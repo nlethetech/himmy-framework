@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from opensims.api.models import (
@@ -17,6 +18,7 @@ from opensims.api.models import (
     RunListResponse,
 )
 from opensims.application.services import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+from opensims.entities.lineage import DEFAULT_TRACE_DEPTH
 from opensims.services.storage.models import RunRecord, RunStatus
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
@@ -148,6 +150,34 @@ async def get_run_thread(
     if thread is None:
         raise HTTPException(status_code=404, detail="thread not found")
     return thread
+
+
+@router.get("/{run_id}/lineage", responses=NOT_FOUND_RESPONSE)
+async def get_run_lineage(
+    run_id: str,
+    request: Request,
+    workspace_id: str | None = None,
+    max_depth: int = Query(DEFAULT_TRACE_DEPTH, ge=0, le=64),
+    relations: str | None = Query(
+        None,
+        description="comma-separated relation allow-list (e.g. uses_persona,in_thread)",
+    ),
+    fmt: str = Query("json", alias="format", pattern="^(json|dot)$"),
+) -> Any:
+    """Trace a run's provenance subgraph: the persona, prompt, and evidence snapshot.
+
+    Returns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.
+    404 when the run is unknown / out-of-workspace or has no projected lineage.
+    """
+    rel = [r.strip() for r in relations.split(",") if r.strip()] if relations else None
+    graph = await _container(request).run_app.get_run_lineage(
+        run_id, workspace_id=workspace_id, max_depth=max_depth, relations=rel
+    )
+    if graph is None:
+        raise HTTPException(status_code=404, detail="run lineage not found")
+    if fmt == "dot":
+        return PlainTextResponse(graph.to_dot())
+    return graph
 
 
 __all__ = ["router"]

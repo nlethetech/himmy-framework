@@ -83,6 +83,42 @@ def test_get_unknown_run_404() -> None:
     assert client.get("/v1/runs/does-not-exist").status_code == 404
 
 
+def test_run_lineage_endpoint_json_and_dot() -> None:
+    """GET /v1/runs/{id}/lineage traces provenance as JSON and as Graphviz DOT."""
+    client = _client()
+    body = {
+        "workspace_id": "w1",
+        "subject_id": "s1",
+        "persona": {"name": "Analyst", "description": "careful"},
+        "task": {"title": "brief", "prompt": "Summarize ACME"},
+    }
+    run_id = client.post("/v1/runs", json=body).json()["run_id"]
+    _await_run(client, run_id)
+
+    graph = client.get(
+        f"/v1/runs/{run_id}/lineage", params={"workspace_id": "w1"}
+    ).json()
+    kinds = {node["kind"] for node in graph["nodes"].values()}
+    assert {"chat_thread", "persona", "prompt"} <= kinds
+    assert any(edge["relation"] == "uses_persona" for edge in graph["edges"])
+    assert graph["truncated"] is False
+
+    dot = client.get(
+        f"/v1/runs/{run_id}/lineage", params={"workspace_id": "w1", "format": "dot"}
+    )
+    assert dot.headers["content-type"].startswith("text/plain")
+    assert dot.text.startswith("digraph lineage {")
+
+    # Tenant isolation + unknown run both 404.
+    assert (
+        client.get(
+            f"/v1/runs/{run_id}/lineage", params={"workspace_id": "other"}
+        ).status_code
+        == 404
+    )
+    assert client.get("/v1/runs/nope/lineage").status_code == 404
+
+
 def test_context_field_upsert_and_list() -> None:
     """Context fields upsert and list back for a subject."""
     client = _client()

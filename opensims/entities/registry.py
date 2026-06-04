@@ -5,6 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from opensims.core.errors import OpenSimsError
+from opensims.entities.lineage import (
+    DEFAULT_TRACE_DEPTH,
+    LineageDirection,
+    LineageGraph,
+)
 from opensims.entities.records import (
     EntityLink,
     EntityQuery,
@@ -146,6 +151,116 @@ class EntityRegistry:
     def links_from(self, record_id: str) -> list[EntityLink]:
         """Return all links originating from a record."""
         return [link for link in self._links if link.from_record_id == record_id]
+
+    def links_to(self, record_id: str) -> list[EntityLink]:
+        """Return all links pointing INTO a record (the reverse of ``links_from``).
+
+        This is the read primitive the documented "trace any output back to its
+        persona/evidence" promise needs; the data was always captured, the reverse
+        query was simply never exposed.
+        """
+        return [link for link in self._links if link.to_record_id == record_id]
+
+    def neighbors(
+        self,
+        record_id: str,
+        *,
+        direction: LineageDirection = LineageDirection.BOTH,
+        relation: str | None = None,
+    ) -> list[EntityLink]:
+        """Return the links incident to a record in the requested direction.
+
+        ``OUT`` = edges leaving the record, ``IN`` = edges entering it, ``BOTH`` =
+        either. When ``relation`` is given, only edges of that relation are returned.
+        Self-loops are de-duplicated so ``BOTH`` never reports the same link twice.
+        """
+        seen: set[str] = set()
+        result: list[EntityLink] = []
+        candidates: list[EntityLink] = []
+        if direction in (LineageDirection.OUT, LineageDirection.BOTH):
+            candidates.extend(self.links_from(record_id))
+        if direction in (LineageDirection.IN, LineageDirection.BOTH):
+            candidates.extend(self.links_to(record_id))
+        for link in candidates:
+            if relation is not None and link.relation != relation:
+                continue
+            if link.link_id in seen:
+                continue
+            seen.add(link.link_id)
+            result.append(link)
+        return result
+
+    def trace(
+        self,
+        record_id: str,
+        *,
+        max_depth: int = DEFAULT_TRACE_DEPTH,
+        direction: LineageDirection = LineageDirection.BOTH,
+        relations: set[str] | list[str] | None = None,
+    ) -> LineageGraph:
+        """Walk the lineage graph from ``record_id`` and return the reached subgraph.
+
+        Breadth-first up to ``max_depth`` hops, following edges in ``direction`` and
+        (optionally) restricted to ``relations``. The returned :class:`LineageGraph`
+        carries the records reached and the edges traversed; ``truncated`` is set
+        when the depth budget stopped the walk while reachable nodes remained.
+        """
+        rel_set = set(relations) if relations is not None else None
+        nodes: dict[str, EntityRecord] = {}
+        edges: list[EntityLink] = []
+        seen_edges: set[str] = set()
+        visited: set[str] = {record_id}
+
+        root = self.get(record_id)
+        if root is not None:
+            nodes[record_id] = root
+
+        frontier = [record_id]
+        for _ in range(max(0, max_depth)):
+            if not frontier:
+                break
+            next_frontier: list[str] = []
+            for rid in frontier:
+                for link in self.neighbors(rid, direction=direction):
+                    if rel_set is not None and link.relation not in rel_set:
+                        continue
+                    if link.link_id not in seen_edges:
+                        seen_edges.add(link.link_id)
+                        edges.append(link)
+                    other = (
+                        link.to_record_id
+                        if link.from_record_id == rid
+                        else link.from_record_id
+                    )
+                    if other in visited:
+                        continue
+                    visited.add(other)
+                    record = self.get(other)
+                    if record is not None:
+                        nodes[other] = record
+                    next_frontier.append(other)
+            frontier = next_frontier
+
+        # The walk is truncated iff a leftover frontier node still has an edge to
+        # an unvisited record we never got to expand.
+        truncated = False
+        for rid in frontier:
+            for link in self.neighbors(rid, direction=direction):
+                if rel_set is not None and link.relation not in rel_set:
+                    continue
+                other = (
+                    link.to_record_id
+                    if link.from_record_id == rid
+                    else link.from_record_id
+                )
+                if other not in visited:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        return LineageGraph(
+            root_id=record_id, nodes=nodes, edges=edges, truncated=truncated
+        )
 
 
 __all__ = ["EntityRegistry", "record_id_for"]

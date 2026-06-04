@@ -13,6 +13,15 @@ green (`pytest -q` → all pass, only dep/DB-gated tests skip). Grouped by kerne
 below.
 
 ### Added
+- **Lineage read layer.** The provenance graph was write-only; it is now
+  queryable. New `EntityRegistry.links_to` (reverse edges), `neighbors`
+  (direction- and relation-filtered), and `trace` (bounded multi-hop BFS)
+  returning a typed `LineageGraph` (nodes + edges, `truncated` flag,
+  `filter_relations`, `to_dot`). `PostgresEntityRegistry` mirrors these with a
+  `WITH RECURSIVE` walk over the (previously unused) `entity_links_to_idx`.
+  Surfaced as `RunAppService.get_run_lineage` and `GET /v1/runs/{run_id}/lineage`
+  (tenant-scoped; `?format=dot` for Graphviz) — fulfilling the documented "trace
+  any run back to its persona + evidence" promise.
 - **Project health & tooling.** Initialized version control, an MIT `LICENSE`,
   a blocking GitHub Actions CI gate (`ruff` lint + format check, `mypy`, and
   `pytest` with coverage), a `.pre-commit-config.yaml` mirroring that gate, and a

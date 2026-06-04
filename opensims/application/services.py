@@ -25,11 +25,13 @@ Production hardening (see IMPROVEMENTS AAEO-1/3/4/6/8/16):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from typing import TYPE_CHECKING, Any
 
 from opensims.application.models import RecommendationEnvelope
+from opensims.entities.lineage import DEFAULT_TRACE_DEPTH
 from opensims.services.storage.models import (
     RecommendationItem,
     RecommendationStatus,
@@ -41,6 +43,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from opensims.agents.base_agent.task import Task
     from opensims.agents.personas.persona import Persona
     from opensims.core.ids import utc_now_iso  # noqa: F401
+    from opensims.entities.lineage import LineageGraph
     from opensims.entities.registry import EntityRegistry
     from opensims.runtime.single_agent import SingleAgentRuntime
     from opensims.services.context.models import ContextField
@@ -49,6 +52,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from opensims.services.storage.service import StorageService
 
 logger = logging.getLogger("opensims.application")
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await ``value`` when it is awaitable, else return it unchanged.
+
+    Lets the run service drive both the synchronous in-memory ``EntityRegistry``
+    and an async ``PostgresEntityRegistry`` through one code path.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
 
 #: Default and maximum page sizes for list endpoints (AAEO-8).
 DEFAULT_PAGE_LIMIT = 100
@@ -589,6 +604,40 @@ class RunAppService:
         if workspace_id is not None and run.workspace_id != workspace_id:
             return None
         return run
+
+    async def get_run_lineage(
+        self,
+        run_id: str,
+        *,
+        workspace_id: str | None = None,
+        max_depth: int = DEFAULT_TRACE_DEPTH,
+        relations: set[str] | list[str] | None = None,
+    ) -> LineageGraph | None:
+        """Return the provenance subgraph for a run, or None.
+
+        Resolves the run (tenant-scoped), finds its ``chat_thread`` entity — the
+        lineage hub — and traces the connected records: the persona it used, the
+        prompt, and the context snapshot it was built from. This is the read side
+        of the captured lineage that fulfils the documented "trace any run back to
+        its persona + evidence" promise.
+
+        Returns None when the run is unknown / out-of-workspace, no entity registry
+        is wired, or the thread was never projected into the registry.
+        """
+        run = await self.get_run(run_id, workspace_id=workspace_id)
+        if run is None or self._registry is None or run.thread_id is None:
+            return None
+        from opensims.entities.records import stable_id_for
+
+        stable_id = stable_id_for(run.thread_id, namespace="chat_thread")
+        root = await _maybe_await(self._registry.get_latest(stable_id))
+        if root is None:
+            return None
+        return await _maybe_await(
+            self._registry.trace(
+                root.record_id, max_depth=max_depth, relations=relations
+            )
+        )
 
     async def list_runs(
         self,

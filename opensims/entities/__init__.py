@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from opensims.entities.lineage import (
+    DEFAULT_TRACE_DEPTH,
+    LineageDirection,
+    LineageGraph,
+)
 from opensims.entities.postgres import PostgresEntityRegistry
 from opensims.entities.records import (
     EntityLink,
@@ -18,6 +23,9 @@ __all__ = [
     "EntityQuery",
     "EntityRegistry",
     "PostgresEntityRegistry",
+    "LineageGraph",
+    "LineageDirection",
+    "DEFAULT_TRACE_DEPTH",
     "stable_id_for",
     "record_id_for",
 ]

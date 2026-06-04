@@ -27,6 +27,11 @@ from datetime import datetime
 from typing import Any
 
 from opensims.core.errors import OpenSimsError
+from opensims.entities.lineage import (
+    DEFAULT_TRACE_DEPTH,
+    LineageDirection,
+    LineageGraph,
+)
 from opensims.entities.records import (
     EntityLink,
     EntityQuery,
@@ -434,6 +439,147 @@ class PostgresEntityRegistry:
                 "SELECT * FROM entity_links WHERE from_record_id = $1", record_id
             )
         return [self._row_to_link(r) for r in rows]
+
+    async def links_to(self, record_id: str) -> list[EntityLink]:
+        """Return all links pointing INTO a record (reverse of ``links_from``).
+
+        Backed by the ``entity_links_to_idx`` index, which existed in the schema but
+        had no query using it until now.
+        """
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM entity_links WHERE to_record_id = $1", record_id
+            )
+        return [self._row_to_link(r) for r in rows]
+
+    async def neighbors(
+        self,
+        record_id: str,
+        *,
+        direction: LineageDirection = LineageDirection.BOTH,
+        relation: str | None = None,
+    ) -> list[EntityLink]:
+        """Return the links incident to a record in the requested direction."""
+        if direction is LineageDirection.OUT:
+            where = "from_record_id = $1"
+        elif direction is LineageDirection.IN:
+            where = "to_record_id = $1"
+        else:
+            where = "(from_record_id = $1 OR to_record_id = $1)"
+        params: list[Any] = [record_id]
+        if relation is not None:
+            params.append(relation)
+            where += f" AND relation = ${len(params)}"
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM entity_links WHERE {where}", *params
+            )
+        # De-dup self-loops that match both arms of a BOTH query.
+        seen: set[str] = set()
+        out: list[EntityLink] = []
+        for row in rows:
+            link = self._row_to_link(row)
+            if link.link_id not in seen:
+                seen.add(link.link_id)
+                out.append(link)
+        return out
+
+    async def trace(
+        self,
+        record_id: str,
+        *,
+        max_depth: int = DEFAULT_TRACE_DEPTH,
+        direction: LineageDirection = LineageDirection.BOTH,
+        relations: set[str] | list[str] | None = None,
+    ) -> LineageGraph:
+        """Walk the lineage graph from ``record_id`` via a recursive CTE.
+
+        A single ``WITH RECURSIVE`` query collects the reachable record ids (using
+        the indexed ``from``/``to`` columns); the induced records and edges are then
+        fetched in two further queries. ``truncated`` is resolved with an ``EXISTS``
+        probe for an edge leaving the depth-limit frontier toward an unreached node,
+        matching the in-memory registry's semantics.
+        """
+        rel_list = list(relations) if relations is not None else None
+        depth = max(0, max_depth)
+
+        if direction is LineageDirection.OUT:
+            join_cond = "l.from_record_id = w.node_id"
+            next_expr = "l.to_record_id"
+        elif direction is LineageDirection.IN:
+            join_cond = "l.to_record_id = w.node_id"
+            next_expr = "l.from_record_id"
+        else:
+            join_cond = "(l.from_record_id = w.node_id OR l.to_record_id = w.node_id)"
+            next_expr = (
+                "CASE WHEN l.from_record_id = w.node_id "
+                "THEN l.to_record_id ELSE l.from_record_id END"
+            )
+
+        walk_sql = f"""
+            WITH RECURSIVE walk(node_id, depth) AS (
+                SELECT $1::text, 0
+              UNION
+                SELECT {next_expr}, w.depth + 1
+                FROM walk w
+                JOIN entity_links l ON {join_cond}
+                WHERE w.depth < $2
+                  AND ($3::text[] IS NULL OR l.relation = ANY($3))
+            )
+            SELECT node_id, MIN(depth) AS depth FROM walk GROUP BY node_id
+        """
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            walk_rows = await conn.fetch(walk_sql, record_id, depth, rel_list)
+            node_ids = [r["node_id"] for r in walk_rows]
+            frontier = [r["node_id"] for r in walk_rows if r["depth"] == depth]
+
+            record_rows = await conn.fetch(
+                "SELECT * FROM entity_records WHERE record_id = ANY($1)", node_ids
+            )
+            edge_rows = await conn.fetch(
+                """
+                SELECT * FROM entity_links
+                WHERE from_record_id = ANY($1) AND to_record_id = ANY($1)
+                  AND ($2::text[] IS NULL OR relation = ANY($2))
+                """,
+                node_ids,
+                rel_list,
+            )
+            truncated = False
+            if frontier:
+                if direction is LineageDirection.OUT:
+                    probe = "from_record_id = ANY($1) AND to_record_id <> ALL($2)"
+                elif direction is LineageDirection.IN:
+                    probe = "to_record_id = ANY($1) AND from_record_id <> ALL($2)"
+                else:
+                    probe = (
+                        "((from_record_id = ANY($1) AND to_record_id <> ALL($2)) "
+                        "OR (to_record_id = ANY($1) AND from_record_id <> ALL($2)))"
+                    )
+                truncated = bool(
+                    await conn.fetchval(
+                        f"""
+                        SELECT EXISTS(
+                            SELECT 1 FROM entity_links
+                            WHERE {probe}
+                              AND ($3::text[] IS NULL OR relation = ANY($3))
+                        )
+                        """,
+                        frontier,
+                        node_ids,
+                        rel_list,
+                    )
+                )
+
+        nodes = {r["record_id"]: self._row_to_record(r) for r in record_rows}
+        edges = [self._row_to_link(r) for r in edge_rows]
+        return LineageGraph(
+            root_id=record_id, nodes=nodes, edges=edges, truncated=truncated
+        )
 
     @staticmethod
     def _row_to_record(row: Any) -> EntityRecord:
