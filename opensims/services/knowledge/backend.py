@@ -173,15 +173,19 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
 );
 
 CREATE TABLE IF NOT EXISTS knowledge_documents (
-    document_id TEXT PRIMARY KEY,
-    kb_id       TEXT NOT NULL REFERENCES knowledge_bases (kb_id) ON DELETE CASCADE,
-    title       TEXT,
-    source_uri  TEXT,
-    text        TEXT,
-    metadata    JSONB NOT NULL DEFAULT '{{}}'::jsonb
+    document_id  TEXT PRIMARY KEY,
+    kb_id        TEXT NOT NULL REFERENCES knowledge_bases (kb_id) ON DELETE CASCADE,
+    title        TEXT,
+    source_uri   TEXT,
+    text         TEXT,
+    content_hash TEXT NOT NULL DEFAULT '',
+    metadata     JSONB NOT NULL DEFAULT '{{}}'::jsonb
 );
 CREATE INDEX IF NOT EXISTS knowledge_documents_kb_id_idx
     ON knowledge_documents (kb_id);
+-- Backs the replace-by-source upsert in persist_documents.
+CREATE INDEX IF NOT EXISTS knowledge_documents_source_idx
+    ON knowledge_documents (kb_id, source_uri);
 
 CREATE TABLE IF NOT EXISTS knowledge_chunks (
     chunk_id    TEXT PRIMARY KEY,
@@ -380,16 +384,30 @@ class PgVectorKnowledgeBackend:
         documents: list[KnowledgeDocument],
         chunks: list[KnowledgeChunk],
     ) -> None:
-        """Insert documents + chunks in one transaction (vectors cast to the col)."""
+        """Insert documents + chunks in one transaction (vectors cast to the col).
+
+        Replace-by-source: any prior document(s) sharing an incoming ``source_uri``
+        are deleted first (cascading to their chunks), so re-ingesting a changed or
+        unchanged source replaces it rather than doubling the index.
+        """
         cast = self._cast()
+        sources = {d.source_uri for d in documents if d.source_uri is not None}
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                for src in sources:
+                    await conn.execute(
+                        "DELETE FROM knowledge_documents "
+                        "WHERE kb_id = $1 AND source_uri = $2",
+                        kb_id,
+                        src,
+                    )
                 for doc in documents:
                     await conn.execute(
                         """
                         INSERT INTO knowledge_documents
-                            (document_id, kb_id, title, source_uri, text, metadata)
-                        VALUES ($1, $2, $3, $4, $5, $6)
+                            (document_id, kb_id, title, source_uri, text,
+                             content_hash, metadata)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
                         ON CONFLICT (document_id) DO NOTHING
                         """,
                         doc.document_id,
@@ -397,6 +415,7 @@ class PgVectorKnowledgeBackend:
                         doc.title,
                         doc.source_uri,
                         doc.text,
+                        doc.content_hash,
                         doc.metadata,
                     )
                 for ch in chunks:

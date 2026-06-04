@@ -31,6 +31,14 @@ from opensims.services.knowledge.readers import (
     PDFReader,
     TextReader,
 )
+from opensims.services.knowledge.retrieval_eval import (
+    RetrievalEvalCase,
+    RetrievalEvalReport,
+    RetrievalScore,
+    aggregate_scores,
+    evaluate_retrieval,
+    score_retrieval,
+)
 from opensims.services.knowledge.service import (
     KnowledgeBase,
     KnowledgeBaseAdapter,
@@ -70,4 +78,11 @@ __all__ = [
     # in-run kb_search tool
     "register_kb_search_tool",
     "KB_SEARCH_ARGS_SCHEMA",
+    # retrieval-quality evaluation
+    "RetrievalEvalCase",
+    "RetrievalScore",
+    "RetrievalEvalReport",
+    "score_retrieval",
+    "aggregate_scores",
+    "evaluate_retrieval",
 ]

@@ -13,6 +13,19 @@ green (`pytest -q` → all pass, only dep/DB-gated tests skip). Grouped by kerne
 below.
 
 ### Added
+- **Content-addressed ingest.** `KnowledgeDocument` gains a `content_hash`;
+  `KnowledgeBase.ingest_documents` now skips unchanged sources, replaces changed
+  ones, and dedups identical raw text — so re-scanning a corpus no longer doubles
+  the index or re-spends embed quota. The pgvector backend replaces-by-source in
+  `persist_documents` (new `content_hash` column + source index).
+- **Retrieval-quality evaluation.** New `opensims.services.knowledge.retrieval_eval`
+  (`RetrievalEvalCase` → `evaluate_retrieval` → `RetrievalEvalReport`) scores a
+  golden set with recall@k / precision@k / MRR / nDCG / hit-rate, fully offline —
+  the feedback loop that makes chunker/threshold/reranker changes measurable.
+- **Public `build_runtime()` facade.** The full offline-first stack now wires in
+  one call via `from opensims import build_runtime` (lazily exposed to keep
+  `import opensims` light). The example bootstrap delegates to it instead of
+  duplicating the wiring.
 - **Recommendations as first-class lineage nodes.** `RecommendationItem.to_record`
   projects each extracted recommendation into a `recommendation` entity, and
   `RecommendationAppService` (now registry-wired, incl. `deps.py` and the

@@ -10,6 +10,7 @@ the parent document. ``KnowledgeBaseAdapter`` projects a search into a
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,11 @@ from opensims.services.knowledge.readers import DocumentReaderFactory
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from opensims.services.knowledge.backend import KnowledgeBackendProtocol
     from opensims.services.storage.service import StorageService
+
+
+def _content_hash(text: str) -> str:
+    """Stable sha256 hex of a document's source text (its content identity)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -231,37 +237,86 @@ class KnowledgeBase:
         as silent no-op documents, and every produced embedding is validated to be a
         usable (non-empty, non-zero-norm, correct-dim) vector before any chunk is
         written.
+
+        Ingest is content-addressed (the in-memory path), so re-running it over a
+        mutable corpus stays warm instead of doubling the index:
+
+        - **unchanged** (same ``source_uri`` + same ``content_hash``, or, for raw
+          text without a uri, the same content) is a no-op — the existing document
+          is returned and NOT re-embedded;
+        - **changed** (same ``source_uri``, new content) REPLACES the prior document
+          and its chunks rather than stacking a second copy;
+        - genuinely new content is inserted.
+
+        The returned list has one document per non-skipped input, in input order
+        (the reused document for unchanged inputs).
         """
         kb = await self._resolve_kb_record(kb_id)
-        created_docs: list[KnowledgeDocument] = []
+        # Existing-content lookups for dedup (in-memory path only; a backend manages
+        # its own upsert in persist_documents).
+        existing = (
+            list(self._documents.get(kb_id, {}).values())
+            if self._backend is None
+            else []
+        )
+        by_identity: dict[tuple[str | None, str], KnowledgeDocument] = {
+            (d.source_uri, d.content_hash): d for d in existing
+        }
+        by_source: dict[str, KnowledgeDocument] = {
+            d.source_uri: d for d in existing if d.source_uri is not None
+        }
+
         skipped: list[str] = []
-        # Collect (document, [(start,end,text)]) so we can batch the embed call.
-        pending: list[tuple[KnowledgeDocument, list[tuple[int, int, str]]]] = []
+        replaced_ids: list[str] = []
+        # Per-input result slot: the reused-or-created document (None when skipped).
+        slots: list[KnowledgeDocument | None] = [None] * len(docs)
+        # (document, triples, input_index) for the inputs that need embedding.
+        pending: list[tuple[KnowledgeDocument, list[tuple[int, int, str]], int]] = []
         all_chunk_texts: list[str] = []
 
-        for item in docs:
+        for idx, item in enumerate(docs):
             text = self._materialize_text(item)
+            content_hash = _content_hash(text)
+            source_uri = item.source_uri or item.file
+            identity = (source_uri, content_hash)
+
+            reuse = by_identity.get(identity)
+            if reuse is not None:
+                # Unchanged content — reuse the stored document, skip re-embedding.
+                slots[idx] = reuse
+                continue
+
             # Treat whitespace-only content (incl. from a file the DocumentInput
-            # validator can't see into) as empty: it would chunk to a useless
-            # whitespace span, so skip the document rather than persist a no-op.
+            # validator can't see into) as empty: skip rather than persist a no-op.
             triples = self._chunker.chunk(text) if text.strip() else []
             if not triples:
-                # An empty / whitespace-only document yields no chunks and would be
-                # unretrievable — skip it loudly rather than persist a no-op doc.
                 skipped.append(item.title or item.source_uri or item.file or "<text>")
                 continue
+
+            # Same source, new content -> the old document is superseded.
+            if source_uri is not None and source_uri in by_source:
+                replaced_ids.append(by_source[source_uri].document_id)
+
             document = KnowledgeDocument(
                 kb_id=kb_id,
                 title=item.title,
-                source_uri=item.source_uri or item.file,
+                source_uri=source_uri,
                 text=text,
+                content_hash=content_hash,
                 metadata=dict(item.metadata),
             )
-            pending.append((document, triples))
+            pending.append((document, triples, idx))
             all_chunk_texts.extend(t for (_, _, t) in triples)
-            created_docs.append(document)
+            slots[idx] = document
+            # Keep working lookups current so in-batch dups dedup/replace too.
+            by_identity[identity] = document
+            if source_uri is not None:
+                by_source[source_uri] = document
 
         if not pending:
+            if any(slot is not None for slot in slots):
+                # Everything was an unchanged no-op — nothing to embed or persist.
+                return [slot for slot in slots if slot is not None]
             if skipped:
                 raise OpenSimsError(
                     "ingest_documents produced zero chunks for every input "
@@ -276,9 +331,10 @@ class KnowledgeBase:
             )
         self._validate_embeddings(kb, embeddings)
 
+        created_docs = [doc for (doc, _, _) in pending]
         all_chunks: list[KnowledgeChunk] = []
         cursor = 0
-        for document, triples in pending:
+        for document, triples, _ in pending:
             for start, end, chunk_text in triples:
                 embedding = embeddings[cursor]
                 cursor += 1
@@ -297,11 +353,23 @@ class KnowledgeBase:
         if self._backend is not None:
             await self._backend.persist_documents(kb_id, created_docs, all_chunks)
         else:
+            # Drop superseded documents (and their chunks) before writing the new
+            # versions so a changed source replaces rather than doubles.
+            for old_id in replaced_ids:
+                self._documents[kb_id].pop(old_id, None)
+                stale = [
+                    cid
+                    for cid, ch in self._chunks[kb_id].items()
+                    if ch.document_id == old_id
+                ]
+                for cid in stale:
+                    del self._chunks[kb_id][cid]
             for document in created_docs:
                 self._documents[kb_id][document.document_id] = document
             for chunk in all_chunks:
                 self._chunks[kb_id][chunk.chunk_id] = chunk
-        return created_docs
+
+        return [slot for slot in slots if slot is not None]
 
     async def ingest_directory(
         self,

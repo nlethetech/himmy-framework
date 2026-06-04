@@ -31,6 +31,9 @@ class KnowledgeDocument(BaseModel):
     title: str | None = None
     source_uri: str | None = None
     text: str | None = None
+    #: sha256 hex of the source text — the content identity used to skip unchanged
+    #: re-ingests and replace changed ones (so a re-scan never doubles the index).
+    content_hash: str = ""
     metadata: dict[str, Any] = {}
 
 
