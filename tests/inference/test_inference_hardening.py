@@ -1,7 +1,7 @@
 """Expanded INF hardening tests — lock in the production inference contract.
 
 These complement ``test_inference_service.py`` by pinning the harder edges of the
-hardened kernel (IMPROVEMENTS.md INF-1..INF-12):
+hardened inference kernel:
 
 * ``run`` NEVER raises for any manager exception, and normalizes by *type*
   (``HimmyError`` -> non-retryable INVALID_REQUEST; transport-named exceptions
