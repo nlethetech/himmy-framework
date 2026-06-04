@@ -13,6 +13,21 @@ green (`pytest -q` → all pass, only dep/DB-gated tests skip). Grouped by kerne
 below.
 
 ### Added
+- **Sandbox kernel (`opensims.services.sandbox`).** Isolated, resource-limited code
+  execution. `SubprocessSandbox` is portable defense-in-depth: a child process with
+  POSIX `setrlimit` caps (CPU/memory/file-size/core), a hard wall-clock timeout that
+  kills the process group, a throwaway working dir, a stripped/allow-listed env,
+  bounded output, and Python `-I` isolated mode — with an explicit threat model
+  (safe against runaway/buggy code; for *untrusted* code compose an OS-level
+  isolate). The `Sandbox` protocol is the seam for a stronger backend, and
+  `register_sandbox_tool` exposes it as an approval-gated, audited agent tool.
+- **Provider/model fallback routing.** `RoutingClientManager` (a `ClientManager`)
+  fails over across an ordered list of `Route`s on eligible failures
+  (QUOTA/AUTH/RATE_LIMITED/TIMEOUT/PROVIDER_UNAVAILABLE), stamping
+  `metadata['fallback_chain']` with what was tried and which route served — closing
+  the single biggest "reach for LiteLLM" gap. Composes over stub/pydantic-ai/gateway
+  and slots into `InferenceService`; streaming keeps the failover guarantee via the
+  buffered fallback.
 - **Content-addressed ingest.** `KnowledgeDocument` gains a `content_hash`;
   `KnowledgeBase.ingest_documents` now skips unchanged sources, replaces changed
   ones, and dedups identical raw text — so re-scanning a corpus no longer doubles

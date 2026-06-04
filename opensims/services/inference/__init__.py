@@ -42,6 +42,11 @@ from opensims.services.inference.models import (
 from opensims.services.inference.pydantic_ai_manager import (
     PydanticAIClientManager,
 )
+from opensims.services.inference.routing import (
+    DEFAULT_FAILOVER_CODES,
+    Route,
+    RoutingClientManager,
+)
 from opensims.services.inference.service import InferenceService, StreamDelta
 
 __all__ = [
@@ -67,6 +72,9 @@ __all__ = [
     "GatewayRuntimeConfig",
     "PydanticAIClientManager",
     "ClientManager",
+    "RoutingClientManager",
+    "Route",
+    "DEFAULT_FAILOVER_CODES",
     "synthesize_from_schema",
     "ModelPrice",
     "StreamDelta",
