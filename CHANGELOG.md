@@ -14,6 +14,17 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Tamper-evident audit (`himmy.entities.integrity`).** A deterministic SHA-256
+  `content_hash` over a record's full content, plus `export_audit_bundle` (a signed
+  manifest: per-record/link hashes, a Merkle root, an HMAC signature) and
+  `verify_audit_bundle`, which re-derives hashes from a live graph and pinpoints
+  every altered/removed/added record or link — catching even an in-place row edit
+  the `(kind, stable_id, version)` id alone could not. The "provably auditable"
+  layer.
+- **Durable SQLite registry (`SqliteEntityRegistry`).** A stdlib-`sqlite3`,
+  file-backed registry, API-compatible with `EntityRegistry` and — unlike the async
+  Postgres one — **synchronous**, so it drops straight into the runtime and gives a
+  run's lineage a durable home that survives restarts/power cuts with no server.
 - **MCP kernel (`himmy.services.mcp`).** A transport-direct Model Context
   Protocol stdio client — newline-delimited JSON-RPC 2.0 to a server subprocess,
   with a background reader task de-multiplexing responses by id. Implemented
