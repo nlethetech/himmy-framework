@@ -8,15 +8,15 @@ from typing import Any
 
 import pytest
 
-from opensims.services.mcp import (
+from himmy.services.mcp import (
     MCPClient,
     MCPError,
     MCPServerSpec,
     register_mcp_tools,
 )
-from opensims.services.tools.models import ToolInvocation
-from opensims.services.tools.registry import ToolRegistry
-from opensims.services.tools.service import ToolService
+from himmy.services.tools.models import ToolInvocation
+from himmy.services.tools.registry import ToolRegistry
+from himmy.services.tools.service import ToolService
 from tests.conftest import run_async
 
 _MOCK_SERVER = os.path.join(os.path.dirname(__file__), "mock_mcp_server.py")

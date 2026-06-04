@@ -39,11 +39,11 @@ jobs:
         run: ruff format --check .
 
       - name: Mypy
-        run: mypy opensims
+        run: mypy himmy
 
       - name: Pytest (with coverage)
         # Postgres/provider/observability tests skip without a DB/keys/extras.
-        run: pytest -q --cov=opensims --cov-report=term-missing --cov-report=xml
+        run: pytest -q --cov=himmy --cov-report=term-missing --cov-report=xml
 
       - name: Upload coverage artifact
         if: always()

@@ -18,14 +18,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _runtime import build_runtime  # noqa: E402
 
-from opensims.agents.personas.persona import Persona  # noqa: E402
-from opensims.orchestrators.workflow import (  # noqa: E402
+from himmy.agents.personas.persona import Persona  # noqa: E402
+from himmy.orchestrators.workflow import (  # noqa: E402
     Workflow,
     WorkflowOrchestrator,
     WorkflowStep,
 )
-from opensims.services.inference.models import ResponseFormat  # noqa: E402
-from opensims.services.tools.registry import register_local_tool  # noqa: E402
+from himmy.services.inference.models import ResponseFormat  # noqa: E402
+from himmy.services.tools.registry import register_local_tool  # noqa: E402
 
 
 def _count_words(args: dict) -> dict:
@@ -106,7 +106,7 @@ async def main() -> None:
     result = await orchestrator.run(
         workflow,
         persona,
-        initial_state={"text": "OpenSims is a good, composable agent framework."},
+        initial_state={"text": "Himmy is a good, composable agent framework."},
     )
 
     print("=== Example 05: workflow ===")

@@ -7,8 +7,8 @@ tests pin the corrected behaviour on the in-memory path.
 
 from __future__ import annotations
 
-from opensims.services.knowledge import DeterministicEmbedder, KnowledgeBase
-from opensims.services.storage.service import StorageService
+from himmy.services.knowledge import DeterministicEmbedder, KnowledgeBase
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 

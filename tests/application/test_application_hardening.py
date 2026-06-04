@@ -9,19 +9,19 @@ from __future__ import annotations
 
 import asyncio
 
-from opensims.agents.base_agent.task import Task
-from opensims.agents.personas.persona import Persona
-from opensims.application.services import (
+from himmy.agents.base_agent.task import Task
+from himmy.agents.personas.persona import Persona
+from himmy.application.services import (
     MAX_PAGE_LIMIT,
     RecommendationAppService,
     RunAppService,
     _resolve_model_key,
 )
-from opensims.entities.registry import EntityRegistry
-from opensims.runtime.single_agent import SingleAgentRuntime
-from opensims.services.context.service import ContextService
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.models import (
+from himmy.entities.registry import EntityRegistry
+from himmy.runtime.single_agent import SingleAgentRuntime
+from himmy.services.context.service import ContextService
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.models import (
     InferenceError,
     InferenceErrorCode,
     InferenceRequest,
@@ -29,9 +29,9 @@ from opensims.services.inference.models import (
     InferenceStatus,
     LLMConfig,
 )
-from opensims.services.inference.service import InferenceService
-from opensims.services.storage.models import RunRecord, RunStatus
-from opensims.services.storage.service import StorageService
+from himmy.services.inference.service import InferenceService
+from himmy.services.storage.models import RunRecord, RunStatus
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -159,8 +159,8 @@ def test_workspace_isolation_on_reads() -> None:
 
 def test_context_field_workspace_isolation() -> None:
     """Two workspaces sharing a subject_id don't see each other's fields."""
-    from opensims.application.services import ContextAppService
-    from opensims.services.context.models import ContextField
+    from himmy.application.services import ContextAppService
+    from himmy.services.context.models import ContextField
 
     storage = StorageService()
     ctx = ContextService(storage_service=storage)

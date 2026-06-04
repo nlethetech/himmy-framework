@@ -16,23 +16,23 @@ from __future__ import annotations
 
 import asyncio
 
-from opensims.agents.personas.persona import Persona
-from opensims.core.events import EventType
-from opensims.entities.registry import EntityRegistry
-from opensims.orchestrators import Workflow, WorkflowOrchestrator, WorkflowStep
-from opensims.runtime.single_agent import SingleAgentRuntime
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.models import (
+from himmy.agents.personas.persona import Persona
+from himmy.core.events import EventType
+from himmy.entities.registry import EntityRegistry
+from himmy.orchestrators import Workflow, WorkflowOrchestrator, WorkflowStep
+from himmy.runtime.single_agent import SingleAgentRuntime
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.models import (
     InferenceError,
     InferenceErrorCode,
     InferenceResponse,
     InferenceStatus,
     ToolCallRecord,
 )
-from opensims.services.inference.service import InferenceService
-from opensims.services.storage.service import StorageService
-from opensims.services.tools.registry import ToolRegistry, register_local_tool
-from opensims.services.tools.service import ToolService
+from himmy.services.inference.service import InferenceService
+from himmy.services.storage.service import StorageService
+from himmy.services.tools.registry import ToolRegistry, register_local_tool
+from himmy.services.tools.service import ToolService
 from tests.conftest import run_async
 
 

@@ -1,1 +1,1 @@
-"""OpenSims test suite."""
+"""Himmy test suite."""

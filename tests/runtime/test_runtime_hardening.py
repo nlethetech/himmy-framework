@@ -16,16 +16,16 @@ from __future__ import annotations
 import asyncio
 import json
 
-from opensims.agents.base_agent.task import Task
-from opensims.agents.base_agent.thread import ChatThread, MessageRole
-from opensims.agents.personas.persona import Persona
-from opensims.core.errors import OpenSimsError
-from opensims.core.events import EventType
-from opensims.entities.registry import EntityRegistry
-from opensims.runtime import RunResult, SingleAgentRuntime
-from opensims.services.context.service import ContextService
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.models import (
+from himmy.agents.base_agent.task import Task
+from himmy.agents.base_agent.thread import ChatThread, MessageRole
+from himmy.agents.personas.persona import Persona
+from himmy.core.errors import HimmyError
+from himmy.core.events import EventType
+from himmy.entities.registry import EntityRegistry
+from himmy.runtime import RunResult, SingleAgentRuntime
+from himmy.services.context.service import ContextService
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.models import (
     InferenceError,
     InferenceErrorCode,
     InferenceResponse,
@@ -33,10 +33,10 @@ from opensims.services.inference.models import (
     LLMConfig,
     ResponseFormat,
 )
-from opensims.services.inference.service import InferenceService
-from opensims.services.storage.service import StorageService
-from opensims.services.tools.registry import ToolRegistry, register_local_tool
-from opensims.services.tools.service import ToolService
+from himmy.services.inference.service import InferenceService
+from himmy.services.storage.service import StorageService
+from himmy.services.tools.registry import ToolRegistry, register_local_tool
+from himmy.services.tools.service import ToolService
 from tests.conftest import run_async
 
 
@@ -303,10 +303,10 @@ def test_strict_snapshot_without_context_service_raises() -> None:
     persona = Persona(name="A")
     try:
         run_async(rt.run_task(persona, Task(title="t", prompt="p"), snapshot_id="x"))
-    except OpenSimsError as exc:
+    except HimmyError as exc:
         assert "context_service" in str(exc)
     else:  # pragma: no cover - must raise
-        raise AssertionError("expected OpenSimsError in strict mode")
+        raise AssertionError("expected HimmyError in strict mode")
 
 
 # ------------------------------------------------------------- RO-8 versioning
@@ -471,7 +471,7 @@ def test_failed_run_detailed_exposes_error_and_back_compat_thread() -> None:
 # ----------------------------------------------------------- RO-9 workflow guard
 def test_workflow_with_unbound_step_tool_fails_fast() -> None:
     """RO-9: WORKFLOW whose step tool isn't registered raises a clear error."""
-    from opensims.services.inference.models import WorkflowDefinition, WorkflowState
+    from himmy.services.inference.models import WorkflowDefinition, WorkflowState
 
     storage = StorageService()
     tool_registry = ToolRegistry()
@@ -492,10 +492,10 @@ def test_workflow_with_unbound_step_tool_fails_fast() -> None:
     cfg = LLMConfig(response_format=ResponseFormat.WORKFLOW, workflow=state)
     try:
         run_async(rt.run_task(persona, Task(title="t", prompt="p"), llm_config=cfg))
-    except OpenSimsError as exc:
+    except HimmyError as exc:
         assert "unregistered" in str(exc)
     else:  # pragma: no cover - must raise
-        raise AssertionError("expected OpenSimsError for unbound step tool")
+        raise AssertionError("expected HimmyError for unbound step tool")
 
 
 # ------------------------------------------------------- structured / minimal

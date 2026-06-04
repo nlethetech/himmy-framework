@@ -1,25 +1,25 @@
-# Local Postgres + pgvector for the OpenSims [postgres] / [knowledge] extras.
+# Local Postgres + pgvector for the Himmy [postgres] / [knowledge] extras.
 # Bring it up with:  docker compose -f docker/docker-compose.yml up -d
-# Then point OPENSIMS_TEST_POSTGRES_DSN at it:
-#   postgresql://opensims:opensims@localhost:5433/opensims
+# Then point HIMMY_TEST_POSTGRES_DSN at it:
+#   postgresql://himmy:himmy@localhost:5433/himmy
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: opensims_postgres
+    container_name: himmy_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: opensims
-      POSTGRES_USER: opensims
-      POSTGRES_PASSWORD: opensims
+      POSTGRES_DB: himmy
+      POSTGRES_USER: himmy
+      POSTGRES_PASSWORD: himmy
     ports:
       - "5433:5432"
     volumes:
-      - opensims_pgdata:/var/lib/postgresql/data
+      - himmy_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U opensims -d opensims"]
+      test: ["CMD-SHELL", "pg_isready -U himmy -d himmy"]
       interval: 5s
       timeout: 5s
       retries: 10
 
 volumes:
-  opensims_pgdata:
+  himmy_pgdata:

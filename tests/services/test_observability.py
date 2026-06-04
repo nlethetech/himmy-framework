@@ -6,19 +6,19 @@ import importlib
 
 import pytest
 
-from opensims.core.events import EventType, RunEvent
+from himmy.core.events import EventType, RunEvent
 
 
 def _fresh_module():
     """Re-import the observability module so its module-level state is reset."""
-    import opensims.services.observability as obs
+    import himmy.services.observability as obs
 
     return importlib.reload(obs)
 
 
 def test_configure_is_noop_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """With the switch unset, configure_observability never imports logfire."""
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_ENABLED", raising=False)
+    monkeypatch.delenv("HIMMY_LOGFIRE_ENABLED", raising=False)
     obs = _fresh_module()
     # Should simply return without raising or importing logfire.
     obs.configure_observability()
@@ -32,7 +32,7 @@ def test_emit_event_span_noop_without_configure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """emit_event_span does nothing (and never raises) when not configured."""
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_ENABLED", raising=False)
+    monkeypatch.delenv("HIMMY_LOGFIRE_ENABLED", raising=False)
     obs = _fresh_module()
     # No exception even with a fully-populated event.
     obs.emit_event_span(
@@ -47,7 +47,7 @@ def test_emit_event_span_noop_without_configure(
 
 def test_enabled_without_logfire_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enabled but missing the logfire package is a hard misconfiguration."""
-    monkeypatch.setenv("OPENSIMS_LOGFIRE_ENABLED", "1")
+    monkeypatch.setenv("HIMMY_LOGFIRE_ENABLED", "1")
     obs = _fresh_module()
     try:
         import logfire  # type: ignore  # noqa: F401
@@ -64,7 +64,7 @@ def test_enabled_without_logfire_raises(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_instrument_fastapi_noop_when_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """instrument_fastapi is a no-op when observability is disabled."""
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_ENABLED", raising=False)
+    monkeypatch.delenv("HIMMY_LOGFIRE_ENABLED", raising=False)
     obs = _fresh_module()
     # Passing a dummy 'app' must not raise when the switch is off.
     obs.instrument_fastapi(object())

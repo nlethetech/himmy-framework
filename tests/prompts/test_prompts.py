@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.services.context.models import ContextField, ContextSnapshot
-from opensims.services.prompts import (
+from himmy.core.errors import HimmyError
+from himmy.services.context.models import ContextField, ContextSnapshot
+from himmy.services.prompts import (
     ContextPromptKey,
     ContextPromptMapper,
     ContextPromptMapSpec,
@@ -16,7 +16,7 @@ from opensims.services.prompts import (
     SystemPromptVariables,
     TaskPromptVariables,
 )
-from opensims.services.prompts.manager import (
+from himmy.services.prompts.manager import (
     PromptTemplate,
     _load_validated_yaml,
     _render,
@@ -126,18 +126,18 @@ def test_render_value_with_braces_is_safe() -> None:
 
 # ----------------------------------------------------------------- YAML validation
 def test_template_validation_rejects_non_dict_section(tmp_path: Path) -> None:
-    """A section authored as a list raises a clear OpenSimsError."""
+    """A section authored as a list raises a clear HimmyError."""
     bad = tmp_path / "bad.yaml"
     bad.write_text("persona:\n  - just\n  - a\n  - list\n", encoding="utf-8")
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         PromptTemplate.from_paths([bad])
 
 
 def test_template_validation_rejects_non_string_value(tmp_path: Path) -> None:
-    """A non-string template value raises a clear OpenSimsError."""
+    """A non-string template value raises a clear HimmyError."""
     bad = tmp_path / "bad.yaml"
     bad.write_text("persona:\n  role: 123\n", encoding="utf-8")
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         PromptTemplate.from_paths([bad])
 
 

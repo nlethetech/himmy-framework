@@ -1,4 +1,4 @@
-"""Shared pytest fixtures + helpers for the OpenSims test suite.
+"""Shared pytest fixtures + helpers for the Himmy test suite.
 
 Tests are plain ``def test_*`` functions that drive async code via the local
 :func:`run_async` helper (``asyncio.run``); ``pytest-asyncio`` is not required and
@@ -34,7 +34,7 @@ def run_async(coro: Awaitable[T]) -> T:
 @pytest.fixture()
 def storage() -> Any:
     """A fresh in-memory :class:`StorageService`."""
-    from opensims.services.storage.service import StorageService
+    from himmy.services.storage.service import StorageService
 
     return StorageService()
 
@@ -42,7 +42,7 @@ def storage() -> Any:
 @pytest.fixture()
 def registry() -> Any:
     """A fresh in-memory :class:`EntityRegistry`."""
-    from opensims.entities.registry import EntityRegistry
+    from himmy.entities.registry import EntityRegistry
 
     return EntityRegistry()
 
@@ -50,8 +50,8 @@ def registry() -> Any:
 @pytest.fixture()
 def inference_service(storage: Any) -> Any:
     """An :class:`InferenceService` backed by the offline stub, sinking to storage."""
-    from opensims.services.inference.client_manager import StubClientManager
-    from opensims.services.inference.service import InferenceService
+    from himmy.services.inference.client_manager import StubClientManager
+    from himmy.services.inference.service import InferenceService
 
     return InferenceService(StubClientManager(), event_sink=storage)
 
@@ -59,7 +59,7 @@ def inference_service(storage: Any) -> Any:
 @pytest.fixture()
 def context_service(storage: Any, registry: Any) -> Any:
     """A :class:`ContextService` over storage + registry (no adapters)."""
-    from opensims.services.context.service import ContextService
+    from himmy.services.context.service import ContextService
 
     return ContextService(storage_service=storage, entity_registry=registry)
 
@@ -67,8 +67,8 @@ def context_service(storage: Any, registry: Any) -> Any:
 @pytest.fixture()
 def tool_service() -> Any:
     """A :class:`ToolService` over a fresh registry with no tools registered yet."""
-    from opensims.services.tools.registry import ToolRegistry
-    from opensims.services.tools.service import ToolService
+    from himmy.services.tools.registry import ToolRegistry
+    from himmy.services.tools.service import ToolService
 
     return ToolService(ToolRegistry())
 
@@ -81,7 +81,7 @@ def runtime(
     registry: Any,
 ) -> Any:
     """A fully-wired :class:`SingleAgentRuntime` (offline, persistent, evidenced)."""
-    from opensims.runtime.single_agent import SingleAgentRuntime
+    from himmy.runtime.single_agent import SingleAgentRuntime
 
     return SingleAgentRuntime(
         inference_service=inference_service,
@@ -94,7 +94,7 @@ def runtime(
 @pytest.fixture()
 def persona() -> Any:
     """A simple analyst :class:`Persona`."""
-    from opensims.agents.personas.persona import Persona
+    from himmy.agents.personas.persona import Persona
 
     return Persona(
         name="Analyst",
@@ -107,6 +107,6 @@ def persona() -> Any:
 @pytest.fixture()
 def task() -> Any:
     """A simple :class:`Task` asking for a brief."""
-    from opensims.agents.base_agent.task import Task
+    from himmy.agents.base_agent.task import Task
 
     return Task(title="Brief", prompt="Summarize the outlook for ACME.")

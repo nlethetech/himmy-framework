@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from opensims.api.deps import ApiContainer
-from opensims.services.storage.service import StorageService
+from himmy.api.deps import ApiContainer
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -16,8 +16,8 @@ def test_build_default_is_in_memory_and_offline() -> None:
 
 
 def test_build_default_async_falls_back_to_memory_without_dsn(monkeypatch) -> None:
-    """Without OPENSIMS_DATABASE_URL, the async builder uses the in-memory store."""
-    monkeypatch.delenv("OPENSIMS_DATABASE_URL", raising=False)
+    """Without HIMMY_DATABASE_URL, the async builder uses the in-memory store."""
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
     container = run_async(ApiContainer.build_default_async())
     assert isinstance(container.storage, StorageService)
 
@@ -25,14 +25,14 @@ def test_build_default_async_falls_back_to_memory_without_dsn(monkeypatch) -> No
 def test_build_storage_selects_postgres_when_dsn_set(monkeypatch) -> None:
     """A set DSN routes _build_storage to PostgresStorageService (gated on the extra).
 
-    Without asyncpg/a DB the connect() raises OpenSimsError — proving the Postgres
+    Without asyncpg/a DB the connect() raises HimmyError — proving the Postgres
     path is selected by env, not silently ignored.
     """
     import pytest
 
-    from opensims.core.errors import OpenSimsError
+    from himmy.core.errors import HimmyError
 
-    monkeypatch.setenv("OPENSIMS_DATABASE_URL", "postgresql://localhost/none")
+    monkeypatch.setenv("HIMMY_DATABASE_URL", "postgresql://localhost/none")
     try:
         import asyncpg  # type: ignore  # noqa: F401
 
@@ -43,7 +43,7 @@ def test_build_storage_selects_postgres_when_dsn_set(monkeypatch) -> None:
     if has_asyncpg:
         pytest.skip("asyncpg installed; cannot assert the missing-extra path offline")
 
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(ApiContainer._build_storage())
 
 

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from opensims.agents.base_agent.task import Task
-from opensims.agents.personas.persona import Persona
-from opensims.application import (
+from himmy.agents.base_agent.task import Task
+from himmy.agents.personas.persona import Persona
+from himmy.application import (
     ContextAppService,
     DashboardQueryService,
     Recommendation,
@@ -12,18 +12,18 @@ from opensims.application import (
     RecommendationEnvelope,
     RunAppService,
 )
-from opensims.entities.registry import EntityRegistry
-from opensims.runtime.single_agent import SingleAgentRuntime
-from opensims.services.context.service import ContextService
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.models import LLMConfig, ResponseFormat
-from opensims.services.inference.service import InferenceService
-from opensims.services.storage.models import (
+from himmy.entities.registry import EntityRegistry
+from himmy.runtime.single_agent import SingleAgentRuntime
+from himmy.services.context.service import ContextService
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.models import LLMConfig, ResponseFormat
+from himmy.services.inference.service import InferenceService
+from himmy.services.storage.models import (
     RecommendationStatus,
     RunRecord,
     RunStatus,
 )
-from opensims.services.storage.service import StorageService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -198,7 +198,7 @@ def test_dashboard_summary_aggregates_counts() -> None:
     dashboard = DashboardQueryService(storage=storage)
     context_service = ContextService(storage_service=storage)
     context_app = ContextAppService(context_service=context_service, storage=storage)
-    from opensims.services.context.models import ContextField
+    from himmy.services.context.models import ContextField
 
     persona = Persona(name="A")
     task = Task(title="t", prompt="hi")

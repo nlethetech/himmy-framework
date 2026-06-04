@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from opensims.entities.registry import EntityRegistry
-from opensims.services.context import (
+from himmy.entities.registry import EntityRegistry
+from himmy.services.context import (
     ContextAdapter,
     ContextBuildSpec,
     ContextField,
@@ -13,7 +13,7 @@ from opensims.services.context import (
     ContextSpecKey,
     EvidenceRef,
 )
-from opensims.services.storage.service import StorageService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 

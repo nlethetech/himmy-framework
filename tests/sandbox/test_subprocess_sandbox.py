@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.services.sandbox import (
+from himmy.core.errors import HimmyError
+from himmy.services.sandbox import (
     SandboxLimits,
     SubprocessSandbox,
     register_sandbox_tool,
 )
-from opensims.services.tools.models import ToolInvocation
-from opensims.services.tools.registry import ToolRegistry
-from opensims.services.tools.service import ToolService
+from himmy.services.tools.models import ToolInvocation
+from himmy.services.tools.registry import ToolRegistry
+from himmy.services.tools.service import ToolService
 from tests.conftest import run_async
 
 
@@ -61,15 +61,15 @@ def test_wall_clock_timeout_kills_the_process() -> None:
 
 def test_environment_is_stripped_unless_allow_listed(monkeypatch) -> None:
     """Parent env is hidden from the child unless explicitly allow-listed."""
-    monkeypatch.setenv("OPENSIMS_SBX_SECRET", "top-secret")
-    code = "import os; print(os.environ.get('OPENSIMS_SBX_SECRET', 'MISSING'))"
+    monkeypatch.setenv("HIMMY_SBX_SECRET", "top-secret")
+    code = "import os; print(os.environ.get('HIMMY_SBX_SECRET', 'MISSING'))"
 
     stripped = run_async(SubprocessSandbox().run_code(code))
     assert stripped.stdout.strip() == "MISSING"
 
     allowed = run_async(
         SubprocessSandbox(
-            limits=SandboxLimits(allow_env=["OPENSIMS_SBX_SECRET"])
+            limits=SandboxLimits(allow_env=["HIMMY_SBX_SECRET"])
         ).run_code(code)
     )
     assert allowed.stdout.strip() == "top-secret"
@@ -95,7 +95,7 @@ def test_output_is_truncated_to_the_limit() -> None:
 
 def test_file_path_traversal_is_rejected() -> None:
     """A file name escaping the working dir is a hard error."""
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(SubprocessSandbox().run_code("pass", files={"../escape.txt": "x"}))
 
 

@@ -6,14 +6,14 @@ import uuid
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.entities.records import (
+from himmy.core.errors import HimmyError
+from himmy.entities.records import (
     EntityQuery,
     EntityRecord,
     record_id_for,
     stable_id_for,
 )
-from opensims.entities.registry import EntityRegistry
+from himmy.entities.registry import EntityRegistry
 
 
 def test_stable_id_for_is_deterministic_and_namespaced() -> None:
@@ -85,11 +85,11 @@ def test_new_version_increments_and_tracks_history() -> None:
 
 
 def test_new_version_optimistic_concurrency_conflict() -> None:
-    """A stale expected_version raises OpenSimsError."""
+    """A stale expected_version raises HimmyError."""
     reg = EntityRegistry()
     sid = stable_id_for("acme", namespace="persona")
     reg.new_version(stable_id=sid, kind="persona", payload={"v": 1})
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         reg.new_version(
             stable_id=sid, kind="persona", payload={"v": 2}, expected_version=0
         )
@@ -182,7 +182,7 @@ def test_register_raises_on_content_address_collision() -> None:
     tampered = EntityRecord.create(
         stable_id=sid, version=1, kind="persona", payload={"v": "TAMPERED"}
     )
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         reg.register(tampered)
     # The stored content is unchanged; the tamper did not silently win.
     assert reg.get(original.record_id).payload == {"v": "original"}
@@ -226,9 +226,9 @@ def test_query_metadata_containment_and_partial_queries() -> None:
 
 def test_domain_to_record_projections() -> None:
     """Domain types project to records with the documented kinds + stable namespaces."""
-    from opensims.agents.base_agent.task import Task
-    from opensims.agents.base_agent.thread import ChatThread, Message, MessageRole
-    from opensims.agents.personas.persona import Persona
+    from himmy.agents.base_agent.task import Task
+    from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
+    from himmy.agents.personas.persona import Persona
 
     persona = Persona(name="Analyst")
     task = Task(title="t", prompt="p")

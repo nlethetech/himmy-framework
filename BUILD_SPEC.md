@@ -1,12 +1,12 @@
-# OpenSims — BUILD SPEC (authoritative contract)
+# Himmy — BUILD SPEC (authoritative contract)
 
-This file is the **single source of truth** for building the OpenSims scaffold.
+This file is the **single source of truth** for building the Himmy scaffold.
 Every builder agent MUST read this file first and conform to the symbol names,
 signatures, and module paths defined here. Downstream layers conform to upstream
 public APIs. When in doubt, match the documentation's wording and these contracts
 exactly.
 
-Source of truth for behavior: `/Users/samriddhagc/Downloads/opensims_agent_documentation.html`
+Source of truth for behavior: `/Users/samriddhagc/Downloads/himmy_agent_documentation.html`
 (embedded markdown in `<script type="text/markdown" id="md-*">` blocks). Builder
 agents may grep that file for any kernel they own.
 
@@ -50,12 +50,12 @@ himmy-agent-test/
   .env.example
   .gitignore
   docker/docker-compose.yml
-  opensims/
+  himmy/
     __init__.py                      # version + top-level re-exports
     core/
       __init__.py
       events.py                      # EventType, RunEvent, EventSink
-      errors.py                      # OpenSimsError + shared enums
+      errors.py                      # HimmyError + shared enums
       ids.py                         # new_uuid(), utc_now_iso() (NO direct datetime.now in scripts; helper ok in lib)
     entities/
       __init__.py
@@ -163,17 +163,17 @@ himmy-agent-test/
 
 ## 2. FOUNDATION CONTRACTS (owned by Foundation agent — everyone imports these)
 
-### 2.1 `opensims/core/ids.py`
+### 2.1 `himmy/core/ids.py`
 ```python
 def new_uuid() -> str               # str(uuid.uuid4())
 def utc_now_iso() -> str            # datetime.now(timezone.utc).isoformat()
 ```
 
-### 2.2 `opensims/core/errors.py`
-- `class OpenSimsError(Exception)` base.
+### 2.2 `himmy/core/errors.py`
+- `class HimmyError(Exception)` base.
 - Re-export nothing else; kernel-specific enums live in their kernels.
 
-### 2.3 `opensims/core/events.py`
+### 2.3 `himmy/core/events.py`
 - `class EventType(str, Enum)` with members (exact names):
   `AGENT_RUN_STARTED, AGENT_RUN_FINISHED, INFERENCE_REQUESTED, INFERENCE_SUCCEEDED,
    INFERENCE_FAILED, TOOL_CALLED, TOOL_COMPLETED, TOOL_FAILED,
@@ -190,7 +190,7 @@ def utc_now_iso() -> str            # datetime.now(timezone.utc).isoformat()
   inside the method to avoid a cycle.
 - `class EventSink(Protocol)`: `async def append_event(self, event: RunEvent) -> None`.
 
-### 2.4 `opensims/entities/records.py`
+### 2.4 `himmy/entities/records.py`
 - `def stable_id_for(value: str, *, namespace: str, fallback_key: str | None = None) -> str`
   UUID5 of (namespace, value). If `value` already parses as a UUID, return it
   unchanged. If `value` falsy, use `fallback_key`.
@@ -211,12 +211,12 @@ def utc_now_iso() -> str            # datetime.now(timezone.utc).isoformat()
   `kind: str | None = None`, `metadata_filters: dict[str, Any] = {}`,
   `stable_id: str | None = None`.
 
-### 2.5 `opensims/entities/registry.py`
+### 2.5 `himmy/entities/registry.py`
 - `class EntityRegistry` (in-memory). Methods:
   - `register(self, record: EntityRecord) -> EntityRecord` — idempotent on record_id.
   - `new_version(self, *, stable_id, kind, payload, metadata=None, expected_version=None) -> EntityRecord`
     — optimistic concurrency: if `expected_version` given and != current latest
-    version, raise `OpenSimsError`. New version = latest+1.
+    version, raise `HimmyError`. New version = latest+1.
   - `link(self, *, from_record_id, to_record_id, relation, metadata=None) -> EntityLink`.
   - `get(self, record_id) -> EntityRecord | None`.
   - `get_latest(self, stable_id) -> EntityRecord | None`.
@@ -227,7 +227,7 @@ def utc_now_iso() -> str            # datetime.now(timezone.utc).isoformat()
 - `__init__.py` re-exports: EntityRecord, EntityLink, EntityQuery, EntityRegistry,
   stable_id_for, record_id_for.
 
-### 2.6 `opensims/agents/personas/persona.py`
+### 2.6 `himmy/agents/personas/persona.py`
 - `class Persona(BaseModel)`:
   `agent_id: str = Field(default_factory=new_uuid)`, `name: str`,
   `description: str = ""`, `instructions: list[str] = []`, `tags: list[str] = []`,
@@ -238,14 +238,14 @@ def utc_now_iso() -> str            # datetime.now(timezone.utc).isoformat()
 - `class RolePersona(Persona)`: adds `objectives: list[str] = []`,
   `required_tools: list[str] = []`, `required_skills: list[str] = []`.
 
-### 2.7 `opensims/agents/base_agent/task.py`
+### 2.7 `himmy/agents/base_agent/task.py`
 - `class Task(BaseModel)`:
   `task_id: str = Field(default_factory=new_uuid)`, `title: str`, `prompt: str`,
   `context: dict[str, Any] = {}`, `constraints: dict[str, Any] = {}`,
   `metadata: dict[str, Any] = {}`.
   `to_record()` -> kind="prompt", stable id namespace "prompt" keyed by task_id.
 
-### 2.8 `opensims/agents/base_agent/thread.py`
+### 2.8 `himmy/agents/base_agent/thread.py`
 - `class MessageRole(str, Enum)`: SYSTEM, USER, ASSISTANT, TOOL.
 - `class Message(BaseModel)`:
   `message_id: str = Field(default_factory=new_uuid)`, `role: MessageRole`,
@@ -260,7 +260,7 @@ def utc_now_iso() -> str            # datetime.now(timezone.utc).isoformat()
   `to_record(version=None,...)` -> kind="chat_thread" keyed by thread_id (uses
   self.version when version arg None).
 
-### 2.9 `opensims/agents/base_agent/agent.py`
+### 2.9 `himmy/agents/base_agent/agent.py`
 - `class Agent(BaseModel)`:
   `agent_id: str = Field(default_factory=new_uuid)`, `name: str`,
   `persona: Persona`, `instructions: list[str] = []`, `tools: list[str] = []`,
@@ -268,12 +268,12 @@ def utc_now_iso() -> str            # datetime.now(timezone.utc).isoformat()
   `@classmethod from_persona(cls, persona, *, name, tools=None, skills=None, instructions=None) -> Agent`.
   `to_record()` -> kind="agent" keyed by agent_id.
 
-### 2.10 `opensims/agents/__init__.py`
+### 2.10 `himmy/agents/__init__.py`
 Re-export Persona, RolePersona, Task, ChatThread, Message, MessageRole, Agent.
 
 ---
 
-## 3. INFERENCE KERNEL (owned by Inference agent) — `opensims/services/inference/`
+## 3. INFERENCE KERNEL (owned by Inference agent) — `himmy/services/inference/`
 
 ### 3.1 `models.py`
 - `class InferenceStatus(str, Enum)`: SUCCESS, FAILED.
@@ -381,7 +381,7 @@ Re-export Persona, RolePersona, Task, ChatThread, Message, MessageRole, Agent.
   (model_key -> pydantic-ai model string) plus optional default.
   Top of file: NO module-level `import pydantic_ai`. Inside `generate()` (and a
   `_require_pydantic_ai()` helper) do `try: import pydantic_ai except ImportError:
-  raise OpenSimsError("pydantic-ai not installed; pip install 'opensims[providers]'")`.
+  raise HimmyError("pydantic-ai not installed; pip install 'himmy[providers]'")`.
   Implement a best-effort real path (build an Agent via infer_model, run, map to
   InferenceResponse) but it's fine for it to be a documented thin adapter since it
   cannot be tested here. Keep it import-safe (the FILE must import even when
@@ -417,7 +417,7 @@ These three are co-owned by ONE agent to avoid cross-agent seams (context writes
 through to storage; knowledge persists to storage; KnowledgeBaseAdapter feeds
 context). Use TYPE_CHECKING to avoid import cycles.
 
-### 4.1 STORAGE — `opensims/services/storage/`
+### 4.1 STORAGE — `himmy/services/storage/`
 `models.py`:
 - `class RunStatus(str, Enum)`: QUEUED, RUNNING, SUCCEEDED, FAILED.
 - `class RecommendationStatus(str, Enum)`: PROPOSED, ACCEPTED, DISMISSED, SCHEDULED.
@@ -465,14 +465,14 @@ context). Use TYPE_CHECKING to avoid import cycles.
 - `class PostgresStorageService:` SCAFFOLD. `@classmethod async def connect(cls, dsn, *, max_size=10)`,
   `async def create_schema(self)` (idempotent CREATE TABLE IF NOT EXISTS — write the
   ~14-table DDL as a string; do not require a live DB to import), plus the same
-  method surface as StorageService raising `OpenSimsError("requires [postgres] extra
+  method surface as StorageService raising `HimmyError("requires [postgres] extra
   + running DB")` if asyncpg/conn missing. Guard `import asyncpg` lazily. Include an
   `ai_call_log` view in the DDL string (documented). The MODULE must import without
   asyncpg/DB present.
 `__init__.py` re-exports: StorageService, MemoryStore, RunRecord, RunStatus,
 RecommendationItem, RecommendationStatus, PostgresStorageService, + the memory/orch records.
 
-### 4.2 CONTEXT — `opensims/services/context/`
+### 4.2 CONTEXT — `himmy/services/context/`
 `models.py`:
 - `class ContextSourcePreference(str, Enum)`: STORAGE_FIRST, TOOL_FIRST, TOOL_ONLY.
 - `class EvidenceRef(BaseModel)`: `evidence_id: str = factory`, `source_type: str`,
@@ -508,7 +508,7 @@ RecommendationItem, RecommendationStatus, PostgresStorageService, + the memory/o
      present. Accept build_spec as ContextBuildSpec OR dict (model_validate).
 `__init__.py` re-exports all of the above.
 
-### 4.3 KNOWLEDGE — `opensims/services/knowledge/`
+### 4.3 KNOWLEDGE — `himmy/services/knowledge/`
 `embedder.py`:
 - `class EmbedderProtocol(Protocol)`: `async def embed_documents(self, texts:
   list[str]) -> list[list[float]]`; `async def embed_query(self, text) -> list[float]`.
@@ -560,7 +560,7 @@ OpenAIMultimodalEmbeddingModel.
 
 ---
 
-## 5. PROMPTS (owned by Foundation agent — it consumes Persona/Task) — `opensims/services/prompts/`
+## 5. PROMPTS (owned by Foundation agent — it consumes Persona/Task) — `himmy/services/prompts/`
 `configs/prompts/default_prompt.yaml`: exactly the two-section template from the doc
 (persona: role/background/objectives/skills ; task: task/output/schema).
 `manager.py`:
@@ -587,7 +587,7 @@ OpenAIMultimodalEmbeddingModel.
 
 ## 6. TOOLS + EVAL + OBSERVABILITY (owned by ToolsEval agent)
 
-### 6.1 TOOLS — `opensims/services/tools/`
+### 6.1 TOOLS — `himmy/services/tools/`
 `models.py`:
 - `class ToolBackendKind(str, Enum)`: LOCAL, HTTP.
 - `class HttpAuthMode(str, Enum)`: NONE, BEARER, HEADER, BASIC.
@@ -650,7 +650,7 @@ OpenAIMultimodalEmbeddingModel.
 ToolInvocation, ToolPolicyDecision, ToolErrorCode, ToolExecutionResult, HttpToolConfig,
 HttpAuthConfig, HttpAuthMode, register_local_tool, register_http_tool.
 
-### 6.2 EVALUATION — `opensims/services/evaluation/`
+### 6.2 EVALUATION — `himmy/services/evaluation/`
 `models.py`: `EvaluationCase` (case_id, input: dict, expected_output: dict,
 metric_weights: dict[str,float], metadata), `EvaluationSuite` (suite_id, name,
 cases: list[EvaluationCase]), `MetricScore` (metric: str, score: float (0..1),
@@ -668,20 +668,20 @@ dict[str, Any]) -> EvaluationRun` — weighted aggregate per case, overall aggre
 persist via storage.save_evaluation_run when present.
 `__init__.py` re-exports the surface incl. default_metric_registry.
 
-### 6.3 OBSERVABILITY — `opensims/services/observability/__init__.py`
+### 6.3 OBSERVABILITY — `himmy/services/observability/__init__.py`
 - `def configure_observability() -> None`: idempotent. No-op when
-  `OPENSIMS_LOGFIRE_ENABLED` unset/false. If enabled but `logfire` missing -> raise
+  `HIMMY_LOGFIRE_ENABLED` unset/false. If enabled but `logfire` missing -> raise
   RuntimeError. NEVER import logfire unless enabled.
 - `def emit_event_span(event) -> None`: safe no-op when off.
 - `def instrument_fastapi(app) -> None` / `def instrument_asyncpg() -> None`: soft
   no-op (print one-line warning) when sub-extra missing.
-- Respect `OPENSIMS_LOGFIRE_INCLUDE_CONTENT`, `OPENSIMS_LOGFIRE_SERVICE_NAME`.
+- Respect `HIMMY_LOGFIRE_INCLUDE_CONTENT`, `HIMMY_LOGFIRE_SERVICE_NAME`.
 
 ---
 
 ## 7. INTEGRATION (owned by Integration agent): runtime + application + api + orchestrators
 
-### 7.1 RUNTIME — `opensims/runtime/single_agent.py`
+### 7.1 RUNTIME — `himmy/runtime/single_agent.py`
 - `class SingleAgentRuntime:` constructor exactly:
   `__init__(self, *, inference_service, memory_store=None, tool_service=None,
    context_service=None, prompt_manager=None, context_prompt_mapper=None,
@@ -726,9 +726,9 @@ persist via storage.save_evaluation_run when present.
      caller advances state.
   - Be defensive: every optional dep guarded. Never crash if registry/context/tool
     services are None.
-- `opensims/runtime/__init__.py` re-exports SingleAgentRuntime.
+- `himmy/runtime/__init__.py` re-exports SingleAgentRuntime.
 
-### 7.2 APPLICATION — `opensims/application/`
+### 7.2 APPLICATION — `himmy/application/`
 `models.py`:
 - `class Recommendation(BaseModel)`: `kind: str`, `title: str`, `summary: str=""`,
   `rationale: str=""`, `confidence: float=0.0`, `evidence_refs: list[str]=[]`,
@@ -758,7 +758,7 @@ persist via storage.save_evaluation_run when present.
   counts by status; recommendation counts by status.
 `__init__.py` re-exports models + services.
 
-### 7.3 ORCHESTRATORS — `opensims/orchestrators/workflow.py`
+### 7.3 ORCHESTRATORS — `himmy/orchestrators/workflow.py`
 - `class WorkflowStep(BaseModel)`: `name: str`, `subtask: str`,
   `tool_names: list[str] = []`, `response_format: ResponseFormat | None=None`,
   `output_json_schema: dict | None=None`, `output_key: str | None=None`,
@@ -787,7 +787,7 @@ persist via storage.save_evaluation_run when present.
    ?? output_text`. Respect stop_on_step_failure.
 - `__init__.py` re-exports.
 
-### 7.4 API — `opensims/api/`
+### 7.4 API — `himmy/api/`
 `deps.py`:
 - `class ApiContainer:` holds storage, entity_registry, inference, runtime,
   context_app, run_app, recommendation_app, dashboard. `@classmethod
@@ -797,8 +797,8 @@ persist via storage.save_evaluation_run when present.
 `app.py`:
 - `def create_app(container: ApiContainer | None = None) -> FastAPI`. Calls
   configure_observability(); instrument_fastapi(app). Optional internal-key guard
-  dependency when `OPENSIMS_INTERNAL_API_KEY` set (header from
-  `OPENSIMS_INTERNAL_HEADER`, default `x-opensims-internal-key`). Mount routers.
+  dependency when `HIMMY_INTERNAL_API_KEY` set (header from
+  `HIMMY_INTERNAL_HEADER`, default `x-himmy-internal-key`). Mount routers.
   Store container on app.state.
 `routers/context.py`: POST `/v1/context/fields:upsert`, GET `/v1/context/fields`,
   POST `/v1/context/snapshots:build`, GET `/v1/context/snapshots/{snapshot_id}`.
@@ -820,7 +820,7 @@ Use pydantic request/response models. Background runs are fine (in-memory). Make
 `_runtime.py`:
 - `def build_runtime(**overrides) -> tuple[SingleAgentRuntime, InferenceService, ToolService]`.
   Chooses client manager: if `OPENPSIMS`... actually: if `pydantic_ai` importable AND
-  a provider key present -> PydanticAIClientManager via `OPENSIMS_EXAMPLES_MODEL`
+  a provider key present -> PydanticAIClientManager via `HIMMY_EXAMPLES_MODEL`
   env; else StubClientManager (DEFAULT, offline). Wire in-memory storage,
   EntityRegistry, ContextService, PromptManager, ContextPromptMapper, ToolService.
   Also `build_storage()`, `build_inference()` helpers as needed. Calls
@@ -836,7 +836,7 @@ Use pydantic request/response models. Background runs are fine (in-memory). Make
 - `04_orchestration_team.py`: 3 specialists via run_batch + manager synthesis.
 - `05_workflow.py`: WorkflowOrchestrator with a forced sequential-tools step + a
   structured report step (count_words/score_sentiment/extract_topics tools).
-- `06_postgres_storage.py`: gated — if `OPENSIMS_TEST_POSTGRES_DSN` unset, print a
+- `06_postgres_storage.py`: gated — if `HIMMY_TEST_POSTGRES_DSN` unset, print a
   skip notice and exit 0. Otherwise wire PostgresStorageService.
 
 ## 9. TESTS — `tests/` (pytest + pytest-asyncio style via asyncio.run or anyio)
@@ -850,7 +850,7 @@ Use pydantic request/response models. Background runs are fine (in-memory). Make
 
 ## 10. PACKAGING
 `pyproject.toml` (PEP 621, hatchling or setuptools build backend):
-- name "opensims", version "0.1.0", requires-python ">=3.12".
+- name "himmy", version "0.1.0", requires-python ">=3.12".
 - dependencies: `pydantic>=2`, `pyyaml>=6`, `httpx>=0.27`.
 - optional-dependencies:
   - `api = ["fastapi>=0.110", "uvicorn>=0.29"]`
@@ -864,13 +864,13 @@ Use pydantic request/response models. Background runs are fine (in-memory). Make
   but since dev deps may be absent, tests should not REQUIRE pytest-asyncio — use
   asyncio.run. Keep `testpaths = ["tests"]`.
 NOTE: fastapi IS installed here, so `[api]` can be assumed available for tests.
-`.env.example`: OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENSIMS_EXAMPLES_MODEL,
-PYDANTIC_AI_GATEWAY_API_KEY, OPENSIMS_GATEWAY_REGION, OPENSIMS_INTERNAL_API_KEY,
-OPENSIMS_LOGFIRE_ENABLED, OPENSIMS_TEST_POSTGRES_DSN, OPENAI_COMPATIBLE_* — all
+`.env.example`: OPENROUTER_API_KEY, OPENROUTER_MODEL, HIMMY_EXAMPLES_MODEL,
+PYDANTIC_AI_GATEWAY_API_KEY, HIMMY_GATEWAY_REGION, HIMMY_INTERNAL_API_KEY,
+HIMMY_LOGFIRE_ENABLED, HIMMY_TEST_POSTGRES_DSN, OPENAI_COMPATIBLE_* — all
 commented with guidance.
 `.gitignore`: venv, __pycache__, .env, *.egg-info, .pytest_cache, dist/build.
 `docker/docker-compose.yml`: pgvector/pgvector:pg16 on host port 5433, volume
-opensims_pgdata, db/user/pass opensims.
+himmy_pgdata, db/user/pass himmy.
 `README.md`: what it is, install, quickstart (offline stub), architecture overview
 (link kernels), running examples, running tests, optional extras, project layout.
 

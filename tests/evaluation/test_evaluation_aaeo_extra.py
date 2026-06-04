@@ -21,25 +21,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from opensims.services.evaluation import (
+from himmy.services.evaluation import (
     EmbeddingSimilarityMetric,
     EvaluationCase,
     EvaluationService,
     EvaluationSuite,
     build_registry,
 )
-from opensims.services.evaluation.metrics import EvaluationMetricRegistry
-from opensims.services.evaluation.models import MetricScore
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.models import (
+from himmy.services.evaluation.metrics import EvaluationMetricRegistry
+from himmy.services.evaluation.models import MetricScore
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.models import (
     InferenceError,
     InferenceErrorCode,
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
 )
-from opensims.services.inference.service import InferenceService
-from opensims.services.knowledge.embedder import DeterministicEmbedder
+from himmy.services.inference.service import InferenceService
+from himmy.services.knowledge.embedder import DeterministicEmbedder
 from tests.conftest import run_async
 
 

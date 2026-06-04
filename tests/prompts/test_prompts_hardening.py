@@ -17,14 +17,14 @@ from pathlib import Path
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.services.prompts import (
+from himmy.core.errors import HimmyError
+from himmy.services.prompts import (
     PromptManager,
     PromptTemplate,
     SystemPromptVariables,
     TaskPromptVariables,
 )
-from opensims.services.prompts.manager import _load_validated_yaml, _render
+from himmy.services.prompts.manager import _load_validated_yaml, _render
 
 try:  # logfire is an optional observability dep; gate its test on presence
     import logfire  # noqa: F401
@@ -114,8 +114,8 @@ def test_from_paths_later_file_wins_per_key(tmp_path: Path) -> None:
 
 
 def test_from_paths_missing_file_raises(tmp_path: Path) -> None:
-    """A non-existent template path raises a clear OpenSimsError."""
-    with pytest.raises(OpenSimsError):
+    """A non-existent template path raises a clear HimmyError."""
+    with pytest.raises(HimmyError):
         PromptTemplate.from_paths([tmp_path / "does_not_exist.yaml"])
 
 
@@ -134,11 +134,11 @@ def test_empty_yaml_loads_as_empty_mapping(tmp_path: Path) -> None:
     assert _load_validated_yaml(p) == {}
 
 
-def test_invalid_yaml_raises_opensims_error(tmp_path: Path) -> None:
-    """Malformed YAML raises a clear OpenSimsError (not a raw yaml error)."""
+def test_invalid_yaml_raises_himmy_error(tmp_path: Path) -> None:
+    """Malformed YAML raises a clear HimmyError (not a raw yaml error)."""
     p = tmp_path / "broken.yaml"
     p.write_text("persona: [unclosed\n", encoding="utf-8")
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         _load_validated_yaml(p)
 
 
@@ -146,7 +146,7 @@ def test_top_level_scalar_rejected(tmp_path: Path) -> None:
     """A template whose top level is a scalar (not a mapping) is rejected."""
     p = tmp_path / "scalar.yaml"
     p.write_text("just a string\n", encoding="utf-8")
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         _load_validated_yaml(p)
 
 

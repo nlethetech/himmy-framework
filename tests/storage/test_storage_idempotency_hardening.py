@@ -23,7 +23,7 @@ import asyncio
 
 import pytest
 
-from opensims.services.storage.models import (
+from himmy.services.storage.models import (
     ActionRecord,
     AgentStateRecord,
     ContextEvidenceRecord,
@@ -33,7 +33,7 @@ from opensims.services.storage.models import (
     RecommendationItem,
     RunRecord,
 )
-from opensims.services.storage.service import StorageService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 

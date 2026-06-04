@@ -2,8 +2,8 @@
 
 These tests are SKIPPED unless both:
 
-- ``OPENSIMS_TEST_POSTGRES_DSN`` is set (e.g.
-  ``postgresql://opensims:opensims@localhost:5433/opensims`` — see
+- ``HIMMY_TEST_POSTGRES_DSN`` is set (e.g.
+  ``postgresql://himmy:himmy@localhost:5433/himmy`` — see
   ``docker/docker-compose.yml``), and
 - the ``asyncpg`` extra is importable.
 
@@ -21,19 +21,19 @@ import uuid
 
 import pytest
 
-from opensims.agents.base_agent.thread import ChatThread, Message, MessageRole
-from opensims.core.events import EventType, RunEvent
-from opensims.services.storage import (
+from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
+from himmy.core.events import EventType, RunEvent
+from himmy.services.storage import (
     MemoryObject,
     RecommendationItem,
     RecommendationStatus,
     RunRecord,
     RunStatus,
 )
-from opensims.services.storage.postgres import PostgresStorageService
+from himmy.services.storage.postgres import PostgresStorageService
 from tests.conftest import run_async
 
-_DSN = os.environ.get("OPENSIMS_TEST_POSTGRES_DSN")
+_DSN = os.environ.get("HIMMY_TEST_POSTGRES_DSN")
 
 try:  # pragma: no cover - import probe
     import asyncpg  # type: ignore  # noqa: F401
@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover
 
 pytestmark = pytest.mark.skipif(
     not _DSN or not _HAVE_ASYNCPG,
-    reason="requires OPENSIMS_TEST_POSTGRES_DSN + the [postgres] extra",
+    reason="requires HIMMY_TEST_POSTGRES_DSN + the [postgres] extra",
 )
 
 

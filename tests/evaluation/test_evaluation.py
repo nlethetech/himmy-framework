@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from opensims.services.evaluation import (
+from himmy.services.evaluation import (
     AccuracyMetric,
     EvaluationCase,
     EvaluationService,
@@ -11,7 +11,7 @@ from opensims.services.evaluation import (
     SafetyMetric,
     default_metric_registry,
 )
-from opensims.services.storage.service import StorageService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 

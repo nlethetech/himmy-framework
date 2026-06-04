@@ -26,8 +26,8 @@ import uuid
 import pytest
 from pydantic import ValidationError
 
-from opensims.core.errors import OpenSimsError
-from opensims.entities.records import (
+from himmy.core.errors import HimmyError
+from himmy.entities.records import (
     EntityLink,
     EntityQuery,
     EntityRecord,
@@ -35,7 +35,7 @@ from opensims.entities.records import (
     record_id_for,
     stable_id_for,
 )
-from opensims.entities.registry import EntityRegistry
+from himmy.entities.registry import EntityRegistry
 
 
 # --------------------------------------------------------------- local fixtures
@@ -105,7 +105,7 @@ def test_register_collision_on_payload_divergence_raises(reg: EntityRegistry) ->
     tampered = EntityRecord.create(
         stable_id=sid, version=1, kind="persona", payload={"v": "TAMPERED"}
     )
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         reg.register(tampered)
     stored = reg.get(original.record_id)
     assert stored is not None and stored.payload == {"v": "original"}
@@ -125,7 +125,7 @@ def test_register_collision_on_metadata_divergence_raises(
             metadata={"team": "alpha"},
         )
     )
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         reg.register(
             EntityRecord.create(
                 stable_id=sid,
@@ -146,7 +146,7 @@ def test_register_identical_content_is_idempotent_after_collision(
         stable_id=sid, version=1, kind="persona", payload={"v": "x"}
     )
     reg.register(original)
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         reg.register(
             EntityRecord.create(
                 stable_id=sid, version=1, kind="persona", payload={"v": "y"}

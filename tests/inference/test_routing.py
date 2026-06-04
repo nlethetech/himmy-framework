@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.services.inference import (
+from himmy.core.errors import HimmyError
+from himmy.services.inference import (
     InferenceError,
     InferenceErrorCode,
     InferenceMessage,
@@ -164,7 +164,7 @@ def test_route_model_key_override_is_applied() -> None:
 
 def test_empty_routes_rejected() -> None:
     """A router with no routes is a construction error."""
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         RoutingClientManager([])
 
 

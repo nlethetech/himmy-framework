@@ -6,9 +6,9 @@ import asyncio
 
 import httpx
 
-from opensims.core.events import EventType
-from opensims.services.storage.service import StorageService
-from opensims.services.tools import (
+from himmy.core.events import EventType
+from himmy.services.storage.service import StorageService
+from himmy.services.tools import (
     HttpAuthConfig,
     HttpAuthMode,
     HttpToolConfig,
@@ -20,7 +20,7 @@ from opensims.services.tools import (
     register_http_tool,
     register_local_tool,
 )
-from opensims.services.tools.security import REDACTED
+from himmy.services.tools.security import REDACTED
 from tests.conftest import run_async
 
 

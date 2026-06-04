@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to OpenSims are documented here. This project keeps an
+All notable changes to Himmy are documented here. This project keeps an
 **offline-first** invariant: every release runs end-to-end with no network and no
 keys via the deterministic `StubClientManager`; optional extras layer in real
 providers, Postgres/pgvector, and observability.
@@ -12,8 +12,14 @@ A full kernel-by-kernel hardening pass driven by the 6-reviewer audit in
 green (`pytest -q` → all pass, only dep/DB-gated tests skip). Grouped by kernel
 below.
 
+### Changed
+- **Renamed the project to the Himmy Agent Framework.** The import package is now
+  `himmy` (was `opensims`), the base exception is `HimmyError`, environment
+  variables use the `HIMMY_` prefix (e.g. `HIMMY_DATABASE_URL`), and the
+  distribution is `himmy`. Update imports: `from himmy import ...`.
+
 ### Added
-- **MCP kernel (`opensims.services.mcp`).** A transport-direct Model Context
+- **MCP kernel (`himmy.services.mcp`).** A transport-direct Model Context
   Protocol stdio client — newline-delimited JSON-RPC 2.0 to a server subprocess,
   with a background reader task de-multiplexing responses by id. Implemented
   against the wire format (no `mcp`/pydantic-ai SDK), so the core stays
@@ -22,7 +28,7 @@ below.
   bridges a server's tools into a `ToolRegistry` (MCP `inputSchema` → the tool's
   `args_json_schema`), so MCP tools flow through the same validation / approval /
   events / lineage pipeline as native ones.
-- **Sandbox kernel (`opensims.services.sandbox`).** Isolated, resource-limited code
+- **Sandbox kernel (`himmy.services.sandbox`).** Isolated, resource-limited code
   execution. `SubprocessSandbox` is portable defense-in-depth: a child process with
   POSIX `setrlimit` caps (CPU/memory/file-size/core), a hard wall-clock timeout that
   kills the process group, a throwaway working dir, a stripped/allow-listed env,
@@ -42,13 +48,13 @@ below.
   ones, and dedups identical raw text — so re-scanning a corpus no longer doubles
   the index or re-spends embed quota. The pgvector backend replaces-by-source in
   `persist_documents` (new `content_hash` column + source index).
-- **Retrieval-quality evaluation.** New `opensims.services.knowledge.retrieval_eval`
+- **Retrieval-quality evaluation.** New `himmy.services.knowledge.retrieval_eval`
   (`RetrievalEvalCase` → `evaluate_retrieval` → `RetrievalEvalReport`) scores a
   golden set with recall@k / precision@k / MRR / nDCG / hit-rate, fully offline —
   the feedback loop that makes chunker/threshold/reranker changes measurable.
 - **Public `build_runtime()` facade.** The full offline-first stack now wires in
-  one call via `from opensims import build_runtime` (lazily exposed to keep
-  `import opensims` light). The example bootstrap delegates to it instead of
+  one call via `from himmy import build_runtime` (lazily exposed to keep
+  `import himmy` light). The example bootstrap delegates to it instead of
   duplicating the wiring.
 - **Recommendations as first-class lineage nodes.** `RecommendationItem.to_record`
   projects each extracted recommendation into a `recommendation` entity, and
@@ -81,7 +87,7 @@ below.
   opts in via `use_cache`.
 - **pgvector knowledge backend** and a `kb_search` in-run tool that returns
   evidence-shaped results.
-- **Durable persistence selection** via `OPENSIMS_DATABASE_URL`
+- **Durable persistence selection** via `HIMMY_DATABASE_URL`
   (`ApiContainer.build_default_async` wires a Postgres-backed `StorageService`).
 - New `CHANGELOG.md`; README "Production capabilities" section; expanded
   `.env.example` and `pyproject.toml` extras.
@@ -95,7 +101,7 @@ below.
   message history, tools/toolsets, generation params, per-call timeout — and reads
   `result.usage()` for real token/cost accounting (INF-1, INF-3).
 - `GatewayClientManager` does real Pydantic-AI-Gateway routing when a key + the
-  `providers` extra are present (with an `OPENSIMS_GATEWAY_STUB_FALLBACK` offline
+  `providers` extra are present (with an `HIMMY_GATEWAY_STUB_FALLBACK` offline
   switch) instead of always raising (INF-2).
 - WORKFLOW mode uses `agent.iter()` and breaks right after the first
   `CallToolsNode`, enforcing one-tool-per-call on the live path (INF-6).
@@ -174,7 +180,7 @@ below.
 
 ### Application + API + Evaluation + Observability (AAEO-1 … AAEO-16)
 - Background runs are durable, cancellable, and drained on shutdown (AAEO-1);
-  env-driven persistence selection via `OPENSIMS_DATABASE_URL` (AAEO-2).
+  env-driven persistence selection via `HIMMY_DATABASE_URL` (AAEO-2).
 - Failed inference is recorded as a FAILED run with `run.error` populated, not a
   false SUCCESS (AAEO-3); structured output is schema-validated before
   recommendation extraction (AAEO-6).

@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from opensims.agents.base_agent.task import Task
-from opensims.agents.base_agent.thread import MessageRole
-from opensims.agents.personas.persona import Persona
-from opensims.core.events import EventType
-from opensims.entities.registry import EntityRegistry
-from opensims.runtime import SingleAgentRuntime
-from opensims.services.context.service import ContextService
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.models import LLMConfig, ResponseFormat
-from opensims.services.inference.service import InferenceService
-from opensims.services.storage.service import StorageService
-from opensims.services.tools.registry import ToolRegistry, register_local_tool
-from opensims.services.tools.service import ToolService
+from himmy.agents.base_agent.task import Task
+from himmy.agents.base_agent.thread import MessageRole
+from himmy.agents.personas.persona import Persona
+from himmy.core.events import EventType
+from himmy.entities.registry import EntityRegistry
+from himmy.runtime import SingleAgentRuntime
+from himmy.services.context.service import ContextService
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.models import LLMConfig, ResponseFormat
+from himmy.services.inference.service import InferenceService
+from himmy.services.storage.service import StorageService
+from himmy.services.tools.registry import ToolRegistry, register_local_tool
+from himmy.services.tools.service import ToolService
 from tests.conftest import run_async
 
 
@@ -186,7 +186,7 @@ class _FailingClientManager:
         return f"stub:{model_key}"
 
     async def generate(self, request):  # noqa: ANN001
-        from opensims.services.inference.models import (
+        from himmy.services.inference.models import (
             InferenceError,
             InferenceErrorCode,
             InferenceResponse,
@@ -299,7 +299,7 @@ def test_failed_inference_emits_failed_event_and_stamps_metadata() -> None:
 
 def test_run_task_detailed_exposes_typed_run_result() -> None:
     """RO-5: run_task_detailed returns status/cost/structured + typed records."""
-    from opensims.runtime import RunResult
+    from himmy.runtime import RunResult
 
     rt, _storage, _registry = _runtime()
     persona = Persona(name="A")
@@ -340,8 +340,8 @@ def test_on_event_callback_receives_run_events() -> None:
 
 def test_workflow_format_without_tool_service_fails_fast() -> None:
     """RO-9: WORKFLOW response_format with no tool_service raises a clear error."""
-    from opensims.core.errors import OpenSimsError
-    from opensims.services.inference.models import WorkflowDefinition, WorkflowState
+    from himmy.core.errors import HimmyError
+    from himmy.services.inference.models import WorkflowDefinition, WorkflowState
 
     rt = SingleAgentRuntime(
         inference_service=InferenceService(StubClientManager()),
@@ -351,10 +351,10 @@ def test_workflow_format_without_tool_service_fails_fast() -> None:
     cfg = LLMConfig(response_format=ResponseFormat.WORKFLOW, workflow=state)
     try:
         run_async(rt.run_task(persona, Task(title="t", prompt="p"), llm_config=cfg))
-    except OpenSimsError as exc:
+    except HimmyError as exc:
         assert "tool_service" in str(exc)
     else:  # pragma: no cover - the call must raise
-        raise AssertionError("expected OpenSimsError for WORKFLOW without tool_service")
+        raise AssertionError("expected HimmyError for WORKFLOW without tool_service")
 
 
 def test_cancelled_run_emits_terminal_event_and_saves() -> None:
@@ -390,7 +390,7 @@ def test_cancelled_run_emits_terminal_event_and_saves() -> None:
 
 def test_strict_snapshot_raises_when_requested_but_missing() -> None:
     """RO-11: strict_snapshot raises when a requested snapshot can't be resolved."""
-    from opensims.core.errors import OpenSimsError
+    from himmy.core.errors import HimmyError
 
     storage = StorageService()
     context = ContextService(storage_service=storage)
@@ -407,7 +407,7 @@ def test_strict_snapshot_raises_when_requested_but_missing() -> None:
                 persona, Task(title="t", prompt="p"), snapshot_id="does-not-exist"
             )
         )
-    except OpenSimsError:
+    except HimmyError:
         pass
     else:  # pragma: no cover - must raise in strict mode
-        raise AssertionError("expected OpenSimsError for missing strict snapshot")
+        raise AssertionError("expected HimmyError for missing strict snapshot")

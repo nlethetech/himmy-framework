@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.services.context.models import ContextField
-from opensims.services.knowledge import (
+from himmy.core.errors import HimmyError
+from himmy.services.context.models import ContextField
+from himmy.services.knowledge import (
     DeterministicEmbedder,
     DocumentInput,
     KnowledgeBase,
@@ -37,7 +37,7 @@ from opensims.services.knowledge import (
     embedder_is_multimodal,
     register_kb_search_tool,
 )
-from opensims.services.storage.service import StorageService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -80,7 +80,7 @@ def test_partial_empty_vector_aborts_entire_ingest() -> None:
     """One empty vector in a batch fails the whole ingest — no partial persistence."""
     kb = _kb(_PartialEmptyEmbedder())
     rec = run_async(kb.create_kb(workspace_id="w", client_id="c", name="kb"))
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(
             kb.ingest_documents(
                 rec.kb_id,
@@ -100,7 +100,7 @@ def test_wrong_dimension_vector_is_rejected_at_ingest() -> None:
     rec = run_async(
         kb.create_kb(workspace_id="w", client_id="c", name="kb", vector_dim=64)
     )
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(kb.ingest_text(rec.kb_id, "content that should not persist"))
     assert run_async(kb.search(rec.kb_id, "content", similarity_threshold=0.0)) == []
 
@@ -232,9 +232,9 @@ def test_chunker_rejects_invalid_overlap_and_min_new_chars() -> None:
 # --------------------------------------------------------------------- CK-5
 def test_kb_search_tool_emits_called_and_completed_events() -> None:
     """The in-run tool emits both TOOL_CALLED and TOOL_COMPLETED around the handler."""
-    from opensims.services.tools.models import ToolInvocation
-    from opensims.services.tools.registry import ToolRegistry
-    from opensims.services.tools.service import ToolService
+    from himmy.services.tools.models import ToolInvocation
+    from himmy.services.tools.registry import ToolRegistry
+    from himmy.services.tools.service import ToolService
 
     storage = StorageService()
     kb = KnowledgeBase(storage=storage, embedder=DeterministicEmbedder())
@@ -262,9 +262,9 @@ def test_kb_search_tool_emits_called_and_completed_events() -> None:
 
 def test_kb_search_tool_evidence_matches_adapter_shape() -> None:
     """The tool's evidence_refs/account_scope mirror the KnowledgeBaseAdapter exactly."""
-    from opensims.services.tools.models import ToolInvocation
-    from opensims.services.tools.registry import ToolRegistry
-    from opensims.services.tools.service import ToolService
+    from himmy.services.tools.models import ToolInvocation
+    from himmy.services.tools.registry import ToolRegistry
+    from himmy.services.tools.service import ToolService
 
     storage = StorageService()
     kb = KnowledgeBase(storage=storage, embedder=DeterministicEmbedder())
@@ -310,9 +310,9 @@ def test_kb_search_tool_evidence_matches_adapter_shape() -> None:
 
 def test_kb_search_tool_blocks_arg_override_to_other_tenant() -> None:
     """A workspace_id arg pointing at another tenant cannot reach this KB's chunks."""
-    from opensims.services.tools.models import ToolInvocation
-    from opensims.services.tools.registry import ToolRegistry
-    from opensims.services.tools.service import ToolService
+    from himmy.services.tools.models import ToolInvocation
+    from himmy.services.tools.registry import ToolRegistry
+    from himmy.services.tools.service import ToolService
 
     kb = KnowledgeBase(storage=StorageService(), embedder=DeterministicEmbedder())
     rec = run_async(kb.create_kb(workspace_id="w1", client_id="c1", name="kb"))
@@ -338,9 +338,9 @@ def test_kb_search_tool_blocks_arg_override_to_other_tenant() -> None:
 
 def test_kb_search_tool_uses_pinned_defaults_when_args_omit_scope() -> None:
     """Pinned default workspace/client are used when the agent omits them."""
-    from opensims.services.tools.models import ToolInvocation
-    from opensims.services.tools.registry import ToolRegistry
-    from opensims.services.tools.service import ToolService
+    from himmy.services.tools.models import ToolInvocation
+    from himmy.services.tools.registry import ToolRegistry
+    from himmy.services.tools.service import ToolService
 
     kb = KnowledgeBase(storage=StorageService(), embedder=DeterministicEmbedder())
     rec = run_async(kb.create_kb(workspace_id="w1", client_id="c1", name="kb"))
@@ -383,7 +383,7 @@ def test_text_only_embedder_refuses_image_ingest() -> None:
     """A text-only embedder cannot ingest images (no silent garbage embedding)."""
     kb = KnowledgeBase(storage=StorageService(), embedder=DeterministicEmbedder())
     rec = run_async(kb.create_kb(workspace_id="w", client_id="c", name="kb"))
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(kb.ingest_image(rec.kb_id, "image://logo.png", caption="logo"))
 
 
@@ -444,5 +444,5 @@ def test_all_empty_batch_raises_rather_than_silent_no_op() -> None:
     with tempfile.TemporaryDirectory() as d:
         blank = Path(d) / "blank.txt"
         blank.write_text("    \n   ", encoding="utf-8")
-        with pytest.raises(OpenSimsError):
+        with pytest.raises(HimmyError):
             run_async(kb.ingest_documents(rec.kb_id, [DocumentInput(file=str(blank))]))

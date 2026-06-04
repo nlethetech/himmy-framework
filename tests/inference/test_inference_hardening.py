@@ -4,7 +4,7 @@ These complement ``test_inference_service.py`` by pinning the harder edges of th
 hardened kernel (IMPROVEMENTS.md INF-1..INF-12):
 
 * ``run`` NEVER raises for any manager exception, and normalizes by *type*
-  (``OpenSimsError`` -> non-retryable INVALID_REQUEST; transport-named exceptions
+  (``HimmyError`` -> non-retryable INVALID_REQUEST; transport-named exceptions
   -> retryable transient codes; everything else -> non-retryable UNKNOWN), while
   still firing latency stamping and the ``INFERENCE_FAILED`` lifecycle event.
 * ``run_batch`` is failure-isolated for *both* raising and FAILED-returning
@@ -34,9 +34,9 @@ import time
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.core.events import EventType
-from opensims.services.inference import (
+from himmy.core.errors import HimmyError
+from himmy.core.events import EventType
+from himmy.services.inference import (
     BatchInferenceRequest,
     GatewayClientManager,
     GatewayModelConfig,
@@ -59,8 +59,8 @@ from opensims.services.inference import (
     compute_cache_key,
     synthesize_from_schema,
 )
-from opensims.services.inference.cache import compute_cache_key as _ck
-from opensims.services.storage.service import StorageService
+from himmy.services.inference.cache import compute_cache_key as _ck
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -99,9 +99,9 @@ class ReadTimeout(Exception):
 
 
 # ============================================================ INF-1/4/10: run()
-def test_run_normalizes_opensims_error_to_invalid_request_non_retryable() -> None:
-    """An OpenSimsError from the manager -> FAILED INVALID_REQUEST, not retried."""
-    mgr = _ExcManager(OpenSimsError("bad request shape"))
+def test_run_normalizes_himmy_error_to_invalid_request_non_retryable() -> None:
+    """An HimmyError from the manager -> FAILED INVALID_REQUEST, not retried."""
+    mgr = _ExcManager(HimmyError("bad request shape"))
     svc = _svc(mgr)
     resp = run_async(svc.run(InferenceRequest()))
     assert resp.status == InferenceStatus.FAILED
@@ -812,11 +812,11 @@ def _pydantic_ai_absent() -> bool:
     reason="pydantic-ai installed; gateway production path needs real credentials",
 )
 def test_gateway_raises_clear_error_without_extra_or_key() -> None:
-    """Offline: GatewayClientManager surfaces an actionable OpenSimsError."""
+    """Offline: GatewayClientManager surfaces an actionable HimmyError."""
     os.environ.pop("PYDANTIC_AI_GATEWAY_API_KEY", None)
-    os.environ.pop("OPENSIMS_GATEWAY_STUB_FALLBACK", None)
+    os.environ.pop("HIMMY_GATEWAY_STUB_FALLBACK", None)
     mgr = GatewayClientManager(GatewayRuntimeConfig())
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(mgr.generate(InferenceRequest()))
 
 
@@ -827,7 +827,7 @@ def test_gateway_raises_clear_error_without_extra_or_key() -> None:
 def test_gateway_stub_fallback_when_env_opted_in() -> None:
     """With the explicit stub-fallback env, the gateway degrades to the stub offline."""
     os.environ.pop("PYDANTIC_AI_GATEWAY_API_KEY", None)
-    os.environ["OPENSIMS_GATEWAY_STUB_FALLBACK"] = "1"
+    os.environ["HIMMY_GATEWAY_STUB_FALLBACK"] = "1"
     try:
         mgr = GatewayClientManager(GatewayRuntimeConfig())
         resp = run_async(
@@ -837,7 +837,7 @@ def test_gateway_stub_fallback_when_env_opted_in() -> None:
         )
         assert resp.status == InferenceStatus.SUCCESS
     finally:
-        os.environ.pop("OPENSIMS_GATEWAY_STUB_FALLBACK", None)
+        os.environ.pop("HIMMY_GATEWAY_STUB_FALLBACK", None)
 
 
 def test_gateway_resolve_uses_registry_then_falls_back_to_key() -> None:
@@ -882,10 +882,10 @@ def test_model_price_table_computes_cost() -> None:
 )
 def test_pydantic_ai_manager_is_import_safe_but_errors_on_generate() -> None:
     """The pydantic-ai manager imports cleanly offline and errors only on generate."""
-    from opensims.services.inference import PydanticAIClientManager
+    from himmy.services.inference import PydanticAIClientManager
 
     mgr = PydanticAIClientManager()
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(
             mgr.generate(
                 InferenceRequest(messages=[InferenceMessage(role="user", content="hi")])

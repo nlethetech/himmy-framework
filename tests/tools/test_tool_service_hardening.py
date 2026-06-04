@@ -18,9 +18,9 @@ import asyncio
 import httpx
 import pytest
 
-from opensims.core.events import EventType
-from opensims.services.storage.service import StorageService
-from opensims.services.tools import (
+from himmy.core.events import EventType
+from himmy.services.storage.service import StorageService
+from himmy.services.tools import (
     HttpAuthConfig,
     HttpAuthMode,
     HttpToolConfig,
@@ -31,7 +31,7 @@ from opensims.services.tools import (
     register_http_tool,
     register_local_tool,
 )
-from opensims.services.tools.security import REDACTED
+from himmy.services.tools.security import REDACTED
 from tests.conftest import run_async
 
 try:  # optional provider extra — gates the pydantic-ai binding test
@@ -497,16 +497,16 @@ def test_register_http_tool_definition_timeout_overrides_config() -> None:
 
 # ----------------------------------------------------------------- pydantic-ai toolset (gated)
 def test_toolset_binding_raises_clear_error_without_extra() -> None:
-    """Without pydantic-ai, the toolset binding raises an actionable OpenSimsError."""
+    """Without pydantic-ai, the toolset binding raises an actionable HimmyError."""
     if _HAS_PYDANTIC_AI:
         pytest.skip("pydantic-ai installed; the absent-extra path is not exercised")
-    from opensims.core.errors import OpenSimsError
-    from opensims.services.tools.runtime_adapter import ToolServiceToolset
+    from himmy.core.errors import HimmyError
+    from himmy.services.tools.runtime_adapter import ToolServiceToolset
 
     registry = ToolRegistry()
     register_local_tool(registry, name="x", handler=lambda a: {"ok": True})
     toolset = ToolServiceToolset(ToolService(registry))
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         toolset.as_pydantic_ai_toolset()
 
 
@@ -515,7 +515,7 @@ def test_toolset_binding_builds_tools_with_extra() -> (
     None
 ):  # pragma: no cover - extra only
     """With pydantic-ai installed, the toolset yields one Tool per definition."""
-    from opensims.services.tools.runtime_adapter import ToolServiceToolset
+    from himmy.services.tools.runtime_adapter import ToolServiceToolset
 
     registry = ToolRegistry()
     register_local_tool(

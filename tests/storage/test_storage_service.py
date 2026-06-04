@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from opensims.agents.base_agent.thread import ChatThread, Message, MessageRole
-from opensims.core.events import EventType, RunEvent
-from opensims.services.storage import (
+from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
+from himmy.core.events import EventType, RunEvent
+from himmy.services.storage import (
     ActionRecord,
     AgentStateRecord,
     ContextEvidenceRecord,
@@ -261,7 +261,7 @@ def test_evidence_memory_orchestration_crud() -> None:
 
 def test_postgres_scaffold_imports_and_exposes_ddl() -> None:
     """The Postgres scaffold imports offline and ships an inspectable DDL string."""
-    from opensims.services.storage.postgres import STORAGE_DDL, STORAGE_MIGRATIONS
+    from himmy.services.storage.postgres import STORAGE_DDL, STORAGE_MIGRATIONS
 
     assert "CREATE TABLE IF NOT EXISTS" in STORAGE_DDL
     assert "ai_call_log" in STORAGE_DDL
@@ -277,8 +277,8 @@ def test_postgres_scaffold_imports_and_exposes_ddl() -> None:
 
 
 def test_postgres_data_methods_require_pool() -> None:
-    """Without a live pool, data methods raise a clear OpenSimsError (offline)."""
-    from opensims.core.errors import OpenSimsError
+    """Without a live pool, data methods raise a clear HimmyError (offline)."""
+    from himmy.core.errors import HimmyError
 
     svc = PostgresStorageService(pool=None)
     for coro in (
@@ -289,6 +289,6 @@ def test_postgres_data_methods_require_pool() -> None:
     ):
         try:
             run_async(coro)
-        except OpenSimsError:
+        except HimmyError:
             continue
-        raise AssertionError("expected OpenSimsError without a live pool")
+        raise AssertionError("expected HimmyError without a live pool")

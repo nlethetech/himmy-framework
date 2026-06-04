@@ -1,6 +1,6 @@
 """Docker-gated integration tests for the pgvector knowledge backend (CK-1, CK-2).
 
-These run only when ``OPENSIMS_TEST_POSTGRES_DSN`` points at a live
+These run only when ``HIMMY_TEST_POSTGRES_DSN`` points at a live
 ``pgvector/pgvector`` database (see ``docker/docker-compose.yml``) and ``asyncpg`` +
 ``pgvector`` are installed; otherwise every test SKIPs so the offline-first suite
 stays green with only pydantic/pyyaml/httpx/fastapi present.
@@ -8,7 +8,7 @@ stays green with only pydantic/pyyaml/httpx/fastapi present.
 Run locally with:
 
     docker compose -f docker/docker-compose.yml up -d
-    OPENSIMS_TEST_POSTGRES_DSN=postgresql://opensims:opensims@localhost:5433/opensims \\
+    HIMMY_TEST_POSTGRES_DSN=postgresql://himmy:himmy@localhost:5433/himmy \\
         python3 -m pytest -q tests/knowledge/test_knowledge_postgres.py
 """
 
@@ -21,10 +21,10 @@ import pytest
 
 from tests.conftest import run_async
 
-_DSN = os.environ.get("OPENSIMS_TEST_POSTGRES_DSN")
+_DSN = os.environ.get("HIMMY_TEST_POSTGRES_DSN")
 
 pytestmark = pytest.mark.skipif(
-    not _DSN, reason="OPENSIMS_TEST_POSTGRES_DSN not set (docker-gated)"
+    not _DSN, reason="HIMMY_TEST_POSTGRES_DSN not set (docker-gated)"
 )
 
 
@@ -38,7 +38,7 @@ def _require_backend_deps() -> None:
 
 def _new_storage():
     """Connect a PostgresStorageService + create both schemas (storage + knowledge)."""
-    from opensims.services.storage.postgres import PostgresStorageService
+    from himmy.services.storage.postgres import PostgresStorageService
 
     storage = run_async(PostgresStorageService.connect(_DSN))
     run_async(storage.create_schema())
@@ -49,7 +49,7 @@ def _new_storage():
 def test_pgvector_roundtrip_ingest_and_search() -> None:
     """Create KB -> ingest -> cosine search end-to-end against a real database."""
     _require_backend_deps()
-    from opensims.services.knowledge import DeterministicEmbedder, KnowledgeBase
+    from himmy.services.knowledge import DeterministicEmbedder, KnowledgeBase
 
     storage = _new_storage()
     try:
@@ -74,9 +74,9 @@ def test_pgvector_roundtrip_ingest_and_search() -> None:
         assert hits and "ACME" in (hits[0].text or "")
         assert hits[0].similarity > 0.0
         # Tenancy guard: wrong workspace cannot reach the KB.
-        from opensims.core.errors import OpenSimsError
+        from himmy.core.errors import HimmyError
 
-        with pytest.raises(OpenSimsError):
+        with pytest.raises(HimmyError):
             run_async(
                 kb_service.search(
                     rec.kb_id, "ACME", workspace_id="other", client_id="c1"
@@ -91,8 +91,8 @@ def test_pgvector_roundtrip_ingest_and_search() -> None:
 def test_pgvector_duplicate_kb_name_raises() -> None:
     """The (workspace, client, name) unique index is enforced at the DB."""
     _require_backend_deps()
-    from opensims.core.errors import OpenSimsError
-    from opensims.services.knowledge import DeterministicEmbedder, KnowledgeBase
+    from himmy.core.errors import HimmyError
+    from himmy.services.knowledge import DeterministicEmbedder, KnowledgeBase
 
     storage = _new_storage()
     try:
@@ -107,7 +107,7 @@ def test_pgvector_duplicate_kb_name_raises() -> None:
                 workspace_id="w1", client_id="c1", name=name, vector_dim=64
             )
         )
-        with pytest.raises(OpenSimsError):
+        with pytest.raises(HimmyError):
             run_async(
                 kb_service.create_kb(
                     workspace_id="w1", client_id="c1", name=name, vector_dim=64
@@ -130,7 +130,7 @@ def test_openai_compatible_embedder_real_call() -> None:
     except ImportError:
         pytest.skip("openai not installed")
 
-    from opensims.services.knowledge import build_openai_compatible_embedder
+    from himmy.services.knowledge import build_openai_compatible_embedder
 
     emb = build_openai_compatible_embedder()
     vecs = run_async(emb.embed_documents(["hello", "world"]))

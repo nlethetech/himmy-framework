@@ -1,6 +1,6 @@
-# Contributing to OpenSims
+# Contributing to Himmy
 
-Thanks for working on OpenSims. The project keeps an **offline-first** invariant:
+Thanks for working on Himmy. The project keeps an **offline-first** invariant:
 everything must run end-to-end with no network and no API keys via the
 deterministic `StubClientManager`. Optional extras layer in real providers,
 Postgres/pgvector, and observability.
@@ -20,7 +20,7 @@ CI runs exactly these four checks; run them locally before opening a PR:
 ```bash
 ruff check .              # lint (E/W/F/I/UP/B)
 ruff format --check .     # formatting
-mypy opensims             # static types
+mypy himmy             # static types
 pytest -q                 # the offline suite must stay green
 ```
 

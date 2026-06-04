@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-from opensims.agents.personas.persona import Persona
-from opensims.core.events import EventType
-from opensims.entities.registry import EntityRegistry
-from opensims.orchestrators import (
+from himmy.agents.personas.persona import Persona
+from himmy.core.events import EventType
+from himmy.entities.registry import EntityRegistry
+from himmy.orchestrators import (
     Workflow,
     WorkflowOrchestrator,
     WorkflowStep,
 )
-from opensims.runtime.single_agent import SingleAgentRuntime
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.models import ResponseFormat
-from opensims.services.inference.service import InferenceService
-from opensims.services.storage.service import StorageService
-from opensims.services.tools.registry import ToolRegistry, register_local_tool
-from opensims.services.tools.service import ToolService
+from himmy.runtime.single_agent import SingleAgentRuntime
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.models import ResponseFormat
+from himmy.services.inference.service import InferenceService
+from himmy.services.storage.service import StorageService
+from himmy.services.tools.registry import ToolRegistry, register_local_tool
+from himmy.services.tools.service import ToolService
 from tests.conftest import run_async
 
 
@@ -110,7 +110,7 @@ def test_sequential_tools_step_drives_one_tool_per_call() -> None:
     assert result.status == "completed"
     step = result.step_results[0]
     # RO-4: tool_calls are real typed ToolCallRecord objects, not dicts.
-    from opensims.services.inference.models import ToolCallRecord
+    from himmy.services.inference.models import ToolCallRecord
 
     assert all(isinstance(c, ToolCallRecord) for c in step.tool_calls)
     # RO-7: the call ORDER must equal the declared tool_names sequence — this is
@@ -177,8 +177,8 @@ class _FlakyManager:
         return f"stub:{model_key}"
 
     async def generate(self, request):  # noqa: ANN001
-        from opensims.services.inference.client_manager import StubClientManager
-        from opensims.services.inference.models import (
+        from himmy.services.inference.client_manager import StubClientManager
+        from himmy.services.inference.models import (
             InferenceError,
             InferenceErrorCode,
             InferenceResponse,
@@ -201,8 +201,8 @@ class _FlakyManager:
 
 
 def _runtime_with_manager(manager):
-    from opensims.runtime.single_agent import SingleAgentRuntime
-    from opensims.services.inference.service import InferenceService
+    from himmy.runtime.single_agent import SingleAgentRuntime
+    from himmy.services.inference.service import InferenceService
 
     storage = StorageService()
     return (
@@ -216,7 +216,7 @@ def _runtime_with_manager(manager):
 
 def test_workflow_result_carries_typed_tool_records() -> None:
     """RO-4: single-step tool_calls/returns are typed ToolCallRecord objects."""
-    from opensims.services.inference.models import ToolCallRecord
+    from himmy.services.inference.models import ToolCallRecord
 
     runtime, _storage = _runtime_with_tools()
     orch = WorkflowOrchestrator(runtime)
@@ -240,8 +240,8 @@ def test_workflow_result_carries_typed_tool_records() -> None:
 
 def test_workflow_resume_from_failed_step() -> None:
     """RO-3: a failed workflow can resume from next_index with accumulated state."""
-    from opensims.runtime.single_agent import SingleAgentRuntime
-    from opensims.services.inference.service import InferenceService
+    from himmy.runtime.single_agent import SingleAgentRuntime
+    from himmy.services.inference.service import InferenceService
 
     # Manager that fails exactly the 2nd generate call, succeeds afterward.
     class _FailNth:
@@ -253,10 +253,10 @@ def test_workflow_resume_from_failed_step() -> None:
             return f"stub:{model_key}"
 
         async def generate(self, request):  # noqa: ANN001
-            from opensims.services.inference.client_manager import (
+            from himmy.services.inference.client_manager import (
                 StubClientManager,
             )
-            from opensims.services.inference.models import (
+            from himmy.services.inference.models import (
                 InferenceError,
                 InferenceErrorCode,
                 InferenceResponse,

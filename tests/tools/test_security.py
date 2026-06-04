@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from opensims.services.tools.security import (
+from himmy.services.tools.security import (
     ALLOWED_HTTP_METHODS,
     REDACTED,
     ToolSecurityError,

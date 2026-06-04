@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.services.context.models import ContextField
-from opensims.services.knowledge import (
+from himmy.core.errors import HimmyError
+from himmy.services.context.models import ContextField
+from himmy.services.knowledge import (
     DeterministicEmbedder,
     DocumentInput,
     DocumentReaderFactory,
@@ -19,7 +19,7 @@ from opensims.services.knowledge import (
     register_kb_search_tool,
     resolve_column_and_index,
 )
-from opensims.services.storage.service import StorageService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -98,7 +98,7 @@ def test_duplicate_kb_name_raises() -> None:
     """Creating a KB with a duplicate (workspace, client, name) raises."""
     kb = KnowledgeBase(storage=StorageService())
     run_async(kb.create_kb(workspace_id="w1", client_id="c1", name="dup"))
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(kb.create_kb(workspace_id="w1", client_id="c1", name="dup"))
 
 
@@ -170,7 +170,7 @@ def test_multimodal_embedder_is_import_safe(monkeypatch) -> None:
     """The multimodal model constructs offline and raises a clear, normalized error.
 
     With no provider configured (no openai key / extra) the real path normalizes the
-    SDK/import failure to an :class:`OpenSimsError` rather than leaking a provider
+    SDK/import failure to an :class:`HimmyError` rather than leaking a provider
     exception. It also advertises image capability so ingest_image accepts it.
     """
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -178,7 +178,7 @@ def test_multimodal_embedder_is_import_safe(monkeypatch) -> None:
     model = OpenAIMultimodalEmbeddingModel("some-model")
     assert model.model_name == "some-model"
     assert getattr(model, "supports_images", False) is True
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(model.embed_query("x"))
 
 
@@ -187,7 +187,7 @@ def test_empty_embedding_vector_is_rejected_at_ingest() -> None:
     """An embedder returning [] must hard-fail ingest (no unretrievable chunks)."""
     kb = KnowledgeBase(storage=StorageService(), embedder=_EmptyVecEmbedder())
     rec = run_async(kb.create_kb(workspace_id="w", client_id="c", name="kb"))
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(kb.ingest_text(rec.kb_id, "some real content here"))
     # Nothing was persisted.
     assert run_async(kb.search(rec.kb_id, "content")) == []
@@ -197,7 +197,7 @@ def test_zero_norm_embedding_vector_is_rejected_at_ingest() -> None:
     """An all-zero (zero-norm) vector is a hard error at ingest."""
     kb = KnowledgeBase(storage=StorageService(), embedder=_ZeroVecEmbedder())
     rec = run_async(kb.create_kb(workspace_id="w", client_id="c", name="kb"))
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(kb.ingest_text(rec.kb_id, "some real content here"))
 
 
@@ -236,7 +236,7 @@ def test_ingest_image_requires_multimodal_embedder() -> None:
     """A text-only embedder is refused; a multimodal-declaring one is accepted."""
     text_kb = KnowledgeBase(storage=StorageService(), embedder=DeterministicEmbedder())
     rec = run_async(text_kb.create_kb(workspace_id="w", client_id="c", name="kb"))
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(text_kb.ingest_image(rec.kb_id, "image://logo.png", caption="logo"))
 
     mm_kb = KnowledgeBase(storage=StorageService(), embedder=_FakeMultimodalEmbedder())
@@ -284,7 +284,7 @@ def test_embedder_must_satisfy_protocol() -> None:
         async def embed_documents(self, texts):
             return [[1.0]]
 
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         KnowledgeBase(storage=StorageService(), embedder=_Bad())
 
 
@@ -298,19 +298,19 @@ def test_search_tenancy_guard_blocks_cross_tenant_kb_id() -> None:
     ok = run_async(kb.search(rec.kb_id, "alpha", workspace_id="w1", client_id="c1"))
     assert ok
     # Wrong workspace is denied.
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(kb.search(rec.kb_id, "alpha", workspace_id="w2", client_id="c1"))
     # Wrong client is denied.
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(kb.search(rec.kb_id, "alpha", workspace_id="w1", client_id="c2"))
 
 
 # --------------------------------------------------------------------- CK-5
 def test_register_kb_search_tool_emits_evidence_shape() -> None:
     """The in-run kb_search tool returns the adapter's evidence shape + emits events."""
-    from opensims.services.tools.models import ToolInvocation
-    from opensims.services.tools.registry import ToolRegistry
-    from opensims.services.tools.service import ToolService
+    from himmy.services.tools.models import ToolInvocation
+    from himmy.services.tools.registry import ToolRegistry
+    from himmy.services.tools.service import ToolService
 
     storage = StorageService()
     kb = KnowledgeBase(storage=storage, embedder=DeterministicEmbedder())
@@ -345,9 +345,9 @@ def test_register_kb_search_tool_emits_evidence_shape() -> None:
 
 def test_kb_search_tool_enforces_tenancy_scope() -> None:
     """kb_search requires workspace+client scope and resolves by name (no raw id)."""
-    from opensims.services.tools.models import ToolInvocation
-    from opensims.services.tools.registry import ToolRegistry
-    from opensims.services.tools.service import ToolService
+    from himmy.services.tools.models import ToolInvocation
+    from himmy.services.tools.registry import ToolRegistry
+    from himmy.services.tools.service import ToolService
 
     kb = KnowledgeBase(storage=StorageService(), embedder=DeterministicEmbedder())
     rec = run_async(kb.create_kb(workspace_id="w1", client_id="c1", name="kb"))
@@ -379,7 +379,7 @@ def test_knowledge_schema_ddl_selects_column_and_index() -> None:
     col, idx = resolve_column_and_index(5000)
     assert col == "halfvec" and idx is None
     # explicit vector beyond ceiling raises
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         resolve_column_and_index(3000, embedding_column_type="vector")
 
     ext, tables, index = build_knowledge_schema_ddl(vector_dim=1536)
@@ -398,11 +398,11 @@ def test_knowledge_schema_ddl_selects_column_and_index() -> None:
 # --------------------------------------------------------------------- CK-4 (freshness)
 def test_storage_first_refetches_when_stale() -> None:
     """A stored field past its freshness TTL falls through to the adapter + recaches."""
-    from opensims.services.context.models import (
+    from himmy.services.context.models import (
         ContextBuildSpec,
         ContextSpecKey,
     )
-    from opensims.services.context.service import ContextService
+    from himmy.services.context.service import ContextService
 
     class _CountingAdapter(KnowledgeBaseAdapter.__bases__[0]):  # ContextAdapter
         name = "static"

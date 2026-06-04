@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from opensims.agents import (
+from himmy.agents import (
     Agent,
     ChatThread,
     Message,

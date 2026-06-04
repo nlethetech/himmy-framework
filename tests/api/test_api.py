@@ -6,7 +6,7 @@ import time
 
 from fastapi.testclient import TestClient
 
-from opensims.api import ApiContainer, create_app
+from himmy.api import ApiContainer, create_app
 
 
 def _client() -> TestClient:

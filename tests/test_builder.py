@@ -1,20 +1,18 @@
-"""Tests for the public build_runtime facade (opensims.build_runtime)."""
+"""Tests for the public build_runtime facade (himmy.build_runtime)."""
 
 from __future__ import annotations
 
-import opensims
-from opensims import build_inference, build_runtime, build_storage
-from opensims.agents.base_agent.task import Task
-from opensims.agents.personas.persona import Persona
+import himmy
+from himmy import build_inference, build_runtime, build_storage
+from himmy.agents.base_agent.task import Task
+from himmy.agents.personas.persona import Persona
 from tests.conftest import run_async
 
 
 def test_facade_is_exported_from_top_level() -> None:
     """The builder is reachable as a top-level attribute and listed in __all__."""
-    assert callable(opensims.build_runtime)
-    assert {"build_runtime", "build_inference", "build_storage"} <= set(
-        opensims.__all__
-    )
+    assert callable(himmy.build_runtime)
+    assert {"build_runtime", "build_inference", "build_storage"} <= set(himmy.__all__)
 
 
 def test_build_runtime_one_call_runs_a_task() -> None:

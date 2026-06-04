@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import importlib
 
-from opensims.core.events import EventType, RunEvent
+from himmy.core.events import EventType, RunEvent
 
 
 def _fresh_module():
-    import opensims.services.observability as obs
+    import himmy.services.observability as obs
 
     return importlib.reload(obs)
 
@@ -56,7 +56,7 @@ class _FakeLogfire:
 
 def test_span_attributes_drop_content_when_disabled(monkeypatch) -> None:
     """Content payload keys are dropped from span attributes by default (AAEO-14)."""
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_INCLUDE_CONTENT", raising=False)
+    monkeypatch.delenv("HIMMY_LOGFIRE_INCLUDE_CONTENT", raising=False)
     obs = _fresh_module()
     event = RunEvent(
         event_type=EventType.AGENT_RUN_STARTED,
@@ -64,14 +64,14 @@ def test_span_attributes_drop_content_when_disabled(monkeypatch) -> None:
         payload={"model_key": "default", "rendered_prompt": "secret prompt"},
     )
     attrs = obs._span_attributes(event)
-    assert attrs["opensims.payload.model_key"] == "default"
+    assert attrs["himmy.payload.model_key"] == "default"
     # Content key dropped.
-    assert "opensims.payload.rendered_prompt" not in attrs
+    assert "himmy.payload.rendered_prompt" not in attrs
 
 
 def test_span_attributes_include_content_when_enabled(monkeypatch) -> None:
     """When content logging is on, content keys are retained."""
-    monkeypatch.setenv("OPENSIMS_LOGFIRE_INCLUDE_CONTENT", "true")
+    monkeypatch.setenv("HIMMY_LOGFIRE_INCLUDE_CONTENT", "true")
     obs = _fresh_module()
     event = RunEvent(
         event_type=EventType.AGENT_RUN_STARTED,
@@ -79,13 +79,13 @@ def test_span_attributes_include_content_when_enabled(monkeypatch) -> None:
         payload={"rendered_prompt": "visible prompt"},
     )
     attrs = obs._span_attributes(event)
-    assert attrs["opensims.payload.rendered_prompt"] == "visible prompt"
+    assert attrs["himmy.payload.rendered_prompt"] == "visible prompt"
 
 
 def test_span_lifecycle_nests_and_closes(monkeypatch) -> None:
     """run/tool open events start spans; paired close events end them (AAEO-11)."""
-    monkeypatch.setenv("OPENSIMS_LOGFIRE_ENABLED", "1")
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_INCLUDE_CONTENT", raising=False)
+    monkeypatch.setenv("HIMMY_LOGFIRE_ENABLED", "1")
+    monkeypatch.delenv("HIMMY_LOGFIRE_INCLUDE_CONTENT", raising=False)
     obs = _fresh_module()
 
     fake = _FakeLogfire()
@@ -114,7 +114,7 @@ def test_span_lifecycle_nests_and_closes(monkeypatch) -> None:
 
 def test_non_lifecycle_event_logs(monkeypatch) -> None:
     """A non-lifecycle event becomes a point-in-time log on the current span."""
-    monkeypatch.setenv("OPENSIMS_LOGFIRE_ENABLED", "1")
+    monkeypatch.setenv("HIMMY_LOGFIRE_ENABLED", "1")
     obs = _fresh_module()
     fake = _FakeLogfire()
     monkeypatch.setitem(importlib.sys.modules, "logfire", fake)
@@ -127,7 +127,7 @@ def test_non_lifecycle_event_logs(monkeypatch) -> None:
 
 def test_emit_is_noop_when_disabled(monkeypatch) -> None:
     """With the switch off, span emission is a hard no-op (no logfire import)."""
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_ENABLED", raising=False)
+    monkeypatch.delenv("HIMMY_LOGFIRE_ENABLED", raising=False)
     obs = _fresh_module()
     # Should not raise even for lifecycle events.
     obs.emit_event_span(RunEvent(event_type=EventType.AGENT_RUN_STARTED, trace_id="t1"))

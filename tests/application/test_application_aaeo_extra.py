@@ -20,9 +20,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from opensims.agents.base_agent.task import Task
-from opensims.agents.personas.persona import Persona
-from opensims.application.services import (
+from himmy.agents.base_agent.task import Task
+from himmy.agents.personas.persona import Persona
+from himmy.application.services import (
     MAX_PAGE_LIMIT,
     ContextAppService,
     DashboardQueryService,
@@ -31,19 +31,19 @@ from opensims.application.services import (
     _requested_schema,
     _validate_structured,
 )
-from opensims.entities.registry import EntityRegistry
-from opensims.runtime.single_agent import SingleAgentRuntime
-from opensims.services.context.models import ContextBuildSpec, ContextSpecKey
-from opensims.services.context.service import ContextService
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.models import LLMConfig, ResponseFormat
-from opensims.services.inference.service import InferenceService
-from opensims.services.storage.models import (
+from himmy.entities.registry import EntityRegistry
+from himmy.runtime.single_agent import SingleAgentRuntime
+from himmy.services.context.models import ContextBuildSpec, ContextSpecKey
+from himmy.services.context.service import ContextService
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.models import LLMConfig, ResponseFormat
+from himmy.services.inference.service import InferenceService
+from himmy.services.storage.models import (
     RecommendationStatus,
     RunRecord,
     RunStatus,
 )
-from opensims.services.storage.service import StorageService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -98,7 +98,7 @@ def _real_stack(manager=None):
 # ------------------------------------------------------------------- AAEO-3
 def test_failed_runresult_from_runtime_marks_run_failed() -> None:
     """A FAILED RunResult (status != SUCCESS) yields a FAILED run + error, no recs."""
-    from opensims.services.inference.models import InferenceStatus
+    from himmy.services.inference.models import InferenceStatus
 
     result = type(
         "RR",
@@ -135,7 +135,7 @@ def test_failed_runresult_from_runtime_marks_run_failed() -> None:
 
 def test_failed_run_falls_back_to_error_code_when_no_message() -> None:
     """When the failed result has only an error_code, that becomes run.error."""
-    from opensims.services.inference.models import InferenceStatus
+    from himmy.services.inference.models import InferenceStatus
 
     result = type(
         "RR",
@@ -176,7 +176,7 @@ def test_execute_run_records_schema_validation_error() -> None:
     ``extraction_error`` on the run while still marking it SUCCEEDED (a schema
     mismatch is observability signal, not a hard run failure).
     """
-    from opensims.services.inference.models import InferenceStatus
+    from himmy.services.inference.models import InferenceStatus
 
     schema = {
         "type": "object",
@@ -347,11 +347,11 @@ def test_recommendation_list_pagination_and_count() -> None:
 # ------------------------------------------------------------------- AAEO-15
 def test_dashboard_folds_evaluation_scores() -> None:
     """The dashboard summary folds in the latest evaluation aggregate (AAEO-15)."""
-    from opensims.services.evaluation.models import (
+    from himmy.services.evaluation.models import (
         EvaluationCase,
         EvaluationSuite,
     )
-    from opensims.services.evaluation.service import EvaluationService
+    from himmy.services.evaluation.service import EvaluationService
 
     storage = StorageService()
     dashboard = DashboardQueryService(storage=storage)

@@ -1,6 +1,6 @@
-# OpenSims
+# Himmy Agent Framework
 
-OpenSims is an **offline-first, entity-backed Python agent framework**. It composes
+**Himmy** is an **offline-first, entity-backed Python agent framework**. It composes
 LLM personas, tasks, threads, tools, context, and knowledge into auditable agent
 runs — and it does all of this with zero network access by default, using a
 deterministic stub inference path. Optional extras layer in real model providers,
@@ -14,7 +14,7 @@ produced it.
 
 ## Production capabilities
 
-OpenSims has been through a full production-hardening pass. On top of the
+Himmy has been through a full production-hardening pass. On top of the
 offline-first core, it now offers:
 
 - **Failure handling** — `InferenceService.run` never raises for provider/manager
@@ -63,15 +63,15 @@ Requires Python **3.12+**.
 
 ## Offline quickstart
 
-OpenSims runs end-to-end with **no API keys and no network** using the deterministic
+Himmy runs end-to-end with **no API keys and no network** using the deterministic
 `StubClientManager`. The smallest possible run:
 
 ```python
 import asyncio
 
-from opensims import Persona, Task
-from opensims.runtime import SingleAgentRuntime
-from opensims.services.inference import InferenceService, StubClientManager
+from himmy import Persona, Task
+from himmy.runtime import SingleAgentRuntime
+from himmy.services.inference import InferenceService, StubClientManager
 
 
 async def main() -> None:
@@ -89,28 +89,28 @@ asyncio.run(main())
 
 ## Architecture overview
 
-OpenSims is organized as a set of independent **kernels** that compose through small
+Himmy is organized as a set of independent **kernels** that compose through small
 typed contracts. Every runtime dependency except inference is optional — drop the
 entity registry and you lose lineage but keep inference; drop the tool service and
 tools simply aren't bound.
 
 | Kernel | Path | Responsibility |
 |---|---|---|
-| Core | `opensims/core/` | Ids, errors, run events, the `EventSink` protocol. |
-| Entities | `opensims/entities/` | The lineage backbone: records, links, the in-memory registry, a Postgres scaffold. |
-| Agents | `opensims/agents/` | The four primitives: `Persona`/`RolePersona`, `Task`, `ChatThread`/`Message`, `Agent`. |
-| Inference | `opensims/services/inference/` | Stub + gateway + pydantic-ai client managers and the retrying `InferenceService`. |
-| Prompts | `opensims/services/prompts/` | YAML-templated system/task prompts and the context→prompt mapper. |
-| Context | `opensims/services/context/` | Snapshot building from storage + adapters with evidence. |
-| Storage | `opensims/services/storage/` | In-memory persistence + a Postgres scaffold. |
-| Knowledge | `opensims/services/knowledge/` | Chunking, embedding, retrieval, and a context adapter. |
-| Tools | `opensims/services/tools/` | Local/HTTP tool registry, execution, and inference binding. |
-| Evaluation | `opensims/services/evaluation/` | Metric suites over agent outputs. |
-| Observability | `opensims/services/observability/` | Optional Logfire instrumentation. |
-| Runtime | `opensims/runtime/` | `SingleAgentRuntime.run_task` — the orchestrating loop. |
-| Application | `opensims/application/` | App-level services (runs, recommendations, dashboard). |
-| Orchestrators | `opensims/orchestrators/` | Multi-step `Workflow` execution. |
-| API | `opensims/api/` | FastAPI app factory and routers. |
+| Core | `himmy/core/` | Ids, errors, run events, the `EventSink` protocol. |
+| Entities | `himmy/entities/` | The lineage backbone: records, links, the in-memory registry, a Postgres scaffold. |
+| Agents | `himmy/agents/` | The four primitives: `Persona`/`RolePersona`, `Task`, `ChatThread`/`Message`, `Agent`. |
+| Inference | `himmy/services/inference/` | Stub + gateway + pydantic-ai client managers and the retrying `InferenceService`. |
+| Prompts | `himmy/services/prompts/` | YAML-templated system/task prompts and the context→prompt mapper. |
+| Context | `himmy/services/context/` | Snapshot building from storage + adapters with evidence. |
+| Storage | `himmy/services/storage/` | In-memory persistence + a Postgres scaffold. |
+| Knowledge | `himmy/services/knowledge/` | Chunking, embedding, retrieval, and a context adapter. |
+| Tools | `himmy/services/tools/` | Local/HTTP tool registry, execution, and inference binding. |
+| Evaluation | `himmy/services/evaluation/` | Metric suites over agent outputs. |
+| Observability | `himmy/services/observability/` | Optional Logfire instrumentation. |
+| Runtime | `himmy/runtime/` | `SingleAgentRuntime.run_task` — the orchestrating loop. |
+| Application | `himmy/application/` | App-level services (runs, recommendations, dashboard). |
+| Orchestrators | `himmy/orchestrators/` | Multi-step `Workflow` execution. |
+| API | `himmy/api/` | FastAPI app factory and routers. |
 
 ## Running the examples
 
@@ -122,7 +122,7 @@ python examples/02_tool_calling.py
 python examples/03_structured_output.py
 python examples/04_orchestration_team.py
 python examples/05_workflow.py
-python examples/06_postgres_storage.py   # skips cleanly unless OPENSIMS_TEST_POSTGRES_DSN is set
+python examples/06_postgres_storage.py   # skips cleanly unless HIMMY_TEST_POSTGRES_DSN is set
 python examples/07_streaming.py          # token-delta streaming via InferenceService.run_stream
 ```
 
@@ -136,7 +136,7 @@ pytest -q
 Tests use `asyncio.run` inside synchronous test functions, so `pytest-asyncio` is
 **not** required. The full suite passes offline with the stub. Real-provider,
 Postgres/pgvector, and Logfire tests **skip cleanly** when their deps/DB are absent
-(set `OPENSIMS_TEST_POSTGRES_DSN` and install the relevant extra to exercise them);
+(set `HIMMY_TEST_POSTGRES_DSN` and install the relevant extra to exercise them);
 run `pytest -q -rs` to see why each skip fired. Per-kernel `*_hardening.py` suites
 cover the production-hardening contracts (failure normalization, streaming, caching,
 SSRF, tenancy, pagination, observability spans, and so on).
@@ -145,7 +145,7 @@ SSRF, tenancy, pagination, observability spans, and so on).
 
 | Extra | Adds | Unlocks |
 |---|---|---|
-| `api` | fastapi, uvicorn | The HTTP API (`opensims.api.create_app`). |
+| `api` | fastapi, uvicorn | The HTTP API (`himmy.api.create_app`). |
 | `providers` | pydantic-ai | Real model providers via `PydanticAIClientManager`. |
 | `postgres` | asyncpg | `PostgresEntityRegistry`, `PostgresStorageService`. |
 | `knowledge` | pgvector, openai, pypdf | pgvector knowledge backend, PDF reading + OpenAI-compatible embeddings. |
@@ -157,7 +157,7 @@ SSRF, tenancy, pagination, observability spans, and so on).
 ## Project layout
 
 ```
-opensims/
+himmy/
   core/            ids, errors, events
   entities/        records, registry, postgres scaffold
   agents/          personas, base_agent (task, thread, agent)

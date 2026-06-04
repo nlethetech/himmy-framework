@@ -1,6 +1,6 @@
 """Docker-gated contract tests for PostgresEntityRegistry (SE-3/4/8).
 
-SKIPPED unless ``OPENSIMS_TEST_POSTGRES_DSN`` is set and ``asyncpg`` is importable.
+SKIPPED unless ``HIMMY_TEST_POSTGRES_DSN`` is set and ``asyncpg`` is importable.
 Covers the Postgres-specific guarantees the in-memory registry already satisfies:
 JSONB round-trip of nested payload/metadata, DB-enforced optimistic concurrency in
 ``new_version`` (a lost version raises rather than silently succeeding), the
@@ -16,12 +16,12 @@ import uuid
 
 import pytest
 
-from opensims.core.errors import OpenSimsError
-from opensims.entities.postgres import PostgresEntityRegistry
-from opensims.entities.records import EntityQuery, EntityRecord, stable_id_for
+from himmy.core.errors import HimmyError
+from himmy.entities.postgres import PostgresEntityRegistry
+from himmy.entities.records import EntityQuery, EntityRecord, stable_id_for
 from tests.conftest import run_async
 
-_DSN = os.environ.get("OPENSIMS_TEST_POSTGRES_DSN")
+_DSN = os.environ.get("HIMMY_TEST_POSTGRES_DSN")
 
 try:  # pragma: no cover - import probe
     import asyncpg  # type: ignore  # noqa: F401
@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover
 
 pytestmark = pytest.mark.skipif(
     not _DSN or not _HAVE_ASYNCPG,
-    reason="requires OPENSIMS_TEST_POSTGRES_DSN + the [postgres] extra",
+    reason="requires HIMMY_TEST_POSTGRES_DSN + the [postgres] extra",
 )
 
 
@@ -89,7 +89,7 @@ def test_register_idempotent_and_collision_guard() -> None:
             tampered = EntityRecord.create(
                 stable_id=sid, version=1, kind="persona", payload={"v": "TAMPERED"}
             )
-            with pytest.raises(OpenSimsError):
+            with pytest.raises(HimmyError):
                 await reg.register(tampered)
             stored = await reg.get(original.record_id)
             assert stored is not None and stored.payload == {"v": "original"}
@@ -128,14 +128,14 @@ def test_new_version_concurrency_does_not_lose_versions() -> None:
 
 
 def test_new_version_expected_version_conflict() -> None:
-    """A stale expected_version raises OpenSimsError (SE-3 parity with in-memory)."""
+    """A stale expected_version raises HimmyError (SE-3 parity with in-memory)."""
 
     async def scenario() -> None:
         reg = await _fresh_registry()
         try:
             sid = _sid("exp")
             await reg.new_version(stable_id=sid, kind="persona", payload={"v": 1})
-            with pytest.raises(OpenSimsError):
+            with pytest.raises(HimmyError):
                 await reg.new_version(
                     stable_id=sid, kind="persona", payload={"v": 2}, expected_version=0
                 )

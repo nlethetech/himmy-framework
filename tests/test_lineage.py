@@ -9,17 +9,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from opensims.agents.base_agent.task import Task
-from opensims.agents.personas.persona import Persona
-from opensims.application.services import RunAppService
-from opensims.entities.lineage import LineageDirection, LineageGraph
-from opensims.entities.records import EntityRecord
-from opensims.entities.registry import EntityRegistry
-from opensims.runtime.single_agent import SingleAgentRuntime
-from opensims.services.context.service import ContextService
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.service import InferenceService
-from opensims.services.storage.service import StorageService
+from himmy.agents.base_agent.task import Task
+from himmy.agents.personas.persona import Persona
+from himmy.application.services import RunAppService
+from himmy.entities.lineage import LineageDirection, LineageGraph
+from himmy.entities.records import EntityRecord
+from himmy.entities.registry import EntityRegistry
+from himmy.runtime.single_agent import SingleAgentRuntime
+from himmy.services.context.service import ContextService
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.service import InferenceService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 

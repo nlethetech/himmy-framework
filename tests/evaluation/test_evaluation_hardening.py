@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from opensims.services.evaluation import (
+from himmy.services.evaluation import (
     EmbeddingSimilarityMetric,
     EvaluationCase,
     EvaluationService,
@@ -11,10 +11,10 @@ from opensims.services.evaluation import (
     bucketed_ece,
     build_registry,
 )
-from opensims.services.inference.client_manager import StubClientManager
-from opensims.services.inference.service import InferenceService
-from opensims.services.knowledge.embedder import DeterministicEmbedder
-from opensims.services.storage.service import StorageService
+from himmy.services.inference.client_manager import StubClientManager
+from himmy.services.inference.service import InferenceService
+from himmy.services.knowledge.embedder import DeterministicEmbedder
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -161,7 +161,7 @@ def test_suite_level_ece_in_metadata() -> None:
 
 def test_groundedness_partial_credit() -> None:
     """Citing a superset that includes all required refs scores full credit (AAEO-5)."""
-    from opensims.services.evaluation import GroundednessMetric
+    from himmy.services.evaluation import GroundednessMetric
 
     case = EvaluationCase(
         expected_output={

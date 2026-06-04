@@ -4,7 +4,7 @@ Runs offline against the deterministic stub by default. The stub client manager
 exposes ``generate_stream``, the offline analogue of provider token streaming, so
 ``run_stream`` yields incremental :class:`StreamDelta` chunks and a final ``done``
 frame that carries the fully-materialized :class:`InferenceResponse`. With a real
-provider configured (``pydantic_ai`` + a key + ``OPENSIMS_EXAMPLES_MODEL``) the
+provider configured (``pydantic_ai`` + a key + ``HIMMY_EXAMPLES_MODEL``) the
 exact same loop streams genuine provider deltas — no code change.
 
     python examples/07_streaming.py
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _runtime import build_inference  # noqa: E402
 
-from opensims.services.inference.models import (  # noqa: E402
+from himmy.services.inference.models import (  # noqa: E402
     InferenceMessage,
     InferenceRequest,
     InferenceStatus,

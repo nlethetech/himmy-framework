@@ -18,16 +18,16 @@ from __future__ import annotations
 
 import time
 
-from opensims.services.context.adapters import ContextAdapter
-from opensims.services.context.models import (
+from himmy.services.context.adapters import ContextAdapter
+from himmy.services.context.models import (
     ContextBuildSpec,
     ContextField,
     ContextSourcePreference,
     ContextSpecKey,
     EvidenceRef,
 )
-from opensims.services.context.service import ContextService
-from opensims.services.storage.service import StorageService
+from himmy.services.context.service import ContextService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 
@@ -161,7 +161,7 @@ def test_storage_first_no_adapter_returns_stale_rather_than_nothing() -> None:
     svc = ContextService(storage_service=storage)  # no adapters
 
     # Seed a field that is already stale (TTL elapsed) with a cached_at in the past.
-    from opensims.core.ids import utc_now_iso
+    from himmy.core.ids import utc_now_iso
 
     stale = ContextField(
         key="k",

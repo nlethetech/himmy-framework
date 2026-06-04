@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from opensims.services.knowledge import (
+from himmy.services.knowledge import (
     DeterministicEmbedder,
     KnowledgeBase,
     RetrievalEvalCase,
@@ -13,7 +13,7 @@ from opensims.services.knowledge import (
     evaluate_retrieval,
     score_retrieval,
 )
-from opensims.services.storage.service import StorageService
+from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
 
 

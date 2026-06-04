@@ -6,7 +6,7 @@ import time
 
 from fastapi.testclient import TestClient
 
-from opensims.api import ApiContainer, create_app
+from himmy.api import ApiContainer, create_app
 
 
 def _client() -> TestClient:
@@ -91,10 +91,10 @@ def test_openapi_declares_error_and_security() -> None:
 
 def test_internal_key_security_scheme(monkeypatch) -> None:
     """When the internal key is set, the API-key scheme appears + guards routes."""
-    monkeypatch.setenv("OPENSIMS_INTERNAL_API_KEY", "topsecret")
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "topsecret")
     client = TestClient(create_app(ApiContainer.build_default()))
     schema = client.get(
-        "/openapi.json", headers={"x-opensims-internal-key": "topsecret"}
+        "/openapi.json", headers={"x-himmy-internal-key": "topsecret"}
     ).json()
     schemes = schema.get("components", {}).get("securitySchemes", {})
     assert any(s.get("type") == "apiKey" for s in schemes.values())
@@ -105,7 +105,7 @@ def test_internal_key_security_scheme(monkeypatch) -> None:
     # Valid key passes.
     ok = client.get(
         "/v1/runs",
-        headers={"x-opensims-internal-key": "topsecret"},
+        headers={"x-himmy-internal-key": "topsecret"},
         params={"workspace_id": "w1"},
     )
     assert ok.status_code == 200
@@ -113,17 +113,17 @@ def test_internal_key_security_scheme(monkeypatch) -> None:
 
 def test_internal_key_rotation_multikey(monkeypatch) -> None:
     """Comma-separated keys support rotation; either key authenticates."""
-    monkeypatch.setenv("OPENSIMS_INTERNAL_API_KEY", "old-key , new-key")
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "old-key , new-key")
     client = TestClient(create_app(ApiContainer.build_default()))
     for key in ("old-key", "new-key"):
         resp = client.get(
             "/v1/runs",
-            headers={"x-opensims-internal-key": key},
+            headers={"x-himmy-internal-key": key},
             params={"workspace_id": "w1"},
         )
         assert resp.status_code == 200
     assert (
-        client.get("/v1/runs", headers={"x-opensims-internal-key": "bogus"}).status_code
+        client.get("/v1/runs", headers={"x-himmy-internal-key": "bogus"}).status_code
         == 401
     )
 

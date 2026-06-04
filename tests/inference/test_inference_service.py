@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from opensims.services.inference import (
+from himmy.services.inference import (
     BatchInferenceRequest,
     BoundTool,
     InferenceError,
@@ -531,12 +531,12 @@ def test_pydantic_ai_path_is_providers_gated() -> None:
     """The pydantic-ai manager raises a clear error when the extra is missing.
 
     This is the offline assertion of the gated provider path: with pydantic_ai
-    absent, generate() surfaces an OpenSimsError rather than importing at module
+    absent, generate() surfaces an HimmyError rather than importing at module
     top. When the [providers] extra IS installed, this test is skipped because the
     real path requires provider credentials.
     """
-    from opensims.core.errors import OpenSimsError
-    from opensims.services.inference import PydanticAIClientManager
+    from himmy.core.errors import HimmyError
+    from himmy.services.inference import PydanticAIClientManager
 
     try:
         import pydantic_ai  # type: ignore  # noqa: F401
@@ -546,7 +546,7 @@ def test_pydantic_ai_path_is_providers_gated() -> None:
         pass
 
     mgr = PydanticAIClientManager()
-    with pytest.raises(OpenSimsError):
+    with pytest.raises(HimmyError):
         run_async(
             mgr.generate(
                 InferenceRequest(messages=[InferenceMessage(role="user", content="hi")])

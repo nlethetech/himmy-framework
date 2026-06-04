@@ -8,7 +8,7 @@ not exercise:
 - Context-field list workspace scoping over the API (AAEO-4).
 - Run events/thread tenant scoping returning empty/404 for a foreign workspace
   (AAEO-4).
-- The global ``OpenSimsError`` -> structured 400 handler (AAEO-9).
+- The global ``HimmyError`` -> structured 400 handler (AAEO-9).
 - Evaluation router list filtering by ``suite_id`` and the 404 read (AAEO-15).
 - The typed 404 / error envelope shape on a few routes.
 
@@ -22,8 +22,8 @@ import time
 
 from fastapi.testclient import TestClient
 
-from opensims.api import ApiContainer, create_app
-from opensims.core.errors import OpenSimsError
+from himmy.api import ApiContainer, create_app
+from himmy.core.errors import HimmyError
 
 
 def _client() -> TestClient:
@@ -178,21 +178,21 @@ def test_run_events_and_thread_workspace_scoping() -> None:
 
 
 # ------------------------------------------------------------------- AAEO-9
-def test_opensims_error_maps_to_structured_400() -> None:
-    """An OpenSimsError raised in a route surfaces as a structured 400 (AAEO-9)."""
+def test_himmy_error_maps_to_structured_400() -> None:
+    """An HimmyError raised in a route surfaces as a structured 400 (AAEO-9)."""
     container = ApiContainer.build_default()
     app = create_app(container)
 
     @app.get("/boom")
     async def _boom():  # noqa: ANN202
-        raise OpenSimsError("kaboom")
+        raise HimmyError("kaboom")
 
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.get("/boom")
     assert resp.status_code == 400
     body = resp.json()
     assert body["detail"] == "kaboom"
-    assert body["code"] == "opensims_error"
+    assert body["code"] == "himmy_error"
 
 
 def test_get_run_404_has_typed_detail() -> None:

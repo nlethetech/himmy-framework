@@ -17,11 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _runtime import build_runtime  # noqa: E402
 
-from opensims.agents.base_agent.task import Task  # noqa: E402
-from opensims.agents.base_agent.thread import MessageRole  # noqa: E402
-from opensims.agents.personas.persona import Persona  # noqa: E402
-from opensims.services.inference.models import LLMConfig, ResponseFormat  # noqa: E402
-from opensims.services.tools.registry import register_local_tool  # noqa: E402
+from himmy.agents.base_agent.task import Task  # noqa: E402
+from himmy.agents.base_agent.thread import MessageRole  # noqa: E402
+from himmy.agents.personas.persona import Persona  # noqa: E402
+from himmy.services.inference.models import LLMConfig, ResponseFormat  # noqa: E402
+from himmy.services.tools.registry import register_local_tool  # noqa: E402
 
 
 def _word_count(args: dict) -> dict:
@@ -74,7 +74,7 @@ async def main() -> None:
     )
     task = Task(
         title="analyze-text",
-        prompt="Analyze this text: 'OpenSims makes agents composable and auditable.'",
+        prompt="Analyze this text: 'Himmy makes agents composable and auditable.'",
         context={"tool_names": ["word_count", "to_upper"]},
     )
 

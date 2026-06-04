@@ -13,7 +13,7 @@ lifecycle paths they do not exercise:
 - ``instrument_asyncpg`` / ``instrument_fastapi`` are no-ops when off.
 - A real-logfire integration test is gated behind a skipif (logfire absent).
 
-The module re-imports ``opensims.services.observability`` per test (via
+The module re-imports ``himmy.services.observability`` per test (via
 ``importlib.reload``) so its module-level span/configure state is reset, and
 injects a fake ``logfire`` module so the span context-manager path is exercised
 fully offline.
@@ -25,11 +25,11 @@ import importlib
 
 import pytest
 
-from opensims.core.events import EventType, RunEvent
+from himmy.core.events import EventType, RunEvent
 
 
 def _fresh_module():
-    import opensims.services.observability as obs
+    import himmy.services.observability as obs
 
     return importlib.reload(obs)
 
@@ -79,8 +79,8 @@ class _FakeLogfire:
 
 def _enabled_obs(monkeypatch):
     """Reload the module with the switch on and a fake logfire installed."""
-    monkeypatch.setenv("OPENSIMS_LOGFIRE_ENABLED", "1")
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_INCLUDE_CONTENT", raising=False)
+    monkeypatch.setenv("HIMMY_LOGFIRE_ENABLED", "1")
+    monkeypatch.delenv("HIMMY_LOGFIRE_INCLUDE_CONTENT", raising=False)
     obs = _fresh_module()
     fake = _FakeLogfire()
     monkeypatch.setitem(importlib.sys.modules, "logfire", fake)
@@ -180,8 +180,8 @@ def test_close_event_drops_content_attributes(monkeypatch) -> None:
     )
     tool_span = fake.spans[0]
     # The non-content key was recorded on close; the content key was dropped.
-    assert tool_span.attributes.get("opensims.payload.status_code") == 200
-    assert "opensims.payload.output" not in tool_span.attributes
+    assert tool_span.attributes.get("himmy.payload.status_code") == 200
+    assert "himmy.payload.output" not in tool_span.attributes
 
 
 def test_emit_robust_to_odd_payload(monkeypatch) -> None:
@@ -196,8 +196,8 @@ def test_emit_robust_to_odd_payload(monkeypatch) -> None:
         )
     )
     span = fake.spans[0]
-    assert span.attributes.get("opensims.payload.keep") == 1
-    assert "opensims.payload.skip" not in span.attributes
+    assert span.attributes.get("himmy.payload.keep") == 1
+    assert "himmy.payload.skip" not in span.attributes
     # Cleanly close it.
     obs.emit_event_span(
         RunEvent(event_type=EventType.AGENT_RUN_FINISHED, trace_id="t1")
@@ -208,7 +208,7 @@ def test_emit_robust_to_odd_payload(monkeypatch) -> None:
 # ------------------------------------------------------------------- no-op when off
 def test_instrument_helpers_noop_when_off(monkeypatch) -> None:
     """instrument_asyncpg / instrument_fastapi are silent no-ops when disabled."""
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_ENABLED", raising=False)
+    monkeypatch.delenv("HIMMY_LOGFIRE_ENABLED", raising=False)
     obs = _fresh_module()
     # No exception and no logfire import.
     obs.instrument_asyncpg()
@@ -217,7 +217,7 @@ def test_instrument_helpers_noop_when_off(monkeypatch) -> None:
 
 def test_configure_then_emit_noop_after_disable(monkeypatch) -> None:
     """emit is a hard no-op when the switch is off even if logfire is importable."""
-    monkeypatch.delenv("OPENSIMS_LOGFIRE_ENABLED", raising=False)
+    monkeypatch.delenv("HIMMY_LOGFIRE_ENABLED", raising=False)
     obs = _fresh_module()
     fake = _FakeLogfire()
     monkeypatch.setitem(importlib.sys.modules, "logfire", fake)
@@ -237,7 +237,7 @@ def test_configure_with_real_logfire_or_skip(monkeypatch) -> None:
         import logfire  # type: ignore  # noqa: F401
     except ImportError:
         pytest.skip("logfire not installed; real-provider observability path skipped")
-    monkeypatch.setenv("OPENSIMS_LOGFIRE_ENABLED", "1")
+    monkeypatch.setenv("HIMMY_LOGFIRE_ENABLED", "1")
     obs = _fresh_module()
     # Should configure without raising when the package is genuinely present.
     obs.configure_observability()

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from opensims.services.tools import build_arg_model
-from opensims.services.tools.validation import _validate_subset, validate_against_schema
+from himmy.services.tools import build_arg_model
+from himmy.services.tools.validation import _validate_subset, validate_against_schema
 
 
 def test_subset_type_and_required() -> None:
@@ -99,7 +99,7 @@ def test_build_arg_model_empty_schema() -> None:
 
 def test_falls_back_to_subset_when_jsonschema_absent(monkeypatch) -> None:
     """With jsonschema unavailable, validation still works via the offline subset."""
-    import opensims.services.tools.validation as v
+    import himmy.services.tools.validation as v
 
     monkeypatch.setattr(v, "_JSONSCHEMA_MODULE", False)
     schema = {

@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "opensims"
+name = "himmy"
 version = "0.1.0"
-description = "OpenSims — an offline-first, entity-backed Python agent framework."
+description = "Himmy Agent Framework — an offline-first, entity-backed Python agent framework."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "OpenSims" }]
+authors = [{ name = "Himmy" }]
 keywords = ["agents", "llm", "inference", "entities", "framework"]
 dependencies = [
     "pydantic>=2",
@@ -24,7 +24,7 @@ postgres = ["asyncpg>=0.29"]
 knowledge = ["pgvector>=0.2", "openai>=1.0", "pypdf>=4.0"]
 observability = ["logfire>=0.30"]
 # Optional full-fidelity JSON Schema validation for tool args/output. Without it,
-# OpenSims falls back to a built-in offline schema-validation subset.
+# Himmy falls back to a built-in offline schema-validation subset.
 validation = ["jsonschema>=4"]
 dev = [
     "pytest>=8",
@@ -50,10 +50,10 @@ all = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["opensims*"]
+include = ["himmy*"]
 
 [tool.setuptools.package-data]
-opensims = ["services/prompts/configs/prompts/*.yaml"]
+himmy = ["services/prompts/configs/prompts/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -66,7 +66,7 @@ filterwarnings = [
 [tool.ruff]
 target-version = "py312"
 line-length = 88
-extend-exclude = ["opensims.egg-info"]
+extend-exclude = ["himmy.egg-info"]
 
 [tool.ruff.lint]
 # Pyflakes (F), pycodestyle (E/W), isort (I), pyupgrade (UP), flake8-bugbear (B).
@@ -87,7 +87,7 @@ ignore = [
 
 [tool.mypy]
 python_version = "3.12"
-files = ["opensims"]
+files = ["himmy"]
 ignore_missing_imports = false
 warn_redundant_casts = true
 no_implicit_optional = true
@@ -106,7 +106,7 @@ module = [
 ignore_missing_imports = true
 
 [tool.coverage.run]
-source = ["opensims"]
+source = ["himmy"]
 branch = true
 
 [tool.coverage.report]

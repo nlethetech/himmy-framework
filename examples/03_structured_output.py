@@ -19,10 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _runtime import build_runtime  # noqa: E402
 
-from opensims.agents.base_agent.task import Task  # noqa: E402
-from opensims.agents.personas.persona import Persona  # noqa: E402
-from opensims.application.models import RecommendationEnvelope  # noqa: E402
-from opensims.services.inference.models import LLMConfig, ResponseFormat  # noqa: E402
+from himmy.agents.base_agent.task import Task  # noqa: E402
+from himmy.agents.personas.persona import Persona  # noqa: E402
+from himmy.application.models import RecommendationEnvelope  # noqa: E402
+from himmy.services.inference.models import LLMConfig, ResponseFormat  # noqa: E402
 
 
 async def main() -> None:
