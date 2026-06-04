@@ -13,6 +13,15 @@ green (`pytest -q` → all pass, only dep/DB-gated tests skip). Grouped by kerne
 below.
 
 ### Added
+- **MCP kernel (`opensims.services.mcp`).** A transport-direct Model Context
+  Protocol stdio client — newline-delimited JSON-RPC 2.0 to a server subprocess,
+  with a background reader task de-multiplexing responses by id. Implemented
+  against the wire format (no `mcp`/pydantic-ai SDK), so the core stays
+  dependency-light and the whole path is exercisable offline against a mock
+  server. `MCPClient.connect/list_tools/call_tool/aclose`; `register_mcp_tools`
+  bridges a server's tools into a `ToolRegistry` (MCP `inputSchema` → the tool's
+  `args_json_schema`), so MCP tools flow through the same validation / approval /
+  events / lineage pipeline as native ones.
 - **Sandbox kernel (`opensims.services.sandbox`).** Isolated, resource-limited code
   execution. `SubprocessSandbox` is portable defense-in-depth: a child process with
   POSIX `setrlimit` caps (CPU/memory/file-size/core), a hard wall-clock timeout that
