@@ -1,0 +1,10 @@
+persona:
+  role: "You are a {role} agent. The current date and time is {datetime}."
+  background: "You have the following personal background:\n{persona}"
+  objectives: "Here are your objectives as an AI agent.\n{objectives}"
+  skills: "You possess the following skills:\n{skills}"
+
+task:
+  task: "You are assigned with the following task:\n{task}"
+  output: "Please provide your output in the following format:\n{output_format}"
+  schema: "Use the following schema if specified:\n{output_schema}"

@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opensims"
+version = "0.1.0"
+description = "OpenSims — an offline-first, entity-backed Python agent framework."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "OpenSims" }]
+keywords = ["agents", "llm", "inference", "entities", "framework"]
+dependencies = [
+    "pydantic>=2",
+    "pyyaml>=6",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
+providers = ["pydantic-ai>=0.0.1"]
+postgres = ["asyncpg>=0.29"]
+knowledge = ["pgvector>=0.2", "openai>=1.0", "pypdf>=4.0"]
+observability = ["logfire>=0.30"]
+# Optional full-fidelity JSON Schema validation for tool args/output. Without it,
+# OpenSims falls back to a built-in offline schema-validation subset.
+validation = ["jsonschema>=4"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+    "jsonschema>=4",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "types-PyYAML>=6",
+]
+all = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic-ai>=0.0.1",
+    "asyncpg>=0.29",
+    "pgvector>=0.2",
+    "openai>=1.0",
+    "pypdf>=4.0",
+    "logfire>=0.30",
+    "jsonschema>=4",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+include = ["opensims*"]
+
+[tool.setuptools.package-data]
+opensims = ["services/prompts/configs/prompts/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "ignore::DeprecationWarning:pytest_asyncio.*",
+    "ignore:.*urllib3.*:Warning",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+extend-exclude = ["opensims.egg-info"]
+
+[tool.ruff.lint]
+# Pyflakes (F), pycodestyle (E/W), isort (I), pyupgrade (UP), flake8-bugbear (B).
+select = ["E", "W", "F", "I", "UP", "B"]
+ignore = [
+    "E501",   # line length is handled by the formatter
+    "B008",   # function calls in argument defaults (common FastAPI Depends pattern)
+    "UP042",  # `str, Enum` is intentional: stable JSON/Postgres serialization vs StrEnum
+    "UP007",  # `Optional[X]`/`Union` retained where it reads clearer than `X | Y`
+    "UP047",  # PEP 695 generic syntax not required for this 3.12 baseline
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The example bootstrap intentionally manipulates sys.path before importing.
+"examples/_runtime.py" = ["E402"]
+# Tests may shadow/redefine and use star-style fixtures freely.
+"tests/**" = ["B011"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["opensims"]
+ignore_missing_imports = false
+warn_redundant_casts = true
+no_implicit_optional = true
+
+# Optional third-party deps (only present with the relevant extras installed) have
+# no stubs in the base/offline environment — don't fail the gate on them.
+[[tool.mypy.overrides]]
+module = [
+    "pydantic_ai.*",
+    "logfire.*",
+    "asyncpg.*",
+    "pgvector.*",
+    "openai.*",
+    "pypdf.*",
+]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["opensims"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
