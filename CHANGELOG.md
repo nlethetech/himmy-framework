@@ -13,6 +13,14 @@ green (`pytest -q` → all pass, only dep/DB-gated tests skip). Grouped by kerne
 below.
 
 ### Added
+- **Recommendations as first-class lineage nodes.** `RecommendationItem.to_record`
+  projects each extracted recommendation into a `recommendation` entity, and
+  `RecommendationAppService` (now registry-wired, incl. `deps.py` and the
+  `RunAppService` fallback) links it `derived_from` the run's thread hub and
+  `cites` each cited evidence record that exists — best-effort, idempotent, and
+  sync/async-registry safe. New `RecommendationAppService.get_recommendation_lineage`
+  + `GET /v1/recommendations/{id}/provenance` (tenant-scoped, `?format=dot`)
+  deliver the literal "trace THIS recommendation to its persona + evidence" demo.
 - **Lineage read layer.** The provenance graph was write-only; it is now
   queryable. New `EntityRegistry.links_to` (reverse edges), `neighbors`
   (direction- and relation-filtered), and `trace` (bounded multi-hop BFS)

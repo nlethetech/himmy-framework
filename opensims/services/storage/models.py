@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
 from opensims.core.ids import new_uuid, utc_now_iso
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from opensims.entities.records import EntityRecord
 
 
 class RunStatus(str, Enum):
@@ -67,6 +70,37 @@ class RecommendationItem(BaseModel):
     notes: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)
+
+    def to_record(self) -> EntityRecord:
+        """Project this recommendation into its canonical ``EntityRecord``.
+
+        A first-class lineage node (``kind="recommendation"``) so a recommendation
+        can be traced back to the run/persona/evidence that produced it. The payload
+        captures only the immutable advisory CONTENT — ``status``/``notes`` are
+        deliberately excluded so the content-addressed ``record_id`` stays stable
+        across status transitions (re-registration remains idempotent).
+        """
+        from opensims.entities.records import EntityRecord, stable_id_for
+
+        stable_id = stable_id_for(self.recommendation_id, namespace="recommendation")
+        return EntityRecord.create(
+            stable_id=stable_id,
+            version=1,
+            kind="recommendation",
+            payload={
+                "recommendation_id": self.recommendation_id,
+                "run_id": self.run_id,
+                "workspace_id": self.workspace_id,
+                "subject_id": self.subject_id,
+                "kind": self.kind,
+                "title": self.title,
+                "summary": self.summary,
+                "rationale": self.rationale,
+                "confidence": self.confidence,
+                "evidence_refs": list(self.evidence_refs),
+            },
+            metadata={"run_id": self.run_id, "workspace_id": self.workspace_id},
+        )
 
 
 class MemoryObject(BaseModel):

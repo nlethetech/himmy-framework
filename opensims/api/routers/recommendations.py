@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from opensims.api.models import (
@@ -16,6 +17,7 @@ from opensims.api.models import (
     RecommendationListResponse,
 )
 from opensims.application.services import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+from opensims.entities.lineage import DEFAULT_TRACE_DEPTH
 from opensims.services.storage.models import RecommendationItem, RecommendationStatus
 
 router = APIRouter(prefix="/v1/recommendations", tags=["recommendations"])
@@ -92,6 +94,36 @@ async def update_recommendation(
     if item is None:
         raise HTTPException(status_code=404, detail="recommendation not found")
     return item
+
+
+@router.get("/{recommendation_id}/provenance", responses=NOT_FOUND_RESPONSE)
+async def get_recommendation_provenance(
+    recommendation_id: str,
+    request: Request,
+    workspace_id: str | None = None,
+    max_depth: int = Query(DEFAULT_TRACE_DEPTH, ge=0, le=64),
+    relations: str | None = Query(
+        None,
+        description="comma-separated relation allow-list (e.g. derived_from,cites)",
+    ),
+    fmt: str = Query("json", alias="format", pattern="^(json|dot)$"),
+) -> Any:
+    """Trace a recommendation back to its run, persona, prompt, and cited evidence.
+
+    Returns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.
+    404 when the recommendation is unknown / out-of-workspace or was never graphed.
+    """
+    rel = [r.strip() for r in relations.split(",") if r.strip()] if relations else None
+    graph = await _container(request).recommendation_app.get_recommendation_lineage(
+        recommendation_id, workspace_id=workspace_id, max_depth=max_depth, relations=rel
+    )
+    if graph is None:
+        raise HTTPException(
+            status_code=404, detail="recommendation provenance not found"
+        )
+    if fmt == "dot":
+        return PlainTextResponse(graph.to_dot())
+    return graph
 
 
 __all__ = ["router"]

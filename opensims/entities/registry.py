@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 from opensims.core.errors import OpenSimsError
@@ -196,7 +197,7 @@ class EntityRegistry:
         *,
         max_depth: int = DEFAULT_TRACE_DEPTH,
         direction: LineageDirection = LineageDirection.BOTH,
-        relations: set[str] | list[str] | None = None,
+        relations: Collection[str] | None = None,
     ) -> LineageGraph:
         """Walk the lineage graph from ``record_id`` and return the reached subgraph.
 

@@ -16,6 +16,7 @@ their backend; both return one of these graphs.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -73,7 +74,7 @@ class LineageGraph(BaseModel):
         """The distinct relation names present among the edges."""
         return {edge.relation for edge in self.edges}
 
-    def filter_relations(self, relations: set[str] | list[str]) -> LineageGraph:
+    def filter_relations(self, relations: Collection[str]) -> LineageGraph:
         """Return a copy keeping only edges whose relation is in ``relations``.
 
         Nodes that become unreferenced are dropped, except the root is always

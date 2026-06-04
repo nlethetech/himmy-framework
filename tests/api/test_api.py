@@ -119,6 +119,58 @@ def test_run_lineage_endpoint_json_and_dot() -> None:
     assert client.get("/v1/runs/nope/lineage").status_code == 404
 
 
+def test_recommendation_provenance_endpoint() -> None:
+    """GET /v1/recommendations/{id}/provenance traces a rec to its run + persona."""
+    from tests.conftest import run_async
+
+    container = ApiContainer.build_default()
+    client = TestClient(create_app(container))
+    body = {
+        "workspace_id": "w1",
+        "subject_id": "s1",
+        "persona": {"name": "Analyst", "description": "careful"},
+        "task": {"title": "brief", "prompt": "Summarize ACME"},
+    }
+    run_id = client.post("/v1/runs", json=body).json()["run_id"]
+    _await_run(client, run_id)
+
+    async def _graph_a_recommendation() -> str:
+        # The stub doesn't emit a RecommendationEnvelope; graph one from the same
+        # run so its real thread_id wires derived_from to the run's hub.
+        run = await container.run_app.get_run(run_id, workspace_id="w1")
+        run.output_structured = {
+            "recommendations": [
+                {"kind": "buy", "title": "Accumulate", "confidence": 0.6}
+            ]
+        }
+        items = await container.recommendation_app.extract_from_run(run)
+        return items[0].recommendation_id
+
+    rec_id = run_async(_graph_a_recommendation())
+
+    graph = client.get(
+        f"/v1/recommendations/{rec_id}/provenance", params={"workspace_id": "w1"}
+    ).json()
+    kinds = {node["kind"] for node in graph["nodes"].values()}
+    assert {"recommendation", "chat_thread", "persona"} <= kinds
+    assert any(edge["relation"] == "derived_from" for edge in graph["edges"])
+
+    dot = client.get(
+        f"/v1/recommendations/{rec_id}/provenance",
+        params={"workspace_id": "w1", "format": "dot"},
+    )
+    assert dot.text.startswith("digraph lineage {")
+
+    # Tenant isolation + unknown id both 404.
+    assert (
+        client.get(
+            f"/v1/recommendations/{rec_id}/provenance", params={"workspace_id": "zzz"}
+        ).status_code
+        == 404
+    )
+    assert client.get("/v1/recommendations/none/provenance").status_code == 404
+
+
 def test_context_field_upsert_and_list() -> None:
     """Context fields upsert and list back for a subject."""
     client = _client()

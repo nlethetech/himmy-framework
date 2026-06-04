@@ -124,7 +124,9 @@ class ApiContainer:
             entity_registry=registry,
         )
 
-        recommendation_app = RecommendationAppService(storage=storage)
+        recommendation_app = RecommendationAppService(
+            storage=storage, entity_registry=registry
+        )
         context_app = ContextAppService(
             context_service=context_service, storage=storage
         )

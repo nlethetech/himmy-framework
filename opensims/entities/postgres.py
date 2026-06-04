@@ -23,6 +23,7 @@ Production hardening (see IMPROVEMENTS SE-3/4/5/8):
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from datetime import datetime
 from typing import Any
 
@@ -492,7 +493,7 @@ class PostgresEntityRegistry:
         *,
         max_depth: int = DEFAULT_TRACE_DEPTH,
         direction: LineageDirection = LineageDirection.BOTH,
-        relations: set[str] | list[str] | None = None,
+        relations: Collection[str] | None = None,
     ) -> LineageGraph:
         """Walk the lineage graph from ``record_id`` via a recursive CTE.
 

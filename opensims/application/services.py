@@ -28,6 +28,7 @@ import asyncio
 import inspect
 import logging
 import time
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any
 
 from opensims.application.models import RecommendationEnvelope
@@ -219,9 +220,21 @@ def _snapshot_in_workspace(snapshot: Any, workspace_id: str) -> bool:
 class RecommendationAppService:
     """Extract, list, and transition advisory recommendations from runs."""
 
-    def __init__(self, *, storage: StorageService) -> None:
-        """Wire the backing store."""
+    def __init__(
+        self,
+        *,
+        storage: StorageService,
+        entity_registry: EntityRegistry | None = None,
+    ) -> None:
+        """Wire the backing store and (optionally) the lineage registry.
+
+        When ``entity_registry`` is present, extracted recommendations are projected
+        as first-class ``recommendation`` entities and linked back to the run they
+        came from (``derived_from``) and the evidence they cite (``cites``), so a
+        recommendation is queryable in the provenance graph.
+        """
         self._storage = storage
+        self._registry = entity_registry
 
     async def extract_from_run(self, run: RunRecord) -> list[RecommendationItem]:
         """Parse a run's structured output as a RecommendationEnvelope and persist items.
@@ -258,8 +271,82 @@ class RecommendationAppService:
                 metadata=dict(rec.metadata),
             )
             await self._storage.save_recommendation(item)
+            await self._project_lineage(item, run)
             items.append(item)
         return items
+
+    async def _project_lineage(self, item: RecommendationItem, run: RunRecord) -> None:
+        """Register the recommendation as a lineage node and link its provenance.
+
+        Best-effort and idempotent: a registry failure never loses the (already
+        persisted) recommendation, and re-extracting the same run neither
+        duplicates the record (content-addressed) nor its links (deduped). Links:
+        ``derived_from`` -> the run's chat_thread hub (so the recommendation joins
+        the run's existing graph), and ``cites`` -> each cited evidence record that
+        actually exists in the registry (dangling citations stay in the payload,
+        not the graph). Works against the sync in-memory and async Postgres
+        registries alike via :func:`_maybe_await`.
+        """
+        if self._registry is None:
+            return
+        try:
+            from opensims.entities.records import record_id_for, stable_id_for
+
+            rec_record = await _maybe_await(self._registry.register(item.to_record()))
+
+            if run.thread_id:
+                thread_sid = stable_id_for(run.thread_id, namespace="chat_thread")
+                thread_record = await _maybe_await(
+                    self._registry.get_latest(thread_sid)
+                )
+                if thread_record is not None:
+                    await self._link_once(
+                        rec_record.record_id,
+                        thread_record.record_id,
+                        "derived_from",
+                    )
+
+            for ref in item.evidence_refs:
+                ev_sid = stable_id_for(ref, namespace="context_evidence")
+                ev_rid = record_id_for(
+                    stable_id=ev_sid, version=1, kind="context_evidence"
+                )
+                # Only graph a citation whose evidence is a real registered node.
+                if await _maybe_await(self._registry.get(ev_rid)) is not None:
+                    await self._link_once(
+                        rec_record.record_id,
+                        ev_rid,
+                        "cites",
+                        metadata={"evidence_ref": ref},
+                    )
+        except Exception:  # pragma: no cover - lineage projection is best-effort
+            logger.warning(
+                "failed to project recommendation lineage for %s",
+                item.recommendation_id,
+            )
+
+    async def _link_once(
+        self,
+        from_record_id: str,
+        to_record_id: str,
+        relation: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Create a link only if an identical (from, to, relation) edge is absent."""
+        assert self._registry is not None  # guarded by caller
+        existing = await _maybe_await(self._registry.links_from(from_record_id))
+        for link in existing:
+            if link.to_record_id == to_record_id and link.relation == relation:
+                return
+        await _maybe_await(
+            self._registry.link(
+                from_record_id=from_record_id,
+                to_record_id=to_record_id,
+                relation=relation,
+                metadata=metadata or {},
+            )
+        )
 
     @staticmethod
     def _coerce_envelope(
@@ -355,6 +442,42 @@ class RecommendationAppService:
             recommendation_id, status=status, notes=notes
         )
 
+    async def get_recommendation_lineage(
+        self,
+        recommendation_id: str,
+        *,
+        workspace_id: str | None = None,
+        max_depth: int = DEFAULT_TRACE_DEPTH,
+        relations: Collection[str] | None = None,
+    ) -> LineageGraph | None:
+        """Return the provenance subgraph for a recommendation, or None.
+
+        Traces from the recommendation node outward: ``derived_from`` reaches the
+        run's thread hub (and through it the persona, prompt, and context
+        snapshot), while ``cites`` reaches the evidence the recommendation stands
+        on. This is the literal "trace THIS recommendation back to its persona +
+        evidence" demo the README promises.
+
+        Returns None when the recommendation is unknown / out-of-workspace, no
+        registry is wired, or it was never projected into the graph.
+        """
+        item = await self._storage.get_recommendation(recommendation_id)
+        if item is None or self._registry is None:
+            return None
+        if workspace_id is not None and item.workspace_id != workspace_id:
+            return None
+        from opensims.entities.records import stable_id_for
+
+        stable_id = stable_id_for(recommendation_id, namespace="recommendation")
+        root = await _maybe_await(self._registry.get_latest(stable_id))
+        if root is None:
+            return None
+        return await _maybe_await(
+            self._registry.trace(
+                root.record_id, max_depth=max_depth, relations=relations
+            )
+        )
+
 
 class RunAppService:
     """Owns the async run lifecycle: idempotent create + background execution."""
@@ -377,7 +500,7 @@ class RunAppService:
         self._storage = storage
         self._registry = entity_registry
         self._recommendations = recommendation_app or RecommendationAppService(
-            storage=storage
+            storage=storage, entity_registry=entity_registry
         )
         self._run_timeout_seconds = run_timeout_seconds
         # Keep strong refs to background tasks so they are not GC'd mid-flight and
