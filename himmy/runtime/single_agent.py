@@ -105,6 +105,46 @@ class RunResult:
         return self.status == InferenceStatus.SUCCESS.value
 
 
+@dataclass
+class AgentLoopResult:
+    """The outcome of a runtime-owned multi-turn agent loop.
+
+    ``turns`` is every :class:`RunResult` in order; ``final`` is the last.
+    ``stopped_reason`` is one of ``final`` (model answered with no tool calls),
+    ``max_turns``, ``budget``, or ``error``. Token/cost totals are summed across
+    turns so a caller can see the whole run's spend.
+    """
+
+    thread: ChatThread
+    turns: list[RunResult] = field(default_factory=list)
+    stopped_reason: str = "final"
+
+    @property
+    def final(self) -> RunResult:
+        """The last turn's result."""
+        return self.turns[-1]
+
+    @property
+    def turn_count(self) -> int:
+        """How many model turns the loop ran."""
+        return len(self.turns)
+
+    @property
+    def total_cost(self) -> float:
+        """Summed provider cost across all turns."""
+        return sum(t.cost for t in self.turns)
+
+    @property
+    def total_input_tokens(self) -> int:
+        """Summed input tokens across all turns."""
+        return sum(t.input_tokens for t in self.turns)
+
+    @property
+    def total_output_tokens(self) -> int:
+        """Summed output tokens across all turns."""
+        return sum(t.output_tokens for t in self.turns)
+
+
 class SingleAgentRuntime:
     """Conducts one agent run end-to-end: persona + task in, answered thread out.
 
@@ -293,6 +333,197 @@ class SingleAgentRuntime:
             )
             await self._maybe_save_thread(thread)
             raise asyncio.CancelledError() from None
+
+    async def run_agent_loop(
+        self,
+        persona: Persona,
+        task: Task,
+        thread: ChatThread | None = None,
+        *,
+        max_turns: int = 6,
+        cost_budget: float | None = None,
+        llm_config: LLMConfig | None = None,
+    ) -> AgentLoopResult:
+        """Run a bounded, runtime-owned agentic loop: act -> observe -> re-invoke.
+
+        The first turn is a normal run; while a turn calls tools (so the model
+        likely wants to act on their results), the runtime feeds the updated thread
+        back for another model turn — until the model answers WITHOUT tool calls
+        (``final``), or ``max_turns`` / ``cost_budget`` is reached, or a turn FAILS.
+        Unlike delegating to a provider's opaque loop, the runtime *bounds* the
+        turns, accrues spend, and emits an ``AGENT_TURN_COMPLETED`` event per turn.
+        """
+        if max_turns < 1:
+            raise HimmyError("run_agent_loop requires max_turns >= 1.")
+
+        first = await self.run_task_detailed(
+            persona, task, thread, llm_config=llm_config
+        )
+        thread = first.thread
+        ctx = dict(task.context or {})
+        trace_id = f"{thread.thread_id}:{task.task_id}"
+        turns = [first]
+        await self._emit_turn_completed(trace_id, thread, persona, 1, first)
+
+        stopped_reason = "final"
+        while True:
+            last = turns[-1]
+            if not last.succeeded:
+                stopped_reason = "error"
+                break
+            if not last.tool_calls:
+                stopped_reason = "final"
+                break
+            if len(turns) >= max_turns:
+                stopped_reason = "max_turns"
+                break
+            if cost_budget is not None and sum(t.cost for t in turns) >= cost_budget:
+                stopped_reason = "budget"
+                break
+            index = len(turns) + 1
+            await self._emit(
+                RunEvent(
+                    event_type=EventType.AGENT_TURN_STARTED,
+                    trace_id=trace_id,
+                    thread_id=thread.thread_id,
+                    agent_id=persona.agent_id,
+                    payload={"turn": index},
+                )
+            )
+            result = await self._continue_turn(
+                persona, thread, ctx, trace_id, llm_config=llm_config
+            )
+            turns.append(result)
+            await self._emit_turn_completed(trace_id, thread, persona, index, result)
+
+        return AgentLoopResult(
+            thread=thread, turns=turns, stopped_reason=stopped_reason
+        )
+
+    async def _emit_turn_completed(
+        self,
+        trace_id: str,
+        thread: ChatThread,
+        persona: Persona,
+        index: int,
+        result: RunResult,
+    ) -> None:
+        await self._emit(
+            RunEvent(
+                event_type=EventType.AGENT_TURN_COMPLETED,
+                trace_id=trace_id,
+                thread_id=thread.thread_id,
+                agent_id=persona.agent_id,
+                cost=result.cost,
+                payload={
+                    "turn": index,
+                    "tool_calls": len(result.tool_calls),
+                    "status": result.status,
+                },
+            )
+        )
+
+    async def _continue_turn(
+        self,
+        persona: Persona,
+        thread: ChatThread,
+        ctx: dict[str, Any],
+        trace_id: str,
+        *,
+        llm_config: LLMConfig | None,
+    ) -> RunResult:
+        """One more inference turn on an existing thread (no new user prompt).
+
+        Builds the request from the thread as-is (so the model sees prior tool
+        results), runs inference, replays tool exchanges, and appends the assistant
+        turn. Persona/prompt lineage was linked by the first turn, so this only
+        registers the new message + the bumped thread version.
+        """
+        from himmy.agents.base_agent.thread import Message, MessageRole
+
+        request, tool_names = self._build_request(thread, ctx, llm_config)
+        await self._emit(
+            RunEvent(
+                event_type=EventType.INFERENCE_REQUESTED,
+                trace_id=trace_id,
+                thread_id=thread.thread_id,
+                agent_id=persona.agent_id,
+                request_id=request.request_id,
+                payload={"model_key": request.model_key, "tool_names": tool_names},
+            )
+        )
+        response = await self.inference_service.run(request)
+        await self._emit(
+            RunEvent(
+                event_type=(
+                    EventType.INFERENCE_SUCCEEDED
+                    if response.status == InferenceStatus.SUCCESS
+                    else EventType.INFERENCE_FAILED
+                ),
+                trace_id=trace_id,
+                thread_id=thread.thread_id,
+                agent_id=persona.agent_id,
+                request_id=request.request_id,
+                latency_ms=response.latency_ms,
+                cost=response.cost,
+                error=(response.error.message if response.error else None),
+                payload={
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                },
+            )
+        )
+        await self._append_tool_messages(
+            thread,
+            response,
+            request_id=request.request_id,
+            trace_id=trace_id,
+            agent_id=persona.agent_id,
+        )
+
+        assistant_text = response.output_text
+        if assistant_text is None and response.output_structured is not None:
+            assistant_text = json.dumps(response.output_structured, default=str)
+        error_message = response.error.message if response.error else None
+        error_code = response.error.code.value if response.error else None
+        assistant_message = Message(
+            role=MessageRole.ASSISTANT,
+            content=assistant_text or "",
+            metadata={
+                "request_id": request.request_id,
+                "trace_id": trace_id,
+                "status": response.status.value,
+                "error": error_message,
+                "error_code": error_code,
+                "cost": response.cost,
+                "input_tokens": response.input_tokens,
+                "output_tokens": response.output_tokens,
+                "output_structured": response.output_structured,
+            },
+        )
+        thread.append_message(assistant_message)
+        thread.version += 1
+        self._register_message(assistant_message)
+        self._register_thread_version(thread)
+
+        return RunResult(
+            thread=thread,
+            status=response.status.value,
+            output_text=assistant_text,
+            output_structured=response.output_structured,
+            tool_calls=list(response.tool_calls),
+            tool_returns=list(response.tool_returns),
+            error=error_message,
+            error_code=error_code,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            cost=response.cost,
+            latency_ms=response.latency_ms,
+            model_path=response.model_path,
+            provider_name=response.provider_name,
+            request_id=request.request_id,
+            trace_id=trace_id,
+        )
 
     async def _run_task_body(
         self,
@@ -1051,4 +1282,10 @@ def _timeout(seconds: float):
     return timeout_cm(seconds)
 
 
-__all__ = ["SingleAgentRuntime", "RunResult", "ToolServiceProtocol", "OnEvent"]
+__all__ = [
+    "SingleAgentRuntime",
+    "RunResult",
+    "AgentLoopResult",
+    "ToolServiceProtocol",
+    "OnEvent",
+]

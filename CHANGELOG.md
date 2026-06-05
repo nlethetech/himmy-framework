@@ -14,6 +14,13 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Runtime-owned agentic loop (`SingleAgentRuntime.run_agent_loop`).** A bounded
+  act→observe→re-invoke loop: while a turn calls tools, the runtime feeds the
+  updated thread back for another model turn — until the model answers with no tool
+  calls (`final`), or `max_turns` / `cost_budget` is hit, or a turn FAILS. Returns a
+  typed `AgentLoopResult` (every turn, totals, `stopped_reason`) and emits
+  `AGENT_TURN_STARTED`/`AGENT_TURN_COMPLETED` per turn. Additive — the single-turn
+  `run_task` path is unchanged.
 - **Nepal data connectors (`himmy.connectors`).** Independent, fetch-direct (no
   intermediary). **News:** a curated set of ~20 Nepali outlet RSS feeds via
   `NewsFetcher`, plus a standalone **MCP server** (`python -m
