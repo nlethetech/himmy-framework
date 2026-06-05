@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
+from himmy.api.auth import resolve_workspace
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
     RecommendationListResponse,
@@ -47,6 +48,7 @@ async def list_recommendations(
     offset: int = Query(0, ge=0),
 ) -> RecommendationListResponse:
     """List recommendations (created_at desc), paginated into an envelope (AAEO-8)."""
+    workspace_id = resolve_workspace(request, workspace_id)
     rec_app = _container(request).recommendation_app
     items = await rec_app.list(
         workspace_id=workspace_id,
@@ -85,6 +87,7 @@ async def update_recommendation(
     workspace_id: str | None = None,
 ) -> RecommendationItem:
     """Transition a recommendation's status (404 when unknown/out-of-workspace)."""
+    workspace_id = resolve_workspace(request, workspace_id)
     item = await _container(request).recommendation_app.update_status(
         recommendation_id,
         status=body.status,
@@ -114,6 +117,7 @@ async def get_recommendation_provenance(
     404 when the recommendation is unknown / out-of-workspace or was never graphed.
     """
     rel = [r.strip() for r in relations.split(",") if r.strip()] if relations else None
+    workspace_id = resolve_workspace(request, workspace_id)
     graph = await _container(request).recommendation_app.get_recommendation_lineage(
         recommendation_id, workspace_id=workspace_id, max_depth=max_depth, relations=rel
     )

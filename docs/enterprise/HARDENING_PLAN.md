@@ -36,7 +36,13 @@ The biggest enterprise gap. Today the BFF has an *optional* single shared intern
 compared, with key rotation. There is **no user identity, no roles, and no binding between
 the caller and the tenant they may access.**
 
-### 1.0 — [P0 SECURITY] Close the tenant-isolation hole (IDOR)
+### 1.0 — [P0 SECURITY] Close the tenant-isolation hole (IDOR) — ✅ DONE
+*Shipped: `himmy/api/auth/` (`Principal`, `Authenticator`, `ApiKeyAuthenticator`,
+`resolve_workspace`/`require_workspace`); all 5 routers derive `workspace_id` from the
+verified principal; mapped API keys bind a caller to tenants; offline default is an
+ANONYMOUS all-tenants principal (unchanged). Tests: `tests/api/test_tenant_isolation.py`
+(cross-tenant read/create → 403), `tests/api/test_auth.py`.*
+
 - **Current:** `workspace_id` is a **client-supplied query parameter** threaded into
   `RunAppService.get_run(run_id, workspace_id=...)` (`himmy/api/routers/runs.py:115`,
   `himmy/application/services.py`). The 404-on-mismatch (AAEO-4) only triggers if the

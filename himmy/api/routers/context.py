@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from himmy.api.auth import require_workspace, resolve_workspace
 from himmy.api.models import NOT_FOUND_RESPONSE, UpsertResult
 from himmy.services.context.models import (
     ContextBuildSpec,
@@ -51,8 +52,9 @@ def _container(request: Request) -> Any:
 @router.post("/fields:upsert", response_model=UpsertResult)
 async def upsert_fields(body: UpsertFieldsRequest, request: Request) -> UpsertResult:
     """Bulk-upsert context fields for a subject; returns the saved count."""
+    workspace_id = require_workspace(request, body.workspace_id)
     saved = await _container(request).context_app.upsert_fields(
-        body.workspace_id, body.subject_id, body.fields
+        workspace_id, body.subject_id, body.fields
     )
     return UpsertResult(upserted=len(saved), subject_id=body.subject_id)
 
@@ -64,6 +66,7 @@ async def list_fields(
     workspace_id: str | None = None,
 ) -> list[ContextField]:
     """List the stored context fields for a subject (workspace-scoped, AAEO-4)."""
+    workspace_id = resolve_workspace(request, workspace_id)
     return await _container(request).context_app.list_fields(
         subject_id, workspace_id=workspace_id
     )
@@ -74,9 +77,10 @@ async def build_snapshot(
     body: BuildSnapshotRequest, request: Request
 ) -> ContextSnapshot:
     """Build, persist, and return a context snapshot (stamping workspace scope)."""
+    workspace_id = resolve_workspace(request, body.workspace_id)
     metadata = dict(body.metadata or {})
-    if body.workspace_id is not None:
-        metadata.setdefault("workspace_id", body.workspace_id)
+    if workspace_id is not None:
+        metadata.setdefault("workspace_id", workspace_id)
     return await _container(request).context_app.build_snapshot(
         subject_id=body.subject_id,
         task_id=body.task_id,
@@ -96,6 +100,7 @@ async def get_snapshot(
     workspace_id: str | None = None,
 ) -> ContextSnapshot:
     """Load one context snapshot by id (404 when unknown/out-of-workspace, AAEO-4)."""
+    workspace_id = resolve_workspace(request, workspace_id)
     snapshot = await _container(request).context_app.get_snapshot(
         snapshot_id, workspace_id=workspace_id
     )

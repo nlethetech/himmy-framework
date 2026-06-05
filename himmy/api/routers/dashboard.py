@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from himmy.api.auth import require_workspace
 from himmy.api.models import DashboardSummary
 
 router = APIRouter(prefix="/v1/dashboard", tags=["dashboard"])
@@ -21,6 +22,7 @@ async def dashboard_summary(
     subject_id: str, workspace_id: str, request: Request
 ) -> DashboardSummary:
     """Return the operator overview: context + run/recommendation/eval counts."""
+    workspace_id = require_workspace(request, workspace_id)
     summary = await _container(request).dashboard.summary(
         subject_id=subject_id, workspace_id=workspace_id
     )

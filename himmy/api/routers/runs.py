@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
+from himmy.api.auth import require_workspace, resolve_workspace
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
     RunListResponse,
@@ -73,8 +74,9 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
         prompt=body.task.prompt,
         context=body.task.context,
     )
+    workspace_id = require_workspace(request, body.workspace_id)
     return await _container(request).run_app.create_run(
-        workspace_id=body.workspace_id,
+        workspace_id=workspace_id,
         subject_id=body.subject_id,
         persona=persona,
         task=task,
@@ -92,6 +94,7 @@ async def list_runs(
     offset: int = Query(0, ge=0),
 ) -> RunListResponse:
     """List runs (created_at desc), paginated. Returns a paged envelope (AAEO-8)."""
+    workspace_id = resolve_workspace(request, workspace_id)
     run_app = _container(request).run_app
     items = await run_app.list_runs(
         workspace_id=workspace_id,
@@ -119,6 +122,7 @@ async def get_run(
     workspace_id: str | None = None,
 ) -> RunRecord:
     """Read one run record by id (404 when unknown/out-of-workspace, AAEO-4)."""
+    workspace_id = resolve_workspace(request, workspace_id)
     run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -132,6 +136,7 @@ async def get_run_events(
     workspace_id: str | None = None,
 ) -> list[Any]:
     """Replay the canonical event stream for one run (tenant-scoped, AAEO-4)."""
+    workspace_id = resolve_workspace(request, workspace_id)
     return await _container(request).run_app.get_run_events(
         run_id, workspace_id=workspace_id
     )
@@ -144,6 +149,7 @@ async def get_run_thread(
     workspace_id: str | None = None,
 ) -> Any:
     """Replay the full conversation thread for one run (404 when absent, AAEO-4)."""
+    workspace_id = resolve_workspace(request, workspace_id)
     thread = await _container(request).run_app.get_run_thread(
         run_id, workspace_id=workspace_id
     )
@@ -170,6 +176,7 @@ async def get_run_lineage(
     404 when the run is unknown / out-of-workspace or has no projected lineage.
     """
     rel = [r.strip() for r in relations.split(",") if r.strip()] if relations else None
+    workspace_id = resolve_workspace(request, workspace_id)
     graph = await _container(request).run_app.get_run_lineage(
         run_id, workspace_id=workspace_id, max_depth=max_depth, relations=rel
     )
