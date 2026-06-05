@@ -1,7 +1,13 @@
-"""Orchestrators kernel: declarative multi-step workflows over the runtime."""
+"""Orchestrators kernel: declarative workflows + multi-agent teams over the runtime."""
 
 from __future__ import annotations
 
+from himmy.orchestrators.multi_agent import (
+    AgentTeam,
+    MultiAgentOrchestrator,
+    MultiAgentResult,
+    TeamMember,
+)
 from himmy.orchestrators.workflow import (
     OnEvent,
     Workflow,
@@ -18,4 +24,8 @@ __all__ = [
     "WorkflowStepResult",
     "WorkflowResult",
     "OnEvent",
+    "AgentTeam",
+    "TeamMember",
+    "MultiAgentOrchestrator",
+    "MultiAgentResult",
 ]

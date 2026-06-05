@@ -24,6 +24,9 @@ __all__ = [
     "load_agent_spec",
     "ToolkitConfig",
     "register_packs",
+    "AgentTeam",
+    "TeamMember",
+    "MultiAgentOrchestrator",
     "build_runtime",
     "build_inference",
     "build_storage",
@@ -35,6 +38,7 @@ __all__ = [
 _LAZY = {"build_runtime", "build_inference", "build_storage"}
 _LAZY_CONFIG = {"AgentSpec", "load_agent_spec"}
 _LAZY_TOOLKIT = {"ToolkitConfig", "register_packs"}
+_LAZY_ORCH = {"AgentTeam", "TeamMember", "MultiAgentOrchestrator"}
 
 
 def __getattr__(name: str) -> Any:
@@ -43,6 +47,10 @@ def __getattr__(name: str) -> Any:
         from himmy.runtime import builder
 
         return getattr(builder, name)
+    if name in _LAZY_ORCH:
+        from himmy import orchestrators
+
+        return getattr(orchestrators, name)
     if name in _LAZY_CONFIG:
         from himmy import config
 

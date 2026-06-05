@@ -168,6 +168,55 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------ team
+
+
+def cmd_team(args: argparse.Namespace) -> int:
+    """Run a multi-agent team from a team.yaml: route a prompt and print the trail."""
+    if not args.prompt:
+        _eprint("error: --prompt/-p is required for `himmy team`")
+        return 2
+    from himmy import build_runtime
+    from himmy.config.team_spec import build_team, load_team_spec
+    from himmy.orchestrators import MultiAgentOrchestrator
+
+    spec = load_team_spec(args.file)
+    team, registry = build_team(spec, resolve_tools_module=_resolve_register)
+    inference = build_inference_for(
+        getattr(args, "provider", None), getattr(args, "model", None)
+    )
+    runtime, _inference, _tools = build_runtime(
+        inference=inference, tool_registry=registry
+    )
+    orch = MultiAgentOrchestrator(runtime, team, registry)
+
+    result = asyncio.run(orch.run(args.prompt))
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "handoff_chain": result.handoff_chain,
+                    "final_agent": result.final_agent,
+                    "stopped_reason": result.stopped_reason,
+                    "turn_count": result.turn_count,
+                    "total_cost": result.total_cost,
+                    "output_text": result.output_text,
+                    "transcript": [
+                        {"agent": name, "output": turn.output_text}
+                        for name, turn in result.turns
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        _eprint(f"route: {' → '.join(result.handoff_chain)}  ({result.stopped_reason})")
+        print(result.output_text or "")
+    return 0
+
+
 # ------------------------------------------------------------------------ init
 
 _AGENT_YAML = """\
@@ -218,11 +267,32 @@ def register(registry: ToolRegistry) -> None:
 '''
 
 
+_TEAM_YAML = """\
+# A multi-agent team: a triage agent that hands off to specialists.
+entry: triage
+members:
+  - name: triage
+    description: Decide which specialist should handle the request, then hand off.
+    handoffs: [researcher, writer]
+  - name: researcher
+    description: Gather facts from the web.
+    tool_packs: [web]
+    tools: [web_search, web_fetch]
+    handoffs: [writer]            # may hand the findings to the writer
+  - name: writer
+    description: Write a clear final answer from the conversation so far.
+"""
+
+
 def cmd_init(args: argparse.Namespace) -> int:
-    """Scaffold an ``agent.yaml`` + ``tools.py`` into the target directory."""
+    """Scaffold an ``agent.yaml`` + ``tools.py`` (or a ``team.yaml`` with ``--team``)."""
     target = Path(args.directory).expanduser()
     target.mkdir(parents=True, exist_ok=True)
-    files = {"agent.yaml": _AGENT_YAML, "tools.py": _TOOLS_PY}
+    files = (
+        {"team.yaml": _TEAM_YAML}
+        if args.team
+        else {"agent.yaml": _AGENT_YAML, "tools.py": _TOOLS_PY}
+    )
 
     existing = [name for name in files if (target / name).exists()]
     if existing and not args.force:
@@ -235,7 +305,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     for name, content in files.items():
         (target / name).write_text(content)
         print(f"wrote {target / name}")
-    print(f'\nNext: himmy run -f {target / "agent.yaml"} -p "hello"')
+    if args.team:
+        print(f'\nNext: himmy team -f {target / "team.yaml"} -p "your question"')
+    else:
+        print(f'\nNext: himmy run -f {target / "agent.yaml"} -p "hello"')
     return 0
 
 

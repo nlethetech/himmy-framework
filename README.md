@@ -173,6 +173,46 @@ llama3.2`). With no flag, Himmy uses a real pydantic-ai provider when a key + th
 `providers` extra are present, otherwise the offline stub. The same spec loads in
 Python via `from himmy import load_agent_spec`.
 
+## Multi-agent teams
+
+Agents can collaborate two ways: **handoff** (control transfers to a peer — swarm-style)
+and **delegation** (a manager calls a worker as a tool and gets its result back —
+supervisor / manager-worker). Define a team in a `team.yaml` and run it:
+
+```bash
+himmy init --team myteam            # scaffold myteam/team.yaml
+himmy team -f myteam/team.yaml -p "Research and summarize permaculture."
+```
+
+```yaml
+entry: triage
+members:
+  - name: triage
+    description: Decide who should handle this, then hand off.
+    handoffs: [researcher, writer]
+  - name: researcher
+    description: Gather facts from the web.
+    tool_packs: [web]
+    tools: [web_search, web_fetch]
+    handoffs: [writer]
+    # delegates: [factchecker]   # call a worker as a tool instead of transferring
+  - name: writer
+    description: Write the final answer.
+```
+
+`himmy team` prints the routing trail (`triage → researcher → writer`) and the final
+answer (`--json` for the full transcript). In Python:
+
+```python
+from himmy import build_runtime, MultiAgentOrchestrator
+from himmy.config import load_team_spec, build_team
+
+team, registry = build_team(load_team_spec("myteam/team.yaml"))
+runtime, _inf, _tools = build_runtime(tool_registry=registry)
+result = await MultiAgentOrchestrator(runtime, team, registry).run("...")
+print(result.handoff_chain, result.output_text)
+```
+
 ## Architecture overview
 
 Himmy is organized as a set of independent **kernels** that compose through small

@@ -57,9 +57,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--message", help="run a single turn non-interactively")
     p_chat.set_defaults(func=commands.cmd_chat)
 
+    p_team = sub.add_parser("team", help="run a multi-agent team from a team.yaml")
+    p_team.add_argument("-f", "--file", required=True, help="path to a team.yaml")
+    p_team.add_argument("-p", "--prompt", help="the prompt to route through the team")
+    p_team.add_argument(
+        "--provider", choices=PROVIDERS, help="inference provider (default: auto)"
+    )
+    p_team.add_argument("--model", help="model key/name for the provider")
+    p_team.add_argument("--json", action="store_true", help="print the full transcript")
+    p_team.set_defaults(func=commands.cmd_team)
+
     p_init = sub.add_parser("init", help="scaffold an agent.yaml + tools.py")
     p_init.add_argument("directory", nargs="?", default=".", help="target directory")
     p_init.add_argument("--force", action="store_true", help="overwrite existing files")
+    p_init.add_argument(
+        "--team", action="store_true", help="scaffold a team.yaml instead"
+    )
     p_init.set_defaults(func=commands.cmd_init)
 
     p_serve = sub.add_parser("serve", help="serve the FastAPI BFF (needs api extra)")

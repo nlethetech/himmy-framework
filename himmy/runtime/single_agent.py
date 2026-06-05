@@ -403,6 +403,29 @@ class SingleAgentRuntime:
             cost_offset=0.0,
         )
 
+    async def continue_turn(
+        self,
+        persona: Persona,
+        thread: ChatThread,
+        *,
+        task_context: dict[str, Any] | None = None,
+        llm_config: LLMConfig | None = None,
+    ) -> RunResult:
+        """Run ONE more inference turn on an existing thread (no new user prompt).
+
+        The model sees the thread as-is (including any prior tool results) and either
+        calls more tools or produces a final answer. ``task_context`` carries the
+        recognized run knobs (``tool_names``, ``model_key``, ``output_schema``), so a
+        multi-agent orchestrator can switch the bound tool set / model per turn. This
+        is the public seam over the runtime's own continuation step (used by
+        :meth:`run_agent_loop`).
+        """
+        ctx = dict(task_context or {})
+        trace_id = f"{thread.thread_id}:continue"
+        return await self._continue_turn(
+            persona, thread, ctx, trace_id, llm_config=llm_config
+        )
+
     async def resume_agent_loop(
         self,
         checkpoint_id: str,

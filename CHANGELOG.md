@@ -14,6 +14,18 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Multi-agent teams: handoff + supervisor delegation (`himmy.orchestrators`).** A
+  `MultiAgentOrchestrator` routes a task across an `AgentTeam` of `TeamMember`s over a
+  shared thread. Two collaboration edges: **handoff** (`handoffs`) binds a synthetic
+  `transfer_to_<peer>` tool and the orchestrator transfers control when the model calls
+  it (detected from `RunResult.tool_calls`); **delegation** (`delegates`) binds an
+  `ask_<worker>` tool whose handler runs the worker to completion in its own sub-thread
+  and returns its answer (control stays with the manager). New `AGENT_HANDOFF` /
+  `AGENT_DELEGATED` events; a public `SingleAgentRuntime.continue_turn` exposes the
+  runtime's own continuation step (no new user prompt) that the orchestrator drives.
+  Teams are declarative (`team.yaml` → `himmy.config.TeamSpec`/`build_team`) and runnable
+  via `himmy team -f team.yaml -p ...` (`himmy init --team` scaffolds one); the CLI prints
+  the routing trail + final answer. No new dependencies.
 - **Toolkit wave 2: +8 tools in 4 packs (`himmy.toolkit`).** Closes the recall/act/
   source gaps on top of the original five packs. `knowledge` (`kb_ingest`, `kb_search`)
   wraps the existing `KnowledgeBase`/RAG so an agent can build and semantically search

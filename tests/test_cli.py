@@ -110,6 +110,35 @@ def test_run_with_tool_packs(
     assert code == 0
 
 
+def test_team_command_routes_and_prints(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`himmy team` runs a team.yaml, routing a prompt through a handoff."""
+    (tmp_path / "team.yaml").write_text(
+        "entry: triage\n"
+        "members:\n"
+        "  - name: triage\n"
+        "    description: route\n"
+        "    handoffs: [writer]\n"
+        "  - name: writer\n"
+        "    description: write\n"
+    )
+    code = main(
+        ["team", "-f", str(tmp_path / "team.yaml"), "--provider", "stub", "-p", "hi"]
+    )
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "triage → writer" in err  # the routing trail
+
+
+def test_init_team_scaffold(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`himmy init --team` writes a team.yaml."""
+    target = tmp_path / "t"
+    assert main(["init", "--team", str(target)]) == 0
+    assert (target / "team.yaml").exists()
+    assert not (target / "agent.yaml").exists()
+
+
 def test_run_structured_output_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
