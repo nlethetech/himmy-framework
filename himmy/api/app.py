@@ -25,6 +25,7 @@ from himmy.api.auth import (
 )
 from himmy.api.deps import ApiContainer
 from himmy.api.models import ErrorResponse
+from himmy.api.ratelimit import build_rate_limiter
 from himmy.api.routers import (
     audit,
     context,
@@ -60,9 +61,10 @@ def set_rate_limiter(limiter: RateLimiter | None) -> None:
 
 
 async def _rate_limit_dependency(request: Request) -> None:
-    """Apply the installed rate-limit hook (no-op by default)."""
-    if _RATE_LIMITER is not None:
-        _RATE_LIMITER(request)
+    """Apply the app's rate limiter (or the global hook); no-op by default."""
+    limiter = getattr(request.app.state, "rate_limiter", None) or _RATE_LIMITER
+    if limiter is not None:
+        limiter(request)
 
 
 def _build_lifespan(container: ApiContainer):
@@ -125,9 +127,10 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
         title="Himmy API",
         version="0.1.0",
         description="Backend-for-frontend over the Himmy application services.",
+        # Authenticate first (so the limiter can key on the principal), then throttle.
         dependencies=[
-            Depends(_rate_limit_dependency),
             Depends(principal_dependency),
+            Depends(_rate_limit_dependency),
         ],
         lifespan=_build_lifespan(container),
     )
@@ -138,6 +141,8 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
     app.state.access_policy = build_access_policy()
     # Security audit: auth/authz/access events as tamper-evident entities (WS1.4).
     app.state.security_audit = SecurityAuditLog(container.entity_registry)
+    # Rate limiting: per-principal/IP token bucket (WS3.2), off unless configured.
+    app.state.rate_limiter = build_rate_limiter()
 
     instrument_fastapi(app)
 
