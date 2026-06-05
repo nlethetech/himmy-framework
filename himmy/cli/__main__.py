@@ -61,6 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat = sub.add_parser("chat", help="interactive chat keeping one thread")
     _add_agent_flags(p_chat)
     p_chat.add_argument("--message", help="run a single turn non-interactively")
+    p_chat.add_argument(
+        "--session", help="persist/resume this conversation by id (.himmy/sessions.db)"
+    )
     p_chat.set_defaults(func=commands.cmd_chat)
 
     p_team = sub.add_parser("team", help="run a multi-agent team from a team.yaml")

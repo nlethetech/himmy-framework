@@ -14,6 +14,15 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Project config (`himmy.toml`) + chat session persistence.** A `himmy.toml`
+  (`himmy.config.load_project_config`; cwd or `~/.himmy/config.toml`) sets per-project
+  `[defaults]` (provider, model, tool_packs, guardrails) and `[toolkit]` (embedder,
+  memory_path…) so you don't pass flags or export many `HIMMY_*` vars — precedence is
+  **CLI flag > env > himmy.toml > built-in** (`ToolkitConfig.from_sources` overlays the
+  toml under the env). `himmy init` scaffolds a starter `himmy.toml` and `himmy doctor`
+  shows the resolved source. `himmy chat --session <id>` persists the conversation to
+  `.himmy/sessions.db` (`SqliteSessionStore`) and resumes it next invocation. No new deps
+  (stdlib `tomllib`/`sqlite3`).
 - **`himmy trace` run inspector (`himmy.services.observability.trace`).** Real agent runs
   are now debuggable: `himmy run --trace` prints and saves a chronological, indented event
   timeline (run → inference → tool call/return → handoff/delegate, with latencies + a

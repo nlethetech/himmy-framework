@@ -64,15 +64,44 @@ def _resolve_register(dotted: str) -> Callable[[Any], Any]:
     return fn
 
 
+_PROJECT_CACHE: dict[str, Any] | None = None
+
+
+def _project() -> dict[str, Any]:
+    """Load (and cache) the ``himmy.toml`` project config for this invocation."""
+    global _PROJECT_CACHE
+    if _PROJECT_CACHE is None:
+        from himmy.config.project import load_project_config
+
+        _PROJECT_CACHE = load_project_config()
+    return _PROJECT_CACHE
+
+
+def _apply_defaults(spec: AgentSpec) -> AgentSpec:
+    """Fill unset spec fields from ``himmy.toml`` ``[defaults]`` (spec/flag still win)."""
+    defaults = _project().get("defaults", {})
+    if spec.provider is None and defaults.get("provider"):
+        spec.provider = defaults["provider"]
+    if spec.model == "default" and defaults.get("model"):
+        spec.model = defaults["model"]
+    if not spec.tool_packs and defaults.get("tool_packs"):
+        spec.tool_packs = list(defaults["tool_packs"])
+    if not spec.guardrails and defaults.get("guardrails"):
+        spec.guardrails = list(defaults["guardrails"])
+    return spec
+
+
 def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
     """Build the AgentSpec from ``-f file`` or ad-hoc ``--name``/``--instruction``."""
     if getattr(args, "file", None):
-        return load_agent_spec(args.file)
-    return AgentSpec(
-        name=getattr(args, "name", None) or "himmy-agent",
-        description="Ad-hoc agent created from CLI flags.",
-        instructions=list(getattr(args, "instruction", None) or []),
-    )
+        spec = load_agent_spec(args.file)
+    else:
+        spec = AgentSpec(
+            name=getattr(args, "name", None) or "himmy-agent",
+            description="Ad-hoc agent created from CLI flags.",
+            instructions=list(getattr(args, "instruction", None) or []),
+        )
+    return _apply_defaults(spec)
 
 
 def _build_runtime_for(
@@ -105,7 +134,8 @@ def _build_runtime_for(
         if spec.tool_packs:
             from himmy.toolkit import ToolkitConfig, register_packs
 
-            register_packs(registry, spec.tool_packs, ToolkitConfig.from_env())
+            tk_config = ToolkitConfig.from_sources(_project().get("toolkit"))
+            register_packs(registry, spec.tool_packs, tk_config)
         if spec.tools_module:
             _resolve_register(spec.tools_module)(registry)
         if pipeline is not None:
@@ -209,6 +239,26 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
     from himmy.agents.base_agent.thread import ChatThread
 
+    # Optional durable session: load the thread + persist after every turn.
+    session_id = getattr(args, "session", None)
+    store = None
+    if session_id:
+        from himmy.runtime.session import SqliteSessionStore
+
+        Path(".himmy").mkdir(exist_ok=True)
+        store = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
+
+    def _new_thread() -> Any:
+        if store is not None:
+            existing = store.load(str(session_id))
+            if existing is not None:
+                return existing
+        return ChatThread(agent_id=persona.agent_id)
+
+    def _persist(thread: Any) -> None:
+        if store is not None:
+            store.save(str(session_id), thread)
+
     async def _stream(thread: Any, text: str) -> None:
         """Stream one reply to stdout token-by-token (appends to ``thread``)."""
         async for delta in runtime.stream_task(
@@ -218,14 +268,19 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 sys.stdout.write(delta.delta)
                 sys.stdout.flush()
         sys.stdout.write("\n")
+        _persist(thread)
 
     if args.message:
-        result = asyncio.run(_turn(None, args.message))
+        thread = _new_thread()
+        result = asyncio.run(_turn(thread, args.message))
+        _persist(result.thread)
         print(result.output_text or "")
         return 0 if result.succeeded else 1
 
     _eprint(f"himmy chat — {persona.name} ({persona.role}). /exit, /reset, /help.")
-    thread = ChatThread(agent_id=persona.agent_id)
+    if session_id:
+        _eprint(f"(session: {session_id})")
+    thread = _new_thread()
     while True:
         try:
             line = input("you> ").strip()
@@ -238,6 +293,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             break
         if line == "/reset":
             thread = ChatThread(agent_id=persona.agent_id)
+            _persist(thread)
             _eprint("(thread reset)")
             continue
         if line == "/help":
@@ -419,6 +475,20 @@ members:
 """
 
 
+_HIMMY_TOML = """\
+# Project defaults for the himmy CLI. Precedence: CLI flag > env > this file > built-in.
+[defaults]
+# provider = "ollama"          # stub | claude-cli | ollama | pydantic-ai
+# model = "qwen2.5:3b-instruct"
+# tool_packs = ["web", "utils"]
+# guardrails = ["pii"]
+
+[toolkit]
+# embedder = "ollama"          # deterministic | ollama | fastembed | openai
+# memory_path = ".himmy/memory.db"
+"""
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Scaffold an ``agent.yaml`` + ``tools.py`` (or a ``team.yaml`` with ``--team``)."""
     target = Path(args.directory).expanduser()
@@ -426,7 +496,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     files = (
         {"team.yaml": _TEAM_YAML}
         if args.team
-        else {"agent.yaml": _AGENT_YAML, "tools.py": _TOOLS_PY}
+        else {
+            "agent.yaml": _AGENT_YAML,
+            "tools.py": _TOOLS_PY,
+            "himmy.toml": _HIMMY_TOML,
+        }
     )
 
     existing = [name for name in files if (target / name).exists()]
@@ -521,6 +595,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(
         f"\nguardrails (agent.yaml `guardrails: [...]`): {', '.join(BUILTIN_GUARDRAILS)}"
     )
+
+    from himmy.config.project import find_project_config
+
+    cfg = find_project_config()
+    print(f"\nproject config: {cfg if cfg else '(none — using env + defaults)'}")
     return 0
 
 

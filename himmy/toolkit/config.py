@@ -127,6 +127,39 @@ class ToolkitConfig(BaseModel):
             memory_subject=env.get("HIMMY_MEMORY_SUBJECT", "default"),
         )
 
+    @classmethod
+    def from_sources(cls, toml_toolkit: dict[str, Any] | None = None) -> ToolkitConfig:
+        """Build from ``himmy.toml`` ``[toolkit]`` defaults overlaid by the environment.
+
+        Precedence is **env > himmy.toml > built-in default**: the toml values seed the
+        config, then any field whose ``HIMMY_*`` env var is set wins.
+        """
+        base = {k: v for k, v in (toml_toolkit or {}).items() if k in cls.model_fields}
+        config = cls(**base)
+        env_config = cls.from_env()
+        overrides = {
+            field: getattr(env_config, field)
+            for field, env_key in _TOOLKIT_ENV_KEYS.items()
+            if env_key in os.environ
+        }
+        return config.model_copy(update=overrides)
+
+
+#: Toolkit fields a ``himmy.toml`` may set, paired with the env var that overrides each.
+_TOOLKIT_ENV_KEYS: dict[str, str] = {
+    "fs_root": "HIMMY_FS_ROOT",
+    "fs_allow_write": "HIMMY_FS_ALLOW_WRITE",
+    "search_backend": "HIMMY_SEARCH_BACKEND",
+    "sqlite_path": "HIMMY_SQLITE_PATH",
+    "kb_dsn": "HIMMY_KB_DSN",
+    "embedder": "HIMMY_EMBEDDER",
+    "embedder_model": "HIMMY_EMBEDDER_MODEL",
+    "embedder_dim": "HIMMY_EMBEDDER_DIM",
+    "ollama_base_url": "HIMMY_OLLAMA_URL",
+    "memory_path": "HIMMY_MEMORY_PATH",
+    "memory_subject": "HIMMY_MEMORY_SUBJECT",
+}
+
 
 def _env_bool(value: str | None, *, default: bool) -> bool:
     """Parse a truthy/falsey env string (``1/true/yes/on``), else ``default``."""
