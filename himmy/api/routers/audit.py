@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from himmy.api.auth import require_permission, resolve_workspace
+from himmy.entities.integrity import AuditBundle
 from himmy.services.audit.models import SecurityEvent
 
 router = APIRouter(prefix="/v1/audit", tags=["audit"])
@@ -37,6 +38,37 @@ async def list_security_events(
     if log is None:
         return []
     return log.recent(limit=limit, workspace_id=workspace_id, event_type=event_type)
+
+
+@router.get("/bundle", response_model=AuditBundle, dependencies=_AUDIT_READ)
+async def export_audit_bundle_route(request: Request) -> AuditBundle:
+    """Export a signed, tamper-evident bundle over the security-audit trail (WS4.5).
+
+    Signs with Ed25519 when ``HIMMY_AUDIT_PRIVATE_KEY`` (PEM) is configured — an
+    auditor then verifies offline with the public key alone — else HMAC with
+    ``HIMMY_AUDIT_SECRET``. The bundle commits to every ``security_event`` entity, so
+    tampering with the log after the fact is detectable.
+    """
+    from himmy.config.secrets import get_secret
+    from himmy.entities.integrity import (
+        export_audit_bundle,
+        export_audit_bundle_ed25519,
+    )
+    from himmy.services.audit.log import SECURITY_EVENT_KIND
+
+    registry = _container(request).entity_registry
+    records = registry.list_by_kind(SECURITY_EVENT_KIND)
+    private_pem = get_secret("HIMMY_AUDIT_PRIVATE_KEY")
+    if private_pem:
+        return export_audit_bundle_ed25519(records, [], private_pem=private_pem)
+    secret = get_secret("HIMMY_AUDIT_SECRET")
+    if secret:
+        return export_audit_bundle(records, [], secret=secret)
+    raise HTTPException(
+        status_code=503,
+        detail="audit signing key not configured "
+        "(set HIMMY_AUDIT_PRIVATE_KEY or HIMMY_AUDIT_SECRET)",
+    )
 
 
 __all__ = ["router"]

@@ -254,7 +254,23 @@ default) in `create_app`. Tests: `tests/config/test_secrets.py`, `tests/api/test
 
 ---
 
-## 4. WS4 — Data Governance & Compliance
+## 4. WS4 — Data Governance & Compliance — ✅ DONE
+
+*Shipped: **4.1** `himmy/services/guardrails/dlp.py` — DLP as policy (allow/redact/tokenize/
+block per class, reversible `TokenVault`, audited counts, optional Presidio); **4.2**
+`himmy/services/governance/retention.py` — right-to-erasure via crypto-shred
+(`SubjectKeyVault`) + immutable erasure tombstone, age-based `expired`; **4.3**
+`himmy/config/residency.py` — region pinning (`enforce_region`); **4.4**
+`himmy/services/storage/encryption.py` — envelope AES-GCM `FieldEncryptor`/`RecordCipher`
+(AAD-bound, opt-in via `HIMMY_ENCRYPTION_KEY`); **4.5** Ed25519-signed audit bundles
+(`himmy/entities/integrity.py`) + `GET /v1/audit/bundle` (auditor-gated). New extras
+`dlp`/`encryption`. Tests across `tests/guardrails/test_dlp.py`,
+`tests/storage/test_encryption.py`, `tests/config/test_residency.py`,
+`tests/entities/test_audit_signing.py`, `tests/governance/test_retention.py`,
+`tests/api/test_audit_bundle.py`. NOTE (4.4): ships the encryption capability + helpers;
+transparent whole-store wiring is the documented opt-in deployment step.*
+
+### 4-orig — Data Governance & Compliance
 
 ### 4.1 — PII as a compliance control (not just a filter)
 - **Current:** `PIIGuardrail`/`NepalPIIGuardrail` are regex redactors at 3 surfaces

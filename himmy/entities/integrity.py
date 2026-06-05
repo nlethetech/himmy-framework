@@ -27,6 +27,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from himmy.core.errors import HimmyError
 from himmy.entities.records import EntityLink, EntityRecord
 
 #: Bumped if the canonical-serialization or Merkle scheme ever changes.
@@ -202,6 +203,109 @@ def verify_audit_bundle(
     )
 
 
+# --------------------------------------------------------- Ed25519 (asymmetric)
+# An asymmetric option (WS4.5): the auditor verifies with only the PUBLIC key, so the
+# signing secret never has to be shared with verifiers — stronger non-repudiation than
+# the shared-secret HMAC. Keys are PEM strings (the private key ideally lives in an HSM
+# / KMS); ``cryptography`` is required.
+
+
+def generate_ed25519_keypair() -> tuple[str, str]:
+    """Generate an Ed25519 keypair; return ``(private_pem, public_pem)``."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private = Ed25519PrivateKey.generate()
+    private_pem = private.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("ascii")
+    public_pem = (
+        private.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("ascii")
+    )
+    return private_pem, public_pem
+
+
+def _sign_ed25519(merkle_root: str, private_pem: str) -> str:
+    """Ed25519-sign the Merkle root; return a hex signature."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key = serialization.load_pem_private_key(private_pem.encode("ascii"), password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise HimmyError("audit signing key must be an Ed25519 private key")
+    return key.sign(merkle_root.encode("utf-8")).hex()
+
+
+def _verify_ed25519(merkle_root: str, signature_hex: str, public_pem: str) -> bool:
+    """Verify an Ed25519 signature over the Merkle root with the public key."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    key = serialization.load_pem_public_key(public_pem.encode("ascii"))
+    if not isinstance(key, Ed25519PublicKey):
+        return False
+    try:
+        key.verify(bytes.fromhex(signature_hex), merkle_root.encode("utf-8"))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def export_audit_bundle_ed25519(
+    records: list[EntityRecord],
+    links: list[EntityLink],
+    *,
+    private_pem: str,
+) -> AuditBundle:
+    """Freeze + Ed25519-sign a graph's integrity (verifiable with the public key)."""
+    record_hashes = {r.record_id: content_hash(r) for r in records}
+    link_hashes = {link.link_id: link_hash(link) for link in links}
+    root = _merkle_root(list(record_hashes.values()) + list(link_hashes.values()))
+    return AuditBundle(
+        records=record_hashes,
+        links=link_hashes,
+        merkle_root=root,
+        signature=_sign_ed25519(root, private_pem),
+        algorithm="Ed25519",
+    )
+
+
+def verify_audit_bundle_ed25519(
+    bundle: AuditBundle,
+    records: list[EntityRecord],
+    links: list[EntityLink],
+    *,
+    public_pem: str,
+) -> VerificationResult:
+    """Verify an Ed25519-signed bundle against a live graph (public-key only)."""
+    base = verify_audit_bundle(bundle, records, links, secret=b"")
+    signature_valid = _verify_ed25519(bundle.merkle_root, bundle.signature, public_pem)
+    return base.model_copy(
+        update={
+            "signature_valid": signature_valid,
+            "ok": signature_valid
+            and not any(
+                [
+                    base.tampered_record_ids,
+                    base.missing_record_ids,
+                    base.added_record_ids,
+                    base.tampered_link_ids,
+                    base.missing_link_ids,
+                    base.added_link_ids,
+                ]
+            ),
+        }
+    )
+
+
 __all__ = [
     "AUDIT_BUNDLE_VERSION",
     "AuditBundle",
@@ -210,4 +314,7 @@ __all__ = [
     "link_hash",
     "export_audit_bundle",
     "verify_audit_bundle",
+    "generate_ed25519_keypair",
+    "export_audit_bundle_ed25519",
+    "verify_audit_bundle_ed25519",
 ]
