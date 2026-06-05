@@ -14,6 +14,22 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Nepali-language RAG (`himmy.nepal.language`).** Cross-script retrieval:
+  `transliterate` (Devanagari→Roman), `normalize_nepali` (script-folds so
+  `नेपाल`/`Nepal`/`nepal` all become `nepal`), and `NepaliEmbedder` (wraps any
+  embedder, embedding the folded form) — so a query in one script finds documents
+  in another (verified both directions over the offline DeterministicEmbedder).
+- **Local-model client managers + cost-aware routing.** `OllamaClientManager`
+  (local Ollama `/api/chat`), `ClaudeCliClientManager` (the local `claude` CLI —
+  not HTTP), and `HimalayaGptClientManager` (self-hosted Transformers) — each with
+  an injectable transport/runner/generate-fn (offline-testable) and `$0` cost.
+  `RoutingClientManager.cost_ordered` tries cheapest routes first (free local
+  before paid cloud, cloud only on failover). (OpenAI/Claude/Gemini/OpenAI-compatible
+  already work via `PydanticAIClientManager`.)
+- **Bikram Sambat calendar (`himmy.nepal`).** A typed BS calendar on the
+  authoritative `nepali-datetime` library (`nepal` extra): `BikramDate` (AD<->BS,
+  today, month/weekday names in English or Devanagari) and the Nepal fiscal year
+  (starts Shrawan 1).
 - **Human-in-the-loop pause/resume.** Tool approval is no longer a terminal deny:
   `run_agent_loop(..., hitl=True)` PAUSES when the model calls a tool that requires
   approval — persisting a durable `AgentCheckpoint` (full thread + persona/task/

@@ -13,6 +13,12 @@ from himmy.nepal.calendar import (
     nepali_fiscal_year,
     today_bs,
 )
+from himmy.nepal.language import (
+    NepaliEmbedder,
+    is_devanagari,
+    normalize_nepali,
+    transliterate,
+)
 
 __all__ = [
     "BikramDate",
@@ -24,4 +30,8 @@ __all__ = [
     "NEPALI_MONTHS_NE",
     "NEPALI_WEEKDAYS_EN",
     "NEPALI_WEEKDAYS_NE",
+    "is_devanagari",
+    "transliterate",
+    "normalize_nepali",
+    "NepaliEmbedder",
 ]
