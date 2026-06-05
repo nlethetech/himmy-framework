@@ -21,8 +21,11 @@ providers, Postgres/pgvector, and observability.
   `search_news` to any MCP client. **NRB:** `NRBClient.forex` (the public
   forex JSON API), `list_macro_reports` (monthly Current Macroeconomic & Financial
   Situation reports via the category feed, with language/period parsed), and
-  `fetch_macro_workbook`/`parse_workbook` (download + parse a report's Excel into
-  sheet rows). `register_nrb_tools` wires NRB into the ToolService. All behind an
+  `fetch_latest_macro_workbook`/`fetch_macro_workbook`/`parse_workbook` — the macro
+  Excel is auto-discovered + fetched (NRB's 'Tables' report URLs serve the .xlsx
+  directly; no URL needed for the latest), then every sheet parsed with openpyxl
+  (live: ~93 sheets of CPI/WPI/GDP data). `register_nrb_tools` wires NRB into the
+  ToolService. All behind an
   injectable `Fetcher` seam, so the whole layer is offline-testable; live-verified
   against NRB + the feeds. New `connectors` extra (feedparser + openpyxl).
 - **Tamper-evident audit (`himmy.entities.integrity`).** A deterministic SHA-256

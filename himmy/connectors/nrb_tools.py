@@ -37,10 +37,18 @@ def register_nrb_tools(
         return {"count": len(reports), "reports": [r.model_dump() for r in reports]}
 
     async def _workbook(args: dict[str, Any]) -> dict[str, Any]:
-        report_url = str(args.get("report_url", ""))
-        workbook = await asyncio.to_thread(nrb.fetch_macro_workbook, report_url)
+        report_url = args.get("report_url")
+        if report_url:
+            workbook = await asyncio.to_thread(
+                nrb.fetch_macro_workbook, str(report_url)
+            )
+        else:
+            # No URL: auto-discover the latest 'Tables' macro workbook.
+            workbook = await asyncio.to_thread(nrb.fetch_latest_macro_workbook)
         return {
             "found": workbook is not None,
+            "source_url": workbook.source_url if workbook is not None else None,
+            "sheets": workbook.sheet_names() if workbook is not None else [],
             "workbook": workbook.model_dump() if workbook is not None else None,
         }
 
@@ -76,11 +84,18 @@ def register_nrb_tools(
         registry,
         name="nrb_macro_workbook",
         handler=_workbook,
-        description="Download + parse a macro report's Excel workbook into sheet rows.",
+        description=(
+            "Download + parse a macro report's Excel workbook into sheet rows. "
+            "Omit report_url to auto-discover the latest 'Tables' workbook."
+        ),
         args_json_schema={
             "type": "object",
-            "properties": {"report_url": {"type": "string"}},
-            "required": ["report_url"],
+            "properties": {
+                "report_url": {
+                    "type": "string",
+                    "description": "optional; defaults to the latest Tables report",
+                }
+            },
         },
         requires_approval=requires_approval,
         metadata={"backend": "nrb"},

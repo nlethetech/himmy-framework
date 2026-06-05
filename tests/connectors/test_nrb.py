@@ -72,6 +72,33 @@ def test_fetch_macro_workbook_finds_link_and_parses() -> None:
 
 
 def test_fetch_macro_workbook_returns_none_without_link() -> None:
-    """A JS-only report page (no static .xlsx) yields None, not an error."""
+    """A plain page with no spreadsheet (and not itself a workbook) yields None."""
     fetcher = FixtureFetcher(text="<html><body>no spreadsheet here</body></html>")
     assert NRBClient(fetcher=fetcher).fetch_macro_workbook("https://x/red/y/") is None
+
+
+def test_fetch_macro_workbook_parses_direct_excel() -> None:
+    """A report URL that serves the .xlsx directly is parsed (NRB 'Tables' case)."""
+    xlsx = _xlsx([["Indicator", "Value"], ["CPI", 105.2]])
+    report_url = "https://www.nrb.org.np/red/macro-tables-9m/"
+    workbook = NRBClient(fetcher=FixtureFetcher(data=xlsx)).fetch_macro_workbook(
+        report_url
+    )
+    assert workbook is not None
+    assert workbook.source_url == report_url  # the report URL was the workbook
+    assert workbook.sheets["Macro"][1][0] == "CPI"
+
+
+def test_fetch_latest_macro_workbook_auto_discovers() -> None:
+    """With no URL, it lists reports, picks the Tables variant, and parses it."""
+    feed = (_FIX / "nrb_macro_feed.xml").read_bytes()
+    xlsx = _xlsx([["a", "b"], [1, 2]])
+    fetcher = FixtureFetcher(
+        routes=[
+            ("current-macroeconomic-situation/feed", feed),
+            ("tables-based-on", xlsx),
+        ]
+    )
+    workbook = NRBClient(fetcher=fetcher).fetch_latest_macro_workbook()
+    assert workbook is not None
+    assert workbook.sheet_names()

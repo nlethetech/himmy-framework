@@ -5,12 +5,15 @@ Fetches DIRECTLY from NRB's public surface (no intermediary):
 * :meth:`NRBClient.forex` / :meth:`latest_forex` — the public forex JSON API
   (``/api/forex/v1/rates``), normalized into :class:`ForexRate`s.
 * :meth:`list_macro_reports` — the monthly "Current Macroeconomic & Financial
-  Situation" reports, listed via NRB's category RSS feed (the page itself is
-  JS-rendered; the feed is the reliable, structured index).
-* :meth:`fetch_macro_workbook` / :meth:`parse_workbook` — download a report's Excel
-  workbook (when the report page links one) and parse every sheet into rows with
-  ``openpyxl``. ``parse_workbook`` works on any ``.xlsx`` bytes, so the Excel
-  capability is fully exercisable offline.
+  Situation" reports, listed via NRB's category RSS feed (Nepali / English /
+  Tables variants, with language + data period parsed out).
+* :meth:`fetch_latest_macro_workbook` / :meth:`fetch_macro_workbook` /
+  :meth:`parse_workbook` — auto-discover and download the macro Excel. NRB's
+  'Tables' report URLs serve the ``.xlsx`` directly (a download response), so
+  ``fetch_macro_workbook`` parses the fetched bytes as a workbook (falling back to
+  scanning an HTML page for a linked spreadsheet), and ``fetch_latest_macro_workbook``
+  needs no URL at all — it finds the newest Tables report and parses every sheet
+  with ``openpyxl``. (Live: ~93 sheets of CPI/WPI/GDP/etc. data.)
 """
 
 from __future__ import annotations
@@ -63,6 +66,11 @@ def _detect_period(title: str) -> str | None:
 def _find_workbook_link(html: str) -> str | None:
     match = _XLS_RE.search(html)
     return match.group(0) if match else None
+
+
+def _looks_like_workbook(data: bytes) -> bool:
+    """True when ``data`` is a spreadsheet by magic bytes (xlsx zip / legacy xls)."""
+    return data[:4] == b"PK\x03\x04" or data[:4] == b"\xd0\xcf\x11\xe0"
 
 
 class NRBClient:
@@ -142,19 +150,38 @@ class NRBClient:
         return reports
 
     def fetch_macro_workbook(self, report_url: str) -> Workbook | None:
-        """Download + parse a report's Excel workbook, if one is linked.
+        """Download + parse a report's Excel workbook (auto-discovering the source).
 
-        Returns the parsed :class:`Workbook`, or None when the report page exposes
-        no downloadable ``.xlsx``/``.xls`` (some are JS-only — pass a direct
-        workbook URL to :meth:`parse_workbook` in that case).
+        NRB's 'Tables' report URLs serve the ``.xlsx`` *directly* (a download
+        response), so this first tries to parse the fetched bytes AS a workbook; if
+        it instead got an HTML page, it scans that page for a linked ``.xlsx``/
+        ``.xls`` and fetches that. Returns None only when neither yields a workbook.
         """
-        html = self._fetcher.get_text(report_url)
-        link = _find_workbook_link(html)
+        data = self._fetcher.get_bytes(report_url)
+        if _looks_like_workbook(data):
+            try:
+                workbook = self.parse_workbook(data)
+                workbook.source_url = report_url
+                return workbook
+            except Exception:  # noqa: BLE001 - not really a workbook; try the HTML path
+                pass
+        link = _find_workbook_link(data.decode("utf-8", "replace"))
         if link is None:
             return None
         workbook = self.parse_workbook(self._fetcher.get_bytes(link))
         workbook.source_url = link
         return workbook
+
+    def fetch_latest_macro_workbook(self) -> Workbook | None:
+        """Auto-discover + fetch the latest macro **Tables** workbook (no URL needed).
+
+        Lists the macro reports, picks the newest 'Tables' variant (the one that
+        carries the spreadsheet), and downloads + parses it.
+        """
+        for report in self.list_macro_reports(limit=20):
+            if report.language == "tables":
+                return self.fetch_macro_workbook(report.url)
+        return None
 
     @staticmethod
     def parse_workbook(data: bytes) -> Workbook:
@@ -166,13 +193,20 @@ class NRBClient:
                 "Excel parsing requires the [connectors] extra "
                 "(pip install 'himmy[connectors]')."
             ) from exc
-        book = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        sheets: dict[str, list[list[object]]] = {}
-        for sheet in book.worksheets:
-            sheets[sheet.title] = [
-                list(row) for row in sheet.iter_rows(values_only=True)
-            ]
-        book.close()
+        import warnings
+
+        with warnings.catch_warnings():
+            # NRB workbooks use extensions openpyxl warns (harmlessly) about.
+            warnings.simplefilter("ignore")
+            book = openpyxl.load_workbook(
+                io.BytesIO(data), read_only=True, data_only=True
+            )
+            sheets: dict[str, list[list[object]]] = {}
+            for sheet in book.worksheets:
+                sheets[sheet.title] = [
+                    list(row) for row in sheet.iter_rows(values_only=True)
+                ]
+            book.close()
         return Workbook(sheets=sheets)
 
 
