@@ -8,6 +8,22 @@ providers, Postgres/pgvector, and observability.
 ## [Unreleased]
 
 ### Added
+- **Deterministic record-and-replay of agent runs.** `himmy run --record FILE` captures
+  every model response to a portable cassette; `himmy run --replay FILE` re-runs the agent
+  exactly from it — no provider, no network, no tool side effects — so debugging a failure
+  becomes "step through the exact trace" instead of "rerun and hope." Matching is by the
+  request's content hash (`compute_cache_key`, which excludes the random `request_id`), so
+  a re-run replays identically; duplicate/retry calls replay FIFO; a miss is a strict
+  `ReplayError`. Verified live: a recorded multi-turn Ollama run replays byte-identically
+  with the provider unreachable.
+- **Automatic context compaction.** Long multi-turn runs that would overflow the context
+  window now summarize their oldest turns in place once the thread crosses a token budget
+  (`compact_context: true`, `compact_after_tokens`, `compact_keep_recent` in `agent.yaml`).
+  Invariants: never touch the system head, always keep the recent tail verbatim, and never
+  split a tool_call from its tool_return (the boundary snaps back); the summary is only
+  applied if it actually shrinks the context, and a `CONTEXT_COMPACTED` event records what
+  was condensed. Verified live on Ollama: a budgeted multi-turn run compacts mid-loop and
+  still answers correctly.
 - **Skills — first-class agent capabilities.** A skill bundles the tools a job needs with
   the know-how to use them; declaring `skills: [data_analysis]` in `agent.yaml` binds the
   tools *and* injects the guidance, no separate `tool_packs`/instructions. Skills are

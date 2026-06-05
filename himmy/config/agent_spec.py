@@ -69,6 +69,11 @@ class AgentSpec(BaseModel):
     guardrails: list[str] = []
     memory: bool = False  # auto-recall long-term memory into the prompt each run
     memory_top_k: int = 5
+    # Auto-compaction: summarize old turns once the thread crosses the token budget,
+    # so long multi-turn runs don't overflow the context window.
+    compact_context: bool = False
+    compact_after_tokens: int = 3000
+    compact_keep_recent: int = 6
     language: str = "en"  # "ne" → instruct the agent to respond in Nepali (Devanagari)
     output_schema: dict[str, Any] | None = None
     metadata: dict[str, Any] = {}
@@ -117,6 +122,11 @@ class AgentSpec(BaseModel):
             context["tool_names"] = list(self.tools)
         if self.metadata.get("skill_routing_hints"):
             context["skill_routing_hints"] = list(self.metadata["skill_routing_hints"])
+        if self.compact_context:
+            context["compaction_spec"] = {
+                "max_tokens": self.compact_after_tokens,
+                "keep_recent": self.compact_keep_recent,
+            }
         if self.output_schema is not None:
             context["output_schema"] = self.output_schema
         if self.memory:

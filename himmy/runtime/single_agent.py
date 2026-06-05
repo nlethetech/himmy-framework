@@ -902,6 +902,84 @@ class SingleAgentRuntime:
             )
         )
 
+    async def _maybe_compact(
+        self,
+        persona: Persona,
+        thread: ChatThread,
+        ctx: dict[str, Any],
+        trace_id: str,
+        llm_config: LLMConfig | None,
+    ) -> None:
+        """Summarize old turns in-place when the thread outgrows its token budget.
+
+        Opt-in via ``ctx['compaction_spec']``. Keeps the system head + recent tail,
+        replaces the middle with one model-written summary message, and emits a
+        ``CONTEXT_COMPACTED`` event (the audit trail of what was condensed). A no-op
+        when not configured or under budget.
+        """
+        spec = ctx.get("compaction_spec")
+        if not spec:
+            return
+        from himmy.agents.base_agent.thread import Message, MessageRole
+        from himmy.runtime.compaction import (
+            SUMMARY_INSTRUCTION,
+            ContextCompactor,
+            estimate_tokens,
+        )
+
+        compactor = ContextCompactor(
+            max_tokens=int(spec.get("max_tokens", 3000)),
+            keep_recent=int(spec.get("keep_recent", 6)),
+        )
+        plan = compactor.plan(thread.messages)
+        if not plan.should_compact:
+            return
+
+        span_text = compactor.render_span(plan.summarize)
+        model_key = str(ctx.get("model_key") or self.default_model_key)
+        summary_req = InferenceRequest(
+            model_key=model_key,
+            response_format=ResponseFormat.TEXT,
+            messages=[
+                InferenceMessage(role="system", content=SUMMARY_INSTRUCTION),
+                InferenceMessage(role="user", content=span_text),
+            ],
+        )
+        summary_resp = await self.inference_service.run(summary_req)
+        summary_text = (summary_resp.output_text or "").strip()
+        if not summary_text:
+            return  # summarization failed/empty — leave history intact (safe)
+
+        summary_msg = Message(
+            role=MessageRole.SYSTEM,
+            content=f"[Summary of earlier conversation]\n{summary_text}",
+            metadata={"compacted": True},
+        )
+        # Only apply if the summary is actually smaller than what it replaces — a verbose
+        # summary of a tiny span would otherwise grow the context, not shrink it.
+        if estimate_tokens(summary_msg.content) >= compactor.estimate(plan.summarize):
+            return
+        head = list(thread.messages[: plan.head_count])
+        tail = list(thread.messages[plan.tail_start :])
+        compacted_count = len(plan.summarize)
+        thread.messages[:] = [*head, summary_msg, *tail]
+        thread.version += 1
+
+        await self._emit(
+            RunEvent(
+                event_type=EventType.CONTEXT_COMPACTED,
+                trace_id=trace_id,
+                thread_id=thread.thread_id,
+                agent_id=persona.agent_id,
+                payload={
+                    "summarized_messages": compacted_count,
+                    "before_tokens": plan.before_tokens,
+                    "after_tokens": compactor.estimate(thread.messages),
+                    "kept_recent": len(tail),
+                },
+            )
+        )
+
     async def _continue_turn(
         self,
         persona: Persona,
@@ -920,6 +998,7 @@ class SingleAgentRuntime:
         """
         from himmy.agents.base_agent.thread import Message, MessageRole
 
+        await self._maybe_compact(persona, thread, ctx, trace_id, llm_config)
         request, tool_names = self._build_request(thread, ctx, llm_config)
         await self._emit(
             RunEvent(
