@@ -21,6 +21,7 @@ from himmy.toolkit.datasources import register_datasources_pack
 from himmy.toolkit.documents import register_documents_pack
 from himmy.toolkit.files import register_files_pack
 from himmy.toolkit.knowledge import register_knowledge_pack
+from himmy.toolkit.memory import register_memory_pack
 from himmy.toolkit.utils import register_utils_pack
 from himmy.toolkit.web import register_web_pack
 
@@ -94,6 +95,12 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
         "Keyless public data: weather, geocoding, and Wikipedia summaries.",
         ("weather", "geocode", "wikipedia"),
         register_datasources_pack,
+    ),
+    "memory": ToolPack(
+        "memory",
+        "Durable long-term memory: remember facts and recall them semantically.",
+        ("remember", "recall"),
+        register_memory_pack,
     ),
 }
 

@@ -49,6 +49,10 @@ class ToolkitConfig(BaseModel):
     # code pack -------------------------------------------------------------
     sandbox_limits: SandboxLimits = Field(default_factory=SandboxLimits)
 
+    # memory pack -----------------------------------------------------------
+    memory_path: str | None = None  # sqlite file → durable; None → in-process
+    memory_subject: str = "default"
+
     @classmethod
     def from_env(cls) -> ToolkitConfig:
         """Build a config from ``HIMMY_*`` environment variables (with defaults).
@@ -86,6 +90,8 @@ class ToolkitConfig(BaseModel):
             smtp_password=env.get("HIMMY_SMTP_PASSWORD"),
             smtp_from=env.get("HIMMY_SMTP_FROM"),
             smtp_use_tls=_env_bool(env.get("HIMMY_SMTP_USE_TLS"), default=True),
+            memory_path=env.get("HIMMY_MEMORY_PATH"),
+            memory_subject=env.get("HIMMY_MEMORY_SUBJECT", "default"),
         )
 
 

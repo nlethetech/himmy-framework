@@ -26,6 +26,7 @@ def test_catalog_has_expected_packs() -> None:
         "documents",
         "comms",
         "data-sources",
+        "memory",
     }
 
 
@@ -53,6 +54,8 @@ def test_register_all_packs_populates_registry() -> None:
         "weather",
         "geocode",
         "wikipedia",
+        "remember",
+        "recall",
     }
     for name in names:
         assert registry.handler_for(name) is not None

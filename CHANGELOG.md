@@ -14,6 +14,14 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Long-term memory module (`himmy.services.memory`) + `memory` toolkit pack.** A
+  `MemoryService` persists facts (`remember`) and recalls them semantically (`recall`,
+  cosine over the offline embedder). Storage is pluggable: `InMemoryMemoryStore` or a
+  durable `SqliteMemoryStore` (stdlib sqlite3) so memory survives across processes. A
+  `MemoryContextAdapter` auto-injects recalled memories into prompts when registered on
+  a `ContextService`. The `memory` toolkit pack exposes `remember`/`recall` to agents
+  (subject + sqlite path from `HIMMY_MEMORY_SUBJECT`/`HIMMY_MEMORY_PATH`); the catalog is
+  now ten packs. No new dependencies.
 - **Multi-agent teams: handoff + supervisor delegation (`himmy.orchestrators`).** A
   `MultiAgentOrchestrator` routes a task across an `AgentTeam` of `TeamMember`s over a
   shared thread. Two collaboration edges: **handoff** (`handoffs`) binds a synthetic

@@ -128,6 +128,7 @@ agent. `himmy tools` lists them:
 | `documents` | `read_document` (PDF / text / Markdown → text) |
 | `comms` | `send_email`, `send_webhook` (outbound; approval-gated) |
 | `data-sources` | `weather`, `geocode`, `wikipedia` (keyless public APIs) |
+| `memory` | `remember`, `recall` (durable long-term memory, SQLite-backed) |
 
 Enable them declaratively in `agent.yaml`:
 

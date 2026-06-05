@@ -27,6 +27,7 @@ __all__ = [
     "AgentTeam",
     "TeamMember",
     "MultiAgentOrchestrator",
+    "MemoryService",
     "build_runtime",
     "build_inference",
     "build_storage",
@@ -51,6 +52,10 @@ def __getattr__(name: str) -> Any:
         from himmy import orchestrators
 
         return getattr(orchestrators, name)
+    if name == "MemoryService":
+        from himmy.services.memory import MemoryService
+
+        return MemoryService
     if name in _LAZY_CONFIG:
         from himmy import config
 
