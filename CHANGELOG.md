@@ -14,6 +14,15 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Guardrails across three surfaces (`himmy.services.guardrails`).** Composable,
+  dependency-free `Guardrail`s — `PIIGuardrail` (redacts emails/phones/cards/SSNs/keys),
+  `InjectionGuardrail` (flags/blocks prompt-injection phrasings), `BlocklistGuardrail` —
+  combine in a `GuardrailPipeline`. They guard all three surfaces: **tool arguments**
+  (via `build_guardrail_pre_hook` → the existing `ToolService` pre-hook: redacts or
+  blocks before a tool runs), the **input prompt**, and the **model's output** (optional
+  `input_guardrail`/`output_guardrail` on `SingleAgentRuntime`, forwarded by
+  `build_runtime`; default `None` → no behavior change). Enable per agent with
+  `guardrails: [pii, injection]` in `agent.yaml`; `himmy doctor` lists them. No new deps.
 - **Agent evaluation harness (`himmy.services.evaluation.agent_harness`).** An
   `AgentEvalHarness` runs an agent or a team over an `EvaluationSuite` (executing each
   case's input through `run_task_detailed` / `MultiAgentOrchestrator.run`) and scores the

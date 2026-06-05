@@ -56,6 +56,7 @@ class AgentSpec(BaseModel):
     tools: list[str] = []
     tool_packs: list[str] = []
     tools_module: str | None = None
+    guardrails: list[str] = []
     output_schema: dict[str, Any] | None = None
     metadata: dict[str, Any] = {}
 

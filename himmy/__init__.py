@@ -30,6 +30,7 @@ __all__ = [
     "MultiAgentOrchestrator",
     "MemoryService",
     "AgentEvalHarness",
+    "build_guardrail_pipeline",
     "build_runtime",
     "build_inference",
     "build_storage",
@@ -66,6 +67,10 @@ def __getattr__(name: str) -> Any:
         from himmy.services.evaluation.agent_harness import AgentEvalHarness
 
         return AgentEvalHarness
+    if name == "build_guardrail_pipeline":
+        from himmy.services.guardrails import build_guardrail_pipeline
+
+        return build_guardrail_pipeline
     if name in _LAZY_CONFIG:
         from himmy import config
 

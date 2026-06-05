@@ -122,6 +122,8 @@ def build_runtime(
         prompt_manager=prompt_manager,
         context_prompt_mapper=context_prompt_mapper,
         entity_registry=registry,
+        input_guardrail=overrides.get("input_guardrail"),
+        output_guardrail=overrides.get("output_guardrail"),
     )
     return runtime, inference, tool_service
 

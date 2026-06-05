@@ -51,6 +51,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.agents.personas.persona import Persona
     from himmy.entities.registry import EntityRegistry
     from himmy.services.context.service import ContextService
+    from himmy.services.guardrails.base import GuardrailPipeline
     from himmy.services.inference.service import InferenceService, StreamDelta
     from himmy.services.prompts.manager import PromptManager
     from himmy.services.prompts.mapper import ContextPromptMapper
@@ -184,6 +185,8 @@ class SingleAgentRuntime:
         strict_snapshot: bool = False,
         on_event: OnEvent | list[OnEvent] | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        input_guardrail: GuardrailPipeline | None = None,
+        output_guardrail: GuardrailPipeline | None = None,
     ) -> None:
         """Wire the runtime; auto-create prompt manager/mapper when omitted.
 
@@ -206,6 +209,8 @@ class SingleAgentRuntime:
         self.default_deadline_seconds = default_deadline_seconds
         self.strict_snapshot = strict_snapshot
         self._checkpoint_store = checkpoint_store
+        self._input_guardrail = input_guardrail
+        self._output_guardrail = output_guardrail
         self._on_event: list[OnEvent] = self._coerce_callbacks(on_event)
 
         # Auto-create the prompt primitives when available; they have no required
@@ -461,7 +466,9 @@ class SingleAgentRuntime:
             sys_msg = Message(role=MessageRole.SYSTEM, content=system_prompt)
             thread.append_message(sys_msg)
             self._register_message(sys_msg)
-        user_msg = Message(role=MessageRole.USER, content=task_prompt)
+        user_msg = Message(
+            role=MessageRole.USER, content=self._guard_input(task_prompt)
+        )
         thread.append_message(user_msg)
         self._register_message(user_msg)
 
@@ -859,6 +866,7 @@ class SingleAgentRuntime:
         assistant_text = response.output_text
         if assistant_text is None and response.output_structured is not None:
             assistant_text = json.dumps(response.output_structured, default=str)
+        assistant_text = self._guard_output(assistant_text)
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
         assistant_message = Message(
@@ -931,7 +939,9 @@ class SingleAgentRuntime:
             system_message = Message(role=MessageRole.SYSTEM, content=system_prompt)
             thread.append_message(system_message)
             self._register_message(system_message)
-        user_message = Message(role=MessageRole.USER, content=task_prompt)
+        user_message = Message(
+            role=MessageRole.USER, content=self._guard_input(task_prompt)
+        )
         thread.append_message(user_message)
         self._register_message(user_message)
 
@@ -1039,6 +1049,7 @@ class SingleAgentRuntime:
         assistant_text = response.output_text
         if assistant_text is None and response.output_structured is not None:
             assistant_text = json.dumps(response.output_structured, default=str)
+        assistant_text = self._guard_output(assistant_text)
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
         assistant_metadata: dict[str, Any] = {
@@ -1124,6 +1135,18 @@ class SingleAgentRuntime:
         )
 
     # ------------------------------------------------------------- snapshot
+    def _guard_input(self, text: str) -> str:
+        """Apply the input guardrail to a user prompt (redact); ``None`` → passthrough."""
+        if self._input_guardrail is None:
+            return text
+        return self._input_guardrail.inspect(text, context={"stage": "input"}).text
+
+    def _guard_output(self, text: str | None) -> str | None:
+        """Apply the output guardrail to an assistant reply (redact); passthrough None."""
+        if self._output_guardrail is None or text is None:
+            return text
+        return self._output_guardrail.inspect(text, context={"stage": "output"}).text
+
     async def _resolve_snapshot(
         self,
         persona: Persona,

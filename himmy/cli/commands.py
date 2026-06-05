@@ -66,6 +66,15 @@ def _build_runtime_for(spec: AgentSpec, args: argparse.Namespace) -> Any:
     inference = build_inference_for(provider, model)
 
     overrides: dict[str, Any] = {"inference": inference}
+
+    pipeline = None
+    if spec.guardrails:
+        from himmy.services.guardrails import build_guardrail_pipeline
+
+        pipeline = build_guardrail_pipeline(spec.guardrails)
+        overrides["input_guardrail"] = pipeline
+        overrides["output_guardrail"] = pipeline
+
     if spec.tool_packs or spec.tools_module:
         registry = ToolRegistry()
         if spec.tool_packs:
@@ -74,7 +83,16 @@ def _build_runtime_for(spec: AgentSpec, args: argparse.Namespace) -> Any:
             register_packs(registry, spec.tool_packs, ToolkitConfig.from_env())
         if spec.tools_module:
             _resolve_register(spec.tools_module)(registry)
-        overrides["tool_registry"] = registry
+        if pipeline is not None:
+            # Guard tool arguments too (the highest-risk "act" surface).
+            from himmy.services.guardrails import build_guardrail_pre_hook
+            from himmy.services.tools.service import ToolService
+
+            overrides["tool_service"] = ToolService(
+                registry, pre_execution_hook=build_guardrail_pre_hook(pipeline)
+            )
+        else:
+            overrides["tool_registry"] = registry
 
     runtime, _inference, _tools = build_runtime(**overrides)
     return runtime
@@ -462,6 +480,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "PYDANTIC_AI_GATEWAY_API_KEY",
     ):
         print(f"  [{'ok ' if os.environ.get(key) else '-- '}] {key}")
+
+    from himmy.services.guardrails import BUILTIN_GUARDRAILS
+
+    print(
+        f"\nguardrails (agent.yaml `guardrails: [...]`): {', '.join(BUILTIN_GUARDRAILS)}"
+    )
     return 0
 
 
