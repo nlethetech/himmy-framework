@@ -112,6 +112,7 @@ module = [
     "feedparser.*",
     "openpyxl.*",
     "nepali_datetime.*",
+    "transformers.*",
 ]
 ignore_missing_imports = true
 
