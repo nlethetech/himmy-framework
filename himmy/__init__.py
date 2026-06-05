@@ -35,6 +35,9 @@ __all__ = [
     "build_runtime",
     "build_inference",
     "build_storage",
+    "Skill",
+    "SkillRegistry",
+    "resolve_skills",
 ]
 
 # The full-stack builder pulls in the heavier runtime/inference/tools kernels, so
@@ -49,6 +52,7 @@ _LAZY_ORCH = {
     "MultiAgentOrchestrator",
     "PlannerOrchestrator",
 }
+_LAZY_SKILLS = {"Skill", "SkillRegistry", "resolve_skills"}
 
 
 def __getattr__(name: str) -> Any:
@@ -85,4 +89,8 @@ def __getattr__(name: str) -> Any:
         from himmy import toolkit
 
         return getattr(toolkit, name)
+    if name in _LAZY_SKILLS:
+        from himmy import skills
+
+        return getattr(skills, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
