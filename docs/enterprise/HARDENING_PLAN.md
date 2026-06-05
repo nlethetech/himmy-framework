@@ -93,7 +93,22 @@ is guarded; deny-by-default for a role-less principal; bypassed when no auth is 
   audit bundles but not mutate; admin-only routes reject operators.
 - **Verify:** `tests/api/test_rbac.py` — a permission matrix test.
 
-### 1.3 — Actor identity on runs & entities ("who did what")
+### 1.3 — Actor identity on runs ("who did what") — ✅ DONE
+*Shipped: `RunAppService.create_run(..., actor=)` stamps the verified principal's
+`actor_metadata()` (subject/auth_method/roles/source_ip) into the run's durable
+`metadata["actor"]` (round-trips on in-memory + Postgres, no migration). The runs router
+passes the principal; offline runs record the `anonymous` actor. Test:
+`tests/api/test_actor_stamping.py`.*
+
+### 1.4 — Security audit log (auth/authz/access) — ✅ DONE
+*Shipped: `himmy/services/audit/` (`SecurityEvent`, `SecurityAuditLog`) records events as
+tamper-evident `security_event` EntityRecords; `himmy/api/security_audit.py::audit_event`
+emits from `principal_dependency` (auth_failure), `require_permission` (authz_denied), and
+run-create (access) — no-op when auth is off. New `GET /v1/audit/events` router gated by
+`audit:read` (auditor/admin), tenant-scoped. Tests: `tests/audit/test_security_log.py`
+(incl. a signed-bundle tamper-evidence proof), `tests/api/test_security_audit.py`.*
+
+### 1.3-orig — Actor identity on runs & entities ("who did what")
 - **Current:** `RunRecord` (`himmy/services/storage/models.py:34`) and `EntityRecord`
   (`himmy/entities/records.py:70`) carry **no actor field** — only `created_at`.
 - **Target:** stamp the authenticated `principal.subject` (+ auth method, source IP, request

@@ -13,11 +13,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from himmy.api.auth import require_permission, require_workspace, resolve_workspace
+from himmy.api.auth import (
+    get_principal,
+    require_permission,
+    require_workspace,
+    resolve_workspace,
+)
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
     RunListResponse,
 )
+from himmy.api.security_audit import audit_event
 from himmy.application.services import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import RunRecord, RunStatus
@@ -78,13 +84,24 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
         context=body.task.context,
     )
     workspace_id = require_workspace(request, body.workspace_id)
-    return await _container(request).run_app.create_run(
+    run = await _container(request).run_app.create_run(
         workspace_id=workspace_id,
         subject_id=body.subject_id,
         persona=persona,
         task=task,
         idempotency_key=body.idempotency_key,
+        actor=get_principal(request).actor_metadata(),
     )
+    audit_event(
+        request,
+        event_type="access",
+        outcome="allow",
+        resource="run",
+        action="create",
+        workspace_id=workspace_id,
+        detail=f"run {run.run_id} created",
+    )
+    return run
 
 
 @router.get("", response_model=RunListResponse, dependencies=_READ)

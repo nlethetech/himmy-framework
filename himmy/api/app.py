@@ -26,6 +26,7 @@ from himmy.api.auth import (
 from himmy.api.deps import ApiContainer
 from himmy.api.models import ErrorResponse
 from himmy.api.routers import (
+    audit,
     context,
     dashboard,
     evaluation,
@@ -33,6 +34,7 @@ from himmy.api.routers import (
     runs,
 )
 from himmy.core.errors import HimmyError
+from himmy.services.audit import SecurityAuditLog
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
@@ -134,6 +136,8 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
     # Authorization: role → permission policy (data-driven via HIMMY_RBAC_FILE).
     # Enforced per-route via require_permission; bypassed when auth is off.
     app.state.access_policy = build_access_policy()
+    # Security audit: auth/authz/access events as tamper-evident entities (WS1.4).
+    app.state.security_audit = SecurityAuditLog(container.entity_registry)
 
     instrument_fastapi(app)
 
@@ -152,6 +156,7 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
     app.include_router(recommendations.router)
     app.include_router(dashboard.router)
     app.include_router(evaluation.router)
+    app.include_router(audit.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:

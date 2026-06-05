@@ -516,6 +516,7 @@ class RunAppService:
         task: Task,
         idempotency_key: str | None = None,
         llm_config: LLMConfig | None = None,
+        actor: dict[str, Any] | None = None,
     ) -> RunRecord:
         """Create (or return the existing) run and launch background execution.
 
@@ -530,6 +531,9 @@ class RunAppService:
         Background execution is only launched for the run this call actually
         created.
         """
+        # Stamp the authenticated actor ("who launched this") into the durable
+        # metadata JSONB (round-trips on both in-memory and Postgres) so every run
+        # records its initiator — the operational half of "who did what" (WS1.3).
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
@@ -538,6 +542,7 @@ class RunAppService:
             model_key=_resolve_model_key(llm_config, task),
             idempotency_key=idempotency_key,
             status=RunStatus.QUEUED,
+            metadata={"actor": actor} if actor else {},
         )
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:

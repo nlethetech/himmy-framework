@@ -133,6 +133,17 @@ def require_permission(
             getattr(request.app.state, "access_policy", None) or DEFAULT_POLICY
         )
         if not policy.authorize(get_principal(request), resource, action):
+            from himmy.api.security_audit import audit_event
+
+            audit_event(
+                request,
+                event_type="authz_denied",
+                outcome="deny",
+                resource=resource,
+                action=action,
+                workspace_id=request.query_params.get("workspace_id"),
+                detail=f"permission denied: {resource}:{action}",
+            )
             raise HTTPException(
                 status_code=403,
                 detail=f"permission denied: {resource}:{action}",

@@ -71,6 +71,11 @@ async def principal_dependency(request: Request) -> None:
     try:
         principal = await authenticator.authenticate(request)
     except AuthError as exc:
+        from himmy.api.security_audit import audit_event
+
+        audit_event(
+            request, event_type="auth_failure", outcome="deny", detail=exc.detail
+        )
         raise HTTPException(
             status_code=401,
             detail=exc.detail,
