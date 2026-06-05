@@ -14,6 +14,14 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Token streaming + crisp agent-loop termination.** `SingleAgentRuntime.stream_task`
+  streams a reply as `StreamDelta` chunks (over `InferenceService.run_stream`); `himmy
+  chat` now streams to stdout token-by-token and `himmy run --stream` opts in. A
+  registerable `final_answer` tool lets an agent end its loop explicitly (the
+  single-agent loop and the multi-agent orchestrator stop with
+  `stopped_reason="final_answer"`), and a no-progress guard halts a loop that repeats the
+  same tool call (`stopped_reason="no_progress"`) instead of spinning to `max_turns`.
+  Team members that hold tools auto-get `final_answer`. No new dependencies.
 - **Real local embeddings (selectable; stub stays the default).** New `OllamaEmbedder`
   (local Ollama `/api/embeddings` over httpx — zero new deps, keyless) and
   `FastEmbedEmbedder` (self-contained ONNX via the new `embeddings` extra), plus a

@@ -33,6 +33,12 @@ from himmy.agents.personas.persona import Persona
 from himmy.core import HimmyError
 from himmy.core.events import EventType, RunEvent
 from himmy.runtime.single_agent import RunResult, SingleAgentRuntime
+from himmy.runtime.termination import (
+    FINAL_ANSWER_TOOL,
+    final_answer_text,
+    is_no_progress,
+    register_final_answer_tool,
+)
 from himmy.services.inference.models import LLMConfig, ResponseFormat
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
 
@@ -121,7 +127,8 @@ class MultiAgentOrchestrator:
     # --------------------------------------------------------------- synthetic tools
 
     def _register_synthetic_tools(self) -> None:
-        """Register ``transfer_to_<peer>`` and ``ask_<worker>`` tools for the team."""
+        """Register ``transfer_to_<peer>``, ``ask_<worker>``, and ``final_answer``."""
+        register_final_answer_tool(self._registry)
         handoff_targets = {t for m in self._team.members for t in m.handoffs}
         delegate_targets = {t for m in self._team.members for t in m.delegates}
 
@@ -233,8 +240,18 @@ class MultiAgentOrchestrator:
                         payload={"from": source, "to": active.name},
                     )
                 )
-            elif not result.tool_calls:
-                return self._finish(thread, turns, active.name, chain, "final")
+            else:
+                answer = final_answer_text(result)
+                if answer is not None:
+                    return self._finish(
+                        thread, turns, active.name, chain, "final_answer", answer
+                    )
+                if not result.tool_calls:
+                    return self._finish(thread, turns, active.name, chain, "final")
+                if is_no_progress([r for _, r in turns]):
+                    return self._finish(
+                        thread, turns, active.name, chain, "no_progress"
+                    )
 
             if len(turns) >= self._max_turns:
                 return self._finish(thread, turns, active.name, chain, "max_turns")
@@ -267,6 +284,10 @@ class MultiAgentOrchestrator:
         names = list(member.tools)
         names += [f"{HANDOFF_PREFIX}{h}" for h in member.handoffs]
         names += [f"{DELEGATE_PREFIX}{d}" for d in member.delegates]
+        # A tool-using member also gets final_answer so it can end cleanly instead of
+        # spinning; a tool-less member already terminates via a plain text answer.
+        if names:
+            names.append(FINAL_ANSWER_TOOL)
         return {"model_key": member.model_key, "tool_names": names}
 
     def _cfg(self, member: TeamMember) -> LLMConfig:
@@ -285,14 +306,16 @@ class MultiAgentOrchestrator:
         final_agent: str,
         chain: list[str],
         reason: str,
+        answer: str | None = None,
     ) -> MultiAgentResult:
         """Assemble the final :class:`MultiAgentResult`."""
         last = turns[-1][1] if turns else None
+        output = answer if answer is not None else (last.output_text if last else None)
         return MultiAgentResult(
             thread=thread,
             turns=turns,
             final_agent=final_agent,
-            output_text=last.output_text if last else None,
+            output_text=output,
             handoff_chain=chain,
             stopped_reason=reason,
             total_cost=sum(r.cost for _, r in turns),

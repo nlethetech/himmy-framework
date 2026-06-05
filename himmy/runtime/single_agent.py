@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -32,6 +32,7 @@ from himmy.runtime.checkpoint import (
     CheckpointStore,
     PendingToolCall,
 )
+from himmy.runtime.termination import final_answer_text, is_no_progress
 from himmy.services.inference.models import (
     BoundTool,
     InferenceMessage,
@@ -50,7 +51,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.agents.personas.persona import Persona
     from himmy.entities.registry import EntityRegistry
     from himmy.services.context.service import ContextService
-    from himmy.services.inference.service import InferenceService
+    from himmy.services.inference.service import InferenceService, StreamDelta
     from himmy.services.prompts.manager import PromptManager
     from himmy.services.prompts.mapper import ContextPromptMapper
     from himmy.services.storage.service import MemoryStore
@@ -359,6 +360,7 @@ class SingleAgentRuntime:
         cost_budget: float | None = None,
         llm_config: LLMConfig | None = None,
         hitl: bool = False,
+        stop_on_no_progress: bool = False,
     ) -> AgentLoopResult:
         """Run a bounded, runtime-owned agentic loop: act -> observe -> re-invoke.
 
@@ -399,6 +401,7 @@ class SingleAgentRuntime:
             cost_budget=cost_budget,
             llm_config=llm_config,
             hitl=hitl,
+            stop_on_no_progress=stop_on_no_progress,
             turns_offset=0,
             cost_offset=0.0,
         )
@@ -425,6 +428,55 @@ class SingleAgentRuntime:
         return await self._continue_turn(
             persona, thread, ctx, trace_id, llm_config=llm_config
         )
+
+    async def stream_task(
+        self,
+        persona: Persona,
+        task: Task,
+        thread: ChatThread | None = None,
+        *,
+        llm_config: LLMConfig | None = None,
+    ) -> AsyncIterator[StreamDelta]:
+        """Stream one task's assistant reply as :class:`StreamDelta` chunks.
+
+        Mirrors :meth:`run_task_detailed`'s pre-inference setup (snapshot, prompt
+        render, system/user message appends) but delegates to
+        :meth:`InferenceService.run_stream`, yielding incremental text. The final
+        ``done`` delta carries the materialized response; the assistant message is
+        appended to the thread before that delta is yielded. Single-turn (no tool
+        loop) — intended for streaming a chat reply to a UI/stdout.
+        """
+        from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
+
+        if thread is None:
+            thread = ChatThread(agent_id=persona.agent_id)
+        ctx = dict(task.context or {})
+        snapshot, _snapshot_id, _err = await self._resolve_snapshot(
+            persona, task, ctx, None
+        )
+        system_prompt, task_prompt, _missing = self._render_prompts(
+            persona, task, ctx, snapshot
+        )
+        if not any(m.role == MessageRole.SYSTEM for m in thread.messages):
+            sys_msg = Message(role=MessageRole.SYSTEM, content=system_prompt)
+            thread.append_message(sys_msg)
+            self._register_message(sys_msg)
+        user_msg = Message(role=MessageRole.USER, content=task_prompt)
+        thread.append_message(user_msg)
+        self._register_message(user_msg)
+
+        request, _tool_names = self._build_request(thread, ctx, llm_config)
+        async for delta in self.inference_service.run_stream(request):
+            if delta.done and delta.response is not None:
+                assistant = Message(
+                    role=MessageRole.ASSISTANT,
+                    content=delta.response.output_text or "",
+                    metadata={"request_id": request.request_id, "streamed": True},
+                )
+                thread.append_message(assistant)
+                self._register_message(assistant)
+                self._register_thread_version(thread)
+            yield delta
 
     async def resume_agent_loop(
         self,
@@ -573,6 +625,7 @@ class SingleAgentRuntime:
             cost_budget=checkpoint.cost_budget,
             llm_config=resume_llm,
             hitl=hitl,
+            stop_on_no_progress=False,
             turns_offset=checkpoint.turns_completed,
             cost_offset=checkpoint.cost_completed,
         )
@@ -590,6 +643,7 @@ class SingleAgentRuntime:
         cost_budget: float | None,
         llm_config: LLMConfig | None,
         hitl: bool,
+        stop_on_no_progress: bool,
         turns_offset: int,
         cost_offset: float,
     ) -> AgentLoopResult:
@@ -636,6 +690,14 @@ class SingleAgentRuntime:
             if not last.tool_calls:
                 return AgentLoopResult(
                     thread=thread, turns=turns, stopped_reason="final"
+                )
+            if final_answer_text(last) is not None:
+                return AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="final_answer"
+                )
+            if stop_on_no_progress and is_no_progress(turns):
+                return AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="no_progress"
                 )
             if turns_offset + len(turns) >= max_turns:
                 return AgentLoopResult(

@@ -50,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_agent_flags(p_run)
     p_run.add_argument("-p", "--prompt", help="the prompt to run")
     p_run.add_argument("--json", action="store_true", help="print full result as JSON")
+    p_run.add_argument(
+        "--stream", action="store_true", help="stream the reply token-by-token"
+    )
     p_run.set_defaults(func=commands.cmd_run)
 
     p_chat = sub.add_parser("chat", help="interactive chat keeping one thread")

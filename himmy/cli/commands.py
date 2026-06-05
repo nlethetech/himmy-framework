@@ -91,6 +91,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     spec = _spec_from_args(args)
     runtime = _build_runtime_for(spec, args)
 
+    if getattr(args, "stream", False):
+
+        async def _stream() -> None:
+            async for delta in runtime.stream_task(
+                spec.to_persona(),
+                spec.make_task(args.prompt),
+                llm_config=spec.to_llm_config(),
+            ):
+                if delta.delta:
+                    sys.stdout.write(delta.delta)
+                    sys.stdout.flush()
+            sys.stdout.write("\n")
+
+        asyncio.run(_stream())
+        return 0
+
     async def _go() -> Any:
         return await runtime.run_task_detailed(
             spec.to_persona(),
@@ -138,13 +154,25 @@ def cmd_chat(args: argparse.Namespace) -> int:
             persona, spec.make_task(text), thread=thread, llm_config=llm_config
         )
 
+    from himmy.agents.base_agent.thread import ChatThread
+
+    async def _stream(thread: Any, text: str) -> None:
+        """Stream one reply to stdout token-by-token (appends to ``thread``)."""
+        async for delta in runtime.stream_task(
+            persona, spec.make_task(text), thread=thread, llm_config=llm_config
+        ):
+            if delta.delta:
+                sys.stdout.write(delta.delta)
+                sys.stdout.flush()
+        sys.stdout.write("\n")
+
     if args.message:
         result = asyncio.run(_turn(None, args.message))
         print(result.output_text or "")
         return 0 if result.succeeded else 1
 
     _eprint(f"himmy chat — {persona.name} ({persona.role}). /exit, /reset, /help.")
-    thread: Any = None
+    thread = ChatThread(agent_id=persona.agent_id)
     while True:
         try:
             line = input("you> ").strip()
@@ -156,15 +184,14 @@ def cmd_chat(args: argparse.Namespace) -> int:
         if line in {"/exit", "/quit"}:
             break
         if line == "/reset":
-            thread = None
+            thread = ChatThread(agent_id=persona.agent_id)
             _eprint("(thread reset)")
             continue
         if line == "/help":
             _eprint("commands: /exit  /reset  /help")
             continue
-        result = asyncio.run(_turn(thread, line))
-        thread = result.thread
-        print(f"bot> {result.output_text or ''}")
+        sys.stdout.write("bot> ")
+        asyncio.run(_stream(thread, line))
     return 0
 
 
