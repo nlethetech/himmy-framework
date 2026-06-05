@@ -221,7 +221,13 @@ def _build_runtime_for(
         )
 
     registry = None
-    if spec.tool_packs or spec.tools_module or spec.mcp_servers or spec.allow_spawn:
+    if (
+        spec.tool_packs
+        or spec.tools_module
+        or spec.mcp_servers
+        or spec.allow_spawn
+        or spec.allow_skill_dispatch
+    ):
         registry = ToolRegistry()
         if spec.tool_packs:
             from himmy.toolkit import ToolkitConfig, register_packs
@@ -236,6 +242,14 @@ def _build_runtime_for(
             from himmy.toolkit.spawn import register_spawn_tool
 
             register_spawn_tool(registry, inference=inference)
+        if spec.allow_skill_dispatch:
+            # dispatch_skill runs a named capability as a tool-scoped sub-agent; the
+            # sub-runtime lacks the tool, so a dispatched skill can't dispatch again.
+            from himmy.skills import build_skill_registry, register_skill_dispatch_tool
+
+            register_skill_dispatch_tool(
+                registry, inference=inference, skill_registry=build_skill_registry()
+            )
         if pipeline is not None:
             # Guard tool arguments too (the highest-risk "act" surface).
             from himmy.services.guardrails import build_guardrail_pre_hook
@@ -961,10 +975,42 @@ def cmd_tools(args: argparse.Namespace) -> int:
 
 
 def cmd_skills(args: argparse.Namespace) -> int:
-    """List available skills (built-in + project-local) for ``skills: [...]``."""
+    """List available skills (or show one in detail) for ``skills: [...]``."""
     from himmy.skills import BUILTIN_SKILLS, build_skill_registry, discover_skill_dirs
 
     registry = build_skill_registry()
+
+    name = getattr(args, "name", None)
+    if name:
+        skill = registry.get(name)
+        if skill is None:
+            import difflib
+
+            close = difflib.get_close_matches(name, registry.names(), n=1)
+            hint = f" (did you mean {close[0]!r}?)" if close else ""
+            _eprint(f"error: unknown skill {name!r}{hint}")
+            return 1
+        origin = "built-in" if skill.name in BUILTIN_SKILLS else "project"
+        print(f"{skill.name}  (v{skill.version}, {origin})")
+        print(f"  {skill.description}")
+        if skill.when_to_use:
+            print(f"\n  use when: {skill.when_to_use}")
+        binds = ", ".join((*skill.tool_packs, *skill.tools)) or "(no tools)"
+        print(f"  binds: {binds}")
+        if skill.requires_skills:
+            print(f"  requires: {', '.join(skill.requires_skills)}")
+        if skill.guardrails:
+            print(f"  guardrails: {', '.join(skill.guardrails)}")
+        if skill.instructions:
+            print("\n  instructions:")
+            for line in skill.instructions:
+                print(f"    - {line}")
+        if skill.examples:
+            print("\n  examples:")
+            for ex in skill.examples:
+                print(f'    - "{ex.input}" → {ex.action}')
+        return 0
+
     print("available skills (use in agent.yaml: `skills: [...]`):\n")
     for skill in registry.list():
         origin = "" if skill.name in BUILTIN_SKILLS else "  [project]"
@@ -976,4 +1022,5 @@ def cmd_skills(args: argparse.Namespace) -> int:
     scanned = [str(d) for d in discover_skill_dirs() if d.is_dir()]
     if scanned:
         print(f"\nproject skill dirs scanned: {', '.join(scanned)}")
+    print("\nDetail: himmy skills <name>")
     return 0

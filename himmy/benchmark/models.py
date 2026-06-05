@@ -24,6 +24,9 @@ class BenchmarkTask:
     prompt: str
     grade: dict[str, Any]
     packs: list[str] = field(default_factory=list)
+    skills: list[str] = field(
+        default_factory=list
+    )  # capabilities (imply packs+know-how)
     expect_tools: list[str] = field(default_factory=list)
     instructions: list[str] = field(default_factory=list)
     category: str = "general"
@@ -49,6 +52,7 @@ class BenchmarkSuite:
                 prompt=str(t["prompt"]),
                 grade=dict(t["grade"]),
                 packs=[str(p) for p in t.get("packs", [])],
+                skills=[str(s) for s in t.get("skills", [])],
                 expect_tools=[str(x) for x in t.get("expect_tools", [])],
                 instructions=[str(i) for i in t.get("instructions", [])],
                 category=str(t.get("category", "general")),
@@ -69,10 +73,18 @@ class BenchmarkSuite:
 
     @property
     def packs(self) -> list[str]:
-        """The union of all tool packs any task needs."""
+        """The union of all tool packs any task needs (incl. those a skill implies)."""
         seen: list[str] = []
+        registry: Any = None
         for task in self.tasks:
-            for p in task.packs:
+            packs = list(task.packs)
+            if task.skills:
+                from himmy.skills import build_skill_registry, resolve_skills
+
+                if registry is None:
+                    registry = build_skill_registry()
+                packs.extend(resolve_skills(task.skills, registry).tool_packs)
+            for p in packs:
                 if p not in seen:
                     seen.append(p)
         return seen

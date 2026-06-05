@@ -14,6 +14,7 @@ an agent binds those tools and injects the guidance. Skills are validated, versi
 from __future__ import annotations
 
 from himmy.skills.builtin import BUILTIN_SKILLS
+from himmy.skills.dispatch import SkillDispatcher, register_skill_dispatch_tool
 from himmy.skills.errors import (
     CyclicSkillError,
     SkillCollisionError,
@@ -42,6 +43,8 @@ __all__ = [
     "load_skill_file",
     "load_skill_dir",
     "discover_skill_dirs",
+    "SkillDispatcher",
+    "register_skill_dispatch_tool",
     "SkillFileError",
     "UnknownSkillError",
     "CyclicSkillError",

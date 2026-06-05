@@ -143,6 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_skills = sub.add_parser(
         "skills", help="list available skills (built-in + project-local)"
     )
+    p_skills.add_argument(
+        "name", nargs="?", help="show full detail for one skill instead of listing"
+    )
     p_skills.set_defaults(func=commands.cmd_skills)
 
     p_trace = sub.add_parser("trace", help="inspect saved run traces")

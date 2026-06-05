@@ -62,6 +62,8 @@ class AgentSpec(BaseModel):
     mcp_servers: list[MCPServerConfig] = []  # stdio MCP servers → agent tools
     # Give the agent a spawn_agent tool (one-level recursive sub-agents):
     allow_spawn: bool = False
+    # Give the agent a dispatch_skill tool (run a named capability as a sub-agent):
+    allow_skill_dispatch: bool = False
     # Route to the few relevant tools per query (helps small models pick correctly):
     tool_router: bool = False
     guardrails: list[str] = []

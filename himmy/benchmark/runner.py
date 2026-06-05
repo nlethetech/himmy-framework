@@ -84,9 +84,17 @@ class BenchmarkRunner:
         try:
             with self._fixtures(task) as config:
                 runtime = self._build_runtime(spec, task, config)
+                instructions = list(task.instructions)
+                bundle = self._skill_bundle(task)
+                if bundle is not None:
+                    from himmy.skills.resolve import format_examples
+
+                    instructions.extend(bundle.instruction_blocks)
+                    if bundle.examples:
+                        instructions.append(format_examples(bundle.examples))
                 llm = LLMConfig(model_key="default", temperature=spec.temperature)
                 loop = await runtime.run_agent_loop(
-                    Persona(name="bench", instructions=task.instructions),
+                    Persona(name="bench", instructions=instructions),
                     AgentTask(title=task.id, prompt=task.prompt),
                     llm_config=llm,
                     max_turns=spec.max_turns,
@@ -152,8 +160,16 @@ class BenchmarkRunner:
                 updates["sqlite_path"] = str(db)
             yield config.model_copy(update=updates)
 
+    def _skill_bundle(self, task: BenchmarkTask) -> Any | None:
+        """Resolve a task's skills (if any) into their applied bundle, else ``None``."""
+        if not task.skills:
+            return None
+        from himmy.skills import build_skill_registry, resolve_skills
+
+        return resolve_skills(task.skills, build_skill_registry())
+
     def _build_runtime(self, spec: ModelSpec, task: BenchmarkTask, config: Any) -> Any:
-        """Build a fresh runtime with the task's packs + any distractor packs."""
+        """Build a fresh runtime with the task's packs + skills' packs + distractors."""
         from himmy import build_runtime
         from himmy.services.tools.registry import ToolRegistry
         from himmy.toolkit import register_packs
@@ -164,7 +180,9 @@ class BenchmarkRunner:
             from himmy.cli.provider import build_inference_for
 
             inference = build_inference_for(spec.provider, spec.model)
-        packs = list(dict.fromkeys([*task.packs, *spec.extra_packs]))
+        bundle = self._skill_bundle(task)
+        skill_packs = list(bundle.tool_packs) if bundle is not None else []
+        packs = list(dict.fromkeys([*task.packs, *skill_packs, *spec.extra_packs]))
         overrides: dict[str, Any] = {"inference": inference}
         if packs:
             registry = ToolRegistry()

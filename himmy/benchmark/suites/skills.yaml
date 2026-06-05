@@ -1,0 +1,30 @@
+name: skills
+# Tasks declared by SKILL, not raw packs — measures that a capability binds its tools
+# and that its injected know-how drives the model to the right answer. Self-contained
+# fixtures keep it offline and reproducible.
+tasks:
+  - id: skill_sql
+    category: skills
+    prompt: "What quantity of chickens is recorded in the animals table?"
+    skills: [data_analysis]
+    expect_tools: [sql_query]
+    sqlite:
+      - "CREATE TABLE animals(name TEXT, quantity INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
+    grade: { type: numeric, value: 30 }
+
+  - id: skill_file
+    category: skills
+    prompt: "Read note.txt and report the secret code it contains."
+    skills: [file_ops]
+    expect_tools: [read_file]
+    files:
+      note.txt: "The secret code is ORCHARD-7."
+    grade: { type: contains, value: "ORCHARD-7" }
+
+  - id: skill_summarize
+    category: skills
+    prompt: >
+      Summarize in one sentence: The cooperative harvested 30 crates of oranges,
+      sold 22 at the market, and stored the remaining 8 for winter.
+    skills: [summarize]
+    grade: { type: all_of, value: ["30", "8"] }

@@ -21,6 +21,16 @@ providers, Postgres/pgvector, and observability.
   `research_writer` (requires web_research + summarize). Verified live on Ollama: a
   composite, skills-only agent binds its prerequisites' packs and a skill's worked example
   drives the small model straight to the correct query.
+- **Skill dispatch, detail view, and skill-level benchmarking.** `dispatch_skill`
+  (enabled by `allow_skill_dispatch: true`) runs a named capability as an isolated
+  sub-agent scoped to just that skill's tools + know-how — a one-level recursion cap, like
+  `spawn_agent` but capability-bound (`SkillDispatcher` is the programmatic API).
+  `himmy skills <name>` shows a skill in full (version, when-to-use, tools, instructions,
+  examples). Benchmark tasks can be declared by `skills:` (not just raw `packs:`), so a
+  standing suite measures that a capability binds its tools and that its know-how yields
+  correct answers — new built-in `skills` suite. Verified live on Ollama: a parent with no
+  data tools dispatches `data_analysis` and answers correctly; the `skills` suite scores
+  100% on `qwen2.5:3b-instruct`.
 
 ### Fixed
 - **Tool-using agents now actually answer on real providers (`himmy run`/`chat`/`telegram`).**
