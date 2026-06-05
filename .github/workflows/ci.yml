@@ -30,7 +30,7 @@ jobs:
         # omitted — their tests skip cleanly when absent.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[api,postgres,knowledge,connectors,dev]"
+          pip install -e ".[api,postgres,knowledge,connectors,nepal,dev]"
 
       - name: Ruff lint
         run: ruff check .
