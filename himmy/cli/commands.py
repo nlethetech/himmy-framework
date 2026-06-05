@@ -354,13 +354,17 @@ def cmd_team(args: argparse.Namespace) -> int:
         _eprint("error: --prompt/-p is required for `himmy team`")
         return 2
     from himmy import build_runtime
-    from himmy.config.team_spec import build_team, load_team_spec
+    from himmy.config.team_spec import build_team, build_team_inference, load_team_spec
     from himmy.orchestrators import MultiAgentOrchestrator
 
     spec = load_team_spec(args.file)
     team, registry = build_team(spec, resolve_tools_module=_resolve_register)
-    inference = build_inference_for(
-        getattr(args, "provider", None), getattr(args, "model", None)
+    # Members may each declare their own provider — a Claude-CLI brain orchestrating
+    # local Ollama workers, etc.; otherwise one backend is used for the whole team.
+    inference = build_team_inference(
+        spec,
+        default_provider=getattr(args, "provider", None),
+        default_model=getattr(args, "model", None),
     )
     runtime, _inference, _tools = build_runtime(
         inference=inference, tool_registry=registry

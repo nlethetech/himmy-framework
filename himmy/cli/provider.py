@@ -11,8 +11,13 @@ managers are imported lazily so the common paths stay light and offline.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from himmy.core import HimmyError
 from himmy.services.inference.service import InferenceService
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.services.inference.client_manager import ClientManager
 
 PROVIDERS = ("stub", "claude-cli", "ollama", "pydantic-ai")
 
@@ -21,33 +26,33 @@ class ProviderError(HimmyError):
     """Raised when a requested provider cannot be constructed (e.g. missing extra)."""
 
 
-def build_inference_for(
+def build_manager_for(
     provider: str | None = None, model: str | None = None
-) -> InferenceService:
-    """Build an :class:`InferenceService` for the requested provider.
+) -> ClientManager:
+    """Build the raw :class:`ClientManager` for a provider (used by the multiplexer).
 
-    ``provider=None`` keeps the framework default (pydantic-ai→stub auto-select).
+    ``provider=None`` returns the framework's auto-selected manager (pydantic-ai when a
+    key + the ``providers`` extra + a model are present, otherwise the offline stub).
     """
     if provider is None:
         from himmy.runtime.builder import build_inference
 
-        return build_inference()
+        return build_inference()._client_manager
 
     if provider == "stub":
         from himmy.services.inference.client_manager import StubClientManager
 
-        return InferenceService(StubClientManager())
+        return StubClientManager()
 
     if provider == "claude-cli":
         from himmy.services.inference.local import ClaudeCliClientManager
 
-        return InferenceService(ClaudeCliClientManager(model=model or "haiku"))
+        return ClaudeCliClientManager(model=model or "haiku")
 
     if provider == "ollama":
         from himmy.services.inference.local import OllamaClientManager
 
-        manager = OllamaClientManager(model=model) if model else OllamaClientManager()
-        return InferenceService(manager)
+        return OllamaClientManager(model=model) if model else OllamaClientManager()
 
     if provider == "pydantic-ai":
         try:
@@ -60,13 +65,19 @@ def build_inference_for(
                 "pip install 'himmy[providers]'"
             ) from exc
         if model:
-            pyd_manager = PydanticAIClientManager(
-                {"default": model}, default_model=model
-            )
-        else:
-            pyd_manager = PydanticAIClientManager()
-        return InferenceService(pyd_manager)
+            return PydanticAIClientManager({"default": model}, default_model=model)
+        return PydanticAIClientManager()
 
     raise ProviderError(
         f"unknown provider {provider!r}; choose one of {', '.join(PROVIDERS)}"
     )
+
+
+def build_inference_for(
+    provider: str | None = None, model: str | None = None
+) -> InferenceService:
+    """Build an :class:`InferenceService` for the requested provider.
+
+    ``provider=None`` keeps the framework default (pydantic-ai→stub auto-select).
+    """
+    return InferenceService(build_manager_for(provider, model))

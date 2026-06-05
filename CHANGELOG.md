@@ -35,6 +35,12 @@ providers, Postgres/pgvector, and observability.
   remains a clean opt-in via the `Guardrail` protocol when more is needed.)
 
 ### Added
+- **Mixed-provider teams (strong brain + cheap local workers).** Each `team.yaml` member
+  can declare its own `provider` + `model`, so a Claude-CLI (Opus) brain can orchestrate
+  free local Ollama workers with a cloud model wherever you want one. A new
+  `MultiProviderClientManager` dispatches each member's `model_key` to its own backend
+  (unknown keys fall back to a default); the CLI builds it automatically via
+  `build_team_inference`. Members without a provider use the CLI `--provider`/`--model`.
 - **Nepal pack + localization.** A `nepal` toolkit pack makes the framework's Nepal
   modules agent-facing: `nepali_date` (AD↔Bikram Sambat + fiscal year), `nepali_format`
   (NPR with Nepali lakh-grouping + Devanagari numerals — `रू १२,३४,५६७.५०`),

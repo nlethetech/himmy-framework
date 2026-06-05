@@ -43,12 +43,20 @@ class TeamMemberSpec(BaseModel):
     description: str = ""
     instructions: list[str] = []
     role: str | None = None
+    provider: str | None = None  # claude-cli | ollama | pydantic-ai | stub (per member)
     model: str = "default"
     tools: list[str] = []
     tool_packs: list[str] = []
     tools_module: str | None = None
     handoffs: list[str] = []
     delegates: list[str] = []
+
+
+def _dispatch_key(member: TeamMemberSpec) -> str:
+    """The model_key a member routes on: ``<provider>:<model>`` or its plain model."""
+    if member.provider:
+        return f"{member.provider}:{member.model}"
+    return member.model
 
 
 class TeamSpec(BaseModel):
@@ -114,7 +122,7 @@ def build_team(
                 name=member.name,
                 persona=_persona_for(member),
                 tools=list(member.tools),
-                model_key=member.model,
+                model_key=_dispatch_key(member),
                 handoffs=list(member.handoffs),
                 delegates=list(member.delegates),
             )
@@ -123,4 +131,42 @@ def build_team(
     return AgentTeam(members=members, entry=spec.entry), registry
 
 
-__all__ = ["TeamSpec", "TeamMemberSpec", "load_team_spec", "build_team"]
+def build_team_inference(
+    spec: TeamSpec,
+    *,
+    default_provider: str | None = None,
+    default_model: str | None = None,
+) -> Any:
+    """Build the team's :class:`InferenceService`, mixing providers across members.
+
+    When a member declares its own ``provider``, the team runs on a
+    :class:`~himmy.services.inference.multi_provider.MultiProviderClientManager` that
+    dispatches each member's ``model_key`` to its own backend (e.g. a Claude-CLI brain +
+    local Ollama workers). When no member sets a provider, a single backend is used (the
+    CLI ``--provider``/``--model``, or the framework default).
+    """
+    from himmy.cli.provider import build_inference_for, build_manager_for
+    from himmy.services.inference.multi_provider import MultiProviderClientManager
+    from himmy.services.inference.service import InferenceService
+
+    if not any(m.provider for m in spec.members):
+        return build_inference_for(default_provider, default_model)
+
+    managers: dict[str, Any] = {}
+    for member in spec.members:
+        if member.provider:
+            key = _dispatch_key(member)
+            if key not in managers:
+                model = None if member.model == "default" else member.model
+                managers[key] = build_manager_for(member.provider, model)
+    managers["default"] = build_manager_for(default_provider, default_model)
+    return InferenceService(MultiProviderClientManager(managers, default_key="default"))
+
+
+__all__ = [
+    "TeamSpec",
+    "TeamMemberSpec",
+    "load_team_spec",
+    "build_team",
+    "build_team_inference",
+]

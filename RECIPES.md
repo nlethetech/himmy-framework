@@ -68,6 +68,43 @@ himmy init my-agent
 himmy run -f my-agent/agent.yaml -p "Research permaculture and summarize."
 ```
 
+## Mixed-provider team — a strong brain + cheap local workers
+
+Each team member can declare **its own `provider` + `model`**, so a strong model
+orchestrates while free local models do the grunt work. The CLI builds a multi-provider
+dispatcher automatically:
+
+```yaml
+# team.yaml
+entry: brain
+members:
+  - name: brain            # the orchestrator / decision-maker
+    description: Decide the approach and delegate the work.
+    provider: claude-cli   # Claude Max (Opus) as the brain
+    model: opus
+    delegates: [researcher, writer]
+  - name: researcher       # cheap local worker
+    description: Gather facts from the web.
+    provider: ollama
+    model: qwen2.5:3b-instruct
+    tool_packs: [web]
+    tools: [web_search]
+  - name: writer           # another local worker
+    description: Write the final answer in Nepali.
+    provider: ollama
+    model: qwen2.5:3b-instruct
+    language: ne
+```
+
+```bash
+himmy team -f team.yaml -p "Research permaculture and write a summary."
+```
+
+Members without a `provider` fall back to the CLI's `--provider`/`--model` (or the
+framework default). Under the hood each `model_key` routes to its own backend via
+`MultiProviderClientManager` — so you pay for the strong model only where it reasons, and
+run everything else locally for free.
+
 ## Notes from real-model testing
 
 - **Tool calling works** on Ollama (native `/api/chat` tools) and, best-effort, on the
