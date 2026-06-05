@@ -325,7 +325,20 @@ transparent whole-store wiring is the documented opt-in deployment step.*
 
 ---
 
-## 5. WS5 — Supply Chain & Secure SDLC (CI/CD)
+## 5. WS5 — Supply Chain & Secure SDLC (CI/CD) — ✅ DONE
+
+*Shipped: **5.1** CycloneDX SBOM per build (verified: 1.6, 423 components); **5.2**
+`pip-audit` gate + weekly schedule + `.github/dependabot.yml` (pip + actions); **5.3** SAST
+via Ruff flake8-bandit (`S`) in the lint gate — dangerous rules active (verified they fire),
+false-positives scoped/justified, zero real findings; gitleaks secret scan + Trivy fs scan;
+**5.5** pinned actions + `SECURITY.md`; **5.6** real-provider integration lane
+(`.github/workflows/integration.yml` — Ollama + qwen2.5:3b) running
+`tests/integration/test_real_provider.py` (marked `integration`, skip-gated), which proves a
+tool agent CALLS the tool and returns a correct non-empty answer — the regression guard so
+the stub can never again mask a broken core path (verified live). New
+`.github/workflows/security.yml` + `Makefile` (same checks locally). **WS1–WS5 complete.***
+
+### 5-orig — Supply Chain & Secure SDLC (CI/CD)
 
 Current CI (`.github/workflows/ci.yml`) runs ruff + mypy + pytest (stub-only). No security
 scanning, no SBOM, no real-provider integration lane.
