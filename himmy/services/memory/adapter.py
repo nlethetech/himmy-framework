@@ -20,14 +20,26 @@ class MemoryContextAdapter(ContextAdapter):
 
     name = "memory"
 
-    def __init__(self, memory: MemoryService, *, top_k: int = 5) -> None:
-        """Wrap a :class:`MemoryService`; ``top_k`` caps how many memories inject."""
+    def __init__(
+        self, memory: MemoryService, *, top_k: int = 5, subject_id: str | None = None
+    ) -> None:
+        """Wrap a :class:`MemoryService`; ``top_k`` caps how many memories inject.
+
+        ``subject_id`` pins the recall subject (overriding the run's scope) so the
+        adapter reads the same subject that facts were remembered under.
+        """
         self._memory = memory
         self._top_k = top_k
+        self._subject_id = subject_id
 
     async def fetch(self, key: str, scope: dict) -> ContextField | None:
         """Recall memories for the scope's subject and render them as a field."""
-        subject_id = scope.get("subject_id") or scope.get("client_id") or "default"
+        subject_id = (
+            self._subject_id
+            or scope.get("subject_id")
+            or scope.get("client_id")
+            or "default"
+        )
         query = str(
             scope.get("query") or scope.get("spec_metadata", {}).get("query") or ""
         )

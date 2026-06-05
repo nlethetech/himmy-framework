@@ -129,6 +129,31 @@ def _build_runtime_for(
         overrides["input_guardrail"] = pipeline
         overrides["output_guardrail"] = pipeline
 
+    if spec.memory:
+        from himmy import build_storage
+        from himmy.services.context.service import ContextService
+        from himmy.services.memory import (
+            InMemoryMemoryStore,
+            MemoryContextAdapter,
+            MemoryService,
+            SqliteMemoryStore,
+        )
+        from himmy.toolkit import ToolkitConfig
+
+        tk = ToolkitConfig.from_sources(_project().get("toolkit"))
+        store = (
+            SqliteMemoryStore(tk.memory_path)
+            if tk.memory_path
+            else InMemoryMemoryStore()
+        )
+        memory = MemoryService(store, embedder=tk.build_embedder_and_dim()[0])
+        adapter = MemoryContextAdapter(
+            memory, top_k=spec.memory_top_k, subject_id=tk.memory_subject
+        )
+        overrides["context_service"] = ContextService(
+            storage_service=build_storage(), adapters=[adapter]
+        )
+
     if spec.tool_packs or spec.tools_module:
         registry = ToolRegistry()
         if spec.tool_packs:

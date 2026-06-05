@@ -24,6 +24,12 @@ providers, Postgres/pgvector, and observability.
   to an explicit repeat-manager.)
 
 ### Added
+- **Auto-memory into context.** Set `memory: true` on an `agent.yaml` and the agent
+  automatically recalls its most relevant long-term memories and injects them into the
+  system prompt **every run, with no tool call** (`AgentSpec.memory`/`memory_top_k` wire a
+  `context_build_spec` + `context_prompt_map_spec`; the CLI builds a `MemoryService` +
+  `MemoryContextAdapter` over a `ContextService`). `MemoryContextAdapter` gained a pinned
+  `subject_id` so it reads the same subject facts were remembered under.
 - **Plan-and-execute + reflection (`himmy.orchestrators`).** `PlannerOrchestrator`
   decomposes a goal into an ordered plan (structured output, with a numbered-text
   fallback for providers that lack JSON mode), executes each step over a shared thread,

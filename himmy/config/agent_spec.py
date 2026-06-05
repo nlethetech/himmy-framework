@@ -57,6 +57,8 @@ class AgentSpec(BaseModel):
     tool_packs: list[str] = []
     tools_module: str | None = None
     guardrails: list[str] = []
+    memory: bool = False  # auto-recall long-term memory into the prompt each run
+    memory_top_k: int = 5
     output_schema: dict[str, Any] | None = None
     metadata: dict[str, Any] = {}
 
@@ -98,6 +100,20 @@ class AgentSpec(BaseModel):
             context["tool_names"] = list(self.tools)
         if self.output_schema is not None:
             context["output_schema"] = self.output_schema
+        if self.memory:
+            # Recall relevant long-term memory and inject it into the system prompt,
+            # with no tool call. Needs a runtime wired with a memory ContextAdapter.
+            context["context_build_spec"] = {
+                "keys": [
+                    {
+                        "key": "agent_memory",
+                        "adapter_name": "memory",
+                        "source_preference": "tool_only",
+                        "metadata": {"query": prompt},
+                    }
+                ]
+            }
+            context["context_prompt_map_spec"] = {"system_keys": ["agent_memory"]}
         return Task(
             title=title or f"{self.name}-task",
             prompt=prompt,
