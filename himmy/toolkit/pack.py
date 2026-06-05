@@ -80,7 +80,7 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
     ),
     "documents": ToolPack(
         "documents",
-        "Extract text from PDF / text / Markdown files under the sandbox root.",
+        "Extract text from PDF / text / Markdown / CSV / Excel files under the root.",
         ("read_document",),
         register_documents_pack,
     ),

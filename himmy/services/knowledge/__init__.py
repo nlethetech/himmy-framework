@@ -26,8 +26,10 @@ from himmy.services.knowledge.models import (
     RetrievedChunk,
 )
 from himmy.services.knowledge.readers import (
+    CsvReader,
     DocumentReader,
     DocumentReaderFactory,
+    ExcelReader,
     PDFReader,
     TextReader,
 )
@@ -67,6 +69,8 @@ __all__ = [
     "DocumentReader",
     "TextReader",
     "PDFReader",
+    "CsvReader",
+    "ExcelReader",
     "DocumentReaderFactory",
     # pgvector backend (requires [postgres,knowledge] + a live DB)
     "PgVectorKnowledgeBackend",

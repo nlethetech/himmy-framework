@@ -20,7 +20,7 @@ _READ_SCHEMA = {
     "properties": {
         "path": {
             "type": "string",
-            "description": "A .pdf/.txt/.md file under the root.",
+            "description": "A .pdf/.txt/.md/.csv/.xlsx file under the root.",
         },
         "max_chars": {"type": "integer", "minimum": 100, "default": 20000},
     },
@@ -51,7 +51,7 @@ def register_documents_pack(registry: ToolRegistry, config: ToolkitConfig) -> No
         registry,
         name="read_document",
         handler=read_document,
-        description="Extract text from a PDF, text, or Markdown file under the root.",
+        description="Extract text from a PDF/text/Markdown/CSV/Excel file under the root.",
         args_json_schema=_READ_SCHEMA,
         metadata={"pack": "documents"},
     )

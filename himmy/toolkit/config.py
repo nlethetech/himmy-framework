@@ -37,6 +37,9 @@ class ToolkitConfig(BaseModel):
     sql_dsn: str | None = None
     sql_read_only: bool = True
 
+    # knowledge pack --------------------------------------------------------
+    kb_dsn: str | None = None  # Postgres+pgvector DSN → durable KB; None → in-process
+
     # comms pack ------------------------------------------------------------
     comms_allow_send: bool = False
     smtp_host: str | None = None
@@ -81,6 +84,7 @@ class ToolkitConfig(BaseModel):
             sqlite_path=env.get("HIMMY_SQLITE_PATH"),
             sql_dsn=env.get("HIMMY_SQL_DSN"),
             sql_read_only=_env_bool(env.get("HIMMY_SQL_READONLY"), default=True),
+            kb_dsn=env.get("HIMMY_KB_DSN"),
             comms_allow_send=_env_bool(
                 env.get("HIMMY_COMMS_ALLOW_SEND"), default=False
             ),

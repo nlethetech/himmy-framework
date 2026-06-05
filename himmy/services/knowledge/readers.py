@@ -55,14 +55,62 @@ class PDFReader(DocumentReader):
         return pypdf
 
 
+class CsvReader(DocumentReader):
+    """Reads CSV files into ``col=value | …`` rows (stdlib ``csv``, no extra)."""
+
+    extensions = (".csv",)
+
+    def read(self, path: str) -> str:
+        """Flatten a CSV into one line per row of ``header=value`` pairs."""
+        import csv
+
+        with Path(path).open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            lines = [" | ".join(f"{k}={v}" for k, v in row.items()) for row in reader]
+        return "\n".join(lines)
+
+
+class ExcelReader(DocumentReader):
+    """Reads ``.xlsx``/``.xlsm`` workbooks via ``openpyxl`` (the [connectors] extra)."""
+
+    extensions = (".xlsx", ".xlsm")
+
+    def read(self, path: str) -> str:
+        """Flatten every sheet's rows to tab-joined text (requires openpyxl)."""
+        openpyxl = self._require_openpyxl()
+        workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        parts: list[str] = []
+        for sheet in workbook.worksheets:
+            parts.append(f"# {sheet.title}")
+            for row in sheet.iter_rows(values_only=True):
+                parts.append(
+                    "\t".join("" if cell is None else str(cell) for cell in row)
+                )
+        return "\n".join(parts)
+
+    @staticmethod
+    def _require_openpyxl() -> Any:
+        """Import openpyxl lazily, raising a clear error when the extra is missing."""
+        try:
+            import openpyxl  # type: ignore
+        except ImportError as exc:  # pragma: no cover - only without the extra
+            raise HimmyError(
+                "ExcelReader requires the [connectors] extra "
+                "(pip install 'himmy[connectors]') for openpyxl."
+            ) from exc
+        return openpyxl
+
+
 class DocumentReaderFactory:
     """Routes a path to the right :class:`DocumentReader` by extension."""
 
     def __init__(self) -> None:
-        """Register the built-in text and PDF readers."""
+        """Register the built-in text, PDF, CSV, and Excel readers."""
         self._by_ext: dict[str, DocumentReader] = {}
         self.register(TextReader())
         self.register(PDFReader())
+        self.register(CsvReader())
+        self.register(ExcelReader())
 
     def register(self, reader: DocumentReader) -> None:
         """Register a reader for each of its declared extensions."""
@@ -87,5 +135,7 @@ __all__ = [
     "DocumentReader",
     "TextReader",
     "PDFReader",
+    "CsvReader",
+    "ExcelReader",
     "DocumentReaderFactory",
 ]

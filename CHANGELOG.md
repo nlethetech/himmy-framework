@@ -14,6 +14,14 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **CSV/Excel document readers.** `CsvReader` (`.csv`, stdlib) and `ExcelReader`
+  (`.xlsx`/`.xlsm`, via the existing `connectors` openpyxl) join the
+  `DocumentReaderFactory`, so `read_document` and `kb_ingest` now cover spreadsheets
+  alongside PDF/text/Markdown.
+- **Durable knowledge via pgvector (toolkit).** Setting `HIMMY_KB_DSN` makes the
+  `knowledge` pack's `kb_ingest`/`kb_search` persist across processes on Postgres +
+  pgvector (resolved by a fixed KB name); the in-process KB remains the default. Uses
+  the existing `postgres`/`knowledge` extras.
 - **Long-term memory module (`himmy.services.memory`) + `memory` toolkit pack.** A
   `MemoryService` persists facts (`remember`) and recalls them semantically (`recall`,
   cosine over the offline embedder). Storage is pluggable: `InMemoryMemoryStore` or a

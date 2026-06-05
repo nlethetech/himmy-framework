@@ -46,19 +46,64 @@ _SEARCH_SCHEMA = {
 }
 
 
-def register_knowledge_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
-    """Register ``kb_ingest`` and ``kb_search`` over a shared in-process KB."""
-    kb = KnowledgeBase(storage=StorageService(), embedder=DeterministicEmbedder())
-    state: dict[str, str] = {}
+_KB_VECTOR_DIM = 64  # matches DeterministicEmbedder's default dimension
 
-    async def _ensure_kb_id() -> str:
-        """Create the backing KB on first use and cache its id (dim matches embedder)."""
-        if "kb_id" not in state:
-            record = await kb.create_kb(
-                workspace_id="local", client_id="local", name=_DEFAULT_KB_ID
-            )
-            state["kb_id"] = record.kb_id
-        return state["kb_id"]
+
+async def _build_durable_kb(dsn: str) -> tuple[KnowledgeBase, str]:
+    """Build a Postgres+pgvector-backed KB, persisting across processes by name."""
+    try:
+        from himmy.services.storage.postgres import PostgresStorageService
+    except Exception as exc:  # pragma: no cover - optional extra missing
+        raise ValueError(
+            "kb_dsn (durable knowledge) needs the 'postgres' extra: "
+            "pip install 'himmy[postgres]'"
+        ) from exc
+
+    storage = await PostgresStorageService.connect(dsn)
+    await storage.create_knowledge_schema(vector_dim=_KB_VECTOR_DIM)
+    kb = KnowledgeBase(
+        storage=storage,
+        embedder=DeterministicEmbedder(),
+        backend=storage.knowledge_backend(),
+    )
+    existing = await kb.resolve_kb(
+        workspace_id="local", client_id="local", name=_DEFAULT_KB_ID
+    )
+    if existing is not None:
+        return kb, existing.kb_id
+    record = await kb.create_kb(
+        workspace_id="local",
+        client_id="local",
+        name=_DEFAULT_KB_ID,
+        vector_dim=_KB_VECTOR_DIM,
+    )
+    return kb, record.kb_id
+
+
+def register_knowledge_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
+    """Register ``kb_ingest`` and ``kb_search`` over a shared KB.
+
+    By default the KB is in-process (per run). When ``config.kb_dsn`` is set, the KB is
+    backed by Postgres + pgvector so ``kb_ingest``/``kb_search`` persist across processes
+    (resolved by a fixed KB name); that path needs the ``postgres`` extra.
+    """
+    state: dict[str, Any] = {}
+
+    async def _ensure_kb() -> tuple[KnowledgeBase, str]:
+        """Build the KB (in-process or durable pgvector) on first use; cache it."""
+        if "kb" not in state:
+            if config.kb_dsn:
+                kb, kb_id = await _build_durable_kb(config.kb_dsn)
+            else:
+                kb = KnowledgeBase(
+                    storage=StorageService(), embedder=DeterministicEmbedder()
+                )
+                record = await kb.create_kb(
+                    workspace_id="local", client_id="local", name=_DEFAULT_KB_ID
+                )
+                kb_id = record.kb_id
+            state["kb"], state["kb_id"] = kb, kb_id
+        return state["kb"], state["kb_id"]
 
     async def kb_ingest(args: dict[str, Any]) -> dict[str, Any]:
         text = args.get("text")
@@ -78,13 +123,15 @@ def register_knowledge_pack(registry: ToolRegistry, config: ToolkitConfig) -> No
                 title=args.get("title"),
                 source_uri=args.get("source_uri"),
             )
-        docs = await kb.ingest_documents(await _ensure_kb_id(), [doc])
+        kb, kb_id = await _ensure_kb()
+        docs = await kb.ingest_documents(kb_id, [doc])
         return {"ingested": len(docs), "document_ids": [d.document_id for d in docs]}
 
     async def kb_search(args: dict[str, Any]) -> dict[str, Any]:
         query = str(args["query"])
         top_k = max(1, min(int(args.get("top_k", 5)), 20))
-        chunks = await kb.search(await _ensure_kb_id(), query, top_k=top_k)
+        kb, kb_id = await _ensure_kb()
+        chunks = await kb.search(kb_id, query, top_k=top_k)
         return {
             "query": query,
             "results": [
