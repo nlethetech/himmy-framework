@@ -14,6 +14,14 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Agent evaluation harness (`himmy.services.evaluation.agent_harness`).** An
+  `AgentEvalHarness` runs an agent or a team over an `EvaluationSuite` (executing each
+  case's input through `run_task_detailed` / `MultiAgentOrchestrator.run`) and scores the
+  outputs via the existing `EvaluationService` — deterministic metrics offline, LLM-judge
+  + embedding-similarity when a provider/embedder is configured. Suites are declarative
+  (`suite.yaml` → `himmy.config.load_eval_suite`) and runnable via `himmy eval -f
+  suite.yaml --agent agent.yaml` (or `--team team.yaml`), printing a per-case PASS/FAIL
+  scorecard. No new dependencies.
 - **Token streaming + crisp agent-loop termination.** `SingleAgentRuntime.stream_task`
   streams a reply as `StreamDelta` chunks (over `InferenceService.run_stream`); `himmy
   chat` now streams to stdout token-by-token and `himmy run --stream` opts in. A

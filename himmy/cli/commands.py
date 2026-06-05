@@ -244,6 +244,61 @@ def cmd_team(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------ eval
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Evaluate an agent (or team) against a suite.yaml and print the scorecard."""
+    from himmy import build_runtime
+    from himmy.config.eval_spec import load_eval_suite
+    from himmy.services.evaluation.agent_harness import AgentEvalHarness
+    from himmy.services.evaluation.service import EvaluationService
+
+    suite = load_eval_suite(args.file)
+    inference = build_inference_for(
+        getattr(args, "provider", None), getattr(args, "model", None)
+    )
+    # LLM-judge metrics activate only when a real (non-stub) provider is selected.
+    judge = inference if getattr(args, "provider", None) not in (None, "stub") else None
+    eval_service = EvaluationService(inference_service=judge)
+
+    if args.team:
+        from himmy.config.team_spec import build_team, load_team_spec
+
+        team, registry = build_team(
+            load_team_spec(args.team), resolve_tools_module=_resolve_register
+        )
+        runtime, _i, _t = build_runtime(inference=inference, tool_registry=registry)
+        harness = AgentEvalHarness(runtime, eval_service)
+        run = asyncio.run(harness.evaluate_team(suite, team, registry))
+    else:
+        if not args.agent:
+            _eprint(
+                "error: `himmy eval` needs --agent <agent.yaml> or --team <team.yaml>"
+            )
+            return 2
+        spec = load_agent_spec(args.agent)
+        runtime = _build_runtime_for(spec, args)
+        harness = AgentEvalHarness(runtime, eval_service)
+        run = asyncio.run(
+            harness.evaluate_agent(
+                suite, spec.to_persona(), llm_config=spec.to_llm_config()
+            )
+        )
+
+    if args.json:
+        print(json.dumps(run.model_dump(), indent=2, ensure_ascii=False, default=str))
+        return 0
+    print(f"suite: {run.suite_name}   aggregate: {run.aggregate_score:.3f}")
+    for case in run.case_results:
+        mark = "PASS" if case.passed else "FAIL"
+        metrics = " ".join(f"{m.metric}={m.score:.2f}" for m in case.metric_scores)
+        print(f"  [{mark}] {case.case_id[:8]}  {case.aggregate:.2f}  {metrics}")
+    passed = sum(1 for c in run.case_results if c.passed)
+    print(f"\n{passed}/{len(run.case_results)} cases passed")
+    return 0 if passed == len(run.case_results) else 1
+
+
 # ------------------------------------------------------------------------ init
 
 _AGENT_YAML = """\

@@ -70,6 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_team.add_argument("--json", action="store_true", help="print the full transcript")
     p_team.set_defaults(func=commands.cmd_team)
 
+    p_eval = sub.add_parser("eval", help="evaluate an agent/team against a suite.yaml")
+    p_eval.add_argument("-f", "--file", required=True, help="path to a suite.yaml")
+    p_eval.add_argument("--agent", help="path to an agent.yaml to evaluate")
+    p_eval.add_argument("--team", help="path to a team.yaml to evaluate instead")
+    p_eval.add_argument(
+        "--provider", choices=PROVIDERS, help="inference provider (default: auto)"
+    )
+    p_eval.add_argument("--model", help="model key/name for the provider")
+    p_eval.add_argument(
+        "--json", action="store_true", help="print the full run as JSON"
+    )
+    p_eval.set_defaults(func=commands.cmd_eval)
+
     p_init = sub.add_parser("init", help="scaffold an agent.yaml + tools.py")
     p_init.add_argument("directory", nargs="?", default=".", help="target directory")
     p_init.add_argument("--force", action="store_true", help="overwrite existing files")

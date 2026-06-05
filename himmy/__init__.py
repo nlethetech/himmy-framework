@@ -29,6 +29,7 @@ __all__ = [
     "TeamMember",
     "MultiAgentOrchestrator",
     "MemoryService",
+    "AgentEvalHarness",
     "build_runtime",
     "build_inference",
     "build_storage",
@@ -61,6 +62,10 @@ def __getattr__(name: str) -> Any:
         from himmy.services.knowledge.local_embedders import build_embedder
 
         return build_embedder
+    if name == "AgentEvalHarness":
+        from himmy.services.evaluation.agent_harness import AgentEvalHarness
+
+        return AgentEvalHarness
     if name in _LAZY_CONFIG:
         from himmy import config
 
