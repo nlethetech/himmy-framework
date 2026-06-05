@@ -411,25 +411,39 @@ def test_required_arg_missing_is_invalid_request_before_dispatch() -> None:
     assert called["hit"] is False
 
 
-def test_additional_properties_false_rejected_on_input() -> None:
-    """additionalProperties:false on the input schema rejects unexpected args."""
+def test_additional_properties_false_strips_or_rejects_by_mode() -> None:
+    """additionalProperties:false: lenient (default) strips the extra; strict rejects.
+
+    Tier 1.2 makes arg-tolerance the default (so small models that hallucinate a
+    spurious key still succeed); ``lenient_args=False`` restores strict rejection.
+    """
     registry = ToolRegistry()
     register_local_tool(
         registry,
         name="strict",
-        handler=lambda a: {"ok": True},
+        handler=lambda a: {"seen": a},
         args_json_schema={
             "type": "object",
             "properties": {"a": {"type": "integer"}},
             "additionalProperties": False,
         },
     )
-    svc = ToolService(registry)
-    result = run_async(
-        svc.execute(ToolInvocation(tool_name="strict", args={"a": 1, "rogue": 2}))
+    # Default (lenient): the hallucinated 'rogue' key is dropped before validation.
+    lenient = run_async(
+        ToolService(registry).execute(
+            ToolInvocation(tool_name="strict", args={"a": 1, "rogue": 2})
+        )
     )
-    assert result.outcome == "failed"
-    assert result.error_code == ToolErrorCode.INVALID_REQUEST
+    assert lenient.outcome == "success"
+    assert lenient.result["seen"] == {"a": 1}
+    # Strict opt-out: the unexpected key is rejected.
+    strict = run_async(
+        ToolService(registry, lenient_args=False).execute(
+            ToolInvocation(tool_name="strict", args={"a": 1, "rogue": 2})
+        )
+    )
+    assert strict.outcome == "failed"
+    assert strict.error_code == ToolErrorCode.INVALID_REQUEST
 
 
 # ----------------------------------------------------------------- post-hook + validation order

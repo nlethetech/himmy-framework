@@ -160,6 +160,14 @@ class AgentLoopResult:
         return sum(t.output_tokens for t in self.turns)
 
 
+#: The forced final-turn instruction when a tool-using loop ends with no answer.
+_SYNTHESIS_NUDGE = (
+    "You have already gathered the information you need from the tools above. "
+    "Now answer the user's original question directly and completely, using only "
+    "those results. Do not call any tools."
+)
+
+
 class SingleAgentRuntime:
     """Conducts one agent run end-to-end: persona + task in, answered thread out.
 
@@ -366,6 +374,7 @@ class SingleAgentRuntime:
         llm_config: LLMConfig | None = None,
         hitl: bool = False,
         stop_on_no_progress: bool = False,
+        synthesize_empty: bool = True,
     ) -> AgentLoopResult:
         """Run a bounded, runtime-owned agentic loop: act -> observe -> re-invoke.
 
@@ -395,7 +404,7 @@ class SingleAgentRuntime:
         trace_id = f"{thread.thread_id}:{task.task_id}"
         await self._emit_turn_completed(trace_id, thread, persona, 1, first)
 
-        return await self._drive_loop(
+        result = await self._drive_loop(
             persona,
             task,
             thread,
@@ -409,6 +418,50 @@ class SingleAgentRuntime:
             stop_on_no_progress=stop_on_no_progress,
             turns_offset=0,
             cost_offset=0.0,
+        )
+        if synthesize_empty:
+            result = await self._maybe_synthesize(result, persona, trace_id, llm_config)
+        return result
+
+    async def _maybe_synthesize(
+        self,
+        result: AgentLoopResult,
+        persona: Persona,
+        trace_id: str,
+        llm_config: LLMConfig | None,
+    ) -> AgentLoopResult:
+        """One forced final turn when a tool-using loop ended with no answer (Tier 1.1).
+
+        Small models often call a tool, get the result, then fail to write the final
+        answer (an empty reply). When the loop stops with an empty answer but tools
+        WERE used, run one more turn with tools unbound and an explicit instruction to
+        answer from the results already gathered — converting an empty into an answer.
+        """
+        # Only rescue the genuine "model fell silent" stops. ``no_progress`` is an
+        # opt-in deliberate halt whose stop reason callers rely on, so leave it.
+        if result.stopped_reason not in ("final", "max_turns"):
+            return result
+        if (result.final.output_text or "").strip():
+            return result  # already answered — nothing to nudge
+        if not any(t.tool_calls for t in result.turns):
+            return result  # no tools were used — synthesis has nothing to work from
+
+        from himmy.agents.base_agent.task import Task
+
+        nudge = Task(
+            title="synthesis",
+            prompt=_SYNTHESIS_NUDGE,
+            context={"tool_names": []},  # unbind tools: force a text answer
+        )
+        synth = await self.run_task_detailed(
+            persona, nudge, thread=result.thread, llm_config=llm_config
+        )
+        index = result.turn_count + 1
+        await self._emit_turn_completed(trace_id, synth.thread, persona, index, synth)
+        return AgentLoopResult(
+            thread=synth.thread,
+            turns=[*result.turns, synth],
+            stopped_reason="synthesized",
         )
 
     async def continue_turn(

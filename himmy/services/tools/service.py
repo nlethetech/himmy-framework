@@ -76,6 +76,52 @@ def _validate_against_schema(value: Any, schema: dict[str, Any]) -> str | None:
     return validate_against_schema(value, schema)
 
 
+def _coerce_lenient_args(
+    args: dict[str, Any], schema: dict[str, Any]
+) -> dict[str, Any]:
+    """Tolerate small-model arg fuzz before strict validation (Tier 1.2).
+
+    Two minimal, safe normalizations against an object schema: (1) drop keys the
+    model hallucinated that the schema forbids (``additionalProperties: false``); and
+    (2) drop ``null``-valued *optional* keys (a model emitting ``"date": null`` for an
+    absent optional should behave like omitting it, so the handler's default applies).
+    Required fields and typed values are left untouched, so validation stays strict.
+    """
+    properties = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    extras_allowed = schema.get("additionalProperties", True) is not False
+    cleaned: dict[str, Any] = {}
+    for key, value in args.items():
+        if key not in properties:
+            if extras_allowed:
+                cleaned[key] = value  # schema permits extras — keep as-is
+            continue  # otherwise strip the unknown key
+        if value is None and key not in required:
+            prop_type = properties[key].get("type")
+            allows_null = prop_type == "null" or (
+                isinstance(prop_type, list) and "null" in prop_type
+            )
+            if not allows_null:
+                continue  # drop the null optional → treated as omitted
+        cleaned[key] = value
+    return cleaned
+
+
+def _schema_hint(schema: dict[str, Any]) -> str:
+    """A compact, model-facing description of an object schema's args (Tier 1.4)."""
+    properties = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    if not properties:
+        return "this tool takes no arguments."
+    parts = []
+    for name, spec in properties.items():
+        ptype = spec.get("type", "any")
+        if isinstance(ptype, list):
+            ptype = "|".join(ptype)
+        parts.append(f"{name} ({ptype}){'*' if name in required else ''}")
+    return "expected args: " + ", ".join(parts) + " (* = required)."
+
+
 class ToolService:
     """Dispatches tool calls with policy hooks, output validation, and events.
 
@@ -96,12 +142,17 @@ class ToolService:
         http_client: Any = None,
         http_max_connections: int = 100,
         http_max_keepalive_connections: int = 20,
+        lenient_args: bool = True,
     ) -> None:
         self._registry = registry
         self._pre_hook = pre_execution_hook
         self._post_hook = post_execution_hook
         self.event_sink = event_sink
         self._default_timeout_seconds = default_timeout_seconds
+        # Tolerate small-model arg fuzz: drop hallucinated unknown keys (when the
+        # schema forbids extras) and null-valued optionals (treated as omitted) BEFORE
+        # validation. Keeps required/typed checks strict; off → strict pass-through.
+        self._lenient_args = lenient_args
         # Shared httpx client, built lazily on first HTTP call (or injected for tests).
         self._http_client = http_client
         self._http_client_owned = http_client is None
@@ -196,13 +247,17 @@ class ToolService:
         args = dict(invocation.args)
         schema = definition.args_json_schema
         if schema and schema.get("type") == "object":
+            if self._lenient_args:
+                args = _coerce_lenient_args(args, schema)
             err = validate_against_schema(args, schema)
             if err is not None:
+                # Self-correction (Tier 1.4): hand the model the schema so it can fix
+                # its args on the next turn, not just the error.
                 return await self._fail(
                     invocation,
                     start,
                     ToolErrorCode.INVALID_REQUEST,
-                    f"args failed schema validation: {err}",
+                    f"args failed schema validation: {err}. {_schema_hint(schema)}",
                 )
 
         # --- pre-execution policy hook -------------------------------------
