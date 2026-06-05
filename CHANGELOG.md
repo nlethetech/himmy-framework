@@ -14,6 +14,13 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Recipe gallery + real-model proof (`RECIPES.md`, `examples/10–12`).** Provider-
+  selectable examples (offline stub by default; `HIMMY_EXAMPLE_PROVIDER=ollama` for a real
+  model) — a tool-using agent, a live web-research agent, and durable semantic memory.
+  Verified end-to-end on Ollama `qwen2.5`: the agent calls `calculator`/`web_search`, the
+  runtime executes it against the real tool/web, and the model answers. `RECIPES.md`
+  documents how to run them and the findings (incl. that small models reliably call tools
+  but may not hand off in a team — a model-capability limit, not a framework one).
 - **Real tool-calling on the local providers.** `OllamaClientManager` now sends bound
   tools via Ollama's native `/api/chat` `tools` schema and parses `message.tool_calls`;
   `ClaudeCliClientManager` (text-only) drives a best-effort ReAct protocol (appends a tool
