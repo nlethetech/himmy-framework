@@ -23,6 +23,17 @@ providers, Postgres/pgvector, and observability.
   and Ollama. (One internal test that relied on the old "always loops" behavior was moved
   to an explicit repeat-manager.)
 
+### Changed
+- **Hardened the regex PII guardrails (still zero-dep, offline).** Detection moved to a
+  validated `PIIRule` model: credit cards are only redacted when they pass the **Luhn
+  checksum**, and IPv4s are octet-validated — cutting the regex's biggest weakness, false
+  positives. Coverage expanded to API keys (OpenAI/GitHub/Google/Slack/AWS), JWTs, URLs
+  with embedded credentials, IBANs, IPv4/IPv6, and MAC addresses. The Nepal `nepal_pii`
+  guardrail's over-greedy PAN rule (which redacted *any* 9-digit number) now requires a
+  `PAN` label, and a domestic 10-digit mobile pattern was added. `PIIGuardrail(rules=…)`
+  accepts custom rules. (A heavier ML detector, e.g. openai/privacy-filter or Presidio,
+  remains a clean opt-in via the `Guardrail` protocol when more is needed.)
+
 ### Added
 - **Nepal pack + localization.** A `nepal` toolkit pack makes the framework's Nepal
   modules agent-facing: `nepali_date` (AD↔Bikram Sambat + fiscal year), `nepali_format`

@@ -9,6 +9,8 @@ banned phrase — without pretending to be a complete safety system. Compose the
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from himmy.services.guardrails.base import (
     Guardrail,
@@ -18,42 +20,126 @@ from himmy.services.guardrails.base import (
 
 # --------------------------------------------------------------------------- PII
 
-_PII_PATTERNS: list[tuple[str, str, re.Pattern[str]]] = [
-    ("email", "[REDACTED-EMAIL]", re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")),
-    ("ssn", "[REDACTED-SSN]", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
-    (
+
+@dataclass(frozen=True)
+class PIIRule:
+    """One redaction rule: a label, placeholder, regex, and optional validator.
+
+    ``validator`` (when set) receives the matched text and must return True for the
+    match to be redacted — this is how regex false positives are cut (e.g. a 16-digit
+    run is only treated as a card if it passes the Luhn checksum).
+    """
+
+    label: str
+    placeholder: str
+    pattern: re.Pattern[str]
+    validator: Callable[[str], bool] | None = None
+
+
+def _luhn_ok(text: str) -> bool:
+    """True when ``text``'s digits pass the Luhn checksum (real card numbers do)."""
+    digits = [int(c) for c in text if c.isdigit()]
+    if not 13 <= len(digits) <= 19:
+        return False
+    total, parity = 0, len(digits) % 2
+    for i, n in enumerate(digits):
+        if i % 2 == parity:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
+def _ipv4_ok(text: str) -> bool:
+    """True when ``text`` is a syntactically valid IPv4 (each octet 0–255)."""
+    parts = text.split(".")
+    return len(parts) == 4 and all(p.isdigit() and int(p) <= 255 for p in parts)
+
+
+def _redact(text: str, rules: list[PIIRule]) -> tuple[str, list[str]]:
+    """Apply each rule (validated) in order; return redacted text + per-label flags."""
+    redacted = text
+    flags: list[str] = []
+    for rule in rules:
+        hit = False
+
+        def _replace(match: re.Match[str], r: PIIRule = rule) -> str:
+            nonlocal hit
+            if r.validator is not None and not r.validator(match.group(0)):
+                return match.group(0)
+            hit = True
+            return r.placeholder
+
+        redacted = rule.pattern.sub(_replace, redacted)
+        if hit:
+            flags.append(f"pii:{rule.label}")
+    return redacted, flags
+
+
+# Ordered most-specific → loosest, so structured matches (keys/cards/IPs) redact
+# before the broad phone rule could swallow their digits.
+_PII_RULES: list[PIIRule] = [
+    PIIRule(
+        "api_key",
+        "[REDACTED-KEY]",
+        re.compile(
+            r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[posru]_[A-Za-z0-9]{20,}"
+            r"|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[0-9A-Za-z-]{10,}"
+            r"|AKIA[0-9A-Z]{16})\b"
+        ),
+    ),
+    PIIRule(
+        "jwt",
+        "[REDACTED-JWT]",
+        re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    ),
+    PIIRule(
+        "url_credentials",
+        "[REDACTED-URL]",
+        re.compile(r"\bhttps?://[^\s/:@]+:[^\s/:@]+@\S+"),
+    ),
+    PIIRule("email", "[REDACTED-EMAIL]", re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")),
+    PIIRule(
+        "iban",
+        "[REDACTED-IBAN]",
+        re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
+    ),
+    PIIRule(
         "card",
         "[REDACTED-CARD]",
-        re.compile(r"\b(?:\d[ -]?){13,16}\b"),
+        re.compile(r"\b(?:\d[ -]?){13,19}\b"),
+        _luhn_ok,
     ),
-    (
+    PIIRule("ssn", "[REDACTED-SSN]", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+    PIIRule(
+        "ipv4", "[REDACTED-IP]", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), _ipv4_ok
+    ),
+    PIIRule(
+        "mac",
+        "[REDACTED-MAC]",
+        re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"),
+    ),
+    PIIRule(
         "phone",
         "[REDACTED-PHONE]",
-        re.compile(r"\b\+?\d[\d().\-\s]{7,}\d\b"),
-    ),
-    (
-        "key",
-        "[REDACTED-KEY]",
-        re.compile(r"\b(?:sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})\b"),
+        re.compile(r"(?<![\d.])\+?\d[\d().\-\s]{7,}\d(?![\d.])"),
     ),
 ]
 
 
 class PIIGuardrail:
-    """Redacts emails, phone numbers, cards, SSNs, and obvious API keys."""
+    """Redacts API keys, JWTs, emails, IBANs, Luhn-valid cards, SSNs, IPs, MACs, phones."""
 
     name = "pii"
 
+    def __init__(self, *, rules: list[PIIRule] | None = None) -> None:
+        """Use the default rule set, or a custom list of :class:`PIIRule`s."""
+        self._rules = rules if rules is not None else _PII_RULES
+
     def inspect(self, text: str, *, context: dict) -> GuardrailVerdict:
         """Replace any detected PII with typed placeholders (never blocks)."""
-        redacted = text
-        flags: list[str] = []
-        # Keys/cards/ssn first (most specific), then phone/email.
-        for label, placeholder, pattern in _PII_PATTERNS:
-            new, count = pattern.subn(placeholder, redacted)
-            if count:
-                redacted = new
-                flags.append(f"pii:{label}")
+        redacted, flags = _redact(text, self._rules)
         return GuardrailVerdict(allowed=True, text=redacted, flags=flags)
 
 
@@ -114,34 +200,33 @@ class BlocklistGuardrail:
         return GuardrailVerdict(allowed=True, text=text)
 
 
-_NEPAL_PII_PATTERNS: list[tuple[str, str, re.Pattern[str]]] = [
-    # +977 mobile/landline (with or without separators).
-    ("np_phone", "[REDACTED-NP-PHONE]", re.compile(r"\+?977[-\s]?\d{8,10}")),
+_NEPAL_PII_RULES: list[PIIRule] = [
+    # +977 international form (with or without separators).
+    PIIRule("np_phone", "[REDACTED-NP-PHONE]", re.compile(r"\+?977[-\s]?\d{8,10}")),
+    # Domestic 10-digit mobile (98/97/96/9810… prefixes).
+    PIIRule(
+        "np_mobile", "[REDACTED-NP-PHONE]", re.compile(r"(?<!\d)9[678]\d{8}(?!\d)")
+    ),
     # Citizenship certificate numbers (commonly ##-##-##-##### style).
-    (
+    PIIRule(
         "citizenship",
         "[REDACTED-CITIZENSHIP]",
         re.compile(r"\b\d{2}-\d{2}-\d{2}-\d{4,6}\b"),
     ),
-    # PAN (Permanent Account Number) — 9 digits, often prefixed "PAN".
-    ("pan", "[REDACTED-PAN]", re.compile(r"\bPAN[:\s]?\d{9}\b|\b\d{9}\b")),
+    # PAN (Permanent Account Number) — 9 digits, REQUIRED to be PAN-labelled so a bare
+    # 9-digit number (an amount, an id) is never wrongly redacted.
+    PIIRule("pan", "[REDACTED-PAN]", re.compile(r"\bPAN[:\s#]*\d{9}\b", re.IGNORECASE)),
 ]
 
 
 class NepalPIIGuardrail:
-    """Redacts Nepal-specific PII: +977 phones, citizenship numbers, PAN."""
+    """Redacts Nepal-specific PII: +977 / domestic mobiles, citizenship numbers, PAN."""
 
     name = "nepal_pii"
 
     def inspect(self, text: str, *, context: dict) -> GuardrailVerdict:
         """Replace Nepali PII with typed placeholders (never blocks)."""
-        redacted = text
-        flags: list[str] = []
-        for label, placeholder, pattern in _NEPAL_PII_PATTERNS:
-            new, count = pattern.subn(placeholder, redacted)
-            if count:
-                redacted = new
-                flags.append(f"pii:{label}")
+        redacted, flags = _redact(text, _NEPAL_PII_RULES)
         return GuardrailVerdict(allowed=True, text=redacted, flags=flags)
 
 
@@ -169,6 +254,7 @@ def build_guardrail_pipeline(names: list[str]) -> GuardrailPipeline:
 
 
 __all__ = [
+    "PIIRule",
     "PIIGuardrail",
     "InjectionGuardrail",
     "BlocklistGuardrail",

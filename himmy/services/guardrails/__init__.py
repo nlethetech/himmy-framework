@@ -18,7 +18,9 @@ from himmy.services.guardrails.builtins import (
     BUILTIN_GUARDRAILS,
     BlocklistGuardrail,
     InjectionGuardrail,
+    NepalPIIGuardrail,
     PIIGuardrail,
+    PIIRule,
     build_guardrail_pipeline,
 )
 from himmy.services.guardrails.tool_hook import build_guardrail_pre_hook
@@ -27,9 +29,11 @@ __all__ = [
     "Guardrail",
     "GuardrailVerdict",
     "GuardrailPipeline",
+    "PIIRule",
     "PIIGuardrail",
     "InjectionGuardrail",
     "BlocklistGuardrail",
+    "NepalPIIGuardrail",
     "BUILTIN_GUARDRAILS",
     "build_guardrail_pipeline",
     "build_guardrail_pre_hook",
