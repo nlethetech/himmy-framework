@@ -22,7 +22,7 @@ jobs:
     name: pip-audit (known CVEs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -36,7 +36,7 @@ jobs:
     name: SBOM (CycloneDX)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -55,7 +55,7 @@ jobs:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0 # full history so a secret in any commit is caught
       - uses: gitleaks/gitleaks-action@v2
@@ -66,7 +66,7 @@ jobs:
     name: trivy (filesystem)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Trivy filesystem scan (deps + misconfig)
         # Pinned by SHA (WS5.5) == v0.36.0. Report-only: pip-audit is the blocking
         # CVE gate; Trivy adds misconfig/secret/IaC findings without flaking the
