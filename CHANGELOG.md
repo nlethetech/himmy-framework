@@ -14,10 +14,13 @@ providers, Postgres/pgvector, and observability.
   Pydantic-validated (`extra="forbid"`), versioned entities (`kind="skill"`), compose via
   `requires_skills` (cycle-guarded), and resolve with a did-you-mean on typos. Author them
   as one-file YAML in `skills/` (auto-discovered; project files shadow built-ins), list
-  them with `himmy skills`, scaffold one with `himmy init`. Built-ins: `web_research`,
-  `data_analysis`, `file_ops`, `python_compute`, `knowledge_base`, `nepal_brief`,
-  `summarize`. Verified live on Ollama: a skills-only agent binds its pack and the injected
-  know-how drives correct tool use.
+  them with `himmy skills`, scaffold one with `himmy init`. A skill can carry few-shot
+  `examples` (rendered into the prompt) and a `when_to_use` hint (rendered as guidance and
+  fed to the tool router). Built-ins: `web_research`, `data_analysis`, `file_ops`,
+  `python_compute`, `knowledge_base`, `nepal_brief`, `summarize`, and the composite
+  `research_writer` (requires web_research + summarize). Verified live on Ollama: a
+  composite, skills-only agent binds its prerequisites' packs and a skill's worked example
+  drives the small model straight to the correct query.
 
 ### Fixed
 - **Tool-using agents now actually answer on real providers (`himmy run`/`chat`/`telegram`).**

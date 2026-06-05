@@ -449,9 +449,18 @@ class SingleAgentRuntime:
 
         from himmy.runtime.tool_router import select_tools
 
+        # Skills contribute "use this when …" hints so the router knows which tools a
+        # capability implies for this request, beyond the bare prompt.
+        query = task.prompt
+        hints = ctx.get("skill_routing_hints") or []
+        if hints:
+            query = f"{query}\n\nRelevant capabilities:\n" + "\n".join(
+                f"- {h}" for h in hints
+            )
+
         selected = await select_tools(
             self.inference_service,
-            task.prompt,
+            query,
             candidates,
             max_tools=max_tools,
             model_key=str(ctx.get("model_key") or self.default_model_key),

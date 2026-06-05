@@ -113,6 +113,8 @@ class AgentSpec(BaseModel):
         context: dict[str, Any] = {"model_key": self.model}
         if self.tools:
             context["tool_names"] = list(self.tools)
+        if self.metadata.get("skill_routing_hints"):
+            context["skill_routing_hints"] = list(self.metadata["skill_routing_hints"])
         if self.output_schema is not None:
             context["output_schema"] = self.output_schema
         if self.memory:
@@ -151,18 +153,24 @@ def apply_skills(spec: AgentSpec, registry: SkillRegistry) -> AgentSpec:
     if not spec.skills:
         return spec
     from himmy.skills import resolve_skills
+    from himmy.skills.resolve import format_examples
 
     bundle = resolve_skills(spec.skills, registry)
-    description = spec.description
-    if bundle.instruction_blocks:
-        know_how = "\n\n".join(bundle.instruction_blocks)
-        description = (
-            f"{description}\n\n{know_how}".strip() if description else know_how
-        )
+    sections: list[str] = []
+    if spec.description:
+        sections.append(spec.description)
+    sections.extend(bundle.instruction_blocks)
+    if bundle.examples:
+        sections.append(format_examples(bundle.examples))
+    description = "\n\n".join(sections).strip()
     metadata = dict(spec.metadata)
     metadata["skills"] = list(bundle.skills)
     if bundle.tools:
         metadata["resolved_skill_tools"] = list(bundle.tools)
+    if bundle.when_to_use:
+        # Routing hints: surfaced to the tool router so it knows when each skill's
+        # tools are relevant (only consulted when tool_router is enabled).
+        metadata["skill_routing_hints"] = list(bundle.when_to_use)
     return spec.model_copy(
         update={
             "skills": [],  # consumed

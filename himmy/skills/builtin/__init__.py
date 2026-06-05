@@ -7,7 +7,7 @@ validated :class:`~himmy.skills.models.Skill`).
 
 from __future__ import annotations
 
-from himmy.skills.models import Skill
+from himmy.skills.models import Skill, SkillExample
 
 BUILTIN_SKILLS: dict[str, Skill] = {
     "web_research": Skill(
@@ -30,6 +30,23 @@ BUILTIN_SKILLS: dict[str, Skill] = {
             "Call sql_schema first if you do not already know the tables and columns.",
             "If a filter returns no rows, read the hint and re-run with a real value.",
             "Report the exact value from the result — do not estimate.",
+        ],
+        examples=[
+            SkillExample(
+                input="How many chickens are there?",
+                action="call sql_schema, then sql_query "
+                "SELECT quantity FROM animals WHERE name='chickens'",
+                note="filter on the exact stored value, not a guess",
+            ),
+        ],
+    ),
+    "research_writer": Skill(
+        name="research_writer",
+        description="Research a topic on the web and write a tight, cited summary.",
+        when_to_use="the user wants a short written brief on an external topic.",
+        requires_skills=["web_research", "summarize"],
+        instructions=[
+            "First gather facts with web_research, then summarize them faithfully.",
         ],
     ),
     "file_ops": Skill(

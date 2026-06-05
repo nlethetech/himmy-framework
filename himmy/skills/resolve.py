@@ -37,12 +37,23 @@ class ResolvedSkills:
 
 
 def _format_block(skill: Skill) -> str:
-    """A single labeled know-how block for one skill (header + bulleted instructions)."""
+    """A single labeled know-how block for one skill (header + when + instructions)."""
     header = f"Skill — {skill.name}"
     if skill.description:
         header += f": {skill.description}"
     lines = [header]
+    if skill.when_to_use:
+        lines.append(f"Use this when {skill.when_to_use}")
     lines.extend(f"- {line}" for line in skill.instructions)
+    return "\n".join(lines)
+
+
+def format_examples(examples: Sequence[SkillExample]) -> str:
+    """Render skill examples as a compact few-shot block for the system prompt."""
+    lines = ["Worked examples:"]
+    for ex in examples:
+        note = f" ({ex.note})" if ex.note else ""
+        lines.append(f'- When asked: "{ex.input}" → {ex.action}{note}')
     return "\n".join(lines)
 
 
