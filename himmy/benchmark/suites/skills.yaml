@@ -27,4 +27,8 @@ tasks:
       Summarize in one sentence: The cooperative harvested 30 crates of oranges,
       sold 22 at the market, and stored the remaining 8 for winter.
     skills: [summarize]
-    grade: { type: all_of, value: ["30", "8"] }
+    grade:
+      type: all_of
+      of:
+        - { type: contains, value: "30" }
+        - { type: contains, value: "8" }

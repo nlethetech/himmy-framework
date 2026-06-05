@@ -52,10 +52,14 @@ def grade(spec: dict[str, Any], answer: str) -> bool:
         target = float(spec["value"])
         tol = float(spec.get("tolerance", 0.0))
         return any(abs(n - target) <= tol for n in _numbers(answer))
-    if gtype == "all_of":
-        return all(grade(s, answer) for s in spec.get("of", []))
-    if gtype == "any_of":
-        return any(grade(s, answer) for s in spec.get("of", []))
+    if gtype in ("all_of", "any_of"):
+        sub = spec.get("of")
+        if not sub:
+            # An empty/missing `of` would make all_of vacuously True (a silent
+            # false-positive). Fail loud so a malformed grade can't pass a task.
+            raise ValueError(f"{gtype} grader requires a non-empty 'of' list")
+        combiner = all if gtype == "all_of" else any
+        return combiner(grade(s, answer) for s in sub)
     raise ValueError(f"unknown grader type {gtype!r}")
 
 
