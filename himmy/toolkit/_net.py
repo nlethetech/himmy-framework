@@ -11,9 +11,20 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+from collections.abc import Collection
 from urllib.parse import urlsplit
 
 from himmy.services.tools.security import ToolSecurityError
+
+
+def _host_allowed(host: str, allow_hosts: Collection[str]) -> bool:
+    """Whether ``host`` matches the allow-list (exact or a subdomain of an entry)."""
+    host = host.lower().rstrip(".")
+    for entry in allow_hosts:
+        allowed = entry.lower().strip().lstrip("*.").rstrip(".")
+        if allowed and (host == allowed or host.endswith("." + allowed)):
+            return True
+    return False
 
 
 def _is_blocked_ip(ip: str) -> bool:
@@ -29,13 +40,22 @@ def _is_blocked_ip(ip: str) -> bool:
     )
 
 
-def guard_url(url: str, *, allow_private: bool = False) -> str:
+def guard_url(
+    url: str,
+    *,
+    allow_private: bool = False,
+    allow_hosts: Collection[str] | None = None,
+) -> str:
     """Validate ``url`` for outbound fetching; return it unchanged or raise.
 
     Raises :class:`ToolSecurityError` for a non-http(s) scheme, embedded userinfo
     credentials, a missing host, or (unless ``allow_private``) a host that resolves
     to a private/loopback/reserved address. DNS resolution is attempted so a public
     name that points at an internal IP is still rejected.
+
+    When ``allow_hosts`` is provided (egress allow-list, WS3.3), the host must match
+    an entry (exact or a subdomain) — everything else is denied, for restricted /
+    air-gapped deployments. The allow-list narrows on top of the public-IP check.
     """
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
@@ -47,6 +67,8 @@ def guard_url(url: str, *, allow_private: bool = False) -> str:
     host = parts.hostname
     if not host:
         raise ToolSecurityError("URL has no host")
+    if allow_hosts is not None and not _host_allowed(host, allow_hosts):
+        raise ToolSecurityError(f"host {host!r} is not in the egress allow-list")
     if allow_private:
         return url
 

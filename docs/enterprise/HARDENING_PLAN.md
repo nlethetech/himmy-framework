@@ -196,7 +196,20 @@ Running model-authored code for a customer is the highest-severity surface.
 
 ---
 
-## 3. WS3 — Secrets, Network & Runtime Controls
+## 3. WS3 — Secrets, Network & Runtime Controls — ✅ DONE
+
+*Shipped: **3.1** `himmy/config/secrets.py` — `SecretProvider` (env/file/Vault/AWS/GCP/Azure,
+env-fallback chain), `get_secret()` routes every secret read (DSNs, SMTP/Telegram/search
+keys, internal + gateway keys); default `EnvSecrets` = unchanged. **3.2**
+`himmy/api/ratelimit.py::TokenBucketRateLimiter` behind the existing hook (per-principal/IP,
+429 + Retry-After, `HIMMY_RATE_LIMIT`), off by default; principal now resolves before the
+limiter. **3.3** egress allow-list in `guard_url(..., allow_hosts=)` + `egress_allow_hosts`
+(`HIMMY_EGRESS_ALLOW`) threaded through web/comms tools. **3.4** security headers
+(HSTS/nosniff/frame-deny/referrer) + opt-in strict CORS (`HIMMY_CORS_ORIGINS`, deny by
+default) in `create_app`. Tests: `tests/config/test_secrets.py`, `tests/api/test_rate_limit.py`,
+`tests/toolkit/test_egress.py`, `tests/api/test_security_headers.py`.*
+
+### 3-orig — Secrets, Network & Runtime Controls
 
 ### 3.1 — Secret provider abstraction
 - **Current:** every secret is a **direct `os.environ` read** with no abstraction —

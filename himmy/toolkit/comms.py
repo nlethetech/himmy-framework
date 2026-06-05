@@ -104,7 +104,11 @@ def register_comms_pack(
 
     def send_webhook(args: dict[str, Any]) -> dict[str, Any]:
         url = str(args["url"])
-        guard_url(url, allow_private=config.allow_private_hosts)
+        guard_url(
+            url,
+            allow_private=config.allow_private_hosts,
+            allow_hosts=set(config.egress_allow_hosts) or None,
+        )
         status = call_webhook(
             url, args.get("payload"), args.get("headers"), config.http_timeout
         )

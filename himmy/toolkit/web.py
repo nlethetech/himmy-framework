@@ -377,7 +377,11 @@ def register_web_pack(
     def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
         url = str(args["url"])
         max_chars = int(args.get("max_chars", 8000))
-        guard_url(url, allow_private=config.allow_private_hosts)
+        guard_url(
+            url,
+            allow_private=config.allow_private_hosts,
+            allow_hosts=set(config.egress_allow_hosts) or None,
+        )
         html = fetcher.get_text(url)
         title, text = html_to_text(html)
         return {
@@ -392,7 +396,11 @@ def register_web_pack(
         method = str(args.get("method", "GET")).upper()
         headers = args.get("headers")
         json_body = args.get("json_body")
-        guard_url(url, allow_private=config.allow_private_hosts)
+        guard_url(
+            url,
+            allow_private=config.allow_private_hosts,
+            allow_hosts=set(config.egress_allow_hosts) or None,
+        )
         resp = caller(
             method,
             url,

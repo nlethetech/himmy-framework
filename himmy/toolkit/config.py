@@ -32,6 +32,7 @@ class ToolkitConfig(BaseModel):
     http_timeout: float = 20.0
     http_max_bytes: int = 5_000_000
     allow_private_hosts: bool = False
+    egress_allow_hosts: list[str] = Field(default_factory=list)  # [] = no allow-list
 
     # data pack -------------------------------------------------------------
     sqlite_path: str | None = None
@@ -111,6 +112,11 @@ class ToolkitConfig(BaseModel):
             allow_private_hosts=_env_bool(
                 env.get("HIMMY_ALLOW_PRIVATE_HOSTS"), default=False
             ),
+            egress_allow_hosts=[
+                h.strip()
+                for h in (env.get("HIMMY_EGRESS_ALLOW") or "").split(",")
+                if h.strip()
+            ],
             sqlite_path=env.get("HIMMY_SQLITE_PATH"),
             sql_dsn=get_secret("HIMMY_SQL_DSN"),
             sql_read_only=_env_bool(env.get("HIMMY_SQL_READONLY"), default=True),

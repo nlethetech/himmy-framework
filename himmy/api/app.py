@@ -15,7 +15,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from himmy.api.auth import (
@@ -168,8 +168,49 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
         """Liveness probe."""
         return {"status": "ok"}
 
+    _install_security_headers(app)
     _install_openapi_security(app, authenticator)
     return app
+
+
+def _install_security_headers(app: FastAPI) -> None:
+    """Add security response headers + an optional strict CORS policy (WS3.4).
+
+    Headers (HSTS, nosniff, frame-deny, referrer) are on by default and safe; CORS
+    stays **deny** (same-origin) unless ``HIMMY_CORS_ORIGINS`` lists allowed origins.
+    """
+    import os
+
+    hsts_on = os.environ.get("HIMMY_HSTS", "1").lower() not in ("0", "false", "no")
+
+    @app.middleware("http")
+    async def _security_headers(request: Request, call_next: Callable) -> Response:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if hsts_on:
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=63072000; includeSubDomains",
+            )
+        return response
+
+    origins = [
+        o.strip()
+        for o in (os.environ.get("HIMMY_CORS_ORIGINS") or "").split(",")
+        if o.strip()
+    ]
+    if origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
 
 def _install_openapi_security(app: FastAPI, authenticator: object | None) -> None:
