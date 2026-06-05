@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from himmy.core import HimmyError
 from himmy.services.tools.registry import ToolRegistry
+from himmy.toolkit.agentic import AGENTIC_TOOL_NAMES, register_agentic_pack
 from himmy.toolkit.code import register_code_pack
 from himmy.toolkit.comms import register_comms_pack
 from himmy.toolkit.config import ToolkitConfig
@@ -108,6 +109,12 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
         "Nepal: Bikram Sambat dates, NPR/Devanagari formatting, NRB forex.",
         NEPAL_TOOL_NAMES,
         register_nepal_pack,
+    ),
+    "agentic": ToolPack(
+        "agentic",
+        "Be agentic: ask the human, keep a scratchpad, manage a todo list.",
+        AGENTIC_TOOL_NAMES,
+        register_agentic_pack,
     ),
 }
 

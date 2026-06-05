@@ -15,7 +15,7 @@ from himmy.toolkit import (
 
 
 def test_catalog_has_expected_packs() -> None:
-    """The built-in catalog exposes all nine expected packs."""
+    """The built-in catalog exposes every expected pack."""
     assert set(BUILTIN_PACKS) == {
         "web",
         "files",
@@ -28,11 +28,12 @@ def test_catalog_has_expected_packs() -> None:
         "data-sources",
         "memory",
         "nepal",
+        "agentic",
     }
 
 
 def test_register_all_packs_populates_registry() -> None:
-    """Registering every pack wires all 18 tools with definitions + handlers."""
+    """Registering every pack wires all tools with definitions + handlers."""
     registry = ToolRegistry()
     register_packs(registry, list(BUILTIN_PACKS), ToolkitConfig())
     names = {d.name for d in registry.list()}
@@ -63,6 +64,11 @@ def test_register_all_packs_populates_registry() -> None:
         "nrb_forex",
         "nrb_macro_reports",
         "nrb_macro_workbook",
+        "ask_human",
+        "scratchpad_set",
+        "scratchpad_get",
+        "todo_write",
+        "todo_read",
     }
     for name in names:
         assert registry.handler_for(name) is not None

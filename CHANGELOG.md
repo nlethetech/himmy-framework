@@ -35,6 +35,13 @@ providers, Postgres/pgvector, and observability.
   remains a clean opt-in via the `Guardrail` protocol when more is needed.)
 
 ### Added
+- **`agentic` pack — the tools that make an agent act like one.** `ask_human` (pause
+  mid-run and ask the operator; returns `answered: false` when non-interactive instead of
+  hanging), `scratchpad_set`/`scratchpad_get` (a keyed working-memory notepad the agent
+  manages itself, distinct from durable `memory`), and `todo_write`/`todo_read` (a
+  self-managed task list — write the whole list with per-item status, read it back).
+  Working state lives for the process (persists across `himmy chat` turns, resets between
+  `himmy run` calls). `set_human_responder()` lets you embed himmy in another UI or test.
 - **MCP servers, declaratively (the whole MCP ecosystem as agent tools).** An
   `agent.yaml`/`team.yaml` can now list `mcp_servers:` — any stdio Model Context Protocol
   server (GitHub, Slack, filesystem, a Playwright browser, …) is launched and its tools are

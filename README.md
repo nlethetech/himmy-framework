@@ -130,6 +130,7 @@ agent. `himmy tools` lists them:
 | `data-sources` | `weather`, `geocode`, `wikipedia` (keyless public APIs) |
 | `memory` | `remember`, `recall` (durable long-term memory, SQLite-backed) |
 | `nepal` | `nepali_date` (Bikram Sambat), `nepali_format` (NPR/Devanagari), `nepali_transliterate`, NRB forex |
+| `agentic` | `ask_human` (human-in-the-loop), `scratchpad_set`/`scratchpad_get` (working notes), `todo_write`/`todo_read` (self-managed task list) |
 
 Enable them declaratively in `agent.yaml`:
 

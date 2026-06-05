@@ -13,6 +13,7 @@ them declaratively (``tool_packs: [web, utils]`` in an ``agent.yaml``) or in cod
 
 from __future__ import annotations
 
+from himmy.toolkit.agentic import set_human_responder
 from himmy.toolkit.config import ToolkitConfig
 from himmy.toolkit.pack import (
     BUILTIN_PACKS,
@@ -29,4 +30,5 @@ __all__ = [
     "register_packs",
     "resolve_packs",
     "UnknownToolPackError",
+    "set_human_responder",
 ]
