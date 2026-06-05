@@ -124,6 +124,7 @@ def build_runtime(
         entity_registry=registry,
         input_guardrail=overrides.get("input_guardrail"),
         output_guardrail=overrides.get("output_guardrail"),
+        on_event=overrides.get("on_event"),
     )
     return runtime, inference, tool_service
 

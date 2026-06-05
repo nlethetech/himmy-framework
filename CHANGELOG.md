@@ -14,6 +14,13 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **`himmy trace` run inspector (`himmy.services.observability.trace`).** Real agent runs
+  are now debuggable: `himmy run --trace` prints and saves a chronological, indented event
+  timeline (run → inference → tool call/return → handoff/delegate, with latencies + a
+  cost/tool-count footer), and `himmy trace [thread_id]` lists recent runs or replays a
+  saved one. `format_timeline` renders any `RunEvent` list; `SqliteEventStore` (stdlib
+  sqlite3) is a durable event log (`.himmy/trace.db`) usable as a runtime event sink.
+  `build_runtime` now forwards an `on_event` override. No new dependencies.
 - **Recipe gallery + real-model proof (`RECIPES.md`, `examples/10–12`).** Provider-
   selectable examples (offline stub by default; `HIMMY_EXAMPLE_PROVIDER=ollama` for a real
   model) — a tool-using agent, a live web-research agent, and durable semantic memory.

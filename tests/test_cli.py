@@ -139,6 +139,22 @@ def test_init_team_scaffold(tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
     assert not (target / "agent.yaml").exists()
 
 
+def test_run_trace_prints_and_saves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`himmy run --trace` prints a timeline and saves it to .himmy/trace.db."""
+    monkeypatch.chdir(tmp_path)
+    code = main(["run", "--provider", "stub", "--name", "t", "-p", "hi", "--trace"])
+    err = capsys.readouterr().err
+    assert code == 0
+    assert "--- trace ---" in err
+    assert "run started" in err
+    assert (tmp_path / ".himmy" / "trace.db").exists()
+    # `himmy trace` then lists the saved run.
+    assert main(["trace"]) == 0
+    assert "recent runs" in capsys.readouterr().out
+
+
 def test_run_structured_output_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

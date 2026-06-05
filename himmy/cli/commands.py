@@ -28,6 +28,27 @@ def _eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
+def _trace_db() -> str:
+    """Path to the durable trace event log (``.himmy/trace.db``), dir created."""
+    path = Path(".himmy")
+    path.mkdir(exist_ok=True)
+    return str(path / "trace.db")
+
+
+class _TraceCollector:
+    """Collects run events in-process and persists them to the trace log."""
+
+    def __init__(self) -> None:
+        from himmy.services.observability.trace import SqliteEventStore
+
+        self.events: list[Any] = []
+        self._store = SqliteEventStore(_trace_db())
+
+    async def handle(self, event: Any) -> None:
+        self.events.append(event)
+        await self._store.append_event(event)
+
+
 def _resolve_register(dotted: str) -> Callable[[Any], Any]:
     """Resolve a ``module:attr`` (or ``module`` → ``register``) tool registrar."""
     module_name, _, attr = dotted.partition(":")
@@ -54,7 +75,9 @@ def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
     )
 
 
-def _build_runtime_for(spec: AgentSpec, args: argparse.Namespace) -> Any:
+def _build_runtime_for(
+    spec: AgentSpec, args: argparse.Namespace, *, on_event: Any = None
+) -> Any:
     """Wire a runtime for ``spec`` honoring CLI provider/model overrides + tools."""
     from himmy import build_runtime
     from himmy.services.tools.registry import ToolRegistry
@@ -66,6 +89,8 @@ def _build_runtime_for(spec: AgentSpec, args: argparse.Namespace) -> Any:
     inference = build_inference_for(provider, model)
 
     overrides: dict[str, Any] = {"inference": inference}
+    if on_event is not None:
+        overrides["on_event"] = on_event
 
     pipeline = None
     if spec.guardrails:
@@ -107,7 +132,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         _eprint("error: --prompt/-p is required for `himmy run`")
         return 2
     spec = _spec_from_args(args)
-    runtime = _build_runtime_for(spec, args)
+    tracer = _TraceCollector() if getattr(args, "trace", False) else None
+    runtime = _build_runtime_for(spec, args, on_event=tracer.handle if tracer else None)
+
+    def _print_trace() -> None:
+        if tracer is not None:
+            from himmy.services.observability.trace import format_timeline
+
+            _eprint("\n--- trace ---")
+            _eprint(format_timeline(tracer.events))
 
     if getattr(args, "stream", False):
 
@@ -123,6 +156,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             sys.stdout.write("\n")
 
         asyncio.run(_stream())
+        _print_trace()
         return 0
 
     async def _go() -> Any:
@@ -157,6 +191,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(json.dumps(result.output_structured, indent=2, ensure_ascii=False))
     else:
         print(result.output_text or "")
+    _print_trace()
     return 0 if result.succeeded else 1
 
 
@@ -486,6 +521,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(
         f"\nguardrails (agent.yaml `guardrails: [...]`): {', '.join(BUILTIN_GUARDRAILS)}"
     )
+    return 0
+
+
+# ----------------------------------------------------------------------- trace
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    """Inspect saved run traces: list recent runs, or show one run's timeline."""
+    from himmy.services.observability.trace import SqliteEventStore, format_timeline
+
+    if not Path(_trace_db()).exists():
+        _eprint("no traces yet — run with `himmy run --trace ...` first")
+        return 1
+    store = SqliteEventStore(_trace_db())
+    if args.thread:
+        print(format_timeline(store.list_events(thread_id=args.thread)))
+        return 0
+    runs = store.recent_threads(limit=args.limit)
+    if not runs:
+        _eprint("no traced runs found")
+        return 1
+    print("recent runs (use `himmy trace <thread_id>` for the timeline):\n")
+    for run in runs:
+        print(f"  {run['thread_id']}  {run['events']:>3} events  {run['last']}")
     return 0
 
 
