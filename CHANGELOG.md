@@ -7,6 +7,18 @@ providers, Postgres/pgvector, and observability.
 
 ## [Unreleased]
 
+### Added
+- **Skills — first-class agent capabilities.** A skill bundles the tools a job needs with
+  the know-how to use them; declaring `skills: [data_analysis]` in `agent.yaml` binds the
+  tools *and* injects the guidance, no separate `tool_packs`/instructions. Skills are
+  Pydantic-validated (`extra="forbid"`), versioned entities (`kind="skill"`), compose via
+  `requires_skills` (cycle-guarded), and resolve with a did-you-mean on typos. Author them
+  as one-file YAML in `skills/` (auto-discovered; project files shadow built-ins), list
+  them with `himmy skills`, scaffold one with `himmy init`. Built-ins: `web_research`,
+  `data_analysis`, `file_ops`, `python_compute`, `knowledge_base`, `nepal_brief`,
+  `summarize`. Verified live on Ollama: a skills-only agent binds its pack and the injected
+  know-how drives correct tool use.
+
 ### Fixed
 - **Tool-using agents now actually answer on real providers (`himmy run`/`chat`/`telegram`).**
   These surfaces called single-turn `run_task_detailed`, so with a real model (Ollama,

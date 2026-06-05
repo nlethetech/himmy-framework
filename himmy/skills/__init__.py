@@ -20,6 +20,13 @@ from himmy.skills.errors import (
     SkillToolError,
     UnknownSkillError,
 )
+from himmy.skills.loader import (
+    SkillFileError,
+    build_skill_registry,
+    discover_skill_dirs,
+    load_skill_dir,
+    load_skill_file,
+)
 from himmy.skills.models import Skill, SkillExample
 from himmy.skills.registry import SkillRegistry
 from himmy.skills.resolve import ResolvedSkills, resolve_skills
@@ -31,6 +38,11 @@ __all__ = [
     "BUILTIN_SKILLS",
     "ResolvedSkills",
     "resolve_skills",
+    "build_skill_registry",
+    "load_skill_file",
+    "load_skill_dir",
+    "discover_skill_dirs",
+    "SkillFileError",
     "UnknownSkillError",
     "CyclicSkillError",
     "SkillToolError",

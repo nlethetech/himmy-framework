@@ -105,10 +105,11 @@ def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
     if spec.skills:
         # Expand declared skills into tools + injected know-how before the runtime is
         # wired, so skill-contributed packs/guardrails flow through the normal path.
+        # Project-local skills (./skills/*.yaml, HIMMY_SKILLS_PATH) overlay the builtins.
         from himmy.config.agent_spec import apply_skills
-        from himmy.skills import SkillRegistry
+        from himmy.skills import build_skill_registry
 
-        spec = apply_skills(spec, SkillRegistry.with_builtins())
+        spec = apply_skills(spec, build_skill_registry())
     return spec
 
 
@@ -655,10 +656,24 @@ instructions:
   - Cite reasoning when it helps the user decide.
 model: default
 # provider: claude-cli      # stub | claude-cli | ollama | pydantic-ai (default: auto)
+# skills: [web_research]    # capability bundles: tools + know-how (run `himmy skills`)
 # tool_packs: [web, utils]  # built-in tool packs (run `himmy tools` to list them)
 tools: []                   # names to bind (from tool_packs and/or tools_module)
 # tools_module: tools:register   # uncomment to wire the example tool in tools.py
 # output_schema: schema.json     # path to a JSON Schema for structured output
+"""
+
+_SKILL_YAML = """\
+# A skill bundles know-how with the tools it needs. Reference it from an agent with
+# `skills: [my_skill]` (run `himmy skills` to list available skills, built-in + here).
+name: my_skill
+description: One line on what this capability does.
+when_to_use: a short cue for when the agent should lean on this skill.
+tool_packs: [utils]          # packs this skill grants (run `himmy tools`)
+# tools: []                  # or specific tool names
+instructions:
+  - Concrete guidance the agent should follow when using this capability.
+  - Prefer running a tool over guessing.
 """
 
 _TOOLS_PY = '''\
@@ -801,6 +816,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "agent.yaml": _AGENT_YAML,
             "tools.py": _TOOLS_PY,
             "himmy.toml": _HIMMY_TOML,
+            "skills/my_skill.yaml": _SKILL_YAML,
         }
     )
 
@@ -813,8 +829,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         return 1
 
     for name, content in files.items():
-        (target / name).write_text(content)
-        print(f"wrote {target / name}")
+        dest = target / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+        print(f"wrote {dest}")
     if args.team:
         print(f'\nNext: himmy team -f {target / "team.yaml"} -p "your question"')
     else:
@@ -939,4 +957,23 @@ def cmd_tools(args: argparse.Namespace) -> int:
     for pack in BUILTIN_PACKS.values():
         print(f"  {pack.name:<7} {pack.description}")
         print(f"          tools: {', '.join(pack.tool_names)}")
+    return 0
+
+
+def cmd_skills(args: argparse.Namespace) -> int:
+    """List available skills (built-in + project-local) for ``skills: [...]``."""
+    from himmy.skills import BUILTIN_SKILLS, build_skill_registry, discover_skill_dirs
+
+    registry = build_skill_registry()
+    print("available skills (use in agent.yaml: `skills: [...]`):\n")
+    for skill in registry.list():
+        origin = "" if skill.name in BUILTIN_SKILLS else "  [project]"
+        binds = ", ".join((*skill.tool_packs, *skill.tools)) or "(no tools)"
+        print(f"  {skill.name:<16} {skill.description}{origin}")
+        print(f"          binds: {binds}")
+        if skill.requires_skills:
+            print(f"          requires: {', '.join(skill.requires_skills)}")
+    scanned = [str(d) for d in discover_skill_dirs() if d.is_dir()]
+    if scanned:
+        print(f"\nproject skill dirs scanned: {', '.join(scanned)}")
     return 0

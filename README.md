@@ -142,6 +142,34 @@ tool_packs: [web, utils]            # register these built-in packs
 tools: [web_search, web_fetch]      # bind a subset to the model (omit = all)
 ```
 
+### Skills — capabilities, not just tools
+
+A **skill** is the layer above tools: it bundles the *tools a job needs* with the
+*know-how to use them well*. Declaring a skill grants both at once — no separate
+`tool_packs` or instruction wiring. `himmy skills` lists the built-ins (`web_research`,
+`data_analysis`, `file_ops`, `python_compute`, `knowledge_base`, `nepal_brief`,
+`summarize`):
+
+```yaml
+name: farm-analyst
+skills: [data_analysis]   # binds sql_query + sql_schema AND injects the SQL know-how
+```
+
+Author your own as a one-file YAML — drop it in `skills/` (auto-discovered; project
+files shadow built-ins of the same name) and reference it by name:
+
+```yaml
+# skills/exact_math.yaml
+name: exact_math
+description: Compute exact arithmetic by running Python.
+tool_packs: [code]
+instructions:
+  - Never estimate arithmetic — run Python and print() the result.
+```
+
+Skills are validated (`extra="forbid"`), versioned entities (`kind="skill"`), and
+compose (`requires_skills`). `himmy init` scaffolds an example `skills/my_skill.yaml`.
+
 **MCP servers — the whole ecosystem as tools.** Beyond the built-in packs, point an
 agent at any stdio **Model Context Protocol** server and its tools become native himmy
 tools (arg-validated, approval-gated, traced). List them in `agent.yaml` (or `team.yaml`):

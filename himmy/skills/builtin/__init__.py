@@ -51,6 +51,36 @@ BUILTIN_SKILLS: dict[str, Skill] = {
             "Lead with the single most important point, then supporting points.",
         ],
     ),
+    "knowledge_base": Skill(
+        name="knowledge_base",
+        description="Build and query the agent's own knowledge base (RAG).",
+        when_to_use="the answer should come from previously ingested documents.",
+        tool_packs=["knowledge"],
+        instructions=[
+            "Search the knowledge base before answering from memory.",
+            "Ground the answer in retrieved passages and say when nothing matched.",
+        ],
+    ),
+    "python_compute": Skill(
+        name="python_compute",
+        description="Compute exact results by running Python in a sandbox.",
+        when_to_use="the task needs real computation, not an estimate.",
+        tool_packs=["code"],
+        instructions=[
+            "For any non-trivial arithmetic or data work, run Python — do not guess.",
+            "Print the final result so it is captured.",
+        ],
+    ),
+    "nepal_brief": Skill(
+        name="nepal_brief",
+        description="Answer Nepal-specific questions: BS dates, NPR, NRB forex.",
+        when_to_use="the question involves Nepali dates, currency, or NRB rates.",
+        tool_packs=["nepal"],
+        instructions=[
+            "Use the Bikram Sambat calendar tool for any date conversion.",
+            "Format money as NPR and report the exact figure from the tool.",
+        ],
+    ),
 }
 
 __all__ = ["BUILTIN_SKILLS"]

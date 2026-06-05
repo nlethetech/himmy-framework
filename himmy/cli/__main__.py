@@ -140,6 +140,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_tools = sub.add_parser("tools", help="list built-in tool packs and their tools")
     p_tools.set_defaults(func=commands.cmd_tools)
 
+    p_skills = sub.add_parser(
+        "skills", help="list available skills (built-in + project-local)"
+    )
+    p_skills.set_defaults(func=commands.cmd_skills)
+
     p_trace = sub.add_parser("trace", help="inspect saved run traces")
     p_trace.add_argument("thread", nargs="?", help="thread id to show the timeline for")
     p_trace.add_argument("--limit", type=int, default=10, help="recent runs to list")
