@@ -448,12 +448,23 @@ class PydanticAIClientManager:
         input_tokens: int,
         output_tokens: int,
     ) -> float:
-        """Compute USD cost from the configured price table (0.0 when unpriced)."""
-        if self._runtime_config is None:
-            return 0.0
-        price = self._runtime_config.price_for(
-            model_key=request.model_key, model_name=model_string.split(":", 1)[-1]
-        )
+        """Compute USD cost: explicit gateway prices first, else the default table.
+
+        Falls back to :mod:`himmy.services.inference.pricing` (bundled snapshot + any
+        ``himmy prices sync`` table) so token spend is priced out of the box, not only
+        when a gateway price table is hand-configured. Unknown models stay $0.
+        """
+        price = None
+        if self._runtime_config is not None:
+            price = self._runtime_config.price_for(
+                model_key=request.model_key, model_name=model_string.split(":", 1)[-1]
+            )
+        if price is None or (price.input_per_1k == 0.0 and price.output_per_1k == 0.0):
+            from himmy.services.inference import pricing
+
+            price = pricing.price_for(model_string)
+            if price.input_per_1k == 0.0 and price.output_per_1k == 0.0:
+                price = pricing.price_for(request.model_key)
         return price.cost(input_tokens=input_tokens, output_tokens=output_tokens)
 
     def _failed(

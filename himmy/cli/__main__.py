@@ -164,6 +164,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_skills.set_defaults(func=commands.cmd_skills)
 
+    p_prices = sub.add_parser(
+        "prices", help="model price table: sync (refresh), show <model>, or list"
+    )
+    p_prices.add_argument(
+        "action", nargs="?", choices=["sync", "show", "list"], help="default: list"
+    )
+    p_prices.add_argument("model", nargs="?", help="model name for `show`")
+    p_prices.add_argument("--url", help="override the price source URL for `sync`")
+    p_prices.set_defaults(func=commands.cmd_prices)
+
     p_trace = sub.add_parser("trace", help="inspect saved run traces")
     p_trace.add_argument("thread", nargs="?", help="thread id to show the timeline for")
     p_trace.add_argument("--limit", type=int, default=10, help="recent runs to list")

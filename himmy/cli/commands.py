@@ -1034,6 +1034,57 @@ def cmd_tools(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prices(args: argparse.Namespace) -> int:
+    """Manage the model price table: `sync` (refresh), `show <model>`, or list."""
+    from himmy.services.inference import pricing
+
+    action = getattr(args, "action", None)
+
+    if action == "sync":
+        url = getattr(args, "url", None) or pricing.LITELLM_PRICES_URL
+        try:
+            n = pricing.sync_prices(url=url)
+        except Exception as exc:  # noqa: BLE001 - report network/parse failures cleanly
+            _eprint(f"error: price sync failed: {exc}")
+            return 1
+        print(f"synced {n} model prices → {pricing.SYNCED_PRICES_PATH}")
+        return 0
+
+    if action == "show":
+        model = getattr(args, "model", None)
+        if not model:
+            _eprint("error: `himmy prices show` needs a model, e.g. openai:gpt-4o-mini")
+            return 2
+        p = pricing.price_for(model)
+        if not pricing.is_priced(model):
+            print(
+                f"{model}: unpriced ($0.00) — run `himmy prices sync` for current data"
+            )
+            return 0
+        # Show in the conventional USD-per-1M-tokens form.
+        print(f"{model}:")
+        print(f"  input:  ${p.input_per_1k * 1000:.2f} / 1M tokens")
+        print(f"  output: ${p.output_per_1k * 1000:.2f} / 1M tokens")
+        return 0
+
+    # Default: list the table.
+    table = pricing.load_price_table()
+    synced = pricing.SYNCED_PRICES_PATH.exists()
+    print(
+        f"{len(table)} model prices loaded "
+        f"({'synced + ' if synced else ''}bundled snapshot).\n"
+        f"  input/output are USD per 1M tokens.\n"
+    )
+    for name in sorted(table):
+        p = table[name]
+        print(
+            f"  {name:<24} ${p.input_per_1k * 1000:>7.2f} / ${p.output_per_1k * 1000:.2f}"
+        )
+    if not synced:
+        print("\nRefresh with the latest community prices: himmy prices sync")
+    return 0
+
+
 def cmd_skills(args: argparse.Namespace) -> int:
     """List available skills (or show one in detail) for ``skills: [...]``."""
     from himmy.skills import BUILTIN_SKILLS, build_skill_registry, discover_skill_dirs

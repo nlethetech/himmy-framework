@@ -8,6 +8,17 @@ providers, Postgres/pgvector, and observability.
 ## [Unreleased]
 
 ### Added
+- **Automatic model pricing (OpenAI + Anthropic), kept current via the community source.**
+  Token usage was always captured; now dollar cost is too, with no hand-configured price
+  table. `himmy.services.inference.pricing` resolves a per-model price from a layered
+  table — explicit override > `himmy prices sync` file > bundled offline snapshot >
+  unpriced ($0, never a guessed number). `himmy prices sync` downloads the
+  ecosystem-standard, continuously-maintained LiteLLM price JSON (2000+ models incl. brand
+  new ones) to `~/.himmy/model_prices.json`, so prices stay current without upgrading
+  himmy; `HIMMY_MODEL_PRICES` points at a custom file (LiteLLM flat shape drops straight
+  in). `himmy prices show <model>` / `himmy prices` inspect the table; name lookup strips
+  a `provider:` prefix and `-YYYY-MM-DD`/`-latest` suffix. The pydantic-ai manager
+  (OpenAI/Anthropic API) now fills `InferenceResponse.cost` from this table automatically.
 - **Deterministic record-and-replay of agent runs.** `himmy run --record FILE` captures
   every model response to a portable cassette; `himmy run --replay FILE` re-runs the agent
   exactly from it — no provider, no network, no tool side effects — so debugging a failure
