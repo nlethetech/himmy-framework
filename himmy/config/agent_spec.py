@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from himmy.agents.base_agent.task import Task
 from himmy.agents.personas.persona import Persona
+from himmy.config.mcp_spec import MCPServerConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.models import LLMConfig
@@ -56,6 +57,7 @@ class AgentSpec(BaseModel):
     tools: list[str] = []
     tool_packs: list[str] = []
     tools_module: str | None = None
+    mcp_servers: list[MCPServerConfig] = []  # stdio MCP servers → agent tools
     guardrails: list[str] = []
     memory: bool = False  # auto-recall long-term memory into the prompt each run
     memory_top_k: int = 5

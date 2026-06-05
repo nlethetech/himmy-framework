@@ -140,6 +140,24 @@ tool_packs: [web, utils]            # register these built-in packs
 tools: [web_search, web_fetch]      # bind a subset to the model (omit = all)
 ```
 
+**MCP servers — the whole ecosystem as tools.** Beyond the built-in packs, point an
+agent at any stdio **Model Context Protocol** server and its tools become native himmy
+tools (arg-validated, approval-gated, traced). List them in `agent.yaml` (or `team.yaml`):
+
+```yaml
+mcp_servers:
+  - command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/workspace"]
+    prefix: fs_                 # namespace tool names (fs_read_file, …)
+  - command: uvx
+    args: ["mcp-server-git", "--repository", "."]
+    requires_approval: true     # gate this server's tools behind approval
+    tools: [git_log, git_diff]  # bind a subset (empty = all)
+```
+
+The CLI launches each server, registers its tools, runs, then tears them down — in
+`himmy run`, `chat`, `team`, and `eval`. Built on a transport-direct stdio client (no SDK).
+
 **Embeddings (knowledge + memory).** Recall defaults to the offline `DeterministicEmbedder`
 (exact-overlap). For real semantic recall, select a model via env — `HIMMY_EMBEDDER=ollama`
 (local Ollama `nomic-embed-text`, keyless, no new deps), `HIMMY_EMBEDDER=fastembed` (ONNX,

@@ -104,10 +104,36 @@ def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
     return _apply_defaults(spec)
 
 
+def _exec_with_mcp(factory: Any, registry: Any, mcp_servers: Any) -> Any:
+    """Run ``factory()`` in one event loop, with MCP servers attached for its duration.
+
+    MCP clients bind their reader task to the running loop, so connect + run + close
+    must share a single ``asyncio.run``. With no MCP servers this is a plain run.
+    """
+    if not mcp_servers:
+        return asyncio.run(factory())
+
+    from himmy.config.mcp_spec import attach_mcp_servers, close_mcp_clients
+
+    async def _outer() -> Any:
+        clients = await attach_mcp_servers(registry, list(mcp_servers))
+        try:
+            return await factory()
+        finally:
+            await close_mcp_clients(clients)
+
+    return asyncio.run(_outer())
+
+
 def _build_runtime_for(
     spec: AgentSpec, args: argparse.Namespace, *, on_event: Any = None
 ) -> Any:
-    """Wire a runtime for ``spec`` honoring CLI provider/model overrides + tools."""
+    """Wire a runtime for ``spec`` honoring CLI provider/model overrides + tools.
+
+    Returns ``(runtime, registry)``. The registry is non-``None`` whenever the agent
+    has tools/packs/MCP servers; MCP tools are registered into it later, inside the
+    event loop (see :func:`_exec_with_mcp`), since connecting is async.
+    """
     from himmy import build_runtime
     from himmy.services.tools.registry import ToolRegistry
 
@@ -154,7 +180,8 @@ def _build_runtime_for(
             storage_service=build_storage(), adapters=[adapter]
         )
 
-    if spec.tool_packs or spec.tools_module:
+    registry = None
+    if spec.tool_packs or spec.tools_module or spec.mcp_servers:
         registry = ToolRegistry()
         if spec.tool_packs:
             from himmy.toolkit import ToolkitConfig, register_packs
@@ -175,7 +202,7 @@ def _build_runtime_for(
             overrides["tool_registry"] = registry
 
     runtime, _inference, _tools = build_runtime(**overrides)
-    return runtime
+    return runtime, registry
 
 
 # --------------------------------------------------------------------- run/chat
@@ -188,7 +215,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     spec = _spec_from_args(args)
     tracer = _TraceCollector() if getattr(args, "trace", False) else None
-    runtime = _build_runtime_for(spec, args, on_event=tracer.handle if tracer else None)
+    runtime, registry = _build_runtime_for(
+        spec, args, on_event=tracer.handle if tracer else None
+    )
 
     def _print_trace() -> None:
         if tracer is not None:
@@ -210,7 +239,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     sys.stdout.flush()
             sys.stdout.write("\n")
 
-        asyncio.run(_stream())
+        _exec_with_mcp(_stream, registry, spec.mcp_servers)
         _print_trace()
         return 0
 
@@ -222,7 +251,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 args.prompt, spec.to_persona(), tool_names=spec.tools or None
             )
 
-        result = asyncio.run(_plan())
+        result = _exec_with_mcp(_plan, registry, spec.mcp_servers)
         _eprint(f"plan: {len(result.plan)} step(s)")
         for i, step in enumerate(result.plan, start=1):
             _eprint(f"  {i}. {step}")
@@ -237,7 +266,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             llm_config=spec.to_llm_config(),
         )
 
-    result = asyncio.run(_go())
+    result = _exec_with_mcp(_go, registry, spec.mcp_servers)
 
     if args.json:
         print(
@@ -269,7 +298,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_chat(args: argparse.Namespace) -> int:
     """Interactive REPL keeping one thread; `--message` runs a single turn."""
     spec = _spec_from_args(args)
-    runtime = _build_runtime_for(spec, args)
+    runtime, registry = _build_runtime_for(spec, args)
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
 
@@ -313,35 +342,56 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
     if args.message:
         thread = _new_thread()
-        result = asyncio.run(_turn(thread, args.message))
+        result = _exec_with_mcp(
+            lambda: _turn(thread, args.message), registry, spec.mcp_servers
+        )
         _persist(result.thread)
         print(result.output_text or "")
         return 0 if result.succeeded else 1
+
+    # Interactive REPL. When the agent has MCP servers, connect them ONCE on a
+    # persistent loop and reuse it across turns (re-spawning per turn would be slow
+    # and the clients' reader tasks are loop-bound).
+    loop = asyncio.new_event_loop()
+    mcp_clients: list[Any] = []
+    if spec.mcp_servers:
+        from himmy.config.mcp_spec import attach_mcp_servers
+
+        mcp_clients = loop.run_until_complete(
+            attach_mcp_servers(registry, list(spec.mcp_servers))
+        )
 
     _eprint(f"himmy chat — {persona.name} ({persona.role}). /exit, /reset, /help.")
     if session_id:
         _eprint(f"(session: {session_id})")
     thread = _new_thread()
-    while True:
-        try:
-            line = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            _eprint("")
-            break
-        if not line:
-            continue
-        if line in {"/exit", "/quit"}:
-            break
-        if line == "/reset":
-            thread = ChatThread(agent_id=persona.agent_id)
-            _persist(thread)
-            _eprint("(thread reset)")
-            continue
-        if line == "/help":
-            _eprint("commands: /exit  /reset  /help")
-            continue
-        sys.stdout.write("bot> ")
-        asyncio.run(_stream(thread, line))
+    try:
+        while True:
+            try:
+                line = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                _eprint("")
+                break
+            if not line:
+                continue
+            if line in {"/exit", "/quit"}:
+                break
+            if line == "/reset":
+                thread = ChatThread(agent_id=persona.agent_id)
+                _persist(thread)
+                _eprint("(thread reset)")
+                continue
+            if line == "/help":
+                _eprint("commands: /exit  /reset  /help")
+                continue
+            sys.stdout.write("bot> ")
+            loop.run_until_complete(_stream(thread, line))
+    finally:
+        if mcp_clients:
+            from himmy.config.mcp_spec import close_mcp_clients
+
+            loop.run_until_complete(close_mcp_clients(mcp_clients))
+        loop.close()
     return 0
 
 
@@ -371,7 +421,7 @@ def cmd_team(args: argparse.Namespace) -> int:
     )
     orch = MultiAgentOrchestrator(runtime, team, registry)
 
-    result = asyncio.run(orch.run(args.prompt))
+    result = _exec_with_mcp(lambda: orch.run(args.prompt), registry, spec.mcp_servers)
 
     if args.json:
         print(
@@ -432,12 +482,14 @@ def cmd_eval(args: argparse.Namespace) -> int:
             )
             return 2
         spec = load_agent_spec(args.agent)
-        runtime = _build_runtime_for(spec, args)
+        runtime, registry = _build_runtime_for(spec, args)
         harness = AgentEvalHarness(runtime, eval_service)
-        run = asyncio.run(
-            harness.evaluate_agent(
+        run = _exec_with_mcp(
+            lambda: harness.evaluate_agent(
                 suite, spec.to_persona(), llm_config=spec.to_llm_config()
-            )
+            ),
+            registry,
+            spec.mcp_servers,
         )
 
     if args.json:

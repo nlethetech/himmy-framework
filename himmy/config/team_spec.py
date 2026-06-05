@@ -30,6 +30,7 @@ import yaml
 from pydantic import BaseModel
 
 from himmy.agents.personas.persona import Persona
+from himmy.config.mcp_spec import MCPServerConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.orchestrators import AgentTeam
@@ -64,6 +65,7 @@ class TeamSpec(BaseModel):
 
     members: list[TeamMemberSpec]
     entry: str
+    mcp_servers: list[MCPServerConfig] = []  # stdio MCP servers shared by the team
 
 
 def load_team_spec(path: str | Path) -> TeamSpec:

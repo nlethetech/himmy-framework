@@ -35,6 +35,15 @@ providers, Postgres/pgvector, and observability.
   remains a clean opt-in via the `Guardrail` protocol when more is needed.)
 
 ### Added
+- **MCP servers, declaratively (the whole MCP ecosystem as agent tools).** An
+  `agent.yaml`/`team.yaml` can now list `mcp_servers:` — any stdio Model Context Protocol
+  server (GitHub, Slack, filesystem, a Playwright browser, …) is launched and its tools are
+  registered as native himmy tools (arg validation, approval gating, events, lineage). Each
+  server supports `prefix` (namespacing), `requires_approval`, a `tools` subset, and
+  `env`/`cwd`. New `himmy.config.mcp_spec` (`MCPServerConfig`, `attach_mcp_servers`,
+  `close_mcp_clients`); the CLI connects them inside the run loop and tears them down after.
+  Wired into `himmy run` (incl. `--plan`/`--stream`), `himmy chat`, `himmy team`, and
+  `himmy eval`. Builds on the existing transport-direct MCP stdio client (no SDK).
 - **Mixed-provider teams (strong brain + cheap local workers).** Each `team.yaml` member
   can declare its own `provider` + `model`, so a Claude-CLI (Opus) brain can orchestrate
   free local Ollama workers with a cloud model wherever you want one. A new

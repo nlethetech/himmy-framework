@@ -105,6 +105,40 @@ framework default). Under the hood each `model_key` routes to its own backend vi
 `MultiProviderClientManager` — so you pay for the strong model only where it reasons, and
 run everything else locally for free.
 
+## Plug in MCP servers — the whole ecosystem as agent tools
+
+Instead of hand-writing a connector for every service, point himmy at any **stdio MCP
+server** and its tools become native agent tools. List them under `mcp_servers:` in
+`agent.yaml` (or `team.yaml`, shared by the team):
+
+```yaml
+# agent.yaml
+name: dev-assistant
+provider: ollama
+model: qwen2.5:3b-instruct
+mcp_servers:
+  - command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/workspace"]
+    prefix: fs_                 # tools become fs_read_file, fs_list_directory, …
+  - command: uvx
+    args: ["mcp-server-git", "--repository", "."]
+    requires_approval: true     # gate this server's tools behind approval
+    tools: [git_log, git_diff]  # bind only a subset (empty = all)
+```
+
+```bash
+himmy run -f agent.yaml -p "Summarize the recent git history and list /tmp/workspace."
+```
+
+The CLI launches each server, registers its tools (arg-validated against the server's
+own JSON Schema, with approval gating + events + lineage like any native tool), runs the
+agent, then tears the servers down. Leave the agent's `tools:` empty to advertise every
+MCP tool to the model, or name the (prefixed) ones you want bound. Works the same in
+`himmy chat`, `himmy team`, and `himmy eval`.
+
+> Verified offline against an in-repo mock MCP server: `himmy run` connected it,
+> registered `mock_echo`/`mock_add`, and the model called them through the full pipeline.
+
 ## Notes from real-model testing
 
 - **Tool calling works** on Ollama (native `/api/chat` tools) and, best-effort, on the
