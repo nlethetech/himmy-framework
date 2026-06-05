@@ -120,7 +120,7 @@ run-create (access) — no-op when auth is off. New `GET /v1/audit/events` route
 `audit:read` (auditor/admin), tenant-scoped. Tests: `tests/audit/test_security_log.py`
 (incl. a signed-bundle tamper-evidence proof), `tests/api/test_security_audit.py`.*
 
-### 1.3-orig — Actor identity on runs & entities ("who did what")
+### 1.3-orig — Actor identity on runs & entities ("who did what") - ✅ DONE
 - **Current:** `RunRecord` (`himmy/services/storage/models.py:34`) and `EntityRecord`
   (`himmy/entities/records.py:70`) carry **no actor field** — only `created_at`.
 - **Target:** stamp the authenticated `principal.subject` (+ auth method, source IP, request
@@ -133,7 +133,7 @@ run-create (access) — no-op when auth is off. New `GET /v1/audit/events` route
   records a configured local actor; reading a run shows who launched it.
 - **Verify:** `tests/api/test_actor_stamping.py`.
 
-### 1.4 — Security audit log (access & admin events)
+### 1.4 — Security audit log (access & admin events) - ✅ DONE
 - **Target:** authn decisions, authz denials, data-access, and admin actions become
   first-class **`EntityRecord`s** (`kind="security_event"`) so they inherit immutability +
   lineage + the tamper-evident bundle (WS4.5). Shippable to a SIEM (WS6.4).
