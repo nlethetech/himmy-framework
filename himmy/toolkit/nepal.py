@@ -40,8 +40,10 @@ _DATE_SCHEMA = {
     "type": "object",
     "properties": {
         "date": {
-            "type": "string",
-            "description": "An AD date YYYY-MM-DD; omit for today.",
+            # Allow null too: small models often emit ``date: null`` for an absent
+            # optional rather than omitting the key — both mean "today".
+            "type": ["string", "null"],
+            "description": "An AD date YYYY-MM-DD; omit (or null) for today.",
         }
     },
     "additionalProperties": False,
