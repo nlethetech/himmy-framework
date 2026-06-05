@@ -45,7 +45,7 @@ jobs:
           pip install -e ".[api,postgres,knowledge,connectors,nepal,auth]"
       - name: Generate CycloneDX SBOM
         run: cyclonedx-py environment -o sbom.cdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom.cdx.json
