@@ -34,10 +34,10 @@ def build_authenticator() -> Authenticator | None:
     shared key can coexist.
     """
     mode = os.environ.get("HIMMY_AUTH_MODE", "").lower()
-    if mode == "oidc":  # pragma: no cover - lands in the OIDC increment
-        raise AuthError(
-            "HIMMY_AUTH_MODE=oidc is not available yet; use API-key auth for now"
-        )
+    if mode == "oidc":
+        from himmy.api.auth.oidc import OidcAuthenticator
+
+        return OidcAuthenticator.from_env()
 
     from himmy.api.auth.apikey import (
         DEFAULT_HEADER,

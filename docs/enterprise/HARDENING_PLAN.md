@@ -60,7 +60,19 @@ ANONYMOUS all-tenants principal (unchanged). Tests: `tests/api/test_tenant_isola
   is closed.
 - **Verify:** `tests/api/test_tenant_isolation.py` — cross-tenant read/write denied.
 
-### 1.1 — Pluggable authentication (`AuthN` provider)
+### 1.1 — Pluggable authentication (OIDC/JWT) — ✅ DONE
+*Shipped: `himmy/api/auth/oidc.py::OidcAuthenticator` — verifies a Bearer JWT against the
+provider's JWKS (RSA/EC signature, `iss`, `aud`, required `exp`), maps claims →
+`Principal` (subject/tenant/roles/scopes, dotted claim paths for Keycloak-style
+`realm_access.roles`, `all_tenants_roles` for platform admins). `JwksCache` (TTL + rotation
+refresh on unknown `kid`) / `StaticJwks` (injectable, so the path is tested offline with a
+self-signed key). `HIMMY_AUTH_MODE=oidc` + `HIMMY_OIDC_*` config; new `auth` extra
+(`pyjwt[crypto]`, also added to `dev` so CI runs it). OpenAPI advertises the bearer scheme.
+Tests: `tests/api/test_oidc.py` (17, incl. expired/wrong-aud/wrong-iss/bad-sig/missing-exp/
+kid-rotation + live BFF RBAC + cross-tenant denial under OIDC). Works with Entra ID /
+Keycloak / Okta / Auth0 / Google. **WS1 (identity & access control) is complete.**
+
+### 1.1-orig — Pluggable authentication (`AuthN` provider)
 - **Current:** static shared key only.
 - **Target:** an `Authenticator` Protocol resolving a request → `Principal`. Ship three
   impls: (a) `ApiKeyAuthenticator` (today's behavior, now mapping a key → a principal with

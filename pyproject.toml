@@ -22,6 +22,8 @@ himmy = "himmy.cli.__main__:main"
 
 [project.optional-dependencies]
 api = ["fastapi>=0.110", "uvicorn>=0.29"]
+# Enterprise auth: OIDC/JWT bearer verification for the BFF (RSA/EC via cryptography).
+auth = ["pyjwt[crypto]>=2.8"]
 providers = ["pydantic-ai>=0.0.1"]
 postgres = ["asyncpg>=0.29"]
 knowledge = ["pgvector>=0.2", "openai>=1.0", "pypdf>=4.0"]
@@ -47,6 +49,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
     "types-PyYAML>=6",
+    # so the OIDC auth tests run in CI (the runtime dep lives in the `auth` extra)
+    "pyjwt[crypto]>=2.8",
 ]
 all = [
     "fastapi>=0.110",
