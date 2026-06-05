@@ -166,13 +166,18 @@ async def _answer(
 
 
 def _build_runtime_for(
-    spec: AgentSpec, args: argparse.Namespace, *, on_event: Any = None
+    spec: AgentSpec,
+    args: argparse.Namespace,
+    *,
+    on_event: Any = None,
+    inference: Any = None,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring CLI provider/model overrides + tools.
 
     Returns ``(runtime, registry)``. The registry is non-``None`` whenever the agent
     has tools/packs/MCP servers; MCP tools are registered into it later, inside the
-    event loop (see :func:`_exec_with_mcp`), since connecting is async.
+    event loop (see :func:`_exec_with_mcp`), since connecting is async. ``inference``
+    overrides the provider-derived service (used by record/replay).
     """
     from himmy import build_runtime
     from himmy.services.tools.registry import ToolRegistry
@@ -181,7 +186,8 @@ def _build_runtime_for(
     model = getattr(args, "model", None) or (
         spec.model if spec.model != "default" else None
     )
-    inference = build_inference_for(provider, model)
+    if inference is None:
+        inference = build_inference_for(provider, model)
 
     overrides: dict[str, Any] = {"inference": inference}
     if on_event is not None:
@@ -283,15 +289,51 @@ def _build_runtime_for(
 # --------------------------------------------------------------------- run/chat
 
 
+def _record_replay_inference(
+    spec: AgentSpec, args: argparse.Namespace
+) -> tuple[Any, Any]:
+    """Build a record/replay inference service from --record/--replay; else (None, None).
+
+    Returns ``(inference, recorder)``: ``inference`` overrides the provider service;
+    ``recorder`` (a RecordingClientManager) is non-None under --record so the caller can
+    dump its cassette after the run.
+    """
+    from himmy.cli.provider import build_manager_for
+    from himmy.services.inference.service import InferenceService
+
+    replay = getattr(args, "replay", None)
+    record = getattr(args, "record", None)
+    if replay:
+        from himmy.services.inference.replay import ReplayClientManager
+
+        return InferenceService(ReplayClientManager.from_file(replay)), None
+    if record:
+        from himmy.services.inference.replay import RecordingClientManager
+
+        provider = getattr(args, "provider", None) or spec.provider
+        model = getattr(args, "model", None) or (
+            spec.model if spec.model != "default" else None
+        )
+        recorder = RecordingClientManager(
+            build_manager_for(provider, model), label=spec.name
+        )
+        return InferenceService(recorder), recorder
+    return None, None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """One-shot: run a single prompt through the agent and print the answer."""
     if not args.prompt:
         _eprint("error: --prompt/-p is required for `himmy run`")
         return 2
+    if getattr(args, "record", None) and getattr(args, "replay", None):
+        _eprint("error: --record and --replay are mutually exclusive")
+        return 2
     spec = _spec_from_args(args)
     tracer = _TraceCollector() if getattr(args, "trace", False) else None
+    inference, recorder = _record_replay_inference(spec, args)
     runtime, registry = _build_runtime_for(
-        spec, args, on_event=tracer.handle if tracer else None
+        spec, args, on_event=tracer.handle if tracer else None, inference=inference
     )
 
     def _print_trace() -> None:
@@ -370,6 +412,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         print(result.output_text or "")
     _print_trace()
+    if recorder is not None:
+        path = recorder.dump(args.record)
+        _eprint(f"recorded {len(recorder.cassette.entries)} model exchange(s) → {path}")
+    elif getattr(args, "replay", None):
+        _eprint(f"replayed from {args.replay}")
     return 0 if result.succeeded else 1
 
 

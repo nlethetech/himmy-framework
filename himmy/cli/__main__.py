@@ -59,6 +59,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--plan", action="store_true", help="plan-and-execute (decompose into steps)"
     )
+    p_run.add_argument(
+        "--record",
+        metavar="FILE",
+        help="record every model response to a replayable cassette (JSON)",
+    )
+    p_run.add_argument(
+        "--replay",
+        metavar="FILE",
+        help="re-run deterministically from a recorded cassette (no provider/network)",
+    )
     p_run.set_defaults(func=commands.cmd_run)
 
     p_chat = sub.add_parser("chat", help="interactive chat keeping one thread")
