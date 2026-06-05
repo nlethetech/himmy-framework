@@ -60,7 +60,7 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
     "data": ToolPack(
         "data",
         "Run read-only SQL queries against SQLite or Postgres.",
-        ("sql_query",),
+        ("sql_query", "sql_schema"),
         register_data_pack,
     ),
     "code": ToolPack(

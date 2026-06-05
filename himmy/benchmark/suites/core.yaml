@@ -21,12 +21,12 @@ tasks:
 
   - id: sql_count
     category: sql
-    prompt: "Query the animals table: how many chickens are there?"
+    prompt: "What is the quantity value recorded for chickens in the animals table?"
     packs: [data]
     expect_tools: [sql_query]
-    instructions: ["The DB has a table animals(name TEXT, count INTEGER)."]
+    instructions: ["The DB has a table animals(name TEXT, quantity INTEGER)."]
     sqlite:
-      - "CREATE TABLE animals(name TEXT, count INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
+      - "CREATE TABLE animals(name TEXT, quantity INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
     grade: { type: numeric, value: 30 }
 
   - id: reasoning_noTool

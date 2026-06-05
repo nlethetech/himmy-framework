@@ -132,6 +132,10 @@ ignore = [
 "himmy/entities/sqlite_registry.py" = ["S608"]
 "himmy/services/knowledge/backend.py" = ["S608"]
 "himmy/services/observability/trace.py" = ["S608"]
+# The empty-result hint introspects DISTINCT values; the table/column identifiers come
+# from PRAGMA/sqlite_master and are regex-restricted to \w + validated against the live
+# schema — never raw model input. Values still go through the parameterized query path.
+"himmy/toolkit/data.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.12"

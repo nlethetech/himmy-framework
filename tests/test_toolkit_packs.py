@@ -46,6 +46,7 @@ def test_register_all_packs_populates_registry() -> None:
         "write_file",
         "list_dir",
         "sql_query",
+        "sql_schema",
         "run_python",
         "calculator",
         "current_time",
