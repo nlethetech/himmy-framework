@@ -94,9 +94,11 @@ class ToolkitConfig(BaseModel):
         ``HIMMY_HTTP_MAX_BYTES``, ``HIMMY_ALLOW_PRIVATE_HOSTS``,
         ``HIMMY_SQLITE_PATH``, ``HIMMY_SQL_DSN``, ``HIMMY_SQL_READONLY``.
         """
+        from himmy.config.secrets import get_secret
+
         env = os.environ
         backend = env.get("HIMMY_SEARCH_BACKEND", "duckduckgo").lower()
-        api_key = env.get("HIMMY_SEARCH_API_KEY") or env.get(
+        api_key = get_secret("HIMMY_SEARCH_API_KEY") or get_secret(
             f"{backend.upper()}_API_KEY"
         )
         return cls(
@@ -110,9 +112,9 @@ class ToolkitConfig(BaseModel):
                 env.get("HIMMY_ALLOW_PRIVATE_HOSTS"), default=False
             ),
             sqlite_path=env.get("HIMMY_SQLITE_PATH"),
-            sql_dsn=env.get("HIMMY_SQL_DSN"),
+            sql_dsn=get_secret("HIMMY_SQL_DSN"),
             sql_read_only=_env_bool(env.get("HIMMY_SQL_READONLY"), default=True),
-            kb_dsn=env.get("HIMMY_KB_DSN"),
+            kb_dsn=get_secret("HIMMY_KB_DSN"),
             embedder=env.get("HIMMY_EMBEDDER", "deterministic"),
             embedder_model=env.get("HIMMY_EMBEDDER_MODEL"),
             embedder_dim=(
@@ -127,10 +129,10 @@ class ToolkitConfig(BaseModel):
             smtp_host=env.get("HIMMY_SMTP_HOST"),
             smtp_port=int(env.get("HIMMY_SMTP_PORT", "587")),
             smtp_user=env.get("HIMMY_SMTP_USER"),
-            smtp_password=env.get("HIMMY_SMTP_PASSWORD"),
+            smtp_password=get_secret("HIMMY_SMTP_PASSWORD"),
             smtp_from=env.get("HIMMY_SMTP_FROM"),
             smtp_use_tls=_env_bool(env.get("HIMMY_SMTP_USE_TLS"), default=True),
-            telegram_bot_token=env.get("HIMMY_TELEGRAM_BOT_TOKEN"),
+            telegram_bot_token=get_secret("HIMMY_TELEGRAM_BOT_TOKEN"),
             telegram_default_chat_id=env.get("HIMMY_TELEGRAM_CHAT_ID"),
             code_exec=env.get("HIMMY_CODE_EXEC", "subprocess"),
             sandbox_image=env.get("HIMMY_SANDBOX_IMAGE", "python:3.12-slim"),

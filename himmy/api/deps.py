@@ -82,7 +82,9 @@ class ApiContainer:
         JSONB codec + timeouts, then migrated. When unset (the default), the
         in-memory store keeps the framework offline-green.
         """
-        dsn = os.environ.get("HIMMY_DATABASE_URL")
+        from himmy.config.secrets import get_secret
+
+        dsn = get_secret("HIMMY_DATABASE_URL")
         if dsn:
             from himmy.services.storage.postgres import PostgresStorageService
 
@@ -157,6 +159,7 @@ class ApiContainer:
     @staticmethod
     def _build_inference() -> InferenceService:
         """Build the inference service: gateway when keyed, else the offline stub."""
+        from himmy.config.secrets import get_secret
         from himmy.services.inference.client_manager import (
             GatewayClientManager,
             StubClientManager,
@@ -164,7 +167,7 @@ class ApiContainer:
         from himmy.services.inference.models import GatewayRuntimeConfig
         from himmy.services.inference.service import InferenceService
 
-        if os.environ.get("PYDANTIC_AI_GATEWAY_API_KEY"):
+        if get_secret("PYDANTIC_AI_GATEWAY_API_KEY"):
             region = os.environ.get("HIMMY_GATEWAY_REGION", "us")
             manager: Any = GatewayClientManager(GatewayRuntimeConfig(region=region))
         else:

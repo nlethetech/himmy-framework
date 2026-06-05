@@ -44,11 +44,12 @@ def build_authenticator() -> Authenticator | None:
         ApiKeyAuthenticator,
         load_key_principals,
     )
+    from himmy.config.secrets import get_secret
 
     header = os.environ.get("HIMMY_INTERNAL_HEADER", DEFAULT_HEADER)
     shared = {
         k.strip()
-        for k in os.environ.get("HIMMY_INTERNAL_API_KEY", "").split(",")
+        for k in (get_secret("HIMMY_INTERNAL_API_KEY") or "").split(",")
         if k.strip()
     }
     mapped = {}
