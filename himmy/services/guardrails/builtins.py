@@ -230,7 +230,8 @@ class NepalPIIGuardrail:
         return GuardrailVerdict(allowed=True, text=redacted, flags=flags)
 
 
-#: Built-in guardrails resolvable by name (for specs/CLI).
+#: Built-in guardrails resolvable by name (for specs/CLI). ``dlp`` is appended below
+#: (after ``_PII_RULES`` is defined) to avoid a circular import.
 BUILTIN_GUARDRAILS: dict[str, type[Guardrail]] = {
     "pii": PIIGuardrail,
     "injection": InjectionGuardrail,
@@ -251,6 +252,13 @@ def build_guardrail_pipeline(names: list[str]) -> GuardrailPipeline:
             )
         guards.append(factory())
     return GuardrailPipeline(guards)
+
+
+# Registered here, after _PII_RULES exists, so dlp.py can import the rule set without
+# a circular import. DlpGuardrail() with no args defaults to redact-all (PII-like).
+from himmy.services.guardrails.dlp import DlpGuardrail as _DlpGuardrail  # noqa: E402
+
+BUILTIN_GUARDRAILS["dlp"] = _DlpGuardrail
 
 
 __all__ = [

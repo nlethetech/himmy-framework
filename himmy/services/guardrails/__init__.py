@@ -23,6 +23,14 @@ from himmy.services.guardrails.builtins import (
     PIIRule,
     build_guardrail_pipeline,
 )
+from himmy.services.guardrails.dlp import (
+    DlpAction,
+    DlpGuardrail,
+    DlpPolicy,
+    PresidioAnalyzerAdapter,
+    TokenVault,
+    build_dlp_guardrail,
+)
 from himmy.services.guardrails.tool_hook import build_guardrail_pre_hook
 
 __all__ = [
@@ -37,4 +45,10 @@ __all__ = [
     "BUILTIN_GUARDRAILS",
     "build_guardrail_pipeline",
     "build_guardrail_pre_hook",
+    "DlpAction",
+    "DlpPolicy",
+    "DlpGuardrail",
+    "TokenVault",
+    "PresidioAnalyzerAdapter",
+    "build_dlp_guardrail",
 ]
