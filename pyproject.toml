@@ -87,6 +87,9 @@ himmy = ["services/prompts/configs/prompts/*.yaml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: end-to-end tests against a real provider (Ollama); skip when absent",
+]
 filterwarnings = [
     "ignore::DeprecationWarning:pytest_asyncio.*",
     "ignore:.*urllib3.*:Warning",
@@ -98,21 +101,37 @@ line-length = 88
 extend-exclude = ["himmy.egg-info"]
 
 [tool.ruff.lint]
-# Pyflakes (F), pycodestyle (E/W), isort (I), pyupgrade (UP), flake8-bugbear (B).
-select = ["E", "W", "F", "I", "UP", "B"]
+# Pyflakes (F), pycodestyle (E/W), isort (I), pyupgrade (UP), flake8-bugbear (B),
+# flake8-bandit (S = SAST / security, WS5.3). The dangerous S rules (exec, pickle,
+# weak hashes, shell=True, os.system, verify=False) stay ACTIVE; only known-safe,
+# high-false-positive classes are ignored below with justification.
+select = ["E", "W", "F", "I", "UP", "B", "S"]
 ignore = [
     "E501",   # line length is handled by the formatter
     "B008",   # function calls in argument defaults (common FastAPI Depends pattern)
     "UP042",  # `str, Enum` is intentional: stable JSON/Postgres serialization vs StrEnum
     "UP007",  # `Optional[X]`/`Union` retained where it reads clearer than `X | Y`
     "UP047",  # PEP 695 generic syntax not required for this 3.12 baseline
+    "S101",   # assert: used for type-narrowing in source + the basis of every test
+    "S110",   # try/except/pass: intentional best-effort teardown/close (commented)
+    "S112",   # try/except/continue: intentional skip of malformed input
+    "S311",   # random: only used for non-cryptographic variance, never secrets
+    "S108",   # hardcoded /tmp: tempfile is used safely; literals are container mounts
 ]
 
 [tool.ruff.lint.per-file-ignores]
 # The example bootstrap intentionally manipulates sys.path before importing.
 "examples/_runtime.py" = ["E402"]
-# Tests may shadow/redefine and use star-style fixtures freely.
-"tests/**" = ["B011"]
+# Tests: fixtures use fake passwords/tokens and drive real subprocesses (docker/python).
+"tests/**" = ["B011", "S105", "S106", "S603", "S607"]
+# Persistence layers: queries are parameterized (?/$n) with constant column-list
+# identifiers — no user-input concatenation; the read-only sql_query tool is
+# separately sandboxed. (The dangerous S rules stay active everywhere.)
+"himmy/services/storage/postgres.py" = ["S608"]
+"himmy/entities/postgres.py" = ["S608"]
+"himmy/entities/sqlite_registry.py" = ["S608"]
+"himmy/services/knowledge/backend.py" = ["S608"]
+"himmy/services/observability/trace.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.12"
