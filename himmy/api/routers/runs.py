@@ -9,11 +9,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from himmy.api.auth import require_workspace, resolve_workspace
+from himmy.api.auth import require_permission, require_workspace, resolve_workspace
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
     RunListResponse,
@@ -23,6 +23,9 @@ from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import RunRecord, RunStatus
 
 router = APIRouter(prefix="/v1/runs", tags=["runs"])
+
+_READ = [Depends(require_permission("run", "read"))]
+_WRITE = [Depends(require_permission("run", "write"))]
 
 
 class PersonaInput(BaseModel):
@@ -57,7 +60,7 @@ def _container(request: Request) -> Any:
     return request.app.state.container
 
 
-@router.post("", response_model=RunRecord)
+@router.post("", response_model=RunRecord, dependencies=_WRITE)
 async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
     """Create a run (idempotent) and execute it in the background; returns the record."""
     from himmy.agents.base_agent.task import Task
@@ -84,7 +87,7 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
     )
 
 
-@router.get("", response_model=RunListResponse)
+@router.get("", response_model=RunListResponse, dependencies=_READ)
 async def list_runs(
     request: Request,
     workspace_id: str | None = None,
@@ -115,7 +118,12 @@ async def list_runs(
     )
 
 
-@router.get("/{run_id}", response_model=RunRecord, responses=NOT_FOUND_RESPONSE)
+@router.get(
+    "/{run_id}",
+    response_model=RunRecord,
+    responses=NOT_FOUND_RESPONSE,
+    dependencies=_READ,
+)
 async def get_run(
     run_id: str,
     request: Request,
@@ -129,7 +137,7 @@ async def get_run(
     return run
 
 
-@router.get("/{run_id}/events")
+@router.get("/{run_id}/events", dependencies=_READ)
 async def get_run_events(
     run_id: str,
     request: Request,
@@ -142,7 +150,7 @@ async def get_run_events(
     )
 
 
-@router.get("/{run_id}/thread", responses=NOT_FOUND_RESPONSE)
+@router.get("/{run_id}/thread", responses=NOT_FOUND_RESPONSE, dependencies=_READ)
 async def get_run_thread(
     run_id: str,
     request: Request,
@@ -158,7 +166,7 @@ async def get_run_thread(
     return thread
 
 
-@router.get("/{run_id}/lineage", responses=NOT_FOUND_RESPONSE)
+@router.get("/{run_id}/lineage", responses=NOT_FOUND_RESPONSE, dependencies=_READ)
 async def get_run_lineage(
     run_id: str,
     request: Request,

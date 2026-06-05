@@ -9,11 +9,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from himmy.api.auth import require_permission
 from himmy.api.models import NOT_FOUND_RESPONSE
 from himmy.services.evaluation.models import EvaluationRun, EvaluationSuite
+
+_READ = [Depends(require_permission("evaluation", "read"))]
+_WRITE = [Depends(require_permission("evaluation", "write"))]
 
 router = APIRouter(prefix="/v1/evaluation", tags=["evaluation"])
 
@@ -38,7 +42,7 @@ def _evaluation_service(request: Request) -> Any:
     return service
 
 
-@router.post("/runs", response_model=EvaluationRun)
+@router.post("/runs", response_model=EvaluationRun, dependencies=_WRITE)
 async def run_suite(body: RunSuiteRequest, request: Request) -> EvaluationRun:
     """Score a suite against actual outputs and persist + return the run."""
     return await _evaluation_service(request).run_suite(
@@ -46,7 +50,7 @@ async def run_suite(body: RunSuiteRequest, request: Request) -> EvaluationRun:
     )
 
 
-@router.get("/runs", response_model=list[EvaluationRun])
+@router.get("/runs", response_model=list[EvaluationRun], dependencies=_READ)
 async def list_evaluation_runs(
     request: Request, suite_id: str | None = None
 ) -> list[EvaluationRun]:
@@ -56,7 +60,10 @@ async def list_evaluation_runs(
 
 
 @router.get(
-    "/runs/{run_id}", response_model=EvaluationRun, responses=NOT_FOUND_RESPONSE
+    "/runs/{run_id}",
+    response_model=EvaluationRun,
+    responses=NOT_FOUND_RESPONSE,
+    dependencies=_READ,
 )
 async def get_evaluation_run(run_id: str, request: Request) -> EvaluationRun:
     """Read one evaluation run by id (404 when unknown)."""

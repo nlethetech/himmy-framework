@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from himmy.api.auth import resolve_workspace
+from himmy.api.auth import require_permission, resolve_workspace
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
     RecommendationListResponse,
@@ -22,6 +22,9 @@ from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import RecommendationItem, RecommendationStatus
 
 router = APIRouter(prefix="/v1/recommendations", tags=["recommendations"])
+
+_READ = [Depends(require_permission("recommendation", "read"))]
+_WRITE = [Depends(require_permission("recommendation", "write"))]
 
 
 class UpdateRecommendationRequest(BaseModel):
@@ -36,7 +39,7 @@ def _container(request: Request) -> Any:
     return request.app.state.container
 
 
-@router.get("", response_model=RecommendationListResponse)
+@router.get("", response_model=RecommendationListResponse, dependencies=_READ)
 async def list_recommendations(
     request: Request,
     workspace_id: str | None = None,
@@ -79,6 +82,7 @@ async def list_recommendations(
     "/{recommendation_id}",
     response_model=RecommendationItem,
     responses=NOT_FOUND_RESPONSE,
+    dependencies=_WRITE,
 )
 async def update_recommendation(
     recommendation_id: str,
@@ -99,7 +103,11 @@ async def update_recommendation(
     return item
 
 
-@router.get("/{recommendation_id}/provenance", responses=NOT_FOUND_RESPONSE)
+@router.get(
+    "/{recommendation_id}/provenance",
+    responses=NOT_FOUND_RESPONSE,
+    dependencies=_READ,
+)
 async def get_recommendation_provenance(
     recommendation_id: str,
     request: Request,

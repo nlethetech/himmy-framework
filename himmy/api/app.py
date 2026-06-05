@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from himmy.api.auth import build_authenticator, principal_dependency
+from himmy.api.auth import (
+    build_access_policy,
+    build_authenticator,
+    principal_dependency,
+)
 from himmy.api.deps import ApiContainer
 from himmy.api.models import ErrorResponse
 from himmy.api.routers import (
@@ -127,6 +131,9 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
     )
     app.state.container = container
     app.state.authenticator = authenticator
+    # Authorization: role → permission policy (data-driven via HIMMY_RBAC_FILE).
+    # Enforced per-route via require_permission; bypassed when auth is off.
+    app.state.access_policy = build_access_policy()
 
     instrument_fastapi(app)
 

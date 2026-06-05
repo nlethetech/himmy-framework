@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
-from himmy.api.auth import require_workspace
+from himmy.api.auth import require_permission, require_workspace
 from himmy.api.models import DashboardSummary
+
+_READ = [Depends(require_permission("dashboard", "read"))]
 
 router = APIRouter(prefix="/v1/dashboard", tags=["dashboard"])
 
@@ -17,7 +19,7 @@ def _container(request: Request) -> Any:
     return request.app.state.container
 
 
-@router.get("/summary", response_model=DashboardSummary)
+@router.get("/summary", response_model=DashboardSummary, dependencies=_READ)
 async def dashboard_summary(
     subject_id: str, workspace_id: str, request: Request
 ) -> DashboardSummary:

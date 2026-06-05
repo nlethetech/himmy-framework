@@ -19,6 +19,12 @@ from himmy.api.auth.context import (
     resolve_workspace,
 )
 from himmy.api.auth.principal import ANONYMOUS, Principal
+from himmy.api.auth.rbac import (
+    DEFAULT_POLICY,
+    AccessPolicy,
+    build_access_policy,
+    require_permission,
+)
 
 __all__ = [
     "Authenticator",
@@ -30,4 +36,8 @@ __all__ = [
     "get_principal",
     "resolve_workspace",
     "require_workspace",
+    "AccessPolicy",
+    "DEFAULT_POLICY",
+    "build_access_policy",
+    "require_permission",
 ]

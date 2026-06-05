@@ -8,10 +8,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from himmy.api.auth import require_workspace, resolve_workspace
+from himmy.api.auth import (
+    require_permission,
+    require_workspace,
+    resolve_workspace,
+)
 from himmy.api.models import NOT_FOUND_RESPONSE, UpsertResult
 from himmy.services.context.models import (
     ContextBuildSpec,
@@ -20,6 +24,9 @@ from himmy.services.context.models import (
 )
 
 router = APIRouter(prefix="/v1/context", tags=["context"])
+
+_READ = [Depends(require_permission("context", "read"))]
+_WRITE = [Depends(require_permission("context", "write"))]
 
 
 class UpsertFieldsRequest(BaseModel):
@@ -49,7 +56,7 @@ def _container(request: Request) -> Any:
     return request.app.state.container
 
 
-@router.post("/fields:upsert", response_model=UpsertResult)
+@router.post("/fields:upsert", response_model=UpsertResult, dependencies=_WRITE)
 async def upsert_fields(body: UpsertFieldsRequest, request: Request) -> UpsertResult:
     """Bulk-upsert context fields for a subject; returns the saved count."""
     workspace_id = require_workspace(request, body.workspace_id)
@@ -59,7 +66,7 @@ async def upsert_fields(body: UpsertFieldsRequest, request: Request) -> UpsertRe
     return UpsertResult(upserted=len(saved), subject_id=body.subject_id)
 
 
-@router.get("/fields", response_model=list[ContextField])
+@router.get("/fields", response_model=list[ContextField], dependencies=_READ)
 async def list_fields(
     subject_id: str,
     request: Request,
@@ -72,7 +79,7 @@ async def list_fields(
     )
 
 
-@router.post("/snapshots:build", response_model=ContextSnapshot)
+@router.post("/snapshots:build", response_model=ContextSnapshot, dependencies=_WRITE)
 async def build_snapshot(
     body: BuildSnapshotRequest, request: Request
 ) -> ContextSnapshot:
@@ -93,6 +100,7 @@ async def build_snapshot(
     "/snapshots/{snapshot_id}",
     response_model=ContextSnapshot,
     responses=NOT_FOUND_RESPONSE,
+    dependencies=_READ,
 )
 async def get_snapshot(
     snapshot_id: str,

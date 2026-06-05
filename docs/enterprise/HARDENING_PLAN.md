@@ -75,7 +75,14 @@ ANONYMOUS all-tenants principal (unchanged). Tests: `tests/api/test_tenant_isola
   401; offline default unchanged (no auth unless configured).
 - **Verify:** `tests/api/test_oidc_auth.py` with a locally-signed JWT + a fixture JWKS.
 
-### 1.2 — Authorization (RBAC + policy enforcement point)
+### 1.2 — Authorization (RBAC + policy enforcement point) — ✅ DONE
+*Shipped: `himmy/api/auth/rbac.py` (`AccessPolicy` over `resource:action` perms with `*`
+wildcards; default `viewer`/`operator`/`auditor`/`admin` roles; `HIMMY_RBAC_FILE` for
+custom policy; `require_permission(resource, action)` route dependency). Every BFF route
+is guarded; deny-by-default for a role-less principal; bypassed when no auth is configured
+(offline-first). Tests: `tests/api/test_rbac.py` (policy matrix + route enforcement).*
+
+### 1.2-orig — Authorization (RBAC + policy enforcement point)
 - **Target:** roles → permissions over (resource, action) pairs. A single
   `AccessPolicy.authorize(principal, resource, action)` checked by a `require_permission(...)`
   dependency on every mutating/reading route. Default roles: `viewer`, `operator`, `admin`,
