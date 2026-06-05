@@ -14,6 +14,40 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Toolkit wave 2: +8 tools in 4 packs (`himmy.toolkit`).** Closes the recall/act/
+  source gaps on top of the original five packs. `knowledge` (`kb_ingest`, `kb_search`)
+  wraps the existing `KnowledgeBase`/RAG so an agent can build and semantically search
+  its own memory (in-process `DeterministicEmbedder`). `documents` (`read_document`)
+  extracts text from PDF/text/Markdown via the existing `DocumentReaderFactory`,
+  root-jailed, feeding straight into `kb_ingest`. `comms` (`send_email` via stdlib
+  `smtplib`, `send_webhook` SSRF-guarded) is the outbound "act" capability —
+  approval-gated by default unless `HIMMY_COMMS_ALLOW_SEND=1`, creds read only from env.
+  `data-sources` (`weather` via Open-Meteo, `geocode` via Nominatim, `wikipedia`) are
+  keyless public connectors. All network behind injectable seams (offline tests). The
+  catalog is now nine packs / 18 tools (`himmy tools`).
+- **Built-in toolkit: 10 general-purpose tools in 5 packs (`himmy.toolkit`).** Agents
+  now ship with batteries included — `web` (`web_search` keyless-DuckDuckGo by default
+  / Tavily / Brave, `web_fetch`, `http_request`), `files` (`read_file`, `write_file`,
+  `list_dir`, jailed to a sandbox root), `data` (`sql_query`, read-only over SQLite or
+  Postgres), `code` (`run_python` via the existing sandbox, approval-gated), and `utils`
+  (`calculator`, `current_time`). A `ToolPack` catalog (`register_packs`/`BUILTIN_PACKS`)
+  resolves packs by name so an `agent.yaml` can say `tool_packs: [web, utils]`; `himmy
+  tools` lists them. Security: model-supplied URLs pass an SSRF guard (no private/
+  loopback hosts, http/https only, no embedded creds, redirects off), files are
+  root-jailed (traversal + symlink-escape rejected), SQL is read-only-enforced (SQLite
+  authorizer + single-statement), and write/exec tools are approval-gated. Network I/O
+  is behind injectable seams so the suite runs fully offline. New optional extra
+  `toolkit` (`beautifulsoup4`) improves `web_fetch` extraction; defaults need no new
+  core deps. Config via `HIMMY_*` env vars (`himmy.toolkit.ToolkitConfig`).
+- **`himmy` command-line interface + declarative agents.** A console-script entry
+  point (`himmy`, also `python -m himmy`) with `run`, `chat`, `init`, `serve`, and
+  `doctor` subcommands, so an agent can go from install to running without writing
+  wiring code. Agents are described in an `agent.yaml` (`himmy.config.AgentSpec` /
+  `load_agent_spec`) that maps onto `Persona` + `Task` + `LLMConfig`; `himmy init`
+  scaffolds the spec plus an example `tools.py`. Provider is selectable per run
+  (`--provider stub|claude-cli|ollama|pydantic-ai`, `--model ...`), defaulting to the
+  existing pydantic-ai→stub auto-select. No new core dependencies (stdlib `argparse`
+  + the existing `pyyaml`).
 - **Nepali-language RAG (`himmy.nepal.language`).** Cross-script retrieval:
   `transliterate` (Devanagari→Roman), `normalize_nepali` (script-folds so
   `नेपाल`/`Nepal`/`nepal` all become `nepal`), and `NepaliEmbedder` (wraps any

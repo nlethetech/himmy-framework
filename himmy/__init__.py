@@ -20,20 +20,35 @@ __all__ = [
     "Persona",
     "Task",
     "Agent",
+    "AgentSpec",
+    "load_agent_spec",
+    "ToolkitConfig",
+    "register_packs",
     "build_runtime",
     "build_inference",
     "build_storage",
 ]
 
 # The full-stack builder pulls in the heavier runtime/inference/tools kernels, so
-# it is exposed lazily (PEP 562) to keep ``import himmy`` light and offline.
+# it is exposed lazily (PEP 562) to keep ``import himmy`` light and offline. The
+# declarative spec loader (himmy.config) is lazy for the same reason.
 _LAZY = {"build_runtime", "build_inference", "build_storage"}
+_LAZY_CONFIG = {"AgentSpec", "load_agent_spec"}
+_LAZY_TOOLKIT = {"ToolkitConfig", "register_packs"}
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily resolve the builder facade from :mod:`himmy.runtime.builder`."""
+    """Lazily resolve the builder + config + toolkit facades from subpackages."""
     if name in _LAZY:
         from himmy.runtime import builder
 
         return getattr(builder, name)
+    if name in _LAZY_CONFIG:
+        from himmy import config
+
+        return getattr(config, name)
+    if name in _LAZY_TOOLKIT:
+        from himmy import toolkit
+
+        return getattr(toolkit, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

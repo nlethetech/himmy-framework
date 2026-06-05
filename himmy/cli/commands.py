@@ -1,0 +1,321 @@
+"""Command handlers for the ``himmy`` CLI.
+
+Each ``cmd_*`` is a synchronous function returning a process exit code; the ones that
+drive the async runtime wrap it in :func:`asyncio.run` internally so the argparse
+dispatcher in :mod:`himmy.cli.__main__` stays plain. Everything defaults to the
+offline stub, so ``himmy run``/``himmy chat`` work with no keys and no network.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import importlib
+import json
+import os
+import shutil
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from himmy.cli.provider import build_inference_for
+from himmy.config.agent_spec import AgentSpec, load_agent_spec
+
+
+def _eprint(*args: Any) -> None:
+    """Print to stderr (diagnostics, never mixed into machine-readable stdout)."""
+    print(*args, file=sys.stderr)
+
+
+def _resolve_register(dotted: str) -> Callable[[Any], Any]:
+    """Resolve a ``module:attr`` (or ``module`` → ``register``) tool registrar."""
+    module_name, _, attr = dotted.partition(":")
+    if not attr:
+        attr = "register"
+    # Allow running against a tools.py sitting next to the spec / in CWD.
+    if str(Path.cwd()) not in sys.path:
+        sys.path.insert(0, str(Path.cwd()))
+    module = importlib.import_module(module_name)
+    fn = getattr(module, attr, None)
+    if not callable(fn):
+        raise ValueError(f"tools_module {dotted!r} has no callable {attr!r}")
+    return fn
+
+
+def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
+    """Build the AgentSpec from ``-f file`` or ad-hoc ``--name``/``--instruction``."""
+    if getattr(args, "file", None):
+        return load_agent_spec(args.file)
+    return AgentSpec(
+        name=getattr(args, "name", None) or "himmy-agent",
+        description="Ad-hoc agent created from CLI flags.",
+        instructions=list(getattr(args, "instruction", None) or []),
+    )
+
+
+def _build_runtime_for(spec: AgentSpec, args: argparse.Namespace) -> Any:
+    """Wire a runtime for ``spec`` honoring CLI provider/model overrides + tools."""
+    from himmy import build_runtime
+    from himmy.services.tools.registry import ToolRegistry
+
+    provider = getattr(args, "provider", None) or spec.provider
+    model = getattr(args, "model", None) or (
+        spec.model if spec.model != "default" else None
+    )
+    inference = build_inference_for(provider, model)
+
+    overrides: dict[str, Any] = {"inference": inference}
+    if spec.tool_packs or spec.tools_module:
+        registry = ToolRegistry()
+        if spec.tool_packs:
+            from himmy.toolkit import ToolkitConfig, register_packs
+
+            register_packs(registry, spec.tool_packs, ToolkitConfig.from_env())
+        if spec.tools_module:
+            _resolve_register(spec.tools_module)(registry)
+        overrides["tool_registry"] = registry
+
+    runtime, _inference, _tools = build_runtime(**overrides)
+    return runtime
+
+
+# --------------------------------------------------------------------- run/chat
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """One-shot: run a single prompt through the agent and print the answer."""
+    if not args.prompt:
+        _eprint("error: --prompt/-p is required for `himmy run`")
+        return 2
+    spec = _spec_from_args(args)
+    runtime = _build_runtime_for(spec, args)
+
+    async def _go() -> Any:
+        return await runtime.run_task_detailed(
+            spec.to_persona(),
+            spec.make_task(args.prompt),
+            llm_config=spec.to_llm_config(),
+        )
+
+    result = asyncio.run(_go())
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "status": result.status,
+                    "output_text": result.output_text,
+                    "output_structured": result.output_structured,
+                    "cost": result.cost,
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "model_path": result.model_path,
+                    "provider_name": result.provider_name,
+                    "latency_ms": result.latency_ms,
+                    "error": result.error,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    elif spec.output_schema is not None and result.output_structured is not None:
+        print(json.dumps(result.output_structured, indent=2, ensure_ascii=False))
+    else:
+        print(result.output_text or "")
+    return 0 if result.succeeded else 1
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    """Interactive REPL keeping one thread; `--message` runs a single turn."""
+    spec = _spec_from_args(args)
+    runtime = _build_runtime_for(spec, args)
+    persona = spec.to_persona()
+    llm_config = spec.to_llm_config()
+
+    async def _turn(thread: Any, text: str) -> Any:
+        return await runtime.run_task_detailed(
+            persona, spec.make_task(text), thread=thread, llm_config=llm_config
+        )
+
+    if args.message:
+        result = asyncio.run(_turn(None, args.message))
+        print(result.output_text or "")
+        return 0 if result.succeeded else 1
+
+    _eprint(f"himmy chat — {persona.name} ({persona.role}). /exit, /reset, /help.")
+    thread: Any = None
+    while True:
+        try:
+            line = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            _eprint("")
+            break
+        if not line:
+            continue
+        if line in {"/exit", "/quit"}:
+            break
+        if line == "/reset":
+            thread = None
+            _eprint("(thread reset)")
+            continue
+        if line == "/help":
+            _eprint("commands: /exit  /reset  /help")
+            continue
+        result = asyncio.run(_turn(thread, line))
+        thread = result.thread
+        print(f"bot> {result.output_text or ''}")
+    return 0
+
+
+# ------------------------------------------------------------------------ init
+
+_AGENT_YAML = """\
+name: my-agent
+description: A helpful assistant. Describe its job here.
+role: Assistant
+instructions:
+  - Be concise and accurate.
+  - Cite reasoning when it helps the user decide.
+model: default
+# provider: claude-cli      # stub | claude-cli | ollama | pydantic-ai (default: auto)
+# tool_packs: [web, utils]  # built-in tool packs (run `himmy tools` to list them)
+tools: []                   # names to bind (from tool_packs and/or tools_module)
+# tools_module: tools:register   # uncomment to wire the example tool in tools.py
+# output_schema: schema.json     # path to a JSON Schema for structured output
+"""
+
+_TOOLS_PY = '''\
+"""Example tool module for a himmy agent.
+
+Wire it by setting ``tools_module: tools:register`` and listing the tool under
+``tools:`` in agent.yaml. ``register(registry)`` is called once at startup.
+"""
+
+from __future__ import annotations
+
+from himmy.services.tools.registry import ToolRegistry, register_local_tool
+
+
+def word_count(text: str) -> dict[str, int]:
+    """Return the number of whitespace-separated words in ``text``."""
+    return {"words": len(text.split())}
+
+
+def register(registry: ToolRegistry) -> None:
+    """Register this module's tools onto the runtime's tool registry."""
+    register_local_tool(
+        registry,
+        name="word_count",
+        handler=word_count,
+        description="Count the words in a piece of text.",
+        args_json_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    )
+'''
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Scaffold an ``agent.yaml`` + ``tools.py`` into the target directory."""
+    target = Path(args.directory).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    files = {"agent.yaml": _AGENT_YAML, "tools.py": _TOOLS_PY}
+
+    existing = [name for name in files if (target / name).exists()]
+    if existing and not args.force:
+        _eprint(
+            f"error: {', '.join(existing)} already exist in {target} "
+            "(use --force to overwrite)"
+        )
+        return 1
+
+    for name, content in files.items():
+        (target / name).write_text(content)
+        print(f"wrote {target / name}")
+    print(f"\nNext: himmy run -f {target / 'agent.yaml'} -p \"hello\"")
+    return 0
+
+
+# ----------------------------------------------------------------------- serve
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Boot the FastAPI BFF via uvicorn (requires the ``api`` extra)."""
+    try:
+        import uvicorn
+
+        from himmy.api.app import create_app
+    except Exception as exc:  # pragma: no cover - optional extra missing
+        _eprint(
+            "error: `himmy serve` needs the 'api' extra: "
+            f"pip install 'himmy[api]'  ({exc})"
+        )
+        return 1
+
+    app = create_app()
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0
+
+
+# ---------------------------------------------------------------------- doctor
+
+
+def _can_import(module: str) -> bool:
+    """True when ``module`` imports cleanly (optional extra is installed)."""
+    try:
+        importlib.import_module(module)
+    except Exception:
+        return False
+    return True
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Report installed optional extras, local providers, and provider keys."""
+    print(f"himmy doctor — Python {sys.version.split()[0]}")
+
+    print("\noptional extras:")
+    extras = {
+        "providers (pydantic-ai)": "pydantic_ai",
+        "api (fastapi)": "fastapi",
+        "postgres (asyncpg)": "asyncpg",
+        "connectors (feedparser)": "feedparser",
+        "connectors (openpyxl)": "openpyxl",
+        "observability (logfire)": "logfire",
+        "nepal (nepali-datetime)": "nepali_datetime",
+        "validation (jsonschema)": "jsonschema",
+    }
+    for label, module in extras.items():
+        mark = "ok " if _can_import(module) else "-- "
+        print(f"  [{mark}] {label}")
+
+    print("\nlocal providers (PATH):")
+    for binary in ("claude", "ollama"):
+        found = shutil.which(binary)
+        print(f"  [{'ok ' if found else '-- '}] {binary}" + (f" → {found}" if found else ""))
+
+    print("\nprovider keys (env):")
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "PYDANTIC_AI_GATEWAY_API_KEY",
+    ):
+        print(f"  [{'ok ' if os.environ.get(key) else '-- '}] {key}")
+    return 0
+
+
+# ----------------------------------------------------------------------- tools
+
+
+def cmd_tools(args: argparse.Namespace) -> int:
+    """List the built-in tool packs and the tools each one provides."""
+    from himmy.toolkit import BUILTIN_PACKS
+
+    print("built-in tool packs (use in agent.yaml: `tool_packs: [...]`):\n")
+    for pack in BUILTIN_PACKS.values():
+        print(f"  {pack.name:<7} {pack.description}")
+        print(f"          tools: {', '.join(pack.tool_names)}")
+    return 0

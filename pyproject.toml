@@ -17,6 +17,9 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[project.scripts]
+himmy = "himmy.cli.__main__:main"
+
 [project.optional-dependencies]
 api = ["fastapi>=0.110", "uvicorn>=0.29"]
 providers = ["pydantic-ai>=0.0.1"]
@@ -30,6 +33,9 @@ nepal = ["nepali-datetime>=1.0"]
 # Optional full-fidelity JSON Schema validation for tool args/output. Without it,
 # Himmy falls back to a built-in offline schema-validation subset.
 validation = ["jsonschema>=4"]
+# Quality boosters for the built-in toolkit (web_fetch readability). The default
+# paths work without it (stdlib HTML parsing); this just improves extraction.
+toolkit = ["beautifulsoup4>=4.12"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
@@ -52,6 +58,7 @@ all = [
     "openpyxl>=3",
     "nepali-datetime>=1.0",
     "jsonschema>=4",
+    "beautifulsoup4>=4.12",
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]

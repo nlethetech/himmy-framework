@@ -87,6 +87,92 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Quickstart (CLI)
+
+Prefer not to write wiring code? Define an agent in a file and drive it from the
+`himmy` command. Everything below runs offline against the stub — no keys needed.
+
+```bash
+# Scaffold an agent.yaml + an example tools.py in ./my-agent
+himmy init my-agent
+
+# One-shot: run a prompt and print the answer
+himmy run -f my-agent/agent.yaml -p "Say hello in one sentence."
+
+# Interactive chat that keeps a single thread
+himmy chat -f my-agent/agent.yaml
+
+# Check which optional extras / local providers / keys are available
+himmy doctor
+
+# List the built-in tools an agent can use
+himmy tools
+
+# Serve the FastAPI BFF (needs the `api` extra)
+himmy serve
+```
+
+### Built-in tools
+
+Agents get a batteries-included **toolkit** — five named packs you switch on per
+agent. `himmy tools` lists them:
+
+| Pack | Tools |
+|------|-------|
+| `web` | `web_search`, `web_fetch`, `http_request` |
+| `files` | `read_file`, `write_file`, `list_dir` (jailed to a sandbox root) |
+| `data` | `sql_query` (read-only; SQLite or Postgres) |
+| `code` | `run_python` (resource-limited sandbox, approval-gated) |
+| `utils` | `calculator`, `current_time` |
+| `knowledge` | `kb_ingest`, `kb_search` (the agent's own RAG memory) |
+| `documents` | `read_document` (PDF / text / Markdown → text) |
+| `comms` | `send_email`, `send_webhook` (outbound; approval-gated) |
+| `data-sources` | `weather`, `geocode`, `wikipedia` (keyless public APIs) |
+
+Enable them declaratively in `agent.yaml`:
+
+```yaml
+name: researcher
+description: Researches a topic and summarizes it.
+tool_packs: [web, utils]            # register these built-in packs
+tools: [web_search, web_fetch]      # bind a subset to the model (omit = all)
+```
+
+`web_search` defaults to a keyless DuckDuckGo backend (no API key, httpx only);
+set `HIMMY_SEARCH_BACKEND=tavily` + `HIMMY_SEARCH_API_KEY=…` for higher-quality
+results. Web tools are SSRF-guarded (no private/loopback hosts), files are
+root-jailed, `sql_query` is read-only, and `write_file`/`run_python` are
+approval-gated. Toolkit settings come from `HIMMY_*` env vars (see
+`himmy.toolkit.ToolkitConfig`). Use the packs from Python too:
+
+```python
+from himmy.toolkit import register_packs, ToolkitConfig
+from himmy.services.tools.registry import ToolRegistry
+
+registry = ToolRegistry()
+register_packs(registry, ["web", "utils"], ToolkitConfig.from_env())
+```
+
+An `agent.yaml` is a thin declarative façade over `Persona` + `Task` + `LLMConfig`:
+
+```yaml
+name: market-analyst
+description: A market research analyst specializing in tech.
+role: Research Analyst
+instructions:
+  - Provide actionable insights backed by clear reasoning.
+model: default
+# provider: claude-cli   # stub | claude-cli | ollama | pydantic-ai (default: auto)
+# tools_module: tools:register   # wire custom tools from tools.py
+# output_schema: schema.json     # path to a JSON Schema for structured output
+```
+
+Pick a provider per run with `--provider`/`--model` (e.g. `--provider claude-cli
+--model haiku` to use a local Claude Max session, or `--provider ollama --model
+llama3.2`). With no flag, Himmy uses a real pydantic-ai provider when a key + the
+`providers` extra are present, otherwise the offline stub. The same spec loads in
+Python via `from himmy import load_agent_spec`.
+
 ## Architecture overview
 
 Himmy is organized as a set of independent **kernels** that compose through small
