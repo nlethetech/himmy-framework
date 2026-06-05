@@ -16,16 +16,22 @@ offline. Compose them with :class:`RoutingClientManager` for cost-aware routing
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from himmy.core.ids import new_uuid
 from himmy.services.inference.models import (
+    BoundTool,
     InferenceError,
     InferenceErrorCode,
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
+    ToolCallRecord,
+    ToolReturnRecord,
 )
 
 
@@ -68,6 +74,105 @@ def _compose_prompt(request: InferenceRequest) -> str:
         if m.content
     ]
     return "\n\n".join(parts)
+
+
+def _ollama_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
+    """Project bound tools into Ollama's ``/api/chat`` function-tool schema."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.args_json_schema or {"type": "object"},
+            },
+        }
+        for tool in bound_tools
+    ]
+
+
+def _parse_ollama_tool_calls(data: dict[str, Any]) -> list[ToolCallRecord]:
+    """Parse Ollama's ``message.tool_calls`` into typed ToolCallRecords."""
+    raw = ((data.get("message") or {}).get("tool_calls")) or []
+    calls: list[ToolCallRecord] = []
+    for item in raw:
+        fn = item.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        calls.append(
+            ToolCallRecord(
+                tool_call_id=new_uuid(),
+                tool_name=str(fn.get("name", "")),
+                args=args if isinstance(args, dict) else {},
+            )
+        )
+    return calls
+
+
+_REACT_CALL_RE = re.compile(r"TOOL_CALL\s+(\S+)\s+(\{.*\})", re.DOTALL)
+
+
+def _react_tool_manifest(bound_tools: list[BoundTool]) -> str:
+    """A text manifest + protocol instruction for a text-only model (Claude CLI)."""
+    lines = ["You can call tools. Available tools:"]
+    for tool in bound_tools:
+        schema = json.dumps(tool.args_json_schema or {"type": "object"})
+        lines.append(f"- {tool.name}: {tool.description} | args schema: {schema}")
+    lines.append(
+        "To call a tool, reply with EXACTLY one line and nothing else:\n"
+        "TOOL_CALL <tool_name> <json-args>\n"
+        "Otherwise, reply with your final answer."
+    )
+    return "\n".join(lines)
+
+
+def _parse_react_tool_call(text: str) -> ToolCallRecord | None:
+    """Parse a ``TOOL_CALL <name> <json>`` line from a text reply, if present."""
+    match = _REACT_CALL_RE.search(text)
+    if not match:
+        return None
+    try:
+        args = json.loads(match.group(2))
+    except json.JSONDecodeError:
+        return None
+    return ToolCallRecord(
+        tool_call_id=new_uuid(),
+        tool_name=match.group(1),
+        args=args if isinstance(args, dict) else {},
+    )
+
+
+async def _execute_tool_calls(
+    bound_tools: list[BoundTool], tool_calls: list[ToolCallRecord]
+) -> list[ToolReturnRecord]:
+    """Run each tool call's bound handler and return the paired ToolReturnRecords.
+
+    A provider that emits tool calls (Ollama/Claude CLI) must also EXECUTE them and
+    populate ``tool_returns`` — the runtime only replays existing call/return pairs
+    onto the thread, so without this the model never sees a result and loops. Mirrors
+    :class:`StubClientManager`'s handler-execution path.
+    """
+    by_name = {t.name: t for t in bound_tools}
+    returns: list[ToolReturnRecord] = []
+    for call in tool_calls:
+        tool = by_name.get(call.tool_name)
+        if tool is not None and tool.handler is not None:
+            ret = await tool.handler(call.args)
+            ret = ret.model_copy(update={"tool_call_id": call.tool_call_id})
+        else:
+            ret = ToolReturnRecord(
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                content=None,
+                outcome="failed",
+                metadata={"error": f"no handler for tool {call.tool_name!r}"},
+            )
+        returns.append(ret)
+    return returns
 
 
 class OllamaClientManager:
@@ -114,6 +219,8 @@ class OllamaClientManager:
         }
         if options:
             payload["options"] = options
+        if request.bound_tools:
+            payload["tools"] = _ollama_tools(request.bound_tools)
         try:
             data = await self._post("/api/chat", payload, request.timeout_seconds)
         except Exception as exc:  # noqa: BLE001 - normalize to FAILED
@@ -125,10 +232,14 @@ class OllamaClientManager:
                 started=started,
             )
         text = ((data.get("message") or {}).get("content")) or ""
+        tool_calls = _parse_ollama_tool_calls(data)
+        tool_returns = await _execute_tool_calls(request.bound_tools, tool_calls)
         return InferenceResponse(
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,
             output_text=text,
+            tool_calls=tool_calls,
+            tool_returns=tool_returns,
             model_path=f"ollama:{model}",
             provider_name=self.provider_name,
             input_tokens=int(data.get("prompt_eval_count", 0) or 0),
@@ -187,10 +298,12 @@ class ClaudeCliClientManager:
         model = self.resolve(request.model_key)
         started = time.perf_counter()
         argv = [self._executable, "-p", "--model", model, *self._extra_args]
+        prompt = _compose_prompt(request)
+        if request.bound_tools:
+            # Text-only CLI: a best-effort ReAct protocol the runtime loop drives.
+            prompt = f"{prompt}\n\n{_react_tool_manifest(request.bound_tools)}"
         try:
-            out = await self._run(
-                argv, _compose_prompt(request), request.timeout_seconds
-            )
+            out = await self._run(argv, prompt, request.timeout_seconds)
         except Exception as exc:  # noqa: BLE001 - normalize to FAILED
             return _failed(
                 request,
@@ -199,10 +312,16 @@ class ClaudeCliClientManager:
                 model_path=f"claude-cli:{model}",
                 started=started,
             )
+        text = out.strip()
+        call = _parse_react_tool_call(text) if request.bound_tools else None
+        tool_calls = [call] if call is not None else []
+        tool_returns = await _execute_tool_calls(request.bound_tools, tool_calls)
         return InferenceResponse(
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,
-            output_text=out.strip(),
+            output_text="" if call is not None else text,
+            tool_calls=tool_calls,
+            tool_returns=tool_returns,
             model_path=f"claude-cli:{model}",
             provider_name=self.provider_name,
             cost=0.0,

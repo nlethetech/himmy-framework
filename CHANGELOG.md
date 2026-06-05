@@ -14,6 +14,17 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Real tool-calling on the local providers.** `OllamaClientManager` now sends bound
+  tools via Ollama's native `/api/chat` `tools` schema and parses `message.tool_calls`;
+  `ClaudeCliClientManager` (text-only) drives a best-effort ReAct protocol (appends a tool
+  manifest, parses a `TOOL_CALL <name> <json>` line). Both also **execute** the bound
+  handlers and populate `tool_returns` — the runtime only replays call/return pairs onto
+  the thread, so without execution the model never saw a result and looped. Previously
+  these managers returned only text and never populated `tool_calls`, so the toolkit /
+  teams / memory / guardrail tool-hook silently no-op'd on local models; now an agent
+  actually calls a tool, gets the result, and answers off-cloud (verified end-to-end on a
+  real Ollama qwen2.5 model). No new dependencies; offline-tested via injected
+  transport/runner.
 - **Guardrails across three surfaces (`himmy.services.guardrails`).** Composable,
   dependency-free `Guardrail`s — `PIIGuardrail` (redacts emails/phones/cards/SSNs/keys),
   `InjectionGuardrail` (flags/blocks prompt-injection phrasings), `BlocklistGuardrail` —
