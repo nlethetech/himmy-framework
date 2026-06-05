@@ -145,7 +145,21 @@ run-create (access) — no-op when auth is off. New `GET /v1/audit/events` route
 
 ---
 
-## 2. WS2 — Code-Execution Isolation (the `code`/`run_python` sandbox)
+## 2. WS2 — Code-Execution Isolation (the `code`/`run_python` sandbox) — ✅ DONE
+
+*Shipped: **2.1** backend selection by policy — `HIMMY_CODE_EXEC` ∈ `off`/`subprocess`/
+`container`, `build_sandbox()` + `DisabledSandbox` (refuses), default stays `subprocess`
+(non-breaking) but served deployments set `container`/`off`; `run_python` always
+approval-gated. **2.2** `ContainerSandbox` (`himmy/services/sandbox/container_sandbox.py`)
+— hardened Docker/Podman isolate: `--network none`, `--read-only` + `/tmp` tmpfs,
+`--cap-drop ALL`, `no-new-privileges`, non-root `--user`, pids/mem/cpu limits, hard
+in-container `timeout` kill + outer watchdog. **2.3** gVisor/microVM seam (`runtime=`) +
+`docs/enterprise/sandbox_backends.md` (threat model + per-tenant quotas). **Live-verified**
+against real Docker: `tests/sandbox/test_container_sandbox.py` proves egress-denied,
+read-only-rootfs, non-root, input-files, and wall-clock-kill (6 tests, skip when no
+engine); `tests/sandbox/test_sandbox_factory.py` covers selection + off-mode refusal.*
+
+### 2-orig — Code-Execution Isolation (the `code`/`run_python` sandbox)
 
 Running model-authored code for a customer is the highest-severity surface.
 

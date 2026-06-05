@@ -9,6 +9,12 @@ sandbox as a policy-gated, audited agent tool.
 from __future__ import annotations
 
 from himmy.services.sandbox.base import Sandbox
+from himmy.services.sandbox.container_sandbox import ContainerSandbox
+from himmy.services.sandbox.factory import (
+    CODE_EXEC_MODES,
+    DisabledSandbox,
+    build_sandbox,
+)
 from himmy.services.sandbox.models import SandboxLimits, SandboxResult
 from himmy.services.sandbox.subprocess_sandbox import SubprocessSandbox
 from himmy.services.sandbox.tools import (
@@ -21,6 +27,10 @@ __all__ = [
     "SandboxLimits",
     "SandboxResult",
     "SubprocessSandbox",
+    "ContainerSandbox",
+    "build_sandbox",
+    "DisabledSandbox",
+    "CODE_EXEC_MODES",
     "register_sandbox_tool",
     "SANDBOX_TOOL_ARGS_SCHEMA",
 ]

@@ -60,6 +60,9 @@ class ToolkitConfig(BaseModel):
 
     # code pack -------------------------------------------------------------
     sandbox_limits: SandboxLimits = Field(default_factory=SandboxLimits)
+    code_exec: str = "subprocess"  # off | subprocess | container (HIMMY_CODE_EXEC)
+    sandbox_image: str = "python:3.12-slim"
+    sandbox_engine: str = "docker"
 
     # memory pack -----------------------------------------------------------
     memory_path: str | None = None  # sqlite file → durable; None → in-process
@@ -129,6 +132,9 @@ class ToolkitConfig(BaseModel):
             smtp_use_tls=_env_bool(env.get("HIMMY_SMTP_USE_TLS"), default=True),
             telegram_bot_token=env.get("HIMMY_TELEGRAM_BOT_TOKEN"),
             telegram_default_chat_id=env.get("HIMMY_TELEGRAM_CHAT_ID"),
+            code_exec=env.get("HIMMY_CODE_EXEC", "subprocess"),
+            sandbox_image=env.get("HIMMY_SANDBOX_IMAGE", "python:3.12-slim"),
+            sandbox_engine=env.get("HIMMY_SANDBOX_ENGINE", "docker"),
             memory_path=env.get("HIMMY_MEMORY_PATH"),
             memory_subject=env.get("HIMMY_MEMORY_SUBJECT", "default"),
         )
