@@ -233,13 +233,16 @@ class InferenceService:
         """Single delegation to the client manager with error normalization.
 
         This is the service-level boundary (INF-1) that guarantees the manager's
-        ``generate`` can raise ANY exception without escaping ``run``: a
-        ``NotImplementedError`` (the reserved TOOL format) maps to a non-retryable
-        INVALID_REQUEST; ``HimmyError`` and any other exception are normalized
-        to a typed FAILED response.
+        ``generate`` can raise ANY exception without escaping ``run``:
+        ``NotImplementedError`` and ``HimmyError`` (e.g. a forced-tool request with no
+        bound tool) map to a non-retryable INVALID_REQUEST; any other exception is
+        normalized to a typed FAILED response. Forced-tool (``ResponseFormat.TOOL``) is
+        normalized here so every provider drives it through the standard tool path.
         """
+        from himmy.services.inference.client_manager import normalize_forced_tool
+
         try:
-            return await self._client_manager.generate(request)
+            return await self._client_manager.generate(normalize_forced_tool(request))
         except asyncio.CancelledError:  # honor cancellation / timeout cleanly
             raise
         except NotImplementedError as exc:

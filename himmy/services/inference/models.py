@@ -26,7 +26,10 @@ class InferenceStatus(str, Enum):
 class ResponseFormat(str, Enum):
     """The explicit lever for the shape of a model response.
 
-    ``TOOL`` is reserved (force one named tool) and not yet supported.
+    ``TOOL`` forces the model to call one named tool: the inference service rewrites it
+    into a single-tool ``AUTO_TOOLS`` call (bind only the forced tool + instruct it),
+    so it works uniformly across providers. The forced tool is ``tool_names_override[0]``
+    when set, else the first bound tool.
     """
 
     TEXT = "TEXT"

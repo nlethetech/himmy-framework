@@ -125,15 +125,15 @@ def test_workflow_runs_current_step_only_and_returns_state() -> None:
     assert resp.workflow.current_step == 0
 
 
-def test_tool_format_raises_not_implemented() -> None:
-    """ResponseFormat.TOOL is reserved and surfaces NotImplementedError."""
+def test_tool_format_without_a_tool_is_failed() -> None:
+    """ResponseFormat.TOOL with nothing to force is a typed FAILED (not a raise)."""
     mgr = StubClientManager()
     req = InferenceRequest(
         messages=[InferenceMessage(role="user", content="x")],
         response_format=ResponseFormat.TOOL,
     )
-    with pytest.raises(NotImplementedError):
-        run_async(mgr.generate(req))
+    resp = run_async(mgr.generate(req))
+    assert resp.status == InferenceStatus.FAILED
 
 
 def test_batch_preserves_order_and_counts() -> None:

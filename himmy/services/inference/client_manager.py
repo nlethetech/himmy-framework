@@ -16,6 +16,7 @@ from himmy.services.inference.models import (
     GatewayRuntimeConfig,
     InferenceError,
     InferenceErrorCode,
+    InferenceMessage,
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
@@ -24,6 +25,45 @@ from himmy.services.inference.models import (
     ToolReturnRecord,
     synthesize_from_schema,
 )
+
+
+def normalize_forced_tool(request: InferenceRequest) -> InferenceRequest:
+    """Express ``ResponseFormat.TOOL`` (force one named tool) uniformly for any provider.
+
+    Rather than each manager wiring a bespoke ``tool_choice``, a forced-tool request is
+    rewritten into an ``AUTO_TOOLS`` call that binds *only* the forced tool and appends an
+    explicit instruction to call it — so the normal tool path produces the forced call on
+    every backend (stub, Ollama, Claude CLI, …). The forced tool is
+    ``tool_names_override[0]`` when set, otherwise the first bound tool. A ``TOOL`` request
+    with no bound tools is a caller error.
+    """
+    if request.response_format != ResponseFormat.TOOL:
+        return request
+    if not request.bound_tools:
+        raise HimmyError(
+            "ResponseFormat.TOOL requires at least one bound tool to force"
+        )
+    forced = None
+    if request.tool_names_override:
+        wanted = request.tool_names_override[0]
+        forced = next((t for t in request.bound_tools if t.name == wanted), None)
+    if forced is None:
+        forced = request.bound_tools[0]
+    nudge = InferenceMessage(
+        role="system",
+        content=(
+            f"You must call the `{forced.name}` tool to handle this request. "
+            "Issue the tool call now; do not reply in plain text."
+        ),
+    )
+    return request.model_copy(
+        update={
+            "response_format": ResponseFormat.AUTO_TOOLS,
+            "bound_tools": [forced],
+            "messages": [*request.messages, nudge],
+            "metadata": {**request.metadata, "forced_tool": forced.name},
+        }
+    )
 
 
 @runtime_checkable
@@ -38,9 +78,9 @@ class ClientManager(Protocol):
     Implementations SHOULD self-normalize: ``generate`` returns an
     :class:`InferenceResponse` with ``status=FAILED`` and a typed
     :class:`InferenceError` rather than raising for provider/transport failures
-    (``StubClientManager``/``PydanticAIClientManager`` both do this). The ONE
-    sanctioned exception is :class:`NotImplementedError` for a genuinely
-    unsupported path (e.g. ``ResponseFormat.TOOL``).
+    (``StubClientManager``/``PydanticAIClientManager`` both do this). Forced-tool
+    (``ResponseFormat.TOOL``) is normalized to a single-tool ``AUTO_TOOLS`` call by the
+    service before dispatch, so no manager needs to special-case it.
 
     Regardless of an implementation's discipline, :class:`InferenceService` wraps
     every ``generate`` call in a normalization boundary (``_run_once``), so a
@@ -118,9 +158,6 @@ class StubClientManager:
         """Deterministically simulate a model response for ``request``."""
         try:
             return await self._generate(request)
-        except NotImplementedError:
-            # TOOL format (and any other unsupported path) propagates per the doc.
-            raise
         except Exception as exc:  # noqa: BLE001 - normalize to a typed failure
             return InferenceResponse(
                 request_id=request.request_id,
@@ -137,6 +174,9 @@ class StubClientManager:
 
     async def _generate(self, request: InferenceRequest) -> InferenceResponse:
         """Core simulation dispatch by response format."""
+        # Force-one-tool is expressed uniformly as a single-tool AUTO_TOOLS call, so the
+        # stub (and every provider) drives it through the normal tool path.
+        request = normalize_forced_tool(request)
         model_path = self.resolve(request.model_key)
         user_text = _last_user_message(request)
         system_text = _system_message(request)
@@ -149,11 +189,6 @@ class StubClientManager:
             provider_name=self.provider_name,
             latency_ms=self._latency_ms,
         )
-
-        if response_format == ResponseFormat.TOOL:
-            raise NotImplementedError(
-                "ResponseFormat.TOOL (force one named tool) is not yet supported"
-            )
 
         if response_format == ResponseFormat.WORKFLOW:
             await self._run_workflow(request, response)
