@@ -114,10 +114,42 @@ class BlocklistGuardrail:
         return GuardrailVerdict(allowed=True, text=text)
 
 
+_NEPAL_PII_PATTERNS: list[tuple[str, str, re.Pattern[str]]] = [
+    # +977 mobile/landline (with or without separators).
+    ("np_phone", "[REDACTED-NP-PHONE]", re.compile(r"\+?977[-\s]?\d{8,10}")),
+    # Citizenship certificate numbers (commonly ##-##-##-##### style).
+    (
+        "citizenship",
+        "[REDACTED-CITIZENSHIP]",
+        re.compile(r"\b\d{2}-\d{2}-\d{2}-\d{4,6}\b"),
+    ),
+    # PAN (Permanent Account Number) — 9 digits, often prefixed "PAN".
+    ("pan", "[REDACTED-PAN]", re.compile(r"\bPAN[:\s]?\d{9}\b|\b\d{9}\b")),
+]
+
+
+class NepalPIIGuardrail:
+    """Redacts Nepal-specific PII: +977 phones, citizenship numbers, PAN."""
+
+    name = "nepal_pii"
+
+    def inspect(self, text: str, *, context: dict) -> GuardrailVerdict:
+        """Replace Nepali PII with typed placeholders (never blocks)."""
+        redacted = text
+        flags: list[str] = []
+        for label, placeholder, pattern in _NEPAL_PII_PATTERNS:
+            new, count = pattern.subn(placeholder, redacted)
+            if count:
+                redacted = new
+                flags.append(f"pii:{label}")
+        return GuardrailVerdict(allowed=True, text=redacted, flags=flags)
+
+
 #: Built-in guardrails resolvable by name (for specs/CLI).
 BUILTIN_GUARDRAILS: dict[str, type[Guardrail]] = {
     "pii": PIIGuardrail,
     "injection": InjectionGuardrail,
+    "nepal_pii": NepalPIIGuardrail,
 }
 
 
@@ -140,6 +172,7 @@ __all__ = [
     "PIIGuardrail",
     "InjectionGuardrail",
     "BlocklistGuardrail",
+    "NepalPIIGuardrail",
     "BUILTIN_GUARDRAILS",
     "build_guardrail_pipeline",
 ]

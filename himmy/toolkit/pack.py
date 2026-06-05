@@ -22,6 +22,7 @@ from himmy.toolkit.documents import register_documents_pack
 from himmy.toolkit.files import register_files_pack
 from himmy.toolkit.knowledge import register_knowledge_pack
 from himmy.toolkit.memory import register_memory_pack
+from himmy.toolkit.nepal import NEPAL_TOOL_NAMES, register_nepal_pack
 from himmy.toolkit.utils import register_utils_pack
 from himmy.toolkit.web import register_web_pack
 
@@ -101,6 +102,12 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
         "Durable long-term memory: remember facts and recall them semantically.",
         ("remember", "recall"),
         register_memory_pack,
+    ),
+    "nepal": ToolPack(
+        "nepal",
+        "Nepal: Bikram Sambat dates, NPR/Devanagari formatting, NRB forex.",
+        NEPAL_TOOL_NAMES,
+        register_nepal_pack,
     ),
 }
 

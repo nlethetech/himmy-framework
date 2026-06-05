@@ -59,6 +59,7 @@ class AgentSpec(BaseModel):
     guardrails: list[str] = []
     memory: bool = False  # auto-recall long-term memory into the prompt each run
     memory_top_k: int = 5
+    language: str = "en"  # "ne" → instruct the agent to respond in Nepali (Devanagari)
     output_schema: dict[str, Any] | None = None
     metadata: dict[str, Any] = {}
 
@@ -67,10 +68,16 @@ class AgentSpec(BaseModel):
         metadata = dict(self.metadata)
         if self.role:
             metadata.setdefault("role", self.role)
+        instructions = list(self.instructions)
+        if self.language == "ne":
+            instructions.append(
+                "कृपया सधैं नेपाली भाषामा (देवनागरी लिपिमा) जवाफ दिनुहोस्। "
+                "(Always respond in the Nepali language, in Devanagari script.)"
+            )
         return Persona(
             name=self.name,
             description=self.description,
-            instructions=list(self.instructions),
+            instructions=instructions,
             metadata=metadata,
         )
 

@@ -117,7 +117,13 @@ class FastEmbedEmbedder:
 
 
 #: Default embedding dimension per backend (used when a dim is not configured).
-_DEFAULT_DIMS = {"deterministic": 64, "ollama": 768, "fastembed": 384, "openai": 1536}
+_DEFAULT_DIMS = {
+    "deterministic": 64,
+    "nepali": 64,
+    "ollama": 768,
+    "fastembed": 384,
+    "openai": 1536,
+}
 
 
 def default_dim_for(name: str) -> int:
@@ -147,6 +153,11 @@ def build_embedder(
         if model:
             kwargs["model"] = model
         return FastEmbedEmbedder(**kwargs)
+    if name == "nepali":
+        # Cross-script (Devanagari/Roman) folding over the offline embedder.
+        from himmy.nepal.language import NepaliEmbedder
+
+        return NepaliEmbedder(dim=dim or _DEFAULT_DIMS["deterministic"])
     if name == "openai":
         from himmy.services.knowledge.embedder import build_openai_compatible_embedder
 

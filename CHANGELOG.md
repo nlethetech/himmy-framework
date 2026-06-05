@@ -24,6 +24,14 @@ providers, Postgres/pgvector, and observability.
   to an explicit repeat-manager.)
 
 ### Added
+- **Nepal pack + localization.** A `nepal` toolkit pack makes the framework's Nepal
+  modules agent-facing: `nepali_date` (AD↔Bikram Sambat + fiscal year), `nepali_format`
+  (NPR with Nepali lakh-grouping + Devanagari numerals — `रू १२,३४,५६७.५०`),
+  `nepali_transliterate` (Devanagari↔Roman), and NRB forex tools. A `nepal_pii` guardrail
+  redacts `+977` phones, citizenship, and PAN numbers; `language: ne` on an `agent.yaml`
+  instructs the agent to answer in Nepali (Devanagari); and `build_embedder("nepali")`
+  selects the cross-script `NepaliEmbedder` for memory/RAG. Calendar/NRB tools lazy-import
+  their extras (`nepal`/`connectors`).
 - **Auto-memory into context.** Set `memory: true` on an `agent.yaml` and the agent
   automatically recalls its most relevant long-term memories and injects them into the
   system prompt **every run, with no tool call** (`AgentSpec.memory`/`memory_top_k` wire a

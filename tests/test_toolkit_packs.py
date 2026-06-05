@@ -27,6 +27,7 @@ def test_catalog_has_expected_packs() -> None:
         "comms",
         "data-sources",
         "memory",
+        "nepal",
     }
 
 
@@ -56,6 +57,12 @@ def test_register_all_packs_populates_registry() -> None:
         "wikipedia",
         "remember",
         "recall",
+        "nepali_date",
+        "nepali_format",
+        "nepali_transliterate",
+        "nrb_forex",
+        "nrb_macro_reports",
+        "nrb_macro_workbook",
     }
     for name in names:
         assert registry.handler_for(name) is not None
