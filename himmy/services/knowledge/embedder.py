@@ -340,7 +340,9 @@ class OpenAIMultimodalEmbeddingModel:
                 "as_pydantic_ai_embedder requires the [providers] extra "
                 "(pip install 'himmy[providers]')."
             ) from exc
-        return Embedder(self)
+        # ``self`` is a himmy embedder adapter satisfying pydantic-ai's EmbeddingModel
+        # protocol structurally; its type union (literal model names) can't express that.
+        return Embedder(self)  # type: ignore[arg-type]
 
 
 __all__ = [

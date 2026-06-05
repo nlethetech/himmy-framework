@@ -112,6 +112,9 @@ class RunResult:
     trace_id: str | None = None
     workflow: Any = None
     workflow_complete: bool | None = None
+    # True when the provider ran the FULL tool round-trip internally (e.g. pydantic-ai),
+    # so this turn already holds the final answer and the loop must not continue.
+    round_trip_complete: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -795,6 +798,13 @@ class SingleAgentRuntime:
                 return AgentLoopResult(
                     thread=thread, turns=turns, stopped_reason="final"
                 )
+            if last.round_trip_complete:
+                # The provider already ran the tool round-trip and produced the final
+                # answer this turn (e.g. pydantic-ai/OpenAI); continuing would re-send a
+                # history the strict API rejects. Stop here.
+                return AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="final"
+                )
             if final_answer_text(last) is not None:
                 return AgentLoopResult(
                     thread=thread, turns=turns, stopped_reason="final_answer"
@@ -1082,6 +1092,7 @@ class SingleAgentRuntime:
             provider_name=response.provider_name,
             request_id=request.request_id,
             trace_id=trace_id,
+            round_trip_complete=bool(response.metadata.get("round_trip_complete")),
         )
 
     async def _run_task_body(
@@ -1308,6 +1319,7 @@ class SingleAgentRuntime:
             workflow_complete=(
                 response.workflow.is_complete if response.workflow is not None else None
             ),
+            round_trip_complete=bool(response.metadata.get("round_trip_complete")),
         )
 
     # ------------------------------------------------------------- snapshot

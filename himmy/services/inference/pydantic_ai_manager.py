@@ -139,7 +139,13 @@ class PydanticAIClientManager:
 
     @staticmethod
     def _make_tool(pydantic_ai: Any, bound: Any) -> Any:
-        """Build one pydantic-ai Tool from a BoundTool, routing to its handler."""
+        """Build one pydantic-ai Tool from a BoundTool, routing to its handler.
+
+        The tool's ``args_json_schema`` is handed to pydantic-ai explicitly via
+        ``Tool.from_schema`` so the provider advertises the REAL parameter names/types to
+        the model. Without it, a ``**kwargs`` runner exposes no parameters and the model
+        guesses arg names (e.g. calling ``sql_query`` with ``query`` instead of ``sql``).
+        """
 
         async def _runner(**kwargs: Any) -> Any:
             if bound.handler is None:
@@ -148,11 +154,12 @@ class PydanticAIClientManager:
             return ret.content
 
         _runner.__name__ = bound.name
-        return pydantic_ai.Tool(  # type: ignore[attr-defined]
+        schema = bound.args_json_schema or {"type": "object", "properties": {}}
+        return pydantic_ai.Tool.from_schema(  # type: ignore[attr-defined]
             _runner,
             name=bound.name,
             description=bound.description or "",
-            takes_ctx=False,
+            json_schema=schema,
         )
 
     # ---------------------------------------------------------------- entry pts
@@ -362,6 +369,10 @@ class PydanticAIClientManager:
             model_path=model_string,
             provider_name=self.provider_name,
             latency_ms=latency_ms,
+            # pydantic-ai runs the whole agent (model → tool → model → answer) inside one
+            # call, so this response already holds the final answer: the outer loop must
+            # not do a continuation turn (which would re-send an OpenAI-invalid history).
+            metadata={"round_trip_complete": True},
         )
 
     @staticmethod

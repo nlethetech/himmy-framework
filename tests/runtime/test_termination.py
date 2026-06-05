@@ -100,6 +100,47 @@ class _RepeatManager:
         )
 
 
+class _RoundTripManager:
+    """A manager that completes the tool round-trip internally (like pydantic-ai):
+    returns tool_calls AND a final answer AND the round_trip_complete flag in one call."""
+
+    def resolve(self, model_key: str) -> str:
+        return f"rt:{model_key}"
+
+    async def generate(self, request: object) -> object:
+        from himmy.services.inference.models import (
+            InferenceResponse,
+            InferenceStatus,
+            ToolCallRecord,
+        )
+
+        return InferenceResponse(
+            request_id=request.request_id,  # type: ignore[attr-defined]
+            status=InferenceStatus.SUCCESS,
+            output_text="the answer is 391",
+            tool_calls=[ToolCallRecord(tool_call_id="c", tool_name="calc", args={})],
+            metadata={"round_trip_complete": True},
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+
+def test_loop_stops_when_provider_completed_round_trip() -> None:
+    """A round_trip_complete response (tool_calls + final answer) must NOT continue —
+    continuing would re-send a history strict APIs (OpenAI) reject."""
+    from himmy.runtime.single_agent import SingleAgentRuntime
+    from himmy.services.inference.service import InferenceService
+
+    runtime = SingleAgentRuntime(
+        inference_service=InferenceService(_RoundTripManager())
+    )
+    task = Task(title="t", prompt="compute", context={"tool_names": ["calc"]})
+    loop = run_async(runtime.run_agent_loop(Persona(name="a"), task, max_turns=8))
+    assert loop.stopped_reason == "final"
+    assert loop.turn_count == 1  # exactly one turn — no redundant continuation
+    assert "391" in (loop.final.output_text or "")
+
+
 def test_loop_stops_on_no_progress_when_opted_in() -> None:
     """With stop_on_no_progress, a repeated identical tool call halts the loop."""
     from himmy.runtime.single_agent import SingleAgentRuntime
