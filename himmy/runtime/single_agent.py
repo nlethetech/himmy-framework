@@ -1485,6 +1485,13 @@ class SingleAgentRuntime:
                 )
             except TypeError:  # pragma: no cover - defensive
                 content_text = str(content)
+            # Surface tool failures as a clear ERROR line so the model can adapt
+            # instead of seeing a bare ``null`` content.
+            if ret is not None and ret.outcome in ("failed", "denied"):
+                meta = ret.metadata or {}
+                code = meta.get("error_code", ret.outcome.upper())
+                detail = meta.get("error_message") or content_text or ""
+                content_text = f"ERROR: {code}: {detail}".strip().rstrip(":")
             message = Message(
                 role=MessageRole.TOOL,
                 content=content_text,

@@ -66,20 +66,47 @@ def test_loop_stops_on_final_answer() -> None:
     assert loop.stopped_reason == "final_answer"
 
 
+class _RepeatManager:
+    """A manager that emits the SAME tool call every turn (to exercise no-progress).
+
+    The faithful stub answers after one tool turn, so a stuck-in-a-loop model is
+    simulated explicitly here: identical tool_name + args each turn.
+    """
+
+    def resolve(self, model_key: str) -> str:
+        return f"repeat:{model_key}"
+
+    async def generate(self, request: object) -> object:
+        from himmy.services.inference.models import (
+            InferenceResponse,
+            InferenceStatus,
+            ToolCallRecord,
+            ToolReturnRecord,
+        )
+
+        cid = "c"
+        return InferenceResponse(
+            request_id=request.request_id,  # type: ignore[attr-defined]
+            status=InferenceStatus.SUCCESS,
+            output_text="",
+            tool_calls=[ToolCallRecord(tool_call_id=cid, tool_name="ping", args={})],
+            tool_returns=[
+                ToolReturnRecord(
+                    tool_call_id=cid, tool_name="ping", content={"ok": True}
+                )
+            ],
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+
 def test_loop_stops_on_no_progress_when_opted_in() -> None:
     """With stop_on_no_progress, a repeated identical tool call halts the loop."""
-    registry = ToolRegistry()
-    from himmy.services.tools.registry import register_local_tool
+    from himmy.runtime.single_agent import SingleAgentRuntime
+    from himmy.services.inference.service import InferenceService
 
-    register_local_tool(
-        registry,
-        name="ping",
-        handler=lambda args: {"ok": True},
-        description="no-op",
-        args_json_schema={"type": "object", "properties": {}},
-    )
-    runtime, _inf, _tools = build_runtime(tool_registry=registry)
-    task = Task(title="t", prompt="go", context={"tool_names": ["ping"]})
+    runtime = SingleAgentRuntime(inference_service=InferenceService(_RepeatManager()))
+    task = Task(title="t", prompt="go")
     loop = run_async(
         runtime.run_agent_loop(
             Persona(name="a"), task, max_turns=10, stop_on_no_progress=True

@@ -13,7 +13,20 @@ providers, Postgres/pgvector, and observability.
   variables use the `HIMMY_` prefix (e.g. `HIMMY_DATABASE_URL`), and the
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
+### Changed
+- **The offline stub now terminates faithfully.** Under `AUTO_TOOLS` the
+  `StubClientManager` used to call a bound tool on *every* turn, so stub-driven agent
+  loops never produced a final answer (they spun to `max_turns`) — which masked real bugs.
+  It now calls a tool once and, on the next turn (seeing a `tool`-role result on the
+  thread), answers with text — exactly like a real model. Single-turn runs are unchanged;
+  a tool-using agent now ends with `stopped_reason="final"` in two turns on both the stub
+  and Ollama. (One internal test that relied on the old "always loops" behavior was moved
+  to an explicit repeat-manager.)
+
 ### Added
+- **Tool-error visibility.** When a tool fails or is denied, the runtime now writes an
+  `ERROR: <code>: <message>` `TOOL` message (instead of a bare `null`), so the model can
+  see what went wrong and adapt on the next turn.
 - **Project config (`himmy.toml`) + chat session persistence.** A `himmy.toml`
   (`himmy.config.load_project_config`; cwd or `~/.himmy/config.toml`) sets per-project
   `[defaults]` (provider, model, tool_packs, guardrails) and `[toolkit]` (embedder,

@@ -76,6 +76,15 @@ def _system_message(request: InferenceRequest) -> str:
     return ""
 
 
+def _has_tool_result(request: InferenceRequest) -> bool:
+    """True when a tool already ran this thread (a prior ``tool``-role message exists).
+
+    Lets the stub behave like a real model: call a tool on the first turn, then —
+    having seen the result — answer on the next turn instead of looping forever.
+    """
+    return any(message.role == "tool" for message in request.messages)
+
+
 def _estimate_tokens(text: str) -> int:
     """Deterministic, length-based token estimate (~4 chars per token, min 1)."""
     if not text:
@@ -151,7 +160,11 @@ class StubClientManager:
         elif response_format == ResponseFormat.STRUCTURED_OUTPUT:
             self._run_structured(request, response, user_text)
         elif response_format in (ResponseFormat.AUTO_TOOLS, ResponseFormat.TEXT):
-            if request.bound_tools and response_format == ResponseFormat.AUTO_TOOLS:
+            if (
+                request.bound_tools
+                and response_format == ResponseFormat.AUTO_TOOLS
+                and not _has_tool_result(request)
+            ):
                 await self._run_auto_tools(request, response, user_text)
             else:
                 response.output_text = self._echo(system_text, user_text)
@@ -162,12 +175,14 @@ class StubClientManager:
         else:
             response.output_text = self._echo(system_text, user_text)
 
-        # Implicit auto-tools: no explicit format but tools were bound.
+        # Implicit auto-tools: no explicit format but tools were bound (and none have
+        # run yet — once a tool result is on the thread, the stub answers instead).
         if (
             request.response_format is None
             and request.bound_tools
             and not response.tool_calls
             and response_format == ResponseFormat.TEXT
+            and not _has_tool_result(request)
         ):
             await self._run_auto_tools(request, response, user_text)
 
