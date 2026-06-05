@@ -22,7 +22,7 @@ jobs:
     name: pip-audit (known CVEs)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -36,7 +36,7 @@ jobs:
     name: SBOM (CycloneDX)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -45,7 +45,7 @@ jobs:
           pip install -e ".[api,postgres,knowledge,connectors,nepal,auth]"
       - name: Generate CycloneDX SBOM
         run: cyclonedx-py environment -o sbom.cdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom.cdx.json
@@ -55,10 +55,10 @@ jobs:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0 # full history so a secret in any commit is caught
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -66,12 +66,12 @@ jobs:
     name: trivy (filesystem)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Trivy filesystem scan (deps + misconfig)
-        # Pinned by SHA (WS5.5) == v0.36.0. Report-only: pip-audit is the blocking
-        # CVE gate; Trivy adds misconfig/secret/IaC findings without flaking the
-        # build on unfixable transitive vulnerabilities.
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        # Pinned by SHA (WS5.5), tracked by Dependabot. Report-only: pip-audit is the
+        # blocking CVE gate; Trivy adds misconfig/secret/IaC findings without flaking
+        # the build on unfixable transitive vulnerabilities.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           scan-type: fs
           scan-ref: .
