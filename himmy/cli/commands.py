@@ -101,7 +101,15 @@ def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
             description="Ad-hoc agent created from CLI flags.",
             instructions=list(getattr(args, "instruction", None) or []),
         )
-    return _apply_defaults(spec)
+    spec = _apply_defaults(spec)
+    if spec.skills:
+        # Expand declared skills into tools + injected know-how before the runtime is
+        # wired, so skill-contributed packs/guardrails flow through the normal path.
+        from himmy.config.agent_spec import apply_skills
+        from himmy.skills import SkillRegistry
+
+        spec = apply_skills(spec, SkillRegistry.with_builtins())
+    return spec
 
 
 def _exec_with_mcp(factory: Any, registry: Any, mcp_servers: Any) -> Any:
@@ -237,6 +245,21 @@ def _build_runtime_for(
             )
         else:
             overrides["tool_registry"] = registry
+
+    # A skill that names explicit tools must find them in the wired registry — fail
+    # loudly here rather than letting the agent silently lack a capability's tools.
+    skill_tools = spec.metadata.get("resolved_skill_tools") or []
+    if skill_tools:
+        from himmy.skills import SkillToolError
+
+        available = {d.name for d in registry.list()} if registry is not None else set()
+        missing = [t for t in skill_tools if t not in available]
+        if missing:
+            raise SkillToolError(
+                f"skill(s) {spec.metadata.get('skills')} require tool(s) not "
+                f"available: {', '.join(missing)} — add the providing tool_pack "
+                f"or tools_module"
+            )
 
     runtime, _inference, _tools = build_runtime(**overrides)
     return runtime, registry

@@ -36,6 +36,7 @@ from himmy.config.mcp_spec import MCPServerConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.models import LLMConfig
+    from himmy.skills import SkillRegistry
 
 
 class AgentSpec(BaseModel):
@@ -54,6 +55,7 @@ class AgentSpec(BaseModel):
     provider: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
+    skills: list[str] = []  # capability bundles → tools + injected know-how
     tools: list[str] = []
     tool_packs: list[str] = []
     tools_module: str | None = None
@@ -133,6 +135,44 @@ class AgentSpec(BaseModel):
             context=context,
             metadata=dict(self.metadata),
         )
+
+
+def apply_skills(spec: AgentSpec, registry: SkillRegistry) -> AgentSpec:
+    """Expand ``spec.skills`` into the spec: tools, packs, guardrails, and know-how.
+
+    Returns a new spec with the resolved skills *consumed*: their ``tool_packs`` /
+    ``tools`` / ``guardrails`` unioned in (order-stable), their instruction blocks
+    appended to the description (so they reliably render as the agent's background),
+    and the contributing skill names recorded in ``metadata['skills']`` — which the
+    runtime's prompt renderer already surfaces as the agent's skills list. Explicit
+    skill-required tool names are stashed in ``metadata`` for the runtime to validate
+    against the live tool registry. A spec with no skills is returned unchanged.
+    """
+    if not spec.skills:
+        return spec
+    from himmy.skills import resolve_skills
+
+    bundle = resolve_skills(spec.skills, registry)
+    description = spec.description
+    if bundle.instruction_blocks:
+        know_how = "\n\n".join(bundle.instruction_blocks)
+        description = (
+            f"{description}\n\n{know_how}".strip() if description else know_how
+        )
+    metadata = dict(spec.metadata)
+    metadata["skills"] = list(bundle.skills)
+    if bundle.tools:
+        metadata["resolved_skill_tools"] = list(bundle.tools)
+    return spec.model_copy(
+        update={
+            "skills": [],  # consumed
+            "description": description,
+            "tools": list(dict.fromkeys([*spec.tools, *bundle.tools])),
+            "tool_packs": list(dict.fromkeys([*spec.tool_packs, *bundle.tool_packs])),
+            "guardrails": list(dict.fromkeys([*spec.guardrails, *bundle.guardrails])),
+            "metadata": metadata,
+        }
+    )
 
 
 def load_agent_spec(path: str | Path) -> AgentSpec:
