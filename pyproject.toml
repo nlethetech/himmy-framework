@@ -36,6 +36,9 @@ validation = ["jsonschema>=4"]
 # Quality boosters for the built-in toolkit (web_fetch readability). The default
 # paths work without it (stdlib HTML parsing); this just improves extraction.
 toolkit = ["beautifulsoup4>=4.12"]
+# A self-contained local embedding model (ONNX) for real semantic recall in the
+# knowledge/memory packs. Ollama/OpenAI embedders need no new deps.
+embeddings = ["fastembed>=0.3"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",

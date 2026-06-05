@@ -139,6 +139,12 @@ tool_packs: [web, utils]            # register these built-in packs
 tools: [web_search, web_fetch]      # bind a subset to the model (omit = all)
 ```
 
+**Embeddings (knowledge + memory).** Recall defaults to the offline `DeterministicEmbedder`
+(exact-overlap). For real semantic recall, select a model via env — `HIMMY_EMBEDDER=ollama`
+(local Ollama `nomic-embed-text`, keyless, no new deps), `HIMMY_EMBEDDER=fastembed` (ONNX,
+`pip install 'himmy[embeddings]'`), or `HIMMY_EMBEDDER=openai`. The dimension threads through
+automatically (`HIMMY_EMBEDDER_DIM` to override).
+
 `web_search` defaults to a keyless DuckDuckGo backend (no API key, httpx only);
 set `HIMMY_SEARCH_BACKEND=tavily` + `HIMMY_SEARCH_API_KEY=…` for higher-quality
 results. Web tools are SSRF-guarded (no private/loopback hosts), files are

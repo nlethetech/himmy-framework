@@ -24,6 +24,7 @@ __all__ = [
     "load_agent_spec",
     "ToolkitConfig",
     "register_packs",
+    "build_embedder",
     "AgentTeam",
     "TeamMember",
     "MultiAgentOrchestrator",
@@ -56,6 +57,10 @@ def __getattr__(name: str) -> Any:
         from himmy.services.memory import MemoryService
 
         return MemoryService
+    if name == "build_embedder":
+        from himmy.services.knowledge.local_embedders import build_embedder
+
+        return build_embedder
     if name in _LAZY_CONFIG:
         from himmy import config
 

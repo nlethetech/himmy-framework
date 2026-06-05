@@ -14,6 +14,14 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Real local embeddings (selectable; stub stays the default).** New `OllamaEmbedder`
+  (local Ollama `/api/embeddings` over httpx — zero new deps, keyless) and
+  `FastEmbedEmbedder` (self-contained ONNX via the new `embeddings` extra), plus a
+  `build_embedder(name, …)` factory covering `deterministic|ollama|fastembed|openai`. The
+  `knowledge` and `memory` packs pick the embedder from `ToolkitConfig`
+  (`HIMMY_EMBEDDER`/`HIMMY_EMBEDDER_MODEL`/`HIMMY_EMBEDDER_DIM`/`HIMMY_OLLAMA_URL`) and
+  thread its real dimension into `create_kb(vector_dim=…)`, so semantic recall no longer
+  needs exact word overlap. The offline `DeterministicEmbedder` remains the default.
 - **CSV/Excel document readers.** `CsvReader` (`.csv`, stdlib) and `ExcelReader`
   (`.xlsx`/`.xlsm`, via the existing `connectors` openpyxl) join the
   `DocumentReaderFactory`, so `read_document` and `kb_ingest` now cover spreadsheets

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -37,8 +38,12 @@ class ToolkitConfig(BaseModel):
     sql_dsn: str | None = None
     sql_read_only: bool = True
 
-    # knowledge pack --------------------------------------------------------
+    # knowledge / memory embeddings ----------------------------------------
     kb_dsn: str | None = None  # Postgres+pgvector DSN → durable KB; None → in-process
+    embedder: str = "deterministic"  # deterministic | ollama | fastembed | openai
+    embedder_model: str | None = None
+    embedder_dim: int | None = None
+    ollama_base_url: str | None = None
 
     # comms pack ------------------------------------------------------------
     comms_allow_send: bool = False
@@ -55,6 +60,22 @@ class ToolkitConfig(BaseModel):
     # memory pack -----------------------------------------------------------
     memory_path: str | None = None  # sqlite file → durable; None → in-process
     memory_subject: str = "default"
+
+    def build_embedder_and_dim(self) -> tuple[Any, int]:
+        """Build the configured embedder and its effective embedding dimension."""
+        from himmy.services.knowledge.local_embedders import (
+            build_embedder,
+            default_dim_for,
+        )
+
+        dim = self.embedder_dim or default_dim_for(self.embedder)
+        embedder = build_embedder(
+            self.embedder,
+            model=self.embedder_model,
+            dim=dim,
+            base_url=self.ollama_base_url,
+        )
+        return embedder, dim
 
     @classmethod
     def from_env(cls) -> ToolkitConfig:
@@ -85,6 +106,14 @@ class ToolkitConfig(BaseModel):
             sql_dsn=env.get("HIMMY_SQL_DSN"),
             sql_read_only=_env_bool(env.get("HIMMY_SQL_READONLY"), default=True),
             kb_dsn=env.get("HIMMY_KB_DSN"),
+            embedder=env.get("HIMMY_EMBEDDER", "deterministic"),
+            embedder_model=env.get("HIMMY_EMBEDDER_MODEL"),
+            embedder_dim=(
+                int(env["HIMMY_EMBEDDER_DIM"])
+                if env.get("HIMMY_EMBEDDER_DIM")
+                else None
+            ),
+            ollama_base_url=env.get("HIMMY_OLLAMA_URL"),
             comms_allow_send=_env_bool(
                 env.get("HIMMY_COMMS_ALLOW_SEND"), default=False
             ),

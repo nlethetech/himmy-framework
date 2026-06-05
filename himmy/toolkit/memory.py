@@ -43,7 +43,8 @@ def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
         if config.memory_path
         else InMemoryMemoryStore()
     )
-    memory = MemoryService(store)
+    embedder, _dim = config.build_embedder_and_dim()
+    memory = MemoryService(store, embedder=embedder)
     subject = config.memory_subject
 
     def remember(args: dict[str, Any]) -> dict[str, Any]:

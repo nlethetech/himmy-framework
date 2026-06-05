@@ -13,7 +13,6 @@ from __future__ import annotations
 from typing import Any
 
 from himmy.services.knowledge import (
-    DeterministicEmbedder,
     DocumentInput,
     KnowledgeBase,
 )
@@ -46,10 +45,9 @@ _SEARCH_SCHEMA = {
 }
 
 
-_KB_VECTOR_DIM = 64  # matches DeterministicEmbedder's default dimension
-
-
-async def _build_durable_kb(dsn: str) -> tuple[KnowledgeBase, str]:
+async def _build_durable_kb(
+    dsn: str, embedder: Any, vector_dim: int
+) -> tuple[KnowledgeBase, str]:
     """Build a Postgres+pgvector-backed KB, persisting across processes by name."""
     try:
         from himmy.services.storage.postgres import PostgresStorageService
@@ -60,10 +58,10 @@ async def _build_durable_kb(dsn: str) -> tuple[KnowledgeBase, str]:
         ) from exc
 
     storage = await PostgresStorageService.connect(dsn)
-    await storage.create_knowledge_schema(vector_dim=_KB_VECTOR_DIM)
+    await storage.create_knowledge_schema(vector_dim=vector_dim)
     kb = KnowledgeBase(
         storage=storage,
-        embedder=DeterministicEmbedder(),
+        embedder=embedder,
         backend=storage.knowledge_backend(),
     )
     existing = await kb.resolve_kb(
@@ -75,7 +73,7 @@ async def _build_durable_kb(dsn: str) -> tuple[KnowledgeBase, str]:
         workspace_id="local",
         client_id="local",
         name=_DEFAULT_KB_ID,
-        vector_dim=_KB_VECTOR_DIM,
+        vector_dim=vector_dim,
     )
     return kb, record.kb_id
 
@@ -88,18 +86,20 @@ def register_knowledge_pack(registry: ToolRegistry, config: ToolkitConfig) -> No
     (resolved by a fixed KB name); that path needs the ``postgres`` extra.
     """
     state: dict[str, Any] = {}
+    embedder, vector_dim = config.build_embedder_and_dim()
 
     async def _ensure_kb() -> tuple[KnowledgeBase, str]:
         """Build the KB (in-process or durable pgvector) on first use; cache it."""
         if "kb" not in state:
             if config.kb_dsn:
-                kb, kb_id = await _build_durable_kb(config.kb_dsn)
+                kb, kb_id = await _build_durable_kb(config.kb_dsn, embedder, vector_dim)
             else:
-                kb = KnowledgeBase(
-                    storage=StorageService(), embedder=DeterministicEmbedder()
-                )
+                kb = KnowledgeBase(storage=StorageService(), embedder=embedder)
                 record = await kb.create_kb(
-                    workspace_id="local", client_id="local", name=_DEFAULT_KB_ID
+                    workspace_id="local",
+                    client_id="local",
+                    name=_DEFAULT_KB_ID,
+                    vector_dim=vector_dim,
                 )
                 kb_id = record.kb_id
             state["kb"], state["kb_id"] = kb, kb_id
