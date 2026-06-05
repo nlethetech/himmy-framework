@@ -23,7 +23,12 @@ def test_ingest_then_search_finds_text() -> None:
     ingest = reg.handler_for("kb_ingest")
     search = reg.handler_for("kb_search")
     out = run_async(
-        ingest({"text": "Permaculture food forests layer canopy shrubs and roots", "title": "pc"})
+        ingest(
+            {
+                "text": "Permaculture food forests layer canopy shrubs and roots",
+                "title": "pc",
+            }
+        )
     )
     assert out["ingested"] == 1
     assert out["document_ids"]

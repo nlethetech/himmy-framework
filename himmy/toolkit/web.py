@@ -85,9 +85,14 @@ def _httpx_caller(
 
 
 class _TextExtractor(HTMLParser):
-    """Collect visible text, dropping ``<script>``/``<style>`` content + tags."""
+    """Collect visible text, dropping ``<script>``/``<style>`` content + tags.
 
-    _SKIP = {"script", "style", "noscript", "head"}
+    ``<title>`` is captured separately (not emitted into the body text) — note that
+    ``head`` is NOT skipped wholesale, so the title is still reachable while other
+    head elements (``meta``/``link``) carry no text data to leak anyway.
+    """
+
+    _SKIP = {"script", "style", "noscript"}
 
     def __init__(self) -> None:
         super().__init__()
@@ -114,8 +119,10 @@ class _TextExtractor(HTMLParser):
         text = data.strip()
         if not text:
             return
-        if self._in_title and self.title is None:
-            self.title = text
+        if self._in_title:
+            if self.title is None:
+                self.title = text
+            return  # keep the title out of the body text
         self._chunks.append(text)
 
     def text(self) -> str:
@@ -180,7 +187,11 @@ class _DdgResultParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if self._mode == "title" and tag == "a":
             self.results.append(
-                {"title": "".join(self._buf).strip(), "url": _ddg_clean(self._href), "snippet": ""}
+                {
+                    "title": "".join(self._buf).strip(),
+                    "url": _ddg_clean(self._href),
+                    "snippet": "",
+                }
             )
             self._mode = None
         elif self._mode == "snippet" and tag in ("a", "td", "div"):

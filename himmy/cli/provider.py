@@ -46,9 +46,7 @@ def build_inference_for(
     if provider == "ollama":
         from himmy.services.inference.local import OllamaClientManager
 
-        manager = (
-            OllamaClientManager(model=model) if model else OllamaClientManager()
-        )
+        manager = OllamaClientManager(model=model) if model else OllamaClientManager()
         return InferenceService(manager)
 
     if provider == "pydantic-ai":

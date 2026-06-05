@@ -41,7 +41,9 @@ def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argument parser with all subcommands."""
     parser = argparse.ArgumentParser(prog="himmy", description="Himmy agent CLI.")
-    parser.add_argument("-v", "--version", action="version", version=f"himmy {__version__}")
+    parser.add_argument(
+        "-v", "--version", action="version", version=f"himmy {__version__}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="run a single prompt and print the answer")

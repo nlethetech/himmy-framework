@@ -235,7 +235,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     for name, content in files.items():
         (target / name).write_text(content)
         print(f"wrote {target / name}")
-    print(f"\nNext: himmy run -f {target / 'agent.yaml'} -p \"hello\"")
+    print(f'\nNext: himmy run -f {target / "agent.yaml"} -p "hello"')
     return 0
 
 
@@ -294,7 +294,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("\nlocal providers (PATH):")
     for binary in ("claude", "ollama"):
         found = shutil.which(binary)
-        print(f"  [{'ok ' if found else '-- '}] {binary}" + (f" → {found}" if found else ""))
+        print(
+            f"  [{'ok ' if found else '-- '}] {binary}"
+            + (f" → {found}" if found else "")
+        )
 
     print("\nprovider keys (env):")
     for key in (

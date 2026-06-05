@@ -18,7 +18,10 @@ from himmy.toolkit.files import _safe_path
 _READ_SCHEMA = {
     "type": "object",
     "properties": {
-        "path": {"type": "string", "description": "A .pdf/.txt/.md file under the root."},
+        "path": {
+            "type": "string",
+            "description": "A .pdf/.txt/.md file under the root.",
+        },
         "max_chars": {"type": "integer", "minimum": 100, "default": 20000},
     },
     "required": ["path"],

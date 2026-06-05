@@ -17,10 +17,19 @@ def _registry() -> ToolRegistry:
 
 @pytest.mark.parametrize(
     "expr,expected",
-    [("2+2*10", 22.0), ("(1+2)*3", 9.0), ("2**8", 256.0), ("-5 + 3", -2.0), ("7 % 3", 1.0)],
+    [
+        ("2+2*10", 22.0),
+        ("(1+2)*3", 9.0),
+        ("2**8", 256.0),
+        ("-5 + 3", -2.0),
+        ("7 % 3", 1.0),
+    ],
 )
 def test_calculator_arithmetic(expr: str, expected: float) -> None:
-    assert _registry().handler_for("calculator")({"expression": expr})["result"] == expected
+    assert (
+        _registry().handler_for("calculator")({"expression": expr})["result"]
+        == expected
+    )
 
 
 @pytest.mark.parametrize(

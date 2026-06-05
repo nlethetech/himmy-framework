@@ -72,9 +72,7 @@ def test_load_agent_spec_resolves_schema_path(tmp_path: Path) -> None:
     """A string output_schema is read as a JSON file relative to the YAML."""
     schema = {"type": "object", "properties": {"n": {"type": "integer"}}}
     (tmp_path / "schema.json").write_text(json.dumps(schema))
-    (tmp_path / "agent.yaml").write_text(
-        "name: a\noutput_schema: schema.json\n"
-    )
+    (tmp_path / "agent.yaml").write_text("name: a\noutput_schema: schema.json\n")
     spec = load_agent_spec(tmp_path / "agent.yaml")
     assert spec.output_schema == schema
 

@@ -61,9 +61,8 @@ class ToolkitConfig(BaseModel):
         """
         env = os.environ
         backend = env.get("HIMMY_SEARCH_BACKEND", "duckduckgo").lower()
-        api_key = (
-            env.get("HIMMY_SEARCH_API_KEY")
-            or env.get(f"{backend.upper()}_API_KEY")
+        api_key = env.get("HIMMY_SEARCH_API_KEY") or env.get(
+            f"{backend.upper()}_API_KEY"
         )
         return cls(
             fs_root=Path(env.get("HIMMY_FS_ROOT", str(Path.cwd()))).expanduser(),

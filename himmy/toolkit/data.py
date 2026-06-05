@@ -43,7 +43,9 @@ def _single_statement(sql: str) -> str:
 
 def _readonly_authorizer(action: int, *_args: Any) -> int:
     """SQLite authorizer: allow read actions, deny everything else."""
-    return sqlite3.SQLITE_OK if action in _ALLOWED_SQLITE_ACTIONS else sqlite3.SQLITE_DENY
+    return (
+        sqlite3.SQLITE_OK if action in _ALLOWED_SQLITE_ACTIONS else sqlite3.SQLITE_DENY
+    )
 
 
 def _query_sqlite(path: str, sql: str, params: list[Any], limit: int) -> dict[str, Any]:

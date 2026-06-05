@@ -27,9 +27,7 @@ class FakeFetcher:
 
 def _registry(routes: dict[str, object]) -> ToolRegistry:
     registry = ToolRegistry()
-    register_datasources_pack(
-        registry, ToolkitConfig(), fetcher=FakeFetcher(routes)
-    )
+    register_datasources_pack(registry, ToolkitConfig(), fetcher=FakeFetcher(routes))
     return registry
 
 
@@ -64,7 +62,10 @@ def test_wikipedia_extracts_summary() -> None:
         "wikipedia.org": {
             "query": {
                 "pages": {
-                    "42": {"title": "Permaculture", "extract": "Permaculture is a design system."}
+                    "42": {
+                        "title": "Permaculture",
+                        "extract": "Permaculture is a design system.",
+                    }
                 }
             }
         }

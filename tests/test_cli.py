@@ -102,9 +102,7 @@ def test_run_with_tool_packs(
 ) -> None:
     """A spec declaring tool_packs registers them and runs end-to-end (stub)."""
     (tmp_path / "agent.yaml").write_text(
-        "name: calc\n"
-        "tool_packs: [utils]\n"
-        "tools: [calculator]\n"
+        "name: calc\ntool_packs: [utils]\ntools: [calculator]\n"
     )
     code = main(
         ["run", "-f", str(tmp_path / "agent.yaml"), "--provider", "stub", "-p", "2+2"]
