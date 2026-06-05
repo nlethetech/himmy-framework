@@ -97,6 +97,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_eval.set_defaults(func=commands.cmd_eval)
 
+    p_bench = sub.add_parser(
+        "bench", help="benchmark models on a task suite (accuracy/tool-call/latency)"
+    )
+    p_bench.add_argument(
+        "--models",
+        required=True,
+        help="comma list of provider:model (e.g. ollama:qwen2.5:3b-instruct,claude-cli:haiku)",
+    )
+    p_bench.add_argument(
+        "--suite", help="path to a suite.yaml (default: built-in core)"
+    )
+    p_bench.add_argument(
+        "--trials", type=int, default=3, help="runs per task (more → tighter CIs)"
+    )
+    p_bench.add_argument(
+        "--router", action="store_true", help="enable the tool router for all models"
+    )
+    p_bench.add_argument(
+        "--extra-packs", help="comma list of distractor tool packs (to test routing)"
+    )
+    p_bench.add_argument("--temperature", type=float, default=0.0)
+    p_bench.add_argument("--json", help="also write the full results as JSON")
+    p_bench.set_defaults(func=commands.cmd_bench)
+
     p_init = sub.add_parser("init", help="scaffold an agent.yaml + tools.py")
     p_init.add_argument("directory", nargs="?", default=".", help="target directory")
     p_init.add_argument("--force", action="store_true", help="overwrite existing files")

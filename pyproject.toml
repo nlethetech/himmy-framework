@@ -82,7 +82,7 @@ all = [
 include = ["himmy*"]
 
 [tool.setuptools.package-data]
-himmy = ["services/prompts/configs/prompts/*.yaml"]
+himmy = ["services/prompts/configs/prompts/*.yaml", "benchmark/suites/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

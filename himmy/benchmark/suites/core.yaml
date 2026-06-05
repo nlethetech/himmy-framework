@@ -1,0 +1,78 @@
+name: core
+# The standing model benchmark: a fixed set of graded tasks across capability
+# categories. Run with `himmy bench`. File/SQL tasks carry self-contained fixtures, so
+# the suite is reproducible anywhere. Tasks marked (network) need internet.
+tasks:
+  - id: arithmetic
+    category: arithmetic
+    prompt: "What is 17 times 23? Use the calculator tool."
+    packs: [utils]
+    expect_tools: [calculator]
+    grade: { type: numeric, value: 391 }
+
+  - id: file_read
+    category: files
+    prompt: "Read notes.txt and tell me exactly how many ducks the farm has."
+    packs: [files]
+    expect_tools: [read_file]
+    files:
+      notes.txt: "The farm has 12 ducks, 30 chickens, and 4 beehives.\n"
+    grade: { type: numeric, value: 12 }
+
+  - id: sql_count
+    category: sql
+    prompt: "Query the animals table: how many chickens are there?"
+    packs: [data]
+    expect_tools: [sql_query]
+    instructions: ["The DB has a table animals(name TEXT, count INTEGER)."]
+    sqlite:
+      - "CREATE TABLE animals(name TEXT, count INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
+    grade: { type: numeric, value: 30 }
+
+  - id: reasoning_noTool
+    category: reasoning
+    prompt: "What is the capital of France? Answer in one word."
+    grade: { type: contains, value: paris }
+
+  - id: retrieval_wiki
+    category: retrieval
+    prompt: "Use wikipedia to say what Kathmandu is, in one sentence."
+    packs: [data-sources]
+    expect_tools: [wikipedia]
+    grade:
+      type: all_of
+      of:
+        - { type: contains, value: nepal }
+        - { type: contains, value: capital }
+
+  - id: nepal_date
+    category: nepal
+    prompt: "Convert the date 2026-06-05 to Bikram Sambat."
+    packs: [nepal]
+    expect_tools: [nepali_date]
+    grade: { type: contains, value: "2083" }
+
+  - id: nepal_format
+    category: nepal
+    prompt: "Format the amount 1234567 as Nepali rupees."
+    packs: [nepal]
+    expect_tools: [nepali_format]
+    grade: { type: numeric, value: 1234567 }
+
+  - id: agentic_todo
+    category: agentic
+    prompt: "Use todo_write to record a 3-step plan to plant a tree."
+    packs: [agentic]
+    expect_tools: [todo_write]
+    grade:
+      type: any_of
+      of:
+        - { type: contains, value: step }
+        - { type: regex, value: "\\b1\\b" }
+
+  - id: memory_recall
+    category: memory
+    prompt: "Use the remember tool to store that my favorite crop is millet, then recall my favorite crop."
+    packs: [memory]
+    expect_tools: [remember]
+    grade: { type: contains, value: millet }

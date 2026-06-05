@@ -702,6 +702,71 @@ _HIMMY_TOML = """\
 """
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Benchmark one or more models on a task suite; print a comparative scorecard."""
+    from himmy.benchmark import (
+        BenchmarkRunner,
+        BenchmarkSuite,
+        ModelSpec,
+        default_suite,
+        render_markdown,
+        to_json,
+    )
+
+    suite = (
+        BenchmarkSuite.from_yaml(args.suite)
+        if getattr(args, "suite", None)
+        else default_suite()
+    )
+    extra = [
+        p.strip()
+        for p in (getattr(args, "extra_packs", None) or "").split(",")
+        if p.strip()
+    ]
+    specs: list[ModelSpec] = []
+    for raw in (args.models or "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        provider, _, model = raw.partition(":")  # model may itself contain ':'
+        if not model:
+            _eprint(f"error: model spec {raw!r} must be provider:model")
+            return 2
+        specs.append(
+            ModelSpec(
+                provider=provider,
+                model=model,
+                tool_router=bool(getattr(args, "router", False)),
+                temperature=getattr(args, "temperature", 0.0),
+                extra_packs=extra,
+            )
+        )
+    if not specs:
+        _eprint(
+            "error: --models is required, e.g. "
+            "--models ollama:qwen2.5:3b-instruct,claude-cli:haiku"
+        )
+        return 2
+
+    def _progress(spec: Any, task: Any, i: int, n: int) -> None:
+        _eprint(f"  [{spec.name}] {task.id}  trial {i}/{n}")
+
+    runner = BenchmarkRunner(trials=args.trials, on_progress=_progress)
+    _eprint(
+        f"benchmarking {len(specs)} model(s) on '{suite.name}' "
+        f"({len(suite.tasks)} tasks × {args.trials} trials)…"
+    )
+    cards = asyncio.run(runner.run(suite, specs))
+    print(render_markdown(cards, suite_name=suite.name))
+    if getattr(args, "json", None):
+        Path(args.json).write_text(
+            json.dumps(to_json(cards, suite_name=suite.name), indent=2),
+            encoding="utf-8",
+        )
+        _eprint(f"\nwrote full results to {args.json}")
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Scaffold an ``agent.yaml`` + ``tools.py`` (or a ``team.yaml`` with ``--team``)."""
     target = Path(args.directory).expanduser()
