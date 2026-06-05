@@ -74,28 +74,29 @@ def test_scratchpad_get_missing_key_is_none() -> None:
     assert _call(_service(), "scratchpad_get", key="nope")["value"] is None
 
 
-def test_todo_write_then_read_tracks_completion() -> None:
+def test_todo_write_takes_flat_strings_then_complete_tracks_status() -> None:
     service = _service()
-    written = _call(
-        service,
-        "todo_write",
-        items=[
-            {"content": "research", "status": "completed"},
-            {"content": "draft", "status": "in_progress"},
-            {"content": "review"},  # defaults to pending
-        ],
-    )
+    written = _call(service, "todo_write", items=["research", "draft", "review"])
     assert written["count"] == 3
-    assert written["completed"] == 1
+    assert written["completed"] == 0
+    assert all(it["status"] == "pending" for it in written["items"])
+    done = _call(service, "todo_complete", item="research")
+    assert done["matched"] is True
     read = _call(service, "todo_read")
-    assert read["items"][2]["status"] == "pending"
     assert read["completed"] == 1
+    assert read["items"][0]["status"] == "completed"
+
+
+def test_todo_complete_unmatched_is_reported() -> None:
+    service = _service()
+    _call(service, "todo_write", items=["alpha"])
+    assert _call(service, "todo_complete", item="zzz")["matched"] is False
 
 
 def test_todo_write_replaces_the_list() -> None:
     service = _service()
-    _call(service, "todo_write", items=[{"content": "old"}])
-    _call(service, "todo_write", items=[{"content": "new1"}, {"content": "new2"}])
+    _call(service, "todo_write", items=["old"])
+    _call(service, "todo_write", items=["new1", "new2"])
     assert _call(service, "todo_read")["count"] == 2
 
 

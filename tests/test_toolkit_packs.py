@@ -69,6 +69,7 @@ def test_register_all_packs_populates_registry() -> None:
         "scratchpad_set",
         "scratchpad_get",
         "todo_write",
+        "todo_complete",
         "todo_read",
         "send_telegram",
     }

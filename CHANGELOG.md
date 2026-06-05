@@ -7,6 +7,23 @@ providers, Postgres/pgvector, and observability.
 
 ## [Unreleased]
 
+### Fixed
+- **Tool-using agents now actually answer on real providers (`himmy run`/`chat`/`telegram`).**
+  These surfaces called single-turn `run_task_detailed`, so with a real model (Ollama,
+  Claude CLI) the *first* turn is the tool **call** and the run ended before the model
+  saw the result — returning an empty answer. They now use the runtime-owned
+  `run_agent_loop` (act → observe → answer) whenever the agent has tools, so the model
+  gets the tool result and replies. The offline stub was unaffected, which masked this.
+  Verified live: Ollama `qwen2.5:3b-instruct` + a real MCP filesystem server reads a file
+  and answers correctly.
+- **`todo_write` works on small local models.** Its schema was a nested array-of-objects
+  (`[{content, status}]`), which Ollama's tool grammar / small models silently choke on
+  (empty reply, no tool call). It's now a flat array of strings, with a new
+  `todo_complete` tool tracking status — verified live on `qwen2.5:3b-instruct`.
+- **`claude-cli` provider works from inside a Claude Code session.** The subprocess now
+  strips the parent session's `CLAUDECODE`/`CLAUDE_CODE_*` env markers so a nested
+  `claude -p` starts a clean session instead of erroring.
+
 ### Changed
 - **Renamed the project to the Himmy Agent Framework.** The import package is now
   `himmy` (was `opensims`), the base exception is `HimmyError`, environment

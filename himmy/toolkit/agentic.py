@@ -85,24 +85,31 @@ _SCRATCH_GET_SCHEMA = {
     "additionalProperties": False,
 }
 
-_TODO_ITEM = {
+# A FLAT array-of-strings schema: small local models (and Ollama's tool grammar)
+# reliably emit this, but choke on nested array-of-objects and return nothing. Status
+# is tracked via the separate todo_complete tool rather than an inline object field.
+_TODO_WRITE_SCHEMA = {
     "type": "object",
     "properties": {
-        "content": {"type": "string"},
-        "status": {
-            "type": "string",
-            "enum": ["pending", "in_progress", "completed"],
-            "default": "pending",
-        },
+        "items": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The task descriptions, in order.",
+        }
     },
-    "required": ["content"],
+    "required": ["items"],
     "additionalProperties": False,
 }
 
-_TODO_WRITE_SCHEMA = {
+_TODO_COMPLETE_SCHEMA = {
     "type": "object",
-    "properties": {"items": {"type": "array", "items": _TODO_ITEM}},
-    "required": ["items"],
+    "properties": {
+        "item": {
+            "type": "string",
+            "description": "The task to mark done (matched by content prefix).",
+        }
+    },
+    "required": ["item"],
     "additionalProperties": False,
 }
 
@@ -134,22 +141,32 @@ def register_agentic_pack(registry: ToolRegistry, config: ToolkitConfig) -> None
             return {"notes": dict(scratchpad)}
         return {"key": str(key), "value": scratchpad.get(str(key))}
 
+    def _todo_result() -> dict[str, Any]:
+        done = sum(1 for t in todo if t["status"] == "completed")
+        return {"count": len(todo), "completed": done, "items": list(todo)}
+
     def todo_write(args: dict[str, Any]) -> dict[str, Any]:
         items = args.get("items") or []
         todo.clear()
         for item in items:
-            todo.append(
-                {
-                    "content": str(item["content"]),
-                    "status": str(item.get("status", "pending")),
-                }
-            )
-        done = sum(1 for t in todo if t["status"] == "completed")
-        return {"count": len(todo), "completed": done, "items": list(todo)}
+            content = str(item).strip()
+            if content:
+                todo.append({"content": content, "status": "pending"})
+        return _todo_result()
+
+    def todo_complete(args: dict[str, Any]) -> dict[str, Any]:
+        target = str(args["item"]).strip().lower()
+        matched = False
+        for entry in todo:
+            content = entry["content"].lower()
+            if content == target or content.startswith(target) or target in content:
+                entry["status"] = "completed"
+                matched = True
+                break
+        return {"matched": matched, **_todo_result()}
 
     def todo_read(_args: dict[str, Any]) -> dict[str, Any]:
-        done = sum(1 for t in todo if t["status"] == "completed")
-        return {"count": len(todo), "completed": done, "items": list(todo)}
+        return _todo_result()
 
     register_local_tool(
         registry,
@@ -183,10 +200,18 @@ def register_agentic_pack(registry: ToolRegistry, config: ToolkitConfig) -> None
         name="todo_write",
         handler=todo_write,
         description=(
-            "Replace your task list with `items` (each {content, status}). Use to plan "
-            "multi-step work and mark steps in_progress / completed as you go."
+            "Replace your task list with `items`, a flat list of task descriptions "
+            "(strings). Use it to plan multi-step work before you start."
         ),
         args_json_schema=_TODO_WRITE_SCHEMA,
+        metadata={"pack": "agentic"},
+    )
+    register_local_tool(
+        registry,
+        name="todo_complete",
+        handler=todo_complete,
+        description="Mark a task on your list done (matched by its content).",
+        args_json_schema=_TODO_COMPLETE_SCHEMA,
         metadata={"pack": "agentic"},
     )
     register_local_tool(
@@ -204,6 +229,7 @@ AGENTIC_TOOL_NAMES = (
     "scratchpad_set",
     "scratchpad_get",
     "todo_write",
+    "todo_complete",
     "todo_read",
 )
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -349,11 +350,19 @@ class ClaudeCliClientManager:
             if isinstance(result, Awaitable):
                 return await result  # type: ignore[no-any-return]
             return str(result)
+        # Strip the parent Claude Code session's markers so a nested `claude -p`
+        # spawned from inside one starts a clean session (avoids the nesting error).
+        child_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE")
+        }
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env,
         )
         out, err = await asyncio.wait_for(
             proc.communicate(stdin.encode("utf-8")), timeout=timeout or self._timeout

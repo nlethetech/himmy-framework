@@ -125,6 +125,31 @@ def _exec_with_mcp(factory: Any, registry: Any, mcp_servers: Any) -> Any:
     return asyncio.run(_outer())
 
 
+async def _answer(
+    runtime: Any,
+    persona: Any,
+    task: Any,
+    *,
+    thread: Any = None,
+    llm_config: Any = None,
+    has_tools: bool = False,
+    max_turns: int = 8,
+) -> Any:
+    """Produce a final answer, driving the tool loop when the agent has tools.
+
+    ``run_task_detailed`` is a single inference call — correct for a no-tool agent,
+    but for a tool-using one the model's first turn is the tool *call*; the answer
+    only comes after the runtime feeds the tool result back. So when tools are wired
+    we use ``run_agent_loop`` (act → observe → answer) and return its final turn.
+    """
+    if has_tools:
+        loop = await runtime.run_agent_loop(
+            persona, task, thread, llm_config=llm_config, max_turns=max_turns
+        )
+        return loop.final
+    return await runtime.run_task_detailed(persona, task, thread, llm_config=llm_config)
+
+
 def _build_runtime_for(
     spec: AgentSpec, args: argparse.Namespace, *, on_event: Any = None
 ) -> Any:
@@ -266,10 +291,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     async def _go() -> Any:
-        return await runtime.run_task_detailed(
+        return await _answer(
+            runtime,
             spec.to_persona(),
             spec.make_task(args.prompt),
             llm_config=spec.to_llm_config(),
+            has_tools=registry is not None,
         )
 
     result = _exec_with_mcp(_go, registry, spec.mcp_servers)
@@ -308,9 +335,16 @@ def cmd_chat(args: argparse.Namespace) -> int:
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
 
+    has_tools = registry is not None
+
     async def _turn(thread: Any, text: str) -> Any:
-        return await runtime.run_task_detailed(
-            persona, spec.make_task(text), thread=thread, llm_config=llm_config
+        return await _answer(
+            runtime,
+            persona,
+            spec.make_task(text),
+            thread=thread,
+            llm_config=llm_config,
+            has_tools=has_tools,
         )
 
     from himmy.agents.base_agent.thread import ChatThread
@@ -336,7 +370,16 @@ def cmd_chat(args: argparse.Namespace) -> int:
             store.save(str(session_id), thread)
 
     async def _stream(thread: Any, text: str) -> None:
-        """Stream one reply to stdout token-by-token (appends to ``thread``)."""
+        """Reply to stdout (appends to ``thread``).
+
+        Streams token-by-token for a no-tool agent; a tool-using agent runs the full
+        act→observe→answer loop (which can't stream mid-loop) and prints the answer.
+        """
+        if has_tools:
+            result = await _turn(thread, text)
+            sys.stdout.write((result.output_text or "") + "\n")
+            _persist(result.thread)
+            return
         async for delta in runtime.stream_task(
             persona, spec.make_task(text), thread=thread, llm_config=llm_config
         ):
@@ -424,13 +467,20 @@ def cmd_telegram(args: argparse.Namespace) -> int:
     # One conversation thread per chat, so each user gets continuous context.
     threads: dict[str, Any] = {}
 
+    has_tools = registry is not None
+
     async def _handle(chat_id: str, text: str) -> str:
         thread = threads.get(chat_id)
         if thread is None:
             thread = ChatThread(agent_id=persona.agent_id)
             threads[chat_id] = thread
-        result = await runtime.run_task_detailed(
-            persona, spec.make_task(text), thread=thread, llm_config=llm_config
+        result = await _answer(
+            runtime,
+            persona,
+            spec.make_task(text),
+            thread=thread,
+            llm_config=llm_config,
+            has_tools=has_tools,
         )
         threads[chat_id] = result.thread
         return result.output_text or ""
