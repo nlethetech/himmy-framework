@@ -49,4 +49,6 @@ jobs:
         run: ollama pull "$HIMMY_INTEGRATION_MODEL"
 
       - name: Run the real-provider integration tests
-        run: pytest -q -m integration
+        # Scope collection to tests/integration so pytest doesn't import the api/db
+        # test modules (which need extras this lean provider lane doesn't install).
+        run: pytest -q -m integration tests/integration
