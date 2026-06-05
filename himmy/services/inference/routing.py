@@ -58,6 +58,9 @@ class Route:
     manager: ClientManager
     model_key: str | None = None
     label: str | None = None
+    #: A relative cost hint (e.g. $/1k tokens) used by :meth:`cost_ordered` to try
+    #: cheaper routes first; 0.0 for free/local providers.
+    cost: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -86,6 +89,22 @@ class RoutingClientManager:
     ) -> RoutingClientManager:
         """Build a router from bare managers (no per-route model override)."""
         return cls([Route(manager=m) for m in managers], failover_codes=failover_codes)
+
+    @classmethod
+    def cost_ordered(
+        cls,
+        routes: Iterable[Route],
+        *,
+        failover_codes: Iterable[InferenceErrorCode] = DEFAULT_FAILOVER_CODES,
+    ) -> RoutingClientManager:
+        """Build a cost-aware router: try cheapest routes first (local/free, then cloud).
+
+        Routes are ordered by ascending :attr:`Route.cost` (stable on ties), so a
+        free local model is tried before a paid cloud one and the cloud is reached
+        only when the cheaper route fails over. ``$0`` local managers therefore
+        carry the load, with cloud as the reliability backstop.
+        """
+        return cls(sorted(routes, key=lambda r: r.cost), failover_codes=failover_codes)
 
     def resolve(self, model_key: str) -> str:
         """Resolve via the primary route (the model that would serve by default)."""

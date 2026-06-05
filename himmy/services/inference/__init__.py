@@ -18,6 +18,11 @@ from himmy.services.inference.client_manager import (
     GatewayClientManager,
     StubClientManager,
 )
+from himmy.services.inference.local import (
+    ClaudeCliClientManager,
+    HimalayaGptClientManager,
+    OllamaClientManager,
+)
 from himmy.services.inference.models import (
     BatchInferenceRequest,
     BatchInferenceResponse,
@@ -75,6 +80,9 @@ __all__ = [
     "RoutingClientManager",
     "Route",
     "DEFAULT_FAILOVER_CODES",
+    "OllamaClientManager",
+    "ClaudeCliClientManager",
+    "HimalayaGptClientManager",
     "synthesize_from_schema",
     "ModelPrice",
     "StreamDelta",
