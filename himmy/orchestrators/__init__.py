@@ -8,6 +8,8 @@ from himmy.orchestrators.multi_agent import (
     MultiAgentResult,
     TeamMember,
 )
+from himmy.orchestrators.planner import PlannerOrchestrator, PlanResult
+from himmy.orchestrators.reflection import reflect
 from himmy.orchestrators.workflow import (
     OnEvent,
     Workflow,
@@ -28,4 +30,7 @@ __all__ = [
     "TeamMember",
     "MultiAgentOrchestrator",
     "MultiAgentResult",
+    "PlannerOrchestrator",
+    "PlanResult",
+    "reflect",
 ]

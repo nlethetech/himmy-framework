@@ -189,6 +189,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         _print_trace()
         return 0
 
+    if getattr(args, "plan", False):
+        from himmy.orchestrators import PlannerOrchestrator
+
+        async def _plan() -> Any:
+            return await PlannerOrchestrator(runtime).run(
+                args.prompt, spec.to_persona(), tool_names=spec.tools or None
+            )
+
+        result = asyncio.run(_plan())
+        _eprint(f"plan: {len(result.plan)} step(s)")
+        for i, step in enumerate(result.plan, start=1):
+            _eprint(f"  {i}. {step}")
+        print(result.output_text or "")
+        _print_trace()
+        return 0
+
     async def _go() -> Any:
         return await runtime.run_task_detailed(
             spec.to_persona(),

@@ -56,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--trace", action="store_true", help="print + save the run's event timeline"
     )
+    p_run.add_argument(
+        "--plan", action="store_true", help="plan-and-execute (decompose into steps)"
+    )
     p_run.set_defaults(func=commands.cmd_run)
 
     p_chat = sub.add_parser("chat", help="interactive chat keeping one thread")

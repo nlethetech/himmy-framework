@@ -28,6 +28,7 @@ __all__ = [
     "AgentTeam",
     "TeamMember",
     "MultiAgentOrchestrator",
+    "PlannerOrchestrator",
     "MemoryService",
     "AgentEvalHarness",
     "build_guardrail_pipeline",
@@ -42,7 +43,12 @@ __all__ = [
 _LAZY = {"build_runtime", "build_inference", "build_storage"}
 _LAZY_CONFIG = {"AgentSpec", "load_agent_spec"}
 _LAZY_TOOLKIT = {"ToolkitConfig", "register_packs"}
-_LAZY_ORCH = {"AgentTeam", "TeamMember", "MultiAgentOrchestrator"}
+_LAZY_ORCH = {
+    "AgentTeam",
+    "TeamMember",
+    "MultiAgentOrchestrator",
+    "PlannerOrchestrator",
+}
 
 
 def __getattr__(name: str) -> Any:

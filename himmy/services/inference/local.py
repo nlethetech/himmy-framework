@@ -30,6 +30,7 @@ from himmy.services.inference.models import (
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
+    ResponseFormat,
     ToolCallRecord,
     ToolReturnRecord,
 )
@@ -221,6 +222,13 @@ class OllamaClientManager:
             payload["options"] = options
         if request.bound_tools:
             payload["tools"] = _ollama_tools(request.bound_tools)
+        structured_requested = (
+            request.response_format == ResponseFormat.STRUCTURED_OUTPUT
+            and request.output_json_schema is not None
+        )
+        if structured_requested:
+            # Ollama's native structured-output: constrain the reply to the schema.
+            payload["format"] = request.output_json_schema
         try:
             data = await self._post("/api/chat", payload, request.timeout_seconds)
         except Exception as exc:  # noqa: BLE001 - normalize to FAILED
@@ -234,10 +242,17 @@ class OllamaClientManager:
         text = ((data.get("message") or {}).get("content")) or ""
         tool_calls = _parse_ollama_tool_calls(data)
         tool_returns = await _execute_tool_calls(request.bound_tools, tool_calls)
+        output_structured = None
+        if structured_requested and text:
+            try:
+                output_structured = json.loads(text)
+            except json.JSONDecodeError:
+                output_structured = None
         return InferenceResponse(
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,
             output_text=text,
+            output_structured=output_structured,
             tool_calls=tool_calls,
             tool_returns=tool_returns,
             model_path=f"ollama:{model}",

@@ -82,6 +82,31 @@ def test_ollama_parses_stringified_arguments() -> None:
     assert resp.tool_calls[0].args == {"query": "x"}
 
 
+def test_ollama_structured_output() -> None:
+    """Ollama gets the schema via `format` and the JSON reply parses to output_structured."""
+    from himmy.services.inference.models import ResponseFormat
+
+    seen: dict = {}
+
+    def transport(path: str, payload: dict) -> dict:
+        seen.update(payload)
+        return {"message": {"content": '{"steps": ["a", "b"]}'}}
+
+    schema = {
+        "type": "object",
+        "properties": {"steps": {"type": "array", "items": {"type": "string"}}},
+        "required": ["steps"],
+    }
+    req = InferenceRequest(
+        messages=[InferenceMessage(role="user", content="plan it")],
+        response_format=ResponseFormat.STRUCTURED_OUTPUT,
+        output_json_schema=schema,
+    )
+    resp = run_async(OllamaClientManager(transport=transport).generate(req))
+    assert seen["format"] == schema  # schema sent to Ollama
+    assert resp.output_structured == {"steps": ["a", "b"]}
+
+
 def test_ollama_no_tools_stays_text() -> None:
     def transport(path: str, payload: dict) -> dict:
         assert "tools" not in payload  # none bound → no tools key

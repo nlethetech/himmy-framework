@@ -24,6 +24,15 @@ providers, Postgres/pgvector, and observability.
   to an explicit repeat-manager.)
 
 ### Added
+- **Plan-and-execute + reflection (`himmy.orchestrators`).** `PlannerOrchestrator`
+  decomposes a goal into an ordered plan (structured output, with a numbered-text
+  fallback for providers that lack JSON mode), executes each step over a shared thread,
+  and synthesizes a final answer — the agentic counterpart to the reactive tool loop.
+  `reflect(runtime, draft, …)` is a one-turn critique-and-revise pass. CLI: `himmy run
+  --plan`. Verified on Ollama qwen2.5: 4 real plan steps → synthesized answer.
+- **Structured output on Ollama.** `OllamaClientManager` now sends `output_json_schema`
+  via Ollama's native `format` and parses the JSON reply into `output_structured`, so
+  structured output (and the planner) work on the local model, not just stub/pydantic-ai.
 - **Tool-error visibility.** When a tool fails or is denied, the runtime now writes an
   `ERROR: <code>: <message>` `TOOL` message (instead of a bare `null`), so the model can
   see what went wrong and adapt on the next turn.
