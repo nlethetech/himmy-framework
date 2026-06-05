@@ -9,11 +9,63 @@ decision, not a silent capability.
 
 from __future__ import annotations
 
+import ast
 from typing import Any
 
 from himmy.services.sandbox.base import Sandbox
 from himmy.services.tools.models import ToolDefinition
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
+
+_REPL_TMP = "__himmy_repl__"
+
+
+def echo_last_expression(code: str) -> str:
+    """Auto-print the value of a trailing bare expression (REPL/Jupyter semantics).
+
+    Models routinely end a snippet with a bare expression (``result`` or ``4869*17``)
+    instead of ``print(...)``, IPython-style — which otherwise produces *no* stdout, so
+    the agent sees an empty result and falls back to guessing. This rewrites a trailing
+    expression statement to print its ``repr`` when the value is not ``None``, leaving
+    everything else (including a trailing ``print(...)``, which evaluates to ``None``)
+    untouched. Unparseable code is returned verbatim — the sandbox reports the error.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    if not tree.body or not isinstance(tree.body[-1], ast.Expr):
+        return code
+    value = tree.body[-1].value
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return code  # a trailing string/docstring — not a result to echo
+    assign = ast.Assign(targets=[ast.Name(id=_REPL_TMP, ctx=ast.Store())], value=value)
+    guard = ast.If(
+        test=ast.Compare(
+            left=ast.Name(id=_REPL_TMP, ctx=ast.Load()),
+            ops=[ast.IsNot()],
+            comparators=[ast.Constant(value=None)],
+        ),
+        body=[
+            ast.Expr(
+                ast.Call(
+                    func=ast.Name(id="print", ctx=ast.Load()),
+                    args=[
+                        ast.Call(
+                            func=ast.Name(id="repr", ctx=ast.Load()),
+                            args=[ast.Name(id=_REPL_TMP, ctx=ast.Load())],
+                            keywords=[],
+                        )
+                    ],
+                    keywords=[],
+                )
+            )
+        ],
+        orelse=[],
+    )
+    tree.body[-1:] = [assign, guard]
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
 
 #: Argument schema for the sandbox tool (validated by the ToolService).
 SANDBOX_TOOL_ARGS_SCHEMA: dict[str, Any] = {
@@ -50,7 +102,7 @@ def register_sandbox_tool(
     """
 
     async def _handler(args: dict[str, Any]) -> dict[str, Any]:
-        code = str(args.get("code", ""))
+        code = echo_last_expression(str(args.get("code", "")))
         raw_stdin = args.get("stdin")
         stdin = str(raw_stdin) if raw_stdin is not None else None
         result = await sandbox.run_code(code, stdin=stdin)
@@ -71,4 +123,8 @@ def register_sandbox_tool(
     )
 
 
-__all__ = ["register_sandbox_tool", "SANDBOX_TOOL_ARGS_SCHEMA"]
+__all__ = [
+    "register_sandbox_tool",
+    "SANDBOX_TOOL_ARGS_SCHEMA",
+    "echo_last_expression",
+]
