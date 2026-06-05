@@ -181,7 +181,7 @@ def _build_runtime_for(
         )
 
     registry = None
-    if spec.tool_packs or spec.tools_module or spec.mcp_servers:
+    if spec.tool_packs or spec.tools_module or spec.mcp_servers or spec.allow_spawn:
         registry = ToolRegistry()
         if spec.tool_packs:
             from himmy.toolkit import ToolkitConfig, register_packs
@@ -190,6 +190,12 @@ def _build_runtime_for(
             register_packs(registry, spec.tool_packs, tk_config)
         if spec.tools_module:
             _resolve_register(spec.tools_module)(registry)
+        if spec.allow_spawn:
+            # Recursive sub-agents share the parent's inference backend; the spawned
+            # worker's runtime has no spawn_agent tool, capping recursion at one level.
+            from himmy.toolkit.spawn import register_spawn_tool
+
+            register_spawn_tool(registry, inference=inference)
         if pipeline is not None:
             # Guard tool arguments too (the highest-risk "act" surface).
             from himmy.services.guardrails import build_guardrail_pre_hook

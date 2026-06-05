@@ -35,6 +35,13 @@ providers, Postgres/pgvector, and observability.
   remains a clean opt-in via the `Guardrail` protocol when more is needed.)
 
 ### Added
+- **`spawn_agent` — ad-hoc recursive sub-agents.** Set `allow_spawn: true` in `agent.yaml`
+  and the agent gets a `spawn_agent` tool: hand a sub-task to a fresh single-agent (its own
+  `instructions`/`prompt`, optionally its own `tool_packs`) that runs to completion and
+  returns its answer. Unlike team delegation it needs no `team.yaml` — the parent decides
+  at run time. The sub-agent shares the parent's inference but runs in a fresh runtime with
+  no `spawn_agent` tool, so recursion is capped at one level; unknown `tool_packs` are
+  reported, not fatal. New `himmy.toolkit.spawn.register_spawn_tool`.
 - **`agentic` pack — the tools that make an agent act like one.** `ask_human` (pause
   mid-run and ask the operator; returns `answered: false` when non-interactive instead of
   hanging), `scratchpad_set`/`scratchpad_get` (a keyed working-memory notepad the agent

@@ -159,6 +159,11 @@ mcp_servers:
 The CLI launches each server, registers its tools, runs, then tears them down — in
 `himmy run`, `chat`, `team`, and `eval`. Built on a transport-direct stdio client (no SDK).
 
+**Recursive sub-agents.** Set `allow_spawn: true` and the agent gains a `spawn_agent` tool
+— it can hand a sub-task to a fresh single-agent (its own instructions, optionally its own
+`tool_packs`) and use the answer. No `team.yaml` needed; the parent decides at run time.
+The spawned worker can't itself spawn, so recursion is capped at one level.
+
 **Embeddings (knowledge + memory).** Recall defaults to the offline `DeterministicEmbedder`
 (exact-overlap). For real semantic recall, select a model via env — `HIMMY_EMBEDDER=ollama`
 (local Ollama `nomic-embed-text`, keyless, no new deps), `HIMMY_EMBEDDER=fastembed` (ONNX,
