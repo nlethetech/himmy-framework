@@ -134,6 +134,7 @@ async def _answer(
     llm_config: Any = None,
     has_tools: bool = False,
     max_turns: int = 8,
+    route_tools: bool = False,
 ) -> Any:
     """Produce a final answer, driving the tool loop when the agent has tools.
 
@@ -144,7 +145,12 @@ async def _answer(
     """
     if has_tools:
         loop = await runtime.run_agent_loop(
-            persona, task, thread, llm_config=llm_config, max_turns=max_turns
+            persona,
+            task,
+            thread,
+            llm_config=llm_config,
+            max_turns=max_turns,
+            route_tools=route_tools,
         )
         return loop.final
     return await runtime.run_task_detailed(persona, task, thread, llm_config=llm_config)
@@ -297,6 +303,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             spec.make_task(args.prompt),
             llm_config=spec.to_llm_config(),
             has_tools=registry is not None,
+            route_tools=spec.tool_router,
         )
 
     result = _exec_with_mcp(_go, registry, spec.mcp_servers)
@@ -345,6 +352,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             thread=thread,
             llm_config=llm_config,
             has_tools=has_tools,
+            route_tools=spec.tool_router,
         )
 
     from himmy.agents.base_agent.thread import ChatThread
@@ -481,6 +489,7 @@ def cmd_telegram(args: argparse.Namespace) -> int:
             thread=thread,
             llm_config=llm_config,
             has_tools=has_tools,
+            route_tools=spec.tool_router,
         )
         threads[chat_id] = result.thread
         return result.output_text or ""

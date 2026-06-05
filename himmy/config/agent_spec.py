@@ -60,6 +60,8 @@ class AgentSpec(BaseModel):
     mcp_servers: list[MCPServerConfig] = []  # stdio MCP servers → agent tools
     # Give the agent a spawn_agent tool (one-level recursive sub-agents):
     allow_spawn: bool = False
+    # Route to the few relevant tools per query (helps small models pick correctly):
+    tool_router: bool = False
     guardrails: list[str] = []
     memory: bool = False  # auto-recall long-term memory into the prompt each run
     memory_top_k: int = 5

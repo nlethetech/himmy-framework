@@ -375,6 +375,8 @@ class SingleAgentRuntime:
         hitl: bool = False,
         stop_on_no_progress: bool = False,
         synthesize_empty: bool = True,
+        route_tools: bool = False,
+        route_max_tools: int = 4,
     ) -> AgentLoopResult:
         """Run a bounded, runtime-owned agentic loop: act -> observe -> re-invoke.
 
@@ -395,6 +397,9 @@ class SingleAgentRuntime:
             raise HimmyError("run_agent_loop requires max_turns >= 1.")
         if hitl and self._checkpoint_store is None:
             raise HimmyError("hitl=True requires a checkpoint_store on the runtime.")
+
+        if route_tools:
+            task = await self._route_tools(task, route_max_tools)
 
         first = await self.run_task_detailed(
             persona, task, thread, llm_config=llm_config
@@ -422,6 +427,36 @@ class SingleAgentRuntime:
         if synthesize_empty:
             result = await self._maybe_synthesize(result, persona, trace_id, llm_config)
         return result
+
+    async def _route_tools(self, task: Task, max_tools: int) -> Task:
+        """Narrow the bound tools to the relevant few for this task (Tier 1.3).
+
+        A no-op unless a tool service is wired, the task hasn't already pinned
+        ``tool_names``, and there are more candidate tools than ``max_tools``. Returns
+        a copy of the task with ``context['tool_names']`` set to the routed subset.
+        """
+        if self.tool_service is None or max_tools < 1:
+            return task
+        ctx = task.context or {}
+        if ctx.get("tool_names") is not None:
+            return task  # caller already chose the tools — respect that
+        registry = getattr(self.tool_service, "registry", None)
+        if registry is None:
+            return task
+        candidates = [(d.name, d.description) for d in registry.list()]
+        if len(candidates) <= max_tools:
+            return task
+
+        from himmy.runtime.tool_router import select_tools
+
+        selected = await select_tools(
+            self.inference_service,
+            task.prompt,
+            candidates,
+            max_tools=max_tools,
+            model_key=str(ctx.get("model_key") or self.default_model_key),
+        )
+        return task.model_copy(update={"context": {**ctx, "tool_names": selected}})
 
     async def _maybe_synthesize(
         self,
