@@ -54,6 +54,10 @@ class ToolkitConfig(BaseModel):
     smtp_from: str | None = None
     smtp_use_tls: bool = True
 
+    # telegram pack ---------------------------------------------------------
+    telegram_bot_token: str | None = None
+    telegram_default_chat_id: str | None = None
+
     # code pack -------------------------------------------------------------
     sandbox_limits: SandboxLimits = Field(default_factory=SandboxLimits)
 
@@ -123,6 +127,8 @@ class ToolkitConfig(BaseModel):
             smtp_password=env.get("HIMMY_SMTP_PASSWORD"),
             smtp_from=env.get("HIMMY_SMTP_FROM"),
             smtp_use_tls=_env_bool(env.get("HIMMY_SMTP_USE_TLS"), default=True),
+            telegram_bot_token=env.get("HIMMY_TELEGRAM_BOT_TOKEN"),
+            telegram_default_chat_id=env.get("HIMMY_TELEGRAM_CHAT_ID"),
             memory_path=env.get("HIMMY_MEMORY_PATH"),
             memory_subject=env.get("HIMMY_MEMORY_SUBJECT", "default"),
         )

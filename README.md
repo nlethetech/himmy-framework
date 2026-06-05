@@ -131,6 +131,7 @@ agent. `himmy tools` lists them:
 | `memory` | `remember`, `recall` (durable long-term memory, SQLite-backed) |
 | `nepal` | `nepali_date` (Bikram Sambat), `nepali_format` (NPR/Devanagari), `nepali_transliterate`, NRB forex |
 | `agentic` | `ask_human` (human-in-the-loop), `scratchpad_set`/`scratchpad_get` (working notes), `todo_write`/`todo_read` (self-managed task list) |
+| `telegram` | `send_telegram` (message a Telegram chat via a bot; approval-gated) |
 
 Enable them declaratively in `agent.yaml`:
 
@@ -163,6 +164,11 @@ The CLI launches each server, registers its tools, runs, then tears them down �
 — it can hand a sub-task to a fresh single-agent (its own instructions, optionally its own
 `tool_packs`) and use the answer. No `team.yaml` needed; the parent decides at run time.
 The spawned worker can't itself spawn, so recursion is capped at one level.
+
+**Live on Telegram.** Turn any `agent.yaml` into a Telegram bot — `himmy telegram -f
+agent.yaml` long-polls for messages, runs the agent (one thread per chat), and replies.
+Set `HIMMY_TELEGRAM_BOT_TOKEN` (or `--token`). The `telegram` tool pack also gives an
+agent `send_telegram` so it can message a chat proactively.
 
 **Embeddings (knowledge + memory).** Recall defaults to the offline `DeterministicEmbedder`
 (exact-overlap). For real semantic recall, select a model via env — `HIMMY_EMBEDDER=ollama`

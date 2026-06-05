@@ -69,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_chat.set_defaults(func=commands.cmd_chat)
 
+    p_tg = sub.add_parser("telegram", help="run an agent as a live Telegram bot")
+    _add_agent_flags(p_tg)
+    p_tg.add_argument("--token", help="bot token (default: HIMMY_TELEGRAM_BOT_TOKEN)")
+    p_tg.set_defaults(func=commands.cmd_telegram)
+
     p_team = sub.add_parser("team", help="run a multi-agent team from a team.yaml")
     p_team.add_argument("-f", "--file", required=True, help="path to a team.yaml")
     p_team.add_argument("-p", "--prompt", help="the prompt to route through the team")

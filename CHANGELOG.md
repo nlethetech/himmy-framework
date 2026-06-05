@@ -35,6 +35,14 @@ providers, Postgres/pgvector, and observability.
   remains a clean opt-in via the `Guardrail` protocol when more is needed.)
 
 ### Added
+- **Telegram — himmy agents live in Telegram.** A new `telegram` tool pack adds
+  `send_telegram` (message a chat via a bot, approval-gated like `comms`), and a new
+  `himmy telegram` command runs an `agent.yaml` as a live bot: long-poll for messages,
+  run the agent (one conversation thread per chat), reply. Token + default chat from
+  `HIMMY_TELEGRAM_BOT_TOKEN` / `HIMMY_TELEGRAM_CHAT_ID` (or `--token`), never the model.
+  New `himmy.toolkit.telegram` (`TelegramClient`, `TelegramBot`, `register_telegram_pack`);
+  the bot loop is injectable so it's fully tested offline. `httpx` only, no SDK. Works
+  with `mcp_servers`/`allow_spawn` too (they stay connected for the session).
 - **`spawn_agent` — ad-hoc recursive sub-agents.** Set `allow_spawn: true` in `agent.yaml`
   and the agent gets a `spawn_agent` tool: hand a sub-task to a fresh single-agent (its own
   `instructions`/`prompt`, optionally its own `tool_packs`) that runs to completion and

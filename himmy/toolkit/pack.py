@@ -24,6 +24,7 @@ from himmy.toolkit.files import register_files_pack
 from himmy.toolkit.knowledge import register_knowledge_pack
 from himmy.toolkit.memory import register_memory_pack
 from himmy.toolkit.nepal import NEPAL_TOOL_NAMES, register_nepal_pack
+from himmy.toolkit.telegram import TELEGRAM_TOOL_NAMES, register_telegram_pack
 from himmy.toolkit.utils import register_utils_pack
 from himmy.toolkit.web import register_web_pack
 
@@ -115,6 +116,12 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
         "Be agentic: ask the human, keep a scratchpad, manage a todo list.",
         AGENTIC_TOOL_NAMES,
         register_agentic_pack,
+    ),
+    "telegram": ToolPack(
+        "telegram",
+        "Send messages to Telegram chats via a bot (approval-gated).",
+        TELEGRAM_TOOL_NAMES,
+        register_telegram_pack,
     ),
 }
 

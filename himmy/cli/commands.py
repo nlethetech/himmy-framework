@@ -401,6 +401,57 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return 0
 
 
+# -------------------------------------------------------------------- telegram
+
+
+def cmd_telegram(args: argparse.Namespace) -> int:
+    """Run an agent as a live Telegram bot: each message → an agent reply."""
+    from himmy.agents.base_agent.thread import ChatThread
+    from himmy.toolkit import ToolkitConfig
+    from himmy.toolkit.telegram import TelegramBot, TelegramClient
+
+    spec = _spec_from_args(args)
+    runtime, registry = _build_runtime_for(spec, args)
+    persona = spec.to_persona()
+    llm_config = spec.to_llm_config()
+
+    cfg = ToolkitConfig.from_sources(_project().get("toolkit"))
+    token = getattr(args, "token", None) or cfg.telegram_bot_token
+    if not token:
+        _eprint("error: set HIMMY_TELEGRAM_BOT_TOKEN (or pass --token) to run the bot.")
+        return 2
+
+    # One conversation thread per chat, so each user gets continuous context.
+    threads: dict[str, Any] = {}
+
+    async def _handle(chat_id: str, text: str) -> str:
+        thread = threads.get(chat_id)
+        if thread is None:
+            thread = ChatThread(agent_id=persona.agent_id)
+            threads[chat_id] = thread
+        result = await runtime.run_task_detailed(
+            persona, spec.make_task(text), thread=thread, llm_config=llm_config
+        )
+        threads[chat_id] = result.thread
+        return result.output_text or ""
+
+    bot = TelegramBot(TelegramClient(token, timeout=cfg.http_timeout + 30), _handle)
+    _eprint(f"himmy telegram — {persona.name} is live. Ctrl-C to stop.")
+
+    async def _serve() -> None:
+        try:
+            await bot.run()
+        except (KeyboardInterrupt, asyncio.CancelledError):  # pragma: no cover
+            pass
+
+    try:
+        # MCP servers (if any) stay connected for the whole session.
+        _exec_with_mcp(_serve, registry, spec.mcp_servers)
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        _eprint("\n(stopped)")
+    return 0
+
+
 # ------------------------------------------------------------------------ team
 
 
