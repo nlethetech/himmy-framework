@@ -24,6 +24,14 @@ from typing import (
 
 from himmy.core.errors import HimmyError
 from himmy.core.events import EventType, RunEvent
+from himmy.runtime.checkpoint import (
+    APPROVED,
+    AWAITING_APPROVAL,
+    REJECTED,
+    AgentCheckpoint,
+    CheckpointStore,
+    PendingToolCall,
+)
 from himmy.services.inference.models import (
     BoundTool,
     InferenceMessage,
@@ -67,6 +75,10 @@ class ToolServiceProtocol(Protocol):
     def bound_tools(
         self, names: list[str] | None = None
     ) -> list[BoundTool]:  # pragma: no cover - structural typing
+        ...
+
+    async def execute(self, invocation: Any) -> Any:  # pragma: no cover - structural
+        """Execute one tool invocation (used by HITL resume to run an approved tool)."""
         ...
 
 
@@ -118,6 +130,7 @@ class AgentLoopResult:
     thread: ChatThread
     turns: list[RunResult] = field(default_factory=list)
     stopped_reason: str = "final"
+    checkpoint_id: str | None = None
 
     @property
     def final(self) -> RunResult:
@@ -169,6 +182,7 @@ class SingleAgentRuntime:
         default_deadline_seconds: float | None = None,
         strict_snapshot: bool = False,
         on_event: OnEvent | list[OnEvent] | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         """Wire the runtime; auto-create prompt manager/mapper when omitted.
 
@@ -190,6 +204,7 @@ class SingleAgentRuntime:
         self.save_threads = save_threads
         self.default_deadline_seconds = default_deadline_seconds
         self.strict_snapshot = strict_snapshot
+        self._checkpoint_store = checkpoint_store
         self._on_event: list[OnEvent] = self._coerce_callbacks(on_event)
 
         # Auto-create the prompt primitives when available; they have no required
@@ -343,6 +358,7 @@ class SingleAgentRuntime:
         max_turns: int = 6,
         cost_budget: float | None = None,
         llm_config: LLMConfig | None = None,
+        hitl: bool = False,
     ) -> AgentLoopResult:
         """Run a bounded, runtime-owned agentic loop: act -> observe -> re-invoke.
 
@@ -352,9 +368,17 @@ class SingleAgentRuntime:
         (``final``), or ``max_turns`` / ``cost_budget`` is reached, or a turn FAILS.
         Unlike delegating to a provider's opaque loop, the runtime *bounds* the
         turns, accrues spend, and emits an ``AGENT_TURN_COMPLETED`` event per turn.
+
+        With ``hitl=True`` (requires a ``checkpoint_store``) the loop PAUSES when a
+        turn calls a tool that requires approval: it persists an
+        :class:`~himmy.runtime.checkpoint.AgentCheckpoint`, emits
+        ``APPROVAL_REQUIRED``, and returns with ``stopped_reason='awaiting_approval'``
+        and a ``checkpoint_id`` for :meth:`resume_agent_loop`.
         """
         if max_turns < 1:
             raise HimmyError("run_agent_loop requires max_turns >= 1.")
+        if hitl and self._checkpoint_store is None:
+            raise HimmyError("hitl=True requires a checkpoint_store on the runtime.")
 
         first = await self.run_task_detailed(
             persona, task, thread, llm_config=llm_config
@@ -362,25 +386,246 @@ class SingleAgentRuntime:
         thread = first.thread
         ctx = dict(task.context or {})
         trace_id = f"{thread.thread_id}:{task.task_id}"
-        turns = [first]
         await self._emit_turn_completed(trace_id, thread, persona, 1, first)
 
-        stopped_reason = "final"
+        return await self._drive_loop(
+            persona,
+            task,
+            thread,
+            ctx,
+            trace_id,
+            turns=[first],
+            max_turns=max_turns,
+            cost_budget=cost_budget,
+            llm_config=llm_config,
+            hitl=hitl,
+            turns_offset=0,
+            cost_offset=0.0,
+        )
+
+    async def resume_agent_loop(
+        self,
+        checkpoint_id: str,
+        *,
+        approved: bool,
+        llm_config: LLMConfig | None = None,
+        hitl: bool = True,
+    ) -> AgentLoopResult:
+        """Resume a paused agent run after a human approves or rejects the action.
+
+        Rehydrates the checkpoint, applies the decision to each pending tool call
+        — executing it (``approved=True``) and recording the real result, or
+        recording a rejection — then drives one more model turn (so the model sees
+        the outcome) and continues the loop. Idempotency is enforced: a checkpoint
+        already ``approved``/``rejected`` cannot be resumed twice.
+        """
+        if self._checkpoint_store is None:
+            raise HimmyError("resume_agent_loop requires a checkpoint_store.")
+        checkpoint = self._checkpoint_store.load(checkpoint_id)
+        if checkpoint is None:
+            raise HimmyError(f"unknown checkpoint {checkpoint_id!r}.")
+        if checkpoint.status != AWAITING_APPROVAL:
+            raise HimmyError(
+                f"checkpoint {checkpoint_id!r} already resolved ({checkpoint.status})."
+            )
+        if approved and self.tool_service is None:
+            raise HimmyError(
+                "cannot resume approved: no tool_service to execute the action."
+            )
+
+        from himmy.agents.base_agent.task import Task as _Task
+        from himmy.agents.base_agent.thread import ChatThread as _ChatThread
+        from himmy.agents.personas.persona import Persona as _Persona
+        from himmy.services.tools.models import ToolInvocation
+
+        persona = _Persona.model_validate(checkpoint.persona)
+        task = _Task.model_validate(checkpoint.task)
+        thread = _ChatThread.model_validate(checkpoint.thread)
+        ctx = dict(checkpoint.ctx)
+        trace_id = f"{thread.thread_id}:{task.task_id}"
+        resume_llm = llm_config
+        if resume_llm is None and checkpoint.llm_config is not None:
+            resume_llm = LLMConfig.model_validate(checkpoint.llm_config)
+
+        # Apply the human decision to each pending tool call, recording the outcome
+        # on the thread as a TOOL message (so the next model turn sees it).
+        for call in checkpoint.pending_tool_calls:
+            if approved:
+                assert self.tool_service is not None
+                execution = await self.tool_service.execute(
+                    ToolInvocation(
+                        tool_name=call.tool_name,
+                        args=dict(call.args),
+                        metadata={"approved": True},
+                    )
+                )
+                tool_returns = [
+                    ToolReturnRecord(
+                        tool_call_id=call.tool_call_id,
+                        tool_name=call.tool_name,
+                        content=execution.result,
+                        outcome=execution.outcome,
+                        metadata={
+                            "approved_by": "human",
+                            "error_code": execution.error_code.value
+                            if execution.error_code
+                            else None,
+                        },
+                    )
+                ]
+                event_type = EventType.APPROVAL_GRANTED
+            else:
+                tool_returns = [
+                    ToolReturnRecord(
+                        tool_call_id=call.tool_call_id,
+                        tool_name=call.tool_name,
+                        content={"rejected": True, "reason": "rejected by human"},
+                        outcome="rejected",
+                        metadata={"approved_by": "human"},
+                    )
+                ]
+                event_type = EventType.APPROVAL_REJECTED
+            synthetic = InferenceResponse(
+                request_id=f"resume:{checkpoint_id}",
+                status=InferenceStatus.SUCCESS,
+                tool_calls=[
+                    ToolCallRecord(
+                        tool_call_id=call.tool_call_id,
+                        tool_name=call.tool_name,
+                        args=dict(call.args),
+                    )
+                ],
+                tool_returns=tool_returns,
+            )
+            await self._append_tool_messages(
+                thread,
+                synthetic,
+                request_id=synthetic.request_id,
+                trace_id=trace_id,
+                agent_id=persona.agent_id,
+            )
+            await self._emit(
+                RunEvent(
+                    event_type=event_type,
+                    trace_id=trace_id,
+                    thread_id=thread.thread_id,
+                    agent_id=persona.agent_id,
+                    payload={
+                        "checkpoint_id": checkpoint_id,
+                        "tool_name": call.tool_name,
+                    },
+                )
+            )
+
+        # Resolve the checkpoint exactly once (idempotency guard above).
+        self._checkpoint_store.save(
+            checkpoint.model_copy(update={"status": APPROVED if approved else REJECTED})
+        )
+        thread.version += 1
+        self._register_thread_version(thread)
+
+        # One continuation turn so the model reacts to the decision, then drive on.
+        index = checkpoint.turns_completed + 1
+        await self._emit(
+            RunEvent(
+                event_type=EventType.AGENT_TURN_STARTED,
+                trace_id=trace_id,
+                thread_id=thread.thread_id,
+                agent_id=persona.agent_id,
+                payload={"turn": index},
+            )
+        )
+        result = await self._continue_turn(
+            persona, thread, ctx, trace_id, llm_config=resume_llm
+        )
+        await self._emit_turn_completed(trace_id, thread, persona, index, result)
+        return await self._drive_loop(
+            persona,
+            task,
+            thread,
+            ctx,
+            trace_id,
+            turns=[result],
+            max_turns=checkpoint.max_turns,
+            cost_budget=checkpoint.cost_budget,
+            llm_config=resume_llm,
+            hitl=hitl,
+            turns_offset=checkpoint.turns_completed,
+            cost_offset=checkpoint.cost_completed,
+        )
+
+    async def _drive_loop(
+        self,
+        persona: Persona,
+        task: Task,
+        thread: ChatThread,
+        ctx: dict[str, Any],
+        trace_id: str,
+        *,
+        turns: list[RunResult],
+        max_turns: int,
+        cost_budget: float | None,
+        llm_config: LLMConfig | None,
+        hitl: bool,
+        turns_offset: int,
+        cost_offset: float,
+    ) -> AgentLoopResult:
+        """Drive continuation turns until a stop condition (shared by run/resume)."""
         while True:
             last = turns[-1]
             if not last.succeeded:
-                stopped_reason = "error"
-                break
+                return AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="error"
+                )
+            if hitl:
+                pending = self._pending_approvals(last)
+                if pending:
+                    checkpoint = self._save_checkpoint(
+                        persona,
+                        task,
+                        thread,
+                        ctx,
+                        llm_config,
+                        max_turns,
+                        cost_budget,
+                        turns_offset + len(turns),
+                        cost_offset + sum(t.cost for t in turns),
+                        pending,
+                    )
+                    await self._emit(
+                        RunEvent(
+                            event_type=EventType.APPROVAL_REQUIRED,
+                            trace_id=trace_id,
+                            thread_id=thread.thread_id,
+                            agent_id=persona.agent_id,
+                            payload={
+                                "checkpoint_id": checkpoint.checkpoint_id,
+                                "tools": [p.tool_name for p in pending],
+                            },
+                        )
+                    )
+                    return AgentLoopResult(
+                        thread=thread,
+                        turns=turns,
+                        stopped_reason="awaiting_approval",
+                        checkpoint_id=checkpoint.checkpoint_id,
+                    )
             if not last.tool_calls:
-                stopped_reason = "final"
-                break
-            if len(turns) >= max_turns:
-                stopped_reason = "max_turns"
-                break
-            if cost_budget is not None and sum(t.cost for t in turns) >= cost_budget:
-                stopped_reason = "budget"
-                break
-            index = len(turns) + 1
+                return AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="final"
+                )
+            if turns_offset + len(turns) >= max_turns:
+                return AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="max_turns"
+                )
+            if (
+                cost_budget is not None
+                and cost_offset + sum(t.cost for t in turns) >= cost_budget
+            ):
+                return AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="budget"
+                )
+            index = turns_offset + len(turns) + 1
             await self._emit(
                 RunEvent(
                     event_type=EventType.AGENT_TURN_STARTED,
@@ -396,9 +641,54 @@ class SingleAgentRuntime:
             turns.append(result)
             await self._emit_turn_completed(trace_id, thread, persona, index, result)
 
-        return AgentLoopResult(
-            thread=thread, turns=turns, stopped_reason=stopped_reason
+    @staticmethod
+    def _pending_approvals(result: RunResult) -> list[PendingToolCall]:
+        """The tool calls in a turn that were denied for lack of approval."""
+        denied = {
+            r.tool_call_id
+            for r in result.tool_returns
+            if r.outcome == "denied"
+            and (r.metadata or {}).get("error_code") == "POLICY_BLOCKED"
+        }
+        return [
+            PendingToolCall(
+                tool_call_id=c.tool_call_id, tool_name=c.tool_name, args=dict(c.args)
+            )
+            for c in result.tool_calls
+            if c.tool_call_id in denied
+        ]
+
+    def _save_checkpoint(
+        self,
+        persona: Persona,
+        task: Task,
+        thread: ChatThread,
+        ctx: dict[str, Any],
+        llm_config: LLMConfig | None,
+        max_turns: int,
+        cost_budget: float | None,
+        turns_completed: int,
+        cost_completed: float,
+        pending: list[PendingToolCall],
+    ) -> AgentCheckpoint:
+        """Persist a paused run as a durable checkpoint and return it."""
+        assert self._checkpoint_store is not None
+        checkpoint = AgentCheckpoint(
+            persona=persona.model_dump(mode="json"),
+            task=task.model_dump(mode="json"),
+            thread=thread.model_dump(mode="json"),
+            ctx=ctx,
+            llm_config=llm_config.model_dump(mode="json")
+            if llm_config is not None
+            else None,
+            max_turns=max_turns,
+            cost_budget=cost_budget,
+            turns_completed=turns_completed,
+            cost_completed=cost_completed,
+            pending_tool_calls=pending,
         )
+        self._checkpoint_store.save(checkpoint)
+        return checkpoint
 
     async def _emit_turn_completed(
         self,

@@ -14,6 +14,17 @@ providers, Postgres/pgvector, and observability.
   distribution is `himmy`. Update imports: `from himmy import ...`.
 
 ### Added
+- **Human-in-the-loop pause/resume.** Tool approval is no longer a terminal deny:
+  `run_agent_loop(..., hitl=True)` PAUSES when the model calls a tool that requires
+  approval — persisting a durable `AgentCheckpoint` (full thread + persona/task/
+  context + the pending tool call + loop limits) via a `CheckpointStore`
+  (`InMemoryCheckpointStore` or durable `SqliteCheckpointStore`), emitting
+  `APPROVAL_REQUIRED`, and returning `stopped_reason="awaiting_approval"` + a
+  `checkpoint_id`. `resume_agent_loop(checkpoint_id, approved=…)` rehydrates it and
+  either executes the approved tool (recording the real result) or records the
+  rejection, then continues the loop. Idempotent (a resolved checkpoint can't be
+  resumed twice) and **survives a process restart** (a fresh runtime resumes a
+  SQLite checkpoint). New `APPROVAL_REQUIRED`/`GRANTED`/`REJECTED` events.
 - **Runtime-owned agentic loop (`SingleAgentRuntime.run_agent_loop`).** A bounded
   act→observe→re-invoke loop: while a turn calls tools, the runtime feeds the
   updated thread back for another model turn — until the model answers with no tool

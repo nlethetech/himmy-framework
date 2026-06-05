@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from himmy.runtime.checkpoint import (
+    AgentCheckpoint,
+    CheckpointStore,
+    InMemoryCheckpointStore,
+    PendingToolCall,
+    SqliteCheckpointStore,
+)
 from himmy.runtime.single_agent import (
     AgentLoopResult,
     OnEvent,
@@ -16,4 +23,9 @@ __all__ = [
     "AgentLoopResult",
     "ToolServiceProtocol",
     "OnEvent",
+    "AgentCheckpoint",
+    "PendingToolCall",
+    "CheckpointStore",
+    "InMemoryCheckpointStore",
+    "SqliteCheckpointStore",
 ]
