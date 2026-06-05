@@ -119,6 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_bench.add_argument("--temperature", type=float, default=0.0)
     p_bench.add_argument("--json", help="also write the full results as JSON")
+    p_bench.add_argument(
+        "--fail-under",
+        type=float,
+        default=None,
+        help="exit non-zero if any model's accuracy is below this floor (0-1), for CI",
+    )
     p_bench.set_defaults(func=commands.cmd_bench)
 
     p_init = sub.add_parser("init", help="scaffold an agent.yaml + tools.py")

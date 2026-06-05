@@ -8,6 +8,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *" # nightly: track agent pass-rate over time
 
 permissions:
   contents: read
@@ -52,3 +54,51 @@ jobs:
         # Scope collection to tests/integration so pytest doesn't import the api/db
         # test modules (which need extras this lean provider lane doesn't install).
         run: pytest -q -m integration tests/integration
+
+  benchmark:
+    name: agent benchmark vs. Ollama (qwen2.5:3b)
+    # Post-merge + nightly + manual — NOT on PRs (CPU Ollama is too slow to gate every PR).
+    # This is the standing eval that answers "did this change make agents better or worse?"
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install himmy with the packs the suite exercises
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,nepal,knowledge]"
+
+      - name: Install + start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:11434/api/tags >/dev/null && break || sleep 2
+          done
+
+      - name: Pull the benchmark model
+        run: ollama pull qwen2.5:3b-instruct
+
+      - name: Run the standing benchmark (regression gate)
+        # --fail-under is a floor, not a target: a real regression (e.g. a broken tool
+        # loop) tanks accuracy well below it. The per-category table is the diagnostic.
+        run: |
+          python -m himmy bench \
+            --models ollama:qwen2.5:3b-instruct \
+            --trials 2 \
+            --fail-under 0.6 \
+            --json bench-results.json
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench-results.json

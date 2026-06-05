@@ -816,6 +816,19 @@ def cmd_bench(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         _eprint(f"\nwrote full results to {args.json}")
+
+    # Regression gate (for CI): fail if any model scores below the floor. This is what
+    # makes "did my change make agents worse?" answerable — a real regression trips it.
+    floor = getattr(args, "fail_under", None)
+    if floor is not None:
+        below = [c for c in cards if c.accuracy < floor]
+        for c in below:
+            _eprint(
+                f"FAIL: {c.spec.name} accuracy {c.accuracy:.0%} < floor {floor:.0%}"
+            )
+        if below:
+            return 1
+        _eprint(f"OK: all models ≥ {floor:.0%} floor")
     return 0
 
 
