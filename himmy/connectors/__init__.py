@@ -19,6 +19,7 @@ from himmy.connectors.models import (
     Workbook,
 )
 from himmy.connectors.news import NEPAL_NEWS_SOURCES, NewsFetcher
+from himmy.connectors.news_tools import NEWS_TOOL_NAMES, register_news_tools
 from himmy.connectors.nrb import NRB_FOREX_API, NRB_MACRO_FEED, NRBClient
 from himmy.connectors.nrb_tools import register_nrb_tools
 
@@ -37,4 +38,6 @@ __all__ = [
     "NRB_FOREX_API",
     "NRB_MACRO_FEED",
     "register_nrb_tools",
+    "register_news_tools",
+    "NEWS_TOOL_NAMES",
 ]

@@ -43,6 +43,13 @@ class ToolPack:
     register: Callable[[ToolRegistry, ToolkitConfig], None]
 
 
+def _register_news_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
+    """News connector → agent tools (lazy import keeps `connectors` out of import)."""
+    from himmy.connectors.news_tools import register_news_tools
+
+    register_news_tools(registry)
+
+
 #: The built-in pack catalog, keyed by pack name.
 BUILTIN_PACKS: dict[str, ToolPack] = {
     "web": ToolPack(
@@ -98,6 +105,12 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
         "Keyless public data: weather, geocoding, and Wikipedia summaries.",
         ("weather", "geocode", "wikipedia"),
         register_datasources_pack,
+    ),
+    "news": ToolPack(
+        "news",
+        "Read RSS/Atom news feeds: list sources, fetch a feed, or keyword-search headlines.",
+        ("news_sources", "news_search", "news_fetch"),
+        _register_news_pack,
     ),
     "memory": ToolPack(
         "memory",
