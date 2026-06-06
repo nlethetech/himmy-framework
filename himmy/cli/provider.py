@@ -81,3 +81,25 @@ def build_inference_for(
     ``provider=None`` keeps the framework default (pydantic-ai→stub auto-select).
     """
     return InferenceService(build_manager_for(provider, model))
+
+
+def is_stub_manager(manager: ClientManager) -> bool:
+    """True when ``manager`` is the offline deterministic stub (no real model)."""
+    from himmy.services.inference.client_manager import StubClientManager
+
+    return isinstance(manager, StubClientManager)
+
+
+def resolves_to_stub(
+    provider: str | None = None, model: str | None = None
+) -> bool:
+    """True when this provider/model pair will run on the offline stub.
+
+    Used by the CLI to surface a one-line "you're offline, here's how to use a real
+    model" hint. Returns ``False`` if the manager can't be constructed (let the real
+    run raise the actionable error instead of guessing here).
+    """
+    try:
+        return is_stub_manager(build_manager_for(provider, model))
+    except Exception:  # noqa: BLE001 - never let a hint probe break the command
+        return False

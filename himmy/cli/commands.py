@@ -28,6 +28,45 @@ def _eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
+def _effective_provider_model(
+    spec: AgentSpec, args: argparse.Namespace
+) -> tuple[str | None, str | None]:
+    """The provider/model a run will actually use: CLI flags override the spec."""
+    provider = getattr(args, "provider", None) or spec.provider
+    model = getattr(args, "model", None) or (
+        spec.model if spec.model != "default" else None
+    )
+    return provider, model
+
+
+def _maybe_hint_stub(spec: AgentSpec, args: argparse.Namespace) -> None:
+    """Tell a human at the terminal when a run is falling back to the offline stub.
+
+    The stub returns canned, deterministic text — fine for wiring/tests, useless as a
+    real answer. Without this, a first-time user sees nonsense and assumes himmy is
+    broken. Only fires on an interactive terminal so piped/CI output and the test
+    harness stay clean, and never when the user explicitly asked for the stub.
+    """
+    if not sys.stderr.isatty() or os.environ.get("HIMMY_NO_HINTS"):
+        return
+    provider, model = _effective_provider_model(spec, args)
+    if provider == "stub":  # explicit choice — don't nag
+        return
+    from himmy.cli.provider import resolves_to_stub
+
+    if not resolves_to_stub(provider, model):
+        return
+    _eprint(
+        "note: running offline on the stub — canned deterministic output, not a real "
+        "model.\n"
+        "  for real answers, pick a backend:\n"
+        "    • local, free:  ollama pull llama3.2   then add  --provider ollama\n"
+        "    • Claude Max:   --provider claude-cli\n"
+        "    • cloud:        set OPENAI_API_KEY or ANTHROPIC_API_KEY\n"
+        "  details: himmy doctor\n"
+    )
+
+
 def _trace_db() -> str:
     """Path to the durable trace event log (``.himmy/trace.db``), dir created."""
     path = Path(".himmy")
@@ -379,6 +418,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     spec = _spec_from_args(args)
     tracer = _TraceCollector() if getattr(args, "trace", False) else None
     inference, recorder = _record_replay_inference(spec, args)
+    if inference is None:  # record/replay supplies its own (non-stub) manager
+        _maybe_hint_stub(spec, args)
     runtime, registry = _build_runtime_for(
         spec, args, on_event=tracer.handle if tracer else None, inference=inference
     )
@@ -470,6 +511,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_chat(args: argparse.Namespace) -> int:
     """Interactive REPL keeping one thread; `--message` runs a single turn."""
     spec = _spec_from_args(args)
+    _maybe_hint_stub(spec, args)
     runtime, registry = _build_runtime_for(spec, args)
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
@@ -1105,21 +1147,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  [{mark}] {label}")
 
     print("\nlocal providers (PATH):")
-    for binary in ("claude", "ollama"):
-        found = shutil.which(binary)
+    have_claude = bool(shutil.which("claude"))
+    have_ollama = bool(shutil.which("ollama"))
+    for binary, found in (("claude", have_claude), ("ollama", have_ollama)):
+        path = shutil.which(binary)
         print(
             f"  [{'ok ' if found else '-- '}] {binary}"
-            + (f" → {found}" if found else "")
+            + (f" → {path}" if path else "")
         )
 
     print("\nprovider keys (env):")
+    have_key = False
     for key in (
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
         "PYDANTIC_AI_GATEWAY_API_KEY",
     ):
-        print(f"  [{'ok ' if os.environ.get(key) else '-- '}] {key}")
+        present = bool(os.environ.get(key))
+        have_key = have_key or present
+        print(f"  [{'ok ' if present else '-- '}] {key}")
 
     from himmy.services.guardrails import BUILTIN_GUARDRAILS
 
@@ -1131,6 +1178,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     cfg = find_project_config()
     print(f"\nproject config: {cfg if cfg else '(none — using env + defaults)'}")
+
+    # End on the single most useful next action, not just a status table.
+    has_real_model = have_claude or have_ollama or have_key
+    has_agent = any(Path(p).exists() for p in ("agent.yaml", "team.yaml"))
+    print("\nnext step:")
+    if not has_real_model:
+        print(
+            "  → no real model yet. Install one (free, local):  ollama pull llama3.2\n"
+            "    or set OPENAI_API_KEY / ANTHROPIC_API_KEY for a cloud model."
+        )
+    elif not has_agent:
+        print("  → scaffold your first agent:  himmy init my-agent")
+    else:
+        provider_hint = (
+            " --provider ollama" if (have_ollama and not have_key) else ""
+        )
+        print(
+            f'  → run it:  himmy run -f agent.yaml -p "Say hello."{provider_hint}'
+        )
     return 0
 
 

@@ -33,7 +33,7 @@ No keys. No cloud. Your documents never leave the machine. → **[full example](
 - **Offline-first** — Ollama / Claude CLI / a deterministic stub; cloud is optional, never required.
 - **Auditable + replayable** — re-run a failed agent run *exactly* from recorded model
   responses, with the provider turned off. Most frameworks can't do this.
-- **Batteries included** — declarative agents in YAML, a [skills](#skills--capabilities-not-just-tools)
+- **Batteries included** — declarative agents in YAML, a [skills](#extend-it-tools-knowledge-and-skills)
   layer, 13 tool packs, MCP servers, memory, RAG, and multi-agent — all offline-capable.
 - **Honest about quality** — a standing benchmark runs in CI against a real local model, so
   "did my change make agents better or worse?" is actually answerable.
@@ -41,40 +41,6 @@ No keys. No cloud. Your documents never leave the machine. → **[full example](
 > **Everything that matters is an entity.** Personas, prompts, tools, threads, messages,
 > context snapshots, and run events are all immutable, versioned `EntityRecord`s with typed
 > links — the audit/lineage spine the rest of the framework is built on.
-
-## Production capabilities
-
-Himmy has been through a full production-hardening pass. On top of the
-offline-first core, it now offers:
-
-- **Failure handling** — `InferenceService.run` never raises for provider/manager
-  errors; every exception is normalized to a typed `InferenceError`, retries fire
-  only on retryable codes, batches are failure-isolated, and runs record the real
-  status/error (a failed inference is no longer logged as a success).
-- **Streaming** — `InferenceService.run_stream` yields typed `StreamDelta` chunks
-  ending in a `done` frame that carries the materialized response. The stub streams
-  deterministic offline deltas; the pydantic-ai path streams real provider tokens
-  via `agent.run_stream` (see `examples/07_streaming.py`).
-- **Caching** — a pluggable, TTL-bounded inference response cache
-  (`InMemoryTTLCache`) honored when a request opts in via `use_cache`; a no-op by
-  default so behavior is unchanged unless wired.
-- **Real providers** — `PydanticAIClientManager` honors the full request envelope
-  (system prompt, message history, tools, generation params, timeout) and reads
-  token usage/cost; `GatewayClientManager` does real Pydantic-AI-Gateway routing
-  when a key + the `providers` extra are present.
-- **Postgres + pgvector** — durable `PostgresStorageService` and
-  `PostgresEntityRegistry` (JSONB codecs, optimistic-concurrency, idempotent
-  `create_run`, pool teardown/timeouts) plus a pgvector knowledge backend with
-  enforced embedding-dimension and freshness checks.
-- **Security** — HTTP tools are SSRF-hardened (path/host pinning, no traversal or
-  query/host injection), auth secrets are redacted from logs/events, and incoming
-  tool args are validated against `args_json_schema`.
-- **Observability** — optional Logfire instrumentation emits real spans for runs,
-  inference, and tools via `configure_observability()` (no-op unless enabled).
-- **Evaluation** — metric suites over agent outputs with honest per-metric `passed`
-  verdicts (no false-success rollups).
-- **Pagination & tenancy** — list endpoints support pagination/ordering/caps and
-  enforce `workspace_id` isolation on read paths.
 
 ## Install
 
@@ -89,12 +55,57 @@ pip install -e ".[api]"
 pip install -e ".[all]"
 ```
 
-Requires Python **3.12+**.
+Requires Python **3.12+**. The full list of [optional extras is in the advanced
+guide](docs/advanced.md#optional-extras).
 
-## Offline quickstart
+---
 
-Himmy runs end-to-end with **no API keys and no network** using the deterministic
-`StubClientManager`. The smallest possible run:
+# Three concepts, start to finish
+
+You only need three things to ship an agent with Himmy: **define it**, **run it**, and
+**extend it** with tools and knowledge. Everything else is optional and lives in the
+**[advanced guide](docs/advanced.md)**.
+
+## 1. Define it — `agent.yaml`
+
+An agent is a small YAML file. Scaffold one (with an example `tools.py` and `skill`):
+
+```bash
+himmy init my-agent
+```
+
+```yaml
+# my-agent/agent.yaml
+name: market-analyst
+description: A market research analyst specializing in tech.
+role: Research Analyst
+instructions:
+  - Provide actionable insights backed by clear reasoning.
+model: default
+# provider: ollama   # stub | claude-cli | ollama | pydantic-ai (default: auto)
+```
+
+`agent.yaml` is a thin declarative façade over `Persona` + `Task` + `LLMConfig` — the same
+spec loads in Python via `from himmy import load_agent_spec`.
+
+## 2. Run it
+
+Everything below runs **offline against the deterministic stub** — no keys needed. Add a
+real model with `--provider ollama` (or set a key); see [choosing a
+provider](docs/advanced.md#choosing-a-provider).
+
+```bash
+# One-shot: run a prompt and print the answer
+himmy run -f my-agent/agent.yaml -p "Say hello in one sentence."
+
+# Interactive chat that keeps a single thread
+himmy chat -f my-agent/agent.yaml
+
+# Is a real model available on this machine? What's my next step?
+himmy doctor
+```
+
+The smallest possible run, in pure Python:
 
 ```python
 import asyncio
@@ -117,35 +128,33 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-## Quickstart (CLI)
+## 3. Extend it — tools, knowledge, and skills
 
-Prefer not to write wiring code? Define an agent in a file and drive it from the
-`himmy` command. Everything below runs offline against the stub — no keys needed.
+This is the part people confuse. Three words, one ladder:
 
-```bash
-# Scaffold an agent.yaml + an example tools.py in ./my-agent
-himmy init my-agent
-
-# One-shot: run a prompt and print the answer
-himmy run -f my-agent/agent.yaml -p "Say hello in one sentence."
-
-# Interactive chat that keeps a single thread
-himmy chat -f my-agent/agent.yaml
-
-# Check which optional extras / local providers / keys are available
-himmy doctor
-
-# List the built-in tools an agent can use
-himmy tools
-
-# Serve the FastAPI BFF (needs the `api` extra)
-himmy serve
+```
+tool        a single function the model can call          web_search
+tool_pack   a named bundle of related tools               web → web_search, web_fetch, http_request
+skill       a tool_pack + the know-how to use it well     web_research → the web tools + how-to + examples
 ```
 
-### Built-in tools
+**Rule of thumb:** reach for a **skill** first — you get the tools *and* the guidance to use
+them. Drop to **`tool_packs`** when you want the raw tools without the know-how. Name
+individual **`tools`** only to bind a subset.
 
-Agents get a batteries-included **toolkit** — five named packs you switch on per
-agent. `himmy tools` lists them:
+```yaml
+# capabilities, the easy way: tools + know-how in one line
+skills: [web_research]
+
+# or wire raw tool packs yourself
+tool_packs: [web, utils]            # register these built-in packs
+tools: [web_search, web_fetch]      # bind a subset to the model (omit = all)
+
+# ground the agent in your own docs — auto-ingested into a local KB → kb_search
+knowledge: [./docs]
+```
+
+List what's available: `himmy tools` (packs) and `himmy skills` (capabilities).
 
 | Pack | Tools |
 |------|-------|
@@ -160,33 +169,12 @@ agent. `himmy tools` lists them:
 | `data-sources` | `weather`, `geocode`, `wikipedia` (keyless public APIs) |
 | `memory` | `remember`, `recall` (durable long-term memory, SQLite-backed) |
 | `nepal` | `nepali_date` (Bikram Sambat), `nepali_format` (NPR/Devanagari), `nepali_transliterate`, NRB forex |
-| `agentic` | `ask_human` (human-in-the-loop), `scratchpad_set`/`scratchpad_get` (working notes), `todo_write`/`todo_read` (self-managed task list) |
+| `agentic` | `ask_human` (human-in-the-loop), `scratchpad_set`/`get`, `todo_write`/`read` (self-managed task list) |
 | `telegram` | `send_telegram` (message a Telegram chat via a bot; approval-gated) |
 
-Enable them declaratively in `agent.yaml`:
-
-```yaml
-name: researcher
-description: Researches a topic and summarizes it.
-tool_packs: [web, utils]            # register these built-in packs
-tools: [web_search, web_fetch]      # bind a subset to the model (omit = all)
-```
-
-### Skills — capabilities, not just tools
-
-A **skill** is the layer above tools: it bundles the *tools a job needs* with the
-*know-how to use them well*. Declaring a skill grants both at once — no separate
-`tool_packs` or instruction wiring. `himmy skills` lists the built-ins (`web_research`,
-`data_analysis`, `file_ops`, `python_compute`, `knowledge_base`, `nepal_brief`,
-`summarize`):
-
-```yaml
-name: farm-analyst
-skills: [data_analysis]   # binds sql_query + sql_schema AND injects the SQL know-how
-```
-
-Author your own as a one-file YAML — drop it in `skills/` (auto-discovered; project
-files shadow built-ins of the same name) and reference it by name:
+Built-in skills: `web_research`, `data_analysis`, `file_ops`, `python_compute`,
+`knowledge_base`, `nepal_brief`, `summarize`. Author your own as a one-file YAML in
+`skills/` (auto-discovered; project files shadow built-ins):
 
 ```yaml
 # skills/exact_math.yaml
@@ -197,26 +185,19 @@ instructions:
   - Never estimate arithmetic — run Python and print() the result.
 ```
 
-Skills are validated (`extra="forbid"`), versioned entities (`kind="skill"`), and
-compose (`requires_skills`). `himmy init` scaffolds an example `skills/my_skill.yaml`.
+### Connect your own API, no Python
 
-### Build a whole agent with no Python
-
-Four declarative levers in `agent.yaml` cover most specialised agents — connect your API,
-ground it in your docs, and give it know-how, all without code:
+Declare REST endpoints right in `agent.yaml` and they become arg-validated, traced tools:
 
 ```yaml
-name: my-agent
-skills: [web_research]            # capabilities = tools + know-how
-knowledge: [./docs]              # auto-ingested into a local KB → kb_search, grounded answers
-http_tools:                      # your own REST API, no tools.py
+http_tools:
   - name: get_order
     base_url_env_var: MYAPI_URL
     path: /orders/{order_id}
     auth: { type: bearer, env_var: MYAPI_KEY }
 ```
 
-Start from a working specialised agent:
+### Start from a working specialised agent
 
 ```bash
 himmy init my-agent --template helpdesk    # docs-grounded Q&A (knowledge)
@@ -224,139 +205,35 @@ himmy init my-agent --template analyst     # live API lookups (http_tools)
 himmy init my-agent --template researcher  # web research (skills)
 ```
 
-**MCP servers — the whole ecosystem as tools.** Beyond the built-in packs, point an
-agent at any stdio **Model Context Protocol** server and its tools become native himmy
-tools (arg-validated, approval-gated, traced). List them in `agent.yaml` (or `team.yaml`):
+---
 
-```yaml
-mcp_servers:
-  - command: npx
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/workspace"]
-    prefix: fs_                 # namespace tool names (fs_read_file, …)
-  - command: uvx
-    args: ["mcp-server-git", "--repository", "."]
-    requires_approval: true     # gate this server's tools behind approval
-    tools: [git_log, git_diff]  # bind a subset (empty = all)
-```
-
-The CLI launches each server, registers its tools, runs, then tears them down — in
-`himmy run`, `chat`, `team`, and `eval`. Built on a transport-direct stdio client (no SDK).
-
-**Recursive sub-agents.** Set `allow_spawn: true` and the agent gains a `spawn_agent` tool
-— it can hand a sub-task to a fresh single-agent (its own instructions, optionally its own
-`tool_packs`) and use the answer. No `team.yaml` needed; the parent decides at run time.
-The spawned worker can't itself spawn, so recursion is capped at one level.
-
-**Live on Telegram.** Turn any `agent.yaml` into a Telegram bot — `himmy telegram -f
-agent.yaml` long-polls for messages, runs the agent (one thread per chat), and replies.
-Set `HIMMY_TELEGRAM_BOT_TOKEN` (or `--token`). The `telegram` tool pack also gives an
-agent `send_telegram` so it can message a chat proactively.
-
-**Embeddings (knowledge + memory).** Recall defaults to the offline `DeterministicEmbedder`
-(exact-overlap). For real semantic recall, select a model via env — `HIMMY_EMBEDDER=ollama`
-(local Ollama `nomic-embed-text`, keyless, no new deps), `HIMMY_EMBEDDER=fastembed` (ONNX,
-`pip install 'himmy[embeddings]'`), or `HIMMY_EMBEDDER=openai`. The dimension threads through
-automatically (`HIMMY_EMBEDDER_DIM` to override).
-
-`web_search` defaults to a keyless DuckDuckGo backend (no API key, httpx only);
-set `HIMMY_SEARCH_BACKEND=tavily` + `HIMMY_SEARCH_API_KEY=…` for higher-quality
-results. Web tools are SSRF-guarded (no private/loopback hosts), files are
-root-jailed, `sql_query` is read-only, and `write_file`/`run_python` are
-approval-gated. Toolkit settings come from `HIMMY_*` env vars (see
-`himmy.toolkit.ToolkitConfig`). Use the packs from Python too:
-
-```python
-from himmy.toolkit import register_packs, ToolkitConfig
-from himmy.services.tools.registry import ToolRegistry
-
-registry = ToolRegistry()
-register_packs(registry, ["web", "utils"], ToolkitConfig.from_env())
-```
-
-An `agent.yaml` is a thin declarative façade over `Persona` + `Task` + `LLMConfig`:
-
-```yaml
-name: market-analyst
-description: A market research analyst specializing in tech.
-role: Research Analyst
-instructions:
-  - Provide actionable insights backed by clear reasoning.
-model: default
-# provider: claude-cli   # stub | claude-cli | ollama | pydantic-ai (default: auto)
-# tools_module: tools:register   # wire custom tools from tools.py
-# output_schema: schema.json     # path to a JSON Schema for structured output
-```
-
-Pick a provider per run with `--provider`/`--model` (e.g. `--provider claude-cli
---model haiku` to use a local Claude Max session, or `--provider ollama --model
-llama3.2`). With no flag, Himmy uses a real pydantic-ai provider when a key + the
-`providers` extra are present, otherwise the offline stub. The same spec loads in
-Python via `from himmy import load_agent_spec`.
-
-## Multi-agent teams
-
-Agents can collaborate two ways: **handoff** (control transfers to a peer — swarm-style)
-and **delegation** (a manager calls a worker as a tool and gets its result back —
-supervisor / manager-worker). Define a team in a `team.yaml` and run it:
+## CLI reference
 
 ```bash
-himmy init --team myteam            # scaffold myteam/team.yaml
-himmy team -f myteam/team.yaml -p "Research and summarize permaculture."
+himmy init my-agent          # scaffold an agent.yaml + example tools.py + skill
+himmy run   -f agent.yaml -p "…"   # one-shot prompt → answer
+himmy chat  -f agent.yaml          # interactive single-thread chat
+himmy doctor                 # what extras / providers / keys are available + next step
+himmy tools                  # list built-in tool packs
+himmy skills                 # list skills (built-in + project-local)
+himmy serve                  # serve the FastAPI BFF (needs the `api` extra)
 ```
 
-```yaml
-entry: triage
-members:
-  - name: triage
-    description: Decide who should handle this, then hand off.
-    handoffs: [researcher, writer]
-  - name: researcher
-    description: Gather facts from the web.
-    tool_packs: [web]
-    tools: [web_search, web_fetch]
-    handoffs: [writer]
-    # delegates: [factchecker]   # call a worker as a tool instead of transferring
-  - name: writer
-    description: Write the final answer.
-```
+Other commands — `team`, `telegram`, `eval`, `bench`, `prices`, `trace` — are covered in
+the **[advanced guide](docs/advanced.md)**.
 
-`himmy team` prints the routing trail (`triage → researcher → writer`) and the final
-answer (`--json` for the full transcript). In Python:
+## Going further
 
-```python
-from himmy import build_runtime, MultiAgentOrchestrator
-from himmy.config import load_team_spec, build_team
+When you outgrow a single agent, the [advanced guide](docs/advanced.md) covers:
 
-team, registry = build_team(load_team_spec("myteam/team.yaml"))
-runtime, _inf, _tools = build_runtime(tool_registry=registry)
-result = await MultiAgentOrchestrator(runtime, team, registry).run("...")
-print(result.handoff_chain, result.output_text)
-```
-
-## Architecture overview
-
-Himmy is organized as a set of independent **kernels** that compose through small
-typed contracts. Every runtime dependency except inference is optional — drop the
-entity registry and you lose lineage but keep inference; drop the tool service and
-tools simply aren't bound.
-
-| Kernel | Path | Responsibility |
-|---|---|---|
-| Core | `himmy/core/` | Ids, errors, run events, the `EventSink` protocol. |
-| Entities | `himmy/entities/` | The lineage backbone: records, links, the in-memory registry, a Postgres scaffold. |
-| Agents | `himmy/agents/` | The four primitives: `Persona`/`RolePersona`, `Task`, `ChatThread`/`Message`, `Agent`. |
-| Inference | `himmy/services/inference/` | Stub + gateway + pydantic-ai client managers and the retrying `InferenceService`. |
-| Prompts | `himmy/services/prompts/` | YAML-templated system/task prompts and the context→prompt mapper. |
-| Context | `himmy/services/context/` | Snapshot building from storage + adapters with evidence. |
-| Storage | `himmy/services/storage/` | In-memory persistence + a Postgres scaffold. |
-| Knowledge | `himmy/services/knowledge/` | Chunking, embedding, retrieval, and a context adapter. |
-| Tools | `himmy/services/tools/` | Local/HTTP tool registry, execution, and inference binding. |
-| Evaluation | `himmy/services/evaluation/` | Metric suites over agent outputs. |
-| Observability | `himmy/services/observability/` | Optional Logfire instrumentation. |
-| Runtime | `himmy/runtime/` | `SingleAgentRuntime.run_task` — the orchestrating loop. |
-| Application | `himmy/application/` | App-level services (runs, recommendations, dashboard). |
-| Orchestrators | `himmy/orchestrators/` | Multi-step `Workflow` execution. |
-| API | `himmy/api/` | FastAPI app factory and routers. |
+- **[Multi-agent teams](docs/advanced.md#multi-agent-teams)** — handoff (swarm) and delegation (manager-worker).
+- **[MCP servers](docs/advanced.md#mcp-servers)** — point an agent at any Model Context Protocol server; its tools become native himmy tools.
+- **[Recursive sub-agents](docs/advanced.md#recursive-sub-agents)** — `allow_spawn` gives an agent a `spawn_agent` tool.
+- **[Live on Telegram](docs/advanced.md#live-on-telegram)** — turn any `agent.yaml` into a Telegram bot.
+- **[Embeddings](docs/advanced.md#embeddings)** — swap the offline embedder for real semantic recall (Ollama / fastembed / OpenAI).
+- **[Record & replay](docs/advanced.md#record--replay)** — capture a run to a cassette and re-run it exactly, offline.
+- **[Production capabilities](docs/advanced.md#production-capabilities)** — failure handling, streaming, caching, Postgres/pgvector, security, observability, evaluation.
+- **[Architecture overview](docs/advanced.md#architecture-overview)** — the kernel layout.
 
 ## Running the examples
 
@@ -383,22 +260,7 @@ Tests use `asyncio.run` inside synchronous test functions, so `pytest-asyncio` i
 **not** required. The full suite passes offline with the stub. Real-provider,
 Postgres/pgvector, and Logfire tests **skip cleanly** when their deps/DB are absent
 (set `HIMMY_TEST_POSTGRES_DSN` and install the relevant extra to exercise them);
-run `pytest -q -rs` to see why each skip fired. Per-kernel `*_hardening.py` suites
-cover the production-hardening contracts (failure normalization, streaming, caching,
-SSRF, tenancy, pagination, observability spans, and so on).
-
-## Optional extras
-
-| Extra | Adds | Unlocks |
-|---|---|---|
-| `api` | fastapi, uvicorn | The HTTP API (`himmy.api.create_app`). |
-| `providers` | pydantic-ai | Real model providers via `PydanticAIClientManager`. |
-| `postgres` | asyncpg | `PostgresEntityRegistry`, `PostgresStorageService`. |
-| `knowledge` | pgvector, openai, pypdf | pgvector knowledge backend, PDF reading + OpenAI-compatible embeddings. |
-| `observability` | logfire | Real run/inference/tool spans via `configure_observability()`. |
-| `validation` | jsonschema | Full-fidelity tool arg/output validation (offline subset used otherwise). |
-| `dev` | pytest, pytest-asyncio, jsonschema | Test tooling. |
-| `all` | all of the above | Everything. |
+run `pytest -q -rs` to see why each skip fired.
 
 ## Project layout
 
@@ -415,5 +277,6 @@ himmy/
   api/             FastAPI app + routers
 examples/          runnable, offline-first demos
 tests/             pytest suite (asyncio.run based)
+docs/              advanced guide + design notes
 docker/            pgvector docker-compose for local Postgres
 ```
