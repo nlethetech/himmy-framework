@@ -1,6 +1,33 @@
-/* Himmy Studio — Odysseus-inspired design system.
-   One Dark slate canvas, cyan text, red accent, Fira Code everywhere, chat bubbles,
-   springy transitions. Bundled font (offline-first). */
+/* Himmy Studio — product design system (v2).
+   A polished, softer SaaS look: sans-serif chrome (Inter), an indigo brand accent,
+   deeper slate surfaces, mono (Fira Code) reserved for code + data. Token names are
+   kept stable (with aliases) so every existing screen re-skins without JSX changes.
+   Bundled fonts (offline-first). */
+
+@font-face {
+  font-family: "Inter";
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/Inter-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/Inter-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/Inter-SemiBold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/Inter-Bold.woff2") format("woff2");
+}
 
 @font-face {
   font-family: "Fira Code";
@@ -28,47 +55,99 @@
 }
 
 :root {
-  --bg: #282c34;
-  --bg-elev: #21252b;
-  --card: #2c313a;
-  --card-hover: #323845;
-  --surface: #353b45;
-  --hover: #3a4150;
-  --border: #3a4350;
-  --border-strong: #44515f;
-  --border-accent: #355a66;
+  /* surfaces — deeper, softer slate */
+  --bg: #0f1117;
+  --bg-elev: #151823;
+  --card: #1a1e2b;
+  --card-hover: #20253a;
+  --surface: #232838;
+  --hover: #272d40;
+  --border: #262c3c;
+  --border-strong: #39415a;
+  --border-accent: #3a4470;
 
-  --text: #c6e6f1;
-  --text-muted: #84a7b3;
-  --text-dim: #5f7c87;
-  --cyan: #9cdef2;
+  /* text — neutral near-white, not cyan */
+  --text: #e6e9f2;
+  --text-muted: #9aa3b8;
+  --text-dim: #677089;
+  --cyan: var(--text); /* legacy alias: cyan-as-text → neutral */
 
-  --accent: #e06c75;
-  --accent-hover: #ef7a83;
-  --accent-soft: rgba(224, 108, 117, 0.15);
-  --accent-line: rgba(224, 108, 117, 0.45);
+  /* brand — indigo, the new primary (accent-* alias to it) */
+  --brand: #6c8cff;
+  --brand-hover: #7e9bff;
+  --brand-soft: rgba(108, 140, 255, 0.14);
+  --brand-line: rgba(108, 140, 255, 0.4);
+  --accent: var(--brand);
+  --accent-hover: var(--brand-hover);
+  --accent-soft: var(--brand-soft);
+  --accent-line: var(--brand-line);
 
-  --ok: #98c379;
-  --ok-soft: rgba(152, 195, 121, 0.16);
-  --warn: #e5c07b;
-  --warn-soft: rgba(229, 192, 123, 0.16);
-  --err: #e06c75;
-  --err-soft: rgba(224, 108, 117, 0.16);
+  /* status ramps */
+  --ok: #4ade80;
+  --ok-soft: rgba(74, 222, 128, 0.14);
+  --warn: #fbbf24;
+  --warn-soft: rgba(251, 191, 36, 0.14);
+  --err: #f87171;
+  --err-soft: rgba(248, 113, 113, 0.14);
+  --info: #60a5fa;
+  --info-soft: rgba(96, 165, 250, 0.14);
 
-  --purple: #c678dd;
-  --yellow: #e5c07b;
-  --blue: #61afef;
-  --teal: #56b6c2;
+  --purple: #a78bfa;
+  --yellow: #fbbf24;
+  --blue: #60a5fa;
+  --teal: #2dd4bf;
 
+  /* per-capability accent hues (connections, capability chips) */
+  --hue-email: #ea4335;
+  --hue-telegram: #2aabee;
+  --hue-web: #34d399;
+  --hue-memory: #a78bfa;
+  --hue-knowledge: #f59e0b;
+
+  /* fonts — sans chrome, mono reserved for code/data */
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
   --mono: "Fira Code", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
     monospace;
 
-  --radius: 8px;
-  --radius-sm: 5px;
-  --bubble: 15px;
-  --chat-col: 820px; /* readable, centered chat column (messages + composer) */
+  /* type scale */
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14.5px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+  --fs-3xl: 34px;
+
+  /* spacing scale (4px base) */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* radii — softer */
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+  --bubble: 14px;
+  --chat-col: 820px;
+
   --spring: cubic-bezier(0.22, 1.61, 0.36, 1);
-  --shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 8px 28px rgba(0, 0, 0, 0.28);
+
+  /* elevation */
+  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.18), 0 1px 1px rgba(0, 0, 0, 0.12);
+  --elev-2: 0 2px 8px rgba(0, 0, 0, 0.2), 0 6px 16px rgba(0, 0, 0, 0.16);
+  --elev-3: 0 8px 30px rgba(0, 0, 0, 0.3);
+  --shadow: var(--elev-2); /* legacy alias */
+
+  --sidebar-w: 232px;
 }
 
 * {
@@ -83,23 +162,29 @@ body,
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: var(--mono);
-  font-size: 13.5px;
+  font-family: var(--sans);
+  font-size: var(--fs-md);
   font-weight: 400;
-  line-height: 1.55;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-  font-feature-settings: "calt" 1; /* Fira Code ligatures */
+  text-rendering: optimizeLegibility;
 }
 a {
-  color: var(--cyan);
+  color: var(--brand);
   text-decoration: none;
 }
 a:hover {
   text-decoration: underline;
 }
+/* Mono is reserved for code + data surfaces (re-asserted after the sans default). */
 code,
-.mono {
+pre,
+.mono,
+.cog-trace,
+.io-pre,
+.composer-input {
   font-family: var(--mono);
+  font-feature-settings: "calt" 1;
 }
 ::selection {
   background: var(--accent-soft);
@@ -126,100 +211,207 @@ code,
 
 .shell {
   display: grid;
-  grid-template-columns: 54px 1fr;
+  grid-template-columns: var(--sidebar-w) 1fr;
   height: 100vh;
 }
 
-/* slim icon rail (Odysseus-style) with hover tooltips */
-.rail {
+/* ---- Product sidebar (labeled, grouped) -------------------------------- */
+.sidebar {
   background: var(--bg-elev);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding: 14px 0;
-  gap: 6px;
+  padding: var(--sp-3) var(--sp-3) var(--sp-2);
+  gap: var(--sp-1);
+  overflow-y: auto;
 }
-.rail-brand {
-  width: 34px;
-  height: 34px;
+.sb-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-2) var(--sp-4);
+}
+.sb-logo {
+  width: 30px;
+  height: 30px;
   border-radius: 9px;
-  background: var(--accent);
+  background: linear-gradient(140deg, var(--brand), #9a7bff);
   display: grid;
   place-items: center;
   color: #fff;
+  font-weight: 700;
+  font-size: 15px;
+  box-shadow: 0 2px 10px var(--brand-soft);
+}
+.sb-title {
   font-weight: 600;
-  font-family: var(--mono);
-  margin-bottom: 12px;
-  box-shadow: 0 0 0 1px var(--accent-line), 0 0 16px var(--accent-soft);
+  font-size: var(--fs-md);
+  color: var(--text);
 }
-.rail-nav {
+.sb-group {
+  margin-top: var(--sp-3);
+  padding: 0 var(--sp-2) var(--sp-1);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.sb-link {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.rail-link {
-  position: relative;
-  width: 38px;
-  height: 38px;
-  border-radius: 9px;
-  display: grid;
-  place-items: center;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 8px var(--sp-2);
+  border-radius: var(--radius-sm);
   color: var(--text-muted);
+  font-size: var(--fs-sm);
+  font-weight: 500;
   transition:
-    background 0.14s,
-    color 0.14s,
-    transform 0.1s var(--spring);
+    background 0.13s,
+    color 0.13s;
 }
-.rail-link:hover {
+.sb-link:hover {
   background: var(--card-hover);
   color: var(--text);
   text-decoration: none;
 }
-.rail-link.active {
-  background: var(--accent-soft);
-  color: var(--cyan);
-  box-shadow: inset 0 0 0 1px var(--accent-line);
+.sb-link.active {
+  background: var(--brand-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--brand-line);
 }
-.rail-link .ico {
-  width: 18px;
+.sb-link .ico {
+  width: 17px;
+  height: 17px;
+  flex: none;
+}
+.sb-link.active .ico {
+  color: var(--brand);
+}
+.sb-link-label {
+  flex: 1;
+}
+.sb-badge {
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--brand);
+  border-radius: var(--radius-pill);
+  min-width: 18px;
   height: 18px;
-}
-.rail-foot {
-  position: relative;
-  margin-top: auto;
+  padding: 0 5px;
   display: grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
 }
-/* tooltips shown to the right on hover */
-.rail-link::after,
-.rail-foot::after {
-  content: attr(data-label);
-  position: absolute;
-  left: calc(100% + 9px);
-  top: 50%;
-  transform: translateY(-50%) translateX(-4px);
-  background: var(--surface);
+.sb-disclosure {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  padding: var(--sp-3) var(--sp-2) var(--sp-1);
+}
+.sb-disclosure .chev {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s;
+}
+.sb-disclosure.open .chev {
+  transform: rotate(90deg);
+}
+.sb-foot {
+  margin-top: auto;
+  padding: var(--sp-3) var(--sp-2) var(--sp-1);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+
+/* ---- EmptyState -------------------------------------------------------- */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: var(--sp-3);
+  min-height: 60vh;
+  padding: var(--sp-8);
+}
+.empty-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-lg);
+  display: grid;
+  place-items: center;
+  font-size: 24px;
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+.empty-title {
+  font-size: var(--fs-xl);
+  font-weight: 600;
   color: var(--text);
-  border: 1px solid var(--border-strong);
-  padding: 4px 9px;
-  border-radius: 6px;
-  font-size: 12px;
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  transition:
-    opacity 0.12s,
-    transform 0.14s var(--spring);
-  z-index: 30;
-  box-shadow: var(--shadow);
 }
-.rail-link:hover::after,
-.rail-foot:hover::after {
-  opacity: 1;
-  transform: translateY(-50%) translateX(0);
+.empty-sub {
+  font-size: var(--fs-md);
+  color: var(--text-muted);
+  max-width: 440px;
+  line-height: 1.55;
+}
+.empty-action {
+  margin-top: var(--sp-2);
+}
+
+/* ---- Toasts ------------------------------------------------------------ */
+.toasts {
+  position: fixed;
+  bottom: var(--sp-5);
+  right: var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  z-index: 100;
+}
+.toast {
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  box-shadow: var(--elev-3);
+  max-width: 340px;
+  animation: toast-in 0.18s var(--spring);
+}
+.toast.ok {
+  border-color: var(--ok);
+}
+.toast.err {
+  border-color: var(--err);
+}
+.toast.info {
+  border-color: var(--brand-line);
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .main {

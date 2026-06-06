@@ -82,3 +82,63 @@ export const RefreshIcon = (p: P) => (
     <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
   </svg>
 );
+
+export const HomeIcon = (p: P) => (
+  <svg {...base} className={p.className}>
+    <path d="M3 9.5 12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z" />
+  </svg>
+);
+
+export const BellIcon = (p: P) => (
+  <svg {...base} className={p.className}>
+    <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+    <path d="M13.7 21a2 2 0 0 1-3.4 0" />
+  </svg>
+);
+
+export const PlugIcon = (p: P) => (
+  <svg {...base} className={p.className}>
+    <path d="M12 22v-5" />
+    <path d="M9 8V2M15 8V2" />
+    <path d="M7 8h10v3a5 5 0 0 1-10 0z" />
+  </svg>
+);
+
+export const ChevronIcon = (p: P) => (
+  <svg {...base} className={p.className} width={14} height={14}>
+    <polyline points="9 6 15 12 9 18" />
+  </svg>
+);
+
+export const MailIcon = (p: P) => (
+  <svg {...base} className={p.className}>
+    <rect x="2" y="4" width="20" height="16" rx="2" />
+    <path d="m22 7-10 6L2 7" />
+  </svg>
+);
+
+export const TelegramIcon = (p: P) => (
+  <svg {...base} className={p.className}>
+    <path d="M21.5 4.3 2.9 11.5c-1 .4-1 1 .1 1.3l4.6 1.4 1.8 5.4c.2.6.1.9.7.9.5 0 .7-.2 1-.5l2.4-2.3 4.7 3.5c.9.5 1.5.2 1.7-.8l3.1-14.6c.3-1.2-.5-1.8-1.3-1.4z" />
+  </svg>
+);
+
+export const GlobeIcon = (p: P) => (
+  <svg {...base} className={p.className}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M3 12h18M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18" />
+  </svg>
+);
+
+export const MemoryIcon = (p: P) => (
+  <svg {...base} className={p.className}>
+    <path d="M12 3a5 5 0 0 0-5 5c0 1-1 1.5-1 3a3 3 0 0 0 3 3v3a2 2 0 0 0 4 0 2 2 0 0 0 4 0v-3a3 3 0 0 0 3-3c0-1.5-1-2-1-3a5 5 0 0 0-5-5 3 3 0 0 0-3 0z" />
+  </svg>
+);
+
+export const BookIcon = (p: P) => (
+  <svg {...base} className={p.className}>
+    <path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v18H6.5A2.5 2.5 0 0 0 4 22.5z" />
+    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+  </svg>
+);
