@@ -1,16 +1,46 @@
-# Himmy Agent Framework
+# Himmy
 
-**Himmy** is an **offline-first, entity-backed Python agent framework**. It composes
-LLM personas, tasks, threads, tools, context, and knowledge into auditable agent
-runs — and it does all of this with zero network access by default, using a
-deterministic stub inference path. Optional extras layer in real model providers,
-Postgres lineage storage, pgvector knowledge bases, and Logfire observability.
+**Build AI agents that run entirely on your own machine — no API keys, no cloud, every
+run replayable.**
 
-The headline idea: **everything that matters is an entity.** Personas, prompts,
-tools, agents, threads, messages, context snapshots, and run events are all
-immutable, versioned `EntityRecord`s with typed links — so any recommendation can
-be traced back to the exact persona version, prompt, evidence, and thread that
-produced it.
+Himmy is an **offline-first** Python agent framework. The default needs zero network and
+zero keys; real local models run through **Ollama** or the **Claude CLI**; cloud providers
+(OpenAI / Anthropic) are an opt-in extra, not a requirement. Under the hood every persona,
+prompt, tool, message, and run event is an immutable, versioned `EntityRecord` — so any
+answer can be traced, or **replayed exactly**, months later.
+
+### See it in 30 seconds — chat with your own docs, fully offline
+
+```bash
+pip install -e ".[knowledge]"
+ollama pull qwen2.5:3b-instruct
+cd examples/local-doc-chat
+python chat.py "How many PTO days do I get?"
+```
+
+```
+✓ ingested 3 documents into a local knowledge base — offline, no keys.
+
+you   › How many PTO days do I get?
+agent › Full-time employees accrue 20 days of paid time off per year, rolling over up
+        to 5 days. (source: handbook-pto.md)
+```
+
+No keys. No cloud. Your documents never leave the machine. → **[full example](examples/local-doc-chat/)**
+
+### Why himmy
+
+- **Offline-first** — Ollama / Claude CLI / a deterministic stub; cloud is optional, never required.
+- **Auditable + replayable** — re-run a failed agent run *exactly* from recorded model
+  responses, with the provider turned off. Most frameworks can't do this.
+- **Batteries included** — declarative agents in YAML, a [skills](#skills--capabilities-not-just-tools)
+  layer, 13 tool packs, MCP servers, memory, RAG, and multi-agent — all offline-capable.
+- **Honest about quality** — a standing benchmark runs in CI against a real local model, so
+  "did my change make agents better or worse?" is actually answerable.
+
+> **Everything that matters is an entity.** Personas, prompts, tools, threads, messages,
+> context snapshots, and run events are all immutable, versioned `EntityRecord`s with typed
+> links — the audit/lineage spine the rest of the framework is built on.
 
 ## Production capabilities
 

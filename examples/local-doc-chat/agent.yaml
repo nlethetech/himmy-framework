@@ -1,0 +1,7 @@
+# A plain offline agent — used to show record/replay (see README).
+# The doc-chat itself runs via chat.py, which pre-loads your docs into a local KB.
+name: offline-assistant
+provider: ollama
+model: qwen2.5:3b-instruct
+instructions:
+  - Answer concisely and accurately.
