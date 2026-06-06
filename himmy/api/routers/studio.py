@@ -462,6 +462,40 @@ async def eval_run(body: EvalRunRequest) -> Any:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+# ---- Workflows (declarative multi-step) ---------------------------------
+
+
+class WorkflowRunRequest(BaseModel):
+    workflow_path: str
+    agent_path: str
+    provider: str | None = None
+    model: str | None = None
+    initial_state: dict[str, Any] = {}
+
+
+@router.get("/workflows")
+async def workflows() -> list[Any]:
+    from himmy.api import studio_workflows
+
+    return studio_workflows.discover_workflows()
+
+
+@router.post("/workflows/run")
+async def workflow_run(body: WorkflowRunRequest) -> Any:
+    from himmy.api import studio_workflows
+
+    try:
+        return await studio_workflows.run_workflow(
+            body.workflow_path,
+            body.agent_path,
+            provider=body.provider,
+            model=body.model,
+            initial_state=body.initial_state,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ---- Agent authoring (the no-code builder) ------------------------------
 
 

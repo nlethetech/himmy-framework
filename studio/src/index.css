@@ -2867,3 +2867,49 @@ label.field > .hint {
   padding: var(--sp-2) var(--sp-3);
   white-space: pre-wrap;
 }
+
+/* ---- Workflows --------------------------------------------------------- */
+.wf-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.wf-step {
+  display: flex;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+}
+.wf-step-num {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--brand-soft);
+  color: var(--brand);
+  display: grid;
+  place-items: center;
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  flex: none;
+}
+.wf-step-body {
+  flex: 1;
+  min-width: 0;
+}
+.wf-step-name {
+  font-weight: 600;
+  font-size: var(--fs-md);
+}
+.wf-step-task {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.wf-step-tools {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}

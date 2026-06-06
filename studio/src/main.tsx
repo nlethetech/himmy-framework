@@ -14,6 +14,7 @@ import Memory from "./screens/Memory";
 import Knowledge from "./screens/Knowledge";
 import Teams from "./screens/Teams";
 import Evaluation from "./screens/Evaluation";
+import Workflows from "./screens/Workflows";
 import ComingSoon from "./screens/ComingSoon";
 import "./index.css";
 
@@ -35,15 +36,7 @@ const router = createBrowserRouter([
       { path: "connections", element: <Connections /> },
       { path: "advanced/doctor", element: <Doctor /> },
       { path: "advanced/teams", element: <Teams /> },
-      {
-        path: "advanced/workflows",
-        element: (
-          <ComingSoon
-            title="Workflows"
-            note="Deterministic multi-step workflows (himmy.orchestrators) run via the CLI today. A DAG editor + run timeline will live here."
-          />
-        ),
-      },
+      { path: "advanced/workflows", element: <Workflows /> },
       { path: "advanced/knowledge", element: <Knowledge /> },
       { path: "advanced/memory", element: <Memory /> },
       { path: "advanced/eval", element: <Evaluation /> },

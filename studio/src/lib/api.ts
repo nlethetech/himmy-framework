@@ -40,6 +40,43 @@ export const api = {
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
+// ---- Workflows -----------------------------------------------------------
+
+export interface WorkflowStepInfo {
+  name: string;
+  subtask: string;
+  tools: string[];
+  output_key: string | null;
+}
+export interface WorkflowInfo {
+  path: string;
+  name: string;
+  description: string;
+  steps: WorkflowStepInfo[];
+}
+export interface WorkflowStepResult {
+  step_name: string;
+  status: string;
+  output_text: string | null;
+}
+export interface WorkflowResult {
+  workflow_name: string;
+  status: string;
+  final_state: Record<string, unknown>;
+  step_results: WorkflowStepResult[];
+}
+export const listWorkflows = () => api.get<WorkflowInfo[]>("/workflows");
+export const runWorkflow = (
+  workflow_path: string,
+  agent_path: string,
+  provider?: string | null,
+) =>
+  api.post<WorkflowResult>("/workflows/run", {
+    workflow_path,
+    agent_path,
+    provider,
+  });
+
 // ---- Evaluation ----------------------------------------------------------
 
 export interface EvalSuiteInfo {
