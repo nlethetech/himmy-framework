@@ -851,6 +851,21 @@ def cmd_bench(args: argparse.Namespace) -> int:
     )
     cards = asyncio.run(runner.run(suite, specs))
     print(render_markdown(cards, suite_name=suite.name))
+
+    # Cache the scorecards so Studio's Doctor can show per-model reliability.
+    from datetime import datetime, timezone
+
+    from himmy.benchmark.cache import save_scorecards
+
+    try:
+        save_scorecards(
+            cards,
+            suite_name=suite.name,
+            when=datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception:  # noqa: BLE001 - caching is best-effort, never fail the run
+        pass
+
     if getattr(args, "json", None):
         Path(args.json).write_text(
             json.dumps(to_json(cards, suite_name=suite.name), indent=2),

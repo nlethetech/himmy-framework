@@ -43,6 +43,26 @@ async def doctor() -> dict:
     return collect_doctor_report().to_dict()
 
 
+@router.get("/benchmarks")
+async def benchmarks() -> dict:
+    """Cached per-model reliability scorecards (from `himmy bench` / the probe)."""
+    from himmy.api import studio_bench
+
+    return {"entries": studio_bench.list_cached()}
+
+
+@router.post("/benchmarks/probe")
+async def benchmarks_probe() -> dict:
+    """Run a quick tool-focused reliability check against detected local models.
+
+    Slow (real model calls) but bounded — a small suite against ≤3 local models, one
+    trial each. Caches the result so Doctor shows it without re-running.
+    """
+    from himmy.api import studio_bench
+
+    return await studio_bench.run_probe()
+
+
 @router.get("/agents", response_model=list[studio_service.AgentSummary])
 async def list_agents() -> list[studio_service.AgentSummary]:
     """Discover single-agent specs under the project root."""

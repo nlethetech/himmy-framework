@@ -73,6 +73,27 @@ export interface DoctorReport {
   next_step: NextStep | null;
 }
 
+export interface BenchmarkEntry {
+  model: string;
+  provider: string;
+  suite: string;
+  when: string;
+  accuracy: number;
+  accuracy_ci?: number[];
+  tool_call_accuracy: number | null;
+  p50_latency_s: number;
+  p95_latency_s: number;
+  error_rate: number;
+  total_trials: number;
+}
+
+export interface ProbeResult {
+  ran: boolean;
+  reason?: string;
+  suite?: string;
+  results: BenchmarkEntry[];
+}
+
 export interface AgentSummary {
   name: string;
   path: string;
@@ -190,12 +211,21 @@ export interface RunSummary {
   tool_count: number;
 }
 
+export interface IoCapture {
+  model: string | null;
+  messages: { role: string; content: string }[];
+  tools: string[];
+  response_text: string;
+  tool_calls: { tool: string; args: unknown }[];
+}
+
 export interface TimelineStep {
   seq: number;
   type: string;
   label: string;
   detail: string;
   ts: string | null;
+  io: IoCapture | null;
 }
 
 export interface TranscriptMessage {

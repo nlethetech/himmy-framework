@@ -1,7 +1,107 @@
 import { useEffect, useState } from "react";
-import { api, type DoctorReport } from "../lib/api";
+import {
+  api,
+  type DoctorReport,
+  type BenchmarkEntry,
+  type ProbeResult,
+} from "../lib/api";
 import { Topbar, Page, Loading, ErrorState } from "../components/Page";
 import { CheckIcon, XIcon, RefreshIcon } from "../components/icons";
+
+function pct(x: number | null): string {
+  return x == null ? "—" : `${Math.round(x * 100)}%`;
+}
+function accClass(x: number | null): "ok" | "warn" | "err" | "dim" {
+  if (x == null) return "dim";
+  if (x >= 0.8) return "ok";
+  if (x >= 0.55) return "warn";
+  return "err";
+}
+
+function Benchmarks() {
+  const [entries, setEntries] = useState<BenchmarkEntry[]>([]);
+  const [running, setRunning] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  const load = () =>
+    api
+      .get<{ entries: BenchmarkEntry[] }>("/benchmarks")
+      .then((r) => setEntries(r.entries))
+      .catch(() => {});
+  useEffect(() => {
+    load();
+  }, []);
+
+  const probe = async () => {
+    setRunning(true);
+    setNote(null);
+    try {
+      const r = await api.post<ProbeResult>("/benchmarks/probe", {});
+      if (!r.ran) setNote(r.reason ?? "No local models detected.");
+      else await load();
+    } catch (e) {
+      setNote(String(e instanceof Error ? e.message : e));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h2>Model reliability</h2>
+        <button className="btn" onClick={probe} disabled={running}>
+          {running ? <span className="spinner" /> : <RefreshIcon />}
+          {running ? "Running…" : "Run quick check"}
+        </button>
+      </div>
+      {running && (
+        <div className="statrow dim" style={{ fontSize: 12.5 }}>
+          Running a small tool-focused suite against your local models — this calls the
+          models for real, so it can take a minute.
+        </div>
+      )}
+      {note && (
+        <div className="statrow" style={{ color: "var(--warn)", fontSize: 13 }}>
+          {note}
+        </div>
+      )}
+      {entries.length === 0 && !running ? (
+        <div className="statrow dim" style={{ fontSize: 13 }}>
+          No benchmarks yet. Run a quick check, or{" "}
+          <code>himmy bench --models ollama:qwen2.5:3b-instruct</code>.
+        </div>
+      ) : (
+        <>
+          <div className="statrow" style={{ color: "var(--text-dim)", fontSize: 11.5, textTransform: "uppercase", letterSpacing: 0.5 }}>
+            <span style={{ flex: 1 }}>model</span>
+            <span style={{ width: 90, textAlign: "right" }}>tool-call</span>
+            <span style={{ width: 70, textAlign: "right" }}>accuracy</span>
+            <span style={{ width: 70, textAlign: "right" }}>p50</span>
+          </div>
+          {entries.map((e) => (
+            <div className="statrow" key={`${e.model}:${e.suite}`}>
+              <span className="name mono" style={{ flex: 1, fontSize: 12.5 }}>
+                {e.model}
+              </span>
+              <span style={{ width: 90, textAlign: "right" }}>
+                <span className={"pill " + accClass(e.tool_call_accuracy)}>
+                  {pct(e.tool_call_accuracy)}
+                </span>
+              </span>
+              <span className="mono" style={{ width: 70, textAlign: "right", fontSize: 12.5 }}>
+                {pct(e.accuracy)}
+              </span>
+              <span className="dim mono" style={{ width: 70, textAlign: "right", fontSize: 12 }}>
+                {e.p50_latency_s.toFixed(1)}s
+              </span>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
 
 function Status({ ok }: { ok: boolean }) {
   return ok ? (
@@ -107,6 +207,8 @@ export default function Doctor() {
                 ))}
               </div>
             </div>
+
+            <Benchmarks />
 
             <div className="card card-pad">
               <div className="row spread">
