@@ -154,6 +154,19 @@ export type RunEvent =
     }
   | { type: "delegate"; worker: string; task: string; from?: string | null }
   | { type: "handoff"; to: string; from?: string | null }
+  | {
+      type: "usage";
+      agent?: string | null;
+      model: string;
+      input_tokens: number;
+      output_tokens: number;
+      cost: number;
+      latency_ms?: number | null;
+      total_input_tokens: number;
+      total_output_tokens: number;
+      total_cost: number;
+      inferences: number;
+    }
   | { type: "message"; text: string }
   | {
       type: "done";
@@ -220,6 +233,47 @@ export interface RunSummary {
   status: string;
   duration_ms: number | null;
   tool_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+}
+
+export interface ModelUsage {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+  inferences: number;
+}
+
+export interface ModelAnalytics {
+  model: string;
+  runs: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+}
+
+export interface DayAnalytics {
+  day: string;
+  runs: number;
+  cost: number;
+  tokens: number;
+}
+
+export interface RunAnalytics {
+  total_runs: number;
+  ok_runs: number;
+  error_runs: number;
+  success_rate: number;
+  total_cost: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  avg_latency_ms: number;
+  p50_latency_ms: number;
+  p95_latency_ms: number;
+  by_model: ModelAnalytics[];
+  by_day: DayAnalytics[];
 }
 
 export interface IoCapture {
@@ -270,6 +324,7 @@ export interface RunDetailT extends RunSummary {
   messages: TranscriptMessage[];
   timeline: TimelineStep[];
   steps: CognitionStep[];
+  usage_by_model: ModelUsage[];
 }
 
 export interface RunListResponse {

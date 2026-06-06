@@ -85,6 +85,38 @@ def test_claude_cli_runs_and_captures_output() -> None:
     assert "hello" in captured["stdin"]
 
 
+def test_claude_cli_parses_json_usage_and_cost() -> None:
+    """With JSON output the CLI's token usage + total_cost_usd are surfaced."""
+    import json
+
+    captured: dict[str, Any] = {}
+
+    def runner(argv: list[str], stdin: str) -> str:
+        captured["argv"] = argv
+        return json.dumps(
+            {
+                "type": "result",
+                "result": "pong",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 12,
+                    "cache_read_input_tokens": 20,
+                },
+                "total_cost_usd": 0.0034,
+            }
+        )
+
+    resp = run_async(
+        ClaudeCliClientManager(model="haiku", runner=runner).generate(_req())
+    )
+    assert resp.output_text == "pong"  # the JSON envelope is unwrapped
+    assert resp.input_tokens == 120  # 100 + 20 cache-read
+    assert resp.output_tokens == 12
+    assert resp.cost == 0.0034
+    # the manager asks the CLI for JSON output
+    assert "--output-format" in captured["argv"]
+
+
 def test_claude_cli_failure_is_normalized() -> None:
     """A runner error becomes a FAILED response."""
 

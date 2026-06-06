@@ -4,6 +4,7 @@ import { api, type RunDetailT, type IoCapture } from "../lib/api";
 import { Topbar, Loading, ErrorState } from "../components/Page";
 import { Markdown } from "../components/Markdown";
 import { CognitionTrace, WorldLedger } from "../components/Cognition";
+import { RunUsage, fmtTokens, fmtUsd } from "../components/Usage";
 import { BackIcon } from "../components/icons";
 import { relativeTime, duration, statusClass } from "../lib/format";
 
@@ -95,6 +96,14 @@ export default function RunDetail() {
                   {run.tool_count > 0 && (
                     <span className="pill dim">⚙ {run.tool_count} tools</span>
                   )}
+                  {run.input_tokens + run.output_tokens > 0 && (
+                    <span className="pill dim">
+                      {fmtTokens(run.input_tokens + run.output_tokens)} tok
+                    </span>
+                  )}
+                  {run.cost > 0 && (
+                    <span className="pill dim">{fmtUsd(run.cost)}</span>
+                  )}
                 </div>
                 {run.agent_path && (
                   <div className="dim mono mt8" style={{ fontSize: 12 }}>
@@ -140,6 +149,13 @@ export default function RunDetail() {
                   </div>
                 </div>
               )}
+
+              <RunUsage
+                inputTokens={run.input_tokens}
+                outputTokens={run.output_tokens}
+                cost={run.cost}
+                byModel={run.usage_by_model}
+              />
 
               {run.tools.length > 0 && (
                 <div className="card card-pad">

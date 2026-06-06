@@ -1,12 +1,19 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api, type RunListResponse, type RunSummary } from "../lib/api";
+import {
+  api,
+  type RunListResponse,
+  type RunSummary,
+  type RunAnalytics,
+} from "../lib/api";
 import { Topbar, Page, Loading, ErrorState } from "../components/Page";
 import { RefreshIcon } from "../components/icons";
+import { AnalyticsPanel, fmtTokens, fmtUsd } from "../components/Usage";
 import { relativeTime, duration, statusClass } from "../lib/format";
 
 export default function Runs() {
   const [data, setData] = useState<RunListResponse | null>(null);
+  const [analytics, setAnalytics] = useState<RunAnalytics | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const nav = useNavigate();
@@ -19,6 +26,10 @@ export default function Runs() {
       .then(setData)
       .catch((e) => setError(String(e.message ?? e)))
       .finally(() => setLoading(false));
+    api
+      .get<RunAnalytics>("/runs/analytics")
+      .then(setAnalytics)
+      .catch(() => setAnalytics(null));
   };
   useEffect(load, []);
 
@@ -46,35 +57,52 @@ export default function Runs() {
             </div>
           </div>
         ) : data ? (
-          <div className="card">
-            {data.items.map((r: RunSummary) => (
-              <div
-                className="list-row"
-                key={r.id}
-                onClick={() => nav(`/runs/${r.id}`)}
-              >
-                <div className="lead">
-                  <div className="row gap10">
-                    <span className="title">{r.agent_name ?? "agent"}</span>
-                    <span className={"pill " + statusClass(r.status)}>
-                      <span className="dot" />
-                      {r.status}
-                    </span>
-                    {r.tool_count > 0 && (
-                      <span className="pill dim">⚙ {r.tool_count}</span>
-                    )}
+          <>
+            {analytics && <AnalyticsPanel a={analytics} />}
+            <div className="card">
+              {data.items.map((r: RunSummary) => (
+                <div
+                  className="list-row"
+                  key={r.id}
+                  onClick={() => nav(`/runs/${r.id}`)}
+                >
+                  <div className="lead">
+                    <div className="row gap10">
+                      <span className="title">{r.agent_name ?? "agent"}</span>
+                      <span className={"pill " + statusClass(r.status)}>
+                        <span className="dot" />
+                        {r.status}
+                      </span>
+                      {r.tool_count > 0 && (
+                        <span className="pill dim">⚙ {r.tool_count}</span>
+                      )}
+                    </div>
+                    <span className="meta">{r.prompt || "(no prompt)"}</span>
                   </div>
-                  <span className="meta">{r.prompt || "(no prompt)"}</span>
+                  <div className="stack gap6" style={{ textAlign: "right" }}>
+                    <span className="meta">{relativeTime(r.created_at)}</span>
+                    <span className="meta">
+                      {r.provider ?? "auto"} · {duration(r.duration_ms)}
+                      {r.input_tokens + r.output_tokens > 0 && (
+                        <>
+                          {" · "}
+                          <span className="mono">
+                            {fmtTokens(r.input_tokens + r.output_tokens)} tok
+                          </span>
+                          {r.cost > 0 && (
+                            <>
+                              {" · "}
+                              <span className="mono">{fmtUsd(r.cost)}</span>
+                            </>
+                          )}
+                        </>
+                      )}
+                    </span>
+                  </div>
                 </div>
-                <div className="stack gap6" style={{ textAlign: "right" }}>
-                  <span className="meta">{relativeTime(r.created_at)}</span>
-                  <span className="meta">
-                    {r.provider ?? "auto"} · {duration(r.duration_ms)}
-                  </span>
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          </>
         ) : null}
       </Page>
     </>

@@ -23,6 +23,21 @@ def _tool_event(name: str, *, outcome: str = "success", **payload) -> RunEvent:
     )
 
 
+def _inference_event(
+    *, model: str, in_tok: int, out_tok: int, cost: float, latency: float
+) -> RunEvent:
+    return RunEvent(
+        event_type=EventType.INFERENCE_SUCCEEDED,
+        latency_ms=latency,
+        cost=cost,
+        payload={
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "io": {"model": model},
+        },
+    )
+
+
 def test_tool_frame_carries_args_result_intent_latency() -> None:
     cog = ss._Cognition({"egg_totals": True}, "livestock")
     frames = cog.frames(
@@ -90,6 +105,99 @@ def test_agent_switch_and_delegate_are_tracked() -> None:
     assert cog.delegate_answers == [("livestock", "245")]
     kinds = [s["kind"] for s in cog.steps]
     assert kinds == ["agent", "delegate"]
+
+
+def test_inference_events_emit_usage_frames_and_accumulate() -> None:
+    cog = ss._Cognition({}, "manager")
+    f1 = cog.frames(
+        _inference_event(
+            model="claude:sonnet", in_tok=100, out_tok=20, cost=0.01, latency=900.0
+        )
+    )
+    usage = [f for f in f1 if f["type"] == "usage"]
+    assert usage and usage[0]["total_cost"] == 0.01
+    assert usage[0]["total_input_tokens"] == 100
+    # a second inference on another model accumulates + splits per model
+    cog.frames(
+        _inference_event(
+            model="ollama:qwen", in_tok=50, out_tok=10, cost=0.0, latency=300.0
+        )
+    )
+    assert cog.input_tokens == 150
+    assert cog.output_tokens == 30
+    assert cog.cost == 0.01
+    by_model = {u["model"]: u for u in cog.usage_by_model}
+    assert set(by_model) == {"claude:sonnet", "ollama:qwen"}
+    assert by_model["claude:sonnet"]["cost"] == 0.01
+    assert by_model["ollama:qwen"]["inferences"] == 1
+
+
+def test_analytics_rolls_up_cost_latency_and_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    reset_run_store()
+    from himmy.api.studio_runs import (
+        ModelUsage,
+        StudioRun,
+        get_run_store,
+    )
+
+    store = get_run_store()
+    store.save(
+        StudioRun(
+            id="r1",
+            created_at="2026-06-01T10:00:00+00:00",
+            status="ok",
+            model="claude:sonnet",
+            duration_ms=1000.0,
+            input_tokens=100,
+            output_tokens=20,
+            cost=0.01,
+            usage_by_model=[
+                ModelUsage(
+                    model="claude:sonnet",
+                    input_tokens=100,
+                    output_tokens=20,
+                    cost=0.01,
+                    inferences=1,
+                )
+            ],
+        )
+    )
+    store.save(
+        StudioRun(
+            id="r2",
+            created_at="2026-06-02T10:00:00+00:00",
+            status="error",
+            model="ollama:qwen",
+            duration_ms=3000.0,
+            input_tokens=50,
+            output_tokens=5,
+            cost=0.0,
+            usage_by_model=[
+                ModelUsage(
+                    model="ollama:qwen",
+                    input_tokens=50,
+                    output_tokens=5,
+                    cost=0.0,
+                    inferences=1,
+                )
+            ],
+        )
+    )
+
+    a = store.analytics()
+    assert a.total_runs == 2
+    assert a.ok_runs == 1 and a.error_runs == 1
+    assert a.success_rate == 0.5
+    assert abs(a.total_cost - 0.01) < 1e-9
+    assert a.total_input_tokens == 150
+    assert a.p50_latency_ms in (1000.0, 3000.0)
+    assert a.p95_latency_ms == 3000.0
+    models = {m.model: m for m in a.by_model}
+    assert models["claude:sonnet"].cost == 0.01
+    assert {d.day for d in a.by_day} == {"2026-06-01", "2026-06-02"}
 
 
 def test_recorded_steps_round_trip_through_the_store(

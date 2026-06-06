@@ -316,6 +316,32 @@ class OllamaClientManager:
             return response.json()  # type: ignore[no-any-return]
 
 
+def _parse_cli_output(out: str) -> tuple[str, int, int, float]:
+    """Parse ``claude`` CLI stdout → (text, input_tokens, output_tokens, cost_usd).
+
+    With ``--output-format json`` the CLI emits a result object carrying ``result``,
+    ``usage``, and ``total_cost_usd``. A plain-text reply (test runner / older CLI)
+    falls back to (text, 0, 0, 0.0) so behaviour is unchanged when usage is absent.
+    """
+    text = out.strip()
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text, 0, 0, 0.0
+    if not isinstance(data, dict) or "result" not in data:
+        return text, 0, 0, 0.0
+    result = str(data.get("result") or "")
+    usage = data.get("usage") or {}
+    in_tok = int(usage.get("input_tokens", 0) or 0)
+    # Cache reads/creates are billed input the CLI breaks out separately; fold
+    # them in so the token count matches what was actually charged.
+    in_tok += int(usage.get("cache_read_input_tokens", 0) or 0)
+    in_tok += int(usage.get("cache_creation_input_tokens", 0) or 0)
+    out_tok = int(usage.get("output_tokens", 0) or 0)
+    cost = float(data.get("total_cost_usd", 0.0) or 0.0)
+    return result.strip(), in_tok, out_tok, cost
+
+
 class ClaudeCliClientManager:
     """A :class:`ClientManager` that drives the local ``claude`` CLI (Claude Max)."""
 
@@ -346,10 +372,18 @@ class ClaudeCliClientManager:
         return self._registry.get(model_key, model_key)
 
     async def generate(self, request: InferenceRequest) -> InferenceResponse:
-        """Run ``claude -p --model <m>`` with the prompt on stdin; capture stdout."""
+        """Run ``claude -p --model <m>`` with the prompt on stdin; capture stdout.
+
+        Requests ``--output-format json`` so the CLI reports real token usage +
+        ``total_cost_usd`` (powering the cost/token HUD). A plain-text reply (e.g. a
+        test runner, or an older CLI) is still accepted via :func:`_parse_cli_output`.
+        """
         model = self.resolve(request.model_key)
         started = time.perf_counter()
-        argv = [self._executable, "-p", "--model", model, *self._extra_args]
+        argv = [self._executable, "-p", "--model", model]
+        if not any("--output-format" in a for a in self._extra_args):
+            argv += ["--output-format", "json"]
+        argv += self._extra_args
         prompt = _compose_prompt(request)
         if request.bound_tools:
             # Text-only CLI: a best-effort ReAct protocol the runtime loop drives.
@@ -364,7 +398,7 @@ class ClaudeCliClientManager:
                 model_path=f"claude-cli:{model}",
                 started=started,
             )
-        text = out.strip()
+        text, in_tok, out_tok, cli_cost = _parse_cli_output(out)
         tool_calls = (
             parse_text_tool_calls(text, {t.name for t in request.bound_tools})
             if request.bound_tools
@@ -379,7 +413,9 @@ class ClaudeCliClientManager:
             tool_returns=tool_returns,
             model_path=f"claude-cli:{model}",
             provider_name=self.provider_name,
-            cost=0.0,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cost=cli_cost,
             latency_ms=(time.perf_counter() - started) * 1000.0,
         )
 

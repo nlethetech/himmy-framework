@@ -17,6 +17,12 @@ import {
   type CogStep,
   type GraphMember,
 } from "../components/Cognition";
+import {
+  UsageHud,
+  emptyUsage,
+  foldUsage,
+  type LiveUsage,
+} from "../components/Usage";
 import { SendIcon, RefreshIcon, PlusIcon } from "../components/icons";
 
 // Domain-agnostic starter prompts for the empty state (fill the input, don't send).
@@ -40,6 +46,7 @@ interface Msg {
   steps?: CogStep[];
   active?: string | null; // currently-active agent (for the team graph)
   team?: boolean;
+  usage?: LiveUsage;
   streaming?: boolean;
   runId?: string;
 }
@@ -121,7 +128,14 @@ export default function Chat() {
     setMessages((m) => [
       ...m,
       { role: "user", text: prompt },
-      { role: "agent", text: "", streaming: true, steps: [], team: isTeam },
+      {
+        role: "agent",
+        text: "",
+        streaming: true,
+        steps: [],
+        team: isTeam,
+        usage: emptyUsage(),
+      },
     ]);
     setBusy(true);
 
@@ -167,6 +181,12 @@ export default function Chat() {
         case "handoff":
           patchLast((m) => ({ ...m, active: e.to }));
           addStep({ kind: "handoff", to: e.to, agent: e.from });
+          break;
+        case "usage":
+          patchLast((m) => ({
+            ...m,
+            usage: foldUsage(m.usage ?? emptyUsage(), e),
+          }));
           break;
         case "message":
           patchLast((m) => ({ ...m, text: e.text }));
@@ -309,6 +329,9 @@ export default function Chat() {
                     )}
                   {m.steps && m.steps.length > 0 && (
                     <CognitionTrace steps={m.steps} />
+                  )}
+                  {m.role === "agent" && m.usage && (
+                    <UsageHud usage={m.usage} live={m.streaming} />
                   )}
                   {m.text &&
                     (m.role === "agent" ? (

@@ -18,24 +18,38 @@ from pydantic import BaseModel
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS studio_runs (
-    id          TEXT PRIMARY KEY,
-    created_at  TEXT NOT NULL,
-    agent_name  TEXT,
-    agent_path  TEXT,
-    provider    TEXT,
-    model       TEXT,
-    prompt      TEXT,
-    output      TEXT,
-    status      TEXT NOT NULL DEFAULT 'ok',
-    duration_ms REAL,
-    thread_id   TEXT,
-    tools       TEXT NOT NULL DEFAULT '[]',
-    messages    TEXT NOT NULL DEFAULT '[]',
-    timeline    TEXT NOT NULL DEFAULT '[]',
-    steps       TEXT NOT NULL DEFAULT '[]'
+    id            TEXT PRIMARY KEY,
+    created_at    TEXT NOT NULL,
+    agent_name    TEXT,
+    agent_path    TEXT,
+    provider      TEXT,
+    model         TEXT,
+    prompt        TEXT,
+    output        TEXT,
+    status        TEXT NOT NULL DEFAULT 'ok',
+    duration_ms   REAL,
+    thread_id     TEXT,
+    tools         TEXT NOT NULL DEFAULT '[]',
+    messages      TEXT NOT NULL DEFAULT '[]',
+    timeline      TEXT NOT NULL DEFAULT '[]',
+    steps         TEXT NOT NULL DEFAULT '[]',
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost          REAL NOT NULL DEFAULT 0,
+    usage_by_model TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS studio_runs_created_idx ON studio_runs (created_at);
 """
+
+# Columns added after the table first shipped — applied by _migrate() with a
+# matching SQL type so an existing DB is upgraded in place.
+_LATER_COLUMNS = {
+    "steps": "TEXT NOT NULL DEFAULT '[]'",
+    "input_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "output_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "cost": "REAL NOT NULL DEFAULT 0",
+    "usage_by_model": "TEXT NOT NULL DEFAULT '[]'",
+}
 
 
 class TimelineStep(BaseModel):
@@ -94,6 +108,20 @@ class StudioRunSummary(BaseModel):
     status: str = "ok"
     duration_ms: float | None = None
     tool_count: int = 0
+    # Usage rollup (surfaced in the list + analytics).
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost: float = 0.0
+
+
+class ModelUsage(BaseModel):
+    """Per-model token + cost rollup for one run (teams touch several models)."""
+
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost: float = 0.0
+    inferences: int = 0
 
 
 class StudioRun(StudioRunSummary):
@@ -105,6 +133,7 @@ class StudioRun(StudioRunSummary):
     messages: list[TranscriptMessage] = []
     timeline: list[TimelineStep] = []
     steps: list[CognitionStep] = []  # the cognition trace (think → act → observe)
+    usage_by_model: list[ModelUsage] = []
 
 
 class StudioRunListResponse(BaseModel):
@@ -122,6 +151,59 @@ def _preview(text: str, n: int = 140) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+def _col(row: sqlite3.Row, name: str, default: Any) -> Any:
+    """Read a column that may be absent on rows written before a migration."""
+    if name in row.keys():
+        val = row[name]
+        return default if val is None else val
+    return default
+
+
+def _pct(values: list[float], q: float) -> float:
+    """The q-th percentile (0–1) by nearest-rank, on an unsorted list."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    k = max(0, min(len(ordered) - 1, int(round(q * (len(ordered) - 1)))))
+    return ordered[k]
+
+
+class ModelAnalytics(BaseModel):
+    """Per-model rollup across all runs."""
+
+    model: str
+    runs: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost: float = 0.0
+
+
+class DayAnalytics(BaseModel):
+    """One day's rollup (for the cost-over-time chart)."""
+
+    day: str  # YYYY-MM-DD
+    runs: int = 0
+    cost: float = 0.0
+    tokens: int = 0
+
+
+class RunAnalytics(BaseModel):
+    """Aggregate stats across all runs — powers the analytics dashboard."""
+
+    total_runs: int = 0
+    ok_runs: int = 0
+    error_runs: int = 0
+    success_rate: float = 0.0  # 0–1
+    total_cost: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    avg_latency_ms: float = 0.0
+    p50_latency_ms: float = 0.0
+    p95_latency_ms: float = 0.0
+    by_model: list[ModelAnalytics] = []
+    by_day: list[DayAnalytics] = []
+
+
 class StudioRunStore:
     """A durable SQLite store of Studio runs (stdlib sqlite3)."""
 
@@ -133,23 +215,23 @@ class StudioRunStore:
         self._conn.commit()
 
     def _migrate(self) -> None:
-        """Add columns introduced after a DB was first created (e.g. ``steps``)."""
+        """Add columns introduced after a DB was first created (steps, usage)."""
         cols = {
             r["name"]
             for r in self._conn.execute("PRAGMA table_info(studio_runs)").fetchall()
         }
-        if "steps" not in cols:
-            self._conn.execute(
-                "ALTER TABLE studio_runs ADD COLUMN steps TEXT NOT NULL DEFAULT '[]'"
-            )
+        for name, decl in _LATER_COLUMNS.items():
+            if name not in cols:
+                self._conn.execute(f"ALTER TABLE studio_runs ADD COLUMN {name} {decl}")
 
     def save(self, run: StudioRun) -> None:
         """Insert (or replace) one run record."""
         self._conn.execute(
             "INSERT OR REPLACE INTO studio_runs (id, created_at, agent_name, "
             "agent_path, provider, model, prompt, output, status, duration_ms, "
-            "thread_id, tools, messages, timeline, steps) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "thread_id, tools, messages, timeline, steps, input_tokens, "
+            "output_tokens, cost, usage_by_model) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 run.id,
                 run.created_at,
@@ -166,6 +248,10 @@ class StudioRunStore:
                 json.dumps([m.model_dump() for m in run.messages]),
                 json.dumps([s.model_dump() for s in run.timeline]),
                 json.dumps([s.model_dump() for s in run.steps]),
+                run.input_tokens,
+                run.output_tokens,
+                run.cost,
+                json.dumps([u.model_dump() for u in run.usage_by_model]),
             ),
         )
         self._conn.commit()
@@ -188,6 +274,79 @@ class StudioRunStore:
         ).fetchone()
         return self._full(row) if row else None
 
+    def analytics(self, limit: int = 1000) -> RunAnalytics:
+        """Aggregate stats over the most recent ``limit`` runs.
+
+        Computed in Python (percentiles + per-model rollup from the usage JSON)
+        over a bounded window — fine for the local single-user store.
+        """
+        rows = self._conn.execute(
+            "SELECT created_at, status, duration_ms, cost, input_tokens, "
+            "output_tokens, model, usage_by_model FROM studio_runs "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        if not rows:
+            return RunAnalytics()
+
+        ok = sum(1 for r in rows if r["status"] == "ok")
+        latencies = [float(r["duration_ms"]) for r in rows if r["duration_ms"]]
+        by_model: dict[str, ModelAnalytics] = {}
+        by_day: dict[str, DayAnalytics] = {}
+        total_cost = total_in = total_out = 0.0
+
+        for r in rows:
+            total_cost += float(_col(r, "cost", 0.0) or 0.0)
+            total_in += int(_col(r, "input_tokens", 0) or 0)
+            total_out += int(_col(r, "output_tokens", 0) or 0)
+
+            # per-day rollup
+            day = str(r["created_at"])[:10]
+            d = by_day.setdefault(day, DayAnalytics(day=day))
+            d.runs += 1
+            d.cost += float(_col(r, "cost", 0.0) or 0.0)
+            d.tokens += int(_col(r, "input_tokens", 0) or 0) + int(
+                _col(r, "output_tokens", 0) or 0
+            )
+
+            # per-model rollup: prefer the detailed usage_by_model breakdown,
+            # falling back to the run's headline model for older rows.
+            breakdown = json.loads(_col(r, "usage_by_model", "[]") or "[]")
+            if breakdown:
+                for u in breakdown:
+                    name = u.get("model") or r["model"] or "unknown"
+                    m = by_model.setdefault(name, ModelAnalytics(model=name))
+                    m.runs += 0  # counted once below
+                    m.input_tokens += int(u.get("input_tokens", 0))
+                    m.output_tokens += int(u.get("output_tokens", 0))
+                    m.cost += float(u.get("cost", 0.0))
+                for name in {
+                    u.get("model") or r["model"] or "unknown" for u in breakdown
+                }:
+                    by_model[name].runs += 1
+            else:
+                name = r["model"] or "unknown"
+                m = by_model.setdefault(name, ModelAnalytics(model=name))
+                m.runs += 1
+                m.input_tokens += int(_col(r, "input_tokens", 0) or 0)
+                m.output_tokens += int(_col(r, "output_tokens", 0) or 0)
+                m.cost += float(_col(r, "cost", 0.0) or 0.0)
+
+        return RunAnalytics(
+            total_runs=len(rows),
+            ok_runs=ok,
+            error_runs=len(rows) - ok,
+            success_rate=ok / len(rows),
+            total_cost=total_cost,
+            total_input_tokens=int(total_in),
+            total_output_tokens=int(total_out),
+            avg_latency_ms=(sum(latencies) / len(latencies)) if latencies else 0.0,
+            p50_latency_ms=_pct(latencies, 0.50),
+            p95_latency_ms=_pct(latencies, 0.95),
+            by_model=sorted(by_model.values(), key=lambda m: m.cost, reverse=True),
+            by_day=[by_day[k] for k in sorted(by_day)],
+        )
+
     def close(self) -> None:
         self._conn.close()
 
@@ -205,6 +364,9 @@ class StudioRunStore:
             status=row["status"],
             duration_ms=row["duration_ms"],
             tool_count=len(json.loads(row["tools"] or "[]")),
+            input_tokens=_col(row, "input_tokens", 0),
+            output_tokens=_col(row, "output_tokens", 0),
+            cost=_col(row, "cost", 0.0),
         )
 
     @staticmethod
@@ -232,6 +394,13 @@ class StudioRunStore:
                 for s in json.loads(
                     (row["steps"] if "steps" in row.keys() else None) or "[]"
                 )
+            ],
+            input_tokens=_col(row, "input_tokens", 0),
+            output_tokens=_col(row, "output_tokens", 0),
+            cost=_col(row, "cost", 0.0),
+            usage_by_model=[
+                ModelUsage(**u)
+                for u in json.loads(_col(row, "usage_by_model", "[]") or "[]")
             ],
             tool_count=len(json.loads(row["tools"] or "[]")),
         )
@@ -275,6 +444,10 @@ __all__ = [
     "StudioRunListResponse",
     "TimelineStep",
     "CognitionStep",
+    "ModelUsage",
+    "RunAnalytics",
+    "ModelAnalytics",
+    "DayAnalytics",
     "TranscriptMessage",
     "StudioRunStore",
     "get_run_store",

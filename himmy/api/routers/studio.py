@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from himmy.api import studio_agents, studio_service
 from himmy.api.studio_runs import (
+    RunAnalytics,
     StudioRun,
     StudioRunListResponse,
     get_run_store,
@@ -193,6 +194,12 @@ async def list_runs(limit: int = 50, offset: int = 0) -> StudioRunListResponse:
         offset=offset,
         next_offset=(offset + len(items)) if offset + len(items) < total else None,
     )
+
+
+@router.get("/runs/analytics", response_model=RunAnalytics)
+async def runs_analytics() -> RunAnalytics:
+    """Aggregate cost/token/latency stats across runs (the analytics dashboard)."""
+    return get_run_store().analytics()
 
 
 @router.get("/runs/{run_id}", response_model=StudioRun)

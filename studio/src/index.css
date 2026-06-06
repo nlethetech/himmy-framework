@@ -1088,6 +1088,223 @@ label.field > .hint {
   text-anchor: middle;
 }
 
+/* ---- Live cost/token/latency HUD ------------------------------------ */
+.hud {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  margin: 8px 0;
+  padding: 7px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  font-size: 12px;
+}
+.hud.live {
+  border-color: var(--border-accent);
+}
+.hud-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text);
+}
+.hud-item.cost .mono {
+  color: var(--warn);
+}
+.hud-ico {
+  font-size: 12px;
+  opacity: 0.9;
+}
+.hud-arrow {
+  color: var(--text-dim);
+  margin: 0 3px;
+}
+.hud-dim {
+  color: var(--text-dim);
+}
+.hud-model {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+/* ---- Per-run usage (RunDetail) -------------------------------------- */
+.usage-grid {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+.usage-cell {
+  flex: 1;
+  text-align: center;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 6px;
+}
+.usage-num {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--cyan);
+}
+.usage-lab {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 2px;
+}
+.usage-models {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.usage-model-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+}
+.usage-model-name {
+  flex: 1;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-model-tok {
+  color: var(--text-dim);
+}
+.usage-model-cost {
+  color: var(--warn);
+  min-width: 56px;
+  text-align: right;
+}
+
+/* ---- Analytics dashboard (Runs header) ------------------------------ */
+.analytics {
+  margin-bottom: 16px;
+}
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.kpi {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 10px;
+  text-align: center;
+}
+.kpi-val {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+}
+.kpi.ok .kpi-val {
+  color: var(--ok);
+}
+.kpi.warn .kpi-val {
+  color: var(--warn);
+}
+.kpi.err .kpi-val {
+  color: var(--err);
+}
+.kpi-lab {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 3px;
+}
+.analytics-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.analytics-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.analytics-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.spark {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 72px;
+}
+.spark-bar {
+  flex: 1;
+  min-width: 3px;
+  background: var(--cyan);
+  border-radius: 2px 2px 0 0;
+  opacity: 0.8;
+  transition: opacity 0.15s;
+}
+.spark-bar:hover {
+  opacity: 1;
+}
+.spark-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 5px;
+}
+.model-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  padding: 5px 0;
+  border-top: 1px solid var(--border);
+}
+.model-row:first-child {
+  border-top: none;
+}
+.model-name {
+  flex: 1;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-runs {
+  color: var(--text-dim);
+}
+.model-tok {
+  color: var(--text-muted);
+  min-width: 54px;
+  text-align: right;
+}
+.model-cost {
+  color: var(--warn);
+  min-width: 56px;
+  text-align: right;
+}
+
 .chat-compose {
   border-top: 1px solid var(--border);
   padding: 13px 24px 18px;

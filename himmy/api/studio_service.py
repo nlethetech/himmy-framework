@@ -224,13 +224,46 @@ class _Cognition:
         self._E = EventType
         self._read_only = read_only
         self.active = initial_agent
+        self.active_model: str | None = None
         self.tools_used: list[str] = []
         self.delegate_answers: list[tuple[str, str]] = []
         self.steps: list[dict[str, Any]] = []
+        # Usage rollup (tokens/cost/latency) accumulated across inferences.
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cost = 0.0
+        self.inferences = 0
+        self._latencies: list[float] = []
+        self._by_model: dict[str, dict[str, Any]] = {}
 
     def _record(self, **kw: Any) -> None:
         kw["seq"] = len(self.steps) + 1
         self.steps.append(kw)
+
+    def _account(self, model: str, in_tok: int, out_tok: int, cost: float) -> None:
+        """Fold one inference into the run-level + per-model usage rollup."""
+        self.input_tokens += in_tok
+        self.output_tokens += out_tok
+        self.cost += cost
+        self.inferences += 1
+        m = self._by_model.setdefault(
+            model,
+            {
+                "model": model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost": 0.0,
+                "inferences": 0,
+            },
+        )
+        m["input_tokens"] += in_tok
+        m["output_tokens"] += out_tok
+        m["cost"] += cost
+        m["inferences"] += 1
+
+    @property
+    def usage_by_model(self) -> list[dict[str, Any]]:
+        return list(self._by_model.values())
 
     def _intent(self, name: str) -> bool | None:
         ro = self._read_only.get(name)
@@ -250,18 +283,45 @@ class _Cognition:
 
         if et == E.AGENT_RUN_STARTED:
             name = payload.get("persona_name")
+            model = payload.get("model_key")
+            if model:
+                self.active_model = model
             if name and name != self.active:
                 self.active = name
-                model = payload.get("model_key")
                 out.append({"type": "agent", "name": name, "model": model})
                 self._record(kind="agent", agent=name, model=model, ts=ts)
             return out
 
-        if et == E.INFERENCE_SUCCEEDED:
+        if et in (E.INFERENCE_SUCCEEDED, E.INFERENCE_FAILED):
             io = payload.get("io") or {}
-            text = (io.get("response_text") or "").strip()
+            model = io.get("model") or self.active_model or "?"
+            in_tok = int(payload.get("input_tokens") or 0)
+            out_tok = int(payload.get("output_tokens") or 0)
+            cost = float(getattr(event, "cost", None) or 0.0)
+            latency = getattr(event, "latency_ms", None)
+            if latency is not None:
+                self._latencies.append(float(latency))
+            # Account every inference (a failed call can still cost), then emit a
+            # live usage frame carrying both the delta and the running totals.
+            self._account(model, in_tok, out_tok, cost)
+            out.append(
+                {
+                    "type": "usage",
+                    "agent": self.active,
+                    "model": model,
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "cost": cost,
+                    "latency_ms": latency,
+                    "total_input_tokens": self.input_tokens,
+                    "total_output_tokens": self.output_tokens,
+                    "total_cost": self.cost,
+                    "inferences": self.inferences,
+                }
+            )
             # Reasoning that PRECEDES an action (the final answer has no tool calls
             # and is delivered as the message, not as a reasoning step).
+            text = (io.get("response_text") or "").strip()
             if text and (io.get("tool_calls") or []):
                 out.append({"type": "reason", "agent": self.active, "text": text})
                 self._record(kind="reason", agent=self.active, text=text, ts=ts)
@@ -353,6 +413,16 @@ async def _drain_cognition(
                 for frame in cog.frames(queue.get_nowait()):
                     yield frame
             break
+
+
+def _usage_of(cog: _Cognition) -> dict[str, Any]:
+    """The run-level usage rollup to persist (tokens, cost, per-model)."""
+    return {
+        "input_tokens": cog.input_tokens,
+        "output_tokens": cog.output_tokens,
+        "cost": cog.cost,
+        "by_model": cog.usage_by_model,
+    }
 
 
 def _read_only_map(registry: Any) -> dict[str, bool | None]:
@@ -506,6 +576,7 @@ async def stream_agent_run(
             tools=tools,
             events=collected_events,
             steps=cog.steps,
+            usage=_usage_of(cog),
             status=status,
             error=error_msg,
             duration_ms=duration_ms,
@@ -539,6 +610,7 @@ def _record_run(
     tools: list[str],
     events: list[Any],
     steps: list[Any] | None = None,
+    usage: dict[str, Any] | None = None,
     status: str,
     error: str | None,
     duration_ms: float,
@@ -546,6 +618,7 @@ def _record_run(
 ) -> None:
     """Build a :class:`StudioRun` and persist it (runs in a worker thread)."""
     from himmy.api.studio_runs import (
+        ModelUsage,
         StudioRun,
         TranscriptMessage,
         get_run_store,
@@ -559,6 +632,7 @@ def _record_run(
     messages.append(
         TranscriptMessage(role="assistant", content=output or (error or ""))
     )
+    usage = usage or {}
     run = StudioRun(
         id=run_id,
         created_at=utc_now_iso(),
@@ -576,6 +650,10 @@ def _record_run(
         messages=messages,
         timeline=_build_timeline(prompt, events, output, status, error),
         steps=list(steps or []),
+        input_tokens=int(usage.get("input_tokens", 0)),
+        output_tokens=int(usage.get("output_tokens", 0)),
+        cost=float(usage.get("cost", 0.0)),
+        usage_by_model=[ModelUsage(**u) for u in usage.get("by_model", [])],
     )
     get_run_store().save(run)
 
@@ -784,6 +862,7 @@ async def stream_team_run(
             tools=cog.tools_used,
             events=collected,
             steps=cog.steps,
+            usage=_usage_of(cog),
             status=status,
             error=error_msg,
             duration_ms=duration_ms,
@@ -816,17 +895,24 @@ def _record_team_run(
     tools: list[str],
     events: list[Any],
     steps: list[Any] | None = None,
+    usage: dict[str, Any] | None = None,
     status: str,
     error: str | None,
     duration_ms: float,
 ) -> None:
     """Persist a team run (transcript = prompt + final answer; timeline = the trail)."""
-    from himmy.api.studio_runs import StudioRun, TranscriptMessage, get_run_store
+    from himmy.api.studio_runs import (
+        ModelUsage,
+        StudioRun,
+        TranscriptMessage,
+        get_run_store,
+    )
 
     messages = [
         TranscriptMessage(role="user", content=prompt),
         TranscriptMessage(role="assistant", content=output or (error or "")),
     ]
+    usage = usage or {}
     run = StudioRun(
         id=run_id,
         created_at=utc_now_iso(),
@@ -844,6 +930,10 @@ def _record_team_run(
         messages=messages,
         timeline=_build_timeline(prompt, events, output, status, error),
         steps=list(steps or []),
+        input_tokens=int(usage.get("input_tokens", 0)),
+        output_tokens=int(usage.get("output_tokens", 0)),
+        cost=float(usage.get("cost", 0.0)),
+        usage_by_model=[ModelUsage(**u) for u in usage.get("by_model", [])],
     )
     get_run_store().save(run)
 
