@@ -115,7 +115,10 @@ def _parse_ollama_tool_calls(data: dict[str, Any]) -> list[ToolCallRecord]:
     return calls
 
 
-_REACT_CALL_RE = re.compile(r"TOOL_CALL\s+(\S+)\s+(\{.*\})", re.DOTALL)
+# Marker + tool name; the JSON args are decoded with a balanced-brace JSON decoder
+# (not a greedy regex), so prose around the call and repeated/multiple calls in one
+# reply all parse correctly instead of silently dropping the call.
+_REACT_CALL_RE = re.compile(r"TOOL_CALL\s+([^\s{]+)")
 
 
 def _react_tool_manifest(bound_tools: list[BoundTool]) -> str:
@@ -132,20 +135,43 @@ def _react_tool_manifest(bound_tools: list[BoundTool]) -> str:
     return "\n".join(lines)
 
 
+def _parse_react_tool_calls(text: str) -> list[ToolCallRecord]:
+    """Parse every ``TOOL_CALL <name> <json>`` in a text reply (text-protocol models).
+
+    Robust to prose around the marker and to multiple calls in one reply: the JSON
+    args are read with :meth:`json.JSONDecoder.raw_decode` (a balanced object that
+    ignores trailing text), not a greedy regex. Identical calls are de-duplicated so
+    a model that repeats the same line doesn't run the tool twice.
+    """
+    decoder = json.JSONDecoder()
+    calls: list[ToolCallRecord] = []
+    seen: set[str] = set()
+    for match in _REACT_CALL_RE.finditer(text):
+        rest = text[match.end():]
+        brace = rest.find("{")
+        if brace == -1:
+            continue
+        try:
+            args, _consumed = decoder.raw_decode(rest[brace:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(args, dict):
+            continue
+        name = match.group(1)
+        key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        calls.append(
+            ToolCallRecord(tool_call_id=new_uuid(), tool_name=name, args=args)
+        )
+    return calls
+
+
 def _parse_react_tool_call(text: str) -> ToolCallRecord | None:
-    """Parse a ``TOOL_CALL <name> <json>`` line from a text reply, if present."""
-    match = _REACT_CALL_RE.search(text)
-    if not match:
-        return None
-    try:
-        args = json.loads(match.group(2))
-    except json.JSONDecodeError:
-        return None
-    return ToolCallRecord(
-        tool_call_id=new_uuid(),
-        tool_name=match.group(1),
-        args=args if isinstance(args, dict) else {},
-    )
+    """The first ``TOOL_CALL`` in a reply, or None (kept for back-compat)."""
+    calls = _parse_react_tool_calls(text)
+    return calls[0] if calls else None
 
 
 async def _execute_tool_calls(
@@ -329,13 +355,14 @@ class ClaudeCliClientManager:
                 started=started,
             )
         text = out.strip()
-        call = _parse_react_tool_call(text) if request.bound_tools else None
-        tool_calls = [call] if call is not None else []
+        tool_calls = (
+            _parse_react_tool_calls(text) if request.bound_tools else []
+        )
         tool_returns = await _execute_tool_calls(request.bound_tools, tool_calls)
         return InferenceResponse(
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,
-            output_text="" if call is not None else text,
+            output_text="" if tool_calls else text,
             tool_calls=tool_calls,
             tool_returns=tool_returns,
             model_path=f"claude-cli:{model}",
