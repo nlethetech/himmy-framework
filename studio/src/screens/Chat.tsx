@@ -9,6 +9,7 @@ import {
   type RunEvent,
 } from "../lib/api";
 import { Topbar } from "../components/Page";
+import { Markdown } from "../components/Markdown";
 import { SendIcon, RefreshIcon } from "../components/icons";
 
 // Domain-agnostic starter prompts for the empty state (fill the input, don't send).
@@ -344,7 +345,12 @@ export default function Chat() {
                       ))}
                     </div>
                   )}
-                  {m.text}
+                  {m.text &&
+                    (m.role === "agent" ? (
+                      <Markdown>{m.text}</Markdown>
+                    ) : (
+                      m.text
+                    ))}
                   {m.streaming &&
                     (m.text ? (
                       <span className="caret" />

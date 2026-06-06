@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { api, type RunDetailT, type IoCapture } from "../lib/api";
 import { Topbar, Loading, ErrorState } from "../components/Page";
+import { Markdown } from "../components/Markdown";
 import { BackIcon } from "../components/icons";
 import { relativeTime, duration, statusClass } from "../lib/format";
 
@@ -113,7 +114,11 @@ export default function RunDetail() {
                       </div>
                       <div className="body">
                         <div className="who">{m.role}</div>
-                        {m.content}
+                        {m.role === "user" ? (
+                          m.content
+                        ) : (
+                          <Markdown>{m.content}</Markdown>
+                        )}
                       </div>
                     </div>
                   ))}
