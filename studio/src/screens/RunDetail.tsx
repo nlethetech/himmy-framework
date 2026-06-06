@@ -1,11 +1,128 @@
-import { Topbar, Page } from "../components/Page";
+import { useEffect, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { api, type RunDetailT } from "../lib/api";
+import { Topbar, Page, Loading, ErrorState } from "../components/Page";
+import { BackIcon } from "../components/icons";
+import { relativeTime, duration, statusClass } from "../lib/format";
 
 export default function RunDetail() {
+  const { runId } = useParams();
+  const [run, setRun] = useState<RunDetailT | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const nav = useNavigate();
+
+  useEffect(() => {
+    setLoading(true);
+    api
+      .get<RunDetailT>(`/runs/${runId}`)
+      .then(setRun)
+      .catch((e) => setError(String(e.message ?? e)))
+      .finally(() => setLoading(false));
+  }, [runId]);
+
   return (
     <>
-      <Topbar title="Run" sub="trace timeline" />
+      <Topbar
+        title={run ? run.agent_name ?? "Run" : "Run"}
+        sub={run ? relativeTime(run.created_at) : "trace timeline"}
+        actions={
+          <button className="btn" onClick={() => nav("/runs")}>
+            <BackIcon /> Back
+          </button>
+        }
+      />
       <Page>
-        <div className="empty">Trace timelines arrive in Phase 2.</div>
+        {loading ? (
+          <Loading label="Loading run…" />
+        ) : error ? (
+          <ErrorState message={error} />
+        ) : run ? (
+          <div className="grid grid-2" style={{ alignItems: "start" }}>
+            {/* Left: transcript + meta */}
+            <div className="stack gap16">
+              <div className="card card-pad">
+                <div className="row wrap gap6">
+                  <span className={"pill " + statusClass(run.status)}>
+                    <span className="dot" />
+                    {run.status}
+                  </span>
+                  <span className="pill dim">{run.provider ?? "auto"}</span>
+                  {run.model && <span className="pill dim">{run.model}</span>}
+                  <span className="pill dim">{duration(run.duration_ms)}</span>
+                  {run.tool_count > 0 && (
+                    <span className="pill dim">⚙ {run.tool_count} tools</span>
+                  )}
+                </div>
+                {run.agent_path && (
+                  <div className="dim mono mt8" style={{ fontSize: 12 }}>
+                    {run.agent_path}
+                  </div>
+                )}
+              </div>
+
+              <div className="card">
+                <div className="card-head">
+                  <h2>Transcript</h2>
+                </div>
+                <div className="card-pad stack gap16">
+                  {run.messages.map((m, i) => (
+                    <div className={"msg " + (m.role === "user" ? "user" : "agent")} key={i}>
+                      <div className="avatar">
+                        {m.role === "user" ? "you" : "H"}
+                      </div>
+                      <div className="body">
+                        <div className="who">{m.role}</div>
+                        {m.content}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {run.tools.length > 0 && (
+                <div className="card card-pad">
+                  <span className="section-title">Tools used</span>
+                  <div className="row wrap gap6">
+                    {run.tools.map((t) => (
+                      <span className="chip on" key={t}>
+                        ⚙ {t}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Right: timeline */}
+            <div className="card">
+              <div className="card-head">
+                <h2>Timeline</h2>
+                <span className="dim" style={{ fontSize: 12 }}>
+                  {run.timeline.length} steps
+                </span>
+              </div>
+              <div className="card-pad">
+                <div className="timeline">
+                  {run.timeline.map((s) => (
+                    <div className="tl-item" key={s.seq}>
+                      <div className="tl-dot" />
+                      <div className="tl-body">
+                        <div className="row spread">
+                          <span className="tl-label">{s.label}</span>
+                          {s.ts && (
+                            <span className="tl-time">{relativeTime(s.ts)}</span>
+                          )}
+                        </div>
+                        {s.detail && <div className="tl-detail">{s.detail}</div>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </Page>
     </>
   );

@@ -19,7 +19,7 @@ const router = createBrowserRouter([
       { path: "agents", element: <Builder /> },
       { path: "agents/:name", element: <Builder /> },
       { path: "runs", element: <Runs /> },
-      { path: "runs/:threadId", element: <RunDetail /> },
+      { path: "runs/:runId", element: <RunDetail /> },
       { path: "doctor", element: <Doctor /> },
     ],
   },

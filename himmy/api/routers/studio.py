@@ -22,6 +22,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from himmy.api import studio_service
+from himmy.api.studio_runs import (
+    StudioRun,
+    StudioRunListResponse,
+    get_run_store,
+)
 
 router = APIRouter(prefix="/api/studio", tags=["studio"])
 
@@ -93,6 +98,7 @@ async def run(body: RunRequest) -> StreamingResponse:
                 history=[t.model_dump() for t in body.history],
                 provider=body.provider,
                 model=body.model,
+                agent_path=body.agent_path,
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - surface as a terminal error frame
@@ -103,6 +109,32 @@ async def run(body: RunRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/runs", response_model=StudioRunListResponse)
+async def list_runs(limit: int = 50, offset: int = 0) -> StudioRunListResponse:
+    """List past Studio runs (newest first), paginated."""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    store = get_run_store()
+    items = store.list(limit=limit, offset=offset)
+    total = store.count()
+    return StudioRunListResponse(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+        next_offset=(offset + len(items)) if offset + len(items) < total else None,
+    )
+
+
+@router.get("/runs/{run_id}", response_model=StudioRun)
+async def get_run(run_id: str) -> StudioRun:
+    """Fetch one run in full: transcript, tools, and the step-by-step timeline."""
+    run = get_run_store().get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
 
 
 __all__ = ["router"]

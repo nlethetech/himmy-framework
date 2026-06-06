@@ -104,8 +104,57 @@ export type RunEvent =
   | { type: "token"; delta: string }
   | { type: "tool"; name: string }
   | { type: "message"; text: string }
-  | { type: "done"; output_text: string; thread_id: string; succeeded: boolean }
-  | { type: "error"; message: string };
+  | {
+      type: "done";
+      output_text: string;
+      thread_id: string;
+      run_id: string;
+      succeeded: boolean;
+    }
+  | { type: "error"; message: string; run_id?: string };
+
+export interface RunSummary {
+  id: string;
+  created_at: string;
+  agent_name: string | null;
+  agent_path: string | null;
+  provider: string | null;
+  model: string | null;
+  prompt: string;
+  output_preview: string;
+  status: string;
+  duration_ms: number | null;
+  tool_count: number;
+}
+
+export interface TimelineStep {
+  seq: number;
+  type: string;
+  label: string;
+  detail: string;
+  ts: string | null;
+}
+
+export interface TranscriptMessage {
+  role: string;
+  content: string;
+}
+
+export interface RunDetailT extends RunSummary {
+  output: string;
+  thread_id: string | null;
+  tools: string[];
+  messages: TranscriptMessage[];
+  timeline: TimelineStep[];
+}
+
+export interface RunListResponse {
+  items: RunSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+  next_offset: number | null;
+}
 
 // Stream an agent run over SSE (fetch + ReadableStream; EventSource can't POST).
 // Calls `onEvent` for each frame; resolves when the stream ends.

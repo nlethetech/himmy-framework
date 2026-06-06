@@ -9,6 +9,7 @@ root (the directory ``himmy studio`` was launched in).
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from himmy.config.agent_spec import AgentSpec, load_agent_spec
+from himmy.core.ids import new_uuid, utc_now_iso
 from himmy.runtime import from_spec
 
 
@@ -153,6 +155,7 @@ async def stream_agent_run(
     history: list[dict[str, Any]] | None = None,
     provider: str | None = None,
     model: str | None = None,
+    agent_path: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run an agent for one user turn, yielding GUI events.
 
@@ -196,10 +199,17 @@ async def stream_agent_run(
 
         mcp_clients = await attach_mcp_servers(registry, list(spec.mcp_servers))
 
+    run_id = new_uuid()
+    started = time.monotonic()
+    output_text = ""
+    tools: list[str] = []
+    status = "ok"
+    error_msg: str | None = None
+
     yield {"type": "start", "agent": spec.name, "streaming": not has_tools}
     try:
+        task = spec.make_task(prompt)
         if has_tools:
-            task = spec.make_task(prompt)
             loop = await runtime.run_agent_loop(
                 persona,
                 task,
@@ -208,40 +218,160 @@ async def stream_agent_run(
                 max_turns=8,
                 route_tools=spec.tool_router,
             )
-            for name in _tool_names(collected_events):
+            tools = _tool_names(collected_events)
+            for name in tools:
                 yield {"type": "tool", "name": name}
-            text = loop.final.output_text or ""
-            yield {"type": "message", "text": text}
-            yield {
-                "type": "done",
-                "output_text": text,
-                "thread_id": thread.thread_id,
-                "succeeded": bool(loop.final.succeeded)
-                if hasattr(loop.final, "succeeded")
-                else True,
-            }
+            output_text = loop.final.output_text or ""
+            yield {"type": "message", "text": output_text}
         else:
-            task = spec.make_task(prompt)
-            final_text = ""
             async for delta in runtime.stream_task(
                 persona, task, thread, llm_config=llm_config
             ):
                 if delta.delta:
-                    final_text += delta.delta
+                    output_text += delta.delta
                     yield {"type": "token", "delta": delta.delta}
                 if delta.done and delta.response is not None:
-                    final_text = delta.response.output_text or final_text
-            yield {
-                "type": "done",
-                "output_text": final_text,
-                "thread_id": thread.thread_id,
-                "succeeded": True,
-            }
+                    output_text = delta.response.output_text or output_text
+    except Exception as exc:  # noqa: BLE001 - record the failed run, then surface it
+        status = "error"
+        error_msg = str(exc)
     finally:
         if mcp_clients:
             from himmy.config.mcp_spec import close_mcp_clients
 
             await close_mcp_clients(mcp_clients)
+
+    duration_ms = (time.monotonic() - started) * 1000.0
+    # Persist the run (best-effort) so it's browsable under Runs.
+    try:
+        await asyncio.to_thread(
+            _record_run,
+            run_id=run_id,
+            spec=spec,
+            agent_path=agent_path,
+            provider=provider,
+            model=model,
+            prompt=prompt,
+            history=history,
+            output=output_text,
+            tools=tools,
+            events=collected_events,
+            status=status,
+            error=error_msg,
+            duration_ms=duration_ms,
+            thread_id=thread.thread_id,
+        )
+    except Exception:  # noqa: BLE001 - persistence must never break the stream
+        pass
+
+    if status == "error":
+        yield {"type": "error", "message": error_msg or "run failed", "run_id": run_id}
+        return
+    yield {
+        "type": "done",
+        "output_text": output_text,
+        "thread_id": thread.thread_id,
+        "run_id": run_id,
+        "succeeded": True,
+    }
+
+
+def _record_run(
+    *,
+    run_id: str,
+    spec: AgentSpec,
+    agent_path: str | None,
+    provider: str | None,
+    model: str | None,
+    prompt: str,
+    history: list[dict[str, Any]],
+    output: str,
+    tools: list[str],
+    events: list[Any],
+    status: str,
+    error: str | None,
+    duration_ms: float,
+    thread_id: str,
+) -> None:
+    """Build a :class:`StudioRun` and persist it (runs in a worker thread)."""
+    from himmy.api.studio_runs import (
+        StudioRun,
+        TranscriptMessage,
+        get_run_store,
+    )
+
+    messages = [
+        TranscriptMessage(role=str(t.get("role")), content=str(t.get("content") or ""))
+        for t in history
+    ]
+    messages.append(TranscriptMessage(role="user", content=prompt))
+    messages.append(
+        TranscriptMessage(role="assistant", content=output or (error or ""))
+    )
+    run = StudioRun(
+        id=run_id,
+        created_at=utc_now_iso(),
+        agent_name=spec.name,
+        agent_path=agent_path,
+        provider=provider or spec.provider,
+        model=(model or (spec.model if spec.model != "default" else None)),
+        prompt=prompt,
+        output=output,
+        output_preview=output,
+        status=status,
+        duration_ms=duration_ms,
+        thread_id=thread_id,
+        tools=tools,
+        messages=messages,
+        timeline=_build_timeline(prompt, events, output, status, error),
+    )
+    get_run_store().save(run)
+
+
+def _build_timeline(
+    prompt: str, events: list[Any], output: str, status: str, error: str | None
+) -> list[Any]:
+    """Compose a step-by-step timeline from synthetic bookends + runtime events."""
+    from himmy.api.studio_runs import TimelineStep
+
+    steps: list[TimelineStep] = []
+
+    def add(type_: str, label: str, detail: str = "", ts: str | None = None) -> None:
+        steps.append(
+            TimelineStep(
+                seq=len(steps) + 1, type=type_, label=label, detail=detail, ts=ts
+            )
+        )
+
+    add("run_started", "Run started", _trim(prompt, 200))
+    for ev in events:
+        et = getattr(ev, "event_type", None)
+        name = et.value if et is not None else "event"
+        payload = getattr(ev, "payload", None) or {}
+        ts = getattr(ev, "timestamp", None)
+        add(name.lower(), name.replace("_", " ").title(), _summarize_payload(payload), ts)
+    if status == "ok":
+        add("run_completed", "Completed", _trim(output, 200))
+    else:
+        add("run_failed", "Failed", error or "")
+    return steps
+
+
+def _trim(text: str, n: int) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _summarize_payload(payload: dict[str, Any]) -> str:
+    """A compact one-line summary of a run event's payload."""
+    if not payload:
+        return ""
+    for key in ("tool", "name", "tool_name", "summary", "text", "reason"):
+        if payload.get(key):
+            return _trim(str(payload[key]), 160)
+    import json
+
+    return _trim(json.dumps(payload, default=str), 160)
 
 
 def _tool_names(events: list[Any]) -> list[str]:

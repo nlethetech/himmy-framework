@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   api,
   streamRun,
@@ -21,6 +22,7 @@ interface Msg {
   text: string;
   tools?: string[];
   streaming?: boolean;
+  runId?: string;
 }
 
 export default function Chat() {
@@ -97,6 +99,7 @@ export default function Chat() {
               ...m,
               text: e.output_text || m.text,
               streaming: false,
+              runId: e.run_id,
             }));
           } else if (e.type === "error") {
             patchLast((m) => ({
@@ -240,6 +243,17 @@ export default function Chat() {
                   )}
                   {m.text}
                   {m.streaming && <span className="caret" />}
+                  {m.role === "agent" && m.runId && !m.streaming && (
+                    <div className="mt8">
+                      <Link
+                        to={`/runs/${m.runId}`}
+                        className="dim"
+                        style={{ fontSize: 12 }}
+                      >
+                        ↗ view trace
+                      </Link>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
