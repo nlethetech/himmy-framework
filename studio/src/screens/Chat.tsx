@@ -3,7 +3,9 @@ import { Link } from "react-router-dom";
 import {
   api,
   streamRun,
+  streamTeamRun,
   type AgentSummary,
+  type TeamSummary,
   type RunEvent,
 } from "../lib/api";
 import { Topbar } from "../components/Page";
@@ -17,17 +19,26 @@ const PROVIDERS = [
   { value: "pydantic-ai", label: "Cloud (key)" },
 ];
 
+interface Step {
+  label: string;
+  kind: "tool" | "delegate" | "handoff";
+}
 interface Msg {
   role: "user" | "agent";
   text: string;
-  tools?: string[];
+  steps?: Step[];
   streaming?: boolean;
   runId?: string;
 }
 
+type Pick =
+  | { kind: "agent"; item: AgentSummary }
+  | { kind: "team"; item: TeamSummary };
+
 export default function Chat() {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
-  const [agentPath, setAgentPath] = useState<string>("");
+  const [teams, setTeams] = useState<TeamSummary[]>([]);
+  const [path, setPath] = useState<string>("");
   const [provider, setProvider] = useState<string>("");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
@@ -36,17 +47,20 @@ export default function Chat() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const loadAgents = () => {
-    api
-      .get<AgentSummary[]>("/agents")
-      .then((a) => {
+  const load = () => {
+    Promise.all([
+      api.get<AgentSummary[]>("/agents"),
+      api.get<TeamSummary[]>("/teams"),
+    ])
+      .then(([a, t]) => {
         setAgents(a);
-        setAgentPath((cur) => cur || a[0]?.path || "");
+        setTeams(t);
+        setPath((cur) => cur || t[0]?.path || a[0]?.path || "");
         setLoadErr(null);
       })
       .catch((e) => setLoadErr(String(e.message ?? e)));
   };
-  useEffect(loadAgents, []);
+  useEffect(load, []);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -55,14 +69,21 @@ export default function Chat() {
     });
   }, [messages]);
 
-  const current = agents.find((a) => a.path === agentPath);
+  const picked: Pick | null = (() => {
+    const team = teams.find((t) => t.path === path);
+    if (team) return { kind: "team", item: team };
+    const agent = agents.find((a) => a.path === path);
+    if (agent) return { kind: "agent", item: agent };
+    return null;
+  })();
+  const isTeam = picked?.kind === "team";
+  const hasAny = agents.length + teams.length > 0;
 
   const send = async () => {
     const prompt = input.trim();
-    if (!prompt || !agentPath || busy) return;
+    if (!prompt || !path || busy) return;
     setInput("");
 
-    // History = the committed turns so far (exclude the in-flight assistant msg).
     const history = messages.map((m) => ({
       role: m.role === "agent" ? ("assistant" as const) : ("user" as const),
       content: m.text,
@@ -71,7 +92,7 @@ export default function Chat() {
     setMessages((m) => [
       ...m,
       { role: "user", text: prompt },
-      { role: "agent", text: "", streaming: true, tools: [] },
+      { role: "agent", text: "", streaming: true, steps: [] },
     ]);
     setBusy(true);
 
@@ -83,34 +104,55 @@ export default function Chat() {
         copy[copy.length - 1] = fn(copy[copy.length - 1]);
         return copy;
       });
+    const addStep = (s: Step) =>
+      patchLast((m) => ({ ...m, steps: [...(m.steps ?? []), s] }));
+
+    const onEvent = (e: RunEvent) => {
+      switch (e.type) {
+        case "token":
+          patchLast((m) => ({ ...m, text: m.text + e.delta }));
+          break;
+        case "tool":
+          addStep({ label: e.name, kind: "tool" });
+          break;
+        case "delegate":
+          addStep({ label: `${e.worker}${e.task ? ` — ${e.task}` : ""}`, kind: "delegate" });
+          break;
+        case "handoff":
+          addStep({ label: e.to, kind: "handoff" });
+          break;
+        case "message":
+          patchLast((m) => ({ ...m, text: e.text }));
+          break;
+        case "done":
+          patchLast((m) => ({
+            ...m,
+            text: e.output_text || m.text,
+            streaming: false,
+            runId: e.run_id,
+          }));
+          break;
+        case "error":
+          patchLast((m) => ({
+            ...m,
+            text: (m.text ? m.text + "\n\n" : "") + "⚠ " + e.message,
+            streaming: false,
+            runId: e.run_id,
+          }));
+          break;
+      }
+    };
 
     try {
-      await streamRun(
-        { agent_path: agentPath, prompt, provider: provider || null, history },
-        (e: RunEvent) => {
-          if (e.type === "token") {
-            patchLast((m) => ({ ...m, text: m.text + e.delta }));
-          } else if (e.type === "tool") {
-            patchLast((m) => ({ ...m, tools: [...(m.tools ?? []), e.name] }));
-          } else if (e.type === "message") {
-            patchLast((m) => ({ ...m, text: e.text }));
-          } else if (e.type === "done") {
-            patchLast((m) => ({
-              ...m,
-              text: e.output_text || m.text,
-              streaming: false,
-              runId: e.run_id,
-            }));
-          } else if (e.type === "error") {
-            patchLast((m) => ({
-              ...m,
-              text: (m.text ? m.text + "\n\n" : "") + "⚠ " + e.message,
-              streaming: false,
-            }));
-          }
-        },
-        ac.signal,
-      );
+      if (isTeam) {
+        await streamTeamRun({ team_path: path, prompt }, onEvent, ac.signal);
+      } else {
+        await streamRun(
+          { agent_path: path, prompt, provider: provider || null, history },
+          onEvent,
+          ac.signal,
+        );
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       patchLast((m) => ({
@@ -132,52 +174,77 @@ export default function Chat() {
     }
   };
 
+  const sub = picked
+    ? isTeam
+      ? `team · ${(picked.item as TeamSummary).members.length} agents`
+      : (picked.item as AgentSummary).description || picked.item.name
+    : "talk to an agent or team";
+
   return (
     <div className="chat-wrap">
-      <Topbar
-        title="Chat"
-        sub={current ? current.description || current.name : "talk to an agent"}
-      />
+      <Topbar title="Chat" sub={sub} />
 
       <div className="chat-bar">
         <label className="row gap6">
           <span className="dim" style={{ fontSize: 12 }}>
-            Agent
+            Run
           </span>
           <select
             className="select"
-            style={{ width: "auto", minWidth: 180 }}
-            value={agentPath}
-            onChange={(e) => setAgentPath(e.target.value)}
+            style={{ width: "auto", minWidth: 220 }}
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
           >
-            {agents.length === 0 && <option value="">No agents found</option>}
-            {agents.map((a) => (
-              <option key={a.path} value={a.path}>
-                {a.name} {a.has_tools ? "· tools" : ""} ({a.path})
-              </option>
-            ))}
+            {!hasAny && <option value="">No agents or teams found</option>}
+            {teams.length > 0 && (
+              <optgroup label="Teams (manager + workers)">
+                {teams.map((t) => (
+                  <option key={t.path} value={t.path}>
+                    {t.name} · team ({t.members.length})
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {agents.length > 0 && (
+              <optgroup label="Agents">
+                {agents.map((a) => (
+                  <option key={a.path} value={a.path}>
+                    {a.name} {a.has_tools ? "· tools" : ""}
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
         </label>
 
-        <label className="row gap6">
-          <span className="dim" style={{ fontSize: 12 }}>
-            Provider
+        {!isTeam && (
+          <label className="row gap6">
+            <span className="dim" style={{ fontSize: 12 }}>
+              Provider
+            </span>
+            <select
+              className="select"
+              style={{ width: "auto" }}
+              value={provider}
+              onChange={(e) => setProvider(e.target.value)}
+            >
+              {PROVIDERS.map((p) => (
+                <option key={p.value} value={p.value}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        {isTeam && (
+          <span className="pill dim" title="members run on their own providers">
+            {(picked!.item as TeamSummary).members
+              .map((m) => `${m.name}:${m.provider ?? "auto"}`)
+              .join("  ·  ")}
           </span>
-          <select
-            className="select"
-            style={{ width: "auto" }}
-            value={provider}
-            onChange={(e) => setProvider(e.target.value)}
-          >
-            {PROVIDERS.map((p) => (
-              <option key={p.value} value={p.value}>
-                {p.label}
-              </option>
-            ))}
-          </select>
-        </label>
+        )}
 
-        <button className="btn" onClick={loadAgents} title="Reload agents">
+        <button className="btn" onClick={load} title="Reload">
           <RefreshIcon />
         </button>
         {messages.length > 0 && (
@@ -203,7 +270,7 @@ export default function Chat() {
                 !
               </div>
               <div>
-                <div className="b-title">Couldn't load agents</div>
+                <div className="b-title">Couldn't load</div>
                 <div className="b-msg mono">{loadErr}</div>
               </div>
             </div>
@@ -211,16 +278,20 @@ export default function Chat() {
         ) : messages.length === 0 ? (
           <div className="chat-thread">
             <div className="empty">
-              {agents.length === 0 ? (
+              {!hasAny ? (
                 <>
-                  No agents found in this project.
+                  Nothing to run in this project.
                   <br />
-                  Create one in the <b>Agents</b> tab, or run{" "}
-                  <code>himmy init my-agent</code>.
+                  Create an agent in <b>Agents</b>, or drop a <code>team.yaml</code> here.
+                </>
+              ) : isTeam ? (
+                <>
+                  Running the <b>{picked!.item.name}</b> team — a manager that
+                  delegates to specialists. Ask it something.
                 </>
               ) : (
                 <>
-                  Chatting with <b>{current?.name}</b>. Say something below.
+                  Chatting with <b>{picked?.item.name}</b>. Say something below.
                 </>
               )}
             </div>
@@ -231,12 +302,19 @@ export default function Chat() {
               <div className={"msg " + m.role} key={i}>
                 <div className="avatar">{m.role === "user" ? "you" : "H"}</div>
                 <div className="body">
-                  <div className="who">{m.role === "user" ? "You" : current?.name ?? "Agent"}</div>
-                  {m.tools && m.tools.length > 0 && (
+                  <div className="who">
+                    {m.role === "user" ? "You" : picked?.item.name ?? "Agent"}
+                  </div>
+                  {m.steps && m.steps.length > 0 && (
                     <div className="row wrap gap6" style={{ marginBottom: 8 }}>
-                      {m.tools.map((t, j) => (
+                      {m.steps.map((s, j) => (
                         <span className="tool-event" key={j}>
-                          ⚙ {t}
+                          {s.kind === "delegate"
+                            ? "→ "
+                            : s.kind === "handoff"
+                              ? "⇒ "
+                              : "⚙ "}
+                          {s.label}
                         </span>
                       ))}
                     </div>
@@ -245,11 +323,7 @@ export default function Chat() {
                   {m.streaming && <span className="caret" />}
                   {m.role === "agent" && m.runId && !m.streaming && (
                     <div className="mt8">
-                      <Link
-                        to={`/runs/${m.runId}`}
-                        className="dim"
-                        style={{ fontSize: 12 }}
-                      >
+                      <Link to={`/runs/${m.runId}`} className="dim" style={{ fontSize: 12 }}>
                         ↗ view trace
                       </Link>
                     </div>
@@ -266,19 +340,21 @@ export default function Chat() {
           <textarea
             className="textarea"
             placeholder={
-              agents.length === 0
-                ? "Create an agent first…"
-                : "Message your agent…  (Enter to send, Shift+Enter for newline)"
+              !hasAny
+                ? "Create an agent or add a team first…"
+                : isTeam
+                  ? "Ask the team to manage something…  (Enter to send)"
+                  : "Message your agent…  (Enter to send, Shift+Enter for newline)"
             }
             value={input}
-            disabled={busy || agents.length === 0}
+            disabled={busy || !hasAny}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKey}
           />
           <button
             className="btn btn-primary"
             onClick={send}
-            disabled={busy || !input.trim() || agents.length === 0}
+            disabled={busy || !input.trim() || !hasAny}
           >
             {busy ? <span className="spinner" /> : <SendIcon />}
             Send

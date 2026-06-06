@@ -85,6 +85,23 @@ export interface AgentSummary {
   error: string | null;
 }
 
+export interface TeamMemberInfo {
+  name: string;
+  role: string | null;
+  provider: string | null;
+  model: string;
+  delegates: string[];
+  handoffs: string[];
+}
+
+export interface TeamSummary {
+  name: string;
+  path: string;
+  entry: string;
+  members: TeamMemberInfo[];
+  is_team: boolean;
+}
+
 export interface RunTurn {
   role: "user" | "assistant";
   content: string;
@@ -98,20 +115,36 @@ export interface RunRequest {
   history?: RunTurn[];
 }
 
-// One streamed event from POST /api/studio/run (see studio_service.stream_agent_run).
+// One streamed event from POST /api/studio/run or /run-team.
 export type RunEvent =
-  | { type: "start"; agent: string; streaming: boolean }
+  | { type: "start"; agent: string; streaming: boolean; team?: boolean }
   | { type: "token"; delta: string }
   | { type: "tool"; name: string }
+  | { type: "delegate"; worker: string; task: string }
+  | { type: "handoff"; to: string }
   | { type: "message"; text: string }
   | {
       type: "done";
       output_text: string;
-      thread_id: string;
+      thread_id?: string;
       run_id: string;
       succeeded: boolean;
     }
   | { type: "error"; message: string; run_id?: string };
+
+export interface RunTeamRequest {
+  team_path: string;
+  prompt: string;
+}
+
+// Stream a team run (manager → workers) over SSE.
+export async function streamTeamRun(
+  body: RunTeamRequest,
+  onEvent: (e: RunEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return streamSse("/api/studio/run-team", body, onEvent, signal);
+}
 
 export interface PackInfo {
   name: string;
@@ -186,14 +219,15 @@ export interface RunListResponse {
   next_offset: number | null;
 }
 
-// Stream an agent run over SSE (fetch + ReadableStream; EventSource can't POST).
-// Calls `onEvent` for each frame; resolves when the stream ends.
-export async function streamRun(
-  body: RunRequest,
+// Stream an SSE endpoint (fetch + ReadableStream; EventSource can't POST).
+// Calls `onEvent` for each `data:` frame; resolves when the stream ends.
+async function streamSse(
+  path: string,
+  body: unknown,
   onEvent: (e: RunEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch("/api/studio/run", {
+  const res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -225,4 +259,12 @@ export async function streamRun(
       if (line) onEvent(JSON.parse(line.slice(6)) as RunEvent);
     }
   }
+}
+
+export function streamRun(
+  body: RunRequest,
+  onEvent: (e: RunEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return streamSse("/api/studio/run", body, onEvent, signal);
 }

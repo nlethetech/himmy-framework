@@ -193,15 +193,16 @@ class MultiAgentOrchestrator:
                 max_turns=self._delegate_max_turns,
                 llm_config=self._cfg(worker),
             )
+            answer = loop.final.output_text or ""
             await self._emit(
                 RunEvent(
                     event_type=EventType.AGENT_DELEGATED,
                     thread_id=sub_thread.thread_id,
                     agent_id=worker.persona.agent_id,
-                    payload={"worker": worker_name, "task": subtask},
+                    payload={"worker": worker_name, "task": subtask, "answer": answer},
                 )
             )
-            return {"agent": worker_name, "answer": loop.final.output_text or ""}
+            return {"agent": worker_name, "answer": answer}
 
         return _handler
 

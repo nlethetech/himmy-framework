@@ -38,3 +38,6 @@ himmy/api/_studio_static/
 
 # TypeScript incremental build info
 studio/*.tsbuildinfo
+
+# Local-only farm demo (not for GitHub — framework testing)
+/examples/farm-studio/

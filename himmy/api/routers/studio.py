@@ -45,8 +45,14 @@ async def doctor() -> dict:
 
 @router.get("/agents", response_model=list[studio_service.AgentSummary])
 async def list_agents() -> list[studio_service.AgentSummary]:
-    """Discover agent specs under the project root (where `himmy studio` launched)."""
+    """Discover single-agent specs under the project root."""
     return studio_service.list_agents()
+
+
+@router.get("/teams", response_model=list[studio_service.TeamSummary])
+async def list_teams() -> list[studio_service.TeamSummary]:
+    """Discover multi-agent team specs (manager + workers) under the project root."""
+    return studio_service.list_teams()
 
 
 class TurnInput(BaseModel):
@@ -102,6 +108,47 @@ async def run(body: RunRequest) -> StreamingResponse:
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - surface as a terminal error frame
+            yield _sse({"type": "error", "message": str(exc)})
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class RunTeamRequest(BaseModel):
+    """POST /api/studio/run-team body: which team and the request prompt."""
+
+    team_path: str = Field(..., description="team spec path, relative to the root")
+    prompt: str
+
+
+@router.post("/run-team")
+async def run_team(body: RunTeamRequest) -> StreamingResponse:
+    """Run a multi-agent team, streaming the live routing/delegate/tool trail (SSE).
+
+    Members run on their own providers (e.g. a Claude-CLI manager delegating to local
+    Ollama workers). Frames: ``start`` → ``delegate``/``handoff``/``tool`` → ``message``
+    → ``done`` (or a terminal ``error``).
+    """
+    try:
+        spec = studio_service.load_team(body.team_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    teams = {t.path: t for t in studio_service.list_teams()}
+    team_name = teams[body.team_path].name if body.team_path in teams else "team"
+
+    async def _stream() -> AsyncIterator[str]:
+        try:
+            async for event in studio_service.stream_team_run(
+                spec, body.prompt, team_name=team_name, team_path=body.team_path
+            ):
+                yield _sse(event)
+        except Exception as exc:  # noqa: BLE001 - terminal error frame
             yield _sse({"type": "error", "message": str(exc)})
 
     return StreamingResponse(

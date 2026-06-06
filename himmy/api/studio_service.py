@@ -88,17 +88,87 @@ def _summarize(path: Path, root: Path) -> AgentSummary | None:
     )
 
 
+def _looks_like_team(path: Path) -> dict | None:
+    """Return the parsed mapping if ``path`` is a team spec (entry + members), else None."""
+    import yaml
+
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - non-YAML / unreadable → not a team
+        return None
+    if isinstance(raw, dict) and raw.get("entry") and isinstance(raw.get("members"), list):
+        return raw
+    return None
+
+
 def list_agents(root: Path | None = None) -> list[AgentSummary]:
-    """Discover agent specs under the project root, de-duplicated by name+path."""
+    """Discover single-agent specs under the project root (excludes team specs)."""
     root = root or project_root()
     out: list[AgentSummary] = []
     seen: set[str] = set()
     for f in _candidate_files(root):
+        if _looks_like_team(f) is not None:
+            continue  # teams are listed separately
         summary = _summarize(f, root)
         if summary is None or summary.path in seen:
             continue
         seen.add(summary.path)
         out.append(summary)
+    return out
+
+
+class TeamMemberInfo(BaseModel):
+    name: str
+    role: str | None = None
+    provider: str | None = None
+    model: str = "default"
+    delegates: list[str] = []
+    handoffs: list[str] = []
+
+
+class TeamSummary(BaseModel):
+    """A discovered team.yaml — enough to list and pick it in the GUI."""
+
+    name: str
+    path: str  # relative to the project root
+    entry: str
+    members: list[TeamMemberInfo] = []
+    is_team: bool = True
+
+
+def list_teams(root: Path | None = None) -> list[TeamSummary]:
+    """Discover multi-agent team specs under the project root."""
+    root = root or project_root()
+    out: list[TeamSummary] = []
+    seen: set[str] = set()
+    for f in _candidate_files(root):
+        raw = _looks_like_team(f)
+        if raw is None:
+            continue
+        rel = str(f.relative_to(root))
+        if rel in seen:
+            continue
+        seen.add(rel)
+        members = [
+            TeamMemberInfo(
+                name=str(m.get("name", "?")),
+                role=m.get("role"),
+                provider=m.get("provider"),
+                model=str(m.get("model", "default")),
+                delegates=list(m.get("delegates", []) or []),
+                handoffs=list(m.get("handoffs", []) or []),
+            )
+            for m in raw.get("members", [])
+            if isinstance(m, dict)
+        ]
+        out.append(
+            TeamSummary(
+                name=f.stem.replace("-team", "").replace(".team", "") or f.stem,
+                path=rel,
+                entry=str(raw.get("entry", "")),
+                members=members,
+            )
+        )
     return out
 
 
@@ -374,6 +444,215 @@ def _summarize_payload(payload: dict[str, Any]) -> str:
     return _trim(json.dumps(payload, default=str), 160)
 
 
+# ---- Running a TEAM (manager → workers), streamed live ------------------
+
+# Synthetic tool-name prefixes the orchestrator registers (hidden from the trail).
+_SYNTHETIC_TOOL_PREFIXES = ("ask_", "transfer_to_")
+
+
+def load_team(rel_path: str, root: Path | None = None) -> Any:
+    """Resolve + load a team spec selected in the GUI."""
+    from himmy.config.team_spec import load_team_spec
+
+    path = resolve_spec_path(rel_path, root)
+    return load_team_spec(str(path))
+
+
+def _tool_name_of(event: Any) -> str | None:
+    from himmy.core.events import EventType
+
+    if getattr(event, "event_type", None) != EventType.TOOL_CALLED:
+        return None
+    payload = getattr(event, "payload", None) or {}
+    return payload.get("tool") or payload.get("name") or payload.get("tool_name")
+
+
+async def stream_team_run(
+    spec: Any,
+    prompt: str,
+    *,
+    team_name: str = "team",
+    team_path: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Run a multi-agent team for one request, streaming the live routing trail.
+
+    Members run on their own providers (e.g. a Claude-CLI manager delegating to local
+    Ollama workers). Emits ``start`` → ``tool``/``delegate``/``handoff`` frames as they
+    happen → ``message`` (the final synthesized answer) → ``done``. The whole run is
+    persisted for the Runs browser.
+    """
+    from himmy import build_runtime
+    from himmy.config.team_spec import build_team, build_team_inference
+    from himmy.core.events import EventType
+    from himmy.orchestrators import MultiAgentOrchestrator
+
+    queue: asyncio.Queue = asyncio.Queue()
+    collected: list[Any] = []
+
+    async def _push(event: Any) -> None:
+        collected.append(event)
+        await queue.put(event)
+
+    # Build off the event loop (tool-module import + pack registration are sync).
+    def _build() -> tuple[Any, Any]:
+        team, registry = build_team(
+            spec, resolve_tools_module=from_spec.resolve_tools_module
+        )
+        inference = build_team_inference(spec)
+        runtime, _i, _t = build_runtime(
+            inference=inference, tool_registry=registry, on_event=_push
+        )
+        return runtime, registry, team
+
+    runtime, registry, team = await asyncio.to_thread(_build)
+    orch = MultiAgentOrchestrator(runtime, team, registry, on_event=_push)
+
+    mcp_clients: list[Any] = []
+    mcp_servers = list(getattr(spec, "mcp_servers", []) or [])
+    if mcp_servers:
+        from himmy.config.mcp_spec import attach_mcp_servers
+
+        mcp_clients = await attach_mcp_servers(registry, mcp_servers)
+
+    run_id = new_uuid()
+    started = time.monotonic()
+    output_text = ""
+    status = "ok"
+    error_msg: str | None = None
+    tools_used: list[str] = []
+    delegate_answers: list[tuple[str, str]] = []  # (worker, answer) for a fallback
+
+    yield {"type": "start", "agent": team_name, "streaming": False, "team": True}
+
+    def _frame(event: Any) -> dict[str, Any] | None:
+        et = getattr(event, "event_type", None)
+        payload = getattr(event, "payload", None) or {}
+        if et == EventType.AGENT_DELEGATED:
+            worker = payload.get("worker", "?")
+            answer = str(payload.get("answer", "") or "")
+            if answer:
+                delegate_answers.append((worker, answer))
+            return {
+                "type": "delegate",
+                "worker": worker,
+                "task": _trim(str(payload.get("task", "")), 140),
+            }
+        if et == EventType.AGENT_HANDOFF:
+            return {"type": "handoff", "to": payload.get("to", "?")}
+        name = _tool_name_of(event)
+        if name and not name.startswith(_SYNTHETIC_TOOL_PREFIXES) and name != "final_answer":
+            if name not in tools_used:
+                tools_used.append(name)
+            return {"type": "tool", "name": name}
+        return None
+
+    run_task = asyncio.create_task(orch.run(prompt))
+    try:
+        while True:
+            getter = asyncio.create_task(queue.get())
+            done, _pending = await asyncio.wait(
+                {getter, run_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if getter in done:
+                frame = _frame(getter.result())
+                if frame is not None:
+                    yield frame
+            else:
+                getter.cancel()
+            if run_task.done():
+                # Drain whatever events are still queued, then stop.
+                while not queue.empty():
+                    frame = _frame(queue.get_nowait())
+                    if frame is not None:
+                        yield frame
+                break
+        result = await run_task
+        output_text = (result.output_text or "").strip()
+        if not output_text and delegate_answers:
+            # The manager ended without a closing synthesis — fall back to the
+            # specialists' findings so the user always sees a real answer.
+            output_text = "Here's what the team found:\n\n" + "\n".join(
+                f"• **{worker}** — {ans.strip()}" for worker, ans in delegate_answers
+            )
+        yield {"type": "message", "text": output_text}
+    except Exception as exc:  # noqa: BLE001 - record + surface a terminal error
+        status = "error"
+        error_msg = str(exc)
+    finally:
+        if mcp_clients:
+            from himmy.config.mcp_spec import close_mcp_clients
+
+            await close_mcp_clients(mcp_clients)
+
+    duration_ms = (time.monotonic() - started) * 1000.0
+    try:
+        await asyncio.to_thread(
+            _record_team_run,
+            run_id=run_id,
+            team_name=team_name,
+            team_path=team_path,
+            prompt=prompt,
+            output=output_text,
+            tools=tools_used,
+            events=collected,
+            status=status,
+            error=error_msg,
+            duration_ms=duration_ms,
+        )
+    except Exception:  # noqa: BLE001 - persistence must never break the stream
+        pass
+
+    if status == "error":
+        yield {"type": "error", "message": error_msg or "team run failed", "run_id": run_id}
+        return
+    yield {
+        "type": "done",
+        "output_text": output_text,
+        "run_id": run_id,
+        "succeeded": True,
+    }
+
+
+def _record_team_run(
+    *,
+    run_id: str,
+    team_name: str,
+    team_path: str | None,
+    prompt: str,
+    output: str,
+    tools: list[str],
+    events: list[Any],
+    status: str,
+    error: str | None,
+    duration_ms: float,
+) -> None:
+    """Persist a team run (transcript = prompt + final answer; timeline = the trail)."""
+    from himmy.api.studio_runs import StudioRun, TranscriptMessage, get_run_store
+
+    messages = [
+        TranscriptMessage(role="user", content=prompt),
+        TranscriptMessage(role="assistant", content=output or (error or "")),
+    ]
+    run = StudioRun(
+        id=run_id,
+        created_at=utc_now_iso(),
+        agent_name=team_name,
+        agent_path=team_path,
+        provider="team",
+        model="multi-provider",
+        prompt=prompt,
+        output=output,
+        output_preview=output,
+        status=status,
+        duration_ms=duration_ms,
+        thread_id=None,
+        tools=tools,
+        messages=messages,
+        timeline=_build_timeline(prompt, events, output, status, error),
+    )
+    get_run_store().save(run)
+
+
 def _tool_names(events: list[Any]) -> list[str]:
     """Extract the ordered, de-duplicated tool names from collected run events."""
     from himmy.core.events import EventType
@@ -391,9 +670,14 @@ def _tool_names(events: list[Any]) -> list[str]:
 
 __all__ = [
     "AgentSummary",
+    "TeamSummary",
+    "TeamMemberInfo",
     "list_agents",
+    "list_teams",
     "load_studio_spec",
+    "load_team",
     "resolve_spec_path",
     "stream_agent_run",
+    "stream_team_run",
     "project_root",
 ]
