@@ -2638,3 +2638,62 @@ label.field > .hint {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- Light theme (data-theme="light") ---------------------------------- */
+:root[data-theme="light"] {
+  --bg: #f6f7f9;
+  --bg-elev: #ffffff;
+  --card: #ffffff;
+  --card-hover: #f0f2f7;
+  --surface: #eef1f6;
+  --hover: #e8ebf2;
+  --border: #e4e8f0;
+  --border-strong: #cdd4e2;
+  --border-accent: #c3cdf5;
+
+  --text: #1a1f2e;
+  --text-muted: #57617a;
+  --text-dim: #8893a6;
+  --cyan: var(--text);
+
+  --brand: #5b76f0;
+  --brand-hover: #4a64df;
+  --brand-soft: rgba(91, 118, 240, 0.1);
+  --brand-line: rgba(91, 118, 240, 0.34);
+  --accent: var(--brand);
+  --accent-hover: var(--brand-hover);
+  --accent-soft: var(--brand-soft);
+  --accent-line: var(--brand-line);
+
+  --ok: #16a34a;
+  --ok-soft: rgba(22, 163, 74, 0.12);
+  --warn: #d97706;
+  --warn-soft: rgba(217, 119, 6, 0.12);
+  --err: #dc2626;
+  --err-soft: rgba(220, 38, 38, 0.12);
+  --info: #2563eb;
+  --info-soft: rgba(37, 99, 235, 0.12);
+
+  --elev-1: 0 1px 2px rgba(20, 28, 50, 0.06), 0 1px 1px rgba(20, 28, 50, 0.04);
+  --elev-2: 0 2px 8px rgba(20, 28, 50, 0.08), 0 6px 16px rgba(20, 28, 50, 0.06);
+  --elev-3: 0 8px 30px rgba(20, 28, 50, 0.14);
+  --shadow: var(--elev-2);
+}
+
+.theme-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+  width: 26px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  padding: 0;
+}
+.theme-toggle:hover {
+  background: var(--hover);
+  color: var(--text);
+}

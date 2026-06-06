@@ -10,7 +10,11 @@ import {
   PlugIcon,
   DoctorIcon,
   ChevronIcon,
+  MemoryIcon,
+  BookIcon,
+  GlobeIcon,
 } from "./icons";
+import { useTheme } from "./ui/useTheme";
 
 type NavItem = {
   to: string;
@@ -33,7 +37,15 @@ const BUILD: NavItem[] = [
   { to: "/connections", label: "Connections", Icon: PlugIcon },
 ];
 
-const ADVANCED: NavItem[] = [{ to: "/advanced/doctor", label: "Doctor", Icon: DoctorIcon }];
+const ADVANCED: NavItem[] = [
+  { to: "/advanced/teams", label: "Teams", Icon: BuildIcon },
+  { to: "/advanced/workflows", label: "Workflows", Icon: RunsIcon },
+  { to: "/advanced/knowledge", label: "Knowledge", Icon: BookIcon },
+  { to: "/advanced/memory", label: "Memory", Icon: MemoryIcon },
+  { to: "/advanced/eval", label: "Evaluation", Icon: GlobeIcon },
+  { to: "/advanced/lineage", label: "Lineage", Icon: GlobeIcon },
+  { to: "/advanced/doctor", label: "Doctor", Icon: DoctorIcon },
+];
 
 function SidebarLink({ item }: { item: NavItem }) {
   return (
@@ -53,6 +65,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [connectionsOk, setConnectionsOk] = useState<number | null>(null);
   const [approvalsCount, setApprovalsCount] = useState(0);
+  const { theme, toggleTheme } = useTheme();
 
   // Live connection count for the footer (refreshed when the window regains focus,
   // so connecting an account updates the badge).
@@ -120,9 +133,19 @@ export function AppShell({ children }: { children: ReactNode }) {
               color: connectionsOk == null ? "var(--text-dim)" : "var(--ok)",
             }}
           />
-          {connectionsOk == null
-            ? "offline-first · local"
-            : `${connectionsOk} connection${connectionsOk === 1 ? "" : "s"}`}
+          <span style={{ flex: 1 }}>
+            {connectionsOk == null
+              ? "offline-first · local"
+              : `${connectionsOk} connection${connectionsOk === 1 ? "" : "s"}`}
+          </span>
+          <button
+            className="theme-toggle"
+            onClick={toggleTheme}
+            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            aria-label="Toggle theme"
+          >
+            {theme === "dark" ? "☾" : "☀"}
+          </button>
         </div>
       </aside>
 

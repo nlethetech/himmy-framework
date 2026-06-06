@@ -10,6 +10,7 @@ import Builder from "./screens/Builder";
 import Connections from "./screens/Connections";
 import Home from "./screens/Home";
 import Approvals from "./screens/Approvals";
+import ComingSoon from "./screens/ComingSoon";
 import "./index.css";
 
 // New task-first IA. Screens not yet built (Home/Connections/Approvals) render a
@@ -29,6 +30,60 @@ const router = createBrowserRouter([
       { path: "agents/:name", element: <Builder /> },
       { path: "connections", element: <Connections /> },
       { path: "advanced/doctor", element: <Doctor /> },
+      {
+        path: "advanced/teams",
+        element: (
+          <ComingSoon
+            title="Teams"
+            note="Multi-agent teams (a manager delegating to specialists) run today from Chat — drop a team.yaml in your project and pick it there. A visual team editor is coming here."
+          />
+        ),
+      },
+      {
+        path: "advanced/workflows",
+        element: (
+          <ComingSoon
+            title="Workflows"
+            note="Deterministic multi-step workflows (himmy.orchestrators) run via the CLI today. A DAG editor + run timeline will live here."
+          />
+        ),
+      },
+      {
+        path: "advanced/knowledge",
+        element: (
+          <ComingSoon
+            title="Knowledge"
+            note="Give an agent documents via the Knowledge capability in the Agent builder (auto-ingested → kb_search). A document browser + ingest UI is coming here."
+          />
+        ),
+      },
+      {
+        path: "advanced/memory",
+        element: (
+          <ComingSoon
+            title="Memory"
+            note="Turn on the Memory capability in the Agent builder so an agent can remember and recall facts across runs. A memory browser will live here."
+          />
+        ),
+      },
+      {
+        path: "advanced/eval",
+        element: (
+          <ComingSoon
+            title="Evaluation"
+            note="Score agents against test suites (himmy.services.evaluation / the /v1/evaluation API). A scorecard dashboard is coming here."
+          />
+        ),
+      },
+      {
+        path: "advanced/lineage",
+        element: (
+          <ComingSoon
+            title="Lineage"
+            note="Every answer traces back to its prompt, persona, and evidence (the /v1/runs/{id}/lineage graph). An interactive provenance viewer will live here."
+          />
+        ),
+      },
       // legacy redirects (one release)
       { path: "runs", element: <Navigate to="/activity" replace /> },
       { path: "runs/:runId", element: <Navigate to="/activity" replace /> },
