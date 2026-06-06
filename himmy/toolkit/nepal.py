@@ -107,6 +107,7 @@ def register_nepal_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="nepali_date",
+        read_only=True,
         handler=nepali_date,
         description="Convert an AD date (or today) to the Bikram Sambat calendar + FY.",
         args_json_schema=_DATE_SCHEMA,
@@ -115,6 +116,7 @@ def register_nepal_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="nepali_format",
+        read_only=True,
         handler=nepali_format,
         description="Format an NPR amount (Nepali grouping + Devanagari numerals).",
         args_json_schema=_FORMAT_SCHEMA,
@@ -123,6 +125,7 @@ def register_nepal_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="nepali_transliterate",
+        read_only=True,
         handler=nepali_transliterate,
         description="Transliterate/normalize text across Devanagari and Roman scripts.",
         args_json_schema=_TRANSLIT_SCHEMA,

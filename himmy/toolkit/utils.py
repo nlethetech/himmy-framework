@@ -90,6 +90,7 @@ def register_utils_pack(registry: ToolRegistry, config: Any) -> None:
     register_local_tool(
         registry,
         name="calculator",
+        read_only=True,
         handler=calculator,
         description="Evaluate a math expression (+, -, *, /, //, %, **).",
         args_json_schema=_CALC_SCHEMA,
@@ -98,6 +99,7 @@ def register_utils_pack(registry: ToolRegistry, config: Any) -> None:
     register_local_tool(
         registry,
         name="current_time",
+        read_only=True,
         handler=current_time,
         description="Return the current time in a timezone, with optional offsets.",
         args_json_schema=_TIME_SCHEMA,

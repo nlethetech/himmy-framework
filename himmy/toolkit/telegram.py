@@ -127,6 +127,7 @@ def register_telegram_pack(
     register_local_tool(
         registry,
         name="send_telegram",
+        read_only=False,
         handler=send_telegram,
         description="Send a message to a Telegram chat via the configured bot.",
         args_json_schema=_SEND_SCHEMA,

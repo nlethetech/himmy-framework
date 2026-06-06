@@ -117,6 +117,7 @@ def register_comms_pack(
     register_local_tool(
         registry,
         name="send_email",
+        read_only=False,
         handler=send_email,
         description="Send an email via the configured SMTP server.",
         args_json_schema=_EMAIL_SCHEMA,
@@ -126,6 +127,7 @@ def register_comms_pack(
     register_local_tool(
         registry,
         name="send_webhook",
+        read_only=False,
         handler=send_webhook,
         description="POST a JSON payload to an http(s) webhook URL.",
         args_json_schema=_WEBHOOK_SCHEMA,

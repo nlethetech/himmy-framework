@@ -171,6 +171,7 @@ def register_agentic_pack(registry: ToolRegistry, config: ToolkitConfig) -> None
     register_local_tool(
         registry,
         name="ask_human",
+        read_only=True,
         handler=ask_human,
         description=(
             "Ask the human operator a question and wait for their answer. Use when you "
@@ -182,6 +183,7 @@ def register_agentic_pack(registry: ToolRegistry, config: ToolkitConfig) -> None
     register_local_tool(
         registry,
         name="scratchpad_set",
+        read_only=False,
         handler=scratchpad_set,
         description="Save a named note to your working scratchpad (overwrites the key).",
         args_json_schema=_SCRATCH_SET_SCHEMA,
@@ -190,6 +192,7 @@ def register_agentic_pack(registry: ToolRegistry, config: ToolkitConfig) -> None
     register_local_tool(
         registry,
         name="scratchpad_get",
+        read_only=True,
         handler=scratchpad_get,
         description="Read a note from your scratchpad (omit `key` to read all of them).",
         args_json_schema=_SCRATCH_GET_SCHEMA,
@@ -198,6 +201,7 @@ def register_agentic_pack(registry: ToolRegistry, config: ToolkitConfig) -> None
     register_local_tool(
         registry,
         name="todo_write",
+        read_only=False,
         handler=todo_write,
         description=(
             "Replace your task list with `items`, a flat list of task descriptions "
@@ -209,6 +213,7 @@ def register_agentic_pack(registry: ToolRegistry, config: ToolkitConfig) -> None
     register_local_tool(
         registry,
         name="todo_complete",
+        read_only=False,
         handler=todo_complete,
         description="Mark a task on your list done (matched by its content).",
         args_json_schema=_TODO_COMPLETE_SCHEMA,
@@ -217,6 +222,7 @@ def register_agentic_pack(registry: ToolRegistry, config: ToolkitConfig) -> None
     register_local_tool(
         registry,
         name="todo_read",
+        read_only=True,
         handler=todo_read,
         description="Read your current task list and how many items are completed.",
         args_json_schema=_TODO_READ_SCHEMA,

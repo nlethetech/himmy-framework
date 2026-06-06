@@ -147,6 +147,7 @@ def register_knowledge_pack(registry: ToolRegistry, config: ToolkitConfig) -> No
     register_local_tool(
         registry,
         name="kb_ingest",
+        read_only=False,
         handler=kb_ingest,
         description="Ingest text or a file into the agent's knowledge base.",
         args_json_schema=_INGEST_SCHEMA,
@@ -155,6 +156,7 @@ def register_knowledge_pack(registry: ToolRegistry, config: ToolkitConfig) -> No
     register_local_tool(
         registry,
         name="kb_search",
+        read_only=True,
         handler=kb_search,
         description="Semantically search the agent's knowledge base.",
         args_json_schema=_SEARCH_SCHEMA,

@@ -118,6 +118,7 @@ def register_datasources_pack(
     register_local_tool(
         registry,
         name="weather",
+        read_only=True,
         handler=weather,
         description="Current weather for a latitude/longitude (Open-Meteo, keyless).",
         args_json_schema=_WEATHER_SCHEMA,
@@ -126,6 +127,7 @@ def register_datasources_pack(
     register_local_tool(
         registry,
         name="geocode",
+        read_only=True,
         handler=geocode,
         description="Geocode a place name to coordinates (OpenStreetMap Nominatim).",
         args_json_schema=_GEOCODE_SCHEMA,
@@ -134,6 +136,7 @@ def register_datasources_pack(
     register_local_tool(
         registry,
         name="wikipedia",
+        read_only=True,
         handler=wikipedia,
         description="Plain-text summary of the best-matching Wikipedia article.",
         args_json_schema=_WIKI_SCHEMA,

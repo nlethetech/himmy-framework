@@ -419,6 +419,7 @@ def register_web_pack(
     register_local_tool(
         registry,
         name="web_search",
+        read_only=True,
         handler=web_search,
         description="Search the web; returns a list of {title, url, snippet}.",
         args_json_schema=_SEARCH_SCHEMA,
@@ -427,6 +428,7 @@ def register_web_pack(
     register_local_tool(
         registry,
         name="web_fetch",
+        read_only=True,
         handler=web_fetch,
         description="Fetch an http(s) URL and return its readable text + title.",
         args_json_schema=_FETCH_SCHEMA,
@@ -435,6 +437,10 @@ def register_web_pack(
     register_local_tool(
         registry,
         name="http_request",
+        # Intentionally no read_only claim: a generic GET/POST/... escape hatch is
+        # method-dependent, so we never blanket-label it "safe for look-ups". The
+        # description already signals it can write.
+        read_only=None,
         handler=http_request,
         description="Make an HTTP request (GET/POST/...) to an http(s) URL.",
         args_json_schema=_HTTP_SCHEMA,

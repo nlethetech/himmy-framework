@@ -275,6 +275,7 @@ def register_data_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="sql_query",
+        read_only=True,
         handler=sql_query,
         description=(
             "Run a single read-only SQL query; returns {columns, rows}. If a filter "
@@ -288,6 +289,7 @@ def register_data_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="sql_schema",
+        read_only=True,
         handler=sql_schema,
         description="Inspect the database: list tables and their columns + types.",
         args_json_schema=_SCHEMA_TOOL_SCHEMA,

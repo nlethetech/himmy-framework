@@ -119,6 +119,7 @@ def register_sandbox_tool(
         ),
         args_json_schema=SANDBOX_TOOL_ARGS_SCHEMA,
         requires_approval=requires_approval,
+        read_only=False,  # executes code → an action, not a look-up
         metadata={"backend": "sandbox"},
     )
 

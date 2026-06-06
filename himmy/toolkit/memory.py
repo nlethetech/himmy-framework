@@ -71,6 +71,7 @@ def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="remember",
+        read_only=False,
         handler=remember,
         description="Save a fact to the agent's long-term memory.",
         args_json_schema=_REMEMBER_SCHEMA,
@@ -79,6 +80,7 @@ def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="recall",
+        read_only=True,
         handler=recall,
         description="Recall relevant facts from the agent's long-term memory.",
         args_json_schema=_RECALL_SCHEMA,

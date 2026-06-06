@@ -58,6 +58,7 @@ def register_news_tools(
     register_local_tool(
         registry,
         name="news_sources",
+        read_only=True,
         handler=_sources,
         description="List the available news feeds (name, url, language, category).",
         args_json_schema={
@@ -71,6 +72,7 @@ def register_news_tools(
     register_local_tool(
         registry,
         name="news_search",
+        read_only=True,
         handler=_search,
         description=(
             "Search recent headlines across the news feeds by keyword (matches the "
@@ -101,6 +103,7 @@ def register_news_tools(
     register_local_tool(
         registry,
         name="news_fetch",
+        read_only=True,
         handler=_fetch,
         description="Fetch the latest headlines from one named news feed.",
         args_json_schema={

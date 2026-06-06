@@ -98,6 +98,7 @@ def register_files_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="read_file",
+        read_only=True,
         handler=read_file,
         description="Read a UTF-8 text file under the sandbox root.",
         args_json_schema=_READ_SCHEMA,
@@ -106,6 +107,7 @@ def register_files_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="write_file",
+        read_only=False,
         handler=write_file,
         description="Write (or append to) a file under the sandbox root.",
         args_json_schema=_WRITE_SCHEMA,
@@ -115,6 +117,7 @@ def register_files_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     register_local_tool(
         registry,
         name="list_dir",
+        read_only=True,
         handler=list_dir,
         description="List the entries of a directory under the sandbox root.",
         args_json_schema=_LIST_SCHEMA,

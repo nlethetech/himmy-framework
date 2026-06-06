@@ -85,6 +85,7 @@ def register_nrb_tools(
     register_local_tool(
         registry,
         name="nrb_forex",
+        read_only=True,
         handler=_forex,
         description="NRB foreign-exchange buy/sell rates for a date (ISO YYYY-MM-DD).",
         args_json_schema={
@@ -101,6 +102,7 @@ def register_nrb_tools(
     register_local_tool(
         registry,
         name="nrb_macro_reports",
+        read_only=True,
         handler=_reports,
         description="List NRB monthly Current Macroeconomic & Financial Situation reports.",
         args_json_schema={
@@ -113,6 +115,7 @@ def register_nrb_tools(
     register_local_tool(
         registry,
         name="nrb_macro_workbook",
+        read_only=True,
         handler=_workbook,
         description=(
             "Open NRB's macro 'Tables' Excel workbook. Returns the list of sheet names "

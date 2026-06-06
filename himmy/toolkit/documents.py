@@ -50,6 +50,7 @@ def register_documents_pack(registry: ToolRegistry, config: ToolkitConfig) -> No
     register_local_tool(
         registry,
         name="read_document",
+        read_only=True,
         handler=read_document,
         description="Extract text from a PDF/text/Markdown/CSV/Excel file under the root.",
         args_json_schema=_READ_SCHEMA,
