@@ -136,6 +136,9 @@ class BoundTool(BaseModel):
     description: str = ""
     args_json_schema: dict[str, Any] = {}
     output_json_schema: dict[str, Any] | None = None
+    #: read-only (True) / mutating (False) / infer-from-name (None); surfaced to the
+    #: model so a look-up doesn't pick a write tool.
+    read_only: bool | None = None
     handler: Callable[[dict[str, Any]], Awaitable[ToolReturnRecord]] | None = None
 
 

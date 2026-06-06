@@ -69,14 +69,17 @@ def register_local_tool(
     timeout_seconds: float | None = None,
     retry_hints: dict[str, Any] | None = None,
     sensitive_arg_names: list[str] | None = None,
+    read_only: bool | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> ToolDefinition:
     """Register a ``LOCAL`` tool backed by a Python callable.
 
     The handler may be synchronous or a coroutine function; the service handles
     both. ``timeout_seconds``, ``retry_hints``, and ``sensitive_arg_names`` are
-    all reachable so the service can enforce/redact them. Returns the created
-    :class:`ToolDefinition`.
+    all reachable so the service can enforce/redact them. ``read_only`` declares
+    whether the tool only reads (vs mutates) — surfaced to small models so a
+    look-up doesn't land on a write tool; omit it to infer from the name. Returns
+    the created :class:`ToolDefinition`.
     """
     definition = ToolDefinition(
         name=name,
@@ -85,6 +88,7 @@ def register_local_tool(
         args_json_schema=args_json_schema or {},
         output_json_schema=output_json_schema,
         requires_approval=requires_approval,
+        read_only=read_only,
         sequential=sequential,
         timeout_seconds=timeout_seconds,
         retry_hints=retry_hints or {},

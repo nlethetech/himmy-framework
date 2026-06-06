@@ -35,6 +35,7 @@ from himmy.services.inference.models import (
     ToolReturnRecord,
 )
 from himmy.services.inference.tool_protocol import parse_text_tool_calls
+from himmy.services.tools.access import describe_for_model
 from himmy.services.tools.repair import resolve_tool_name, unknown_tool_message
 
 
@@ -80,13 +81,19 @@ def _compose_prompt(request: InferenceRequest) -> str:
 
 
 def _ollama_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
-    """Project bound tools into Ollama's ``/api/chat`` function-tool schema."""
+    """Project bound tools into Ollama's ``/api/chat`` function-tool schema.
+
+    Descriptions carry a read/write intent hint so a small model doesn't pick a
+    write tool for a look-up (reader/writer disambiguation).
+    """
     return [
         {
             "type": "function",
             "function": {
                 "name": tool.name,
-                "description": tool.description,
+                "description": describe_for_model(
+                    tool.name, tool.description, tool.read_only
+                ),
                 "parameters": tool.args_json_schema or {"type": "object"},
             },
         }
@@ -126,7 +133,8 @@ def _react_tool_manifest(bound_tools: list[BoundTool]) -> str:
     lines = ["You can call tools. Available tools:"]
     for tool in bound_tools:
         schema = json.dumps(tool.args_json_schema or {"type": "object"})
-        lines.append(f"- {tool.name}: {tool.description} | args schema: {schema}")
+        desc = describe_for_model(tool.name, tool.description, tool.read_only)
+        lines.append(f"- {tool.name}: {desc} | args schema: {schema}")
     example = bound_tools[0].name if bound_tools else "tool_name"
     lines.append(
         "To call a tool, write a line of the form:\n"

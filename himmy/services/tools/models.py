@@ -85,6 +85,10 @@ class ToolDefinition(BaseModel):
     args_json_schema: dict[str, Any] = {}
     output_json_schema: dict[str, Any] | None = None
     requires_approval: bool = False
+    #: Whether the tool only reads (True) or also mutates state (False). ``None`` lets
+    #: the model-facing description infer intent from the tool's name. Surfaced to
+    #: small models so a look-up never lands on a write tool (reader/writer confusion).
+    read_only: bool | None = None
     timeout_seconds: float | None = None
     retry_hints: dict[str, Any] = {}
     sequential: bool = False

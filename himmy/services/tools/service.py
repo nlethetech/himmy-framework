@@ -625,6 +625,7 @@ class ToolService:
                     description=definition.description,
                     args_json_schema=definition.args_json_schema,
                     output_json_schema=definition.output_json_schema,
+                    read_only=definition.read_only,
                     handler=_make_handler(definition.name),
                 )
             )
