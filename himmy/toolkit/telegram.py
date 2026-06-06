@@ -62,6 +62,10 @@ class TelegramClient:
             )
         return data.get("result")
 
+    async def get_me(self) -> dict[str, Any]:
+        """Return the bot's own profile (``getMe``) — a cheap token-validity check."""
+        return await self._post("getMe", {})
+
     async def send_message(self, chat_id: Any, text: str) -> dict[str, Any]:
         """Send ``text`` to ``chat_id`` (returns the sent Message)."""
         return await self._post("sendMessage", {"chat_id": chat_id, "text": text})

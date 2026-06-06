@@ -7,6 +7,7 @@ import Chat from "./screens/Chat";
 import Runs from "./screens/Runs";
 import RunDetail from "./screens/RunDetail";
 import Builder from "./screens/Builder";
+import Connections from "./screens/Connections";
 import ComingSoon from "./screens/ComingSoon";
 import "./index.css";
 
@@ -25,7 +26,7 @@ const router = createBrowserRouter([
       { path: "activity/:runId", element: <RunDetail /> },
       { path: "agents", element: <Builder /> },
       { path: "agents/:name", element: <Builder /> },
-      { path: "connections", element: <ComingSoon title="Connections" /> },
+      { path: "connections", element: <Connections /> },
       { path: "advanced/doctor", element: <Doctor /> },
       // legacy redirects (one release)
       { path: "runs", element: <Navigate to="/activity" replace /> },

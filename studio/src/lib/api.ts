@@ -40,6 +40,47 @@ export const api = {
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
+// ---- Connections ---------------------------------------------------------
+
+export interface ConnectionFieldStatus {
+  name: string;
+  label: string;
+  present: boolean;
+  secret: boolean;
+  required: boolean;
+  kind: string; // text | password | number | bool | enum
+  placeholder: string;
+  options: string[];
+  masked_hint: string | null;
+}
+
+export interface ConnectionStatus {
+  type: string;
+  title: string;
+  description: string;
+  hue: string;
+  configured: boolean;
+  writable: boolean;
+  fields: ConnectionFieldStatus[];
+}
+
+export interface ConnectionTestResult {
+  ok: boolean;
+  detail: string;
+  checked: string;
+}
+
+export const listConnections = () =>
+  api.get<ConnectionStatus[]>("/connections");
+export const getConnection = (type: string) =>
+  api.get<ConnectionStatus>(`/connections/${type}`);
+export const setConnection = (type: string, fields: Record<string, unknown>) =>
+  api.put<ConnectionStatus>(`/connections/${type}`, { fields });
+export const deleteConnection = (type: string) =>
+  api.del<ConnectionStatus>(`/connections/${type}`);
+export const testConnection = (type: string) =>
+  api.post<ConnectionTestResult>(`/connections/${type}/test`, {});
+
 // ---- Shared types (mirror the Python response shapes) --------------------
 
 export interface ExtraStatus {

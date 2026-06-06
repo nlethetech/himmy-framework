@@ -85,6 +85,15 @@ def _build_lifespan(container: ApiContainer):
                     )
             except Exception:  # pragma: no cover - startup sweep is best-effort
                 logger.warning("startup run sweep failed", exc_info=True)
+        # Materialize Studio "connection" non-secret fields (SMTP host, search
+        # backend, …) from the writable secrets backend into the process env so
+        # tool config picks them up without a restart.
+        try:
+            from himmy.api.studio_connections import apply_connections_to_env
+
+            apply_connections_to_env()
+        except Exception:  # pragma: no cover - connections are best-effort
+            logger.warning("applying studio connections to env failed", exc_info=True)
         try:
             yield
         finally:

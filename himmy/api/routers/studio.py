@@ -21,7 +21,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from himmy.api import studio_agents, studio_service
+from himmy.api import studio_agents, studio_connections, studio_service
+from himmy.api.studio_connections import (
+    ConnectionStatus,
+    ConnectionTestResult,
+    ReadOnlyBackendError,
+)
 from himmy.api.studio_runs import (
     RunAnalytics,
     StudioRun,
@@ -209,6 +214,57 @@ async def get_run(run_id: str) -> StudioRun:
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run
+
+
+# ---- Connections (connect Email/Telegram/Web so agents can act) ---------
+
+
+class ConnectionSetRequest(BaseModel):
+    fields: dict[str, Any]
+
+
+@router.get("/connections", response_model=list[ConnectionStatus])
+async def connections() -> list[ConnectionStatus]:
+    """List connectable account types + their configured/writable status."""
+    return studio_connections.list_connections()
+
+
+@router.get("/connections/{ctype}", response_model=ConnectionStatus)
+async def connection(ctype: str) -> ConnectionStatus:
+    status = studio_connections.get_connection(ctype)
+    if status is None:
+        raise HTTPException(status_code=404, detail="unknown connection type")
+    return status
+
+
+@router.put("/connections/{ctype}", response_model=ConnectionStatus)
+async def set_connection(ctype: str, body: ConnectionSetRequest) -> ConnectionStatus:
+    """Store a connection's fields (secrets → the writable backend; never echoed)."""
+    try:
+        return studio_connections.set_connection(ctype, body.fields)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="unknown connection type") from exc
+    except ReadOnlyBackendError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.delete("/connections/{ctype}", response_model=ConnectionStatus)
+async def delete_connection(ctype: str) -> ConnectionStatus:
+    try:
+        return studio_connections.delete_connection(ctype)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="unknown connection type") from exc
+    except ReadOnlyBackendError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/connections/{ctype}/test", response_model=ConnectionTestResult)
+async def test_connection(ctype: str) -> ConnectionTestResult:
+    """Live-validate a connection (SMTP login / Telegram getMe / search ping)."""
+    try:
+        return await studio_connections.test_connection(ctype)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="unknown connection type") from exc
 
 
 # ---- Agent authoring (the no-code builder) ------------------------------

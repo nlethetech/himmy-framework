@@ -1,5 +1,6 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
+import { listConnections } from "../lib/api";
 import {
   HomeIcon,
   ChatIcon,
@@ -51,13 +52,25 @@ function SidebarLink({ item }: { item: NavItem }) {
 export function AppShell({
   children,
   approvalsCount = 0,
-  connectionsOk,
 }: {
   children: ReactNode;
   approvalsCount?: number;
-  connectionsOk?: number | null;
 }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [connectionsOk, setConnectionsOk] = useState<number | null>(null);
+
+  // Live connection count for the footer (refreshed when the window regains focus,
+  // so connecting an account updates the badge).
+  useEffect(() => {
+    const refresh = () =>
+      listConnections()
+        .then((c) => setConnectionsOk(c.filter((x) => x.configured).length))
+        .catch(() => setConnectionsOk(null));
+    refresh();
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
+
   const workspace = WORKSPACE.map((i) =>
     i.to === "/approvals" ? { ...i, badge: approvalsCount } : i,
   );

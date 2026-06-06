@@ -41,6 +41,24 @@ def _smtp_send(message: EmailMessage, config: ToolkitConfig) -> None:
         smtp.send_message(message)
 
 
+def smtp_login_check(config: ToolkitConfig) -> None:
+    """Connect + (TLS) + login to the SMTP server without sending — the "Test" path.
+
+    Validates host/port/TLS and, when present, the user/password, raising on
+    failure. Used by the Studio Connections page; no message is sent.
+    """
+    import smtplib
+
+    if not config.smtp_host:
+        raise ToolSecurityError("email needs HIMMY_SMTP_HOST configured")
+    with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=15) as smtp:
+        if config.smtp_use_tls:
+            smtp.starttls()
+        if config.smtp_user and config.smtp_password:
+            smtp.login(config.smtp_user, config.smtp_password)
+        smtp.noop()
+
+
 def _httpx_webhook(
     url: str, payload: Any, headers: dict[str, str] | None, timeout: float
 ) -> int:
