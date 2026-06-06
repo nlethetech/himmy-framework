@@ -237,10 +237,7 @@ def _mount_studio(app: FastAPI) -> None:
         if is_spa_route:
             if path:
                 candidate = (STUDIO_STATIC_DIR / path).resolve()
-                if (
-                    STUDIO_STATIC_DIR in candidate.parents
-                    and candidate.is_file()
-                ):
+                if STUDIO_STATIC_DIR in candidate.parents and candidate.is_file():
                     return FileResponse(str(candidate))
             return FileResponse(str(index))
         # Preserve FastAPI's default HTTPException shape (and any auth/Allow headers).

@@ -1771,8 +1771,10 @@ class SingleAgentRuntime:
             outcome = ret.outcome if ret is not None else "unknown"
             completed = outcome == "success"
             ret_meta = (ret.metadata or {}) if ret is not None else {}
-            result_text = content_text if len(content_text) <= 2000 else (
-                content_text[:1999] + "…"
+            result_text = (
+                content_text
+                if len(content_text) <= 2000
+                else (content_text[:1999] + "…")
             )
             await self._emit(
                 RunEvent(
