@@ -80,6 +80,10 @@ export const deleteConnection = (type: string) =>
   api.del<ConnectionStatus>(`/connections/${type}`);
 export const testConnection = (type: string) =>
   api.post<ConnectionTestResult>(`/connections/${type}/test`, {});
+export const sendViaConnection = (type: string, payload: Record<string, unknown>) =>
+  api.post<{ ok: boolean; detail: string }>(`/connections/${type}/send`, {
+    payload,
+  });
 
 // ---- Shared types (mirror the Python response shapes) --------------------
 

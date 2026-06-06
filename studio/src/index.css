@@ -2299,3 +2299,109 @@ label.field > .hint {
     transform: translateY(0) scale(1);
   }
 }
+
+/* ---- Home launchpad ---------------------------------------------------- */
+.quick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-6);
+}
+.qtile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  align-items: flex-start;
+  padding: var(--sp-4);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    transform 0.12s var(--spring),
+    border-color 0.12s,
+    background 0.12s;
+}
+.qtile:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+  background: var(--card-hover);
+}
+.qtile-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+}
+.qtile-icon svg {
+  width: 21px;
+  height: 21px;
+}
+.qtile-label {
+  font-weight: 600;
+  font-size: var(--fs-md);
+  color: var(--text);
+}
+.qtile-warn {
+  position: absolute;
+  top: var(--sp-3);
+  right: var(--sp-3);
+  color: var(--warn);
+  font-size: 10px;
+}
+.home-cols {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: var(--sp-4);
+  align-items: start;
+}
+.home-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+.conn-mini,
+.tpl-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--sp-2);
+}
+.conn-mini-row,
+.tpl-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 8px var(--sp-1);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: var(--fs-sm);
+}
+.conn-mini-row:hover,
+.tpl-row:hover {
+  background: var(--hover);
+  text-decoration: none;
+}
+.conn-mini-name {
+  flex: 1;
+}
+.conn-mini-state {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+.tpl-row {
+  justify-content: space-between;
+}
+.compose-need {
+  color: var(--text-muted);
+  font-size: var(--fs-md);
+  line-height: 1.55;
+}
+@media (max-width: 860px) {
+  .home-cols {
+    grid-template-columns: 1fr;
+  }
+}

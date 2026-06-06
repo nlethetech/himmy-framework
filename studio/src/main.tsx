@@ -8,6 +8,7 @@ import Runs from "./screens/Runs";
 import RunDetail from "./screens/RunDetail";
 import Builder from "./screens/Builder";
 import Connections from "./screens/Connections";
+import Home from "./screens/Home";
 import ComingSoon from "./screens/ComingSoon";
 import "./index.css";
 
@@ -19,7 +20,7 @@ const router = createBrowserRouter([
     path: "/",
     element: <App />,
     children: [
-      { index: true, element: <ComingSoon title="Home" /> },
+      { index: true, element: <Home /> },
       { path: "chat", element: <Chat /> },
       { path: "approvals", element: <ComingSoon title="Approvals" /> },
       { path: "activity", element: <Runs /> },

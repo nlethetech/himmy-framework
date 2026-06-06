@@ -285,6 +285,63 @@ def delete_connection(ctype: str) -> ConnectionStatus:
     return _status(ct)
 
 
+class SendResult(BaseModel):
+    ok: bool
+    detail: str
+
+
+async def send_via_connection(ctype: str, payload: dict[str, Any]) -> SendResult:
+    """Directly send a user-composed message (a Home quick action).
+
+    This is *user-initiated* (the person clicked Send in the compose form), so it
+    bypasses the agent approval gate — that gate exists for when an *agent* wants
+    to send. Reuses the same SMTP / Telegram plumbing the tools use.
+    """
+    import asyncio
+    from email.message import EmailMessage
+
+    from himmy.toolkit.config import ToolkitConfig
+
+    apply_connections_to_env()
+    cfg = ToolkitConfig.from_env()
+
+    if ctype == "email":
+        from himmy.toolkit.comms import _smtp_send
+
+        to = str(payload.get("to") or "").strip()
+        if not to:
+            return SendResult(ok=False, detail="recipient required")
+        msg = EmailMessage()
+        msg["To"] = to
+        msg["From"] = cfg.smtp_from or cfg.smtp_user or "himmy@localhost"
+        msg["Subject"] = str(payload.get("subject") or "")
+        msg.set_content(str(payload.get("body") or ""))
+        try:
+            await asyncio.to_thread(_smtp_send, msg, cfg)
+            return SendResult(ok=True, detail=f"sent to {to}")
+        except Exception as exc:  # noqa: BLE001
+            return SendResult(ok=False, detail=_sanitize(str(exc), cfg))
+
+    if ctype == "telegram":
+        from himmy.toolkit.telegram import TelegramClient
+
+        if not cfg.telegram_bot_token:
+            return SendResult(ok=False, detail="no bot token")
+        chat_id = str(
+            payload.get("chat_id") or cfg.telegram_default_chat_id or ""
+        ).strip()
+        text = str(payload.get("text") or "")
+        if not chat_id:
+            return SendResult(ok=False, detail="chat id required")
+        try:
+            await TelegramClient(cfg.telegram_bot_token).send_message(chat_id, text)
+            return SendResult(ok=True, detail=f"sent to {chat_id}")
+        except Exception as exc:  # noqa: BLE001
+            return SendResult(ok=False, detail=_sanitize(str(exc), cfg))
+
+    raise KeyError(ctype)
+
+
 async def test_connection(ctype: str) -> ConnectionTestResult:
     """Live-validate a connection by exercising the real tool plumbing."""
     import asyncio
@@ -393,6 +450,7 @@ __all__ = [
     "ConnectionStatus",
     "ConnectionFieldStatus",
     "ConnectionTestResult",
+    "SendResult",
     "ReadOnlyBackendError",
     "CONNECTION_TYPES",
     "list_connections",
@@ -400,5 +458,6 @@ __all__ = [
     "set_connection",
     "delete_connection",
     "test_connection",
+    "send_via_connection",
     "apply_connections_to_env",
 ]

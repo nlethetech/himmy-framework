@@ -26,6 +26,7 @@ from himmy.api.studio_connections import (
     ConnectionStatus,
     ConnectionTestResult,
     ReadOnlyBackendError,
+    SendResult,
 )
 from himmy.api.studio_runs import (
     RunAnalytics,
@@ -263,6 +264,19 @@ async def test_connection(ctype: str) -> ConnectionTestResult:
     """Live-validate a connection (SMTP login / Telegram getMe / search ping)."""
     try:
         return await studio_connections.test_connection(ctype)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="unknown connection type") from exc
+
+
+class SendRequest(BaseModel):
+    payload: dict[str, Any]
+
+
+@router.post("/connections/{ctype}/send", response_model=SendResult)
+async def send_via_connection(ctype: str, body: SendRequest) -> SendResult:
+    """Send a user-composed message directly (a Home quick action)."""
+    try:
+        return await studio_connections.send_via_connection(ctype, body.payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="unknown connection type") from exc
 
