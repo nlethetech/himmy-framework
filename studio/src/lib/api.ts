@@ -113,6 +113,36 @@ export type RunEvent =
     }
   | { type: "error"; message: string; run_id?: string };
 
+export interface PackInfo {
+  name: string;
+  description: string;
+  tools: string[];
+}
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+  when_to_use: string | null;
+  tool_packs: string[];
+  tools: string[];
+  requires_skills: string[];
+  builtin: boolean;
+}
+
+// The editable spec is an open map of agent.yaml fields.
+export type AgentFields = Record<string, unknown>;
+
+export interface AgentDetail {
+  path: string;
+  spec: AgentFields;
+  has_advanced: boolean;
+}
+
+export interface ValidationResult {
+  ok: boolean;
+  errors: string[];
+}
+
 export interface RunSummary {
   id: string;
   created_at: string;

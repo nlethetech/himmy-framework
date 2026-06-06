@@ -21,7 +21,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from himmy.api import studio_service
+from himmy.api import studio_agents, studio_service
 from himmy.api.studio_runs import (
     StudioRun,
     StudioRunListResponse,
@@ -135,6 +135,59 @@ async def get_run(run_id: str) -> StudioRun:
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run
+
+
+# ---- Agent authoring (the no-code builder) ------------------------------
+
+
+@router.get("/tools", response_model=list[studio_agents.PackInfo])
+async def tool_packs() -> list[studio_agents.PackInfo]:
+    """The built-in tool packs an agent can switch on."""
+    return studio_agents.list_tool_packs()
+
+
+@router.get("/skills", response_model=list[studio_agents.SkillInfo])
+async def skills() -> list[studio_agents.SkillInfo]:
+    """Available skills (built-in + project-local)."""
+    return studio_agents.list_skill_infos()
+
+
+@router.get("/agent", response_model=studio_agents.AgentDetail)
+async def get_agent(path: str) -> studio_agents.AgentDetail:
+    """Load one agent's full editable spec (by project-relative path)."""
+    try:
+        return studio_agents.load_agent_detail(path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/agents/validate", response_model=studio_agents.ValidationResult)
+async def validate_agent(spec: dict) -> studio_agents.ValidationResult:
+    """Validate a proposed spec without saving (live form feedback)."""
+    errors = studio_agents.validate_spec(spec)
+    return studio_agents.ValidationResult(ok=not errors, errors=errors)
+
+
+@router.put("/agents", response_model=studio_service.AgentSummary)
+async def save_agent(
+    body: studio_agents.SaveAgentRequest,
+) -> studio_service.AgentSummary:
+    """Create or update an agent.yaml (validated; merges onto any existing file).
+
+    Returns 409 when creating would overwrite an existing file without ``overwrite``.
+    """
+    try:
+        return studio_agents.save_agent(
+            body.path, body.spec, overwrite=body.overwrite
+        )
+    except studio_agents.AgentExists as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except studio_agents.SpecInvalid as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 __all__ = ["router"]
