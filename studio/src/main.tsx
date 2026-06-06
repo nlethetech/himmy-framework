@@ -12,6 +12,7 @@ import Home from "./screens/Home";
 import Approvals from "./screens/Approvals";
 import Memory from "./screens/Memory";
 import Knowledge from "./screens/Knowledge";
+import Teams from "./screens/Teams";
 import ComingSoon from "./screens/ComingSoon";
 import "./index.css";
 
@@ -32,15 +33,7 @@ const router = createBrowserRouter([
       { path: "agents/:name", element: <Builder /> },
       { path: "connections", element: <Connections /> },
       { path: "advanced/doctor", element: <Doctor /> },
-      {
-        path: "advanced/teams",
-        element: (
-          <ComingSoon
-            title="Teams"
-            note="Multi-agent teams (a manager delegating to specialists) run today from Chat — drop a team.yaml in your project and pick it there. A visual team editor is coming here."
-          />
-        ),
-      },
+      { path: "advanced/teams", element: <Teams /> },
       {
         path: "advanced/workflows",
         element: (
