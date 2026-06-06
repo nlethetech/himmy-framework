@@ -106,9 +106,10 @@ def test_himmy_toml_defaults_apply(
     """A himmy.toml default tool_pack is applied without any flag."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "himmy.toml").write_text('[defaults]\ntool_packs = ["utils"]\n')
-    # Clear the module-level project cache so this test's toml is read.
-    import himmy.cli.commands as c
+    # Clear the module-level project cache so this test's toml is read. The cache
+    # lives in himmy.runtime.from_spec (the shared spec→runtime wiring).
+    import himmy.runtime.from_spec as fs
 
-    monkeypatch.setattr(c, "_PROJECT_CACHE", None)
+    monkeypatch.setattr(fs, "_PROJECT_CACHE", None)
     code = main(["run", "--provider", "stub", "--name", "a", "-p", "hi"])
     assert code == 0

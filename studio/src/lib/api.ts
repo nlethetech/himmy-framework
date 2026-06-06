@@ -72,3 +72,78 @@ export interface DoctorReport {
   has_agent: boolean;
   next_step: NextStep | null;
 }
+
+export interface AgentSummary {
+  name: string;
+  path: string;
+  description: string;
+  provider: string | null;
+  model: string;
+  skills: string[];
+  tool_packs: string[];
+  has_tools: boolean;
+  error: string | null;
+}
+
+export interface RunTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface RunRequest {
+  agent_path: string;
+  prompt: string;
+  provider?: string | null;
+  model?: string | null;
+  history?: RunTurn[];
+}
+
+// One streamed event from POST /api/studio/run (see studio_service.stream_agent_run).
+export type RunEvent =
+  | { type: "start"; agent: string; streaming: boolean }
+  | { type: "token"; delta: string }
+  | { type: "tool"; name: string }
+  | { type: "message"; text: string }
+  | { type: "done"; output_text: string; thread_id: string; succeeded: boolean }
+  | { type: "error"; message: string };
+
+// Stream an agent run over SSE (fetch + ReadableStream; EventSource can't POST).
+// Calls `onEvent` for each frame; resolves when the stream ends.
+export async function streamRun(
+  body: RunRequest,
+  onEvent: (e: RunEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch("/api/studio/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const b = await res.json();
+      if (b?.detail) detail = b.detail;
+    } catch {
+      /* non-JSON */
+    }
+    throw new ApiError(res.status, detail);
+  }
+  if (!res.body) throw new ApiError(0, "no response body to stream");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const line = frame.split("\n").find((l) => l.startsWith("data: "));
+      if (line) onEvent(JSON.parse(line.slice(6)) as RunEvent);
+    }
+  }
+}
