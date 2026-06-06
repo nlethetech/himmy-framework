@@ -9,9 +9,9 @@ import {
 import { Topbar, Page, Loading, ErrorState } from "../components/Page";
 import { RefreshIcon } from "../components/icons";
 import { AnalyticsPanel, fmtTokens, fmtUsd } from "../components/Usage";
-import { relativeTime, duration, statusClass } from "../lib/format";
+import { relativeTime, duration, statusClass, statusLabel } from "../lib/format";
 
-export default function Runs() {
+export default function Activity() {
   const [data, setData] = useState<RunListResponse | null>(null);
   const [analytics, setAnalytics] = useState<RunAnalytics | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -36,8 +36,10 @@ export default function Runs() {
   return (
     <>
       <Topbar
-        title="Runs"
-        sub={data ? `${data.total} run${data.total === 1 ? "" : "s"}` : "past runs & traces"}
+        title="Activity"
+        sub={
+          data ? `${data.total} run${data.total === 1 ? "" : "s"}` : "runs & analytics"
+        }
         actions={
           <button className="btn" onClick={load}>
             <RefreshIcon /> Refresh
@@ -46,14 +48,14 @@ export default function Runs() {
       />
       <Page>
         {loading && !data ? (
-          <Loading label="Loading runs…" />
+          <Loading label="Loading activity…" />
         ) : error ? (
           <ErrorState message={error} />
         ) : data && data.items.length === 0 ? (
           <div className="card">
             <div className="empty">
-              No runs yet. Head to <b>Chat</b> and talk to an agent — every run
-              shows up here with its full trace.
+              No activity yet. Head to <b>Chat</b> or use a quick action on{" "}
+              <b>Home</b> — every run shows up here with its full trace.
             </div>
           </div>
         ) : data ? (
@@ -64,14 +66,14 @@ export default function Runs() {
                 <div
                   className="list-row"
                   key={r.id}
-                  onClick={() => nav(`/runs/${r.id}`)}
+                  onClick={() => nav(`/activity/${r.id}`)}
                 >
                   <div className="lead">
                     <div className="row gap10">
                       <span className="title">{r.agent_name ?? "agent"}</span>
                       <span className={"pill " + statusClass(r.status)}>
                         <span className="dot" />
-                        {r.status}
+                        {statusLabel(r.status)}
                       </span>
                       {r.tool_count > 0 && (
                         <span className="pill dim">⚙ {r.tool_count}</span>

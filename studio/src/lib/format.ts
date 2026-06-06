@@ -21,8 +21,14 @@ export function duration(ms: number | null): string {
   return `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)}s`;
 }
 
-export function statusClass(status: string): "ok" | "err" | "dim" {
+export function statusClass(status: string): "ok" | "err" | "dim" | "warn" {
   if (status === "ok") return "ok";
   if (status === "error") return "err";
+  if (status === "awaiting_approval") return "warn";
   return "dim";
+}
+
+export function statusLabel(status: string): string {
+  if (status === "awaiting_approval") return "paused";
+  return status;
 }

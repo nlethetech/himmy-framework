@@ -394,7 +394,7 @@ export default function Chat() {
                     ))}
                   {m.role === "agent" && m.runId && !m.streaming && (
                     <div className="mt8">
-                      <Link to={`/runs/${m.runId}`} className="dim" style={{ fontSize: 12 }}>
+                      <Link to={`/activity/${m.runId}`} className="dim" style={{ fontSize: 12 }}>
                         ↗ view trace
                       </Link>
                     </div>

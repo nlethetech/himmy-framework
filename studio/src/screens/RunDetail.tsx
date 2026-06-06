@@ -72,7 +72,7 @@ export default function RunDetail() {
         title={run ? run.agent_name ?? "Run" : "Run"}
         sub={run ? relativeTime(run.created_at) : "trace timeline"}
         actions={
-          <button className="btn" onClick={() => nav("/runs")}>
+          <button className="btn" onClick={() => nav("/activity")}>
             <BackIcon /> Back
           </button>
         }

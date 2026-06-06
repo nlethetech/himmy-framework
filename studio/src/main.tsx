@@ -4,7 +4,7 @@ import { createBrowserRouter, RouterProvider, Navigate } from "react-router-dom"
 import App from "./App";
 import Doctor from "./screens/Doctor";
 import Chat from "./screens/Chat";
-import Runs from "./screens/Runs";
+import Activity from "./screens/Activity";
 import RunDetail from "./screens/RunDetail";
 import Builder from "./screens/Builder";
 import Connections from "./screens/Connections";
@@ -23,7 +23,7 @@ const router = createBrowserRouter([
       { index: true, element: <Home /> },
       { path: "chat", element: <Chat /> },
       { path: "approvals", element: <Approvals /> },
-      { path: "activity", element: <Runs /> },
+      { path: "activity", element: <Activity /> },
       { path: "activity/:runId", element: <RunDetail /> },
       { path: "agents", element: <Builder /> },
       { path: "agents/:name", element: <Builder /> },
