@@ -1515,7 +1515,12 @@ class SingleAgentRuntime:
                 TaskPromptVariables,
             )
 
-            objectives = list(getattr(persona, "objectives", []) or [])
+            # The persona's instructions are its directives — render them as
+            # objectives so they reach the model EVEN WHEN a description is set.
+            # (Previously the background used `description or instructions`, which
+            # silently dropped every instruction whenever a description existed.)
+            objectives = list(persona.instructions or [])
+            objectives += list(getattr(persona, "objectives", []) or [])
             objectives += list(ctx.get("objectives", []) or [])
             # Skills: ctx override wins, else persona.metadata.skills/required_skills.
             skills = ctx.get("skills")
@@ -1527,7 +1532,7 @@ class SingleAgentRuntime:
 
             system_vars = SystemPromptVariables(
                 role=ctx.get("role") or persona.role,
-                persona=persona.description or "\n".join(persona.instructions),
+                persona=persona.description,
                 objectives=objectives,
                 skills=skills,
                 datetime=ctx.get("datetime", ""),
