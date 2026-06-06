@@ -430,6 +430,38 @@ async def kb_delete(kb_id: str) -> dict[str, bool]:
     return {"ok": await studio_knowledge.delete_kb(kb_id)}
 
 
+# ---- Evaluation (suites → run → scorecard) ------------------------------
+
+
+class EvalRunRequest(BaseModel):
+    suite_path: str
+    agent_path: str
+    provider: str | None = None
+    model: str | None = None
+
+
+@router.get("/evals")
+async def eval_suites() -> list[Any]:
+    from himmy.api import studio_eval
+
+    return studio_eval.discover_suites()
+
+
+@router.post("/evals/run")
+async def eval_run(body: EvalRunRequest) -> Any:
+    from himmy.api import studio_eval
+
+    try:
+        return await studio_eval.run_eval(
+            body.suite_path,
+            body.agent_path,
+            provider=body.provider,
+            model=body.model,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ---- Agent authoring (the no-code builder) ------------------------------
 
 

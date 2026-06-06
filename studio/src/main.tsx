@@ -13,6 +13,7 @@ import Approvals from "./screens/Approvals";
 import Memory from "./screens/Memory";
 import Knowledge from "./screens/Knowledge";
 import Teams from "./screens/Teams";
+import Evaluation from "./screens/Evaluation";
 import ComingSoon from "./screens/ComingSoon";
 import "./index.css";
 
@@ -45,15 +46,7 @@ const router = createBrowserRouter([
       },
       { path: "advanced/knowledge", element: <Knowledge /> },
       { path: "advanced/memory", element: <Memory /> },
-      {
-        path: "advanced/eval",
-        element: (
-          <ComingSoon
-            title="Evaluation"
-            note="Score agents against test suites (himmy.services.evaluation / the /v1/evaluation API). A scorecard dashboard is coming here."
-          />
-        ),
-      },
+      { path: "advanced/eval", element: <Evaluation /> },
       {
         path: "advanced/lineage",
         element: (

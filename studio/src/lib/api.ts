@@ -40,6 +40,38 @@ export const api = {
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
+// ---- Evaluation ----------------------------------------------------------
+
+export interface EvalSuiteInfo {
+  path: string;
+  name: string;
+  cases: number;
+}
+export interface MetricScore {
+  metric: string;
+  score: number;
+  passed: boolean;
+  detail: string;
+}
+export interface EvalCaseResult {
+  case_id: string;
+  metric_scores: MetricScore[];
+  aggregate: number;
+  passed: boolean;
+  actual_output?: string;
+}
+export interface EvalRun {
+  suite_name: string;
+  aggregate_score: number;
+  case_results: EvalCaseResult[];
+}
+export const listEvalSuites = () => api.get<EvalSuiteInfo[]>("/evals");
+export const runEval = (
+  suite_path: string,
+  agent_path: string,
+  provider?: string | null,
+) => api.post<EvalRun>("/evals/run", { suite_path, agent_path, provider });
+
 // ---- Memory --------------------------------------------------------------
 
 export interface MemoryItem {
