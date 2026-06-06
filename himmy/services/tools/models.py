@@ -55,7 +55,11 @@ class HttpToolConfig(BaseModel):
     all resolved from the invocation's ``args`` at execution time.
     """
 
-    base_url_env_var: str
+    # The base URL comes from ``base_url_env_var`` (an env var, preferred for
+    # secrets/config) when set; otherwise the literal ``base_url`` (handy for simple,
+    # public endpoints). At least one must resolve at call time.
+    base_url_env_var: str = ""
+    base_url: str = ""
     method: str = "GET"
     path_template: str = "/"
     auth: HttpAuthConfig = HttpAuthConfig()

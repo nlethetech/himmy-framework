@@ -434,11 +434,16 @@ class ToolService:
                 f"httpx is required for HTTP tools: {exc}",
             ) from exc
 
-        base_url = os.environ.get(cfg.base_url_env_var)
+        base_url = ""
+        if cfg.base_url_env_var:
+            base_url = os.environ.get(cfg.base_url_env_var) or ""
+        if not base_url:
+            base_url = cfg.base_url
         if not base_url:
             raise _ToolDispatchError(
                 ToolErrorCode.INVALID_REQUEST,
-                f"env var {cfg.base_url_env_var!r} is not set",
+                f"no base URL for HTTP tool: set `base_url` or the "
+                f"{cfg.base_url_env_var!r} env var",
             )
 
         # Resolve & encode path placeholders, then pin the final host.
@@ -493,6 +498,16 @@ class ToolService:
             raise _ToolDispatchError(
                 ToolErrorCode.PROVIDER_UNAVAILABLE,
                 f"upstream returned {response.status_code}",
+            )
+        if 300 <= response.status_code < 400:
+            # Redirects aren't followed (SSRF guard), so surface it clearly instead of
+            # returning the redirect page's HTML as a successful result.
+            location = response.headers.get("location", "")
+            raise _ToolDispatchError(
+                ToolErrorCode.INVALID_REQUEST,
+                f"upstream returned a redirect ({response.status_code})"
+                + (f" to {location}" if location else "")
+                + "; point the tool's base_url/path at the final location",
             )
         if response.status_code >= 400:
             raise _ToolDispatchError(

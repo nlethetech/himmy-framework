@@ -1,0 +1,26 @@
+# Connect an agent to ANY REST API — with no Python, just this file.
+# Each entry under `http_tools` becomes a tool the model can call; the framework resolves
+# the URL, path {placeholders}, query/body/header args, and env-backed auth at call time.
+name: fx-agent
+description: Looks up live foreign-exchange rates via a public API.
+provider: ollama
+model: qwen2.5:3b-instruct
+
+http_tools:
+  - name: exchange_rate
+    description: Get the exchange rate from a base currency to one or more others (ISO codes).
+    base_url: https://api.frankfurter.dev
+    path: /v1/latest
+    query: [base, symbols]
+
+  # ── Authenticated example (uncomment + set the env vars) ─────────────────────────────
+  # Your own API behind a bearer token. The URL and key come from env vars, so no secret
+  # is ever written in the YAML:
+  # - name: get_order
+  #   description: Look up an order by its id.
+  #   base_url_env_var: MYAPI_URL          # e.g. export MYAPI_URL=https://api.mycompany.com
+  #   path: /orders/{order_id}             # {order_id} is required (a path placeholder)
+  #   auth: { type: bearer, env_var: MYAPI_KEY }
+
+instructions:
+  - Use exchange_rate (base and symbols are ISO currency codes) and state the rate plainly.

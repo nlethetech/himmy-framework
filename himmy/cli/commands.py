@@ -230,6 +230,7 @@ def _build_runtime_for(
     if (
         spec.tool_packs
         or spec.tools_module
+        or spec.http_tools
         or spec.mcp_servers
         or spec.allow_spawn
         or spec.allow_skill_dispatch
@@ -240,6 +241,10 @@ def _build_runtime_for(
 
             tk_config = ToolkitConfig.from_sources(_project().get("toolkit"))
             register_packs(registry, spec.tool_packs, tk_config)
+        if spec.http_tools:
+            from himmy.config.http_tool_spec import register_http_tools
+
+            register_http_tools(registry, spec.http_tools)
         if spec.tools_module:
             _resolve_register(spec.tools_module)(registry)
         if spec.allow_spawn:

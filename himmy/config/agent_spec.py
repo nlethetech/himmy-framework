@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from himmy.agents.base_agent.task import Task
 from himmy.agents.personas.persona import Persona
+from himmy.config.http_tool_spec import HttpToolSpec
 from himmy.config.mcp_spec import MCPServerConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -59,6 +60,7 @@ class AgentSpec(BaseModel):
     tools: list[str] = []
     tool_packs: list[str] = []
     tools_module: str | None = None
+    http_tools: list[HttpToolSpec] = []  # declarative REST tools (no Python)
     mcp_servers: list[MCPServerConfig] = []  # stdio MCP servers → agent tools
     # Give the agent a spawn_agent tool (one-level recursive sub-agents):
     allow_spawn: bool = False
