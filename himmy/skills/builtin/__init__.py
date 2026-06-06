@@ -98,6 +98,40 @@ BUILTIN_SKILLS: dict[str, Skill] = {
             "Format money as NPR and report the exact figure from the tool.",
         ],
     ),
+    "clarify": Skill(
+        name="clarify",
+        description="Ask before acting when a request is ambiguous or under-specified.",
+        when_to_use=(
+            "a request could be read more than one way, omits a needed detail "
+            "(which item, how many, which of several matching records), or would "
+            "create / change / delete data."
+        ),
+        instructions=[
+            "Before taking ANY action — especially one that records, modifies, or "
+            "deletes data — check that the request is fully specified.",
+            "If something material is ambiguous or missing (e.g. which item/breed/"
+            "account, how many, which of several matching records, or an unstated "
+            "assumption), STOP and ask the user ONE concise clarifying question. Do "
+            "NOT guess a default and do NOT proceed.",
+            "When you ask, briefly state the options or what already exists (e.g. the "
+            "current records) so the user can answer in one line.",
+            "Make no tool call that changes anything until the user has answered. "
+            "Once they answer, carry out the now-unambiguous request.",
+            "Only skip the question when the request is genuinely unambiguous or the "
+            "user has already supplied the missing detail.",
+        ],
+        examples=[
+            SkillExample(
+                input="Add 10 ducks to the farm.",
+                action=(
+                    "ask: 'Which breed, and to which flock? You currently have 12 "
+                    "Khaki Campbell ducks — add to that flock, or start a new breed?' "
+                    "— then wait for the answer before recording anything"
+                ),
+                note="quantity is clear but the breed/flock is not; never assume",
+            ),
+        ],
+    ),
 }
 
 __all__ = ["BUILTIN_SKILLS"]
