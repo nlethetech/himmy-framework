@@ -11,6 +11,7 @@ import Connections from "./screens/Connections";
 import Home from "./screens/Home";
 import Approvals from "./screens/Approvals";
 import Memory from "./screens/Memory";
+import Knowledge from "./screens/Knowledge";
 import ComingSoon from "./screens/ComingSoon";
 import "./index.css";
 
@@ -49,15 +50,7 @@ const router = createBrowserRouter([
           />
         ),
       },
-      {
-        path: "advanced/knowledge",
-        element: (
-          <ComingSoon
-            title="Knowledge"
-            note="Give an agent documents via the Knowledge capability in the Agent builder (auto-ingested → kb_search). A document browser + ingest UI is coming here."
-          />
-        ),
-      },
+      { path: "advanced/knowledge", element: <Knowledge /> },
       { path: "advanced/memory", element: <Memory /> },
       {
         path: "advanced/eval",

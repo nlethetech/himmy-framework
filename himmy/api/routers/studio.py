@@ -378,6 +378,58 @@ async def memory_recall(body: MemoryRecallRequest) -> list[Any]:
     )
 
 
+# ---- Knowledge (RAG: ingest + retrieval tester) -------------------------
+
+
+class KbCreateRequest(BaseModel):
+    name: str
+
+
+class KbIngestRequest(BaseModel):
+    text: str
+    title: str | None = None
+
+
+class KbSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+@router.get("/knowledge")
+async def kb_list() -> list[Any]:
+    from himmy.api import studio_knowledge
+
+    return studio_knowledge.list_kbs()
+
+
+@router.post("/knowledge")
+async def kb_create(body: KbCreateRequest) -> Any:
+    from himmy.api import studio_knowledge
+
+    return await studio_knowledge.create_kb(body.name)
+
+
+@router.post("/knowledge/{kb_id}/ingest")
+async def kb_ingest(kb_id: str, body: KbIngestRequest) -> Any:
+    from himmy.api import studio_knowledge
+
+    return await studio_knowledge.ingest_text(kb_id, body.text, title=body.title)
+
+
+@router.post("/knowledge/{kb_id}/search")
+async def kb_search(kb_id: str, body: KbSearchRequest) -> list[Any]:
+    from himmy.api import studio_knowledge
+
+    return await studio_knowledge.search(kb_id, body.query, top_k=body.top_k)
+
+
+@router.delete("/knowledge/{kb_id}")
+async def kb_delete(kb_id: str) -> dict[str, bool]:
+    from himmy.api import studio_knowledge
+
+    return {"ok": await studio_knowledge.delete_kb(kb_id)}
+
+
 # ---- Agent authoring (the no-code builder) ------------------------------
 
 

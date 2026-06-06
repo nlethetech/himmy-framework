@@ -64,6 +64,27 @@ export const forgetMemory = (id: string) =>
 export const recallMemory = (query: string, subject_id: string) =>
   api.post<MemoryHit[]>("/memory/recall", { query, subject_id, top_k: 5 });
 
+// ---- Knowledge -----------------------------------------------------------
+
+export interface KbInfo {
+  kb_id: string;
+  name: string;
+  documents: number;
+}
+export interface KbHit {
+  text: string;
+  similarity: number;
+  source_uri: string | null;
+}
+export const listKbs = () => api.get<KbInfo[]>("/knowledge");
+export const createKb = (name: string) => api.post<KbInfo>("/knowledge", { name });
+export const ingestText = (kbId: string, text: string, title?: string) =>
+  api.post<{ document_id: string }>(`/knowledge/${kbId}/ingest`, { text, title });
+export const searchKb = (kbId: string, query: string) =>
+  api.post<KbHit[]>(`/knowledge/${kbId}/search`, { query, top_k: 5 });
+export const deleteKb = (kbId: string) =>
+  api.del<{ ok: boolean }>(`/knowledge/${kbId}`);
+
 // ---- Connections ---------------------------------------------------------
 
 export interface ConnectionFieldStatus {
