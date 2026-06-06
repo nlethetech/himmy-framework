@@ -210,6 +210,18 @@ export default function Chat() {
             usage: foldUsage(m.usage ?? emptyUsage(), e),
           }));
           break;
+        case "approval_required":
+          patchLast((m) => ({
+            ...m,
+            text:
+              (m.text ? m.text + "\n\n" : "") +
+              `⏸ Paused — needs your approval to run **${e.tools.join(", ")}**. ` +
+              `Review it in the **Approvals** tab.`,
+          }));
+          break;
+        case "paused":
+          patchLast((m) => ({ ...m, streaming: false, active: null }));
+          break;
         case "message":
           patchLast((m) => ({ ...m, text: e.text }));
           break;

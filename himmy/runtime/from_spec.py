@@ -125,6 +125,7 @@ def build_runtime_for_spec(
     inference: Any = None,
     on_log: Callable[[str], None] | None = None,
     capture_io: bool = False,
+    checkpoint_store: Any = None,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring provider/model overrides + tools.
 
@@ -151,6 +152,8 @@ def build_runtime_for_spec(
         overrides["on_event"] = on_event
     if capture_io:
         overrides["capture_io"] = True
+    if checkpoint_store is not None:
+        overrides["checkpoint_store"] = checkpoint_store
 
     pipeline = None
     if spec.guardrails:

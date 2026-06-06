@@ -85,6 +85,45 @@ export const sendViaConnection = (type: string, payload: Record<string, unknown>
     payload,
   });
 
+// ---- Approvals (HITL inbox) ----------------------------------------------
+
+export interface PendingToolView {
+  tool_name: string;
+  args: Record<string, unknown>;
+}
+export interface ApprovalSummary {
+  checkpoint_id: string;
+  status: string;
+  created_at: string;
+  tools: string[];
+  run_id: string | null;
+  agent: string | null;
+  prompt: string;
+}
+export interface ApprovalDetail extends ApprovalSummary {
+  pending_tool_calls: PendingToolView[];
+  thread_preview: { role: string; content: string }[];
+}
+
+export const listApprovals = () => api.get<ApprovalSummary[]>("/approvals");
+export const getApproval = (id: string) =>
+  api.get<ApprovalDetail>(`/approvals/${id}`);
+
+// approve/reject return an SSE stream of the resumed run
+export function resolveApproval(
+  id: string,
+  approve: boolean,
+  onEvent: (e: RunEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return streamSse(
+    `/approvals/${id}/${approve ? "approve" : "reject"}`,
+    {},
+    onEvent,
+    signal,
+  );
+}
+
 // ---- Shared types (mirror the Python response shapes) --------------------
 
 export interface ExtraStatus {
@@ -228,6 +267,13 @@ export type RunEvent =
       total_cost: number;
       inferences: number;
     }
+  | {
+      type: "approval_required";
+      agent?: string | null;
+      checkpoint_id: string;
+      tools: string[];
+    }
+  | { type: "paused"; checkpoint_id: string | null; run_id: string }
   | { type: "message"; text: string }
   | {
       type: "done";

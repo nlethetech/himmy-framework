@@ -447,6 +447,17 @@ class _Cognition:
                 )
             return out
 
+        if et == E.APPROVAL_REQUIRED:
+            out.append(
+                {
+                    "type": "approval_required",
+                    "agent": self.active,
+                    "checkpoint_id": payload.get("checkpoint_id"),
+                    "tools": list(payload.get("tools") or []),
+                }
+            )
+            return out
+
         if et == E.GUARDRAIL_APPLIED:
             safety = {
                 "stage": payload.get("stage"),
@@ -588,6 +599,8 @@ async def stream_agent_run(
 
     # Build the runtime off the event loop: knowledge ingestion runs its own
     # asyncio.run() internally, which must not happen inside this running loop.
+    from himmy.api.studio_approvals import get_checkpoint_store
+
     runtime, registry = await asyncio.to_thread(
         lambda: from_spec.build_runtime_for_spec(
             spec,
@@ -595,6 +608,7 @@ async def stream_agent_run(
             model=model,
             on_event=_on_event,
             capture_io=True,  # power the cognition stream + trace inspector
+            checkpoint_store=get_checkpoint_store(),  # pause on approval-gated tools
         )
     )
     has_tools = registry is not None
@@ -614,12 +628,14 @@ async def stream_agent_run(
     tools: list[str] = []
     status = "ok"
     error_msg: str | None = None
+    checkpoint_id: str | None = None
 
     yield {"type": "start", "agent": spec.name, "streaming": not has_tools}
     try:
         task = spec.make_task(prompt)
         if has_tools:
-            # Tool-using agents stream their cognition (act → observe) live.
+            # Tool-using agents stream their cognition (act → observe) live, and
+            # PAUSE (hitl) when a tool needs approval instead of auto-denying it.
             run_task = asyncio.create_task(
                 runtime.run_agent_loop(
                     persona,
@@ -628,14 +644,22 @@ async def stream_agent_run(
                     llm_config=llm_config,
                     max_turns=8,
                     route_tools=spec.tool_router,
+                    hitl=True,
                 )
             )
             async for frame in _drain_cognition(queue, run_task, cog):
                 yield frame
             loop = await run_task
             tools = cog.tools_used
-            output_text = loop.final.output_text or ""
-            yield {"type": "message", "text": output_text}
+            if loop.stopped_reason == "awaiting_approval":
+                # The run paused at an approval gate. The approval_required frame
+                # already streamed (via _Cognition); end here without a final
+                # message/done — the user resumes it later from Approvals.
+                status = "awaiting_approval"
+                checkpoint_id = loop.checkpoint_id
+            else:
+                output_text = loop.final.output_text or ""
+                yield {"type": "message", "text": output_text}
         else:
             async for delta in runtime.stream_task(
                 persona, task, thread, llm_config=llm_config
@@ -683,12 +707,22 @@ async def stream_agent_run(
             error=error_msg,
             duration_ms=duration_ms,
             thread_id=thread.thread_id,
+            checkpoint_id=checkpoint_id,
         )
     except Exception:  # noqa: BLE001 - persistence must never break the stream
         pass
 
     if status == "error":
         yield {"type": "error", "message": error_msg or "run failed", "run_id": run_id}
+        return
+    if status == "awaiting_approval":
+        # Terminal for this stream; the approval_required frame already carried the
+        # checkpoint. The user resumes from the Approvals inbox.
+        yield {
+            "type": "paused",
+            "checkpoint_id": checkpoint_id,
+            "run_id": run_id,
+        }
         return
     yield {
         "type": "done",
@@ -716,7 +750,8 @@ def _record_run(
     status: str,
     error: str | None,
     duration_ms: float,
-    thread_id: str,
+    thread_id: str | None,
+    checkpoint_id: str | None = None,
 ) -> None:
     """Build a :class:`StudioRun` and persist it (runs in a worker thread)."""
     from himmy.api.studio_runs import (
@@ -756,6 +791,7 @@ def _record_run(
         output_tokens=int(usage.get("output_tokens", 0)),
         cost=float(usage.get("cost", 0.0)),
         usage_by_model=[ModelUsage(**u) for u in usage.get("by_model", [])],
+        checkpoint_id=checkpoint_id,
     )
     get_run_store().save(run)
 

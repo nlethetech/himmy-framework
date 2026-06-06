@@ -9,7 +9,7 @@ import RunDetail from "./screens/RunDetail";
 import Builder from "./screens/Builder";
 import Connections from "./screens/Connections";
 import Home from "./screens/Home";
-import ComingSoon from "./screens/ComingSoon";
+import Approvals from "./screens/Approvals";
 import "./index.css";
 
 // New task-first IA. Screens not yet built (Home/Connections/Approvals) render a
@@ -22,7 +22,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Home /> },
       { path: "chat", element: <Chat /> },
-      { path: "approvals", element: <ComingSoon title="Approvals" /> },
+      { path: "approvals", element: <Approvals /> },
       { path: "activity", element: <Runs /> },
       { path: "activity/:runId", element: <RunDetail /> },
       { path: "agents", element: <Builder /> },

@@ -21,7 +21,13 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from himmy.api import studio_agents, studio_connections, studio_service
+from himmy.api import (
+    studio_agents,
+    studio_approvals,
+    studio_connections,
+    studio_service,
+)
+from himmy.api.studio_approvals import ApprovalDetail, ApprovalSummary
 from himmy.api.studio_connections import (
     ConnectionStatus,
     ConnectionTestResult,
@@ -279,6 +285,43 @@ async def send_via_connection(ctype: str, body: SendRequest) -> SendResult:
         return await studio_connections.send_via_connection(ctype, body.payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="unknown connection type") from exc
+
+
+# ---- Approvals (human-in-the-loop inbox) --------------------------------
+
+
+@router.get("/approvals", response_model=list[ApprovalSummary])
+async def approvals() -> list[ApprovalSummary]:
+    """List runs paused awaiting a human decision."""
+    return studio_approvals.list_pending()
+
+
+@router.get("/approvals/{checkpoint_id}", response_model=ApprovalDetail)
+async def approval(checkpoint_id: str) -> ApprovalDetail:
+    detail = studio_approvals.get_detail(checkpoint_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="approval not found")
+    return detail
+
+
+def _resolve_stream(checkpoint_id: str, approved: bool) -> StreamingResponse:
+    async def _gen() -> AsyncIterator[str]:
+        async for event in studio_approvals.resolve(checkpoint_id, approved=approved):
+            yield _sse(event)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+@router.post("/approvals/{checkpoint_id}/approve")
+async def approve(checkpoint_id: str) -> StreamingResponse:
+    """Approve the pending tool call and stream the resumed run."""
+    return _resolve_stream(checkpoint_id, True)
+
+
+@router.post("/approvals/{checkpoint_id}/reject")
+async def reject(checkpoint_id: str) -> StreamingResponse:
+    """Reject the pending tool call and stream the resumed run."""
+    return _resolve_stream(checkpoint_id, False)
 
 
 # ---- Agent authoring (the no-code builder) ------------------------------

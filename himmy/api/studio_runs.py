@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS studio_runs (
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cost          REAL NOT NULL DEFAULT 0,
-    usage_by_model TEXT NOT NULL DEFAULT '[]'
+    usage_by_model TEXT NOT NULL DEFAULT '[]',
+    checkpoint_id TEXT
 );
 CREATE INDEX IF NOT EXISTS studio_runs_created_idx ON studio_runs (created_at);
 """
@@ -49,6 +50,7 @@ _LATER_COLUMNS = {
     "output_tokens": "INTEGER NOT NULL DEFAULT 0",
     "cost": "REAL NOT NULL DEFAULT 0",
     "usage_by_model": "TEXT NOT NULL DEFAULT '[]'",
+    "checkpoint_id": "TEXT",
 }
 
 
@@ -144,6 +146,7 @@ class StudioRun(StudioRunSummary):
     timeline: list[TimelineStep] = []
     steps: list[CognitionStep] = []  # the cognition trace (think → act → observe)
     usage_by_model: list[ModelUsage] = []
+    checkpoint_id: str | None = None  # set when the run paused for HITL approval
 
 
 class StudioRunListResponse(BaseModel):
@@ -240,8 +243,8 @@ class StudioRunStore:
             "INSERT OR REPLACE INTO studio_runs (id, created_at, agent_name, "
             "agent_path, provider, model, prompt, output, status, duration_ms, "
             "thread_id, tools, messages, timeline, steps, input_tokens, "
-            "output_tokens, cost, usage_by_model) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "output_tokens, cost, usage_by_model, checkpoint_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 run.id,
                 run.created_at,
@@ -262,6 +265,7 @@ class StudioRunStore:
                 run.output_tokens,
                 run.cost,
                 json.dumps([u.model_dump() for u in run.usage_by_model]),
+                run.checkpoint_id,
             ),
         )
         self._conn.commit()
@@ -281,6 +285,15 @@ class StudioRunStore:
     def get(self, run_id: str) -> StudioRun | None:
         row = self._conn.execute(
             "SELECT * FROM studio_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        return self._full(row) if row else None
+
+    def get_by_checkpoint(self, checkpoint_id: str) -> StudioRun | None:
+        """The run that paused on this checkpoint (so a resume can rebuild it)."""
+        row = self._conn.execute(
+            "SELECT * FROM studio_runs WHERE checkpoint_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (checkpoint_id,),
         ).fetchone()
         return self._full(row) if row else None
 
@@ -412,6 +425,7 @@ class StudioRunStore:
                 ModelUsage(**u)
                 for u in json.loads(_col(row, "usage_by_model", "[]") or "[]")
             ],
+            checkpoint_id=_col(row, "checkpoint_id", None),
             tool_count=len(json.loads(row["tools"] or "[]")),
         )
 

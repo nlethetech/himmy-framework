@@ -133,6 +133,15 @@ class SqliteCheckpointStore:
             return None
         return AgentCheckpoint.model_validate(json.loads(row[0]))
 
+    def list_by_status(self, status: str) -> list[AgentCheckpoint]:
+        """All checkpoints with the given status, newest first (for an approvals UI)."""
+        rows = self._conn.execute(
+            "SELECT data FROM agent_checkpoints WHERE status = ? "
+            "ORDER BY created_at DESC",
+            (status,),
+        ).fetchall()
+        return [AgentCheckpoint.model_validate(json.loads(r[0])) for r in rows]
+
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
         self._conn.close()

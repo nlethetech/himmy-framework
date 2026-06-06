@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
-import { listConnections } from "../lib/api";
+import { listConnections, listApprovals } from "../lib/api";
 import {
   HomeIcon,
   ChatIcon,
@@ -49,15 +49,10 @@ function SidebarLink({ item }: { item: NavItem }) {
   );
 }
 
-export function AppShell({
-  children,
-  approvalsCount = 0,
-}: {
-  children: ReactNode;
-  approvalsCount?: number;
-}) {
+export function AppShell({ children }: { children: ReactNode }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [connectionsOk, setConnectionsOk] = useState<number | null>(null);
+  const [approvalsCount, setApprovalsCount] = useState(0);
 
   // Live connection count for the footer (refreshed when the window regains focus,
   // so connecting an account updates the badge).
@@ -69,6 +64,21 @@ export function AppShell({
     refresh();
     window.addEventListener("focus", refresh);
     return () => window.removeEventListener("focus", refresh);
+  }, []);
+
+  // Poll pending approvals so the sidebar badge stays current.
+  useEffect(() => {
+    const poll = () =>
+      listApprovals()
+        .then((a) => setApprovalsCount(a.length))
+        .catch(() => {});
+    poll();
+    const id = setInterval(poll, 15000);
+    window.addEventListener("focus", poll);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener("focus", poll);
+    };
   }, []);
 
   const workspace = WORKSPACE.map((i) =>
