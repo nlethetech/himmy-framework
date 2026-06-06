@@ -324,6 +324,60 @@ async def reject(checkpoint_id: str) -> StreamingResponse:
     return _resolve_stream(checkpoint_id, False)
 
 
+# ---- Memory (long-term recall browser) ----------------------------------
+
+
+class MemoryAddRequest(BaseModel):
+    text: str
+    subject_id: str = "default"
+    kind: str = "semantic"
+
+
+class MemoryRecallRequest(BaseModel):
+    query: str
+    subject_id: str = "default"
+    top_k: int = 5
+
+
+@router.get("/memory/subjects", response_model=list[str])
+async def memory_subjects() -> list[str]:
+    from himmy.api import studio_memory
+
+    return studio_memory.list_subjects()
+
+
+@router.get("/memory")
+async def memory_list(subject: str = "default") -> list[Any]:
+    from himmy.api import studio_memory
+
+    return studio_memory.list_memories(subject)
+
+
+@router.post("/memory")
+async def memory_add(body: MemoryAddRequest) -> Any:
+    from himmy.api import studio_memory
+
+    return studio_memory.add_memory(
+        body.text, subject_id=body.subject_id, kind=body.kind
+    )
+
+
+@router.delete("/memory/{memory_id}")
+async def memory_forget(memory_id: str) -> dict[str, bool]:
+    from himmy.api import studio_memory
+
+    return {"ok": studio_memory.forget(memory_id)}
+
+
+@router.post("/memory/recall")
+async def memory_recall(body: MemoryRecallRequest) -> list[Any]:
+    from himmy.api import studio_memory
+
+    return await studio_memory.recall(
+        body.query, subject_id=body.subject_id, top_k=body.top_k
+    )
+
+
 # ---- Agent authoring (the no-code builder) ------------------------------
 
 

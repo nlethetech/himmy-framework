@@ -10,6 +10,7 @@ import Builder from "./screens/Builder";
 import Connections from "./screens/Connections";
 import Home from "./screens/Home";
 import Approvals from "./screens/Approvals";
+import Memory from "./screens/Memory";
 import ComingSoon from "./screens/ComingSoon";
 import "./index.css";
 
@@ -57,15 +58,7 @@ const router = createBrowserRouter([
           />
         ),
       },
-      {
-        path: "advanced/memory",
-        element: (
-          <ComingSoon
-            title="Memory"
-            note="Turn on the Memory capability in the Agent builder so an agent can remember and recall facts across runs. A memory browser will live here."
-          />
-        ),
-      },
+      { path: "advanced/memory", element: <Memory /> },
       {
         path: "advanced/eval",
         element: (

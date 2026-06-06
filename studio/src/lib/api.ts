@@ -40,6 +40,30 @@ export const api = {
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
+// ---- Memory --------------------------------------------------------------
+
+export interface MemoryItem {
+  memory_id: string;
+  subject_id: string;
+  kind: string;
+  text: string;
+  created_at: string;
+}
+export interface MemoryHit {
+  memory_id: string;
+  text: string;
+  similarity: number;
+}
+export const listMemorySubjects = () => api.get<string[]>("/memory/subjects");
+export const listMemories = (subject: string) =>
+  api.get<MemoryItem[]>(`/memory?subject=${encodeURIComponent(subject)}`);
+export const addMemory = (text: string, subject_id: string) =>
+  api.post<MemoryItem>("/memory", { text, subject_id });
+export const forgetMemory = (id: string) =>
+  api.del<{ ok: boolean }>(`/memory/${id}`);
+export const recallMemory = (query: string, subject_id: string) =>
+  api.post<MemoryHit[]>("/memory/recall", { query, subject_id, top_k: 5 });
+
 // ---- Connections ---------------------------------------------------------
 
 export interface ConnectionFieldStatus {

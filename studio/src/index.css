@@ -2697,3 +2697,64 @@ label.field > .hint {
   background: var(--hover);
   color: var(--text);
 }
+
+/* ---- Memory / Knowledge browsers --------------------------------------- */
+.mem-bar {
+  margin-bottom: var(--sp-4);
+  max-width: 280px;
+}
+.mem-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-4);
+  align-items: start;
+}
+.mem-list,
+.mem-hits {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.mem-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+}
+.mem-text {
+  flex: 1;
+  font-size: var(--fs-sm);
+}
+.mem-meta {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  flex: none;
+}
+.mem-del {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 2px;
+  flex: none;
+}
+.mem-del:hover {
+  color: var(--err);
+}
+.mem-hit {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  font-size: var(--fs-sm);
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--border);
+}
+@media (max-width: 880px) {
+  .mem-cols {
+    grid-template-columns: 1fr;
+  }
+}
