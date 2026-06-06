@@ -1,10 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import {
-  ChatIcon,
-  BuildIcon,
-  RunsIcon,
-  DoctorIcon,
-} from "./components/icons";
+import { ChatIcon, BuildIcon, RunsIcon, DoctorIcon } from "./components/icons";
 
 const NAV = [
   { to: "/chat", label: "Chat", Icon: ChatIcon },
@@ -16,33 +11,27 @@ const NAV = [
 export default function App() {
   return (
     <div className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">H</div>
-          <div>
-            <div className="brand-name">Himmy</div>
-            <div className="brand-sub">Studio</div>
-          </div>
+      <aside className="rail">
+        <div className="rail-brand" title="Himmy Studio">
+          H
         </div>
-
-        <nav className="stack gap6">
+        <nav className="rail-nav">
           {NAV.map(({ to, label, Icon }) => (
             <NavLink
               key={to}
               to={to}
+              data-label={label}
+              aria-label={label}
               className={({ isActive }) =>
-                "nav-link" + (isActive ? " active" : "")
+                "rail-link" + (isActive ? " active" : "")
               }
             >
               <Icon className="ico" />
-              <span>{label}</span>
             </NavLink>
           ))}
         </nav>
-
-        <div className="sidebar-foot">
+        <div className="rail-foot" data-label="offline-first · local">
           <span className="dot" style={{ color: "var(--ok)" }} />
-          <span>offline-first · local</span>
         </div>
       </aside>
 
