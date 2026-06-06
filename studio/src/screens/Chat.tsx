@@ -10,7 +10,7 @@ import {
 } from "../lib/api";
 import { Topbar } from "../components/Page";
 import { Markdown } from "../components/Markdown";
-import { SendIcon, RefreshIcon } from "../components/icons";
+import { SendIcon, RefreshIcon, PlusIcon } from "../components/icons";
 
 // Domain-agnostic starter prompts for the empty state (fill the input, don't send).
 const EXAMPLES = [
@@ -54,6 +54,15 @@ export default function Chat() {
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-grow the composer textarea with its content (and reset when cleared).
+  useEffect(() => {
+    const ta = inputRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
+  }, [input]);
 
   const load = () => {
     Promise.all([
@@ -192,81 +201,6 @@ export default function Chat() {
     <div className="chat-wrap">
       <Topbar title="Chat" sub={sub} />
 
-      <div className="chat-bar">
-        <label className="row gap6">
-          <span className="dim" style={{ fontSize: 12 }}>
-            Run
-          </span>
-          <select
-            className="select"
-            style={{ width: "auto", minWidth: 220 }}
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-          >
-            {!hasAny && <option value="">No agents or teams found</option>}
-            {teams.length > 0 && (
-              <optgroup label="Teams (manager + workers)">
-                {teams.map((t) => (
-                  <option key={t.path} value={t.path}>
-                    {t.name} · team ({t.members.length})
-                  </option>
-                ))}
-              </optgroup>
-            )}
-            {agents.length > 0 && (
-              <optgroup label="Agents">
-                {agents.map((a) => (
-                  <option key={a.path} value={a.path}>
-                    {a.name} {a.has_tools ? "· tools" : ""}
-                  </option>
-                ))}
-              </optgroup>
-            )}
-          </select>
-        </label>
-
-        {!isTeam && (
-          <label className="row gap6">
-            <span className="dim" style={{ fontSize: 12 }}>
-              Provider
-            </span>
-            <select
-              className="select"
-              style={{ width: "auto" }}
-              value={provider}
-              onChange={(e) => setProvider(e.target.value)}
-            >
-              {PROVIDERS.map((p) => (
-                <option key={p.value} value={p.value}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        {isTeam && (
-          <span className="pill dim" title="members run on their own providers">
-            {(picked!.item as TeamSummary).members
-              .map((m) => `${m.name}:${m.provider ?? "auto"}`)
-              .join("  ·  ")}
-          </span>
-        )}
-
-        <button className="btn" onClick={load} title="Reload">
-          <RefreshIcon />
-        </button>
-        {messages.length > 0 && (
-          <button
-            className="btn"
-            onClick={() => setMessages([])}
-            disabled={busy}
-            style={{ marginLeft: "auto" }}
-          >
-            New chat
-          </button>
-        )}
-      </div>
-
       <div className="chat-scroll" ref={scrollRef}>
         {loadErr ? (
           <div className="chat-thread grow">
@@ -376,29 +310,99 @@ export default function Chat() {
       </div>
 
       <div className="chat-compose">
-        <div className="compose-inner">
+        <div className="composer">
           <textarea
-            className="textarea"
+            ref={inputRef}
+            className="composer-input"
+            rows={1}
             placeholder={
               !hasAny
                 ? "Create an agent or add a team first…"
                 : isTeam
-                  ? "Ask the team to manage something…  (Enter to send)"
-                  : "Message your agent…  (Enter to send, Shift+Enter for newline)"
+                  ? "Ask the team to manage something…"
+                  : "Message your agent…"
             }
             value={input}
             disabled={busy || !hasAny}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKey}
           />
-          <button
-            className="btn btn-primary"
-            onClick={send}
-            disabled={busy || !input.trim() || !hasAny}
-          >
-            {busy ? <span className="spinner" /> : <SendIcon />}
-            Send
-          </button>
+          <div className="composer-bar">
+            <div className="composer-tools">
+              <select
+                className="composer-pick"
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                title="Choose an agent or team"
+              >
+                {!hasAny && <option value="">No agents or teams</option>}
+                {teams.length > 0 && (
+                  <optgroup label="Teams (manager + workers)">
+                    {teams.map((t) => (
+                      <option key={t.path} value={t.path}>
+                        {t.name} · team ({t.members.length})
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {agents.length > 0 && (
+                  <optgroup label="Agents">
+                    {agents.map((a) => (
+                      <option key={a.path} value={a.path}>
+                        {a.name}
+                        {a.has_tools ? " · tools" : ""}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+
+              {!isTeam && (
+                <select
+                  className="composer-pick"
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value)}
+                  title="Inference provider"
+                >
+                  {PROVIDERS.map((p) => (
+                    <option key={p.value} value={p.value}>
+                      {p.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              <button
+                className="composer-icon"
+                onClick={load}
+                title="Reload agents & teams"
+                type="button"
+              >
+                <RefreshIcon />
+              </button>
+              {messages.length > 0 && (
+                <button
+                  className="composer-icon"
+                  onClick={() => setMessages([])}
+                  disabled={busy}
+                  title="New chat"
+                  type="button"
+                >
+                  <PlusIcon />
+                </button>
+              )}
+            </div>
+
+            <button
+              className="composer-send"
+              onClick={send}
+              disabled={busy || !input.trim() || !hasAny}
+              title="Send (Enter)"
+              type="button"
+            >
+              {busy ? <span className="spinner" /> : <SendIcon />}
+            </button>
+          </div>
         </div>
       </div>
     </div>

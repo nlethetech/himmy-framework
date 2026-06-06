@@ -585,15 +585,6 @@ label.field > .hint {
   flex: 1;
   min-height: 0; /* fill .main exactly so the compose bar is flush at the bottom */
 }
-.chat-bar {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  padding: 11px 24px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-elev);
-  flex-wrap: wrap;
-}
 .chat-scroll {
   flex: 1;
   overflow-y: auto;
@@ -786,20 +777,118 @@ label.field > .hint {
 }
 .chat-compose {
   border-top: 1px solid var(--border);
-  padding: 13px 24px 16px;
+  padding: 13px 24px 18px;
   background: var(--bg-elev);
 }
-.compose-inner {
+/* One cohesive rounded input bar (Odysseus-style): textarea + a toolbar row. */
+.composer {
   width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  padding: 10px 12px 10px;
   display: flex;
+  flex-direction: column;
   gap: 9px;
-  align-items: flex-end;
+  transition:
+    border-color 0.14s,
+    box-shadow 0.14s;
 }
-.compose-inner textarea {
-  flex: 1;
-  min-height: 44px;
-  max-height: 180px;
-  border-radius: var(--bubble);
+.composer:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.composer-input {
+  width: 100%;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 1.55;
+  resize: none;
+  min-height: 24px;
+  max-height: 200px;
+  padding: 3px 4px 0;
+}
+.composer-input::placeholder {
+  color: var(--text-dim);
+}
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.composer-pick {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 5px 9px;
+  cursor: pointer;
+  transition: border-color 0.14s;
+}
+.composer-pick:hover {
+  border-color: var(--border-accent);
+}
+.composer-pick:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.composer-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    color 0.14s,
+    border-color 0.14s,
+    background 0.14s;
+}
+.composer-icon:hover {
+  color: var(--text);
+  border-color: var(--border-accent);
+  background: var(--hover);
+}
+.composer-send {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  flex: none;
+  display: grid;
+  place-items: center;
+  background: var(--accent);
+  border: none;
+  color: #fff;
+  cursor: pointer;
+  transition:
+    background 0.14s,
+    transform 0.1s var(--spring);
+}
+.composer-send:hover {
+  background: var(--accent-hover);
+}
+.composer-send:active {
+  transform: scale(0.9);
+}
+.composer-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* ---- Rendered markdown (agent output) ----------------------------------- */
