@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import { api, type RunDetailT, type IoCapture } from "../lib/api";
 import { Topbar, Loading, ErrorState } from "../components/Page";
 import { Markdown } from "../components/Markdown";
+import { CognitionTrace, WorldLedger } from "../components/Cognition";
 import { BackIcon } from "../components/icons";
 import { relativeTime, duration, statusClass } from "../lib/format";
 
@@ -124,6 +125,21 @@ export default function RunDetail() {
                   ))}
                 </div>
               </div>
+
+              {run.steps && run.steps.length > 0 && (
+                <div className="card">
+                  <div className="card-head">
+                    <h2>Cognition</h2>
+                    <span className="dim" style={{ fontSize: 12 }}>
+                      think → act → observe
+                    </span>
+                  </div>
+                  <div className="card-pad">
+                    <CognitionTrace steps={run.steps} />
+                    <WorldLedger steps={run.steps} />
+                  </div>
+                </div>
+              )}
 
               {run.tools.length > 0 && (
                 <div className="card card-pad">

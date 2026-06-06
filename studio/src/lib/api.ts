@@ -140,9 +140,20 @@ export interface RunRequest {
 export type RunEvent =
   | { type: "start"; agent: string; streaming: boolean; team?: boolean }
   | { type: "token"; delta: string }
-  | { type: "tool"; name: string }
-  | { type: "delegate"; worker: string; task: string }
-  | { type: "handoff"; to: string }
+  | { type: "agent"; name: string; model?: string | null }
+  | { type: "reason"; agent?: string | null; text: string }
+  | {
+      type: "tool";
+      name: string;
+      agent?: string | null;
+      args?: Record<string, unknown> | null;
+      result?: string | null;
+      outcome?: string | null;
+      read_only?: boolean | null;
+      latency_ms?: number | null;
+    }
+  | { type: "delegate"; worker: string; task: string; from?: string | null }
+  | { type: "handoff"; to: string; from?: string | null }
   | { type: "message"; text: string }
   | {
       type: "done";
@@ -233,12 +244,32 @@ export interface TranscriptMessage {
   content: string;
 }
 
+// One step in the live cognition trace (think → act → observe).
+export interface CognitionStep {
+  seq: number;
+  kind: "agent" | "reason" | "tool" | "delegate" | "handoff";
+  agent?: string | null;
+  model?: string | null;
+  text?: string | null;
+  name?: string | null;
+  args?: Record<string, unknown> | null;
+  result?: string | null;
+  outcome?: string | null;
+  read_only?: boolean | null;
+  latency_ms?: number | null;
+  worker?: string | null;
+  task?: string | null;
+  to?: string | null;
+  ts?: string | null;
+}
+
 export interface RunDetailT extends RunSummary {
   output: string;
   thread_id: string | null;
   tools: string[];
   messages: TranscriptMessage[];
   timeline: TimelineStep[];
+  steps: CognitionStep[];
 }
 
 export interface RunListResponse {

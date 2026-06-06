@@ -199,6 +199,172 @@ def load_studio_spec(
     return from_spec.load_spec_file(str(path), provider=provider, model=model)
 
 
+# ---- Live cognition: map runtime events into rich GUI frames ------------
+
+# Synthetic orchestration tools, never shown as ordinary tool steps (they're the
+# delegation/handoff/final-answer machinery, surfaced via their own frames).
+_SYNTHETIC_TOOLS = ("ask_", "transfer_to_")
+
+
+def _cap(text: str, n: int) -> str:
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+class _Cognition:
+    """Turn the runtime's event stream into rich, live cognition frames.
+
+    Tracks which agent is active, pairs each tool call with its result + intent +
+    latency, and records a persistable trace (think → act → observe). Used both for
+    the live SSE stream and for the run-detail cognition view.
+    """
+
+    def __init__(self, read_only: dict[str, bool | None], initial_agent: str) -> None:
+        from himmy.core.events import EventType
+
+        self._E = EventType
+        self._read_only = read_only
+        self.active = initial_agent
+        self.tools_used: list[str] = []
+        self.delegate_answers: list[tuple[str, str]] = []
+        self.steps: list[dict[str, Any]] = []
+
+    def _record(self, **kw: Any) -> None:
+        kw["seq"] = len(self.steps) + 1
+        self.steps.append(kw)
+
+    def _intent(self, name: str) -> bool | None:
+        ro = self._read_only.get(name)
+        if ro is None:
+            from himmy.services.tools.access import classify_read_only
+
+            ro = classify_read_only(name)
+        return ro
+
+    def frames(self, event: Any) -> list[dict[str, Any]]:
+        """Map one runtime event to zero or more GUI frames (and record the step)."""
+        E = self._E
+        et = getattr(event, "event_type", None)
+        payload = getattr(event, "payload", None) or {}
+        ts = getattr(event, "timestamp", None)
+        out: list[dict[str, Any]] = []
+
+        if et == E.AGENT_RUN_STARTED:
+            name = payload.get("persona_name")
+            if name and name != self.active:
+                self.active = name
+                model = payload.get("model_key")
+                out.append({"type": "agent", "name": name, "model": model})
+                self._record(kind="agent", agent=name, model=model, ts=ts)
+            return out
+
+        if et == E.INFERENCE_SUCCEEDED:
+            io = payload.get("io") or {}
+            text = (io.get("response_text") or "").strip()
+            # Reasoning that PRECEDES an action (the final answer has no tool calls
+            # and is delivered as the message, not as a reasoning step).
+            if text and (io.get("tool_calls") or []):
+                out.append({"type": "reason", "agent": self.active, "text": text})
+                self._record(kind="reason", agent=self.active, text=text, ts=ts)
+            return out
+
+        if et in (E.TOOL_COMPLETED, E.TOOL_FAILED):
+            name = payload.get("tool_name") or ""
+            if name.startswith(_SYNTHETIC_TOOLS) or name == "final_answer":
+                return out
+            args = dict(payload.get("tool_args") or {})
+            result = payload.get("result")
+            result_str = _cap(str(result), 800) if result is not None else ""
+            outcome = payload.get("tool_outcome") or (
+                "success" if et == E.TOOL_COMPLETED else "failed"
+            )
+            ro = self._intent(name)
+            latency = payload.get("latency_ms")
+            if name not in self.tools_used:
+                self.tools_used.append(name)
+            frame = {
+                "type": "tool",
+                "agent": self.active,
+                "name": name,
+                "args": args,
+                "result": result_str,
+                "outcome": outcome,
+                "read_only": ro,
+                "latency_ms": latency,
+            }
+            out.append(frame)
+            self._record(
+                kind="tool",
+                agent=self.active,
+                name=name,
+                args=args,
+                result=result_str,
+                outcome=outcome,
+                read_only=ro,
+                latency_ms=latency,
+                ts=ts,
+            )
+            return out
+
+        if et == E.AGENT_DELEGATED:
+            worker = payload.get("worker", "?")
+            answer = str(payload.get("answer", "") or "")
+            if answer:
+                self.delegate_answers.append((worker, answer))
+            task = _cap(str(payload.get("task", "")), 200)
+            out.append(
+                {
+                    "type": "delegate",
+                    "from": self.active,
+                    "worker": worker,
+                    "task": task,
+                }
+            )
+            self._record(
+                kind="delegate", agent=self.active, worker=worker, task=task, ts=ts
+            )
+            return out
+
+        if et == E.AGENT_HANDOFF:
+            frm = payload.get("from")
+            to = payload.get("to", "?")
+            out.append({"type": "handoff", "from": frm, "to": to})
+            self._record(kind="handoff", agent=frm, to=to, ts=ts)
+            return out
+
+        return out
+
+
+async def _drain_cognition(
+    queue: asyncio.Queue, run_task: asyncio.Task, cog: _Cognition
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield cognition frames live as runtime events arrive, until the run finishes."""
+    while True:
+        getter = asyncio.create_task(queue.get())
+        done, _pending = await asyncio.wait(
+            {getter, run_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if getter in done:
+            for frame in cog.frames(getter.result()):
+                yield frame
+        else:
+            getter.cancel()
+        if run_task.done():
+            while not queue.empty():
+                for frame in cog.frames(queue.get_nowait()):
+                    yield frame
+            break
+
+
+def _read_only_map(registry: Any) -> dict[str, bool | None]:
+    """Tool name → read-only intent, from the wired registry (empty if none)."""
+    if registry is None:
+        return {}
+    out: dict[str, bool | None] = {}
+    for d in registry.list():
+        out[d.name] = getattr(d, "read_only", None)
+    return out
+
+
 # ---- Running an agent (streaming) ---------------------------------------
 
 
@@ -247,9 +413,11 @@ async def stream_agent_run(
     """
     history = history or []
     collected_events: list[Any] = []
+    queue: asyncio.Queue = asyncio.Queue()
 
     async def _on_event(event: Any) -> None:
-        collected_events.append(event)
+        collected_events.append(event)  # for the raw-I/O inspector timeline
+        await queue.put(event)  # for the live cognition stream
 
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
@@ -262,11 +430,12 @@ async def stream_agent_run(
             provider=provider,
             model=model,
             on_event=_on_event,
-            capture_io=True,  # power the trace inspector
+            capture_io=True,  # power the cognition stream + trace inspector
         )
     )
     has_tools = registry is not None
     thread = _rebuild_thread(spec, history)
+    cog = _Cognition(_read_only_map(registry), spec.name)
 
     # Attach any MCP servers for the lifetime of this run.
     mcp_clients: list[Any] = []
@@ -286,17 +455,21 @@ async def stream_agent_run(
     try:
         task = spec.make_task(prompt)
         if has_tools:
-            loop = await runtime.run_agent_loop(
-                persona,
-                task,
-                thread,
-                llm_config=llm_config,
-                max_turns=8,
-                route_tools=spec.tool_router,
+            # Tool-using agents stream their cognition (act → observe) live.
+            run_task = asyncio.create_task(
+                runtime.run_agent_loop(
+                    persona,
+                    task,
+                    thread,
+                    llm_config=llm_config,
+                    max_turns=8,
+                    route_tools=spec.tool_router,
+                )
             )
-            tools = _tool_names(collected_events)
-            for name in tools:
-                yield {"type": "tool", "name": name}
+            async for frame in _drain_cognition(queue, run_task, cog):
+                yield frame
+            loop = await run_task
+            tools = cog.tools_used
             output_text = loop.final.output_text or ""
             yield {"type": "message", "text": output_text}
         else:
@@ -332,6 +505,7 @@ async def stream_agent_run(
             output=output_text,
             tools=tools,
             events=collected_events,
+            steps=cog.steps,
             status=status,
             error=error_msg,
             duration_ms=duration_ms,
@@ -364,6 +538,7 @@ def _record_run(
     output: str,
     tools: list[str],
     events: list[Any],
+    steps: list[Any] | None = None,
     status: str,
     error: str | None,
     duration_ms: float,
@@ -400,6 +575,7 @@ def _record_run(
         tools=tools,
         messages=messages,
         timeline=_build_timeline(prompt, events, output, status, error),
+        steps=list(steps or []),
     )
     get_run_store().save(run)
 
@@ -505,9 +681,6 @@ def _summarize_payload(payload: dict[str, Any]) -> str:
 
 # ---- Running a TEAM (manager → workers), streamed live ------------------
 
-# Synthetic tool-name prefixes the orchestrator registers (hidden from the trail).
-_SYNTHETIC_TOOL_PREFIXES = ("ask_", "transfer_to_")
-
 
 def load_team(rel_path: str, root: Path | None = None) -> Any:
     """Resolve + load a team spec selected in the GUI."""
@@ -515,15 +688,6 @@ def load_team(rel_path: str, root: Path | None = None) -> Any:
 
     path = resolve_spec_path(rel_path, root)
     return load_team_spec(str(path))
-
-
-def _tool_name_of(event: Any) -> str | None:
-    from himmy.core.events import EventType
-
-    if getattr(event, "event_type", None) != EventType.TOOL_CALLED:
-        return None
-    payload = getattr(event, "payload", None) or {}
-    return payload.get("tool") or payload.get("name") or payload.get("tool_name")
 
 
 async def stream_team_run(
@@ -542,7 +706,6 @@ async def stream_team_run(
     """
     from himmy import build_runtime
     from himmy.config.team_spec import build_team, build_team_inference
-    from himmy.core.events import EventType
     from himmy.orchestrators import MultiAgentOrchestrator
 
     queue: asyncio.Queue = asyncio.Queue()
@@ -581,64 +744,23 @@ async def stream_team_run(
     output_text = ""
     status = "ok"
     error_msg: str | None = None
-    tools_used: list[str] = []
-    delegate_answers: list[tuple[str, str]] = []  # (worker, answer) for a fallback
+    entry = getattr(spec, "entry", None) or team_name
+    cog = _Cognition(_read_only_map(registry), entry)
 
     yield {"type": "start", "agent": team_name, "streaming": False, "team": True}
 
-    def _frame(event: Any) -> dict[str, Any] | None:
-        et = getattr(event, "event_type", None)
-        payload = getattr(event, "payload", None) or {}
-        if et == EventType.AGENT_DELEGATED:
-            worker = payload.get("worker", "?")
-            answer = str(payload.get("answer", "") or "")
-            if answer:
-                delegate_answers.append((worker, answer))
-            return {
-                "type": "delegate",
-                "worker": worker,
-                "task": _trim(str(payload.get("task", "")), 140),
-            }
-        if et == EventType.AGENT_HANDOFF:
-            return {"type": "handoff", "to": payload.get("to", "?")}
-        name = _tool_name_of(event)
-        if (
-            name
-            and not name.startswith(_SYNTHETIC_TOOL_PREFIXES)
-            and name != "final_answer"
-        ):
-            if name not in tools_used:
-                tools_used.append(name)
-            return {"type": "tool", "name": name}
-        return None
-
     run_task = asyncio.create_task(orch.run(prompt))
     try:
-        while True:
-            getter = asyncio.create_task(queue.get())
-            done, _pending = await asyncio.wait(
-                {getter, run_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if getter in done:
-                frame = _frame(getter.result())
-                if frame is not None:
-                    yield frame
-            else:
-                getter.cancel()
-            if run_task.done():
-                # Drain whatever events are still queued, then stop.
-                while not queue.empty():
-                    frame = _frame(queue.get_nowait())
-                    if frame is not None:
-                        yield frame
-                break
+        async for frame in _drain_cognition(queue, run_task, cog):
+            yield frame
         result = await run_task
         output_text = (result.output_text or "").strip()
-        if not output_text and delegate_answers:
+        if not output_text and cog.delegate_answers:
             # The manager ended without a closing synthesis — fall back to the
             # specialists' findings so the user always sees a real answer.
             output_text = "Here's what the team found:\n\n" + "\n".join(
-                f"• **{worker}** — {ans.strip()}" for worker, ans in delegate_answers
+                f"• **{worker}** — {ans.strip()}"
+                for worker, ans in cog.delegate_answers
             )
         yield {"type": "message", "text": output_text}
     except Exception as exc:  # noqa: BLE001 - record + surface a terminal error
@@ -659,8 +781,9 @@ async def stream_team_run(
             team_path=team_path,
             prompt=prompt,
             output=output_text,
-            tools=tools_used,
+            tools=cog.tools_used,
             events=collected,
+            steps=cog.steps,
             status=status,
             error=error_msg,
             duration_ms=duration_ms,
@@ -692,6 +815,7 @@ def _record_team_run(
     output: str,
     tools: list[str],
     events: list[Any],
+    steps: list[Any] | None = None,
     status: str,
     error: str | None,
     duration_ms: float,
@@ -719,23 +843,9 @@ def _record_team_run(
         tools=tools,
         messages=messages,
         timeline=_build_timeline(prompt, events, output, status, error),
+        steps=list(steps or []),
     )
     get_run_store().save(run)
-
-
-def _tool_names(events: list[Any]) -> list[str]:
-    """Extract the ordered, de-duplicated tool names from collected run events."""
-    from himmy.core.events import EventType
-
-    names: list[str] = []
-    for ev in events:
-        if getattr(ev, "event_type", None) != EventType.TOOL_CALLED:
-            continue
-        payload = getattr(ev, "payload", None) or {}
-        name = payload.get("tool") or payload.get("name") or payload.get("tool_name")
-        if name and name not in names:
-            names.append(name)
-    return names
 
 
 __all__ = [

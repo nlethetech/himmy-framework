@@ -1764,9 +1764,16 @@ class SingleAgentRuntime:
             thread.append_message(message)
             self._register_message(message)
 
-            # TOOL_COMPLETED / TOOL_FAILED keyed on the return's outcome.
+            # TOOL_COMPLETED / TOOL_FAILED keyed on the return's outcome. The result
+            # text + latency ride on the payload so an observer (e.g. Studio's live
+            # cognition/ledger view) can show what each tool returned and how long it
+            # took without re-reading the thread.
             outcome = ret.outcome if ret is not None else "unknown"
             completed = outcome == "success"
+            ret_meta = (ret.metadata or {}) if ret is not None else {}
+            result_text = content_text if len(content_text) <= 2000 else (
+                content_text[:1999] + "…"
+            )
             await self._emit(
                 RunEvent(
                     event_type=(
@@ -1780,7 +1787,10 @@ class SingleAgentRuntime:
                     error=None if completed else f"tool outcome: {outcome}",
                     payload={
                         "tool_name": call.tool_name,
+                        "tool_args": dict(call.args),
                         "tool_outcome": outcome,
+                        "result": result_text,
+                        "latency_ms": ret_meta.get("latency_ms"),
                     },
                 )
             )

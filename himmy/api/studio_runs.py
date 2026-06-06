@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS studio_runs (
     thread_id   TEXT,
     tools       TEXT NOT NULL DEFAULT '[]',
     messages    TEXT NOT NULL DEFAULT '[]',
-    timeline    TEXT NOT NULL DEFAULT '[]'
+    timeline    TEXT NOT NULL DEFAULT '[]',
+    steps       TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS studio_runs_created_idx ON studio_runs (created_at);
 """
@@ -47,6 +48,29 @@ class TimelineStep(BaseModel):
     ts: str | None = None
     # Raw model I/O for inference steps when capture is on (the trace inspector).
     io: dict[str, Any] | None = None
+
+
+class CognitionStep(BaseModel):
+    """One step in the live cognition trace (think → act → observe)."""
+
+    seq: int
+    kind: str  # agent | reason | tool | delegate | handoff
+    agent: str | None = None
+    model: str | None = None
+    # reasoning
+    text: str | None = None
+    # tool call
+    name: str | None = None
+    args: dict[str, Any] | None = None
+    result: str | None = None
+    outcome: str | None = None
+    read_only: bool | None = None
+    latency_ms: float | None = None
+    # delegation / handoff
+    worker: str | None = None
+    task: str | None = None
+    to: str | None = None
+    ts: str | None = None
 
 
 class TranscriptMessage(BaseModel):
@@ -80,6 +104,7 @@ class StudioRun(StudioRunSummary):
     tools: list[str] = []
     messages: list[TranscriptMessage] = []
     timeline: list[TimelineStep] = []
+    steps: list[CognitionStep] = []  # the cognition trace (think → act → observe)
 
 
 class StudioRunListResponse(BaseModel):
@@ -104,15 +129,27 @@ class StudioRunStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a DB was first created (e.g. ``steps``)."""
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(studio_runs)").fetchall()
+        }
+        if "steps" not in cols:
+            self._conn.execute(
+                "ALTER TABLE studio_runs ADD COLUMN steps TEXT NOT NULL DEFAULT '[]'"
+            )
 
     def save(self, run: StudioRun) -> None:
         """Insert (or replace) one run record."""
         self._conn.execute(
             "INSERT OR REPLACE INTO studio_runs (id, created_at, agent_name, "
             "agent_path, provider, model, prompt, output, status, duration_ms, "
-            "thread_id, tools, messages, timeline) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "thread_id, tools, messages, timeline, steps) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 run.id,
                 run.created_at,
@@ -128,6 +165,7 @@ class StudioRunStore:
                 json.dumps(run.tools),
                 json.dumps([m.model_dump() for m in run.messages]),
                 json.dumps([s.model_dump() for s in run.timeline]),
+                json.dumps([s.model_dump() for s in run.steps]),
             ),
         )
         self._conn.commit()
@@ -189,6 +227,12 @@ class StudioRunStore:
                 TranscriptMessage(**m) for m in json.loads(row["messages"] or "[]")
             ],
             timeline=[TimelineStep(**s) for s in json.loads(row["timeline"] or "[]")],
+            steps=[
+                CognitionStep(**s)
+                for s in json.loads(
+                    (row["steps"] if "steps" in row.keys() else None) or "[]"
+                )
+            ],
             tool_count=len(json.loads(row["tools"] or "[]")),
         )
 
@@ -230,6 +274,7 @@ __all__ = [
     "StudioRunSummary",
     "StudioRunListResponse",
     "TimelineStep",
+    "CognitionStep",
     "TranscriptMessage",
     "StudioRunStore",
     "get_run_store",

@@ -10,6 +10,13 @@ import {
 } from "../lib/api";
 import { Topbar } from "../components/Page";
 import { Markdown } from "../components/Markdown";
+import {
+  CognitionTrace,
+  WorldLedger,
+  OrchestrationGraph,
+  type CogStep,
+  type GraphMember,
+} from "../components/Cognition";
 import { SendIcon, RefreshIcon, PlusIcon } from "../components/icons";
 
 // Domain-agnostic starter prompts for the empty state (fill the input, don't send).
@@ -27,14 +34,12 @@ const PROVIDERS = [
   { value: "pydantic-ai", label: "Cloud (key)" },
 ];
 
-interface Step {
-  label: string;
-  kind: "tool" | "delegate" | "handoff";
-}
 interface Msg {
   role: "user" | "agent";
   text: string;
-  steps?: Step[];
+  steps?: CogStep[];
+  active?: string | null; // currently-active agent (for the team graph)
+  team?: boolean;
   streaming?: boolean;
   runId?: string;
 }
@@ -95,6 +100,13 @@ export default function Chat() {
   })();
   const isTeam = picked?.kind === "team";
   const hasAny = agents.length + teams.length > 0;
+  const teamMembers: GraphMember[] = isTeam
+    ? (picked!.item as TeamSummary).members.map((m) => ({
+        name: m.name,
+        role: m.role,
+      }))
+    : [];
+  const teamEntry = isTeam ? (picked!.item as TeamSummary).entry : "";
 
   const send = async () => {
     const prompt = input.trim();
@@ -109,7 +121,7 @@ export default function Chat() {
     setMessages((m) => [
       ...m,
       { role: "user", text: prompt },
-      { role: "agent", text: "", streaming: true, steps: [] },
+      { role: "agent", text: "", streaming: true, steps: [], team: isTeam },
     ]);
     setBusy(true);
 
@@ -121,7 +133,7 @@ export default function Chat() {
         copy[copy.length - 1] = fn(copy[copy.length - 1]);
         return copy;
       });
-    const addStep = (s: Step) =>
+    const addStep = (s: CogStep) =>
       patchLast((m) => ({ ...m, steps: [...(m.steps ?? []), s] }));
 
     const onEvent = (e: RunEvent) => {
@@ -129,14 +141,32 @@ export default function Chat() {
         case "token":
           patchLast((m) => ({ ...m, text: m.text + e.delta }));
           break;
+        case "agent":
+          patchLast((m) => ({ ...m, active: e.name }));
+          addStep({ kind: "agent", agent: e.name, model: e.model });
+          break;
+        case "reason":
+          addStep({ kind: "reason", agent: e.agent, text: e.text });
+          break;
         case "tool":
-          addStep({ label: e.name, kind: "tool" });
+          addStep({
+            kind: "tool",
+            name: e.name,
+            agent: e.agent,
+            args: e.args ?? null,
+            result: e.result ?? null,
+            outcome: e.outcome ?? null,
+            read_only: e.read_only ?? null,
+            latency_ms: e.latency_ms ?? null,
+          });
           break;
         case "delegate":
-          addStep({ label: `${e.worker}${e.task ? ` — ${e.task}` : ""}`, kind: "delegate" });
+          patchLast((m) => ({ ...m, active: e.worker }));
+          addStep({ kind: "delegate", worker: e.worker, task: e.task, agent: e.from });
           break;
         case "handoff":
-          addStep({ label: e.to, kind: "handoff" });
+          patchLast((m) => ({ ...m, active: e.to }));
+          addStep({ kind: "handoff", to: e.to, agent: e.from });
           break;
         case "message":
           patchLast((m) => ({ ...m, text: e.text }));
@@ -146,6 +176,7 @@ export default function Chat() {
             ...m,
             text: e.output_text || m.text,
             streaming: false,
+            active: null,
             runId: e.run_id,
           }));
           break;
@@ -265,19 +296,19 @@ export default function Chat() {
                   <div className="who">
                     {m.role === "user" ? "You" : picked?.item.name ?? "Agent"}
                   </div>
+                  {m.role === "agent" &&
+                    m.team &&
+                    teamMembers.length > 1 &&
+                    (m.steps?.length ?? 0) > 0 && (
+                      <OrchestrationGraph
+                        members={teamMembers}
+                        entry={teamEntry}
+                        steps={m.steps ?? []}
+                        active={m.streaming ? m.active : null}
+                      />
+                    )}
                   {m.steps && m.steps.length > 0 && (
-                    <div className="row wrap gap6" style={{ marginBottom: 8 }}>
-                      {m.steps.map((s, j) => (
-                        <span className="tool-event" key={j}>
-                          {s.kind === "delegate"
-                            ? "→ "
-                            : s.kind === "handoff"
-                              ? "⇒ "
-                              : "⚙ "}
-                          {s.label}
-                        </span>
-                      ))}
-                    </div>
+                    <CognitionTrace steps={m.steps} />
                   )}
                   {m.text &&
                     (m.role === "agent" ? (
@@ -285,6 +316,9 @@ export default function Chat() {
                     ) : (
                       m.text
                     ))}
+                  {m.role === "agent" && !m.streaming && m.steps && (
+                    <WorldLedger steps={m.steps} />
+                  )}
                   {m.streaming &&
                     (m.text ? (
                       <span className="caret" />
