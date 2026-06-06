@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -35,6 +34,8 @@ from himmy.services.inference.models import (
     ToolCallRecord,
     ToolReturnRecord,
 )
+from himmy.services.inference.tool_protocol import parse_text_tool_calls
+from himmy.services.tools.repair import resolve_tool_name, unknown_tool_message
 
 
 def _failed(
@@ -115,63 +116,34 @@ def _parse_ollama_tool_calls(data: dict[str, Any]) -> list[ToolCallRecord]:
     return calls
 
 
-# Marker + tool name; the JSON args are decoded with a balanced-brace JSON decoder
-# (not a greedy regex), so prose around the call and repeated/multiple calls in one
-# reply all parse correctly instead of silently dropping the call.
-_REACT_CALL_RE = re.compile(r"TOOL_CALL\s+([^\s{]+)")
-
-
 def _react_tool_manifest(bound_tools: list[BoundTool]) -> str:
-    """A text manifest + protocol instruction for a text-only model (Claude CLI)."""
+    """A text manifest + protocol instruction for a text-only model (Claude CLI).
+
+    Parsing tolerates several reply shapes (see
+    :func:`~himmy.services.inference.tool_protocol.parse_text_tool_calls`), but a single
+    documented format keeps the model on the most reliable path.
+    """
     lines = ["You can call tools. Available tools:"]
     for tool in bound_tools:
         schema = json.dumps(tool.args_json_schema or {"type": "object"})
         lines.append(f"- {tool.name}: {tool.description} | args schema: {schema}")
+    example = bound_tools[0].name if bound_tools else "tool_name"
     lines.append(
-        "To call a tool, reply with EXACTLY one line and nothing else:\n"
+        "To call a tool, write a line of the form:\n"
         "TOOL_CALL <tool_name> <json-args>\n"
-        "Otherwise, reply with your final answer."
+        f'e.g.  TOOL_CALL {example} {{"some_arg": "value"}}\n'
+        "Use the tool names EXACTLY as listed. You may call more than one tool. "
+        "When you are done using tools, reply with your final answer in prose."
     )
     return "\n".join(lines)
 
 
-def _parse_react_tool_calls(text: str) -> list[ToolCallRecord]:
-    """Parse every ``TOOL_CALL <name> <json>`` in a text reply (text-protocol models).
-
-    Robust to prose around the marker and to multiple calls in one reply: the JSON
-    args are read with :meth:`json.JSONDecoder.raw_decode` (a balanced object that
-    ignores trailing text), not a greedy regex. Identical calls are de-duplicated so
-    a model that repeats the same line doesn't run the tool twice.
-    """
-    decoder = json.JSONDecoder()
-    calls: list[ToolCallRecord] = []
-    seen: set[str] = set()
-    for match in _REACT_CALL_RE.finditer(text):
-        rest = text[match.end():]
-        brace = rest.find("{")
-        if brace == -1:
-            continue
-        try:
-            args, _consumed = decoder.raw_decode(rest[brace:])
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(args, dict):
-            continue
-        name = match.group(1)
-        key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
-        if key in seen:
-            continue
-        seen.add(key)
-        calls.append(
-            ToolCallRecord(tool_call_id=new_uuid(), tool_name=name, args=args)
-        )
-    return calls
-
-
-def _parse_react_tool_call(text: str) -> ToolCallRecord | None:
-    """The first ``TOOL_CALL`` in a reply, or None (kept for back-compat)."""
-    calls = _parse_react_tool_calls(text)
-    return calls[0] if calls else None
+# Back-compat shim: the tolerant parser supersedes the old TOOL_CALL-only regex.
+def _parse_react_tool_calls(
+    text: str, known_names: set[str] | None = None
+) -> list[ToolCallRecord]:
+    """Parse tool calls from a text reply (delegates to the tolerant parser)."""
+    return parse_text_tool_calls(text, known_names)
 
 
 async def _execute_tool_calls(
@@ -185,19 +157,42 @@ async def _execute_tool_calls(
     :class:`StubClientManager`'s handler-execution path.
     """
     by_name = {t.name: t for t in bound_tools}
+    available = list(by_name)
     returns: list[ToolReturnRecord] = []
     for call in tool_calls:
         tool = by_name.get(call.tool_name)
+        if tool is None:
+            # Repair a near-miss name: auto-apply a confident typo-fix, otherwise hand
+            # the model a concrete correction (did-you-mean + the available tools).
+            resolution = resolve_tool_name(call.tool_name, available)
+            if resolution.name is not None:
+                tool = by_name[resolution.name]
         if tool is not None and tool.handler is not None:
             ret = await tool.handler(call.args)
             ret = ret.model_copy(update={"tool_call_id": call.tool_call_id})
+            if tool.name != call.tool_name:  # record the auto-correction
+                ret = ret.model_copy(
+                    update={
+                        "tool_name": tool.name,
+                        "metadata": {
+                            **(ret.metadata or {}),
+                            "repaired_from": call.tool_name,
+                        },
+                    }
+                )
         else:
+            resolution = resolve_tool_name(call.tool_name, available)
+            message = unknown_tool_message(resolution, available)
             ret = ToolReturnRecord(
                 tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
-                content=None,
+                content=message,
                 outcome="failed",
-                metadata={"error": f"no handler for tool {call.tool_name!r}"},
+                metadata={
+                    "error_code": "UNKNOWN_TOOL",
+                    "error_message": message,
+                    "suggestions": resolution.suggestions,
+                },
             )
         returns.append(ret)
     return returns
@@ -268,6 +263,13 @@ class OllamaClientManager:
             )
         text = ((data.get("message") or {}).get("content")) or ""
         tool_calls = _parse_ollama_tool_calls(data)
+        # Text fallback: a small model that wrote its tool call in prose instead of
+        # using Ollama's native tool field would otherwise be missed entirely.
+        if not tool_calls and request.bound_tools and text:
+            known = {t.name for t in request.bound_tools}
+            tool_calls = parse_text_tool_calls(text, known)
+            if tool_calls:
+                text = ""  # the reply was a tool call, not a final answer
         tool_returns = await _execute_tool_calls(request.bound_tools, tool_calls)
         output_structured = None
         if structured_requested and text:
@@ -356,7 +358,9 @@ class ClaudeCliClientManager:
             )
         text = out.strip()
         tool_calls = (
-            _parse_react_tool_calls(text) if request.bound_tools else []
+            parse_text_tool_calls(text, {t.name for t in request.bound_tools})
+            if request.bound_tools
+            else []
         )
         tool_returns = await _execute_tool_calls(request.bound_tools, tool_calls)
         return InferenceResponse(
