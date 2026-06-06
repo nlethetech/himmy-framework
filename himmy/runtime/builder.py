@@ -125,6 +125,7 @@ def build_runtime(
         input_guardrail=overrides.get("input_guardrail"),
         output_guardrail=overrides.get("output_guardrail"),
         on_event=overrides.get("on_event"),
+        capture_io=overrides.get("capture_io"),
     )
     return runtime, inference, tool_service
 

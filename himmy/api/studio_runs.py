@@ -45,6 +45,8 @@ class TimelineStep(BaseModel):
     label: str
     detail: str = ""
     ts: str | None = None
+    # Raw model I/O for inference steps when capture is on (the trace inspector).
+    io: dict[str, Any] | None = None
 
 
 class TranscriptMessage(BaseModel):

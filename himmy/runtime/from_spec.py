@@ -124,6 +124,7 @@ def build_runtime_for_spec(
     on_event: Any = None,
     inference: Any = None,
     on_log: Callable[[str], None] | None = None,
+    capture_io: bool = False,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring provider/model overrides + tools.
 
@@ -148,6 +149,8 @@ def build_runtime_for_spec(
     overrides: dict[str, Any] = {"inference": inference}
     if on_event is not None:
         overrides["on_event"] = on_event
+    if capture_io:
+        overrides["capture_io"] = True
 
     pipeline = None
     if spec.guardrails:

@@ -1,9 +1,46 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { api, type RunDetailT } from "../lib/api";
+import { api, type RunDetailT, type IoCapture } from "../lib/api";
 import { Topbar, Page, Loading, ErrorState } from "../components/Page";
 import { BackIcon } from "../components/icons";
 import { relativeTime, duration, statusClass } from "../lib/format";
+
+function IoInspector({ io }: { io: IoCapture }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="io-box">
+      <button className="io-toggle" onClick={() => setOpen((o) => !o)}>
+        {open ? "▾" : "▸"} raw I/O
+        {io.model && <span className="io-model">{io.model}</span>}
+      </button>
+      {open && (
+        <div className="io-body">
+          {io.tools.length > 0 && (
+            <div className="io-row">
+              <span className="io-key">bound tools</span>
+              <span className="io-val mono">{io.tools.join(", ")}</span>
+            </div>
+          )}
+          <div className="io-key">prompt sent</div>
+          {io.messages.map((m, i) => (
+            <div className="io-msg" key={i}>
+              <span className={"io-role " + m.role}>{m.role}</span>
+              <pre className="io-pre">{m.content}</pre>
+            </div>
+          ))}
+          <div className="io-key">model output</div>
+          <pre className="io-pre">{io.response_text || "(empty — only tool calls)"}</pre>
+          {io.tool_calls.length > 0 && (
+            <>
+              <div className="io-key">parsed tool calls</div>
+              <pre className="io-pre">{JSON.stringify(io.tool_calls, null, 2)}</pre>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function RunDetail() {
   const { runId } = useParams();
@@ -115,6 +152,7 @@ export default function RunDetail() {
                           )}
                         </div>
                         {s.detail && <div className="tl-detail">{s.detail}</div>}
+                        {s.io && <IoInspector io={s.io} />}
                       </div>
                     </div>
                   ))}

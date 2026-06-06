@@ -690,6 +690,87 @@ label.field > .hint {
   font-family: var(--mono);
 }
 
+/* raw I/O inspector (trace) */
+.io-box {
+  margin-top: 8px;
+}
+.io-toggle {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 2px 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.io-toggle:hover {
+  color: var(--accent-hover);
+}
+.io-model {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.io-body {
+  margin-top: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  padding: 11px 12px;
+}
+.io-key {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  font-weight: 600;
+  margin: 10px 0 4px;
+}
+.io-key:first-child {
+  margin-top: 0;
+}
+.io-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.io-msg {
+  margin-bottom: 6px;
+}
+.io-role {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text-muted);
+  margin-bottom: 3px;
+}
+.io-role.system {
+  color: var(--warn);
+}
+.io-role.user {
+  color: var(--accent);
+}
+.io-role.tool {
+  color: var(--ok);
+}
+.io-pre {
+  margin: 0 0 2px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+}
+
 .toast {
   position: fixed;
   bottom: 22px;

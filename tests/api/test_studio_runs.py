@@ -111,3 +111,17 @@ def test_runs_pagination(client: TestClient) -> None:
 
 def test_unknown_run_404(client: TestClient) -> None:
     assert client.get("/api/studio/runs/does-not-exist").status_code == 404
+
+
+def test_run_captures_raw_io_in_timeline(client: TestClient) -> None:
+    """Studio runs capture raw model I/O on inference steps (the trace inspector)."""
+    frames = _run(
+        client,
+        {"agent_path": "tooly.agent.yaml", "prompt": "2+2", "provider": "stub"},
+    )
+    det = client.get(f"/api/studio/runs/{frames[-1]['run_id']}").json()
+    io_steps = [s for s in det["timeline"] if s.get("io")]
+    assert io_steps, "expected at least one inference step with captured I/O"
+    io = io_steps[0]["io"]
+    assert {"model", "messages", "tools", "response_text", "tool_calls"} <= set(io)
+    assert any(m["role"] == "system" for m in io["messages"])

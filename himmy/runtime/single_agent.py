@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import (
@@ -170,6 +171,43 @@ _SYNTHESIS_NUDGE = (
     "those results. Do not call any tools."
 )
 
+# Raw-I/O capture (debug inspector): per-field and per-message size caps so an
+# opt-in capture can never bloat the event log unboundedly.
+_IO_FIELD_CAP = 4000
+_IO_MSG_CAP = 1500
+_IO_MAX_MESSAGES = 16
+
+
+def _truncate(text: str, cap: int) -> str:
+    text = text or ""
+    return text if len(text) <= cap else text[: cap - 1] + "…"
+
+
+def build_io_capture(request: Any, response: Any) -> dict[str, Any]:
+    """A bounded snapshot of one inference's raw I/O (for the trace inspector).
+
+    Captures the messages sent to the model, the bound tool names, the raw response
+    text, and the parsed tool calls — each size-capped. Opt-in (see the runtime's
+    ``capture_io`` flag); never on by default, so there's zero cost or exposure unless
+    a developer explicitly turns it on.
+    """
+    messages = []
+    for m in (request.messages or [])[-_IO_MAX_MESSAGES:]:
+        messages.append(
+            {"role": getattr(m, "role", "?"), "content": _truncate(
+                getattr(m, "content", "") or "", _IO_MSG_CAP)}
+        )
+    tool_calls = [
+        {"tool": c.tool_name, "args": c.args} for c in (response.tool_calls or [])
+    ]
+    return {
+        "model": getattr(response, "model_path", None),
+        "messages": messages,
+        "tools": [t.name for t in (request.bound_tools or [])],
+        "response_text": _truncate(getattr(response, "output_text", "") or "", _IO_FIELD_CAP),
+        "tool_calls": tool_calls,
+    }
+
 
 class SingleAgentRuntime:
     """Conducts one agent run end-to-end: persona + task in, answered thread out.
@@ -198,6 +236,7 @@ class SingleAgentRuntime:
         checkpoint_store: CheckpointStore | None = None,
         input_guardrail: GuardrailPipeline | None = None,
         output_guardrail: GuardrailPipeline | None = None,
+        capture_io: bool | None = None,
     ) -> None:
         """Wire the runtime; auto-create prompt manager/mapper when omitted.
 
@@ -222,6 +261,13 @@ class SingleAgentRuntime:
         self._checkpoint_store = checkpoint_store
         self._input_guardrail = input_guardrail
         self._output_guardrail = output_guardrail
+        # Opt-in raw-I/O capture for the trace inspector (off unless asked, or the
+        # HIMMY_CAPTURE_IO env is truthy).
+        self._capture_io = (
+            capture_io
+            if capture_io is not None
+            else os.environ.get("HIMMY_CAPTURE_IO", "").lower() in ("1", "true", "yes")
+        )
         self._on_event: list[OnEvent] = self._coerce_callbacks(on_event)
 
         # Auto-create the prompt primitives when available; they have no required
@@ -1038,6 +1084,11 @@ class SingleAgentRuntime:
                 payload={
                     "input_tokens": response.input_tokens,
                     "output_tokens": response.output_tokens,
+                    **(
+                        {"io": build_io_capture(request, response)}
+                        if self._capture_io
+                        else {}
+                    ),
                 },
             )
         )
@@ -1200,6 +1251,11 @@ class SingleAgentRuntime:
                         "output_tokens": response.output_tokens,
                         "model_path": response.model_path,
                         "provider_name": response.provider_name,
+                        **(
+                            {"io": build_io_capture(request, response)}
+                            if self._capture_io
+                            else {}
+                        ),
                     },
                 )
             )

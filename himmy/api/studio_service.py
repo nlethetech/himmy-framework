@@ -253,11 +253,13 @@ async def stream_agent_run(
     # Build the runtime off the event loop: knowledge ingestion runs its own
     # asyncio.run() internally, which must not happen inside this running loop.
     runtime, registry = await asyncio.to_thread(
-        from_spec.build_runtime_for_spec,
-        spec,
-        provider=provider,
-        model=model,
-        on_event=_on_event,
+        lambda: from_spec.build_runtime_for_spec(
+            spec,
+            provider=provider,
+            model=model,
+            on_event=_on_event,
+            capture_io=True,  # power the trace inspector
+        )
     )
     has_tools = registry is not None
     thread = _rebuild_thread(spec, history)
@@ -406,10 +408,16 @@ def _build_timeline(
 
     steps: list[TimelineStep] = []
 
-    def add(type_: str, label: str, detail: str = "", ts: str | None = None) -> None:
+    def add(
+        type_: str,
+        label: str,
+        detail: str = "",
+        ts: str | None = None,
+        io: dict | None = None,
+    ) -> None:
         steps.append(
             TimelineStep(
-                seq=len(steps) + 1, type=type_, label=label, detail=detail, ts=ts
+                seq=len(steps) + 1, type=type_, label=label, detail=detail, ts=ts, io=io
             )
         )
 
@@ -419,7 +427,13 @@ def _build_timeline(
         name = et.value if et is not None else "event"
         payload = getattr(ev, "payload", None) or {}
         ts = getattr(ev, "timestamp", None)
-        add(name.lower(), name.replace("_", " ").title(), _summarize_payload(payload), ts)
+        add(
+            name.lower(),
+            name.replace("_", " ").title(),
+            _summarize_payload(payload),
+            ts,
+            io=payload.get("io"),
+        )
     if status == "ok":
         add("run_completed", "Completed", _trim(output, 200))
     else:
@@ -500,7 +514,10 @@ async def stream_team_run(
         )
         inference = build_team_inference(spec)
         runtime, _i, _t = build_runtime(
-            inference=inference, tool_registry=registry, on_event=_push
+            inference=inference,
+            tool_registry=registry,
+            on_event=_push,
+            capture_io=True,  # power the trace inspector
         )
         return runtime, registry, team
 
