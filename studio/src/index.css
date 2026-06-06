@@ -66,6 +66,7 @@
   --radius: 8px;
   --radius-sm: 5px;
   --bubble: 15px;
+  --chat-col: 820px; /* readable, centered chat column (messages + composer) */
   --spring: cubic-bezier(0.22, 1.61, 0.36, 1);
   --shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 8px 28px rgba(0, 0, 0, 0.28);
 }
@@ -594,10 +595,13 @@ label.field > .hint {
 }
 .chat-thread {
   width: 100%;
+  max-width: var(--chat-col);
+  margin-left: auto;
+  margin-right: auto;
+  margin-top: auto; /* anchor a short conversation to the bottom (no top void) */
   display: flex;
   flex-direction: column;
   gap: 14px;
-  margin-top: auto; /* anchor a short conversation to the bottom (no top void) */
 }
 .chat-thread.grow {
   flex: 1;
@@ -783,6 +787,8 @@ label.field > .hint {
 /* One cohesive rounded input bar (Odysseus-style): textarea + a toolbar row. */
 .composer {
   width: 100%;
+  max-width: var(--chat-col);
+  margin: 0 auto;
   background: var(--bg);
   border: 1px solid var(--border-strong);
   border-radius: 16px;
@@ -887,7 +893,8 @@ label.field > .hint {
   transform: scale(0.9);
 }
 .composer-send:disabled {
-  opacity: 0.4;
+  background: var(--surface);
+  color: var(--text-dim);
   cursor: not-allowed;
 }
 
