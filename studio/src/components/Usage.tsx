@@ -2,13 +2,15 @@ import type { RunAnalytics, ModelUsage } from "../lib/api";
 
 // ---- formatters ---------------------------------------------------------
 
-export function fmtTokens(n: number): string {
+export function fmtTokens(n?: number | null): string {
+  n = n || 0;
   if (n < 1000) return String(n);
   if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "k";
   return (n / 1_000_000).toFixed(1) + "M";
 }
 
-export function fmtUsd(n: number): string {
+export function fmtUsd(n?: number | null): string {
+  n = n || 0;
   if (!n) return "$0";
   if (n < 0.01) return "$" + n.toFixed(4);
   if (n < 1) return "$" + n.toFixed(3);
@@ -137,34 +139,36 @@ export function RunUsage({
   cost,
   byModel,
 }: {
-  inputTokens: number;
-  outputTokens: number;
-  cost: number;
-  byModel: ModelUsage[];
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  cost?: number | null;
+  byModel?: ModelUsage[] | null;
 }) {
-  if (inputTokens === 0 && outputTokens === 0 && cost === 0) return null;
+  const inTok = inputTokens || 0;
+  const outTok = outputTokens || 0;
+  const c = cost || 0;
+  const models = byModel || [];
+  if (inTok === 0 && outTok === 0 && c === 0) return null;
   return (
     <div className="card card-pad">
       <span className="section-title">Cost &amp; tokens</span>
       <div className="usage-grid">
         <div className="usage-cell">
-          <div className="usage-num mono">{fmtTokens(inputTokens)}</div>
+          <div className="usage-num mono">{fmtTokens(inTok)}</div>
           <div className="usage-lab">input</div>
         </div>
         <div className="usage-cell">
-          <div className="usage-num mono">{fmtTokens(outputTokens)}</div>
+          <div className="usage-num mono">{fmtTokens(outTok)}</div>
           <div className="usage-lab">output</div>
         </div>
         <div className="usage-cell">
-          <div className="usage-num mono">
-            {cost === 0 ? "local" : fmtUsd(cost)}
-          </div>
+          <div className="usage-num mono">{c === 0 ? "local" : fmtUsd(c)}</div>
           <div className="usage-lab">cost</div>
         </div>
       </div>
-      {byModel.length > 0 && (
+      {models.length > 0 && (
         <div className="usage-models">
-          {byModel.map((m) => (
+          {models.map((m) => (
             <div className="usage-model-row" key={m.model}>
               <span className="mono usage-model-name">{m.model}</span>
               <span className="mono usage-model-tok">
@@ -184,9 +188,11 @@ export function RunUsage({
 // ---- analytics dashboard (Runs page header) -----------------------------
 
 export function AnalyticsPanel({ a }: { a: RunAnalytics }) {
-  if (a.total_runs === 0) return null;
-  const maxDayCost = Math.max(...a.by_day.map((d) => d.cost), 0);
-  const maxDayRuns = Math.max(...a.by_day.map((d) => d.runs), 1);
+  if (!a || !a.total_runs) return null;
+  const byDay = a.by_day || [];
+  const byModel = a.by_model || [];
+  const maxDayCost = Math.max(...byDay.map((d) => d.cost), 0);
+  const maxDayRuns = Math.max(...byDay.map((d) => d.runs), 1);
   return (
     <div className="analytics">
       <div className="kpis">
@@ -209,11 +215,11 @@ export function AnalyticsPanel({ a }: { a: RunAnalytics }) {
       </div>
 
       <div className="analytics-cols">
-        {a.by_day.length > 0 && (
+        {byDay.length > 0 && (
           <div className="analytics-card">
             <div className="analytics-head">Activity</div>
             <div className="spark">
-              {a.by_day.map((d) => {
+              {byDay.map((d) => {
                 const h =
                   maxDayCost > 0
                     ? Math.max(6, (d.cost / maxDayCost) * 100)
@@ -231,17 +237,17 @@ export function AnalyticsPanel({ a }: { a: RunAnalytics }) {
               })}
             </div>
             <div className="spark-axis mono">
-              <span>{a.by_day[0]?.day.slice(5)}</span>
-              <span>{a.by_day[a.by_day.length - 1]?.day.slice(5)}</span>
+              <span>{byDay[0]?.day.slice(5)}</span>
+              <span>{byDay[byDay.length - 1]?.day.slice(5)}</span>
             </div>
           </div>
         )}
 
-        {a.by_model.length > 0 && (
+        {byModel.length > 0 && (
           <div className="analytics-card">
             <div className="analytics-head">By model</div>
             <div className="model-table">
-              {a.by_model.map((m) => (
+              {byModel.map((m) => (
                 <div className="model-row" key={m.model}>
                   <span className="mono model-name">{m.model}</span>
                   <span className="mono model-runs">{m.runs}×</span>

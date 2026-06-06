@@ -83,13 +83,16 @@ export default function Runs() {
                     <span className="meta">{relativeTime(r.created_at)}</span>
                     <span className="meta">
                       {r.provider ?? "auto"} · {duration(r.duration_ms)}
-                      {r.input_tokens + r.output_tokens > 0 && (
+                      {(r.input_tokens || 0) + (r.output_tokens || 0) > 0 && (
                         <>
                           {" · "}
                           <span className="mono">
-                            {fmtTokens(r.input_tokens + r.output_tokens)} tok
+                            {fmtTokens(
+                              (r.input_tokens || 0) + (r.output_tokens || 0),
+                            )}{" "}
+                            tok
                           </span>
-                          {r.cost > 0 && (
+                          {(r.cost || 0) > 0 && (
                             <>
                               {" · "}
                               <span className="mono">{fmtUsd(r.cost)}</span>

@@ -23,14 +23,14 @@ function IoInspector({ io }: { io: IoCapture }) {
       </button>
       {open && (
         <div className="io-body">
-          {io.tools.length > 0 && (
+          {(io.tools || []).length > 0 && (
             <div className="io-row">
               <span className="io-key">bound tools</span>
-              <span className="io-val mono">{io.tools.join(", ")}</span>
+              <span className="io-val mono">{(io.tools || []).join(", ")}</span>
             </div>
           )}
           <div className="io-key">prompt sent</div>
-          {io.messages.map((m, i) => (
+          {(io.messages || []).map((m, i) => (
             <div className="io-msg" key={i}>
               <span className={"io-role " + m.role}>{m.role}</span>
               <pre className="io-pre">{m.content}</pre>
@@ -38,7 +38,7 @@ function IoInspector({ io }: { io: IoCapture }) {
           ))}
           <div className="io-key">model output</div>
           <pre className="io-pre">{io.response_text || "(empty — only tool calls)"}</pre>
-          {io.tool_calls.length > 0 && (
+          {(io.tool_calls || []).length > 0 && (
             <>
               <div className="io-key">parsed tool calls</div>
               <pre className="io-pre">{JSON.stringify(io.tool_calls, null, 2)}</pre>
@@ -101,12 +101,13 @@ export default function RunDetail() {
                   {run.tool_count > 0 && (
                     <span className="pill dim">⚙ {run.tool_count} tools</span>
                   )}
-                  {run.input_tokens + run.output_tokens > 0 && (
+                  {(run.input_tokens || 0) + (run.output_tokens || 0) > 0 && (
                     <span className="pill dim">
-                      {fmtTokens(run.input_tokens + run.output_tokens)} tok
+                      {fmtTokens((run.input_tokens || 0) + (run.output_tokens || 0))}{" "}
+                      tok
                     </span>
                   )}
-                  {run.cost > 0 && (
+                  {(run.cost || 0) > 0 && (
                     <span className="pill dim">{fmtUsd(run.cost)}</span>
                   )}
                 </div>
@@ -122,7 +123,7 @@ export default function RunDetail() {
                   <h2>Transcript</h2>
                 </div>
                 <div className="card-pad stack gap16">
-                  {run.messages.map((m, i) => (
+                  {(run.messages || []).map((m, i) => (
                     <div className={"msg " + (m.role === "user" ? "user" : "agent")} key={i}>
                       <div className="avatar">
                         {m.role === "user" ? "you" : "H"}
@@ -176,11 +177,11 @@ export default function RunDetail() {
                 byModel={run.usage_by_model}
               />
 
-              {run.tools.length > 0 && (
+              {(run.tools || []).length > 0 && (
                 <div className="card card-pad">
                   <span className="section-title">Tools used</span>
                   <div className="row wrap gap6">
-                    {run.tools.map((t) => (
+                    {(run.tools || []).map((t) => (
                       <span className="chip on" key={t}>
                         ⚙ {t}
                       </span>
@@ -196,12 +197,12 @@ export default function RunDetail() {
               <div className="card-head">
                 <h2>Timeline</h2>
                 <span className="dim" style={{ fontSize: 12 }}>
-                  {run.timeline.length} steps
+                  {(run.timeline || []).length} steps
                 </span>
               </div>
               <div className="card-pad">
                 <div className="timeline">
-                  {run.timeline.map((s) => (
+                  {(run.timeline || []).map((s) => (
                     <div className="tl-item" key={s.seq}>
                       <div className="tl-dot" />
                       <div className="tl-body">
