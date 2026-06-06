@@ -63,9 +63,7 @@ def save_scorecards(
     """Upsert each model's summary into the cache, replacing the same model+suite."""
     existing = load_entries()
     fresh = {(c.spec.name, suite_name) for c in cards}
-    kept = [
-        e for e in existing if (e.get("model"), e.get("suite")) not in fresh
-    ]
+    kept = [e for e in existing if (e.get("model"), e.get("suite")) not in fresh]
     new = [summarize(c, suite_name=suite_name, when=when) for c in cards]
     cache_path().write_text(
         json.dumps({"entries": kept + new}, indent=2), encoding="utf-8"

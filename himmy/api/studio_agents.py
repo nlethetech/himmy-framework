@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel
 
-from himmy.api.studio_service import AgentSummary, project_root, _summarize
+from himmy.api.studio_service import AgentSummary, _summarize, project_root
 
 # Fields the GUI form may set. Anything else in an existing file is preserved.
 EDITABLE_FIELDS = (

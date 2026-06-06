@@ -194,8 +194,10 @@ def build_io_capture(request: Any, response: Any) -> dict[str, Any]:
     messages = []
     for m in (request.messages or [])[-_IO_MAX_MESSAGES:]:
         messages.append(
-            {"role": getattr(m, "role", "?"), "content": _truncate(
-                getattr(m, "content", "") or "", _IO_MSG_CAP)}
+            {
+                "role": getattr(m, "role", "?"),
+                "content": _truncate(getattr(m, "content", "") or "", _IO_MSG_CAP),
+            }
         )
     tool_calls = [
         {"tool": c.tool_name, "args": c.args} for c in (response.tool_calls or [])
@@ -204,7 +206,9 @@ def build_io_capture(request: Any, response: Any) -> dict[str, Any]:
         "model": getattr(response, "model_path", None),
         "messages": messages,
         "tools": [t.name for t in (request.bound_tools or [])],
-        "response_text": _truncate(getattr(response, "output_text", "") or "", _IO_FIELD_CAP),
+        "response_text": _truncate(
+            getattr(response, "output_text", "") or "", _IO_FIELD_CAP
+        ),
         "tool_calls": tool_calls,
     }
 

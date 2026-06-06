@@ -18,6 +18,7 @@ KNOWN = {"egg_totals", "pond_status", "add_task", "list_flocks"}
 
 # ---- tolerant parser ----------------------------------------------------
 
+
 def test_marker_with_prose_and_dedup() -> None:
     text = (
         "Let me check the eggs.\n"
@@ -62,7 +63,9 @@ def test_final_answer_json_is_not_a_call() -> None:
 
 def test_unknown_name_in_ambiguous_json_rejected() -> None:
     # Bare JSON whose name isn't a known/near tool is not a call (false-positive guard).
-    assert parse_text_tool_calls('{"tool": "wildly_unrelated", "args": {}}', KNOWN) == []
+    assert (
+        parse_text_tool_calls('{"tool": "wildly_unrelated", "args": {}}', KNOWN) == []
+    )
 
 
 def test_marker_accepts_unknown_name_for_repair() -> None:
@@ -72,6 +75,7 @@ def test_marker_accepts_unknown_name_for_repair() -> None:
 
 
 # ---- name repair --------------------------------------------------------
+
 
 def test_resolve_exact_and_typo_and_case() -> None:
     avail = ["egg_totals", "pond_status", "add_task"]
@@ -96,15 +100,21 @@ def test_unknown_tool_message_is_actionable() -> None:
 
 # ---- repair wired into execution ----------------------------------------
 
+
 def _bound() -> list[BoundTool]:
     async def handler(args: dict) -> ToolReturnRecord:
         return ToolReturnRecord(
-            tool_call_id="x", tool_name="egg_totals",
-            content={"total": 245}, outcome="success",
+            tool_call_id="x",
+            tool_name="egg_totals",
+            content={"total": 245},
+            outcome="success",
         )
 
-    return [BoundTool(name="egg_totals", args_json_schema={"type": "object"},
-                      handler=handler)]
+    return [
+        BoundTool(
+            name="egg_totals", args_json_schema={"type": "object"}, handler=handler
+        )
+    ]
 
 
 def test_execute_autocorrects_typo_and_runs() -> None:

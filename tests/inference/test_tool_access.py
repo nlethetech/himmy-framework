@@ -8,14 +8,30 @@ from himmy.services.tools.access import classify_read_only, describe_for_model
 
 
 def test_classify_read_verbs() -> None:
-    for name in ("egg_totals", "list_flocks", "pond_status", "finance_summary",
-                 "farm_overview", "recent_harvests", "get_order", "sql_query"):
+    for name in (
+        "egg_totals",
+        "list_flocks",
+        "pond_status",
+        "finance_summary",
+        "farm_overview",
+        "recent_harvests",
+        "get_order",
+        "sql_query",
+    ):
         assert classify_read_only(name) is True, name
 
 
 def test_classify_write_verbs() -> None:
-    for name in ("log_eggs", "add_task", "record_expense", "complete_task",
-                 "write_file", "send_email", "kb_ingest", "remember"):
+    for name in (
+        "log_eggs",
+        "add_task",
+        "record_expense",
+        "complete_task",
+        "write_file",
+        "send_email",
+        "kb_ingest",
+        "remember",
+    ):
         assert classify_read_only(name) is False, name
 
 
@@ -45,7 +61,10 @@ def test_ollama_tool_descriptions_carry_intent() -> None:
         BoundTool(name="egg_totals", description="Egg totals."),
         BoundTool(name="log_eggs", description="Record eggs."),
     ]
-    specs = {t["function"]["name"]: t["function"]["description"] for t in _ollama_tools(tools)}
+    specs = {
+        t["function"]["name"]: t["function"]["description"]
+        for t in _ollama_tools(tools)
+    }
     assert "[read-only:" in specs["egg_totals"]
     assert "[WRITE:" in specs["log_eggs"]
 

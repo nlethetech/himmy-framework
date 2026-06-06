@@ -90,9 +90,7 @@ def is_stub_manager(manager: ClientManager) -> bool:
     return isinstance(manager, StubClientManager)
 
 
-def resolves_to_stub(
-    provider: str | None = None, model: str | None = None
-) -> bool:
+def resolves_to_stub(provider: str | None = None, model: str | None = None) -> bool:
     """True when this provider/model pair will run on the offline stub.
 
     Used by the CLI to surface a one-line "you're offline, here's how to use a real

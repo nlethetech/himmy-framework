@@ -214,9 +214,7 @@ def _mount_studio(app: FastAPI) -> None:
     index = STUDIO_STATIC_DIR / "index.html"
     assets = STUDIO_STATIC_DIR / "assets"
     if assets.is_dir():
-        app.mount(
-            "/assets", StaticFiles(directory=str(assets)), name="studio-assets"
-        )
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="studio-assets")
 
     @app.get("/", include_in_schema=False)
     async def _studio_index() -> FileResponse:

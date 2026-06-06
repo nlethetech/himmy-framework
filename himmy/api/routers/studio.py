@@ -246,9 +246,7 @@ async def save_agent(
     Returns 409 when creating would overwrite an existing file without ``overwrite``.
     """
     try:
-        return studio_agents.save_agent(
-            body.path, body.spec, overwrite=body.overwrite
-        )
+        return studio_agents.save_agent(body.path, body.spec, overwrite=body.overwrite)
     except studio_agents.AgentExists as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except studio_agents.SpecInvalid as exc:

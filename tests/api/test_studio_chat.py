@@ -89,9 +89,7 @@ def test_run_accepts_multi_turn_history(client: TestClient) -> None:
 
 
 def test_run_unknown_agent_is_404(client: TestClient) -> None:
-    r = client.post(
-        "/api/studio/run", json={"agent_path": "nope.yaml", "prompt": "x"}
-    )
+    r = client.post("/api/studio/run", json={"agent_path": "nope.yaml", "prompt": "x"})
     assert r.status_code == 404
 
 

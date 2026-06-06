@@ -78,7 +78,10 @@ def test_save_writes_tidy_yaml_and_lists(client: TestClient, tmp_path: Path) -> 
 def test_load_agent_detail_roundtrip(client: TestClient) -> None:
     client.put(
         "/api/studio/agents",
-        json={"path": "a.agent.yaml", "spec": {"name": "a", "description": "d", "skills": ["summarize"]}},
+        json={
+            "path": "a.agent.yaml",
+            "spec": {"name": "a", "description": "d", "skills": ["summarize"]},
+        },
     )
     d = client.get("/api/studio/agent", params={"path": "a.agent.yaml"}).json()
     assert d["path"] == "a.agent.yaml"
@@ -113,7 +116,9 @@ def test_edit_preserves_advanced_fields(client: TestClient, tmp_path: Path) -> N
     assert saved["http_tools"][0]["name"] == "get_order"
 
 
-def test_new_agent_will_not_silently_overwrite(client: TestClient, tmp_path: Path) -> None:
+def test_new_agent_will_not_silently_overwrite(
+    client: TestClient, tmp_path: Path
+) -> None:
     (tmp_path / "agent.yaml").write_text("name: existing\ndescription: keep me\n")
     # Creating a new agent at an existing path (overwrite omitted) → 409, file intact.
     r = client.put(

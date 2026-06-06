@@ -96,7 +96,11 @@ def _looks_like_team(path: Path) -> dict | None:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - non-YAML / unreadable → not a team
         return None
-    if isinstance(raw, dict) and raw.get("entry") and isinstance(raw.get("members"), list):
+    if (
+        isinstance(raw, dict)
+        and raw.get("entry")
+        and isinstance(raw.get("members"), list)
+    ):
         return raw
     return None
 
@@ -508,7 +512,7 @@ async def stream_team_run(
         await queue.put(event)
 
     # Build off the event loop (tool-module import + pack registration are sync).
-    def _build() -> tuple[Any, Any]:
+    def _build() -> tuple[Any, Any, Any]:
         team, registry = build_team(
             spec, resolve_tools_module=from_spec.resolve_tools_module
         )
@@ -557,7 +561,11 @@ async def stream_team_run(
         if et == EventType.AGENT_HANDOFF:
             return {"type": "handoff", "to": payload.get("to", "?")}
         name = _tool_name_of(event)
-        if name and not name.startswith(_SYNTHETIC_TOOL_PREFIXES) and name != "final_answer":
+        if (
+            name
+            and not name.startswith(_SYNTHETIC_TOOL_PREFIXES)
+            and name != "final_answer"
+        ):
             if name not in tools_used:
                 tools_used.append(name)
             return {"type": "tool", "name": name}
@@ -620,7 +628,11 @@ async def stream_team_run(
         pass
 
     if status == "error":
-        yield {"type": "error", "message": error_msg or "team run failed", "run_id": run_id}
+        yield {
+            "type": "error",
+            "message": error_msg or "team run failed",
+            "run_id": run_id,
+        }
         return
     yield {
         "type": "done",

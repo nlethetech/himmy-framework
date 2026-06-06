@@ -13,9 +13,8 @@ import asyncio
 import importlib
 import json
 import os
-import shutil
 import sys
-from collections.abc import Callable
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -853,7 +852,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     print(render_markdown(cards, suite_name=suite.name))
 
     # Cache the scorecards so Studio's Doctor can show per-model reliability.
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from himmy.benchmark.cache import save_scorecards
 
@@ -861,7 +860,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         save_scorecards(
             cards,
             suite_name=suite.name,
-            when=datetime.now(timezone.utc).isoformat(),
+            when=datetime.now(UTC).isoformat(),
         )
     except Exception:  # noqa: BLE001 - caching is best-effort, never fail the run
         pass
@@ -1055,8 +1054,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         f"\nguardrails (agent.yaml `guardrails: [...]`): {', '.join(report.guardrails)}"
     )
     print(
-        "\nproject config: "
-        f"{report.project_config or '(none — using env + defaults)'}"
+        f"\nproject config: {report.project_config or '(none — using env + defaults)'}"
     )
 
     if report.next_step is not None:

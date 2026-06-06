@@ -36,7 +36,9 @@ def _all_defs():
 def test_every_builtin_has_explicit_intent_except_dual_use() -> None:
     defs = _all_defs()
     unset = [
-        n for n, d in defs.items() if d.read_only is None and n not in _INTENTIONALLY_UNSET
+        n
+        for n, d in defs.items()
+        if d.read_only is None and n not in _INTENTIONALLY_UNSET
     ]
     assert not unset, f"built-in tools missing an explicit read_only: {unset}"
 

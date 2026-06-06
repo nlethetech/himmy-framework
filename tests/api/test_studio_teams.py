@@ -31,7 +31,9 @@ members:
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     (tmp_path / "demo.team.yaml").write_text(_STUB_TEAM)
-    (tmp_path / "solo.agent.yaml").write_text("name: solo\ndescription: a single agent\n")
+    (tmp_path / "solo.agent.yaml").write_text(
+        "name: solo\ndescription: a single agent\n"
+    )
     monkeypatch.chdir(tmp_path)
     reset_run_store()
     return TestClient(create_app())
@@ -59,9 +61,7 @@ def test_team_discovery_excludes_agents(client: TestClient) -> None:
 
 
 def test_team_run_streams_and_persists(client: TestClient) -> None:
-    frames = _frames(
-        client, {"team_path": "demo.team.yaml", "prompt": "hello team"}
-    )
+    frames = _frames(client, {"team_path": "demo.team.yaml", "prompt": "hello team"})
     types = [f["type"] for f in frames]
     assert types[0] == "start"
     assert frames[0]["team"] is True

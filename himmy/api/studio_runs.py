@@ -14,7 +14,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS studio_runs (
@@ -133,9 +133,7 @@ class StudioRunStore:
         self._conn.commit()
 
     def count(self) -> int:
-        return int(
-            self._conn.execute("SELECT COUNT(*) FROM studio_runs").fetchone()[0]
-        )
+        return int(self._conn.execute("SELECT COUNT(*) FROM studio_runs").fetchone()[0])
 
     def list(self, limit: int = 50, offset: int = 0) -> list[StudioRunSummary]:
         """List run summaries, newest first."""
@@ -190,9 +188,7 @@ class StudioRunStore:
             messages=[
                 TranscriptMessage(**m) for m in json.loads(row["messages"] or "[]")
             ],
-            timeline=[
-                TimelineStep(**s) for s in json.loads(row["timeline"] or "[]")
-            ],
+            timeline=[TimelineStep(**s) for s in json.loads(row["timeline"] or "[]")],
             tool_count=len(json.loads(row["tools"] or "[]")),
         )
 
