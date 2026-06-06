@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Sample News Feed</title>
+    <link>https://example.com</link>
+    <description>A tiny local RSS feed for the himmy connectors demo (offline).</description>
+    <item>
+      <title>Central bank holds interest rates steady amid inflation concerns</title>
+      <link>https://example.com/rates</link>
+      <description>The central bank kept its benchmark rate unchanged this month, citing inflation.</description>
+    </item>
+    <item>
+      <title>Foreign minister to visit India next week for trade talks</title>
+      <link>https://example.com/india</link>
+      <description>Officials will discuss cross-border trade and energy cooperation.</description>
+    </item>
+    <item>
+      <title>Tech startups report record funding in the first quarter</title>
+      <link>https://example.com/startups</link>
+      <description>Venture investment in local startups hit a new high this quarter.</description>
+    </item>
+    <item>
+      <title>Monsoon forecast points to above-average rainfall this season</title>
+      <link>https://example.com/monsoon</link>
+      <description>Meteorologists expect a strong monsoon, with implications for agriculture.</description>
+    </item>
+  </channel>
+</rss>

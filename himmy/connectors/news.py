@@ -111,12 +111,17 @@ class NewsFetcher:
         sources: list[str] | None = None,
         per_source: int = 20,
     ) -> list[NewsItem]:
-        """Keyword search across sources (case-insensitive over title + summary)."""
-        needle = query.lower()
+        """Keyword search across sources (case-insensitive over title + summary).
+
+        Matches an article when ALL query words appear in its title or summary (not the
+        whole query as a single phrase) — so "trade India" finds an article titled
+        "…visit India next week for trade talks".
+        """
+        tokens = [t for t in query.lower().split() if t]
         hits = [
             item
             for item in self.fetch_all(per_source=per_source, sources=sources)
-            if needle in f"{item.title} {item.summary}".lower()
+            if all(t in f"{item.title} {item.summary}".lower() for t in tokens)
         ]
         return hits[:limit]
 

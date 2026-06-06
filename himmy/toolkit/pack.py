@@ -44,10 +44,35 @@ class ToolPack:
 
 
 def _register_news_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
-    """News connector → agent tools (lazy import keeps `connectors` out of import)."""
+    """News connector → agent tools (lazy import keeps `connectors` out of import).
+
+    Honors ``HIMMY_NEWS_FIXTURE`` (a local RSS file) so the news tools run fully offline
+    — handy for demos/tests with no network.
+    """
+    import os
+
     from himmy.connectors.news_tools import register_news_tools
 
-    register_news_tools(registry)
+    fixture = os.environ.get("HIMMY_NEWS_FIXTURE")
+    fetcher = None
+    if fixture:
+        from pathlib import Path
+
+        from himmy.connectors.news import NewsFetcher
+
+        class _FixtureFetcher:
+            def __init__(self, path: str) -> None:
+                self._path = path
+
+            def get_text(self, url: str) -> str:
+                return Path(self._path).read_text(encoding="utf-8")
+
+            def get_bytes(self, url: str) -> bytes:
+                return Path(self._path).read_bytes()
+
+        fetcher = NewsFetcher(fetcher=_FixtureFetcher(fixture))
+
+    register_news_tools(registry, fetcher=fetcher)
 
 
 #: The built-in pack catalog, keyed by pack name.

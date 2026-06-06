@@ -1,0 +1,15 @@
+# An agent that reads two data CONNECTORS as tools — no driver code needed.
+#   - news  : RSS/Atom feeds (news_search, news_fetch, news_sources)
+#   - nepal : NRB foreign-exchange rates (nrb_forex), Bikram Sambat dates, NPR formatting
+name: nepal-data-agent
+description: Answers questions from live news feeds and NRB foreign-exchange rates.
+provider: ollama
+model: qwen2.5:3b-instruct
+tool_packs: [news, nepal]
+tools: [news_search, nrb_forex]
+tool_router: true   # let a small model route to the right tool per question
+instructions:
+  - For a news question, call news_search and summarize the headlines you find.
+  - For an exchange-rate question, call nrb_forex with the date, then state the
+    currency's buy and sell rate.
+  - Only state facts the tools returned; cite what you used.
