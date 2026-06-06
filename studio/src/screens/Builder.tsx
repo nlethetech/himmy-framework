@@ -228,10 +228,22 @@ export default function Builder() {
         </aside>
 
         {/* Editor pane */}
-        <div style={{ overflow: "auto", padding: 26 }}>
+        <div
+          style={{
+            overflow: "auto",
+            padding: 26,
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
           {selected === null ? (
-            <div className="empty">
-              Select an agent to edit, or create a new one.
+            <div className="chat-hero" style={{ margin: "auto" }}>
+              <div className="hero-avatar">✎</div>
+              <div className="hero-title">Agent builder</div>
+              <div className="hero-sub">
+                Select an agent on the left to edit it, or create a new one — no
+                YAML required.
+              </div>
             </div>
           ) : (
             <div style={{ maxWidth: 720 }}>

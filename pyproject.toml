@@ -99,6 +99,7 @@ himmy = [
     # Globs match nothing in a source checkout that hasn't built the GUI yet.
     "api/_studio_static/*",
     "api/_studio_static/assets/*",
+    "api/_studio_static/fonts/*",
 ]
 
 [tool.pytest.ini_options]

@@ -11,6 +11,13 @@ import {
 import { Topbar } from "../components/Page";
 import { SendIcon, RefreshIcon } from "../components/icons";
 
+// Domain-agnostic starter prompts for the empty state (fill the input, don't send).
+const EXAMPLES = [
+  "Give me a quick status summary",
+  "What should I prioritize today?",
+  "What can you help me with?",
+];
+
 const PROVIDERS = [
   { value: "", label: "Auto (spec default)" },
   { value: "stub", label: "Stub (offline)" },
@@ -261,7 +268,7 @@ export default function Chat() {
 
       <div className="chat-scroll" ref={scrollRef}>
         {loadErr ? (
-          <div className="chat-thread">
+          <div className="chat-thread grow">
             <div className="banner" style={{ borderColor: "var(--err)" }}>
               <div
                 className="b-ico"
@@ -276,25 +283,43 @@ export default function Chat() {
             </div>
           </div>
         ) : messages.length === 0 ? (
-          <div className="chat-thread">
-            <div className="empty">
-              {!hasAny ? (
-                <>
-                  Nothing to run in this project.
-                  <br />
-                  Create an agent in <b>Agents</b>, or drop a <code>team.yaml</code> here.
-                </>
-              ) : isTeam ? (
-                <>
-                  Running the <b>{picked!.item.name}</b> team — a manager that
-                  delegates to specialists. Ask it something.
-                </>
-              ) : (
-                <>
-                  Chatting with <b>{picked?.item.name}</b>. Say something below.
-                </>
-              )}
-            </div>
+          <div className="chat-thread grow">
+            {!hasAny ? (
+              <div className="chat-hero">
+                <div className="hero-avatar">∅</div>
+                <div className="hero-title">Nothing to run yet</div>
+                <div className="hero-sub">
+                  Create an agent in the <b>Agents</b> tab, or drop a{" "}
+                  <code>team.yaml</code> into this project.
+                </div>
+              </div>
+            ) : (
+              <div className="chat-hero">
+                <div className="hero-avatar">
+                  {(picked?.item.name ?? "H").charAt(0).toUpperCase()}
+                </div>
+                <div className="hero-title">{picked?.item.name}</div>
+                <div className="hero-sub">
+                  {isTeam
+                    ? `A manager that delegates to ${
+                        (picked!.item as TeamSummary).members.length - 1
+                      } specialists. Ask it to look something up or take an action.`
+                    : (picked?.item as AgentSummary)?.description ||
+                      "Send a message to get started."}
+                </div>
+                <div className="hero-prompts">
+                  {EXAMPLES.map((ex) => (
+                    <button
+                      key={ex}
+                      className="hero-chip"
+                      onClick={() => setInput(ex)}
+                    >
+                      {ex}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           <div className="chat-thread">

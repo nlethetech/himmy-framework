@@ -222,7 +222,12 @@ def _mount_studio(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def _spa_fallback(request: Request, exc: StarletteHTTPException):
-        """Serve the SPA shell on a 404 for a non-API GET; else the default JSON error."""
+        """Serve a real static file or the SPA shell on a 404 for a non-API GET.
+
+        Top-level static files emitted into the build root (fonts, favicon, manifest)
+        live outside ``/assets``; serve the real file when the path resolves to one
+        under the build dir, otherwise fall back to ``index.html`` for client routing.
+        """
         path = request.url.path.lstrip("/")
         is_spa_route = (
             exc.status_code == 404
@@ -230,6 +235,13 @@ def _mount_studio(app: FastAPI) -> None:
             and not path.startswith(_STUDIO_API_PREFIXES)
         )
         if is_spa_route:
+            if path:
+                candidate = (STUDIO_STATIC_DIR / path).resolve()
+                if (
+                    STUDIO_STATIC_DIR in candidate.parents
+                    and candidate.is_file()
+                ):
+                    return FileResponse(str(candidate))
             return FileResponse(str(index))
         # Preserve FastAPI's default HTTPException shape (and any auth/Allow headers).
         return JSONResponse(
