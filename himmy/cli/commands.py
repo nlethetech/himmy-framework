@@ -165,6 +165,34 @@ async def _answer(
     return await runtime.run_task_detailed(persona, task, thread, llm_config=llm_config)
 
 
+_KNOWLEDGE_EXTS = {".md", ".markdown", ".txt", ".rst", ".csv"}
+
+
+async def _ingest_knowledge(registry: Any, sources: list[str]) -> int:
+    """Ingest each declared file/dir of text docs into the KB; returns the count."""
+    ingest = registry.handler_for("kb_ingest")
+    count = 0
+    for src in sources:
+        p = Path(src).expanduser()
+        if p.is_file():
+            files = [p]
+        elif p.is_dir():
+            files = sorted(
+                f for f in p.rglob("*") if f.suffix.lower() in _KNOWLEDGE_EXTS
+            )
+        else:
+            _eprint(f"warning: knowledge source not found: {src}")
+            continue
+        for f in files:
+            try:
+                text = f.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            await ingest({"text": text, "title": f.stem, "source_uri": f.name})
+            count += 1
+    return count
+
+
 def _build_runtime_for(
     spec: AgentSpec,
     args: argparse.Namespace,
@@ -231,6 +259,7 @@ def _build_runtime_for(
         spec.tool_packs
         or spec.tools_module
         or spec.http_tools
+        or spec.knowledge
         or spec.mcp_servers
         or spec.allow_spawn
         or spec.allow_skill_dispatch
@@ -241,6 +270,19 @@ def _build_runtime_for(
 
             tk_config = ToolkitConfig.from_sources(_project().get("toolkit"))
             register_packs(registry, spec.tool_packs, tk_config)
+        if spec.knowledge:
+            # Auto-ingest the declared docs into a local knowledge base and give the
+            # agent kb_search — a grounded doc agent with no driver code.
+            from himmy.toolkit import ToolkitConfig, register_packs
+
+            if "knowledge" not in spec.tool_packs:
+                register_packs(
+                    registry,
+                    ["knowledge"],
+                    ToolkitConfig.from_sources(_project().get("toolkit")),
+                )
+            n = asyncio.run(_ingest_knowledge(registry, spec.knowledge))
+            _eprint(f"ingested {n} document(s) into the knowledge base")
         if spec.http_tools:
             from himmy.config.http_tool_spec import register_http_tools
 

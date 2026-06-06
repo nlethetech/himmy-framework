@@ -71,6 +71,9 @@ class AgentSpec(BaseModel):
     guardrails: list[str] = []
     memory: bool = False  # auto-recall long-term memory into the prompt each run
     memory_top_k: int = 5
+    # Files/dirs to auto-ingest into the agent's knowledge base at startup (no driver
+    # code). The agent gains kb_search and can answer grounded in these docs.
+    knowledge: list[str] = []
     # Auto-compaction: summarize old turns once the thread crosses the token budget,
     # so long multi-turn runs don't overflow the context window.
     compact_context: bool = False

@@ -7,15 +7,29 @@ It ingests the Markdown files in [`docs/`](docs/) into himmy's local knowledge b
 (a local hashing embedder — nothing is downloaded), then answers with a small model via
 **Ollama**, grounded strictly in those docs and citing the source.
 
-## Run it
+## Run it — no code, just `agent.yaml`
+
+The whole thing is one file ([`agent.yaml`](agent.yaml)): `knowledge: [./docs]`
+auto-ingests your documents at startup, so you never write a driver.
 
 ```bash
 pip install -e ".[knowledge]"          # from the repo root
 ollama pull qwen2.5:3b-instruct        # any small local model
 cd examples/local-doc-chat
 
-python chat.py                          # interactive
+himmy run  -f agent.yaml -p "How many PTO days do I get?"   # one-shot
+himmy chat -f agent.yaml                                    # interactive
+```
+
+Point it at *your* docs by editing the one line `knowledge: [./docs]`.
+
+### …or use himmy as a library ([`chat.py`](chat.py))
+
+The same agent in ~60 lines of Python, if you'd rather drive it programmatically:
+
+```bash
 python chat.py "How many PTO days do I get?"   # one-shot
+python chat.py                                  # interactive
 ```
 
 > **Model size matters.** This demo needs a model that reliably calls tools. A **3B**
@@ -51,8 +65,8 @@ plane, behind a firewall, or anywhere you don't want your documents touching a t
   recorded and replayed *exactly*, with the provider turned off:
 
   ```bash
-  himmy run -f agent.yaml -p "Three benefits of running agents locally?" --record session.json
-  himmy run -f agent.yaml -p "Three benefits of running agents locally?" --replay session.json  # no Ollama needed
+  himmy run -f agent.yaml -p "How many PTO days do I get?" --record session.json
+  himmy run -f agent.yaml -p "How many PTO days do I get?" --replay session.json  # no Ollama needed
   ```
 
   The replay returns byte-identical output from `session.json` — that "re-run a past agent

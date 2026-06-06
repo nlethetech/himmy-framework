@@ -1,7 +1,10 @@
-# A plain offline agent — used to show record/replay (see README).
-# The doc-chat itself runs via chat.py, which pre-loads your docs into a local KB.
-name: offline-assistant
+# The whole doc-chat as ONE file — no driver code.
+# `knowledge:` auto-ingests ./docs into a local KB at startup; the agent gets kb_search.
+name: doc-chat
 provider: ollama
 model: qwen2.5:3b-instruct
+knowledge: [./docs]
+tools: [kb_search]
 instructions:
-  - Answer concisely and accurately.
+  - Always call kb_search, then answer only from the documents and name the source.
+  - If the documents don't cover the question, say so plainly — don't guess.
