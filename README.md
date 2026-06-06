@@ -200,6 +200,30 @@ instructions:
 Skills are validated (`extra="forbid"`), versioned entities (`kind="skill"`), and
 compose (`requires_skills`). `himmy init` scaffolds an example `skills/my_skill.yaml`.
 
+### Build a whole agent with no Python
+
+Four declarative levers in `agent.yaml` cover most specialised agents — connect your API,
+ground it in your docs, and give it know-how, all without code:
+
+```yaml
+name: my-agent
+skills: [web_research]            # capabilities = tools + know-how
+knowledge: [./docs]              # auto-ingested into a local KB → kb_search, grounded answers
+http_tools:                      # your own REST API, no tools.py
+  - name: get_order
+    base_url_env_var: MYAPI_URL
+    path: /orders/{order_id}
+    auth: { type: bearer, env_var: MYAPI_KEY }
+```
+
+Start from a working specialised agent:
+
+```bash
+himmy init my-agent --template helpdesk    # docs-grounded Q&A (knowledge)
+himmy init my-agent --template analyst     # live API lookups (http_tools)
+himmy init my-agent --template researcher  # web research (skills)
+```
+
 **MCP servers — the whole ecosystem as tools.** Beyond the built-in packs, point an
 agent at any stdio **Model Context Protocol** server and its tools become native himmy
 tools (arg-validated, approval-gated, traced). List them in `agent.yaml` (or `team.yaml`):

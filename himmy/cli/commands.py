@@ -848,6 +848,89 @@ _HIMMY_TOML = """\
 """
 
 
+# --- `himmy init --template <name>` starters -----------------------------------------
+# Each is a working specialised agent showcasing one no-code feature.
+
+_TPL_HELPDESK_AGENT = """\
+# Answers questions from YOUR documents — grounded, offline, no code.
+name: helpdesk
+description: Answers questions from the documents in ./docs, grounded and cited.
+provider: ollama
+model: qwen2.5:3b-instruct
+knowledge: [./docs]          # auto-ingested at startup; drop your own .md files in here
+tools: [kb_search]
+instructions:
+  - You have NO knowledge of this company's policies — ONLY the documents do. You must
+    call kb_search for EVERY question before answering. Never answer from memory and
+    never ask the user for more context.
+  - Answer in one or two sentences using the retrieved passage, and name the source.
+  - Only if kb_search returns nothing relevant, say "That's not in the handbook."
+"""
+
+_TPL_HELPDESK_DOC = """\
+# Company Handbook
+
+## Time Off
+Full-time employees get **20 days** of paid time off (PTO) per year.
+Part-time employees accrue PTO prorated by their hours.
+
+## Security
+Report any security issue or phishing email to **security@example.com**.
+All laptops must have full-disk encryption enabled.
+
+Replace this file with your own documents — anything in ./docs is ingested.
+"""
+
+_TPL_ANALYST_AGENT = """\
+# Answers questions by calling a live REST API — a declarative HTTP tool, no code.
+name: data-analyst
+description: Looks up live foreign-exchange rates via a public API.
+provider: ollama
+model: qwen2.5:3b-instruct
+http_tools:
+  - name: exchange_rate
+    description: Get the exchange rate from a base currency to others (ISO codes).
+    base_url: https://api.frankfurter.dev
+    path: /v1/latest
+    query: [base, symbols]
+instructions:
+  - Use exchange_rate (base and symbols are ISO currency codes) and state the rate.
+"""
+
+_TPL_RESEARCHER_AGENT = """\
+# Researches a question on the web and answers with citations — uses a skill.
+name: researcher
+description: Searches the web and answers with sources.
+provider: ollama
+model: qwen2.5:3b-instruct
+skills: [web_research]        # bundles the web tools + the know-how to use them
+instructions:
+  - Search before answering; ground the answer in what you find and cite the URLs.
+"""
+
+#: template name -> (files to write, the suggested next command, an offline note).
+_TEMPLATES: dict[str, dict[str, Any]] = {
+    "helpdesk": {
+        "files": {
+            "agent.yaml": _TPL_HELPDESK_AGENT,
+            "docs/handbook.md": _TPL_HELPDESK_DOC,
+        },
+        "prompt": "How many PTO days do I get?",
+        "note": "offline — needs the [knowledge] extra",
+    },
+    "analyst": {
+        "files": {"agent.yaml": _TPL_ANALYST_AGENT},
+        "prompt": "What is the USD to EUR rate? Use base=USD and symbols=EUR.",
+        "note": "calls a live public API (needs network)",
+    },
+    "researcher": {
+        "files": {"agent.yaml": _TPL_RESEARCHER_AGENT},
+        "prompt": "What is permaculture? Cite a source.",
+        "note": "searches the web (needs network + the [web] tools)",
+    },
+}
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     """Benchmark one or more models on a task suite; print a comparative scorecard."""
     from himmy.benchmark import (
@@ -927,19 +1010,30 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Scaffold an ``agent.yaml`` + ``tools.py`` (or a ``team.yaml`` with ``--team``)."""
+    """Scaffold an agent: a default one, a ``--template`` starter, or a ``--team``."""
     target = Path(args.directory).expanduser()
     target.mkdir(parents=True, exist_ok=True)
-    files = (
-        {"team.yaml": _TEAM_YAML}
-        if args.team
-        else {
+
+    template = getattr(args, "template", None)
+    next_msg = ""
+    if template:
+        tmpl = _TEMPLATES[template]
+        files = dict(tmpl["files"])
+        next_msg = (
+            f"\nNext ({tmpl['note']}):\n"
+            f'  himmy run -f {target / "agent.yaml"} -p "{tmpl["prompt"]}"'
+        )
+    elif args.team:
+        files = {"team.yaml": _TEAM_YAML}
+        next_msg = f'\nNext: himmy team -f {target / "team.yaml"} -p "your question"'
+    else:
+        files = {
             "agent.yaml": _AGENT_YAML,
             "tools.py": _TOOLS_PY,
             "himmy.toml": _HIMMY_TOML,
             "skills/my_skill.yaml": _SKILL_YAML,
         }
-    )
+        next_msg = f'\nNext: himmy run -f {target / "agent.yaml"} -p "hello"'
 
     existing = [name for name in files if (target / name).exists()]
     if existing and not args.force:
@@ -954,10 +1048,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content)
         print(f"wrote {dest}")
-    if args.team:
-        print(f'\nNext: himmy team -f {target / "team.yaml"} -p "your question"')
-    else:
-        print(f'\nNext: himmy run -f {target / "agent.yaml"} -p "hello"')
+    print(next_msg)
     return 0
 
 

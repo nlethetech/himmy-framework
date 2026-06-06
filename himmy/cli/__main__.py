@@ -141,6 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("directory", nargs="?", default=".", help="target directory")
     p_init.add_argument("--force", action="store_true", help="overwrite existing files")
     p_init.add_argument(
+        "--template",
+        choices=["helpdesk", "analyst", "researcher"],
+        help="start from a working specialised agent (docs / API / web research)",
+    )
+    p_init.add_argument(
         "--team", action="store_true", help="scaffold a team.yaml instead"
     )
     p_init.set_defaults(func=commands.cmd_init)
