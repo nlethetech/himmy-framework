@@ -42,6 +42,24 @@ No keys. No cloud. Your documents never leave the machine. → **[full example](
 > context snapshots, and run events are all immutable, versioned `EntityRecord`s with typed
 > links — the audit/lineage spine the rest of the framework is built on.
 
+### Prefer a GUI? Himmy Studio
+
+A local web app for everything below — no terminal required:
+
+```bash
+cd studio && npm install && npm run build   # build the GUI once (Node 18+)
+himmy studio                                 # opens http://127.0.0.1:8765
+```
+
+- **Chat** with any agent (live token streaming, multi-turn, tool calls).
+- **Agents** — build/edit an `agent.yaml` from a form: pick skills, tool packs,
+  knowledge, guardrails — no YAML by hand.
+- **Runs** — browse every past run with its transcript and step-by-step trace.
+- **Doctor** — what providers/keys/extras are available, and your next step.
+
+Served by the same FastAPI BFF, bound to loopback. For hot-reload development run
+`himmy serve` + `cd studio && npm run dev` (Vite proxies the API).
+
 ## Install
 
 ```bash

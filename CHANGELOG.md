@@ -8,6 +8,18 @@ providers, Postgres/pgvector, and observability.
 ## [Unreleased]
 
 ### Added
+- **Himmy Studio — a local web GUI (`himmy studio`).** A no-code front door served by
+  the same FastAPI BFF (loopback-bound): **Chat** with an agent (live SSE token
+  streaming, multi-turn, tool calls), an **Agent builder** that reads/validates/saves
+  an `agent.yaml` from a form (skill/tool-pack/guardrail pickers; saves merge so
+  advanced fields like `http_tools`/`mcp_servers` survive an edit; a 409 guard stops a
+  new agent silently overwriting an existing file), a **Runs** browser (every run
+  persisted to `.himmy/studio.db` with transcript + step-by-step timeline), and a JSON
+  **Doctor**. The React/Vite frontend lives in `studio/` and builds into the package
+  (`himmy/api/_studio_static`, shipped as package data); `pip install 'himmy[studio]'`.
+  The spec→runtime wiring is now shared between the CLI and the API via
+  `himmy.runtime.from_spec`, so both wire agents identically. Verified live: real token
+  streaming on Ollama, and the builder create/edit/overwrite-guard round-trip in a browser.
 - **Automatic model pricing (OpenAI + Anthropic), kept current via the community source.**
   Token usage was always captured; now dollar cost is too, with no hand-configured price
   table. `himmy.services.inference.pricing` resolves a per-model price from a layered
