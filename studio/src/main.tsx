@@ -15,7 +15,7 @@ import Knowledge from "./screens/Knowledge";
 import Teams from "./screens/Teams";
 import Evaluation from "./screens/Evaluation";
 import Workflows from "./screens/Workflows";
-import ComingSoon from "./screens/ComingSoon";
+import Lineage from "./screens/Lineage";
 import "./index.css";
 
 // New task-first IA. Screens not yet built (Home/Connections/Approvals) render a
@@ -40,15 +40,7 @@ const router = createBrowserRouter([
       { path: "advanced/knowledge", element: <Knowledge /> },
       { path: "advanced/memory", element: <Memory /> },
       { path: "advanced/eval", element: <Evaluation /> },
-      {
-        path: "advanced/lineage",
-        element: (
-          <ComingSoon
-            title="Lineage"
-            note="Every answer traces back to its prompt, persona, and evidence (the /v1/runs/{id}/lineage graph). An interactive provenance viewer will live here."
-          />
-        ),
-      },
+      { path: "advanced/lineage", element: <Lineage /> },
       // legacy redirects (one release)
       { path: "runs", element: <Navigate to="/activity" replace /> },
       { path: "runs/:runId", element: <Navigate to="/activity" replace /> },

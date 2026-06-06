@@ -40,6 +40,43 @@ export const api = {
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
+// ---- Lineage -------------------------------------------------------------
+
+export interface LineageTool {
+  name: string;
+  args: Record<string, unknown> | null;
+  result: string | null;
+  outcome: string | null;
+  read_only: boolean | null;
+  agent: string | null;
+}
+export interface LineageEvidence {
+  source: string;
+  query: string | null;
+  text: string;
+  similarity: number | null;
+  source_uri: string | null;
+}
+export interface LineageDelegate {
+  worker: string;
+  task: string | null;
+}
+export interface LineageView {
+  run_id: string;
+  agent: string | null;
+  provider: string | null;
+  prompt: string;
+  answer: string;
+  models: string[];
+  tools: LineageTool[];
+  evidence: LineageEvidence[];
+  delegates: LineageDelegate[];
+  cost: number;
+  tokens: number;
+}
+export const getLineage = (runId: string) =>
+  api.get<LineageView>(`/runs/${runId}/lineage`);
+
 // ---- Workflows -----------------------------------------------------------
 
 export interface WorkflowStepInfo {

@@ -2913,3 +2913,76 @@ label.field > .hint {
   color: var(--text-dim);
   margin-top: 4px;
 }
+
+/* ---- Lineage (provenance) ---------------------------------------------- */
+.lin {
+  max-width: 620px;
+}
+.lin-node {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--card);
+}
+.lin-node.answer {
+  border-color: var(--brand-line);
+  background: var(--brand-soft);
+}
+.lin-kind {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.lin-label {
+  font-size: var(--fs-md);
+  margin-top: 3px;
+  word-break: break-word;
+}
+.lin-meta {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.lin-branch,
+.lin-section {
+  position: relative;
+  margin-left: var(--sp-5);
+  padding-left: var(--sp-5);
+  border-left: 2px solid var(--border);
+  padding-top: var(--sp-3);
+}
+.lin-rel {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  margin-bottom: var(--sp-2);
+  font-style: italic;
+}
+.lin-leaf {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+}
+.lin-leaf:first-of-type {
+  border-top: none;
+}
+.lin-leaf-name {
+  font-weight: 600;
+  color: var(--cyan);
+  flex: none;
+}
+.lin-leaf-detail {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.lin-ev-icon {
+  flex: none;
+}

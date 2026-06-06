@@ -496,6 +496,19 @@ async def workflow_run(body: WorkflowRunRequest) -> Any:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+# ---- Lineage (provenance of a run's answer) -----------------------------
+
+
+@router.get("/runs/{run_id}/lineage")
+async def run_lineage(run_id: str) -> Any:
+    from himmy.api import studio_lineage
+
+    view = studio_lineage.run_lineage(run_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return view
+
+
 # ---- Agent authoring (the no-code builder) ------------------------------
 
 

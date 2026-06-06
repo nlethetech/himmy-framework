@@ -72,9 +72,19 @@ export default function RunDetail() {
         title={run ? run.agent_name ?? "Run" : "Run"}
         sub={run ? relativeTime(run.created_at) : "trace timeline"}
         actions={
-          <button className="btn" onClick={() => nav("/activity")}>
-            <BackIcon /> Back
-          </button>
+          <div className="row gap6">
+            {run && (
+              <button
+                className="btn"
+                onClick={() => nav(`/advanced/lineage?run=${run.id}`)}
+              >
+                Lineage
+              </button>
+            )}
+            <button className="btn" onClick={() => nav("/activity")}>
+              <BackIcon /> Back
+            </button>
+          </div>
         }
       />
       {loading ? (
