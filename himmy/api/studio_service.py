@@ -450,16 +450,57 @@ def _trim(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+# Verbose / redundant payload keys never shown in a timeline detail line (the full
+# prompt etc. live in the raw-I/O inspector instead).
+_NOISY_PAYLOAD_KEYS = frozenset(
+    {
+        "rendered_prompt",
+        "snapshot_id",
+        "route_override",
+        "request_id",
+        "trace_id",
+        "model_key",
+        "response_format",
+        "io",
+    }
+)
+
+
 def _summarize_payload(payload: dict[str, Any]) -> str:
-    """A compact one-line summary of a run event's payload."""
+    """A compact, readable one-line summary of a run event's payload.
+
+    Inference events collapse to ``<model>  <in>→<out> tok``; everything else prefers a
+    meaningful key (tool/worker/persona/status). The verbose prompt/ids are dropped —
+    they're available in the raw-I/O inspector — so the timeline reads cleanly.
+    """
     if not payload:
         return ""
-    for key in ("tool", "name", "tool_name", "summary", "text", "reason"):
+    if "input_tokens" in payload or "output_tokens" in payload:
+        model = payload.get("model_path") or payload.get("model_key") or ""
+        toks = f"{payload.get('input_tokens', 0)}→{payload.get('output_tokens', 0)} tok"
+        return f"{model}  {toks}".strip()
+    for key in (
+        "tool",
+        "tool_name",
+        "worker",
+        "persona_name",
+        "to",
+        "status",
+        "summary",
+        "text",
+        "reason",
+        "name",
+    ):
         if payload.get(key):
-            return _trim(str(payload[key]), 160)
+            return _trim(str(payload[key]), 150)
     import json
 
-    return _trim(json.dumps(payload, default=str), 160)
+    clean = {
+        k: v
+        for k, v in payload.items()
+        if k not in _NOISY_PAYLOAD_KEYS and v not in (None, "", [], {})
+    }
+    return _trim(json.dumps(clean, default=str), 150) if clean else ""
 
 
 # ---- Running a TEAM (manager → workers), streamed live ------------------

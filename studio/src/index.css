@@ -734,6 +734,39 @@ label.field > .hint {
     opacity: 0;
   }
 }
+/* "thinking" indicator while an agent/team runs without a token stream */
+.thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 2px;
+}
+.thinking span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.5;
+  animation: think 1.1s var(--spring) infinite;
+}
+.thinking span:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.thinking span:nth-child(3) {
+  animation-delay: 0.36s;
+}
+@keyframes think {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
 .tool-event {
   font-family: var(--mono);
   font-size: 11.5px;
@@ -761,6 +794,52 @@ label.field > .hint {
   min-height: 44px;
   max-height: 180px;
   border-radius: var(--bubble);
+}
+
+/* ---- Run detail (bounded two-pane, each scrolls) ------------------------ */
+
+.run-status {
+  padding: 24px;
+}
+.run-detail {
+  height: calc(100vh - 52px);
+  max-width: 1240px;
+  margin: 0 auto;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 20px 24px;
+  overflow: hidden;
+}
+.run-col {
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-right: 4px;
+}
+.run-col > .card {
+  flex: none;
+}
+/* keep the timeline header visible while its list scrolls under it */
+.run-col .card-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--card);
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+@media (max-width: 860px) {
+  .run-detail {
+    grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
+  }
+  .run-col {
+    overflow: visible;
+  }
 }
 
 /* ---- Lists / runs / timeline -------------------------------------------- */

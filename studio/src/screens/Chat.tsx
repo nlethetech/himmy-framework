@@ -345,7 +345,16 @@ export default function Chat() {
                     </div>
                   )}
                   {m.text}
-                  {m.streaming && <span className="caret" />}
+                  {m.streaming &&
+                    (m.text ? (
+                      <span className="caret" />
+                    ) : (
+                      <span className="thinking" aria-label="working">
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                    ))}
                   {m.role === "agent" && m.runId && !m.streaming && (
                     <div className="mt8">
                       <Link to={`/runs/${m.runId}`} className="dim" style={{ fontSize: 12 }}>

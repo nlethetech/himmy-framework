@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { api, type RunDetailT, type IoCapture } from "../lib/api";
-import { Topbar, Page, Loading, ErrorState } from "../components/Page";
+import { Topbar, Loading, ErrorState } from "../components/Page";
 import { BackIcon } from "../components/icons";
 import { relativeTime, duration, statusClass } from "../lib/format";
 
@@ -69,15 +69,18 @@ export default function RunDetail() {
           </button>
         }
       />
-      <Page>
-        {loading ? (
+      {loading ? (
+        <div className="run-status">
           <Loading label="Loading run…" />
-        ) : error ? (
+        </div>
+      ) : error ? (
+        <div className="run-status">
           <ErrorState message={error} />
-        ) : run ? (
-          <div className="grid grid-2" style={{ alignItems: "start" }}>
-            {/* Left: transcript + meta */}
-            <div className="stack gap16">
+        </div>
+      ) : run ? (
+        <div className="run-detail">
+          {/* Left: transcript + meta (scrolls independently) */}
+          <div className="run-col">
               <div className="card card-pad">
                 <div className="row wrap gap6">
                   <span className={"pill " + statusClass(run.status)}>
@@ -131,7 +134,8 @@ export default function RunDetail() {
               )}
             </div>
 
-            {/* Right: timeline */}
+          {/* Right: timeline (scrolls independently) */}
+          <div className="run-col">
             <div className="card">
               <div className="card-head">
                 <h2>Timeline</h2>
@@ -160,8 +164,8 @@ export default function RunDetail() {
               </div>
             </div>
           </div>
-        ) : null}
-      </Page>
+        </div>
+      ) : null}
     </>
   );
 }
