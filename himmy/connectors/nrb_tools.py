@@ -8,10 +8,22 @@ lineage). Network calls are sync, so handlers offload them with
 from __future__ import annotations
 
 import asyncio
+import datetime
 from typing import Any
 
 from himmy.connectors.nrb import NRBClient
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
+
+
+def _json_safe(cell: Any) -> Any:
+    """Make one spreadsheet cell JSON-serializable (Excel date cells → ISO strings)."""
+    if isinstance(cell, (datetime.datetime, datetime.date)):
+        return cell.isoformat()
+    return cell
+
+
+def _safe_rows(rows: list[list[Any]], limit: int) -> list[list[Any]]:
+    return [[_json_safe(c) for c in row] for row in rows[:limit]]
 
 
 def register_nrb_tools(
@@ -45,12 +57,30 @@ def register_nrb_tools(
         else:
             # No URL: auto-discover the latest 'Tables' macro workbook.
             workbook = await asyncio.to_thread(nrb.fetch_latest_macro_workbook)
-        return {
-            "found": workbook is not None,
-            "source_url": workbook.source_url if workbook is not None else None,
-            "sheets": workbook.sheet_names() if workbook is not None else [],
-            "workbook": workbook.model_dump() if workbook is not None else None,
+        if workbook is None:
+            return {"found": False, "source_url": None, "sheets": []}
+
+        # The full workbook (dozens of sheets, thousands of cells) is far too big for a
+        # model context — and Excel date cells aren't JSON-serializable. So return the
+        # sheet NAMES by default, and only one requested sheet's rows (capped + made
+        # JSON-safe) when ``sheet`` is given.
+        result: dict[str, Any] = {
+            "found": True,
+            "source_url": workbook.source_url,
+            "sheets": workbook.sheet_names(),
+            "sheet_count": len(workbook.sheets),
         }
+        sheet = args.get("sheet")
+        if sheet:
+            rows = workbook.sheets.get(str(sheet))
+            if rows is None:
+                result["error"] = f"unknown sheet {sheet!r}; see `sheets`"
+            else:
+                max_rows = max(1, min(int(args.get("max_rows", 30)), 200))
+                result["sheet"] = str(sheet)
+                result["row_count"] = len(rows)
+                result["rows"] = _safe_rows(rows, max_rows)
+        return result
 
     register_local_tool(
         registry,
@@ -85,8 +115,9 @@ def register_nrb_tools(
         name="nrb_macro_workbook",
         handler=_workbook,
         description=(
-            "Download + parse a macro report's Excel workbook into sheet rows. "
-            "Omit report_url to auto-discover the latest 'Tables' workbook."
+            "Open NRB's macro 'Tables' Excel workbook. Returns the list of sheet names "
+            "(call again with `sheet` to read one sheet's rows). Omit report_url to "
+            "auto-discover the latest workbook. (Heavy: downloads + parses a real .xlsx.)"
         ),
         args_json_schema={
             "type": "object",
@@ -94,7 +125,18 @@ def register_nrb_tools(
                 "report_url": {
                     "type": "string",
                     "description": "optional; defaults to the latest Tables report",
-                }
+                },
+                "sheet": {
+                    "type": "string",
+                    "description": "a sheet name to read rows from (omit to just list)",
+                },
+                "max_rows": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 30,
+                    "description": "cap on rows returned for `sheet`",
+                },
             },
         },
         requires_approval=requires_approval,
