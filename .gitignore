@@ -41,3 +41,6 @@ studio/*.tsbuildinfo
 
 # Local-only farm demo (not for GitHub — framework testing)
 /examples/farm-studio/
+
+# Local runtime data (traces, run store, sessions) — never publish
+.himmy/
