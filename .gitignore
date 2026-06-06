@@ -28,3 +28,13 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Himmy Studio (frontend)
+studio/node_modules/
+studio/dist/
+# Built SPA emitted into the package by `npm run build`; shipped in wheels via
+# package-data, but not tracked in source control.
+himmy/api/_studio_static/
+
+# TypeScript incremental build info
+studio/*.tsbuildinfo

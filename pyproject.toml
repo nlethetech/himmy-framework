@@ -21,7 +21,15 @@ dependencies = [
 himmy = "himmy.cli.__main__:main"
 
 [project.optional-dependencies]
-api = ["fastapi>=0.110", "uvicorn>=0.29"]
+# FastAPI <0.116 binds to Starlette <0.42 (it passes on_startup= to the Starlette
+# Router); pin the transitive so a stray Starlette 1.x (e.g. pulled by sse-starlette)
+# can't silently break the BFF. Studio streams via fastapi.responses.StreamingResponse,
+# so no sse-starlette dependency is needed.
+api = ["fastapi>=0.110,<0.116", "uvicorn>=0.29", "starlette>=0.40,<0.42"]
+# Himmy Studio — the local web GUI (chat, agent builder, run/trace browser). Served
+# by the same FastAPI BFF; the built frontend ships as package data under
+# himmy/api/_studio_static. Same runtime deps as `api`.
+studio = ["fastapi>=0.110,<0.116", "uvicorn>=0.29", "starlette>=0.40,<0.42"]
 # Enterprise auth: OIDC/JWT bearer verification for the BFF (RSA/EC via cryptography).
 auth = ["pyjwt[crypto]>=2.8"]
 # ML-based DLP/PII detection (beyond the built-in regex rules).
@@ -61,8 +69,9 @@ dev = [
     "pyjwt[crypto]>=2.8",
 ]
 all = [
-    "fastapi>=0.110",
+    "fastapi>=0.110,<0.116",
     "uvicorn>=0.29",
+    "starlette>=0.40,<0.42",
     "pydantic-ai>=0.0.1",
     "asyncpg>=0.29",
     "pgvector>=0.2",
@@ -86,6 +95,10 @@ himmy = [
     "services/prompts/configs/prompts/*.yaml",
     "benchmark/suites/*.yaml",
     "services/inference/prices.json",
+    # Himmy Studio: the built (Vite) frontend, emitted here by `npm run build`.
+    # Globs match nothing in a source checkout that hasn't built the GUI yet.
+    "api/_studio_static/*",
+    "api/_studio_static/assets/*",
 ]
 
 [tool.pytest.ini_options]

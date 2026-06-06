@@ -155,6 +155,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.set_defaults(func=commands.cmd_serve)
 
+    p_studio = sub.add_parser(
+        "studio", help="serve Himmy Studio, the local web GUI (needs studio extra)"
+    )
+    p_studio.add_argument("--host", default="127.0.0.1")
+    p_studio.add_argument("--port", type=int, default=8765)
+    p_studio.add_argument(
+        "--no-browser", action="store_true", help="don't open a browser window"
+    )
+    p_studio.set_defaults(func=commands.cmd_studio)
+
     p_doctor = sub.add_parser("doctor", help="report extras, providers, and keys")
     p_doctor.set_defaults(func=commands.cmd_doctor)
 

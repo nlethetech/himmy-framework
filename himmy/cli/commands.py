@@ -1115,6 +1115,67 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------- studio
+
+
+def cmd_studio(args: argparse.Namespace) -> int:
+    """Serve Himmy Studio — the local web GUI — from the built frontend.
+
+    Boots the same FastAPI BFF (so the Studio API + SPA share one origin) bound to
+    loopback by default, since Studio can run agents and write files. If the GUI
+    hasn't been built yet, prints exactly how to build it (or run the Vite dev
+    server) instead of starting an empty shell.
+    """
+    try:
+        import uvicorn
+
+        from himmy.api.app import create_app, studio_is_built
+    except Exception as exc:  # pragma: no cover - optional extra missing
+        _eprint(
+            "error: `himmy studio` needs the 'studio' extra: "
+            f"pip install 'himmy[studio]'  ({exc})"
+        )
+        return 1
+
+    if not studio_is_built():
+        from himmy.api.app import STUDIO_STATIC_DIR
+
+        _eprint(
+            "Himmy Studio hasn't been built yet.\n"
+            "\n"
+            "  Build it once (needs Node 18+):\n"
+            "    cd studio && npm install && npm run build\n"
+            f"    → emits the SPA into {STUDIO_STATIC_DIR}\n"
+            "  then re-run:  himmy studio\n"
+            "\n"
+            "  Or develop with hot-reload (two terminals):\n"
+            "    himmy serve            # API on :8000\n"
+            "    cd studio && npm run dev   # UI on :5173 (proxies /api → :8000)\n"
+        )
+        return 1
+
+    url = f"http://{args.host}:{args.port}"
+    _eprint(f"Himmy Studio → {url}  (Ctrl-C to stop)")
+    if not getattr(args, "no_browser", False):
+        # Open the browser shortly after the server comes up, in a daemon thread.
+        import threading
+        import webbrowser
+
+        def _open() -> None:
+            import time
+
+            time.sleep(1.0)
+            try:
+                webbrowser.open(url)
+            except Exception:  # pragma: no cover - headless / no browser
+                pass
+
+        threading.Thread(target=_open, daemon=True).start()
+
+    uvicorn.run(create_app(), host=args.host, port=args.port)
+    return 0
+
+
 # ---------------------------------------------------------------------- doctor
 
 
@@ -1128,75 +1189,42 @@ def _can_import(module: str) -> bool:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    """Report installed optional extras, local providers, and provider keys."""
-    print(f"himmy doctor — Python {sys.version.split()[0]}")
+    """Report installed optional extras, local providers, and provider keys.
+
+    Renders the shared :func:`himmy.runtime.diagnostics.collect_doctor_report`
+    snapshot (the same data Himmy Studio serves as JSON) as a text table.
+    """
+    from himmy.runtime.diagnostics import collect_doctor_report
+
+    report = collect_doctor_report()
+    print(f"himmy doctor — Python {report.python}")
 
     print("\noptional extras:")
-    extras = {
-        "providers (pydantic-ai)": "pydantic_ai",
-        "api (fastapi)": "fastapi",
-        "postgres (asyncpg)": "asyncpg",
-        "connectors (feedparser)": "feedparser",
-        "connectors (openpyxl)": "openpyxl",
-        "observability (logfire)": "logfire",
-        "nepal (nepali-datetime)": "nepali_datetime",
-        "validation (jsonschema)": "jsonschema",
-    }
-    for label, module in extras.items():
-        mark = "ok " if _can_import(module) else "-- "
-        print(f"  [{mark}] {label}")
+    for extra in report.extras:
+        print(f"  [{'ok ' if extra.ok else '-- '}] {extra.label}")
 
     print("\nlocal providers (PATH):")
-    have_claude = bool(shutil.which("claude"))
-    have_ollama = bool(shutil.which("ollama"))
-    for binary, found in (("claude", have_claude), ("ollama", have_ollama)):
-        path = shutil.which(binary)
+    for prov in report.providers:
         print(
-            f"  [{'ok ' if found else '-- '}] {binary}"
-            + (f" → {path}" if path else "")
+            f"  [{'ok ' if prov.ok else '-- '}] {prov.name}"
+            + (f" → {prov.path}" if prov.path else "")
         )
 
     print("\nprovider keys (env):")
-    have_key = False
-    for key in (
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "PYDANTIC_AI_GATEWAY_API_KEY",
-    ):
-        present = bool(os.environ.get(key))
-        have_key = have_key or present
-        print(f"  [{'ok ' if present else '-- '}] {key}")
-
-    from himmy.services.guardrails import BUILTIN_GUARDRAILS
+    for key in report.keys:
+        print(f"  [{'ok ' if key.present else '-- '}] {key.name}")
 
     print(
-        f"\nguardrails (agent.yaml `guardrails: [...]`): {', '.join(BUILTIN_GUARDRAILS)}"
+        f"\nguardrails (agent.yaml `guardrails: [...]`): {', '.join(report.guardrails)}"
+    )
+    print(
+        "\nproject config: "
+        f"{report.project_config or '(none — using env + defaults)'}"
     )
 
-    from himmy.config.project import find_project_config
-
-    cfg = find_project_config()
-    print(f"\nproject config: {cfg if cfg else '(none — using env + defaults)'}")
-
-    # End on the single most useful next action, not just a status table.
-    has_real_model = have_claude or have_ollama or have_key
-    has_agent = any(Path(p).exists() for p in ("agent.yaml", "team.yaml"))
-    print("\nnext step:")
-    if not has_real_model:
-        print(
-            "  → no real model yet. Install one (free, local):  ollama pull llama3.2\n"
-            "    or set OPENAI_API_KEY / ANTHROPIC_API_KEY for a cloud model."
-        )
-    elif not has_agent:
-        print("  → scaffold your first agent:  himmy init my-agent")
-    else:
-        provider_hint = (
-            " --provider ollama" if (have_ollama and not have_key) else ""
-        )
-        print(
-            f'  → run it:  himmy run -f agent.yaml -p "Say hello."{provider_hint}'
-        )
+    if report.next_step is not None:
+        print("\nnext step:")
+        print(f"  → {report.next_step.message}")
     return 0
 
 

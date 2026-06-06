@@ -33,6 +33,7 @@ from himmy.api.routers import (
     evaluation,
     recommendations,
     runs,
+    studio,
 )
 from himmy.core.errors import HimmyError
 from himmy.services.audit import SecurityAuditLog
@@ -162,6 +163,7 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
     app.include_router(dashboard.router)
     app.include_router(evaluation.router)
     app.include_router(audit.router)
+    app.include_router(studio.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
@@ -170,7 +172,73 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
 
     _install_security_headers(app)
     _install_openapi_security(app, authenticator)
+    # Mount the built Studio SPA last so its catch-all never shadows an API route.
+    _mount_studio(app)
     return app
+
+
+# Built Studio frontend (emitted by `npm run build` in studio/). Absent in a source
+# checkout that hasn't built the GUI — the mount is then a no-op and `himmy studio`
+# prints how to build it.
+STUDIO_STATIC_DIR = (
+    __import__("pathlib").Path(__file__).resolve().parent / "_studio_static"
+)
+
+
+def studio_is_built() -> bool:
+    """True when the Studio SPA has been built into the package (index.html present)."""
+    return (STUDIO_STATIC_DIR / "index.html").is_file()
+
+
+# Path prefixes that must always resolve as API (never fall back to the SPA shell),
+# so an unknown API route still returns a real JSON 404.
+_STUDIO_API_PREFIXES = ("api/", "v1/", "health", "docs", "redoc", "openapi.json")
+
+
+def _mount_studio(app: FastAPI) -> None:
+    """Serve the built Studio SPA without ever shadowing an API route.
+
+    Hashed assets are served from ``/assets`` and ``/`` serves the shell. For any
+    other path we rely on a **404 fallback** rather than a greedy catch-all route:
+    real routes (including any added after ``create_app``) always match first, and
+    only a genuine 404 on a non-API ``GET`` returns ``index.html`` for client-side
+    routing. Unknown API paths keep their JSON 404. No-op until the GUI is built.
+    """
+    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.staticfiles import StaticFiles
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    if not studio_is_built():
+        return
+
+    index = STUDIO_STATIC_DIR / "index.html"
+    assets = STUDIO_STATIC_DIR / "assets"
+    if assets.is_dir():
+        app.mount(
+            "/assets", StaticFiles(directory=str(assets)), name="studio-assets"
+        )
+
+    @app.get("/", include_in_schema=False)
+    async def _studio_index() -> FileResponse:
+        return FileResponse(str(index))
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _spa_fallback(request: Request, exc: StarletteHTTPException):
+        """Serve the SPA shell on a 404 for a non-API GET; else the default JSON error."""
+        path = request.url.path.lstrip("/")
+        is_spa_route = (
+            exc.status_code == 404
+            and request.method in ("GET", "HEAD")
+            and not path.startswith(_STUDIO_API_PREFIXES)
+        )
+        if is_spa_route:
+            return FileResponse(str(index))
+        # Preserve FastAPI's default HTTPException shape (and any auth/Allow headers).
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+            headers=getattr(exc, "headers", None),
+        )
 
 
 def _install_security_headers(app: FastAPI) -> None:

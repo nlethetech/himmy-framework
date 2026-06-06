@@ -8,6 +8,14 @@ from himmy.api.routers import (
     evaluation,
     recommendations,
     runs,
+    studio,
 )
 
-__all__ = ["context", "runs", "recommendations", "dashboard", "evaluation"]
+__all__ = [
+    "context",
+    "runs",
+    "recommendations",
+    "dashboard",
+    "evaluation",
+    "studio",
+]
