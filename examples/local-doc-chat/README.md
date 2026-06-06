@@ -18,6 +18,11 @@ python chat.py                          # interactive
 python chat.py "How many PTO days do I get?"   # one-shot
 ```
 
+> **Model size matters.** This demo needs a model that reliably calls tools. A **3B**
+> model (qwen2.5:3b) grounds every answer in the docs and cites the source. Tiny models
+> (e.g. qwen2.5:**0.5b**) often *skip* the search and answer from their own memory —
+> i.e. they hallucinate. If answers look made-up, use a bigger local model.
+
 ## What it looks like
 
 ```
