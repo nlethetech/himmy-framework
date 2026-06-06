@@ -107,6 +107,91 @@ def test_agent_switch_and_delegate_are_tracked() -> None:
     assert kinds == ["agent", "delegate"]
 
 
+def test_memory_recall_emits_grounding_with_citations() -> None:
+    import json
+
+    cog = ss._Cognition({"recall": True}, "agent")
+    result = json.dumps(
+        {
+            "query": "duck breed",
+            "results": [
+                {"text": "We keep Khaki Campbell ducks.", "similarity": 0.91},
+                {"text": "The flock has 12 birds.", "similarity": 0.55},
+            ],
+        }
+    )
+    frames = cog.frames(_tool_event("recall", result=result))
+    grounding = [f for f in frames if f["type"] == "grounding"]
+    assert grounding, "recall should emit a grounding frame"
+    g = grounding[0]
+    assert g["source"] == "memory"
+    assert g["query"] == "duck breed"
+    assert len(g["citations"]) == 2
+    assert g["citations"][0]["similarity"] == 0.91
+    # also recorded as a grounding step for persistence
+    assert any(s["kind"] == "grounding" for s in cog.steps)
+
+
+def test_kb_search_tool_emits_knowledge_grounding() -> None:
+    import json
+
+    cog = ss._Cognition({"kb_search": True}, "agent")
+    result = json.dumps(
+        {
+            "chunks": [
+                {
+                    "text": "Bardaghat lies in Nawalparasi.",
+                    "similarity": 0.8,
+                    "source_uri": "docs/geo.md",
+                }
+            ],
+        }
+    )
+    g = [
+        f
+        for f in cog.frames(_tool_event("kb_search", result=result))
+        if f["type"] == "grounding"
+    ]
+    assert g and g[0]["source"] == "knowledge"
+    assert g[0]["citations"][0]["source_uri"] == "docs/geo.md"
+
+
+def test_context_snapshot_grounding_maps_to_frames() -> None:
+    cog = ss._Cognition({}, "agent")
+    ev = RunEvent(
+        event_type=EventType.CONTEXT_SNAPSHOT_BUILT,
+        payload={
+            "snapshot_id": "s1",
+            "grounding": [
+                {
+                    "source": "knowledge",
+                    "key": "farm_facts",
+                    "query": "what breed",
+                    "citations": [
+                        {
+                            "text": "Khaki Campbell",
+                            "similarity": 0.7,
+                            "source_uri": "kb://1",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    frames = cog.frames(ev)
+    assert frames and frames[0]["type"] == "grounding"
+    assert frames[0]["citations"][0]["source_uri"] == "kb://1"
+    assert any(s["kind"] == "grounding" for s in cog.steps)
+
+
+def test_non_grounding_tool_has_no_grounding_frame() -> None:
+    import json
+
+    cog = ss._Cognition({"egg_totals": True}, "agent")
+    frames = cog.frames(_tool_event("egg_totals", result=json.dumps({"total": 245})))
+    assert not any(f["type"] == "grounding" for f in frames)
+
+
 def test_inference_events_emit_usage_frames_and_accumulate() -> None:
     cog = ss._Cognition({}, "manager")
     f1 = cog.frames(

@@ -1030,6 +1030,107 @@ label.field > .hint {
   color: var(--err);
 }
 
+/* ---- Grounding: "why it said that" (memory + knowledge) ------------- */
+.ground-panel {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.ground-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: rgba(97, 175, 239, 0.06);
+  border-bottom: 1px solid var(--border);
+}
+.grounding {
+  padding: 8px 11px;
+  border-top: 1px solid var(--border);
+}
+.grounding:first-child {
+  border-top: none;
+}
+.grounding-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.grounding-ico {
+  font-size: 13px;
+}
+.grounding-src {
+  font-weight: 600;
+  color: var(--text);
+}
+.grounding-q {
+  color: var(--text-dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.grounding-n {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--blue);
+  background: rgba(97, 175, 239, 0.12);
+  border-radius: 9px;
+  padding: 1px 7px;
+}
+.cites {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.cite {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.cite-sim {
+  flex-shrink: 0;
+  width: 34px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+.cite-sim-fill {
+  display: block;
+  height: 100%;
+  background: var(--blue);
+}
+.cite-text {
+  flex: 1;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cite-src {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--teal);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- Orchestration graph (manager → workers) ------------------------ */
 .orch {
   margin: 4px 0 12px;

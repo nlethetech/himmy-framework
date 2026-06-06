@@ -155,6 +155,13 @@ export type RunEvent =
   | { type: "delegate"; worker: string; task: string; from?: string | null }
   | { type: "handoff"; to: string; from?: string | null }
   | {
+      type: "grounding";
+      agent?: string | null;
+      source: "memory" | "knowledge";
+      query?: string | null;
+      citations: Citation[];
+    }
+  | {
       type: "usage";
       agent?: string | null;
       model: string;
@@ -298,10 +305,16 @@ export interface TranscriptMessage {
   content: string;
 }
 
+export interface Citation {
+  text: string;
+  similarity?: number | null;
+  source_uri?: string | null;
+}
+
 // One step in the live cognition trace (think → act → observe).
 export interface CognitionStep {
   seq: number;
-  kind: "agent" | "reason" | "tool" | "delegate" | "handoff";
+  kind: "agent" | "reason" | "tool" | "delegate" | "handoff" | "grounding";
   agent?: string | null;
   model?: string | null;
   text?: string | null;
@@ -314,6 +327,9 @@ export interface CognitionStep {
   worker?: string | null;
   task?: string | null;
   to?: string | null;
+  source?: string | null;
+  query?: string | null;
+  citations?: Citation[] | null;
   ts?: string | null;
 }
 

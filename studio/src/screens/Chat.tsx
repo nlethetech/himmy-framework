@@ -13,6 +13,7 @@ import { Markdown } from "../components/Markdown";
 import {
   CognitionTrace,
   WorldLedger,
+  GroundingPanel,
   OrchestrationGraph,
   type CogStep,
   type GraphMember,
@@ -182,6 +183,15 @@ export default function Chat() {
           patchLast((m) => ({ ...m, active: e.to }));
           addStep({ kind: "handoff", to: e.to, agent: e.from });
           break;
+        case "grounding":
+          addStep({
+            kind: "grounding",
+            agent: e.agent,
+            source: e.source,
+            query: e.query,
+            citations: e.citations,
+          });
+          break;
         case "usage":
           patchLast((m) => ({
             ...m,
@@ -329,6 +339,9 @@ export default function Chat() {
                     )}
                   {m.steps && m.steps.length > 0 && (
                     <CognitionTrace steps={m.steps} />
+                  )}
+                  {m.role === "agent" && m.steps && (
+                    <GroundingPanel steps={m.steps} />
                   )}
                   {m.role === "agent" && m.usage && (
                     <UsageHud usage={m.usage} live={m.streaming} />

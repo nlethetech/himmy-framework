@@ -3,8 +3,14 @@ import { useState } from "react";
 // One step of an agent's thinking, shared by the live chat stream and the run
 // detail. Mirrors the backend CognitionStep (himmy/api/studio_runs.py) but every
 // field is optional so it can be assembled incrementally from live SSE frames.
+export interface Citation {
+  text: string;
+  similarity?: number | null;
+  source_uri?: string | null;
+}
+
 export interface CogStep {
-  kind: "agent" | "reason" | "tool" | "delegate" | "handoff";
+  kind: "agent" | "reason" | "tool" | "delegate" | "handoff" | "grounding";
   agent?: string | null;
   model?: string | null;
   text?: string | null;
@@ -17,6 +23,9 @@ export interface CogStep {
   worker?: string | null;
   task?: string | null;
   to?: string | null;
+  source?: string | null;
+  query?: string | null;
+  citations?: Citation[] | null;
 }
 
 function fmtMs(ms?: number | null): string | null {
@@ -98,6 +107,65 @@ function ReasonStep({ s }: { s: CogStep }) {
   );
 }
 
+function simBar(sim?: number | null) {
+  if (sim == null) return null;
+  const pct = Math.max(0, Math.min(100, Math.round(sim * 100)));
+  return (
+    <span className="cite-sim" title={`similarity ${sim.toFixed(2)}`}>
+      <span className="cite-sim-fill" style={{ width: pct + "%" }} />
+    </span>
+  );
+}
+
+function GroundingStep({ s }: { s: CogStep }) {
+  const cites = s.citations || [];
+  const memory = s.source === "memory";
+  return (
+    <div className="grounding">
+      <div className="grounding-head">
+        <span className="grounding-ico">{memory ? "🧠" : "📚"}</span>
+        <span className="grounding-src">
+          {memory ? "Recalled from memory" : "Retrieved from knowledge"}
+        </span>
+        {s.query && <span className="grounding-q mono">“{s.query}”</span>}
+        <span className="grounding-n">{cites.length}</span>
+      </div>
+      <div className="cites">
+        {cites.map((c, i) => (
+          <div className="cite" key={i}>
+            {simBar(c.similarity)}
+            <span className="cite-text">{c.text}</span>
+            {c.source_uri && (
+              <span className="cite-src mono" title={c.source_uri}>
+                {c.source_uri.split("/").pop()}
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// A consolidated "grounded on" panel — every citation a run leaned on, deduped
+// across recall + retrieval steps. Shown under a finished answer.
+export function GroundingPanel({ steps }: { steps: CogStep[] }) {
+  const grounded = (steps || []).filter((s) => s.kind === "grounding");
+  if (grounded.length === 0) return null;
+  const total = grounded.reduce((n, s) => n + (s.citations?.length || 0), 0);
+  return (
+    <div className="ground-panel">
+      <div className="ground-panel-head">
+        <span className="ledger-dot" style={{ background: "var(--blue)" }} />
+        Grounded on {total} source{total === 1 ? "" : "s"}
+      </div>
+      {grounded.map((s, i) => (
+        <GroundingStep s={s} key={i} />
+      ))}
+    </div>
+  );
+}
+
 // The full think → act → observe trace for one turn.
 export function CognitionTrace({ steps }: { steps: CogStep[] }) {
   if (!steps || steps.length === 0) return null;
@@ -120,6 +188,7 @@ export function CognitionTrace({ steps }: { steps: CogStep[] }) {
         }
         if (s.kind === "reason") return <ReasonStep s={s} key={i} />;
         if (s.kind === "tool") return <ToolStep s={s} key={i} />;
+        // grounding is surfaced via the consolidated <GroundingPanel>, not inline
         if (s.kind === "delegate")
           return (
             <div className="cog-route delegate" key={i}>

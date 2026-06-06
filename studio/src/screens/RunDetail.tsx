@@ -3,7 +3,11 @@ import { useParams, useNavigate } from "react-router-dom";
 import { api, type RunDetailT, type IoCapture } from "../lib/api";
 import { Topbar, Loading, ErrorState } from "../components/Page";
 import { Markdown } from "../components/Markdown";
-import { CognitionTrace, WorldLedger } from "../components/Cognition";
+import {
+  CognitionTrace,
+  WorldLedger,
+  GroundingPanel,
+} from "../components/Cognition";
 import { RunUsage, fmtTokens, fmtUsd } from "../components/Usage";
 import { BackIcon } from "../components/icons";
 import { relativeTime, duration, statusClass } from "../lib/format";
@@ -147,6 +151,13 @@ export default function RunDetail() {
                     <CognitionTrace steps={run.steps} />
                     <WorldLedger steps={run.steps} />
                   </div>
+                </div>
+              )}
+
+              {run.steps && run.steps.some((s) => s.kind === "grounding") && (
+                <div className="card card-pad">
+                  <span className="section-title">Grounding</span>
+                  <GroundingPanel steps={run.steps} />
                 </div>
               )}
 

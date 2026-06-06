@@ -84,6 +84,10 @@ class CognitionStep(BaseModel):
     worker: str | None = None
     task: str | None = None
     to: str | None = None
+    # grounding (memory recall / knowledge retrieval)
+    source: str | None = None  # "memory" | "knowledge"
+    query: str | None = None
+    citations: list[dict[str, Any]] | None = None
     ts: str | None = None
 
 

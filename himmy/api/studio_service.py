@@ -210,6 +210,58 @@ def _cap(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+# Tools whose result grounds the answer in retrieved evidence (recall = memory,
+# *kb_search* / *knowledge* = RAG). Matched by name; the result is parsed for
+# citations so the GUI can show what the agent actually relied on.
+def _grounding_from_tool(name: str, result: Any) -> dict[str, Any] | None:
+    """Parse a grounding tool's result into ``{source, query, citations}`` or None."""
+    low = name.lower()
+    is_memory = low == "recall"
+    is_kb = ("kb_search" in low) or ("knowledge" in low) or ("search_kb" in low)
+    if not (is_memory or is_kb):
+        return None
+    import json
+
+    if not isinstance(result, str):
+        return None
+    try:
+        data = json.loads(result)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    citations: list[dict[str, Any]] = []
+    # memory recall → {query, results: [{text, similarity}]}
+    for r in data.get("results") or []:
+        if isinstance(r, dict):
+            citations.append(
+                {
+                    "text": _cap(str(r.get("text", "")), 400),
+                    "similarity": r.get("similarity"),
+                    "source_uri": None,
+                }
+            )
+    # kb search → {chunks: [{text|context_window, similarity, source_uri}]}
+    for c in data.get("chunks") or []:
+        if isinstance(c, dict):
+            snippet = c.get("text") or c.get("context_window") or ""
+            citations.append(
+                {
+                    "text": _cap(str(snippet), 400),
+                    "similarity": c.get("similarity"),
+                    "source_uri": c.get("source_uri"),
+                }
+            )
+    if not citations:
+        return None
+    return {
+        "source": "memory" if is_memory else "knowledge",
+        "query": data.get("query"),
+        "citations": citations,
+    }
+
+
 class _Cognition:
     """Turn the runtime's event stream into rich, live cognition frames.
 
@@ -363,6 +415,38 @@ class _Cognition:
                 latency_ms=latency,
                 ts=ts,
             )
+            # Memory recall / in-run KB search also grounds the answer — surface it
+            # as a citation alongside the plain tool step ("why it said that").
+            if et == E.TOOL_COMPLETED:
+                grounding = _grounding_from_tool(name, payload.get("result"))
+                if grounding is not None:
+                    out.append({"type": "grounding", "agent": self.active, **grounding})
+                    self._record(
+                        kind="grounding", agent=self.active, ts=ts, **grounding
+                    )
+            return out
+
+        if et == E.CONTEXT_SNAPSHOT_BUILT:
+            for g in payload.get("grounding") or []:
+                citations = g.get("citations") or []
+                frame = {
+                    "type": "grounding",
+                    "agent": self.active,
+                    "source": "knowledge",
+                    "query": g.get("query") or g.get("key"),
+                    "citations": citations,
+                }
+                out.append(frame)
+                self._record(
+                    kind="grounding",
+                    agent=self.active,
+                    ts=ts,
+                    **{
+                        "source": "knowledge",
+                        "query": g.get("query") or g.get("key"),
+                        "citations": citations,
+                    },
+                )
             return out
 
         if et == E.AGENT_DELEGATED:

@@ -183,6 +183,43 @@ def _truncate(text: str, cap: int) -> str:
     return text if len(text) <= cap else text[: cap - 1] + "…"
 
 
+def _snapshot_grounding(snapshot: Any) -> list[dict[str, Any]]:
+    """Knowledge citations a snapshot pulled into the prompt (one entry per KB field).
+
+    Reads each ``knowledge_base``-sourced :class:`ContextField`: the query it ran and
+    the chunks it retrieved, each with a snippet, similarity, and source URI. Returns
+    ``[]`` when no KB field was resolved, so non-RAG agents add nothing.
+    """
+    out: list[dict[str, Any]] = []
+    fields = getattr(snapshot, "fields", None) or {}
+    for key, fld in fields.items():
+        if getattr(fld, "source", None) != "knowledge_base":
+            continue
+        value = getattr(fld, "value", None) or {}
+        chunks = value.get("chunks") if isinstance(value, dict) else None
+        meta = getattr(fld, "metadata", None) or {}
+        citations = []
+        for c in chunks or []:
+            snippet = c.get("text") or c.get("context_window") or ""
+            citations.append(
+                {
+                    "text": _truncate(str(snippet), 400),
+                    "similarity": c.get("similarity"),
+                    "source_uri": c.get("source_uri"),
+                }
+            )
+        out.append(
+            {
+                "source": "knowledge",
+                "key": key,
+                "query": meta.get("query"),
+                "kb_name": meta.get("kb_name"),
+                "citations": citations,
+            }
+        )
+    return out
+
+
 def build_io_capture(request: Any, response: Any) -> dict[str, Any]:
     """A bounded snapshot of one inference's raw I/O (for the trace inspector).
 
@@ -1473,6 +1510,10 @@ class SingleAgentRuntime:
                         "missing_required_keys": list(
                             getattr(snapshot, "missing_required_keys", []) or []
                         ),
+                        # Knowledge/RAG grounding — which chunks were retrieved into
+                        # the prompt, with citations (so the GUI can show "why it
+                        # said that"). Empty when no KB-sourced field was resolved.
+                        "grounding": _snapshot_grounding(snapshot),
                     },
                 )
             )
