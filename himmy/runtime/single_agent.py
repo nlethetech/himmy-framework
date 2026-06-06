@@ -654,7 +654,8 @@ class SingleAgentRuntime:
             thread.append_message(sys_msg)
             self._register_message(sys_msg)
         user_msg = Message(
-            role=MessageRole.USER, content=self._guard_input(task_prompt)
+            role=MessageRole.USER,
+            content=await self._guard_input(task_prompt, agent_id=persona.agent_id),
         )
         thread.append_message(user_msg)
         self._register_message(user_msg)
@@ -1144,7 +1145,9 @@ class SingleAgentRuntime:
         assistant_text = response.output_text
         if assistant_text is None and response.output_structured is not None:
             assistant_text = json.dumps(response.output_structured, default=str)
-        assistant_text = self._guard_output(assistant_text)
+        assistant_text = await self._guard_output(
+            assistant_text, agent_id=persona.agent_id
+        )
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
         assistant_message = Message(
@@ -1219,7 +1222,8 @@ class SingleAgentRuntime:
             thread.append_message(system_message)
             self._register_message(system_message)
         user_message = Message(
-            role=MessageRole.USER, content=self._guard_input(task_prompt)
+            role=MessageRole.USER,
+            content=await self._guard_input(task_prompt, agent_id=persona.agent_id),
         )
         thread.append_message(user_message)
         self._register_message(user_message)
@@ -1333,7 +1337,9 @@ class SingleAgentRuntime:
         assistant_text = response.output_text
         if assistant_text is None and response.output_structured is not None:
             assistant_text = json.dumps(response.output_structured, default=str)
-        assistant_text = self._guard_output(assistant_text)
+        assistant_text = await self._guard_output(
+            assistant_text, agent_id=persona.agent_id
+        )
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
         assistant_metadata: dict[str, Any] = {
@@ -1420,17 +1426,55 @@ class SingleAgentRuntime:
         )
 
     # ------------------------------------------------------------- snapshot
-    def _guard_input(self, text: str) -> str:
+    async def _guard_input(self, text: str, *, agent_id: str | None = None) -> str:
         """Apply the input guardrail to a user prompt (redact); ``None`` → passthrough."""
-        if self._input_guardrail is None:
-            return text
-        return self._input_guardrail.inspect(text, context={"stage": "input"}).text
+        return await self._apply_guardrail(
+            self._input_guardrail, text, stage="input", agent_id=agent_id
+        )
 
-    def _guard_output(self, text: str | None) -> str | None:
+    async def _guard_output(
+        self, text: str | None, *, agent_id: str | None = None
+    ) -> str | None:
         """Apply the output guardrail to an assistant reply (redact); passthrough None."""
-        if self._output_guardrail is None or text is None:
+        if text is None:
+            return None
+        return await self._apply_guardrail(
+            self._output_guardrail, text, stage="output", agent_id=agent_id
+        )
+
+    async def _apply_guardrail(
+        self,
+        guardrail: Any,
+        text: str,
+        *,
+        stage: str,
+        agent_id: str | None,
+    ) -> str:
+        """Run a guardrail and emit GUARDRAIL_APPLIED when it redacts or blocks.
+
+        A clean pass (no flags, no block, text unchanged) emits nothing, so the
+        event stream only carries the safety layer when it actually did something —
+        which is exactly what the audit panel surfaces.
+        """
+        if guardrail is None:
             return text
-        return self._output_guardrail.inspect(text, context={"stage": "output"}).text
+        verdict = guardrail.inspect(text, context={"stage": stage})
+        redacted = verdict.text != text
+        if verdict.flags or verdict.reasons or not verdict.allowed or redacted:
+            await self._emit(
+                RunEvent(
+                    event_type=EventType.GUARDRAIL_APPLIED,
+                    agent_id=agent_id,
+                    payload={
+                        "stage": stage,
+                        "blocked": not verdict.allowed,
+                        "redacted": redacted,
+                        "flags": list(verdict.flags),
+                        "reasons": list(verdict.reasons),
+                    },
+                )
+            )
+        return verdict.text
 
     async def _resolve_snapshot(
         self,

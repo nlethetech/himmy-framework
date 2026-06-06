@@ -162,6 +162,15 @@ export type RunEvent =
       citations: Citation[];
     }
   | {
+      type: "safety";
+      agent?: string | null;
+      stage: "input" | "output";
+      blocked: boolean;
+      redacted: boolean;
+      flags: string[];
+      reasons: string[];
+    }
+  | {
       type: "usage";
       agent?: string | null;
       model: string;
@@ -314,7 +323,14 @@ export interface Citation {
 // One step in the live cognition trace (think → act → observe).
 export interface CognitionStep {
   seq: number;
-  kind: "agent" | "reason" | "tool" | "delegate" | "handoff" | "grounding";
+  kind:
+    | "agent"
+    | "reason"
+    | "tool"
+    | "delegate"
+    | "handoff"
+    | "grounding"
+    | "safety";
   agent?: string | null;
   model?: string | null;
   text?: string | null;
@@ -330,6 +346,11 @@ export interface CognitionStep {
   source?: string | null;
   query?: string | null;
   citations?: Citation[] | null;
+  stage?: string | null;
+  blocked?: boolean | null;
+  redacted?: boolean | null;
+  flags?: string[] | null;
+  reasons?: string[] | null;
   ts?: string | null;
 }
 

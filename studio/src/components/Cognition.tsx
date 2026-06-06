@@ -10,7 +10,14 @@ export interface Citation {
 }
 
 export interface CogStep {
-  kind: "agent" | "reason" | "tool" | "delegate" | "handoff" | "grounding";
+  kind:
+    | "agent"
+    | "reason"
+    | "tool"
+    | "delegate"
+    | "handoff"
+    | "grounding"
+    | "safety";
   agent?: string | null;
   model?: string | null;
   text?: string | null;
@@ -26,6 +33,11 @@ export interface CogStep {
   source?: string | null;
   query?: string | null;
   citations?: Citation[] | null;
+  stage?: string | null;
+  blocked?: boolean | null;
+  redacted?: boolean | null;
+  flags?: string[] | null;
+  reasons?: string[] | null;
 }
 
 function fmtMs(ms?: number | null): string | null {
@@ -161,6 +173,42 @@ export function GroundingPanel({ steps }: { steps: CogStep[] }) {
       </div>
       {grounded.map((s, i) => (
         <GroundingStep s={s} key={i} />
+      ))}
+    </div>
+  );
+}
+
+// ---- Guardrails / safety panel --------------------------------------
+
+// Surfaces the safety layer doing its job: what got redacted or blocked, on
+// the way in (a prompt) or out (a reply), with the flags/reasons it raised.
+export function SafetyPanel({ steps }: { steps: CogStep[] }) {
+  const safety = (steps || []).filter((s) => s.kind === "safety");
+  if (safety.length === 0) return null;
+  const blocked = safety.some((s) => s.blocked);
+  return (
+    <div className={"safety" + (blocked ? " blocked" : "")}>
+      <div className="safety-head">
+        <span className="safety-ico">{blocked ? "🛑" : "🛡"}</span>
+        {blocked ? "Blocked by guardrails" : "Guardrails applied"}
+      </div>
+      {safety.map((s, i) => (
+        <div className="safety-row" key={i}>
+          <span className={"safety-tag " + (s.blocked ? "block" : "redact")}>
+            {s.blocked ? "BLOCKED" : "REDACTED"}
+          </span>
+          <span className="safety-stage mono">{s.stage}</span>
+          <span className="safety-flags">
+            {(s.flags || []).map((f) => (
+              <span className="safety-flag mono" key={f}>
+                {f}
+              </span>
+            ))}
+            {(s.reasons || []).length > 0 && (s.flags || []).length === 0 && (
+              <span className="safety-reason">{(s.reasons || []).join("; ")}</span>
+            )}
+          </span>
+        </div>
       ))}
     </div>
   );

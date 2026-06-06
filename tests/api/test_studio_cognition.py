@@ -184,6 +184,41 @@ def test_context_snapshot_grounding_maps_to_frames() -> None:
     assert any(s["kind"] == "grounding" for s in cog.steps)
 
 
+def test_guardrail_event_maps_to_safety_frame() -> None:
+    cog = ss._Cognition({}, "agent")
+    ev = RunEvent(
+        event_type=EventType.GUARDRAIL_APPLIED,
+        payload={
+            "stage": "input",
+            "blocked": False,
+            "redacted": True,
+            "flags": ["pii:email", "pii:card"],
+            "reasons": [],
+        },
+    )
+    frames = cog.frames(ev)
+    assert frames and frames[0]["type"] == "safety"
+    f = frames[0]
+    assert f["stage"] == "input"
+    assert f["redacted"] is True
+    assert f["blocked"] is False
+    assert f["flags"] == ["pii:email", "pii:card"]
+    step = cog.steps[-1]
+    assert step["kind"] == "safety"
+    assert step["flags"] == ["pii:email", "pii:card"]
+
+
+def test_blocked_guardrail_marks_safety_step() -> None:
+    cog = ss._Cognition({}, "agent")
+    ev = RunEvent(
+        event_type=EventType.GUARDRAIL_APPLIED,
+        payload={"stage": "output", "blocked": True, "flags": ["injection"]},
+    )
+    f = cog.frames(ev)[0]
+    assert f["blocked"] is True
+    assert f["stage"] == "output"
+
+
 def test_non_grounding_tool_has_no_grounding_frame() -> None:
     import json
 

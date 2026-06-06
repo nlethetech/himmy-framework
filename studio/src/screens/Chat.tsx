@@ -14,6 +14,7 @@ import {
   CognitionTrace,
   WorldLedger,
   GroundingPanel,
+  SafetyPanel,
   OrchestrationGraph,
   type CogStep,
   type GraphMember,
@@ -192,6 +193,17 @@ export default function Chat() {
             citations: e.citations,
           });
           break;
+        case "safety":
+          addStep({
+            kind: "safety",
+            agent: e.agent,
+            stage: e.stage,
+            blocked: e.blocked,
+            redacted: e.redacted,
+            flags: e.flags,
+            reasons: e.reasons,
+          });
+          break;
         case "usage":
           patchLast((m) => ({
             ...m,
@@ -339,6 +351,9 @@ export default function Chat() {
                     )}
                   {m.steps && m.steps.length > 0 && (
                     <CognitionTrace steps={m.steps} />
+                  )}
+                  {m.role === "agent" && m.steps && (
+                    <SafetyPanel steps={m.steps} />
                   )}
                   {m.role === "agent" && m.steps && (
                     <GroundingPanel steps={m.steps} />

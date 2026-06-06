@@ -441,12 +441,22 @@ class _Cognition:
                     kind="grounding",
                     agent=self.active,
                     ts=ts,
-                    **{
-                        "source": "knowledge",
-                        "query": g.get("query") or g.get("key"),
-                        "citations": citations,
-                    },
+                    source="knowledge",
+                    query=g.get("query") or g.get("key"),
+                    citations=citations,
                 )
+            return out
+
+        if et == E.GUARDRAIL_APPLIED:
+            safety = {
+                "stage": payload.get("stage"),
+                "blocked": bool(payload.get("blocked")),
+                "redacted": bool(payload.get("redacted")),
+                "flags": list(payload.get("flags") or []),
+                "reasons": list(payload.get("reasons") or []),
+            }
+            out.append({"type": "safety", "agent": self.active, **safety})
+            self._record(kind="safety", agent=self.active, ts=ts, **safety)
             return out
 
         if et == E.AGENT_DELEGATED:
@@ -635,6 +645,14 @@ async def stream_agent_run(
                     yield {"type": "token", "delta": delta.delta}
                 if delta.done and delta.response is not None:
                     output_text = delta.response.output_text or output_text
+            # Streaming can't interleave cognition mid-token, so fold the events it
+            # emitted (usage, guardrails, grounding) in afterwards — both to surface
+            # them in the GUI and to record cog.steps for persistence. Reasoning is
+            # skipped: its text already streamed as the answer.
+            while not queue.empty():
+                for frame in cog.frames(queue.get_nowait()):
+                    if frame["type"] != "reason":
+                        yield frame
     except Exception as exc:  # noqa: BLE001 - record the failed run, then surface it
         status = "error"
         error_msg = str(exc)

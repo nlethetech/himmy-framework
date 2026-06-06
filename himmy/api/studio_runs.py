@@ -88,6 +88,12 @@ class CognitionStep(BaseModel):
     source: str | None = None  # "memory" | "knowledge"
     query: str | None = None
     citations: list[dict[str, Any]] | None = None
+    # guardrails / safety
+    stage: str | None = None  # "input" | "output"
+    blocked: bool | None = None
+    redacted: bool | None = None
+    flags: list[str] | None = None
+    reasons: list[str] | None = None
     ts: str | None = None
 
 

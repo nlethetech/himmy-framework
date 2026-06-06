@@ -7,6 +7,7 @@ import {
   CognitionTrace,
   WorldLedger,
   GroundingPanel,
+  SafetyPanel,
 } from "../components/Cognition";
 import { RunUsage, fmtTokens, fmtUsd } from "../components/Usage";
 import { BackIcon } from "../components/icons";
@@ -151,6 +152,13 @@ export default function RunDetail() {
                     <CognitionTrace steps={run.steps} />
                     <WorldLedger steps={run.steps} />
                   </div>
+                </div>
+              )}
+
+              {run.steps && run.steps.some((s) => s.kind === "safety") && (
+                <div className="card card-pad">
+                  <span className="section-title">Guardrails</span>
+                  <SafetyPanel steps={run.steps} />
                 </div>
               )}
 
