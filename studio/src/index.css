@@ -2405,3 +2405,124 @@ label.field > .hint {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- Capability toggles (agent builder) -------------------------------- */
+.builder-section-title {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin: var(--sp-4) 0 var(--sp-2);
+}
+.cap-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-4);
+}
+.cap-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  transition:
+    border-color 0.13s,
+    background 0.13s;
+}
+.cap-row.on {
+  border-color: var(--brand-line);
+  background: var(--brand-soft);
+}
+.cap-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.cap-icon svg {
+  width: 18px;
+  height: 18px;
+}
+.cap-text {
+  flex: 1;
+  min-width: 0;
+}
+.cap-label {
+  font-weight: 600;
+  font-size: var(--fs-md);
+}
+.cap-desc {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+}
+.cap-need {
+  display: inline-block;
+  margin-top: 3px;
+  font-size: var(--fs-xs);
+  color: var(--warn);
+}
+.cap-need:hover {
+  text-decoration: underline;
+}
+/* switch */
+.switch {
+  width: 40px;
+  height: 22px;
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+  padding: 0;
+  position: relative;
+  flex: none;
+  transition: background 0.15s;
+}
+.switch.on {
+  background: var(--brand);
+  border-color: var(--brand);
+}
+.switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s var(--spring);
+}
+.switch.on .switch-knob {
+  transform: translateX(18px);
+}
+/* advanced disclosure */
+.adv-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  padding: var(--sp-3) 0;
+  margin-top: var(--sp-2);
+}
+.adv-toggle .chev {
+  width: 14px;
+  height: 14px;
+  transition: transform 0.15s;
+}
+.adv-toggle.open .chev {
+  transform: rotate(90deg);
+}
+.adv-body {
+  border-top: 1px solid var(--border);
+  padding-top: var(--sp-3);
+}

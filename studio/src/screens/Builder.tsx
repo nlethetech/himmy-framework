@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   api,
+  listConnections,
   type AgentSummary,
   type AgentDetail,
   type AgentFields,
@@ -8,10 +9,15 @@ import {
   type SkillInfo,
   type ValidationResult,
   type DoctorReport,
+  type ConnectionStatus,
   ApiError,
 } from "../lib/api";
 import { Topbar } from "../components/Page";
-import { PlusIcon, CheckIcon } from "../components/icons";
+import { PlusIcon, CheckIcon, ChevronIcon } from "../components/icons";
+import {
+  CapabilityToggle,
+  CAPABILITIES,
+} from "../components/CapabilityToggle";
 
 const PROVIDERS = ["", "stub", "ollama", "claude-cli", "pydantic-ai"];
 const NEW = "__new__";
@@ -73,6 +79,7 @@ export default function Builder() {
   const [packs, setPacks] = useState<PackInfo[]>([]);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [guardrails, setGuardrails] = useState<string[]>([]);
+  const [conns, setConns] = useState<ConnectionStatus[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [form, setForm] = useState<Form>(BLANK);
   const [path, setPath] = useState("");
@@ -93,6 +100,7 @@ export default function Builder() {
       .get<DoctorReport>("/doctor")
       .then((d) => setGuardrails(d.guardrails))
       .catch(() => {});
+    listConnections().then(setConns).catch(() => {});
   }, []);
 
   // Debounced live validation.
@@ -259,6 +267,7 @@ export default function Builder() {
                 packs={packs}
                 skills={skills}
                 guardrails={guardrails}
+                conns={conns}
               />
               {hasAdvanced && (
                 <div className="banner mt16">
@@ -321,6 +330,7 @@ function Editor({
   packs,
   skills,
   guardrails,
+  conns,
 }: {
   form: Form;
   set: <K extends keyof Form>(k: K, v: Form[K]) => void;
@@ -330,12 +340,30 @@ function Editor({
   packs: PackInfo[];
   skills: SkillInfo[];
   guardrails: string[];
+  conns: ConnectionStatus[];
 }) {
+  const [advanced, setAdvanced] = useState(false);
   const toggle = (k: "skills" | "tool_packs" | "guardrails", v: string) =>
     set(
       k,
       form[k].includes(v) ? form[k].filter((x) => x !== v) : [...form[k], v],
     );
+
+  // Capabilities are a friendly layer over tool_packs: a capability is "on" when
+  // all its packs are present; toggling adds/removes exactly those packs.
+  const capOn = (packsNeeded: string[]) =>
+    packsNeeded.every((p) => form.tool_packs.includes(p));
+  const toggleCap = (packsNeeded: string[]) => {
+    const on = capOn(packsNeeded);
+    set(
+      "tool_packs",
+      on
+        ? form.tool_packs.filter((p) => !packsNeeded.includes(p))
+        : [...new Set([...form.tool_packs, ...packsNeeded])],
+    );
+  };
+  const connConfigured = (type?: string) =>
+    type ? (conns.find((c) => c.type === type)?.configured ?? false) : null;
 
   return (
     <div>
@@ -349,6 +377,7 @@ function Editor({
         />
       </Field>
 
+      {/* Identity */}
       <div className="grid grid-2">
         <Field label="Name">
           <input className="input" value={form.name} onChange={(e) => set("name", e.target.value)} />
@@ -366,6 +395,20 @@ function Editor({
         />
       </Field>
 
+      {/* Capabilities — the headline */}
+      <div className="builder-section-title">Capabilities</div>
+      <div className="cap-list">
+        {CAPABILITIES.map((cap) => (
+          <CapabilityToggle
+            key={cap.key}
+            cap={cap}
+            on={capOn(cap.packs)}
+            connected={connConfigured(cap.needs)}
+            onToggle={() => toggleCap(cap.packs)}
+          />
+        ))}
+      </div>
+
       <Field label="Instructions" hint="one guideline per line">
         <ListEditor
           items={form.instructions}
@@ -374,90 +417,103 @@ function Editor({
         />
       </Field>
 
-      <div className="grid grid-2">
-        <Field label="Provider">
-          <select className="select" value={form.provider} onChange={(e) => set("provider", e.target.value)}>
-            {PROVIDERS.map((p) => (
-              <option key={p} value={p}>
-                {p || "auto (default)"}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="Model" hint="e.g. llama3.2, haiku">
-          <input className="input" value={form.model} onChange={(e) => set("model", e.target.value)} />
-        </Field>
-      </div>
+      {/* Advanced settings (progressive disclosure) */}
+      <button
+        type="button"
+        className={"adv-toggle" + (advanced ? " open" : "")}
+        onClick={() => setAdvanced((o) => !o)}
+      >
+        <ChevronIcon className="chev" /> Advanced settings
+      </button>
 
-      <Field label="Skills" hint="capabilities = tools + know-how">
-        <div className="row wrap gap6">
-          {skills.map((s) => (
-            <span
-              key={s.name}
-              className={"chip" + (form.skills.includes(s.name) ? " on" : "")}
-              title={s.description}
-              onClick={() => toggle("skills", s.name)}
-            >
-              {s.name}
-            </span>
-          ))}
-        </div>
-      </Field>
-
-      <Field label="Tool packs" hint="raw tools without the know-how">
-        <div className="row wrap gap6">
-          {packs.map((p) => (
-            <span
-              key={p.name}
-              className={"chip" + (form.tool_packs.includes(p.name) ? " on" : "")}
-              title={p.tools.join(", ")}
-              onClick={() => toggle("tool_packs", p.name)}
-            >
-              {p.name}
-            </span>
-          ))}
-        </div>
-      </Field>
-
-      <Field label="Knowledge" hint="files/dirs to ground the agent (auto-ingested → kb_search)">
-        <ListEditor
-          items={form.knowledge}
-          onChange={(v) => set("knowledge", v)}
-          placeholder="e.g. ./docs"
-        />
-      </Field>
-
-      <div className="grid grid-2">
-        <Field label="Guardrails">
-          <div className="row wrap gap6">
-            {guardrails.map((g) => (
-              <span
-                key={g}
-                className={"chip" + (form.guardrails.includes(g) ? " on" : "")}
-                onClick={() => toggle("guardrails", g)}
-              >
-                {g}
-              </span>
-            ))}
+      {advanced && (
+        <div className="adv-body">
+          <div className="grid grid-2">
+            <Field label="Provider">
+              <select className="select" value={form.provider} onChange={(e) => set("provider", e.target.value)}>
+                {PROVIDERS.map((p) => (
+                  <option key={p} value={p}>
+                    {p || "auto (default)"}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Model" hint="e.g. llama3.2, haiku">
+              <input className="input" value={form.model} onChange={(e) => set("model", e.target.value)} />
+            </Field>
           </div>
-        </Field>
-        <div>
-          <Field label="Language">
-            <select className="select" value={form.language} onChange={(e) => set("language", e.target.value)}>
-              <option value="en">English</option>
-              <option value="ne">Nepali (Devanagari)</option>
-            </select>
+
+          <Field label="Skills" hint="bundled capabilities = tools + know-how">
+            <div className="row wrap gap6">
+              {skills.map((s) => (
+                <span
+                  key={s.name}
+                  className={"chip" + (form.skills.includes(s.name) ? " on" : "")}
+                  title={s.description}
+                  onClick={() => toggle("skills", s.name)}
+                >
+                  {s.name}
+                </span>
+              ))}
+            </div>
           </Field>
-          <label className="row gap10" style={{ cursor: "pointer", marginTop: 6 }}>
-            <input
-              type="checkbox"
-              checked={form.memory}
-              onChange={(e) => set("memory", e.target.checked)}
+
+          <Field label="More tools" hint="raw tool packs (capabilities above cover the common ones)">
+            <div className="row wrap gap6">
+              {packs.map((p) => (
+                <span
+                  key={p.name}
+                  className={"chip" + (form.tool_packs.includes(p.name) ? " on" : "")}
+                  title={p.tools.join(", ")}
+                  onClick={() => toggle("tool_packs", p.name)}
+                >
+                  {p.name}
+                </span>
+              ))}
+            </div>
+          </Field>
+
+          <Field label="Knowledge" hint="files/dirs to ground the agent (auto-ingested → kb_search)">
+            <ListEditor
+              items={form.knowledge}
+              onChange={(v) => set("knowledge", v)}
+              placeholder="e.g. ./docs"
             />
-            <span>Long-term memory (auto-recall each run)</span>
-          </label>
+          </Field>
+
+          <div className="grid grid-2">
+            <Field label="Guardrails">
+              <div className="row wrap gap6">
+                {guardrails.map((g) => (
+                  <span
+                    key={g}
+                    className={"chip" + (form.guardrails.includes(g) ? " on" : "")}
+                    onClick={() => toggle("guardrails", g)}
+                  >
+                    {g}
+                  </span>
+                ))}
+              </div>
+            </Field>
+            <div>
+              <Field label="Language">
+                <select className="select" value={form.language} onChange={(e) => set("language", e.target.value)}>
+                  <option value="en">English</option>
+                  <option value="ne">Nepali (Devanagari)</option>
+                </select>
+              </Field>
+              <label className="row gap10" style={{ cursor: "pointer", marginTop: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={form.memory}
+                  onChange={(e) => set("memory", e.target.checked)}
+                />
+                <span>Auto-recall memory each run</span>
+              </label>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
