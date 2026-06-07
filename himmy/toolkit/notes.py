@@ -63,7 +63,11 @@ def register_notes_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
         read_only=True,
         handler=list_notes,
         description="List the titles of saved notes.",
-        args_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        args_json_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
         metadata={"pack": "notes"},
     )
     register_local_tool(
