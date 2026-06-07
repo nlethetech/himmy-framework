@@ -21,6 +21,7 @@ from himmy.toolkit.data import register_data_pack
 from himmy.toolkit.datasources import register_datasources_pack
 from himmy.toolkit.documents import register_documents_pack
 from himmy.toolkit.files import register_files_pack
+from himmy.toolkit.google_pack import GOOGLE_TOOL_NAMES, register_google_pack
 from himmy.toolkit.knowledge import register_knowledge_pack
 from himmy.toolkit.memory import register_memory_pack
 from himmy.toolkit.nepal import NEPAL_TOOL_NAMES, register_nepal_pack
@@ -156,6 +157,13 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
         "Shared task board: list, add, and complete tasks (same store as the GUI).",
         ("list_tasks", "add_task", "complete_task"),
         register_tasks_pack,
+    ),
+    "google": ToolPack(
+        "google",
+        "Gmail + Google Calendar for the connected account: read inbox, send, "
+        "list/create events.",
+        GOOGLE_TOOL_NAMES,
+        register_google_pack,
     ),
     "nepal": ToolPack(
         "nepal",

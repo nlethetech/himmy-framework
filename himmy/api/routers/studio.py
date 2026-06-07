@@ -17,8 +17,8 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from himmy.api import (
@@ -304,6 +304,170 @@ async def send_via_connection(ctype: str, body: SendRequest) -> SendResult:
         return await studio_connections.send_via_connection(ctype, body.payload)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="unknown connection type") from exc
+
+
+# ---- Google (Gmail + Calendar via OAuth) --------------------------------
+
+
+class GoogleClientRequest(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=300)
+    client_secret: str = Field(..., min_length=1, max_length=300)
+
+
+class GmailSendRequest(BaseModel):
+    to: str = Field(..., min_length=1, max_length=320)
+    subject: str = Field("", max_length=998)
+    body: str = Field("", max_length=20000)
+
+
+class CalendarCreateRequest(BaseModel):
+    summary: str = Field(..., min_length=1, max_length=500)
+    start: str = Field(..., max_length=40)
+    end: str = Field(..., max_length=40)
+    all_day: bool = False
+
+
+def _google_redirect_uri(request: Any) -> str:
+    """Derive the loopback OAuth callback URL from the incoming request."""
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/api/studio/google/callback"
+
+
+@router.get("/google")
+async def google_status() -> Any:
+    from himmy.api import studio_google
+
+    return studio_google.status()
+
+
+@router.put("/google/client")
+async def google_set_client(body: GoogleClientRequest) -> Any:
+    from himmy.api import studio_google
+
+    try:
+        return studio_google.set_client(body.client_id, body.client_secret)
+    except studio_google.GoogleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/google/auth-url")
+async def google_auth_url(request: Request) -> dict[str, str]:
+    from himmy.api import studio_google
+
+    try:
+        url = studio_google.auth_url(_google_redirect_uri(request))
+    except studio_google.GoogleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"url": url}
+
+
+@router.get("/google/callback")
+async def google_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> HTMLResponse:
+    from himmy.api import studio_google
+
+    if error or not code:
+        return HTMLResponse(_oauth_page("Connection cancelled", error or "no code"))
+    try:
+        st = await studio_google.exchange_code(
+            code, _google_redirect_uri(request), state
+        )
+    except studio_google.GoogleError as exc:
+        return HTMLResponse(_oauth_page("Could not connect", str(exc)))
+    who = st.email or "your Google account"
+    return HTMLResponse(
+        _oauth_page("Connected ✓", f"{who} is now connected. You can close this tab.")
+    )
+
+
+def _oauth_page(title: str, detail: str) -> str:
+    """A tiny self-closing page shown in the OAuth popup after the redirect."""
+    import html as _html
+
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Himmy · Google</title>"
+        "<style>body{font-family:system-ui,sans-serif;background:#111;color:#eee;"
+        "display:grid;place-items:center;height:100vh;margin:0;text-align:center}"
+        "h1{font-size:20px;margin:0 0 8px}p{color:#9aa;max-width:30rem}</style>"
+        "<script>try{if(window.opener){window.opener.postMessage("
+        "'himmy-google-connected','*');setTimeout(function(){window.close()},1200)}}"
+        "catch(e){}</script></head><body><div>"
+        f"<h1>{_html.escape(title)}</h1><p>{_html.escape(detail)}</p>"
+        "</div></body></html>"
+    )
+
+
+@router.delete("/google")
+async def google_disconnect() -> Any:
+    from himmy.api import studio_google
+
+    try:
+        return studio_google.disconnect()
+    except studio_google.GoogleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.delete("/google/client")
+async def google_forget_client() -> Any:
+    from himmy.api import studio_google
+
+    try:
+        return studio_google.forget_client()
+    except studio_google.GoogleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/google/gmail")
+async def google_gmail_list(max_results: int = 20) -> Any:
+    from himmy.api import studio_google
+
+    try:
+        return await studio_google.gmail_list(max(1, min(max_results, 50)))
+    except studio_google.GoogleNotConnectedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except studio_google.GoogleError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/google/gmail/send")
+async def google_gmail_send(body: GmailSendRequest) -> Any:
+    from himmy.api import studio_google
+
+    try:
+        return await studio_google.gmail_send(body.to, body.subject, body.body)
+    except studio_google.GoogleNotConnectedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/google/calendar")
+async def google_calendar_list(max_results: int = 20) -> Any:
+    from himmy.api import studio_google
+
+    try:
+        return await studio_google.calendar_list(max(1, min(max_results, 50)))
+    except studio_google.GoogleNotConnectedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except studio_google.GoogleError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/google/calendar")
+async def google_calendar_create(body: CalendarCreateRequest) -> Any:
+    from himmy.api import studio_google
+
+    try:
+        return await studio_google.calendar_create(
+            body.summary, body.start, body.end, all_day=body.all_day
+        )
+    except studio_google.GoogleNotConnectedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except studio_google.GoogleError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # ---- Approvals (human-in-the-loop inbox) --------------------------------

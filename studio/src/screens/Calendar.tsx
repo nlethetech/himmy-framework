@@ -3,7 +3,10 @@ import {
   listCalendar,
   addCalendar,
   deleteCalendar,
+  googleStatus,
+  googleCalendarList,
   type CalendarEvent,
+  type GoogleCalendarEvent,
 } from "../lib/api";
 import { Topbar, Page } from "../components/Page";
 import { Modal } from "../components/ui/Modal";
@@ -20,11 +23,19 @@ function ymd(y: number, m: number, d: number): string {
   return `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 }
 
+// "2026-06-09T09:00:00Z" → "09:00"; an all-day date ("2026-06-09") → "".
+function gTime(start: string): string {
+  const t = start.includes("T") ? start.split("T")[1] : "";
+  return t ? t.slice(0, 5) : "";
+}
+
 export default function Calendar() {
   const today = useMemo(() => new Date(), []);
   const [year, setYear] = useState(today.getFullYear());
   const [month, setMonth] = useState(today.getMonth()); // 0-11
   const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [gevents, setGevents] = useState<GoogleCalendarEvent[]>([]);
+  const [gConnected, setGConnected] = useState(false);
   const [adding, setAdding] = useState<string | null>(null); // date being added to
   const toast = useToast();
 
@@ -34,11 +45,34 @@ export default function Calendar() {
     load();
   }, [monthKey]);
 
+  // Google Calendar overlay (read-only) — fetched once when the account is connected.
+  useEffect(() => {
+    googleStatus()
+      .then((s) => {
+        setGConnected(s.connected);
+        if (s.connected) {
+          googleCalendarList(50)
+            .then(setGevents)
+            .catch(() => setGevents([]));
+        }
+      })
+      .catch(() => setGConnected(false));
+  }, []);
+
   const byDate = useMemo(() => {
     const m: Record<string, CalendarEvent[]> = {};
     for (const e of events) (m[e.date] ??= []).push(e);
     return m;
   }, [events]);
+
+  const gByDate = useMemo(() => {
+    const m: Record<string, GoogleCalendarEvent[]> = {};
+    for (const e of gevents) {
+      const date = (e.start || "").slice(0, 10);
+      if (date) (m[date] ??= []).push(e);
+    }
+    return m;
+  }, [gevents]);
 
   // Build the month grid (Mon-first), including leading/trailing blanks.
   const firstDow = (new Date(year, month, 1).getDay() + 6) % 7; // Mon=0
@@ -66,7 +100,9 @@ export default function Calendar() {
     <>
       <Topbar
         title="Calendar"
-        sub="Plan and track events"
+        sub={
+          gConnected ? "Local events + your Google Calendar" : "Plan and track events"
+        }
         actions={
           <div className="row gap6">
             <button className="btn" onClick={() => move(-1)}>
@@ -102,6 +138,7 @@ export default function Calendar() {
           {cells.map((d, i) => {
             const date = d ? ymd(year, month, d) : "";
             const evs = d ? byDate[date] ?? [] : [];
+            const gevs = d ? gByDate[date] ?? [] : [];
             return (
               <div
                 className={
@@ -132,6 +169,16 @@ export default function Calendar() {
                           <button className="cal-del" onClick={() => remove(e.id)}>
                             <XIcon />
                           </button>
+                        </div>
+                      ))}
+                      {gevs.map((e, gi) => (
+                        <div
+                          className="cal-event google"
+                          key={e.id ?? gi}
+                          title={`${e.summary}${e.location ? " · " + e.location : ""} (Google)`}
+                        >
+                          <span className="cal-time">{gTime(e.start)}</span>
+                          <span className="cal-event-title">{e.summary}</span>
                         </div>
                       ))}
                     </div>

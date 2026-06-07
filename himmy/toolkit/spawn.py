@@ -51,9 +51,9 @@ def register_spawn_tool(
     """Register ``spawn_agent`` bound to ``inference`` (the parent's backend)."""
 
     async def spawn_agent(args: dict[str, Any]) -> dict[str, Any]:
-        from himmy import build_runtime
         from himmy.agents.base_agent.task import Task
         from himmy.agents.personas.persona import Persona
+        from himmy.runtime.builder import build_runtime
         from himmy.toolkit import BUILTIN_PACKS
 
         sub_overrides: dict[str, Any] = {"inference": inference}

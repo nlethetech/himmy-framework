@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { listConnections, type ConnectionStatus } from "../lib/api";
 import { Topbar, Page, Loading, ErrorState } from "../components/Page";
 import { ConnectionCard } from "../components/ConnectionCard";
+import { GoogleCard } from "../components/GoogleCard";
 import { EmptyState } from "../components/ui/EmptyState";
 import { PlugIcon, RefreshIcon } from "../components/icons";
 
@@ -62,6 +63,7 @@ export default function Connections() {
               </EmptyState>
             )}
             <div className="conn-grid">
+              <GoogleCard onChange={load} />
               {conns.map((c) => (
                 <ConnectionCard key={c.type} conn={c} onChange={load} />
               ))}

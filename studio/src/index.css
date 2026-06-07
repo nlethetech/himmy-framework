@@ -3701,3 +3701,103 @@ label.field > .hint {
   border-top: 1px solid var(--border);
   padding-top: 6px;
 }
+
+/* Email screen */
+.mail-list {
+  display: flex;
+  flex-direction: column;
+}
+.mail-row {
+  display: grid;
+  grid-template-columns: 180px 1fr auto;
+  gap: 12px;
+  align-items: baseline;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.mail-row:hover {
+  background: var(--hover);
+}
+.mail-from {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mail-main {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.mail-subj {
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+.mail-snip {
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mail-date {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.compose-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Google connection card */
+.google-setup {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.google-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.google-hint.err {
+  color: var(--err);
+}
+.google-redirect {
+  display: block;
+  margin-top: 4px;
+  padding: 4px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  word-break: break-all;
+  font-size: 11px;
+}
+.google-caps {
+  display: flex;
+  gap: 6px;
+  margin: 8px 0;
+}
+.cap-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+.cap-pill svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* Google events overlaid on the calendar */
+.cal-event.google {
+  border-left: 2px solid #4285f4;
+  background: color-mix(in srgb, #4285f4 12%, transparent);
+}

@@ -183,6 +183,58 @@ export const upsertRecipe = (r: {
 export const deleteRecipe = (id: string) =>
   api.del<{ ok: boolean }>(`/cookbook/${id}`);
 
+// ---- Google (Gmail + Calendar) ------------------------------------------
+
+export interface GoogleStatus {
+  configured: boolean;
+  connected: boolean;
+  email: string | null;
+  writable: boolean;
+}
+export interface GmailMessage {
+  id: string;
+  thread_id: string | null;
+  sender: string;
+  subject: string;
+  snippet: string;
+  date: string;
+}
+export interface GoogleCalendarEvent {
+  id: string | null;
+  summary: string;
+  start: string;
+  end: string;
+  location: string | null;
+  html_link: string | null;
+}
+export const googleStatus = () => api.get<GoogleStatus>("/google");
+export const googleSetClient = (client_id: string, client_secret: string) =>
+  api.put<GoogleStatus>("/google/client", { client_id, client_secret });
+export const googleAuthUrl = () => api.get<{ url: string }>("/google/auth-url");
+export const googleDisconnect = () => api.del<GoogleStatus>("/google");
+export const googleForgetClient = () => api.del<GoogleStatus>("/google/client");
+export const gmailList = (max = 20) =>
+  api.get<GmailMessage[]>(`/google/gmail?max_results=${max}`);
+export const gmailSend = (to: string, subject: string, body: string) =>
+  api.post<{ ok: boolean; id: string | null; detail: string }>(
+    "/google/gmail/send",
+    { to, subject, body },
+  );
+export const googleCalendarList = (max = 20) =>
+  api.get<GoogleCalendarEvent[]>(`/google/calendar?max_results=${max}`);
+export const googleCalendarCreate = (
+  summary: string,
+  start: string,
+  end: string,
+  all_day = false,
+) =>
+  api.post<GoogleCalendarEvent>("/google/calendar", {
+    summary,
+    start,
+    end,
+    all_day,
+  });
+
 // ---- Compare -------------------------------------------------------------
 
 export interface CompareTarget {

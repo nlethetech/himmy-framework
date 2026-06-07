@@ -18,6 +18,7 @@ import {
   SearchIcon,
   PlusIcon,
   CheckIcon,
+  MailIcon,
 } from "./icons";
 import { useTheme } from "./ui/useTheme";
 import { useAccent } from "./ui/useAccent";
@@ -38,6 +39,7 @@ const WORKSPACE: NavItem[] = [
 
 const APPS: NavItem[] = [
   { to: "/calendar", label: "Calendar", Icon: CalendarIcon },
+  { to: "/email", label: "Email", Icon: MailIcon },
   { to: "/tasks", label: "Tasks", Icon: CheckIcon },
   { to: "/notes", label: "Notes", Icon: BookIcon },
   { to: "/brain", label: "Brain", Icon: MemoryIcon },
