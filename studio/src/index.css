@@ -327,6 +327,14 @@ select {
   padding: 14px 8px 8px;
   gap: 1px;
   overflow-y: auto;
+  /* Keep it scrollable but hide the scrollbar for a cleaner look. */
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* legacy Edge */
+}
+.sidebar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none; /* Chrome/Safari */
 }
 .sb-brand {
   display: flex;
