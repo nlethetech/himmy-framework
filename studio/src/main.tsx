@@ -16,6 +16,7 @@ import Teams from "./screens/Teams";
 import Evaluation from "./screens/Evaluation";
 import Workflows from "./screens/Workflows";
 import Lineage from "./screens/Lineage";
+import Calendar from "./screens/Calendar";
 import "./index.css";
 
 // New task-first IA. Screens not yet built (Home/Connections/Approvals) render a
@@ -28,6 +29,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Home /> },
       { path: "chat", element: <Chat /> },
+      { path: "calendar", element: <Calendar /> },
       { path: "approvals", element: <Approvals /> },
       { path: "activity", element: <Activity /> },
       { path: "activity/:runId", element: <RunDetail /> },

@@ -55,71 +55,74 @@
 }
 
 :root {
-  /* surfaces — deeper, softer slate */
-  --bg: #0f1117;
-  --bg-elev: #151823;
-  --card: #1a1e2b;
-  --card-hover: #20253a;
-  --surface: #232838;
-  --hover: #272d40;
-  --border: #262c3c;
-  --border-strong: #39415a;
-  --border-accent: #3a4470;
+  /* Odysseus One Dark — surfaces */
+  --bg: #282c34; /* main canvas */
+  --panel: #111111; /* icon rail + sidebar */
+  --bg-elev: #21252b;
+  --card: #2c313a;
+  --card-hover: #323845;
+  --surface: #353b45;
+  --hover: #3a4150;
+  --border: #355a66; /* the teal-tinted Odysseus border */
+  --border-strong: #44515f;
+  --border-accent: #355a66;
 
-  /* text — neutral near-white, not cyan */
-  --text: #e6e9f2;
-  --text-muted: #9aa3b8;
-  --text-dim: #677089;
-  --cyan: var(--text); /* legacy alias: cyan-as-text → neutral */
+  /* text — cyan-tinted (Odysseus --fg) */
+  --text: #9cdef2;
+  --fg: var(--text);
+  --text-muted: #84a7b3;
+  --text-dim: #6b8a94;
+  --cyan: var(--text);
 
-  /* brand — indigo, the new primary (accent-* alias to it) */
-  --brand: #6c8cff;
-  --brand-hover: #7e9bff;
-  --brand-soft: rgba(108, 140, 255, 0.14);
-  --brand-line: rgba(108, 140, 255, 0.4);
+  /* brand — red (Odysseus --red); accent-* alias to it */
+  --red: #e06c75;
+  --brand: #e06c75;
+  --brand-hover: #ef7a83;
+  --brand-soft: rgba(224, 108, 117, 0.12);
+  --brand-line: rgba(224, 108, 117, 0.45);
   --accent: var(--brand);
   --accent-hover: var(--brand-hover);
   --accent-soft: var(--brand-soft);
   --accent-line: var(--brand-line);
 
-  /* status ramps */
-  --ok: #4ade80;
-  --ok-soft: rgba(74, 222, 128, 0.14);
-  --warn: #fbbf24;
-  --warn-soft: rgba(251, 191, 36, 0.14);
-  --err: #f87171;
-  --err-soft: rgba(248, 113, 113, 0.14);
-  --info: #60a5fa;
-  --info-soft: rgba(96, 165, 250, 0.14);
+  /* status */
+  --ok: #50fa7b;
+  --ok-soft: rgba(80, 250, 123, 0.14);
+  --warn: #f0ad4e;
+  --warn-soft: rgba(240, 173, 78, 0.14);
+  --err: #e06c75;
+  --err-soft: rgba(224, 108, 117, 0.16);
+  --info: #61afef;
+  --info-soft: rgba(97, 175, 239, 0.14);
 
-  --purple: #a78bfa;
-  --yellow: #fbbf24;
-  --blue: #60a5fa;
-  --teal: #2dd4bf;
+  --purple: #c678dd;
+  --yellow: #e5c07b;
+  --blue: #61afef;
+  --teal: #56b6c2;
 
   /* per-capability accent hues (connections, capability chips) */
-  --hue-email: #ea4335;
-  --hue-telegram: #2aabee;
-  --hue-web: #34d399;
-  --hue-memory: #a78bfa;
-  --hue-knowledge: #f59e0b;
+  --hue-email: #e06c75;
+  --hue-telegram: #61afef;
+  --hue-web: #50fa7b;
+  --hue-memory: #c678dd;
+  --hue-knowledge: #e5c07b;
 
-  /* fonts — sans chrome, mono reserved for code/data */
-  --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-    Arial, sans-serif;
+  /* fonts — Fira Code mono everywhere (Odysseus aesthetic) */
   --mono: "Fira Code", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
     monospace;
+  --font-family: var(--mono);
+  --sans: var(--mono); /* legacy alias → mono, so chrome stays terminal */
 
-  /* type scale */
-  --fs-xs: 12px;
-  --fs-sm: 13px;
-  --fs-md: 14.5px;
-  --fs-lg: 16px;
-  --fs-xl: 20px;
-  --fs-2xl: 26px;
-  --fs-3xl: 34px;
+  /* type scale (dense terminal) */
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 13.5px;
+  --fs-lg: 15px;
+  --fs-xl: 19px;
+  --fs-2xl: 24px;
+  --fs-3xl: 32px;
 
-  /* spacing scale (4px base) */
+  /* spacing scale */
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -130,23 +133,24 @@
   --sp-10: 40px;
   --sp-12: 48px;
 
-  /* radii — softer */
-  --radius-sm: 8px;
-  --radius: 12px;
-  --radius-lg: 16px;
-  --radius-xl: 20px;
+  /* radii — tight (Odysseus uses 4px) */
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
   --radius-pill: 999px;
-  --bubble: 14px;
-  --chat-col: 820px;
+  --bubble: 8px;
+  --chat-col: 800px;
 
   --spring: cubic-bezier(0.22, 1.61, 0.36, 1);
 
-  /* elevation */
-  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.18), 0 1px 1px rgba(0, 0, 0, 0.12);
-  --elev-2: 0 2px 8px rgba(0, 0, 0, 0.2), 0 6px 16px rgba(0, 0, 0, 0.16);
-  --elev-3: 0 8px 30px rgba(0, 0, 0, 0.3);
-  --shadow: var(--elev-2); /* legacy alias */
+  /* elevation (subtle, dark) */
+  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --elev-2: 0 2px 10px rgba(0, 0, 0, 0.32);
+  --elev-3: 0 10px 36px rgba(0, 0, 0, 0.45);
+  --shadow: var(--elev-2);
 
+  --rail-w: 48px;
   --sidebar-w: 232px;
 }
 
@@ -162,12 +166,12 @@ body,
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: var(--sans);
+  font-family: var(--font-family); /* Fira Code — mono everywhere (Odysseus) */
   font-size: var(--fs-md);
   font-weight: 400;
-  line-height: 1.5;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
+  font-feature-settings: "calt" 1;
 }
 a {
   color: var(--brand);
@@ -176,24 +180,52 @@ a {
 a:hover {
   text-decoration: underline;
 }
-/* Mono is reserved for code + data surfaces (re-asserted after the sans default). */
 code,
 pre,
-.mono,
-.cog-trace,
-.io-pre,
-.composer-input {
+.mono {
   font-family: var(--mono);
-  font-feature-settings: "calt" 1;
 }
 ::selection {
   background: var(--accent-soft);
 }
 
-/* scrollbars to match the dark canvas */
+/* Odysseus base controls: bg/border/4px radius, hover border → fg */
+input,
+textarea,
+button,
+select {
+  font-family: inherit;
+  font-size: inherit;
+}
+.input,
+.select,
+.textarea {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  transition:
+    background 0.08s,
+    border-color 0.08s,
+    color 0.08s;
+}
+.input:hover,
+.select:hover,
+.textarea:hover {
+  border-color: var(--fg);
+}
+.input:focus,
+.select:focus,
+.textarea:focus {
+  outline: none;
+  border-color: var(--red);
+}
+
+/* scrollbars — red thumb on panel (Odysseus) */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
+  scrollbar-color: var(--red) var(--panel);
 }
 *::-webkit-scrollbar {
   width: 9px;
@@ -204,137 +236,233 @@ pre,
   border-radius: 6px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: var(--text-dim);
+  background: var(--red);
 }
 
 /* ---- App shell ---------------------------------------------------------- */
 
 .shell {
   display: grid;
-  grid-template-columns: var(--sidebar-w) 1fr;
+  grid-template-columns: var(--rail-w) var(--sidebar-w) 1fr;
   height: 100vh;
 }
 
-/* ---- Product sidebar (labeled, grouped) -------------------------------- */
-.sidebar {
-  background: var(--bg-elev);
+/* ---- Far-left icon rail (Odysseus) ------------------------------------- */
+.icon-rail {
+  width: var(--rail-w);
+  background: var(--panel);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  padding: var(--sp-3) var(--sp-3) var(--sp-2);
-  gap: var(--sp-1);
+  align-items: center;
+  padding: 14px 4px 8px;
+  gap: 4px;
+  overflow: visible;
+}
+.rail-btn {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  transition:
+    color 0.1s,
+    background 0.1s;
+}
+.rail-btn:hover {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  text-decoration: none;
+}
+.rail-btn.active {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+}
+.rail-btn .ico {
+  width: 18px;
+  height: 18px;
+}
+.rail-btn::after {
+  content: attr(data-label);
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%) translateX(-4px);
+  background: var(--surface);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition:
+    opacity 0.1s,
+    transform 0.12s var(--spring);
+  z-index: 40;
+}
+.rail-btn:hover::after {
+  opacity: 1;
+  transform: translateY(-50%);
+}
+.rail-spacer {
+  margin-top: auto;
+}
+.rail-divider {
+  width: 22px;
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+/* ---- Labeled sidebar (Odysseus list-items) ----------------------------- */
+.sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 14px 8px 8px;
+  gap: 1px;
   overflow-y: auto;
 }
 .sb-brand {
   display: flex;
   align-items: center;
-  gap: var(--sp-3);
-  padding: var(--sp-2) var(--sp-2) var(--sp-4);
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: 2px 8px 14px;
 }
 .sb-logo {
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  background: linear-gradient(140deg, var(--brand), #9a7bff);
-  display: grid;
-  place-items: center;
-  color: #fff;
-  font-weight: 700;
-  font-size: 15px;
-  box-shadow: 0 2px 10px var(--brand-soft);
+  color: var(--red);
+  font-size: 16px;
 }
 .sb-title {
   font-weight: 600;
-  font-size: var(--fs-md);
-  color: var(--text);
+  font-size: 16px;
+  color: var(--red);
+  letter-spacing: 0.5px;
 }
-.sb-group {
-  margin-top: var(--sp-3);
-  padding: 0 var(--sp-2) var(--sp-1);
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.6px;
-  text-transform: uppercase;
-  color: var(--text-dim);
-}
-.sb-link {
+.sb-newchat {
   display: flex;
   align-items: center;
-  gap: var(--sp-3);
-  padding: 8px var(--sp-2);
+  gap: var(--sp-2);
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--red);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  margin-bottom: 6px;
+  transition:
+    border-color 0.1s,
+    background 0.1s;
+}
+.sb-newchat:hover {
+  border-color: var(--red);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  text-decoration: none;
+}
+.sb-newchat .ico {
+  width: 15px;
+  height: 15px;
+}
+.sb-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
   border-radius: var(--radius-sm);
   color: var(--text-muted);
   font-size: var(--fs-sm);
-  font-weight: 500;
   transition:
-    background 0.13s,
-    color 0.13s;
+    background 0.08s,
+    color 0.08s;
 }
-.sb-link:hover {
-  background: var(--card-hover);
-  color: var(--text);
+.sb-item:hover {
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  color: var(--fg);
   text-decoration: none;
 }
-.sb-link.active {
-  background: var(--brand-soft);
-  color: var(--text);
-  box-shadow: inset 0 0 0 1px var(--brand-line);
+.sb-item.active {
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+  color: var(--fg);
 }
-.sb-link .ico {
-  width: 17px;
-  height: 17px;
+.sb-item .ico {
+  width: 16px;
+  height: 16px;
   flex: none;
+  color: var(--red);
 }
-.sb-link.active .ico {
-  color: var(--brand);
-}
-.sb-link-label {
+.sb-item-label {
   flex: 1;
 }
 .sb-badge {
   font-size: 11px;
   font-weight: 700;
-  color: #fff;
-  background: var(--brand);
+  color: var(--panel);
+  background: var(--red);
   border-radius: var(--radius-pill);
   min-width: 18px;
-  height: 18px;
+  height: 17px;
   padding: 0 5px;
   display: grid;
   place-items: center;
 }
-.sb-disclosure {
+.sb-plus {
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+}
+.sb-section {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  width: 100%;
+  gap: 6px;
+  padding: 8px 8px 4px;
+  margin-top: 6px;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
   background: none;
   border: none;
-  cursor: pointer;
-  color: var(--text-dim);
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.6px;
-  text-transform: uppercase;
-  padding: var(--sp-3) var(--sp-2) var(--sp-1);
+  width: 100%;
+  text-align: left;
 }
-.sb-disclosure .chev {
+.sb-section:hover {
+  color: var(--fg);
+}
+.sb-section .chev {
   width: 12px;
   height: 12px;
+  margin-left: auto;
   transition: transform 0.15s;
 }
-.sb-disclosure.open .chev {
+.sb-section.open .chev {
   transform: rotate(90deg);
 }
 .sb-foot {
   margin-top: auto;
-  padding: var(--sp-3) var(--sp-2) var(--sp-1);
+  padding: 10px 8px 2px;
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+}
+.sb-foot-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  flex: none;
+}
+.theme-toggle {
+  margin-left: auto;
 }
 
 /* ---- EmptyState -------------------------------------------------------- */
@@ -813,28 +941,27 @@ label.field > .hint {
   margin: 0 auto;
 }
 .hero-avatar {
-  width: 56px;
-  height: 56px;
-  border-radius: 14px;
+  width: 54px;
+  height: 54px;
+  border-radius: var(--radius);
   display: grid;
   place-items: center;
   font-size: 22px;
   font-weight: 600;
-  color: #fff;
-  background: var(--accent);
-  box-shadow:
-    0 0 0 1px var(--accent-line),
-    0 0 30px var(--accent-soft);
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  box-shadow: inset 0 0 0 1px var(--brand-line);
 }
 .hero-title {
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--cyan);
+  font-size: 30px;
+  font-weight: 700;
+  color: var(--red);
+  letter-spacing: 0.5px;
 }
 .hero-sub {
   color: var(--text-muted);
-  font-size: 13px;
-  line-height: 1.6;
+  font-size: var(--fs-md);
+  line-height: 1.7;
 }
 .hero-prompts {
   display: flex;
@@ -1674,19 +1801,18 @@ label.field > .hint {
 }
 
 .chat-compose {
-  border-top: 1px solid var(--border);
-  padding: 13px 24px 18px;
-  background: var(--bg-elev);
+  padding: 13px 24px 20px;
+  background: var(--bg);
 }
 /* One cohesive rounded input bar (Odysseus-style): textarea + a toolbar row. */
 .composer {
   width: 100%;
   max-width: var(--chat-col);
   margin: 0 auto;
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: 16px;
-  padding: 10px 12px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 12px 14px;
   display: flex;
   flex-direction: column;
   gap: 9px;
@@ -2985,4 +3111,126 @@ label.field > .hint {
 }
 .lin-ev-icon {
   flex: none;
+}
+
+/* ---- Calendar ---------------------------------------------------------- */
+.cal-month {
+  min-width: 130px;
+  text-align: center;
+  font-size: var(--fs-md);
+  color: var(--fg);
+}
+.cal-grid-head {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.cal-dow {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+}
+.cal-cell {
+  min-height: 96px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  padding: 5px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cal-cell.empty {
+  background: transparent;
+  border-color: transparent;
+}
+.cal-cell.today {
+  border-color: var(--red);
+  box-shadow: inset 0 0 0 1px var(--brand-line);
+}
+.cal-day {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+}
+.cal-cell.today .cal-day {
+  color: var(--red);
+  font-weight: 600;
+}
+.cal-add {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+.cal-add .ico {
+  width: 13px;
+  height: 13px;
+}
+.cal-cell:hover .cal-add {
+  opacity: 1;
+}
+.cal-add:hover {
+  color: var(--red);
+}
+.cal-events {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow: hidden;
+}
+.cal-event {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-xs);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+  border-left: 2px solid var(--red);
+  border-radius: 3px;
+  padding: 2px 5px;
+  color: var(--fg);
+}
+.cal-time {
+  color: var(--text-dim);
+  flex: none;
+}
+.cal-event-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cal-del {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  opacity: 0;
+  display: grid;
+  place-items: center;
+}
+.cal-del svg {
+  width: 11px;
+  height: 11px;
+}
+.cal-event:hover .cal-del {
+  opacity: 1;
+}
+.cal-del:hover {
+  color: var(--err);
 }

@@ -13,6 +13,10 @@ import {
   MemoryIcon,
   BookIcon,
   GlobeIcon,
+  CalendarIcon,
+  GearIcon,
+  SearchIcon,
+  PlusIcon,
 } from "./icons";
 import { useTheme } from "./ui/useTheme";
 
@@ -23,13 +27,12 @@ type NavItem = {
   badge?: number;
 };
 
-// Primary daily-loop sections. New screens (Home/Approvals/Connections) light up
-// as their phases land; until then the sidebar only links what exists.
 const WORKSPACE: NavItem[] = [
   { to: "/", label: "Home", Icon: HomeIcon },
   { to: "/chat", label: "Chat", Icon: ChatIcon },
   { to: "/approvals", label: "Approvals", Icon: BellIcon },
   { to: "/activity", label: "Activity", Icon: RunsIcon },
+  { to: "/calendar", label: "Calendar", Icon: CalendarIcon },
 ];
 
 const BUILD: NavItem[] = [
@@ -47,15 +50,25 @@ const ADVANCED: NavItem[] = [
   { to: "/advanced/doctor", label: "Doctor", Icon: DoctorIcon },
 ];
 
-function SidebarLink({ item }: { item: NavItem }) {
+// The narrow rail mirrors the most-used destinations as icon-only quick nav.
+const RAIL: NavItem[] = [
+  { to: "/", label: "Home", Icon: HomeIcon },
+  { to: "/chat", label: "Chat", Icon: ChatIcon },
+  { to: "/approvals", label: "Approvals", Icon: BellIcon },
+  { to: "/calendar", label: "Calendar", Icon: CalendarIcon },
+  { to: "/agents", label: "Agents", Icon: BuildIcon },
+  { to: "/connections", label: "Connections", Icon: PlugIcon },
+];
+
+function SidebarItem({ item }: { item: NavItem }) {
   return (
     <NavLink
       to={item.to}
       end={item.to === "/"}
-      className={({ isActive }) => "sb-link" + (isActive ? " active" : "")}
+      className={({ isActive }) => "sb-item" + (isActive ? " active" : "")}
     >
       <item.Icon className="ico" />
-      <span className="sb-link-label">{item.label}</span>
+      <span className="sb-item-label">{item.label}</span>
       {item.badge ? <span className="sb-badge">{item.badge}</span> : null}
     </NavLink>
   );
@@ -67,8 +80,6 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [approvalsCount, setApprovalsCount] = useState(0);
   const { theme, toggleTheme } = useTheme();
 
-  // Live connection count for the footer (refreshed when the window regains focus,
-  // so connecting an account updates the badge).
   useEffect(() => {
     const refresh = () =>
       listConnections()
@@ -79,7 +90,6 @@ export function AppShell({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("focus", refresh);
   }, []);
 
-  // Poll pending approvals so the sidebar badge stays current.
   useEffect(() => {
     const poll = () =>
       listApprovals()
@@ -100,49 +110,85 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <div className="shell">
+      {/* Far-left icon rail */}
+      <aside className="icon-rail">
+        {RAIL.map((i) => (
+          <NavLink
+            key={i.to}
+            to={i.to}
+            end={i.to === "/"}
+            data-label={i.label}
+            className={({ isActive }) => "rail-btn" + (isActive ? " active" : "")}
+          >
+            <i.Icon className="ico" />
+          </NavLink>
+        ))}
+        <div className="rail-spacer" />
+        <button
+          className="rail-btn"
+          data-label={`${theme === "dark" ? "Light" : "Dark"} mode`}
+          onClick={toggleTheme}
+        >
+          {theme === "dark" ? "☾" : "☀"}
+        </button>
+        <NavLink
+          to="/advanced/doctor"
+          data-label="Doctor"
+          className={({ isActive }) => "rail-btn" + (isActive ? " active" : "")}
+        >
+          <GearIcon className="ico" />
+        </NavLink>
+      </aside>
+
+      {/* Labeled sidebar */}
       <aside className="sidebar">
         <div className="sb-brand">
-          <div className="sb-logo">H</div>
-          <div className="sb-title">Himmy Studio</div>
+          <span className="sb-logo">⛰</span>
+          <span className="sb-title">Himmy</span>
         </div>
 
-        <div className="sb-group">Workspace</div>
+        <NavLink to="/chat" className="sb-newchat">
+          <PlusIcon className="ico" /> New Chat
+        </NavLink>
+
         {workspace.map((i) => (
-          <SidebarLink key={i.to} item={i} />
+          <SidebarItem key={i.to} item={i} />
         ))}
 
-        <div className="sb-group">Build</div>
+        <NavLink to="/chat" className="sb-item">
+          <SearchIcon className="ico" />
+          <span className="sb-item-label">Search</span>
+        </NavLink>
+
+        <div className="sb-section" style={{ cursor: "default" }}>
+          Build
+        </div>
         {BUILD.map((i) => (
-          <SidebarLink key={i.to} item={i} />
+          <SidebarItem key={i.to} item={i} />
         ))}
 
         <button
           type="button"
-          className={"sb-disclosure" + (advancedOpen ? " open" : "")}
+          className={"sb-section" + (advancedOpen ? " open" : "")}
           onClick={() => setAdvancedOpen((o) => !o)}
         >
-          <ChevronIcon className="chev" />
           Advanced
+          <ChevronIcon className="chev" />
         </button>
-        {advancedOpen && ADVANCED.map((i) => <SidebarLink key={i.to} item={i} />)}
+        {advancedOpen && ADVANCED.map((i) => <SidebarItem key={i.to} item={i} />)}
 
         <div className="sb-foot">
-          <span
-            className="dot"
-            style={{
-              color: connectionsOk == null ? "var(--text-dim)" : "var(--ok)",
-            }}
-          />
-          <span style={{ flex: 1 }}>
+          <span className="sb-foot-avatar" />
+          <span>
             {connectionsOk == null
-              ? "offline-first · local"
+              ? "local"
               : `${connectionsOk} connection${connectionsOk === 1 ? "" : "s"}`}
           </span>
           <button
-            className="theme-toggle"
+            className="rail-btn theme-toggle"
             onClick={toggleTheme}
-            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-            aria-label="Toggle theme"
+            title="Toggle theme"
+            style={{ width: 24, height: 24 }}
           >
             {theme === "dark" ? "☾" : "☀"}
           </button>

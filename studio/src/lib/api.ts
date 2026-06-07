@@ -146,6 +146,27 @@ export const runEval = (
   provider?: string | null,
 ) => api.post<EvalRun>("/evals/run", { suite_path, agent_path, provider });
 
+// ---- Calendar ------------------------------------------------------------
+
+export interface CalendarEvent {
+  id: string;
+  date: string; // YYYY-MM-DD
+  time: string | null;
+  title: string;
+  notes: string;
+  created_at: string;
+}
+export const listCalendar = (month: string) =>
+  api.get<CalendarEvent[]>(`/calendar?month=${month}`);
+export const addCalendar = (e: {
+  date: string;
+  title: string;
+  time?: string | null;
+  notes?: string;
+}) => api.post<CalendarEvent>("/calendar", e);
+export const deleteCalendar = (id: string) =>
+  api.del<{ ok: boolean }>(`/calendar/${id}`);
+
 // ---- Memory --------------------------------------------------------------
 
 export interface MemoryItem {

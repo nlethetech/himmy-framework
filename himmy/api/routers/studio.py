@@ -343,6 +343,40 @@ async def reject(checkpoint_id: str) -> StreamingResponse:
     return _resolve_stream(checkpoint_id, False)
 
 
+# ---- Calendar -----------------------------------------------------------
+
+
+class CalendarAddRequest(BaseModel):
+    date: str = Field(..., min_length=8, max_length=10)  # YYYY-MM-DD
+    title: str = Field(..., min_length=1, max_length=500)
+    time: str | None = Field(None, max_length=5)  # HH:MM
+    notes: str = Field("", max_length=4000)
+
+
+@router.get("/calendar")
+async def calendar_list(month: str | None = None) -> list[Any]:
+    from himmy.api.studio_calendar import get_calendar_store
+
+    return get_calendar_store().list(month=month)
+
+
+@router.post("/calendar")
+async def calendar_add(body: CalendarAddRequest) -> Any:
+    from himmy.api.studio_calendar import CalendarEvent, get_calendar_store
+
+    ev = CalendarEvent(
+        date=body.date, title=body.title, time=body.time or None, notes=body.notes
+    )
+    return get_calendar_store().add(ev)
+
+
+@router.delete("/calendar/{event_id}")
+async def calendar_delete(event_id: str) -> dict[str, bool]:
+    from himmy.api.studio_calendar import get_calendar_store
+
+    return {"ok": get_calendar_store().delete(event_id)}
+
+
 # ---- Memory (long-term recall browser) ----------------------------------
 
 
