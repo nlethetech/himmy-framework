@@ -37,6 +37,8 @@ export const api = {
     request<T>(path, { method: "POST", body: JSON.stringify(body) }),
   put: <T>(path: string, body: unknown) =>
     request<T>(path, { method: "PUT", body: JSON.stringify(body) }),
+  patch: <T>(path: string, body: unknown) =>
+    request<T>(path, { method: "PATCH", body: JSON.stringify(body) }),
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
@@ -180,6 +182,23 @@ export const upsertRecipe = (r: {
 }) => api.put<Recipe>("/cookbook", r);
 export const deleteRecipe = (id: string) =>
   api.del<{ ok: boolean }>(`/cookbook/${id}`);
+
+// ---- Tasks ---------------------------------------------------------------
+
+export interface Task {
+  id: string;
+  title: string;
+  done: boolean;
+  due: string | null;
+  created_at: string;
+}
+export const listTasks = () => api.get<Task[]>("/tasks");
+export const addTask = (title: string, due?: string | null) =>
+  api.post<Task>("/tasks", { title, due });
+export const setTaskDone = (id: string, done: boolean) =>
+  api.patch<{ ok: boolean }>(`/tasks/${id}`, { done });
+export const deleteTask = (id: string) =>
+  api.del<{ ok: boolean }>(`/tasks/${id}`);
 
 // ---- Notes ---------------------------------------------------------------
 

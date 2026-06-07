@@ -386,6 +386,46 @@ async def models() -> list[dict[str, Any]]:
     return out
 
 
+# ---- Tasks --------------------------------------------------------------
+
+
+class TaskAddRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    due: str | None = Field(None, max_length=10)
+
+
+class TaskDoneRequest(BaseModel):
+    done: bool = True
+
+
+@router.get("/tasks")
+async def tasks_list() -> list[Any]:
+    from himmy.api.studio_tasks import get_tasks_store
+
+    return get_tasks_store().list()
+
+
+@router.post("/tasks")
+async def tasks_add(body: TaskAddRequest) -> Any:
+    from himmy.api.studio_tasks import get_tasks_store
+
+    return get_tasks_store().add(body.title, due=body.due)
+
+
+@router.patch("/tasks/{task_id}")
+async def tasks_done(task_id: str, body: TaskDoneRequest) -> dict[str, bool]:
+    from himmy.api.studio_tasks import get_tasks_store
+
+    return {"ok": get_tasks_store().set_done(task_id, body.done)}
+
+
+@router.delete("/tasks/{task_id}")
+async def tasks_delete(task_id: str) -> dict[str, bool]:
+    from himmy.api.studio_tasks import get_tasks_store
+
+    return {"ok": get_tasks_store().delete(task_id)}
+
+
 # ---- Cookbook (saved agent + prompt recipes) ----------------------------
 
 

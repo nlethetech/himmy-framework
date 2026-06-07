@@ -25,6 +25,7 @@ from himmy.toolkit.knowledge import register_knowledge_pack
 from himmy.toolkit.memory import register_memory_pack
 from himmy.toolkit.nepal import NEPAL_TOOL_NAMES, register_nepal_pack
 from himmy.toolkit.notes import register_notes_pack
+from himmy.toolkit.tasks_pack import register_tasks_pack
 from himmy.toolkit.telegram import TELEGRAM_TOOL_NAMES, register_telegram_pack
 from himmy.toolkit.utils import register_utils_pack
 from himmy.toolkit.web import register_web_pack
@@ -149,6 +150,12 @@ BUILTIN_PACKS: dict[str, ToolPack] = {
         "Shared notes: list, read, and write markdown notes (same store as the GUI).",
         ("list_notes", "read_note", "write_note"),
         register_notes_pack,
+    ),
+    "tasks": ToolPack(
+        "tasks",
+        "Shared task board: list, add, and complete tasks (same store as the GUI).",
+        ("list_tasks", "add_task", "complete_task"),
+        register_tasks_pack,
     ),
     "nepal": ToolPack(
         "nepal",
