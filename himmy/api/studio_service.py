@@ -659,6 +659,19 @@ async def stream_agent_run(
                 checkpoint_id = loop.checkpoint_id
             else:
                 output_text = loop.final.output_text or ""
+                if not output_text.strip():
+                    # A tool-using turn can end without a closing synthesis (the
+                    # model emitted tool calls but no final prose, or a tool came
+                    # back empty). Never show a blank card — say what happened.
+                    used = ", ".join(tools) if tools else ""
+                    output_text = (
+                        "I ran "
+                        + (f"`{used}` " if used else "some tools ")
+                        + "but didn't get enough back to answer. This often means a "
+                        "web search returned nothing (try rephrasing, or connect a "
+                        "search key under Connections → Web search) or a needed "
+                        "account isn't connected yet."
+                    )
                 yield {"type": "message", "text": output_text}
         else:
             async for delta in runtime.stream_task(
@@ -973,10 +986,22 @@ async def stream_team_run(
         output_text = (result.output_text or "").strip()
         if not output_text and cog.delegate_answers:
             # The manager ended without a closing synthesis — fall back to the
-            # specialists' findings so the user always sees a real answer.
-            output_text = "Here's what the team found:\n\n" + "\n".join(
+            # specialists' findings so the user always sees a real answer (skip any
+            # specialist that itself came back empty).
+            findings = [
                 f"• **{worker}** — {ans.strip()}"
                 for worker, ans in cog.delegate_answers
+                if ans.strip()
+            ]
+            if findings:
+                output_text = "Here's what the team found:\n\n" + "\n".join(findings)
+        if not output_text.strip():
+            # Nothing usable came back — never show a blank card.
+            output_text = (
+                "The team ran but didn't get enough back to answer. This often "
+                "means a web search returned nothing (try rephrasing, or connect a "
+                "search key under Connections → Web search) or a needed account "
+                "isn't connected yet."
             )
         yield {"type": "message", "text": output_text}
     except Exception as exc:  # noqa: BLE001 - record + surface a terminal error
