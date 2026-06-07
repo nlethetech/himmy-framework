@@ -343,6 +343,49 @@ async def reject(checkpoint_id: str) -> StreamingResponse:
     return _resolve_stream(checkpoint_id, False)
 
 
+# ---- Notes --------------------------------------------------------------
+
+
+class NoteUpsertRequest(BaseModel):
+    id: str | None = None
+    title: str = Field("", max_length=300)
+    body: str = Field("", max_length=200_000)
+
+
+@router.get("/notes")
+async def notes_list() -> list[Any]:
+    from himmy.api.studio_notes import get_notes_store
+
+    return get_notes_store().list()
+
+
+@router.get("/notes/{note_id}")
+async def notes_get(note_id: str) -> Any:
+    from himmy.api.studio_notes import get_notes_store
+
+    note = get_notes_store().get(note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return note
+
+
+@router.put("/notes")
+async def notes_upsert(body: NoteUpsertRequest) -> Any:
+    from himmy.api.studio_notes import Note, get_notes_store
+
+    note = Note(title=body.title, body=body.body)
+    if body.id:
+        note.id = body.id
+    return get_notes_store().upsert(note)
+
+
+@router.delete("/notes/{note_id}")
+async def notes_delete(note_id: str) -> dict[str, bool]:
+    from himmy.api.studio_notes import get_notes_store
+
+    return {"ok": get_notes_store().delete(note_id)}
+
+
 # ---- Calendar -----------------------------------------------------------
 
 

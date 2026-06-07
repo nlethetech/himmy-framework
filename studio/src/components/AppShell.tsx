@@ -33,6 +33,7 @@ const WORKSPACE: NavItem[] = [
   { to: "/approvals", label: "Approvals", Icon: BellIcon },
   { to: "/activity", label: "Activity", Icon: RunsIcon },
   { to: "/calendar", label: "Calendar", Icon: CalendarIcon },
+  { to: "/notes", label: "Notes", Icon: BookIcon },
 ];
 
 const BUILD: NavItem[] = [

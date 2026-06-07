@@ -146,6 +146,20 @@ export const runEval = (
   provider?: string | null,
 ) => api.post<EvalRun>("/evals/run", { suite_path, agent_path, provider });
 
+// ---- Notes ---------------------------------------------------------------
+
+export interface Note {
+  id: string;
+  title: string;
+  body: string;
+  updated_at: string;
+}
+export const listNotes = () => api.get<Note[]>("/notes");
+export const upsertNote = (n: { id?: string; title: string; body: string }) =>
+  api.put<Note>("/notes", n);
+export const deleteNote = (id: string) =>
+  api.del<{ ok: boolean }>(`/notes/${id}`);
+
 // ---- Calendar ------------------------------------------------------------
 
 export interface CalendarEvent {
