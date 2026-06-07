@@ -687,6 +687,70 @@ async def tasks_delete(task_id: str) -> dict[str, bool]:
     return {"ok": get_tasks_store().delete(task_id)}
 
 
+# ---- Chats (saved, resumable conversations) -----------------------------
+
+
+class ChatMessageIn(BaseModel):
+    role: str = Field(..., pattern="^(user|agent)$")
+    text: str = Field("", max_length=100000)
+
+
+class ChatSaveRequest(BaseModel):
+    id: str | None = None
+    title: str | None = Field(None, max_length=200)
+    agent_path: str | None = Field(None, max_length=500)
+    provider: str | None = Field(None, max_length=40)
+    messages: list[ChatMessageIn] = Field(default_factory=list)
+
+
+class ChatRenameRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+
+
+@router.get("/chats")
+async def chats_list() -> Any:
+    from himmy.api.studio_chats import get_chats_store
+
+    return get_chats_store().list()
+
+
+@router.get("/chats/{session_id}")
+async def chats_get(session_id: str) -> Any:
+    from himmy.api.studio_chats import get_chats_store
+
+    detail = get_chats_store().get(session_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="unknown chat session")
+    return detail
+
+
+@router.post("/chats")
+async def chats_save(body: ChatSaveRequest) -> Any:
+    from himmy.api.studio_chats import ChatMessage, get_chats_store
+
+    return get_chats_store().save(
+        session_id=body.id,
+        title=body.title,
+        agent_path=body.agent_path,
+        provider=body.provider,
+        messages=[ChatMessage(role=m.role, text=m.text) for m in body.messages],
+    )
+
+
+@router.patch("/chats/{session_id}")
+async def chats_rename(session_id: str, body: ChatRenameRequest) -> dict[str, bool]:
+    from himmy.api.studio_chats import get_chats_store
+
+    return {"ok": get_chats_store().rename(session_id, body.title)}
+
+
+@router.delete("/chats/{session_id}")
+async def chats_delete(session_id: str) -> dict[str, bool]:
+    from himmy.api.studio_chats import get_chats_store
+
+    return {"ok": get_chats_store().delete(session_id)}
+
+
 # ---- Cookbook (saved agent + prompt recipes) ----------------------------
 
 

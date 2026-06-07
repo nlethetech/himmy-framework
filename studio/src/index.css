@@ -3801,3 +3801,69 @@ label.field > .hint {
   border-left: 2px solid #4285f4;
   background: color-mix(in srgb, #4285f4 12%, transparent);
 }
+
+/* Chats history screen */
+.chats-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.chats-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 10px;
+  border-radius: var(--radius);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.chats-row:hover {
+  background: var(--hover);
+}
+.chats-row > svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+.chats-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.chats-title {
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chats-meta {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+.chats-date {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.chats-btn {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+}
+.chats-btn:hover {
+  background: var(--card);
+  color: var(--text);
+}
+.chats-btn svg {
+  width: 13px;
+  height: 13px;
+}

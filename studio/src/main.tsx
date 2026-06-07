@@ -21,6 +21,7 @@ import Notes from "./screens/Notes";
 import Tasks from "./screens/Tasks";
 import Compare from "./screens/Compare";
 import Email from "./screens/Email";
+import Chats from "./screens/Chats";
 import Cookbook from "./screens/Cookbook";
 import Models from "./screens/Models";
 import Tools from "./screens/Tools";
@@ -38,6 +39,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Home /> },
       { path: "chat", element: <Chat /> },
+      { path: "chats", element: <Chats /> },
       { path: "calendar", element: <Calendar /> },
       { path: "email", element: <Email /> },
       { path: "notes", element: <Notes /> },

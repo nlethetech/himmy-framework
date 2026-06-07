@@ -235,6 +235,39 @@ export const googleCalendarCreate = (
     all_day,
   });
 
+// ---- Chats (saved, resumable conversations) ------------------------------
+
+export interface ChatMessageRow {
+  role: "user" | "agent";
+  text: string;
+}
+export interface ChatSessionSummary {
+  id: string;
+  title: string;
+  agent_path: string | null;
+  provider: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+export interface ChatSessionDetail extends ChatSessionSummary {
+  messages: ChatMessageRow[];
+}
+export const listChats = () => api.get<ChatSessionSummary[]>("/chats");
+export const getChat = (id: string) =>
+  api.get<ChatSessionDetail>(`/chats/${id}`);
+export const saveChat = (body: {
+  id?: string | null;
+  title?: string | null;
+  agent_path?: string | null;
+  provider?: string | null;
+  messages: ChatMessageRow[];
+}) => api.post<ChatSessionSummary>("/chats", body);
+export const renameChat = (id: string, title: string) =>
+  api.patch<{ ok: boolean }>(`/chats/${id}`, { title });
+export const deleteChat = (id: string) =>
+  api.del<{ ok: boolean }>(`/chats/${id}`);
+
 // ---- Compare -------------------------------------------------------------
 
 export interface CompareTarget {

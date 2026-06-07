@@ -4,6 +4,8 @@ import {
   api,
   streamRun,
   streamTeamRun,
+  getChat,
+  saveChat,
   type AgentSummary,
   type TeamSummary,
   type RunEvent,
@@ -66,19 +68,34 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [params, setParams] = useSearchParams();
 
   // A Cookbook recipe (or any deep link) can prefill the agent + prompt via
-  // ?agent=<path>&q=<prompt>. Consume them once on mount.
+  // ?agent=<path>&q=<prompt>. The Chats screen resumes a saved conversation via
+  // ?session=<id>. Consume these once on mount.
   useEffect(() => {
     const a = params.get("agent");
     const q = params.get("q");
+    const s = params.get("session");
+    if (s) {
+      getChat(s)
+        .then((sess) => {
+          setSessionId(sess.id);
+          if (sess.agent_path) setPath(sess.agent_path);
+          if (sess.provider) setProvider(sess.provider);
+          setMessages(
+            sess.messages.map((m) => ({ role: m.role, text: m.text })),
+          );
+        })
+        .catch(() => undefined);
+    }
     if (a) setPath(a);
     if (q) setInput(q);
-    if (a || q) setParams({}, { replace: true });
+    if (a || q || s) setParams({}, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -105,12 +122,33 @@ export default function Chat() {
   };
   useEffect(load, []);
 
+  const messagesRef = useRef<Msg[]>([]);
   useEffect(() => {
+    messagesRef.current = messages;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
   }, [messages]);
+
+  // Persist the current transcript so it shows up under Chats and can be resumed.
+  const persist = async () => {
+    const rows = messagesRef.current
+      .filter((m) => m.text.trim())
+      .map((m) => ({ role: m.role, text: m.text }));
+    if (rows.length === 0) return;
+    try {
+      const saved = await saveChat({
+        id: sessionId,
+        agent_path: path || null,
+        provider: provider || null,
+        messages: rows,
+      });
+      if (!sessionId) setSessionId(saved.id);
+    } catch {
+      /* saving is best-effort; never block the chat */
+    }
+  };
 
   const picked: Pick | null = (() => {
     const team = teams.find((t) => t.path === path);
@@ -278,6 +316,7 @@ export default function Chat() {
       patchLast((m) => ({ ...m, streaming: false }));
       setBusy(false);
       abortRef.current = null;
+      void persist();
     }
   };
 
@@ -492,7 +531,10 @@ export default function Chat() {
               {messages.length > 0 && (
                 <button
                   className="composer-icon"
-                  onClick={() => setMessages([])}
+                  onClick={() => {
+                    setMessages([]);
+                    setSessionId(null);
+                  }}
                   disabled={busy}
                   title="New chat"
                   type="button"
