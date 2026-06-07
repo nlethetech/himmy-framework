@@ -14,7 +14,6 @@ Stores: :class:`InMemoryCheckpointStore` (default, volatile) and
 from __future__ import annotations
 
 import json
-import sqlite3
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -105,7 +104,9 @@ class SqliteCheckpointStore:
 
     def __init__(self, path: str = ":memory:") -> None:
         """Open (or create) the SQLite database at ``path``."""
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        from himmy.core.sqlite_util import connect_hardened
+
+        self._conn = connect_hardened(path)
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 

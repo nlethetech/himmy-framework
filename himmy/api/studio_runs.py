@@ -221,7 +221,9 @@ class StudioRunStore:
     """A durable SQLite store of Studio runs (stdlib sqlite3)."""
 
     def __init__(self, path: str = ":memory:") -> None:
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        from himmy.core.sqlite_util import connect_hardened
+
+        self._conn = connect_hardened(path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._migrate()

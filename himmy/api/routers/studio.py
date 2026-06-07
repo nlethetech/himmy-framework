@@ -99,10 +99,10 @@ class RunRequest(BaseModel):
     """POST /api/studio/run body: which agent, the prompt, and optional overrides."""
 
     agent_path: str = Field(..., description="agent spec path, relative to the root")
-    prompt: str
+    prompt: str = Field(..., max_length=100_000)
     provider: str | None = None
     model: str | None = None
-    history: list[TurnInput] = []
+    history: list[TurnInput] = Field(default=[], max_length=200)
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -154,7 +154,7 @@ class RunTeamRequest(BaseModel):
     """POST /api/studio/run-team body: which team and the request prompt."""
 
     team_path: str = Field(..., description="team spec path, relative to the root")
-    prompt: str
+    prompt: str = Field(..., max_length=100_000)
 
 
 @router.post("/run-team")
@@ -328,15 +328,15 @@ async def reject(checkpoint_id: str) -> StreamingResponse:
 
 
 class MemoryAddRequest(BaseModel):
-    text: str
-    subject_id: str = "default"
-    kind: str = "semantic"
+    text: str = Field(..., min_length=1, max_length=20_000)
+    subject_id: str = Field("default", max_length=200)
+    kind: str = Field("semantic", max_length=40)
 
 
 class MemoryRecallRequest(BaseModel):
-    query: str
-    subject_id: str = "default"
-    top_k: int = 5
+    query: str = Field(..., min_length=1, max_length=2_000)
+    subject_id: str = Field("default", max_length=200)
+    top_k: int = Field(5, ge=1, le=50)
 
 
 @router.get("/memory/subjects", response_model=list[str])
@@ -386,13 +386,13 @@ class KbCreateRequest(BaseModel):
 
 
 class KbIngestRequest(BaseModel):
-    text: str
-    title: str | None = None
+    text: str = Field(..., min_length=1, max_length=1_000_000)
+    title: str | None = Field(None, max_length=300)
 
 
 class KbSearchRequest(BaseModel):
-    query: str
-    top_k: int = 5
+    query: str = Field(..., min_length=1, max_length=2_000)
+    top_k: int = Field(5, ge=1, le=50)
 
 
 @router.get("/knowledge")
@@ -449,17 +449,24 @@ async def eval_suites() -> list[Any]:
 
 @router.post("/evals/run")
 async def eval_run(body: EvalRunRequest) -> Any:
+    import asyncio
+
     from himmy.api import studio_eval
 
     try:
-        return await studio_eval.run_eval(
-            body.suite_path,
-            body.agent_path,
-            provider=body.provider,
-            model=body.model,
+        return await asyncio.wait_for(
+            studio_eval.run_eval(
+                body.suite_path,
+                body.agent_path,
+                provider=body.provider,
+                model=body.model,
+            ),
+            timeout=900,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="eval timed out") from exc
 
 
 # ---- Workflows (declarative multi-step) ---------------------------------
@@ -482,18 +489,25 @@ async def workflows() -> list[Any]:
 
 @router.post("/workflows/run")
 async def workflow_run(body: WorkflowRunRequest) -> Any:
+    import asyncio
+
     from himmy.api import studio_workflows
 
     try:
-        return await studio_workflows.run_workflow(
-            body.workflow_path,
-            body.agent_path,
-            provider=body.provider,
-            model=body.model,
-            initial_state=body.initial_state,
+        return await asyncio.wait_for(
+            studio_workflows.run_workflow(
+                body.workflow_path,
+                body.agent_path,
+                provider=body.provider,
+                model=body.model,
+                initial_state=body.initial_state,
+            ),
+            timeout=900,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="workflow timed out") from exc
 
 
 # ---- Lineage (provenance of a run's answer) -----------------------------
