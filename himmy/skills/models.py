@@ -63,15 +63,15 @@ class Skill(BaseModel):
         self, version: int | None = None, metadata: dict[str, Any] | None = None
     ) -> EntityRecord:
         """Project this skill into its canonical ``EntityRecord`` (``kind="skill"``)."""
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.name, namespace="skill")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=version if version is not None else self.version,
+        return project(
+            self,
+            stable_value=self.name,
+            namespace="skill",
             kind="skill",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=version if version is not None else self.version,
+            metadata=metadata,
         )
 
 

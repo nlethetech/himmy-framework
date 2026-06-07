@@ -11,13 +11,13 @@ from himmy.services.storage import (
     EnvironmentStateRecord,
     EpisodicMemoryObject,
     MemoryObject,
-    MemoryStore,
     PostgresStorageService,
     RecommendationItem,
     RecommendationStatus,
     RunRecord,
     RunStatus,
     StorageService,
+    ThreadEventStore,
 )
 from tests.conftest import run_async
 
@@ -50,9 +50,9 @@ def test_append_and_filter_events() -> None:
     assert run_async(storage.list_events(trace_id="tr2"))[0].event_id == e2.event_id
 
 
-def test_storage_satisfies_memory_store_protocol() -> None:
-    """StorageService is a structural MemoryStore."""
-    assert isinstance(StorageService(), MemoryStore)
+def test_storage_satisfies_thread_event_store_protocol() -> None:
+    """StorageService is a structural ThreadEventStore."""
+    assert isinstance(StorageService(), ThreadEventStore)
 
 
 def test_run_crud_and_status_filter() -> None:
@@ -230,7 +230,7 @@ def test_evidence_memory_orchestration_crud() -> None:
     storage = StorageService()
 
     run_async(storage.save_context_evidence(ContextEvidenceRecord(key="k")))
-    assert len(storage._context_evidence) == 1  # type: ignore[attr-defined]
+    assert len(storage._context_store._evidence) == 1  # type: ignore[attr-defined]
 
     mem = MemoryObject(subject_id="s1", payload={"note": "x"})
     run_async(storage.save_memory(mem))

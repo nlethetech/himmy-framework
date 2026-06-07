@@ -11,9 +11,9 @@ runs on shutdown (AAEO-1). It is a thin transport layer: behavior lives below it
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -68,11 +68,13 @@ async def _rate_limit_dependency(request: Request) -> None:
         limiter(request)
 
 
-def _build_lifespan(container: ApiContainer):
+def _build_lifespan(
+    container: ApiContainer,
+) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """Build a FastAPI lifespan that sweeps stuck runs + drains on shutdown (AAEO-1)."""
 
     @asynccontextmanager
-    async def _lifespan(app: FastAPI):
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Startup: sweep runs left non-terminal by a previous process so they
         # reach a terminal state instead of hanging in QUEUED/RUNNING forever.
         run_app = getattr(container, "run_app", None)
@@ -198,7 +200,7 @@ STUDIO_STATIC_DIR = (
 
 def studio_is_built() -> bool:
     """True when the Studio SPA has been built into the package (index.html present)."""
-    return (STUDIO_STATIC_DIR / "index.html").is_file()
+    return cast(bool, (STUDIO_STATIC_DIR / "index.html").is_file())
 
 
 # Path prefixes that must always resolve as API (never fall back to the SPA shell),
@@ -232,7 +234,7 @@ def _mount_studio(app: FastAPI) -> None:
         return FileResponse(str(index))
 
     @app.exception_handler(StarletteHTTPException)
-    async def _spa_fallback(request: Request, exc: StarletteHTTPException):
+    async def _spa_fallback(request: Request, exc: StarletteHTTPException) -> Response:
         """Serve a real static file or the SPA shell on a 404 for a non-API GET.
 
         Top-level static files emitted into the build root (fonts, favicon, manifest)
@@ -271,7 +273,9 @@ def _install_request_context(app: FastAPI) -> None:
     import uuid
 
     @app.middleware("http")
-    async def _ctx(request: Request, call_next: Callable) -> Response:
+    async def _ctx(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
         rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
         try:
             response = await call_next(request)
@@ -334,7 +338,9 @@ def _install_studio_guard(app: FastAPI) -> None:
     }
 
     @app.middleware("http")
-    async def _guard(request: Request, call_next: Callable) -> Response:
+    async def _guard(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
         if request.url.path.startswith("/api/studio"):
             host = _studio_host(request.headers.get("host", ""))
             if host and host not in allowed:
@@ -362,7 +368,9 @@ def _install_security_headers(app: FastAPI) -> None:
     hsts_on = os.environ.get("HIMMY_HSTS", "1").lower() not in ("0", "false", "no")
 
     @app.middleware("http")
-    async def _security_headers(request: Request, call_next: Callable) -> Response:
+    async def _security_headers(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
@@ -402,7 +410,7 @@ def _install_openapi_security(app: FastAPI, authenticator: object | None) -> Non
         return
     schemes = schemes_fn()
 
-    def _custom_openapi() -> dict:
+    def _custom_openapi() -> dict[str, Any]:
         if app.openapi_schema:
             return app.openapi_schema
         from fastapi.openapi.utils import get_openapi

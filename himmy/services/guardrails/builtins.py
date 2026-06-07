@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from himmy.services.guardrails.base import (
     Guardrail,
@@ -137,7 +138,7 @@ class PIIGuardrail:
         """Use the default rule set, or a custom list of :class:`PIIRule`s."""
         self._rules = rules if rules is not None else _PII_RULES
 
-    def inspect(self, text: str, *, context: dict) -> GuardrailVerdict:
+    def inspect(self, text: str, *, context: dict[str, Any]) -> GuardrailVerdict:
         """Replace any detected PII with typed placeholders (never blocks)."""
         redacted, flags = _redact(text, self._rules)
         return GuardrailVerdict(allowed=True, text=redacted, flags=flags)
@@ -164,7 +165,7 @@ class InjectionGuardrail:
         """``block`` (default True) makes a detection deny; otherwise it only flags."""
         self._block = block
 
-    def inspect(self, text: str, *, context: dict) -> GuardrailVerdict:
+    def inspect(self, text: str, *, context: dict[str, Any]) -> GuardrailVerdict:
         """Detect injection patterns; deny when ``block`` is set."""
         hits = [p.pattern for p in _INJECTION_PATTERNS if p.search(text)]
         if not hits:
@@ -187,7 +188,7 @@ class BlocklistGuardrail:
         self.name = name
         self._patterns = [re.compile(p, re.I) for p in patterns]
 
-    def inspect(self, text: str, *, context: dict) -> GuardrailVerdict:
+    def inspect(self, text: str, *, context: dict[str, Any]) -> GuardrailVerdict:
         """Deny when any blocklist pattern matches."""
         for pattern in self._patterns:
             if pattern.search(text):
@@ -224,10 +225,79 @@ class NepalPIIGuardrail:
 
     name = "nepal_pii"
 
-    def inspect(self, text: str, *, context: dict) -> GuardrailVerdict:
+    def inspect(self, text: str, *, context: dict[str, Any]) -> GuardrailVerdict:
         """Replace Nepali PII with typed placeholders (never blocks)."""
         redacted, flags = _redact(text, _NEPAL_PII_RULES)
         return GuardrailVerdict(allowed=True, text=redacted, flags=flags)
+
+
+# ---------------------------------------------------------------------- grounding
+
+#: Tell-tale phrases a model emits when it answers a real-world question from its own
+#: (stale) parametric memory instead of grounding in a tool. These are assertive
+#: disclaimers — when one appears in an ANSWER, the reply is by definition ungrounded
+#: (a tool-grounded answer cites the tool, not "my training data"). Conservative on
+#: purpose: each requires the model to base the answer on its own knowledge/cutoff, so
+#: legitimate, tool-grounded replies are not caught.
+_UNGROUNDED_TELLS: list[re.Pattern[str]] = [
+    re.compile(
+        r"based on (my|the) (last |latest |most recent |available )*"
+        r"(training |available )*(data|knowledge|information|update|updates)",
+        re.I,
+    ),
+    re.compile(
+        r"as of my (last |latest |most recent )*(knowledge |training )*"
+        r"(update|cutoff|cut-?off|data|knowledge)",
+        re.I,
+    ),
+    re.compile(r"\bmy (training data|knowledge cut-?off|last update)\b", re.I),
+    re.compile(
+        r"\bi (do not|don't|cannot|can't|do not currently) have "
+        r"(access to )?(real-?time|current|up-?to-?date|live)\b",
+        re.I,
+    ),
+    re.compile(r"\bi was (last )?(trained|updated)\b", re.I),
+    re.compile(r"\b(up to|until) my (last )?(training|knowledge)\b", re.I),
+    re.compile(
+        r"\bmy knowledge (is|was|only goes|extends) (current )?(up to|as of)\b", re.I
+    ),
+]
+
+#: What the agent says instead of an ungrounded answer (replaces the offending text).
+_GROUNDING_REFUSAL = (
+    "I won't answer this from my built-in knowledge, because it may be out of date "
+    "and I could not ground it in a live source. Ask me to look it up (e.g. with web "
+    "search or news search) and I'll answer from what the tool returns — or check an "
+    "official source directly."
+)
+
+
+class GroundingGuardrail:
+    """Enforces grounding on an agent's OUTPUT: blocks answers given from stale memory.
+
+    Output-stage only. When a reply contains a tell-tale phrase showing the model
+    answered a real-world question from its own training data rather than a tool
+    (see :data:`_UNGROUNDED_TELLS`), the guardrail BLOCKS it and replaces the text
+    with :data:`_GROUNDING_REFUSAL`, so a stale, unverifiable claim never reaches the
+    user. It is a no-op on the input stage and on already-grounded answers, adding no
+    latency (pure regex). Pairs with the framework-default ``conduct`` prompt block
+    (prevention); this is the enforcement backstop for when a model slips.
+    """
+
+    name = "grounding"
+
+    def inspect(self, text: str, *, context: dict[str, Any]) -> GuardrailVerdict:
+        """Block + replace an ungrounded answer; pass everything else through."""
+        if context.get("stage") != "output" or not text:
+            return GuardrailVerdict(allowed=True, text=text)
+        if any(pattern.search(text) for pattern in _UNGROUNDED_TELLS):
+            return GuardrailVerdict(
+                allowed=False,
+                text=_GROUNDING_REFUSAL,
+                reasons=["answer relied on stale built-in knowledge, not a tool"],
+                flags=["ungrounded"],
+            )
+        return GuardrailVerdict(allowed=True, text=text)
 
 
 #: Built-in guardrails resolvable by name (for specs/CLI). ``dlp`` is appended below
@@ -236,6 +306,7 @@ BUILTIN_GUARDRAILS: dict[str, type[Guardrail]] = {
     "pii": PIIGuardrail,
     "injection": InjectionGuardrail,
     "nepal_pii": NepalPIIGuardrail,
+    "grounding": GroundingGuardrail,
 }
 
 
@@ -267,6 +338,7 @@ __all__ = [
     "InjectionGuardrail",
     "BlocklistGuardrail",
     "NepalPIIGuardrail",
+    "GroundingGuardrail",
     "BUILTIN_GUARDRAILS",
     "build_guardrail_pipeline",
 ]

@@ -12,6 +12,7 @@ from himmy.services.inference.models import (
 )
 from himmy.services.inference.tool_protocol import parse_text_tool_calls
 from himmy.services.tools.repair import resolve_tool_name, unknown_tool_message
+from tests.conftest import executor_from
 
 KNOWN = {"egg_totals", "pond_status", "add_task", "list_flocks"}
 
@@ -102,24 +103,24 @@ def test_unknown_tool_message_is_actionable() -> None:
 
 
 def _bound() -> list[BoundTool]:
-    async def handler(args: dict) -> ToolReturnRecord:
-        return ToolReturnRecord(
-            tool_call_id="x",
-            tool_name="egg_totals",
-            content={"total": 245},
-            outcome="success",
-        )
+    return [BoundTool(name="egg_totals", args_json_schema={"type": "object"})]
 
-    return [
-        BoundTool(
-            name="egg_totals", args_json_schema={"type": "object"}, handler=handler
-        )
-    ]
+
+async def _egg_handler(args: dict) -> ToolReturnRecord:
+    return ToolReturnRecord(
+        tool_call_id="x",
+        tool_name="egg_totals",
+        content={"total": 245},
+        outcome="success",
+    )
+
+
+_EXECUTOR = executor_from({"egg_totals": _egg_handler})
 
 
 def test_execute_autocorrects_typo_and_runs() -> None:
     calls = [ToolCallRecord(tool_call_id="c1", tool_name="egg_total", args={"days": 7})]
-    rets = asyncio.run(_execute_tool_calls(_bound(), calls))
+    rets = asyncio.run(_execute_tool_calls(_bound(), calls, _EXECUTOR))
     assert rets[0].outcome == "success"
     assert rets[0].tool_name == "egg_totals"
     assert rets[0].metadata["repaired_from"] == "egg_total"
@@ -127,7 +128,7 @@ def test_execute_autocorrects_typo_and_runs() -> None:
 
 def test_execute_unknown_tool_returns_correction() -> None:
     calls = [ToolCallRecord(tool_call_id="c2", tool_name="frobnicate", args={})]
-    rets = asyncio.run(_execute_tool_calls(_bound(), calls))
+    rets = asyncio.run(_execute_tool_calls(_bound(), calls, _EXECUTOR))
     assert rets[0].outcome == "failed"
     assert "Unknown tool" in rets[0].content
     assert rets[0].metadata["error_code"] == "UNKNOWN_TOOL"

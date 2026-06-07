@@ -64,7 +64,7 @@ async def health() -> dict[str, Any]:
 
 
 @router.get("/doctor")
-async def doctor() -> dict:
+async def doctor() -> dict[str, Any]:
     """Environment diagnostics: extras, providers, keys, and the next step.
 
     The JSON twin of ``himmy doctor`` — same
@@ -76,7 +76,7 @@ async def doctor() -> dict:
 
 
 @router.get("/benchmarks")
-async def benchmarks() -> dict:
+async def benchmarks() -> dict[str, Any]:
     """Cached per-model reliability scorecards (from `himmy bench` / the probe)."""
     from himmy.api import studio_bench
 
@@ -84,7 +84,7 @@ async def benchmarks() -> dict:
 
 
 @router.post("/benchmarks/probe")
-async def benchmarks_probe() -> dict:
+async def benchmarks_probe() -> dict[str, Any]:
     """Run a quick tool-focused reliability check against detected local models.
 
     Slow (real model calls) but bounded — a small suite against ≤3 local models, one
@@ -1160,7 +1160,7 @@ async def get_agent(path: str) -> studio_agents.AgentDetail:
 
 
 @router.post("/agents/validate", response_model=studio_agents.ValidationResult)
-async def validate_agent(spec: dict) -> studio_agents.ValidationResult:
+async def validate_agent(spec: dict[str, Any]) -> studio_agents.ValidationResult:
     """Validate a proposed spec without saving (live form feedback)."""
     errors = studio_agents.validate_spec(spec)
     return studio_agents.ValidationResult(ok=not errors, errors=errors)

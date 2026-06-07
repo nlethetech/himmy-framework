@@ -141,14 +141,22 @@ def test_events_emitted_to_sink() -> None:
     assert EventType.TOOL_COMPLETED in types
 
 
-def test_bound_tools_round_trip_through_execute() -> None:
-    """bound_tools yields BoundTools whose handler routes back through execute."""
+def test_bound_tools_are_pure_data() -> None:
+    """bound_tools yields pure-data BoundTools (schemas only, no execution handle)."""
     svc = ToolService(_registry_with_adder())
     bound = svc.bound_tools(["adder"])
     assert len(bound) == 1
     tool = bound[0]
     assert tool.name == "adder"
-    ret = run_async(tool.handler({"a": 4, "b": 6}))
+    # Execution is no longer carried on the BoundTool — that's the decoupling.
+    assert not hasattr(tool, "handler")
+
+
+def test_tool_executor_routes_by_name_through_execute() -> None:
+    """tool_executor() runs a tool by name through execute and normalizes the result."""
+    svc = ToolService(_registry_with_adder())
+    executor = svc.tool_executor()
+    ret = run_async(executor("adder", {"a": 4, "b": 6}))
     assert ret.tool_name == "adder"
     assert ret.content == {"sum": 10}
     assert ret.outcome == "success"

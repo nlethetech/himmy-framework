@@ -117,7 +117,7 @@ class DlpGuardrail:
         self._audit_sink = audit_sink
         self._analyzer = analyzer
 
-    def inspect(self, text: str, *, context: dict) -> GuardrailVerdict:
+    def inspect(self, text: str, *, context: dict[str, Any]) -> GuardrailVerdict:
         """Classify sensitive data and apply the per-class action."""
         result = text
         counts: dict[str, int] = {}

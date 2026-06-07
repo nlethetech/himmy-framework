@@ -17,6 +17,7 @@ from himmy.services.guardrails.base import (
 from himmy.services.guardrails.builtins import (
     BUILTIN_GUARDRAILS,
     BlocklistGuardrail,
+    GroundingGuardrail,
     InjectionGuardrail,
     NepalPIIGuardrail,
     PIIGuardrail,
@@ -42,6 +43,7 @@ __all__ = [
     "InjectionGuardrail",
     "BlocklistGuardrail",
     "NepalPIIGuardrail",
+    "GroundingGuardrail",
     "BUILTIN_GUARDRAILS",
     "build_guardrail_pipeline",
     "build_guardrail_pre_hook",

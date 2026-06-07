@@ -26,7 +26,7 @@ from himmy.services.inference import (
     WorkflowState,
     synthesize_from_schema,
 )
-from tests.conftest import run_async
+from tests.conftest import executor_from, run_async
 
 
 def _service() -> InferenceService:
@@ -84,13 +84,13 @@ def test_auto_tools_invokes_bound_tools() -> None:
     tool = BoundTool(
         name="adder",
         args_json_schema={"type": "object", "properties": {"a": {"type": "integer"}}},
-        handler=_handler,
     )
     svc = _service()
     req = InferenceRequest(
         messages=[InferenceMessage(role="user", content="add")],
         response_format=ResponseFormat.AUTO_TOOLS,
         bound_tools=[tool],
+        tool_executor=executor_from({"adder": _handler}),
     )
     resp = run_async(svc.run(req))
     assert resp.status == InferenceStatus.SUCCESS
@@ -107,13 +107,14 @@ def test_workflow_runs_current_step_only_and_returns_state() -> None:
     async def _handler(args: dict) -> ToolReturnRecord:
         return ToolReturnRecord(tool_call_id="", tool_name="step_one", content="done")
 
-    tool = BoundTool(name="step_one", handler=_handler)
+    tool = BoundTool(name="step_one")
     state = WorkflowState(definition=WorkflowDefinition(steps=["step_one", "step_two"]))
     svc = _service()
     req = InferenceRequest(
         messages=[InferenceMessage(role="user", content="go")],
         workflow=state,
         bound_tools=[tool],
+        tool_executor=executor_from({"step_one": _handler}),
     )
     assert req.response_format == ResponseFormat.WORKFLOW
     resp = run_async(svc.run(req))
@@ -514,12 +515,13 @@ def test_stub_tokens_include_tool_and_structured_payloads() -> None:
             tool_call_id="", tool_name="big", content={"data": "x" * 400}
         )
 
-    tool = BoundTool(name="big", handler=_handler)
+    tool = BoundTool(name="big")
     svc = _service()
     req = InferenceRequest(
         messages=[InferenceMessage(role="user", content="go")],
         response_format=ResponseFormat.AUTO_TOOLS,
         bound_tools=[tool],
+        tool_executor=executor_from({"big": _handler}),
     )
     resp = run_async(svc.run(req))
     assert resp.status == InferenceStatus.SUCCESS

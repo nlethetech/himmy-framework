@@ -7,7 +7,7 @@ shapes for accurate OpenAPI (AAEO-9).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
@@ -84,13 +84,16 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
         context=body.task.context,
     )
     workspace_id = require_workspace(request, body.workspace_id)
-    run = await _container(request).run_app.create_run(
-        workspace_id=workspace_id,
-        subject_id=body.subject_id,
-        persona=persona,
-        task=task,
-        idempotency_key=body.idempotency_key,
-        actor=get_principal(request).actor_metadata(),
+    run: RunRecord = cast(
+        RunRecord,
+        await _container(request).run_app.create_run(
+            workspace_id=workspace_id,
+            subject_id=body.subject_id,
+            persona=persona,
+            task=task,
+            idempotency_key=body.idempotency_key,
+            actor=get_principal(request).actor_metadata(),
+        ),
     )
     audit_event(
         request,
@@ -151,7 +154,7 @@ async def get_run(
     run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
-    return run
+    return cast(RunRecord, run)
 
 
 @router.get("/{run_id}/events", dependencies=_READ)
@@ -162,8 +165,11 @@ async def get_run_events(
 ) -> list[Any]:
     """Replay the canonical event stream for one run (tenant-scoped, AAEO-4)."""
     workspace_id = resolve_workspace(request, workspace_id)
-    return await _container(request).run_app.get_run_events(
-        run_id, workspace_id=workspace_id
+    return cast(
+        list[Any],
+        await _container(request).run_app.get_run_events(
+            run_id, workspace_id=workspace_id
+        ),
     )
 
 

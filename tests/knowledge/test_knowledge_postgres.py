@@ -36,56 +36,57 @@ def _require_backend_deps() -> None:
         pytest.skip("asyncpg not installed")
 
 
-def _new_storage():
-    """Connect a PostgresStorageService + create both schemas (storage + knowledge)."""
+async def _new_storage():
+    """Connect a PostgresStorageService + create both schemas (storage + knowledge).
+
+    Async (awaited within a single event loop): an asyncpg pool is bound to the loop
+    it was created on, so connect + every operation must run on ONE ``asyncio.run``
+    loop. Each test does all its async work inside a single ``run_async(scenario())``.
+    """
     from himmy.services.storage.postgres import PostgresStorageService
 
-    storage = run_async(PostgresStorageService.connect(_DSN))
-    run_async(storage.create_schema())
-    run_async(storage.create_knowledge_schema(vector_dim=64))
+    storage = await PostgresStorageService.connect(_DSN)
+    await storage.create_schema()
+    await storage.create_knowledge_schema(vector_dim=64)
     return storage
 
 
 def test_pgvector_roundtrip_ingest_and_search() -> None:
     """Create KB -> ingest -> cosine search end-to-end against a real database."""
     _require_backend_deps()
+    from himmy.core.errors import HimmyError
     from himmy.services.knowledge import DeterministicEmbedder, KnowledgeBase
 
-    storage = _new_storage()
-    try:
-        kb_service = KnowledgeBase(
-            storage=storage,
-            embedder=DeterministicEmbedder(dim=64),
-            backend=storage.knowledge_backend(),
-        )
-        name = f"kb-{uuid.uuid4().hex[:8]}"
-        rec = run_async(
-            kb_service.create_kb(
+    async def scenario() -> None:
+        storage = await _new_storage()
+        try:
+            kb_service = KnowledgeBase(
+                storage=storage,
+                embedder=DeterministicEmbedder(dim=64),
+                backend=storage.knowledge_backend(),
+            )
+            name = f"kb-{uuid.uuid4().hex[:8]}"
+            rec = await kb_service.create_kb(
                 workspace_id="w1", client_id="c1", name=name, vector_dim=64
             )
-        )
-        run_async(
-            kb_service.ingest_text(
+            await kb_service.ingest_text(
                 rec.kb_id, "ACME quarterly revenue rose on strong widget demand."
             )
-        )
-        run_async(kb_service.ingest_text(rec.kb_id, "Unrelated note about tomatoes."))
-        hits = run_async(kb_service.search(rec.kb_id, "ACME revenue widgets", top_k=1))
-        assert hits and "ACME" in (hits[0].text or "")
-        assert hits[0].similarity > 0.0
-        # Tenancy guard: wrong workspace cannot reach the KB.
-        from himmy.core.errors import HimmyError
-
-        with pytest.raises(HimmyError):
-            run_async(
-                kb_service.search(
+            await kb_service.ingest_text(rec.kb_id, "Unrelated note about tomatoes.")
+            hits = await kb_service.search(rec.kb_id, "ACME revenue widgets", top_k=1)
+            assert hits and "ACME" in (hits[0].text or "")
+            assert hits[0].similarity > 0.0
+            # Tenancy guard: wrong workspace cannot reach the KB.
+            with pytest.raises(HimmyError):
+                await kb_service.search(
                     rec.kb_id, "ACME", workspace_id="other", client_id="c1"
                 )
-            )
-        # Cascade delete removes the KB.
-        assert run_async(kb_service.delete_kb(rec.kb_id)) is True
-    finally:
-        run_async(storage.close())
+            # Cascade delete removes the KB.
+            assert await kb_service.delete_kb(rec.kb_id) is True
+        finally:
+            await storage.close()
+
+    run_async(scenario())
 
 
 def test_pgvector_duplicate_kb_name_raises() -> None:
@@ -94,27 +95,26 @@ def test_pgvector_duplicate_kb_name_raises() -> None:
     from himmy.core.errors import HimmyError
     from himmy.services.knowledge import DeterministicEmbedder, KnowledgeBase
 
-    storage = _new_storage()
-    try:
-        kb_service = KnowledgeBase(
-            storage=storage,
-            embedder=DeterministicEmbedder(dim=64),
-            backend=storage.knowledge_backend(),
-        )
-        name = f"dup-{uuid.uuid4().hex[:8]}"
-        run_async(
-            kb_service.create_kb(
+    async def scenario() -> None:
+        storage = await _new_storage()
+        try:
+            kb_service = KnowledgeBase(
+                storage=storage,
+                embedder=DeterministicEmbedder(dim=64),
+                backend=storage.knowledge_backend(),
+            )
+            name = f"dup-{uuid.uuid4().hex[:8]}"
+            await kb_service.create_kb(
                 workspace_id="w1", client_id="c1", name=name, vector_dim=64
             )
-        )
-        with pytest.raises(HimmyError):
-            run_async(
-                kb_service.create_kb(
+            with pytest.raises(HimmyError):
+                await kb_service.create_kb(
                     workspace_id="w1", client_id="c1", name=name, vector_dim=64
                 )
-            )
-    finally:
-        run_async(storage.close())
+        finally:
+            await storage.close()
+
+    run_async(scenario())
 
 
 def test_openai_compatible_embedder_real_call() -> None:

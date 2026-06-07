@@ -32,7 +32,7 @@ class MemoryContextAdapter(ContextAdapter):
         self._top_k = top_k
         self._subject_id = subject_id
 
-    async def fetch(self, key: str, scope: dict) -> ContextField | None:
+    async def fetch(self, key: str, scope: dict[str, Any]) -> ContextField | None:
         """Recall memories for the scope's subject and render them as a field."""
         subject_id = (
             self._subject_id

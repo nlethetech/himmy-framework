@@ -28,8 +28,8 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import Collection
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Collection
+from typing import TYPE_CHECKING, Any, cast
 
 from himmy.application.models import RecommendationEnvelope
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
@@ -91,7 +91,7 @@ def _paginate(
     *,
     limit: int | None,
     offset: int,
-    sort_key,
+    sort_key: Callable[[Any], Any],
     reverse: bool = True,
 ) -> list[Any]:
     """Deterministically sort + window a list (AAEO-8).
@@ -472,10 +472,13 @@ class RecommendationAppService:
         root = await _maybe_await(self._registry.get_latest(stable_id))
         if root is None:
             return None
-        return await _maybe_await(
-            self._registry.trace(
-                root.record_id, max_depth=max_depth, relations=relations
-            )
+        return cast(
+            "LineageGraph | None",
+            await _maybe_await(
+                self._registry.trace(
+                    root.record_id, max_depth=max_depth, relations=relations
+                )
+            ),
         )
 
 
@@ -761,10 +764,13 @@ class RunAppService:
         root = await _maybe_await(self._registry.get_latest(stable_id))
         if root is None:
             return None
-        return await _maybe_await(
-            self._registry.trace(
-                root.record_id, max_depth=max_depth, relations=relations
-            )
+        return cast(
+            "LineageGraph | None",
+            await _maybe_await(
+                self._registry.trace(
+                    root.record_id, max_depth=max_depth, relations=relations
+                )
+            ),
         )
 
     async def list_runs(
@@ -853,7 +859,7 @@ def _resolve_model_key(llm_config: LLMConfig | None, task: Task) -> str | None:
     must NOT shadow a ``model_key`` the task supplied in its context. Precedence:
     caller-set llm_config.model_key, else task.context['model_key'], else None.
     """
-    ctx_key = (task.context or {}).get("model_key")
+    ctx_key = cast("str | None", (task.context or {}).get("model_key"))
     if llm_config is not None and llm_config.model_key != _DEFAULT_MODEL_KEY:
         return llm_config.model_key
     if ctx_key is not None:

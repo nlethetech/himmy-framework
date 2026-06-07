@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from himmy.services.context.models import ContextField
 
@@ -19,7 +20,7 @@ class ContextAdapter(ABC):
     name: str = "adapter"
 
     @abstractmethod
-    async def fetch(self, key: str, scope: dict) -> ContextField | None:
+    async def fetch(self, key: str, scope: dict[str, Any]) -> ContextField | None:
         """Fetch a context field for ``key`` within ``scope``, or None."""
         raise NotImplementedError
 

@@ -692,7 +692,7 @@ class KnowledgeBaseAdapter(ContextAdapter):
         """Wire the adapter to a :class:`KnowledgeBase` service."""
         self._kb = kb_service
 
-    async def fetch(self, key: str, scope: dict) -> ContextField | None:
+    async def fetch(self, key: str, scope: dict[str, Any]) -> ContextField | None:
         """Resolve a KB-backed context field for ``key`` within ``scope``."""
         spec_metadata: dict[str, Any] = dict(scope.get("spec_metadata", {}))
         workspace_id = scope.get("workspace_id") or scope.get("workspace")

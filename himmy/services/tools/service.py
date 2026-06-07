@@ -46,7 +46,7 @@ from himmy.services.tools.validation import validate_against_schema
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from himmy.core.events import EventSink
-    from himmy.services.inference.models import BoundTool
+    from himmy.services.inference.models import BoundTool, ToolExecutor
 
 PreExecutionHook = Callable[
     [ToolInvocation, ToolDefinition], Awaitable[ToolPolicyDecision]
@@ -578,15 +578,17 @@ class ToolService:
         return result
 
     def bound_tools(self, names: list[str] | None = None) -> list[BoundTool]:
-        """Bind selected tools as inference ``BoundTool``s for the offline path.
+        """Bind selected tools as pure-data inference ``BoundTool``s.
 
-        Each returned ``BoundTool`` carries the tool's schemas and a handler that
-        routes back through :meth:`execute`, returning a ``ToolReturnRecord``. The
-        inference kernel is imported lazily so this module imports without it.
+        Each returned ``BoundTool`` carries only the tool's schemas and read-only
+        flag — execution flows separately through :meth:`tool_executor`, which the
+        runtime attaches to the request. Keeping execution out of ``BoundTool`` is
+        what decouples the inference layer from the tool layer. The inference kernel
+        is imported lazily so this module imports without it.
         """
         # Imported lazily: the inference kernel may be built in parallel and is
         # not on the core import path for this kernel.
-        from himmy.services.inference.models import BoundTool, ToolReturnRecord
+        from himmy.services.inference.models import BoundTool
 
         selected = (
             self._registry.list()
@@ -594,42 +596,44 @@ class ToolService:
             else [d for n in names if (d := self._registry.get(n)) is not None]
         )
 
-        bound: list[BoundTool] = []
-        for definition in selected:
-
-            def _make_handler(
-                tool_name: str,
-            ) -> Callable[[dict[str, Any]], Awaitable[Any]]:
-                async def _handler(args: dict[str, Any]) -> ToolReturnRecord:
-                    invocation = ToolInvocation(tool_name=tool_name, args=args)
-                    res = await self.execute(invocation)
-                    return ToolReturnRecord(
-                        tool_call_id=res.tool_call_id,
-                        tool_name=res.tool_name,
-                        content=res.result,
-                        outcome=res.outcome,
-                        metadata={
-                            "error_code": res.error_code.value
-                            if res.error_code
-                            else None,
-                            "error_message": res.error_message,
-                            "latency_ms": res.latency_ms,
-                        },
-                    )
-
-                return _handler
-
-            bound.append(
-                BoundTool(
-                    name=definition.name,
-                    description=definition.description,
-                    args_json_schema=definition.args_json_schema,
-                    output_json_schema=definition.output_json_schema,
-                    read_only=definition.read_only,
-                    handler=_make_handler(definition.name),
-                )
+        return [
+            BoundTool(
+                name=definition.name,
+                description=definition.description,
+                args_json_schema=definition.args_json_schema,
+                output_json_schema=definition.output_json_schema,
+                read_only=definition.read_only,
             )
-        return bound
+            for definition in selected
+        ]
+
+    def tool_executor(self) -> ToolExecutor:
+        """Return the single callback a client manager uses to execute tools by name.
+
+        This is the one explicit seam between inference and tool execution: it routes
+        ``(tool_name, args)`` through :meth:`execute` (so every policy hook, timeout,
+        retry, and event still applies) and normalizes the result into a
+        ``ToolReturnRecord``. The runtime attaches it to ``InferenceRequest`` next to
+        ``bound_tools``; unknown names fail closed via :meth:`execute`.
+        """
+        # Imported lazily: the inference kernel is not on this kernel's import path.
+        from himmy.services.inference.models import ToolReturnRecord
+
+        async def _execute(tool_name: str, args: dict[str, Any]) -> ToolReturnRecord:
+            res = await self.execute(ToolInvocation(tool_name=tool_name, args=args))
+            return ToolReturnRecord(
+                tool_call_id=res.tool_call_id,
+                tool_name=res.tool_name,
+                content=res.result,
+                outcome=res.outcome,
+                metadata={
+                    "error_code": res.error_code.value if res.error_code else None,
+                    "error_message": res.error_message,
+                    "latency_ms": res.latency_ms,
+                },
+            )
+
+        return _execute
 
 
 class _RetryPolicy:

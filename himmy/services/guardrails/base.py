@@ -11,7 +11,7 @@ so they sit on the hot path without adding latency or I/O.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass
@@ -30,7 +30,7 @@ class Guardrail(Protocol):
 
     name: str
 
-    def inspect(self, text: str, *, context: dict) -> GuardrailVerdict: ...
+    def inspect(self, text: str, *, context: dict[str, Any]) -> GuardrailVerdict: ...
 
 
 class GuardrailPipeline:
@@ -45,7 +45,9 @@ class GuardrailPipeline:
         """The names of the guardrails in this pipeline."""
         return [g.name for g in self._guardrails]
 
-    def inspect(self, text: str, *, context: dict | None = None) -> GuardrailVerdict:
+    def inspect(
+        self, text: str, *, context: dict[str, Any] | None = None
+    ) -> GuardrailVerdict:
         """Run every guardrail over ``text``; thread redactions, accumulate flags."""
         ctx = context or {}
         current = text

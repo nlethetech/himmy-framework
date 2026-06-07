@@ -14,13 +14,8 @@ from himmy.services.inference.models import (
     InferenceMessage,
     InferenceRequest,
     ResponseFormat,
-    ToolReturnRecord,
 )
 from tests.conftest import run_async
-
-
-async def _handler(args: dict) -> ToolReturnRecord:
-    return ToolReturnRecord(tool_call_id="", tool_name="lookup", content={"ok": args})
 
 
 def _tool(name: str) -> BoundTool:
@@ -32,7 +27,6 @@ def _tool(name: str) -> BoundTool:
             "properties": {"q": {"type": "string"}},
             "required": ["q"],
         },
-        handler=_handler,
     )
 
 

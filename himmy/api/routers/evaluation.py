@@ -7,7 +7,7 @@ actual outputs to score it, and GET runs by suite for the dashboard's
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -45,8 +45,11 @@ def _evaluation_service(request: Request) -> Any:
 @router.post("/runs", response_model=EvaluationRun, dependencies=_WRITE)
 async def run_suite(body: RunSuiteRequest, request: Request) -> EvaluationRun:
     """Score a suite against actual outputs and persist + return the run."""
-    return await _evaluation_service(request).run_suite(
-        suite=body.suite, actual_outputs=body.actual_outputs
+    return cast(
+        EvaluationRun,
+        await _evaluation_service(request).run_suite(
+            suite=body.suite, actual_outputs=body.actual_outputs
+        ),
     )
 
 
@@ -56,7 +59,9 @@ async def list_evaluation_runs(
 ) -> list[EvaluationRun]:
     """List evaluation runs, optionally filtered by suite id."""
     storage = _container(request).storage
-    return await storage.list_evaluation_runs(suite_id=suite_id)
+    return cast(
+        list[EvaluationRun], await storage.list_evaluation_runs(suite_id=suite_id)
+    )
 
 
 @router.get(
@@ -71,7 +76,7 @@ async def get_evaluation_run(run_id: str, request: Request) -> EvaluationRun:
     run = await storage.get_evaluation_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="evaluation run not found")
-    return run
+    return cast(EvaluationRun, run)
 
 
 __all__ = ["router"]

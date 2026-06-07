@@ -184,6 +184,13 @@ class PromptManager:
             blocks.append(
                 _render(section.get("skills", ""), {"skills": _join_list(vars.skills)})
             )
+        # Always append the framework-wide operating principles (grounding, cite
+        # sources, use the user's exact terms). Rendered unconditionally so every
+        # agent inherits trustworthy, verifiable conduct by default; edit the
+        # ``conduct`` section of the prompt template to change it.
+        conduct = self.template.section("conduct").get("default", "")
+        if conduct:
+            blocks.append(conduct.strip())
         return "\n\n".join(b for b in blocks if b).strip()
 
     def get_task_prompt(self, vars: TaskPromptVariables) -> str:

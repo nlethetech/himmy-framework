@@ -88,7 +88,7 @@ def _summarize(path: Path, root: Path) -> AgentSummary | None:
     )
 
 
-def _looks_like_team(path: Path) -> dict | None:
+def _looks_like_team(path: Path) -> dict[str, Any] | None:
     """Return the parsed mapping if ``path`` is a team spec (entry + members), else None."""
     import yaml
 
@@ -500,7 +500,7 @@ class _Cognition:
 
 
 async def _drain_cognition(
-    queue: asyncio.Queue, run_task: asyncio.Task, cog: _Cognition
+    queue: asyncio.Queue[Any], run_task: asyncio.Task[Any], cog: _Cognition
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield cognition frames live as runtime events arrive, until the run finishes."""
     while True:
@@ -588,7 +588,7 @@ async def stream_agent_run(
     """
     history = history or []
     collected_events: list[Any] = []
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
 
     async def _on_event(event: Any) -> None:
         collected_events.append(event)  # for the raw-I/O inspector timeline
@@ -822,7 +822,7 @@ def _build_timeline(
         label: str,
         detail: str = "",
         ts: str | None = None,
-        io: dict | None = None,
+        io: dict[str, Any] | None = None,
     ) -> None:
         steps.append(
             TimelineStep(
@@ -937,7 +937,7 @@ async def stream_team_run(
     from himmy.config.team_spec import build_team, build_team_inference
     from himmy.orchestrators import MultiAgentOrchestrator
 
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
     collected: list[Any] = []
 
     async def _push(event: Any) -> None:

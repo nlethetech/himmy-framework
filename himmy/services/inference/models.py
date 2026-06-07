@@ -123,14 +123,25 @@ class ToolReturnRecord(BaseModel):
     metadata: dict[str, Any] = {}
 
 
+#: Executes a bound tool by name and returns its :class:`ToolReturnRecord`.
+#:
+#: A single execution callback the runtime hands to a client manager on the
+#: :class:`InferenceRequest`. Keeping execution OUT of :class:`BoundTool` (which is
+#: now pure, serializable data) means the inference layer no longer holds tool-layer
+#: Python callables — it advertises tool schemas and invokes execution through this
+#: one explicit, minimal seam (``ToolService.tool_executor``).
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[ToolReturnRecord]]
+
+
 class BoundTool(BaseModel):
-    """Internal tool binding consumed by the offline stub path.
+    """A pure-data tool binding (name + schemas) consumed by the inference path.
 
-    The runtime/tool kernel produces these so the stub can synthesize arguments
-    from ``args_json_schema`` and (optionally) execute the bound ``handler``.
+    The runtime/tool kernel produces these so a manager can advertise the tool to
+    the model and synthesize arguments from ``args_json_schema``. Execution is NOT
+    carried here — it flows through :data:`ToolExecutor` on the request, so this
+    model stays free of Python callables and the inference layer stays decoupled
+    from the tool layer.
     """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str
     description: str = ""
@@ -139,7 +150,6 @@ class BoundTool(BaseModel):
     #: read-only (True) / mutating (False) / infer-from-name (None); surfaced to the
     #: model so a look-up doesn't pick a write tool.
     read_only: bool | None = None
-    handler: Callable[[dict[str, Any]], Awaitable[ToolReturnRecord]] | None = None
 
 
 class WorkflowDefinition(BaseModel):
@@ -190,6 +200,9 @@ class InferenceRequest(BaseModel):
     metadata: dict[str, Any] = {}
     toolsets: list[Any] = []
     bound_tools: list[BoundTool] = []
+    #: Executes the bound tools by name (set by the runtime alongside ``bound_tools``).
+    #: ``None`` means no execution capability — managers then synthesize stub results.
+    tool_executor: ToolExecutor | None = None
     tool_names_override: list[str] | None = None
 
     @model_validator(mode="after")

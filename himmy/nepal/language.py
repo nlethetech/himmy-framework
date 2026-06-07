@@ -17,7 +17,7 @@ documents in another. This module normalizes across scripts:
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, cast
 
 # Devanagari consonants -> Roman base (no inherent vowel yet).
 _CONSONANTS = {
@@ -180,11 +180,14 @@ class NepaliEmbedder:
 
     async def embed_query(self, text: str) -> list[float]:
         """Embed a query after folding it across scripts."""
-        return await self._base.embed_query(normalize_nepali(text))
+        return cast(list[float], await self._base.embed_query(normalize_nepali(text)))
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed documents after folding each across scripts."""
-        return await self._base.embed_documents([normalize_nepali(t) for t in texts])
+        return cast(
+            list[list[float]],
+            await self._base.embed_documents([normalize_nepali(t) for t in texts]),
+        )
 
 
 __all__ = [

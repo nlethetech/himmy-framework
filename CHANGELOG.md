@@ -87,6 +87,56 @@ providers, Postgres/pgvector, and observability.
 - **`claude-cli` provider works from inside a Claude Code session.** The subprocess now
   strips the parent session's `CLAUDECODE`/`CLAUDE_CODE_*` env markers so a nested
   `claude -p` starts a clean session instead of erroring.
+- **pydantic-ai toolset binding works on pydantic-ai ≥ 1.x.** `ToolServiceToolset.as_pydantic_ai_toolset`
+  built each proxy with an inline `args: model` annotation; under PEP 563 (`from __future__
+  import annotations`) that stringified to `"model"`, which pydantic-ai 1.106's `get_type_hints()`
+  could no longer resolve (`NameError` at bind time). The generated arg-model class is now
+  assigned directly to the proxy's `__annotations__`, so no string eval runs.
+- **Postgres entity-registry metadata-filter queries actually match now.** `PostgresEntityRegistry.query()`
+  pre-serialized `metadata_filters` with `json.dumps` AND the registered jsonb codec re-serialized
+  it, double-encoding the parameter into a jsonb *string* (`"{...}"`) that `@>` could never match a
+  jsonb *object* — so every `metadata @> $1::jsonb` query silently returned nothing. It now binds
+  the dict directly (the codec encodes once). Verified end-to-end against a live `pgvector/pgvector:pg16`.
+- **pgvector knowledge + Postgres-entity integration tests are re-runnable.** They drove a persistent
+  asyncpg pool across multiple `asyncio.run` loops (a pool is bound to its creating loop → "operation
+  in progress"), and reused a shared, un-truncated table across tests/runs. The knowledge tests now
+  run each scenario in a single event loop, and `_fresh_registry()` truncates so count/containment
+  assertions are isolated.
+
+### Internal — production hardening (architecture)
+- **Decomposed the `StorageService` god object into focused, single-responsibility stores —
+  both backends.** The in-memory backend is a thin facade composing `InMemory{Thread,Event,
+  Context,Run,Recommendation,Evaluation,Orchestration}Store`, and `PostgresStorageService` is
+  likewise a facade composing `Postgres{…}Store` classes (a shared `_PgStoreBase` holds the pool
+  accessor + generic SQL helpers; row mappers are module-level). Each store satisfies a focused
+  protocol in `himmy.services.storage.protocols` (`ThreadStore`, `EventLog`, `ContextStore`,
+  `RunStore`, `RecommendationStore`, `EvaluationStore`, `OrchestrationStore`, plus the
+  runtime-facing `ThreadEventStore`). The public `StorageService`/`PostgresStorageService` APIs
+  are unchanged, so the ~15 call sites are untouched. A DB-free conformance test asserts both
+  facades satisfy every protocol; the Postgres split is verified against a live database.
+- **Disambiguated the two `MemoryStore` protocols.** The storage-layer one (async threads +
+  events) is renamed `ThreadEventStore`; the cognitive-memory one
+  (`himmy.services.memory.store.MemoryStore`, sync `MemoryRecord` CRUD) keeps the name it
+  actually describes.
+- **Centralized entity projection.** All 12 `to_record()` methods (plus an inline projection
+  in the context service) now delegate to one algorithm, `himmy.entities.project()`. Domain
+  models declare only *what identifies them* (stable key, namespace, kind); the projection
+  mechanism (stable-id derivation + `EntityRecord.create`) lives in one place. Adds dedicated
+  projection tests (previously there were none).
+- **Decoupled tool execution from the inference layer.** `BoundTool` is now pure data
+  (name + schemas); execution flows through a single `ToolExecutor` callback on the
+  `InferenceRequest`, provided by `ToolService.tool_executor()`. The inference layer no longer
+  carries tool-layer Python callables.
+- **Documented the `metadata` key vocabulary.** `himmy.core.metadata` adds `total=False`
+  `TypedDict`s naming the framework-written keys (assistant message, routing, persona, context,
+  knowledge-adapter, tool-event). The model fields stay open `dict[str, Any]` (extensibility is
+  a feature); the TypedDicts type the write sites that opt in. (Typing the routing site surfaced
+  and fixed a latent `route_label` nullability bug.)
+- **Tightened mypy to near-strict.** Enabled `disallow_untyped_defs`/`_incomplete_defs`/
+  `_untyped_calls`/`_untyped_decorators`, `disallow_any_generics`, `warn_return_any`,
+  `strict_equality`, `extra_checks`, `no_implicit_reexport`, and `warn_unused_configs`, and
+  cleared the resulting ~86 errors. `warn_unused_ignores` is intentionally left off: many
+  `# type: ignore`s guard optional-extra imports and are required in the no-extras base install.
 
 ### Changed
 - **Renamed the project to the Himmy Agent Framework.** The import package is now

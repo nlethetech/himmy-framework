@@ -6,7 +6,7 @@ routes declare typed responses + 404 shapes (AAEO-9).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -74,8 +74,11 @@ async def list_fields(
 ) -> list[ContextField]:
     """List the stored context fields for a subject (workspace-scoped, AAEO-4)."""
     workspace_id = resolve_workspace(request, workspace_id)
-    return await _container(request).context_app.list_fields(
-        subject_id, workspace_id=workspace_id
+    return cast(
+        list[ContextField],
+        await _container(request).context_app.list_fields(
+            subject_id, workspace_id=workspace_id
+        ),
     )
 
 
@@ -88,11 +91,14 @@ async def build_snapshot(
     metadata = dict(body.metadata or {})
     if workspace_id is not None:
         metadata.setdefault("workspace_id", workspace_id)
-    return await _container(request).context_app.build_snapshot(
-        subject_id=body.subject_id,
-        task_id=body.task_id,
-        build_spec=body.build_spec,
-        metadata=metadata or None,
+    return cast(
+        ContextSnapshot,
+        await _container(request).context_app.build_snapshot(
+            subject_id=body.subject_id,
+            task_id=body.task_id,
+            build_spec=body.build_spec,
+            metadata=metadata or None,
+        ),
     )
 
 
@@ -114,7 +120,7 @@ async def get_snapshot(
     )
     if snapshot is None:
         raise HTTPException(status_code=404, detail="snapshot not found")
-    return snapshot
+    return cast(ContextSnapshot, snapshot)
 
 
 __all__ = ["router"]

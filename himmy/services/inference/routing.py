@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from himmy.core.errors import HimmyError
+from himmy.core.metadata import RouteMetadata
 from himmy.services.inference.client_manager import ClientManager
 from himmy.services.inference.models import (
     InferenceError,
@@ -189,12 +190,12 @@ class RoutingClientManager:
         route: Route,
     ) -> InferenceResponse:
         """Stamp the fallback chain + serving-route info onto a response."""
-        response.metadata = {
-            **response.metadata,
+        route_meta: RouteMetadata = {
             "fallback_chain": attempts,
             "route_index": index,
             "route_label": route.label,
         }
+        response.metadata = {**response.metadata, **route_meta}
         return response
 
 

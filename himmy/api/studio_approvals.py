@@ -168,7 +168,7 @@ async def resolve(
         return
 
     collected: list[Any] = []
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
 
     async def _on_event(event: Any) -> None:
         collected.append(event)

@@ -150,6 +150,16 @@ export default function Chat() {
     }
   };
 
+  // Persist when a run finishes (busy true→false). Doing it here — rather than in
+  // send()'s finally — guarantees the final reply has committed to messagesRef, so
+  // the saved transcript always includes the assistant turn (not just the user's).
+  const wasBusy = useRef(false);
+  useEffect(() => {
+    if (wasBusy.current && !busy) void persist();
+    wasBusy.current = busy;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy]);
+
   const picked: Pick | null = (() => {
     const team = teams.find((t) => t.path === path);
     if (team) return { kind: "team", item: team };
@@ -316,7 +326,10 @@ export default function Chat() {
       patchLast((m) => ({ ...m, streaming: false }));
       setBusy(false);
       abortRef.current = null;
-      void persist();
+      // NOTE: do NOT persist() here — patchLast/setBusy are async, so messagesRef
+      // hasn't yet flushed the final reply and we'd save a partial transcript
+      // (e.g. the user turn without the assistant answer). The busy→false effect
+      // below persists once state has committed and messagesRef is current.
     }
   };
 

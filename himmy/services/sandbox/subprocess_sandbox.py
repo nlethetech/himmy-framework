@@ -28,6 +28,7 @@ import signal
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 
@@ -144,7 +145,7 @@ class SubprocessSandbox:
         return env
 
     @staticmethod
-    def _preexec(limits: SandboxLimits):  # noqa: ANN205 - returns a child callback
+    def _preexec(limits: SandboxLimits) -> Callable[[], None]:  # noqa: ANN205 - returns a child callback
         """Return a POSIX child-process callback that applies the resource limits."""
 
         def _apply() -> None:  # pragma: no cover - runs in the forked child

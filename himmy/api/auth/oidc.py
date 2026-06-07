@@ -14,7 +14,7 @@ self-signed key — no IdP or network required.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from himmy.api.auth.base import AuthError, client_ip
 from himmy.api.auth.principal import Principal
@@ -235,7 +235,7 @@ class OidcAuthenticator:
         keys = jwks.get("keys") or []
         for jwk in keys:
             if kid is None or jwk.get("kid") == kid:
-                return jwk
+                return cast(dict[str, Any], jwk)
         return None
 
     def _principal_from_claims(

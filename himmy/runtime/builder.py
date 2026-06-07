@@ -79,7 +79,7 @@ def build_inference() -> InferenceService:
 
 
 def build_storage() -> StorageService:
-    """Build a fresh in-memory :class:`StorageService` (EventSink + MemoryStore)."""
+    """Build a fresh in-memory :class:`StorageService` (EventSink + ThreadEventStore)."""
     return StorageService()
 
 

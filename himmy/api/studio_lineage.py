@@ -8,12 +8,14 @@ grounded on, and any specialists it delegated to — so you can see *why it said
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel
 
 
 class LineageTool(BaseModel):
     name: str
-    args: dict | None = None
+    args: dict[str, Any] | None = None
     result: str | None = None
     outcome: str | None = None
     read_only: bool | None = None

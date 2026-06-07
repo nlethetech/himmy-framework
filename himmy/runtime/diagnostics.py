@@ -15,6 +15,7 @@ import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 # Optional extras probed by module import — label is what the user sees.
 _EXTRAS: tuple[tuple[str, str], ...] = (
@@ -76,7 +77,7 @@ class DoctorReport:
     has_agent: bool = False
     next_step: NextStep | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """JSON-friendly dict (nested dataclasses flattened)."""
         return asdict(self)
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -28,6 +28,22 @@ T = TypeVar("T")
 def run_async(coro: Awaitable[T]) -> T:
     """Run an awaitable to completion on a fresh event loop (asyncio.run shim)."""
     return asyncio.run(coro)  # type: ignore[arg-type]
+
+
+def executor_from(
+    handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]],
+) -> Callable[[str, dict[str, Any]], Awaitable[Any]]:
+    """Build a ``ToolExecutor`` from a ``{tool_name: async (args) -> ToolReturnRecord}`` map.
+
+    Mirrors :meth:`ToolService.tool_executor` for tests that build ``BoundTool``s by
+    hand and want them to actually execute through the inference path (execution is
+    no longer carried on ``BoundTool`` itself).
+    """
+
+    async def _exec(name: str, args: dict[str, Any]) -> Any:
+        return await handlers[name](args)
+
+    return _exec
 
 
 # ----------------------------------------------------------------- core builders

@@ -423,7 +423,10 @@ class PostgresEntityRegistry:
             params.append(q.stable_id)
             clauses.append(f"stable_id = ${len(params)}")
         if q.metadata_filters:
-            params.append(json.dumps(q.metadata_filters))
+            # Bind the dict directly: the registered jsonb codec (encoder=json.dumps)
+            # serializes it once. Pre-dumping to a string here double-encodes it into
+            # a jsonb *string* ("{...}") that never @>-matches a jsonb *object*.
+            params.append(q.metadata_filters)
             clauses.append(f"metadata @> ${len(params)}::jsonb")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         async with pool.acquire() as conn:

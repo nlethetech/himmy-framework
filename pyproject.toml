@@ -159,8 +159,24 @@ ignore = [
 python_version = "3.12"
 files = ["himmy"]
 ignore_missing_imports = false
+# Near-strict: every flag in mypy's ``--strict`` is enabled here EXCEPT
+# ``warn_unused_ignores``. That one is intentionally off: many ``# type: ignore``
+# comments guard imports/calls into OPTIONAL extras (pydantic-ai, asyncpg, openai,
+# presidio, …). With the extras installed (CI/dev) those ignores look "unused", but
+# they are required when the extras are absent (the offline-first base install), so
+# flagging them would force their removal and break no-extras type-checking.
 warn_redundant_casts = true
 no_implicit_optional = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_any_generics = true
+warn_return_any = true
+warn_unused_configs = true
+strict_equality = true
+extra_checks = true
+no_implicit_reexport = true
 
 # Optional third-party deps (only present with the relevant extras installed) have
 # no stubs in the base/offline environment — don't fail the gate on them.
@@ -169,7 +185,6 @@ module = [
     "pydantic_ai.*",
     "logfire.*",
     "asyncpg.*",
-    "pgvector.*",
     "openai.*",
     "pypdf.*",
     "feedparser.*",
@@ -180,7 +195,6 @@ module = [
     "google.*",
     "azure.*",
     "presidio_analyzer.*",
-    "presidio_anonymizer.*",
 ]
 ignore_missing_imports = true
 

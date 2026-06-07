@@ -31,13 +31,13 @@ class Task(BaseModel):
         self, version: int = 1, metadata: dict[str, Any] | None = None
     ) -> EntityRecord:
         """Project this task into its canonical ``EntityRecord`` (kind ``prompt``)."""
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.task_id, namespace="prompt")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=version,
+        return project(
+            self,
+            stable_value=self.task_id,
+            namespace="prompt",
             kind="prompt",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=version,
+            metadata=metadata,
         )

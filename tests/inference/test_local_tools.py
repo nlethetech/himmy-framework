@@ -9,7 +9,7 @@ from himmy.services.inference.models import (
     InferenceRequest,
     ToolReturnRecord,
 )
-from tests.conftest import run_async
+from tests.conftest import executor_from, run_async
 
 
 async def _search_handler(args: dict) -> ToolReturnRecord:
@@ -26,14 +26,16 @@ _TOOL = BoundTool(
         "properties": {"query": {"type": "string"}},
         "required": ["query"],
     },
-    handler=_search_handler,
 )
+
+_EXECUTOR = executor_from({"web_search": _search_handler})
 
 
 def _req(tools: bool = True) -> InferenceRequest:
     return InferenceRequest(
         messages=[InferenceMessage(role="user", content="find permaculture")],
         bound_tools=[_TOOL] if tools else [],
+        tool_executor=_EXECUTOR if tools else None,
     )
 
 

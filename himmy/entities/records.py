@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -64,7 +64,7 @@ def metadata_contains(haystack: Any, needle: Any) -> bool:
         return all(
             any(metadata_contains(item, sub) for item in haystack) for sub in needle
         )
-    return haystack == needle
+    return cast(bool, haystack == needle)
 
 
 class EntityRecord(BaseModel):

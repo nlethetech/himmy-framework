@@ -11,7 +11,7 @@ pydantic-ai. Offline, the runtime uses the ``BoundTool`` path from
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import create_model
 
@@ -57,7 +57,7 @@ def build_arg_model(name: str, args_json_schema: dict[str, Any]) -> type:
         not isinstance(args_json_schema, dict)
         or args_json_schema.get("type") != "object"
     ):
-        return create_model(model_name)  # type: ignore[call-overload]
+        return cast(type, create_model(model_name))  # type: ignore[call-overload]
 
     properties = args_json_schema.get("properties", {}) or {}
     required = set(args_json_schema.get("required", []) or [])
@@ -70,7 +70,7 @@ def build_arg_model(name: str, args_json_schema: dict[str, Any]) -> type:
             fields[prop_name] = (py_type, ...)
         else:
             fields[prop_name] = (py_type | None if py_type is not Any else Any, None)
-    return create_model(model_name, **fields)  # type: ignore[call-overload]
+    return cast(type, create_model(model_name, **fields))  # type: ignore[call-overload]
 
 
 class ToolServiceToolset:
@@ -124,7 +124,7 @@ class ToolServiceToolset:
             arg_model = build_arg_model(definition.name, definition.args_json_schema)
 
             def _make_proxy(tool_name: str, model: type) -> Any:
-                async def _proxy(args: model) -> Any:  # type: ignore[valid-type]
+                async def _proxy(args):  # type: ignore[no-untyped-def]
                     payload = (
                         args.model_dump(exclude_none=True)  # type: ignore[attr-defined]
                         if hasattr(args, "model_dump")
@@ -142,6 +142,12 @@ class ToolServiceToolset:
                         )
                     return result.result
 
+                # This module uses PEP 563 (``from __future__ import annotations``),
+                # which would stringify an inline ``args: model`` annotation to the
+                # literal ``"model"`` — a closure local that pydantic-ai's
+                # ``get_type_hints()`` can't resolve (NameError at bind time). Assign
+                # the real generated arg-model class object directly so no eval runs.
+                _proxy.__annotations__ = {"args": model, "return": Any}
                 return _proxy
 
             tools.append(

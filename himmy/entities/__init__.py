@@ -16,6 +16,7 @@ from himmy.entities.lineage import (
     LineageGraph,
 )
 from himmy.entities.postgres import PostgresEntityRegistry
+from himmy.entities.projection import project
 from himmy.entities.records import (
     EntityLink,
     EntityQuery,
@@ -38,6 +39,7 @@ __all__ = [
     "DEFAULT_TRACE_DEPTH",
     "stable_id_for",
     "record_id_for",
+    "project",
     # tamper-evident audit
     "AuditBundle",
     "VerificationResult",

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from himmy.core.ids import new_uuid
-from himmy.entities.records import stable_id_for
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from himmy.entities.records import EntityRecord
@@ -101,15 +100,15 @@ class ToolDefinition(BaseModel):
         self, version: int = 1, metadata: dict[str, Any] | None = None
     ) -> EntityRecord:
         """Project this definition into its ``EntityRecord`` (kind ``tool_definition``)."""
-        from himmy.entities.records import EntityRecord
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.name, namespace="tool_definition")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=version,
+        return project(
+            self,
+            stable_value=self.name,
+            namespace="tool_definition",
             kind="tool_definition",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=version,
+            metadata=metadata,
         )
 
 

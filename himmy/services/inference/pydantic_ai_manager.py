@@ -24,6 +24,7 @@ when pydantic_ai is absent, and these paths are providers-gated in tests.
 from __future__ import annotations
 
 import time
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 from himmy.core.errors import HimmyError
@@ -35,6 +36,7 @@ from himmy.services.inference.models import (
     InferenceStatus,
     ResponseFormat,
     ToolCallRecord,
+    ToolExecutor,
     ToolReturnRecord,
 )
 
@@ -132,14 +134,14 @@ class PydanticAIClientManager:
         for bound in request.bound_tools:
             if allowed is not None and bound.name not in allowed:
                 continue
-            tools.append(self._make_tool(pydantic_ai, bound))
+            tools.append(self._make_tool(pydantic_ai, bound, request.tool_executor))
         # Caller-supplied toolsets pass straight through.
         tools.extend(request.toolsets or [])
         return tools
 
     @staticmethod
-    def _make_tool(pydantic_ai: Any, bound: Any) -> Any:
-        """Build one pydantic-ai Tool from a BoundTool, routing to its handler.
+    def _make_tool(pydantic_ai: Any, bound: Any, executor: ToolExecutor | None) -> Any:
+        """Build one pydantic-ai Tool from a BoundTool, routing to the executor.
 
         The tool's ``args_json_schema`` is handed to pydantic-ai explicitly via
         ``Tool.from_schema`` so the provider advertises the REAL parameter names/types to
@@ -148,9 +150,9 @@ class PydanticAIClientManager:
         """
 
         async def _runner(**kwargs: Any) -> Any:
-            if bound.handler is None:
+            if executor is None:
                 return {"stub": True, "args": kwargs}
-            ret: ToolReturnRecord = await bound.handler(kwargs)
+            ret: ToolReturnRecord = await executor(bound.name, kwargs)
             return ret.content
 
         _runner.__name__ = bound.name
@@ -222,7 +224,9 @@ class PydanticAIClientManager:
         except Exception as exc:  # noqa: BLE001 - normalize provider failures
             return self._failed(request, model_string, started, exc)
 
-    async def generate_stream(self, request: InferenceRequest):
+    async def generate_stream(
+        self, request: InferenceRequest
+    ) -> AsyncIterator[str | InferenceResponse]:
         """Stream text deltas via ``agent.run_stream`` then the final response (INF-7)."""
         model_string = self.resolve(request.model_key)
         started = time.perf_counter()

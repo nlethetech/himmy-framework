@@ -209,14 +209,14 @@ class ContextService:
         self._registry.register(snapshot_record)
         for key, field in snapshot.fields.items():
             for ref in field.evidence_refs:
-                from himmy.entities.records import EntityRecord, stable_id_for
+                from himmy.entities.projection import project
 
-                stable_id = stable_id_for(ref.evidence_id, namespace="context_evidence")
-                evidence_record = EntityRecord.create(
-                    stable_id=stable_id,
-                    version=1,
+                evidence_record = project(
+                    ref,
+                    stable_value=ref.evidence_id,
+                    namespace="context_evidence",
                     kind="context_evidence",
-                    payload=ref.model_dump(mode="json"),
+                    version=1,
                     metadata={"key": key, "snapshot_id": snapshot.snapshot_id},
                 )
                 self._registry.register(evidence_record)

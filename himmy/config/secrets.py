@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable, Iterable
@@ -202,7 +202,7 @@ class AwsSecretsManager:
             resp = self._ensure().get_secret_value(SecretId=name)  # type: ignore[attr-defined]
         except Exception:
             return None
-        return resp.get("SecretString")
+        return cast("str | None", resp.get("SecretString"))
 
 
 class GcpSecretManager:
@@ -229,7 +229,7 @@ class GcpSecretManager:
             resp = self._ensure().access_secret_version(name=path)  # type: ignore[attr-defined]
         except Exception:
             return None
-        return resp.payload.data.decode("utf-8")
+        return cast(str, resp.payload.data.decode("utf-8"))
 
 
 class AzureKeyVault:
@@ -259,7 +259,7 @@ class AzureKeyVault:
         if not self._vault_url:
             return None
         try:
-            return self._ensure().get_secret(name).value  # type: ignore[attr-defined]
+            return cast("str | None", self._ensure().get_secret(name).value)  # type: ignore[attr-defined]
         except Exception:
             return None
 

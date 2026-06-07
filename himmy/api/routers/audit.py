@@ -7,7 +7,7 @@ via the principal, like the rest of the BFF.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -37,7 +37,10 @@ async def list_security_events(
     log = getattr(request.app.state, "security_audit", None)
     if log is None:
         return []
-    return log.recent(limit=limit, workspace_id=workspace_id, event_type=event_type)
+    return cast(
+        list[SecurityEvent],
+        log.recent(limit=limit, workspace_id=workspace_id, event_type=event_type),
+    )
 
 
 @router.get("/bundle", response_model=AuditBundle, dependencies=_AUDIT_READ)

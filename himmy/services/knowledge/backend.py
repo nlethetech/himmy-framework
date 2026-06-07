@@ -21,7 +21,7 @@ skip when ``HIMMY_TEST_POSTGRES_DSN`` is unset.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from himmy.core.errors import HimmyError
 from himmy.services.knowledge.models import (
@@ -373,7 +373,7 @@ class PgVectorKnowledgeBackend:
         sql = "DELETE FROM knowledge_bases WHERE kb_id = $1"
         async with self._pool.acquire() as conn:
             status = await conn.execute(sql, kb_id)
-        return status.endswith(" 1")
+        return cast(bool, status.endswith(" 1"))
 
     # -------------------------------------------------------------- documents
     async def persist_documents(
@@ -443,7 +443,7 @@ class PgVectorKnowledgeBackend:
         sql = "DELETE FROM knowledge_documents WHERE document_id = $1 AND kb_id = $2"
         async with self._pool.acquire() as conn:
             status = await conn.execute(sql, document_id, kb_id)
-        return status.endswith(" 1")
+        return cast(bool, status.endswith(" 1"))
 
     # ----------------------------------------------------------------- search
     async def search(
@@ -542,10 +542,10 @@ class PgVectorKnowledgeBackend:
             import json
 
             try:
-                return json.loads(value)
+                return cast(dict[str, Any], json.loads(value))
             except (ValueError, TypeError):  # pragma: no cover - defensive
                 return {}
-        return dict(value)
+        return cast(dict[str, Any], dict(value))
 
     def _row_to_kb(self, row: Any) -> KnowledgeBaseRecord:
         """Map a knowledge_bases row to a KnowledgeBaseRecord."""

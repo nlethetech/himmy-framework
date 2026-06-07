@@ -35,15 +35,15 @@ class Message(BaseModel):
         self, version: int = 1, metadata: dict[str, Any] | None = None
     ) -> EntityRecord:
         """Project this message into its canonical ``EntityRecord``."""
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.message_id, namespace="message")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=version,
+        return project(
+            self,
+            stable_value=self.message_id,
+            namespace="message",
             kind="message",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=version,
+            metadata=metadata,
         )
 
 
@@ -76,13 +76,13 @@ class ChatThread(BaseModel):
 
         When ``version`` is None the thread's own ``version`` is used.
         """
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.thread_id, namespace="chat_thread")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=self.version if version is None else version,
+        return project(
+            self,
+            stable_value=self.thread_id,
+            namespace="chat_thread",
             kind="chat_thread",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=self.version if version is None else version,
+            metadata=metadata,
         )

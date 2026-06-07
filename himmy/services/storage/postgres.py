@@ -26,8 +26,9 @@ Production hardening (see IMPROVEMENTS SE-1/4/5/6/10/11):
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from himmy.core.errors import HimmyError
 from himmy.core.events import RunEvent
@@ -362,8 +363,835 @@ def _iso(value: Any) -> str | None:
         return None
     isoformat = getattr(value, "isoformat", None)
     if callable(isoformat):
-        return isoformat()
+        return cast(str, isoformat())
     return str(value)
+
+
+# ----------------------------------------------------------------- row mappers
+def _row_to_event(row: Any) -> RunEvent:
+    """Map a run_events row to a RunEvent (payload is native via the codec)."""
+    data = dict(row)
+    data["timestamp"] = _iso(data.get("timestamp"))
+    data["payload"] = data.get("payload") or {}
+    return RunEvent.model_validate(data)
+
+
+def _row_to_run(row: Any) -> RunRecord:
+    """Map a runs row to a RunRecord (timestamps normalised to ISO)."""
+    data = dict(row)
+    data["created_at"] = _iso(data.get("created_at"))
+    data["updated_at"] = _iso(data.get("updated_at"))
+    data["metadata"] = data.get("metadata") or {}
+    structured = data.get("output_structured")
+    if isinstance(structured, dict) and set(structured.keys()) == {"value"}:
+        data["output_structured"] = structured["value"]
+    return RunRecord.model_validate(data)
+
+
+def _row_to_recommendation(row: Any) -> RecommendationItem:
+    """Map a recommendations row to a RecommendationItem."""
+    data = dict(row)
+    data["created_at"] = _iso(data.get("created_at"))
+    data["metadata"] = data.get("metadata") or {}
+    data["evidence_refs"] = data.get("evidence_refs") or []
+    return RecommendationItem.model_validate(data)
+
+
+class _PgStoreBase:
+    """Shared base for the focused Postgres stores.
+
+    Holds the injected ``require_pool`` callable (the facade's bound
+    :meth:`PostgresStorageService._require_pool`) and the generic SQL helpers
+    that several concern-stores reuse (keyed upsert/fetch, subject and
+    environment/round listings). Each store's method bodies reference
+    ``pool = self._require_pool()`` exactly as the original facade methods did.
+    """
+
+    def __init__(self, require_pool: Callable[[], Any]) -> None:
+        self._require_pool = require_pool
+
+    # ------------------------------------------------------------- generic helpers
+    async def _save_keyed(
+        self, table: str, pk: str, pk_value: str, obj: Any, *, extra: dict[str, Any]
+    ) -> None:
+        """Upsert a record whose columns are (pk, <extra...>, payload, created_at).
+
+        The full model is stored in ``payload``; ``extra`` carries the indexed
+        filter columns (subject_id/agent_id/environment_name/round).
+        """
+        pool = self._require_pool()
+        columns = [pk, *extra.keys(), "payload", "created_at"]
+        values = [
+            pk_value,
+            *extra.values(),
+            obj.model_dump(mode="json"),
+            getattr(obj, "created_at", None) or _utc_now(),
+        ]
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(columns)))
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c != pk)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders}) "
+                f"ON CONFLICT ({pk}) DO UPDATE SET {updates}",
+                *values,
+            )
+
+    async def _fetch_keyed(self, table: str, pk: str, pk_value: str) -> Any | None:
+        """Fetch a single row's payload by primary key."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            return await conn.fetchrow(
+                f"SELECT payload FROM {table} WHERE {pk} = $1", pk_value
+            )
+
+    async def _list_by_subject(self, table: str, subject_id: str | None) -> list[Any]:
+        """List rows optionally filtered by subject_id, ordered by created_at."""
+        pool = self._require_pool()
+        if subject_id is None:
+            sql = f"SELECT payload FROM {table} ORDER BY created_at ASC"
+            params: list[Any] = []
+        else:
+            sql = (
+                f"SELECT payload FROM {table} WHERE subject_id = $1 "
+                "ORDER BY created_at ASC"
+            )
+            params = [subject_id]
+        async with pool.acquire() as conn:
+            return list(await conn.fetch(sql, *params))
+
+    async def _list_by_env_round(
+        self, table: str, environment_name: str | None, round: int | None
+    ) -> list[Any]:
+        """List rows filtered by environment_name and/or round."""
+        pool = self._require_pool()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if environment_name is not None:
+            params.append(environment_name)
+            clauses.append(f"environment_name = ${len(params)}")
+        if round is not None:
+            params.append(round)
+            clauses.append(f"round = ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with pool.acquire() as conn:
+            return list(
+                await conn.fetch(
+                    f"SELECT payload FROM {table}{where} ORDER BY created_at ASC",
+                    *params,
+                )
+            )
+
+
+class PostgresThreadStore(_PgStoreBase):
+    """Postgres-backed chat-thread persistence keyed by ``thread_id``."""
+
+    async def save_thread(self, thread: Any) -> Any:
+        """Upsert a chat thread keyed by ``thread_id`` (refreshes ``updated_at``)."""
+        pool = self._require_pool()
+        from himmy.core.ids import utc_now_iso
+
+        payload = thread.model_dump(mode="json")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO chat_threads
+                    (thread_id, agent_id, version, payload, metadata, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (thread_id) DO UPDATE SET
+                    agent_id = EXCLUDED.agent_id,
+                    version = EXCLUDED.version,
+                    payload = EXCLUDED.payload,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                thread.thread_id,
+                thread.agent_id,
+                thread.version,
+                payload,
+                dict(getattr(thread, "metadata", {}) or {}),
+                utc_now_iso(),
+            )
+        return thread
+
+    async def load_thread(self, thread_id: str) -> Any | None:
+        """Load a chat thread by id, or None."""
+        from himmy.agents.base_agent.thread import ChatThread
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT payload FROM chat_threads WHERE thread_id = $1", thread_id
+            )
+        if row is None:
+            return None
+        return ChatThread.model_validate(row["payload"])
+
+
+class PostgresEventLog(_PgStoreBase):
+    """Postgres-backed append-only run-event stream (EventSink surface)."""
+
+    async def append_event(self, event: RunEvent) -> None:
+        """Append a run event (EventSink role)."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO run_events
+                    (event_id, event_type, trace_id, thread_id, agent_id,
+                     request_id, tool_call_id, latency_ms, cost, payload, error,
+                     timestamp)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+                event.event_id,
+                event.event_type.value,
+                event.trace_id,
+                event.thread_id,
+                event.agent_id,
+                event.request_id,
+                event.tool_call_id,
+                event.latency_ms,
+                event.cost,
+                dict(event.payload or {}),
+                event.error,
+                event.timestamp,
+            )
+
+    async def list_events(
+        self, thread_id: str | None = None, trace_id: str | None = None
+    ) -> list[RunEvent]:
+        """List events, optionally filtered by thread/trace id (insertion order)."""
+        pool = self._require_pool()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if thread_id is not None:
+            params.append(thread_id)
+            clauses.append(f"thread_id = ${len(params)}")
+        if trace_id is not None:
+            params.append(trace_id)
+            clauses.append(f"trace_id = ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM run_events{where} ORDER BY timestamp ASC", *params
+            )
+        return [_row_to_event(r) for r in rows]
+
+
+class PostgresContextStore(_PgStoreBase):
+    """Postgres-backed context fields, snapshots, and evidence."""
+
+    async def save_context_field(self, field: Any) -> Any:
+        """Upsert a context field keyed by ``(subject_id, key)``."""
+        pool = self._require_pool()
+        from himmy.core.ids import utc_now_iso
+
+        subject_id = str(getattr(field, "metadata", {}).get("subject_id", ""))
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO context_fields
+                    (subject_id, key, payload, metadata, updated_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (subject_id, key) DO UPDATE SET
+                    payload = EXCLUDED.payload,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                subject_id,
+                field.key,
+                field.model_dump(mode="json"),
+                dict(getattr(field, "metadata", {}) or {}),
+                utc_now_iso(),
+            )
+        return field
+
+    async def get_context_field(self, subject_id: str, key: str) -> Any | None:
+        """Return the context field for ``(subject_id, key)``, or None."""
+        from himmy.services.context.models import ContextField
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT payload FROM context_fields WHERE subject_id = $1 AND key = $2",
+                subject_id,
+                key,
+            )
+        if row is None:
+            return None
+        return ContextField.model_validate(row["payload"])
+
+    async def list_context_fields(self, subject_id: str) -> list[Any]:
+        """Return all context fields for a subject."""
+        from himmy.services.context.models import ContextField
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT payload FROM context_fields WHERE subject_id = $1", subject_id
+            )
+        return [ContextField.model_validate(r["payload"]) for r in rows]
+
+    async def save_snapshot(self, snapshot: Any) -> Any:
+        """Upsert a context snapshot keyed by ``snapshot_id``."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO context_snapshots
+                    (snapshot_id, subject_id, task_id, payload, metadata, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (snapshot_id) DO UPDATE SET
+                    subject_id = EXCLUDED.subject_id,
+                    task_id = EXCLUDED.task_id,
+                    payload = EXCLUDED.payload,
+                    metadata = EXCLUDED.metadata
+                """,
+                snapshot.snapshot_id,
+                snapshot.subject_id,
+                getattr(snapshot, "task_id", None),
+                snapshot.model_dump(mode="json"),
+                dict(getattr(snapshot, "metadata", {}) or {}),
+                snapshot.created_at,
+            )
+        return snapshot
+
+    async def load_snapshot(self, snapshot_id: str) -> Any | None:
+        """Return a stored snapshot by id, or None."""
+        from himmy.services.context.models import ContextSnapshot
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT payload FROM context_snapshots WHERE snapshot_id = $1",
+                snapshot_id,
+            )
+        if row is None:
+            return None
+        return ContextSnapshot.model_validate(row["payload"])
+
+    async def save_context_evidence(self, record: Any) -> Any:
+        """Persist a context evidence record (idempotent on its id)."""
+        pool = self._require_pool()
+        # Accept either a ContextEvidenceRecord or an EvidenceRef-like object.
+        evidence_id = getattr(record, "evidence_id", None) or new_uuid_safe()
+        payload = (
+            record.model_dump(mode="json")
+            if hasattr(record, "model_dump")
+            else dict(record)
+        )
+        created_at = getattr(record, "created_at", None) or _utc_now()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO context_evidence
+                    (evidence_id, subject_id, snapshot_id, key, payload, metadata,
+                     created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (evidence_id) DO UPDATE SET
+                    subject_id = EXCLUDED.subject_id,
+                    snapshot_id = EXCLUDED.snapshot_id,
+                    key = EXCLUDED.key,
+                    payload = EXCLUDED.payload,
+                    metadata = EXCLUDED.metadata
+                """,
+                evidence_id,
+                getattr(record, "subject_id", None),
+                getattr(record, "snapshot_id", None),
+                getattr(record, "key", None),
+                payload,
+                dict(getattr(record, "metadata", {}) or {}),
+                created_at,
+            )
+        return record
+
+
+class PostgresRunStore(_PgStoreBase):
+    """Postgres-backed run records, including atomic idempotent creation."""
+
+    async def save_run(self, run: RunRecord) -> RunRecord:
+        """Upsert a run record keyed by ``run_id``; storage stamps ``updated_at``.
+
+        Storage owns ``updated_at`` so it can never drift. The partial UNIQUE
+        index ``runs_idempotency_idx`` is the source of truth for the idempotency
+        constraint; this method is a plain upsert by ``run_id`` (use
+        :meth:`save_run_if_absent_by_idempotency` for the race-free create).
+        """
+        from himmy.core.ids import utc_now_iso
+
+        run.updated_at = utc_now_iso()
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(self._RUN_UPSERT_BY_ID, *self._run_params(run))
+        return run
+
+    async def save_run_if_absent_by_idempotency(
+        self, run: RunRecord
+    ) -> tuple[RunRecord, bool]:
+        """Atomically create a run unless its idempotency key already exists.
+
+        Returns ``(run, created)``. The DB partial UNIQUE index closes the race:
+        ``INSERT ... ON CONFLICT (workspace_id, idempotency_key) DO NOTHING`` lets
+        exactly one concurrent writer win. On conflict the existing row is read
+        back and returned with ``created=False``. Runs without an idempotency key
+        are always inserted (the partial index does not apply to NULL keys).
+        """
+        from himmy.core.ids import utc_now_iso
+
+        run.updated_at = utc_now_iso()
+        pool = self._require_pool()
+        if run.idempotency_key is None:
+            async with pool.acquire() as conn:
+                await conn.execute(self._RUN_UPSERT_BY_ID, *self._run_params(run))
+            return run, True
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO runs
+                    (run_id, workspace_id, subject_id, task_id, thread_id,
+                     snapshot_id, persona_name, model_key, idempotency_key, status,
+                     output_text, output_structured, error, trace_id, metadata,
+                     created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                        $14, $15, $16, $17)
+                ON CONFLICT (workspace_id, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                    DO NOTHING
+                RETURNING run_id
+                """,
+                *self._run_params(run),
+            )
+            if row is not None:
+                return run, True
+            existing = await conn.fetchrow(
+                """
+                SELECT * FROM runs
+                WHERE workspace_id = $1 AND idempotency_key = $2
+                """,
+                run.workspace_id,
+                run.idempotency_key,
+            )
+        return _row_to_run(existing), False
+
+    _RUN_UPSERT_BY_ID = """
+        INSERT INTO runs
+            (run_id, workspace_id, subject_id, task_id, thread_id, snapshot_id,
+             persona_name, model_key, idempotency_key, status, output_text,
+             output_structured, error, trace_id, metadata, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                $16, $17)
+        ON CONFLICT (run_id) DO UPDATE SET
+            workspace_id = EXCLUDED.workspace_id,
+            subject_id = EXCLUDED.subject_id,
+            task_id = EXCLUDED.task_id,
+            thread_id = EXCLUDED.thread_id,
+            snapshot_id = EXCLUDED.snapshot_id,
+            persona_name = EXCLUDED.persona_name,
+            model_key = EXCLUDED.model_key,
+            idempotency_key = EXCLUDED.idempotency_key,
+            status = EXCLUDED.status,
+            output_text = EXCLUDED.output_text,
+            output_structured = EXCLUDED.output_structured,
+            error = EXCLUDED.error,
+            trace_id = EXCLUDED.trace_id,
+            metadata = EXCLUDED.metadata,
+            updated_at = EXCLUDED.updated_at
+    """
+
+    @staticmethod
+    def _run_params(run: RunRecord) -> list[Any]:
+        """Positional params for the runs upsert (output_structured as jsonb)."""
+        structured = run.output_structured
+        # output_structured is a jsonb column: the codec encodes dict/list; wrap
+        # scalars/None so the bind type is unambiguous.
+        if structured is not None and not isinstance(structured, (dict, list)):
+            structured = {"value": structured}
+        return [
+            run.run_id,
+            run.workspace_id,
+            run.subject_id,
+            run.task_id,
+            run.thread_id,
+            run.snapshot_id,
+            run.persona_name,
+            run.model_key,
+            run.idempotency_key,
+            run.status.value,
+            run.output_text,
+            structured,
+            run.error,
+            run.trace_id,
+            dict(run.metadata or {}),
+            run.created_at,
+            run.updated_at,
+        ]
+
+    async def get_run(self, run_id: str) -> RunRecord | None:
+        """Return a run record by id, or None."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM runs WHERE run_id = $1", run_id)
+        return _row_to_run(row) if row else None
+
+    async def list_runs(
+        self,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        status: RunStatus | None = None,
+    ) -> list[RunRecord]:
+        """List runs filtered by workspace, subject, and/or status."""
+        pool = self._require_pool()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workspace_id is not None:
+            params.append(workspace_id)
+            clauses.append(f"workspace_id = ${len(params)}")
+        if subject_id is not None:
+            params.append(subject_id)
+            clauses.append(f"subject_id = ${len(params)}")
+        if status is not None:
+            params.append(status.value)
+            clauses.append(f"status = ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM runs{where} ORDER BY created_at ASC", *params
+            )
+        return [_row_to_run(r) for r in rows]
+
+    async def load_run_by_idempotency(
+        self, workspace_id: str, idempotency_key: str
+    ) -> RunRecord | None:
+        """Return the existing run for an idempotency key, or None."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM runs WHERE workspace_id = $1 AND idempotency_key = $2",
+                workspace_id,
+                idempotency_key,
+            )
+        return _row_to_run(row) if row else None
+
+
+class PostgresRecommendationStore(_PgStoreBase):
+    """Postgres-backed recommendation items."""
+
+    async def save_recommendation(self, item: RecommendationItem) -> RecommendationItem:
+        """Upsert a recommendation keyed by ``recommendation_id``."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO recommendations
+                    (recommendation_id, run_id, workspace_id, subject_id, kind,
+                     title, summary, rationale, confidence, evidence_refs, status,
+                     notes, metadata, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                ON CONFLICT (recommendation_id) DO UPDATE SET
+                    run_id = EXCLUDED.run_id,
+                    workspace_id = EXCLUDED.workspace_id,
+                    subject_id = EXCLUDED.subject_id,
+                    kind = EXCLUDED.kind,
+                    title = EXCLUDED.title,
+                    summary = EXCLUDED.summary,
+                    rationale = EXCLUDED.rationale,
+                    confidence = EXCLUDED.confidence,
+                    evidence_refs = EXCLUDED.evidence_refs,
+                    status = EXCLUDED.status,
+                    notes = EXCLUDED.notes,
+                    metadata = EXCLUDED.metadata
+                """,
+                item.recommendation_id,
+                item.run_id,
+                item.workspace_id,
+                item.subject_id,
+                item.kind,
+                item.title,
+                item.summary,
+                item.rationale,
+                item.confidence,
+                list(item.evidence_refs or []),
+                item.status.value,
+                item.notes,
+                dict(item.metadata or {}),
+                item.created_at,
+            )
+        return item
+
+    async def get_recommendation(
+        self, recommendation_id: str
+    ) -> RecommendationItem | None:
+        """Return a recommendation by id, or None."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM recommendations WHERE recommendation_id = $1",
+                recommendation_id,
+            )
+        return _row_to_recommendation(row) if row else None
+
+    async def list_recommendations(
+        self,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        run_id: str | None = None,
+        kind: str | None = None,
+        status: RecommendationStatus | None = None,
+    ) -> list[RecommendationItem]:
+        """List recommendations filtered by the given dimensions."""
+        pool = self._require_pool()
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("workspace_id", workspace_id),
+            ("subject_id", subject_id),
+            ("run_id", run_id),
+            ("kind", kind),
+            ("status", status.value if status is not None else None),
+        ):
+            if value is not None:
+                params.append(value)
+                clauses.append(f"{column} = ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM recommendations{where} ORDER BY created_at ASC",
+                *params,
+            )
+        return [_row_to_recommendation(r) for r in rows]
+
+    async def update_recommendation(
+        self,
+        recommendation_id: str,
+        *,
+        status: RecommendationStatus | None = None,
+        notes: str | None = None,
+    ) -> RecommendationItem | None:
+        """Update a recommendation's status/notes; return it or None."""
+        pool = self._require_pool()
+        sets: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            params.append(status.value)
+            sets.append(f"status = ${len(params)}")
+        if notes is not None:
+            params.append(notes)
+            sets.append(f"notes = ${len(params)}")
+        if not sets:
+            return await self.get_recommendation(recommendation_id)
+        params.append(recommendation_id)
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"UPDATE recommendations SET {', '.join(sets)} "
+                f"WHERE recommendation_id = ${len(params)} RETURNING *",
+                *params,
+            )
+        return _row_to_recommendation(row) if row else None
+
+
+class PostgresEvaluationStore(_PgStoreBase):
+    """Postgres-backed evaluation runs keyed by ``run_id``."""
+
+    async def save_evaluation_run(self, run: Any) -> Any:
+        """Upsert an evaluation run keyed by ``run_id``."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO evaluation_runs
+                    (run_id, suite_id, suite_name, aggregate_score, payload,
+                     created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    suite_id = EXCLUDED.suite_id,
+                    suite_name = EXCLUDED.suite_name,
+                    aggregate_score = EXCLUDED.aggregate_score,
+                    payload = EXCLUDED.payload
+                """,
+                run.run_id,
+                getattr(run, "suite_id", None),
+                getattr(run, "suite_name", None),
+                getattr(run, "aggregate_score", 0.0),
+                run.model_dump(mode="json"),
+                getattr(run, "created_at", None) or _utc_now(),
+            )
+        return run
+
+    async def get_evaluation_run(self, run_id: str) -> Any | None:
+        """Return an evaluation run by id, or None."""
+        from himmy.services.evaluation.models import EvaluationRun
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT payload FROM evaluation_runs WHERE run_id = $1", run_id
+            )
+        if row is None:
+            return None
+        return EvaluationRun.model_validate(row["payload"])
+
+    async def list_evaluation_runs(self, suite_id: str | None = None) -> list[Any]:
+        """List evaluation runs, optionally filtered by suite id."""
+        from himmy.services.evaluation.models import EvaluationRun
+
+        pool = self._require_pool()
+        if suite_id is None:
+            sql = "SELECT payload FROM evaluation_runs ORDER BY created_at ASC"
+            params: list[Any] = []
+        else:
+            sql = (
+                "SELECT payload FROM evaluation_runs WHERE suite_id = $1 "
+                "ORDER BY created_at ASC"
+            )
+            params = [suite_id]
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [EvaluationRun.model_validate(r["payload"]) for r in rows]
+
+
+class PostgresOrchestrationStore(_PgStoreBase):
+    """Postgres-backed multi-agent + world-model records.
+
+    Cognitive memory objects, episodic memories, agent states, actions, and
+    environment states used by the multi-agent orchestrators and simulations.
+    """
+
+    async def save_memory(self, obj: MemoryObject) -> MemoryObject:
+        """Upsert a cognitive memory object."""
+        await self._save_keyed(
+            "memory_objects",
+            "memory_id",
+            obj.memory_id,
+            obj,
+            extra={"subject_id": obj.subject_id, "agent_id": obj.agent_id},
+        )
+        return obj
+
+    async def get_memory(self, memory_id: str) -> MemoryObject | None:
+        """Return a memory object by id, or None."""
+        row = await self._fetch_keyed("memory_objects", "memory_id", memory_id)
+        return MemoryObject.model_validate(row["payload"]) if row else None
+
+    async def list_memory(self, subject_id: str | None = None) -> list[MemoryObject]:
+        """List memory objects, optionally filtered by subject."""
+        rows = await self._list_by_subject("memory_objects", subject_id)
+        return [MemoryObject.model_validate(r["payload"]) for r in rows]
+
+    async def save_episodic_memory(
+        self, obj: EpisodicMemoryObject
+    ) -> EpisodicMemoryObject:
+        """Upsert an episodic memory object."""
+        await self._save_keyed(
+            "episodic_memory_objects",
+            "episode_id",
+            obj.episode_id,
+            obj,
+            extra={"subject_id": obj.subject_id, "agent_id": obj.agent_id},
+        )
+        return obj
+
+    async def get_episodic_memory(self, episode_id: str) -> EpisodicMemoryObject | None:
+        """Return an episodic memory object by id, or None."""
+        row = await self._fetch_keyed(
+            "episodic_memory_objects", "episode_id", episode_id
+        )
+        return EpisodicMemoryObject.model_validate(row["payload"]) if row else None
+
+    async def list_episodic_memory(
+        self, subject_id: str | None = None
+    ) -> list[EpisodicMemoryObject]:
+        """List episodic memory objects, optionally filtered by subject."""
+        rows = await self._list_by_subject("episodic_memory_objects", subject_id)
+        return [EpisodicMemoryObject.model_validate(r["payload"]) for r in rows]
+
+    async def save_agent_state(self, record: AgentStateRecord) -> AgentStateRecord:
+        """Upsert an agent state record."""
+        await self._save_keyed(
+            "agent_states",
+            "state_id",
+            record.state_id,
+            record,
+            extra={
+                "agent_id": record.agent_id,
+                "environment_name": record.environment_name,
+                "round": record.round,
+            },
+        )
+        return record
+
+    async def get_agent_state(self, state_id: str) -> AgentStateRecord | None:
+        """Return an agent state record by id, or None."""
+        row = await self._fetch_keyed("agent_states", "state_id", state_id)
+        return AgentStateRecord.model_validate(row["payload"]) if row else None
+
+    async def list_agent_states(
+        self, environment_name: str | None = None, round: int | None = None
+    ) -> list[AgentStateRecord]:
+        """List agent state records filtered by environment and/or round."""
+        rows = await self._list_by_env_round("agent_states", environment_name, round)
+        return [AgentStateRecord.model_validate(r["payload"]) for r in rows]
+
+    async def save_action(self, record: ActionRecord) -> ActionRecord:
+        """Upsert an action record."""
+        await self._save_keyed(
+            "actions",
+            "action_id",
+            record.action_id,
+            record,
+            extra={
+                "agent_id": record.agent_id,
+                "environment_name": record.environment_name,
+                "round": record.round,
+            },
+        )
+        return record
+
+    async def get_action(self, action_id: str) -> ActionRecord | None:
+        """Return an action record by id, or None."""
+        row = await self._fetch_keyed("actions", "action_id", action_id)
+        return ActionRecord.model_validate(row["payload"]) if row else None
+
+    async def list_actions(
+        self, environment_name: str | None = None, round: int | None = None
+    ) -> list[ActionRecord]:
+        """List action records filtered by environment and/or round."""
+        rows = await self._list_by_env_round("actions", environment_name, round)
+        return [ActionRecord.model_validate(r["payload"]) for r in rows]
+
+    async def save_environment_state(
+        self, record: EnvironmentStateRecord
+    ) -> EnvironmentStateRecord:
+        """Upsert an environment state record."""
+        await self._save_keyed(
+            "environment_states",
+            "environment_state_id",
+            record.environment_state_id,
+            record,
+            extra={
+                "environment_name": record.environment_name,
+                "round": record.round,
+            },
+        )
+        return record
+
+    async def get_environment_state(
+        self, environment_state_id: str
+    ) -> EnvironmentStateRecord | None:
+        """Return an environment state record by id, or None."""
+        row = await self._fetch_keyed(
+            "environment_states", "environment_state_id", environment_state_id
+        )
+        return EnvironmentStateRecord.model_validate(row["payload"]) if row else None
+
+    async def list_environment_states(
+        self, environment_name: str | None = None, round: int | None = None
+    ) -> list[EnvironmentStateRecord]:
+        """List environment state records filtered by environment and/or round."""
+        rows = await self._list_by_env_round(
+            "environment_states", environment_name, round
+        )
+        return [EnvironmentStateRecord.model_validate(r["payload"]) for r in rows]
 
 
 class PostgresStorageService:
@@ -384,6 +1212,15 @@ class PostgresStorageService:
 
     def __init__(self, pool: Any | None = None) -> None:
         self._pool = pool
+        # Compose the focused per-concern stores behind this facade, injecting the
+        # bound ``_require_pool`` so each store reads the live pool lazily.
+        self._thread_store = PostgresThreadStore(self._require_pool)
+        self._event_log = PostgresEventLog(self._require_pool)
+        self._context_store = PostgresContextStore(self._require_pool)
+        self._run_store = PostgresRunStore(self._require_pool)
+        self._recommendation_store = PostgresRecommendationStore(self._require_pool)
+        self._evaluation_store = PostgresEvaluationStore(self._require_pool)
+        self._orchestration_store = PostgresOrchestrationStore(self._require_pool)
 
     @classmethod
     async def connect(
@@ -522,343 +1359,62 @@ class PostgresStorageService:
     # ------------------------------------------------------------------ threads
     async def save_thread(self, thread: Any) -> Any:
         """Upsert a chat thread keyed by ``thread_id`` (refreshes ``updated_at``)."""
-        pool = self._require_pool()
-        from himmy.core.ids import utc_now_iso
-
-        payload = thread.model_dump(mode="json")
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO chat_threads
-                    (thread_id, agent_id, version, payload, metadata, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (thread_id) DO UPDATE SET
-                    agent_id = EXCLUDED.agent_id,
-                    version = EXCLUDED.version,
-                    payload = EXCLUDED.payload,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = EXCLUDED.updated_at
-                """,
-                thread.thread_id,
-                thread.agent_id,
-                thread.version,
-                payload,
-                dict(getattr(thread, "metadata", {}) or {}),
-                utc_now_iso(),
-            )
-        return thread
+        return await self._thread_store.save_thread(thread)
 
     async def load_thread(self, thread_id: str) -> Any | None:
         """Load a chat thread by id, or None."""
-        from himmy.agents.base_agent.thread import ChatThread
-
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT payload FROM chat_threads WHERE thread_id = $1", thread_id
-            )
-        if row is None:
-            return None
-        return ChatThread.model_validate(row["payload"])
+        return await self._thread_store.load_thread(thread_id)
 
     # ------------------------------------------------------------------- events
     async def append_event(self, event: RunEvent) -> None:
         """Append a run event (EventSink role)."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO run_events
-                    (event_id, event_type, trace_id, thread_id, agent_id,
-                     request_id, tool_call_id, latency_ms, cost, payload, error,
-                     timestamp)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                ON CONFLICT (event_id) DO NOTHING
-                """,
-                event.event_id,
-                event.event_type.value,
-                event.trace_id,
-                event.thread_id,
-                event.agent_id,
-                event.request_id,
-                event.tool_call_id,
-                event.latency_ms,
-                event.cost,
-                dict(event.payload or {}),
-                event.error,
-                event.timestamp,
-            )
+        await self._event_log.append_event(event)
 
     async def list_events(
         self, thread_id: str | None = None, trace_id: str | None = None
     ) -> list[RunEvent]:
         """List events, optionally filtered by thread/trace id (insertion order)."""
-        pool = self._require_pool()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if thread_id is not None:
-            params.append(thread_id)
-            clauses.append(f"thread_id = ${len(params)}")
-        if trace_id is not None:
-            params.append(trace_id)
-            clauses.append(f"trace_id = ${len(params)}")
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"SELECT * FROM run_events{where} ORDER BY timestamp ASC", *params
-            )
-        return [self._row_to_event(r) for r in rows]
+        return await self._event_log.list_events(thread_id, trace_id)
 
     # ------------------------------------------------------------------ context
     async def save_context_field(self, field: Any) -> Any:
         """Upsert a context field keyed by ``(subject_id, key)``."""
-        pool = self._require_pool()
-        from himmy.core.ids import utc_now_iso
-
-        subject_id = str(getattr(field, "metadata", {}).get("subject_id", ""))
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO context_fields
-                    (subject_id, key, payload, metadata, updated_at)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (subject_id, key) DO UPDATE SET
-                    payload = EXCLUDED.payload,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = EXCLUDED.updated_at
-                """,
-                subject_id,
-                field.key,
-                field.model_dump(mode="json"),
-                dict(getattr(field, "metadata", {}) or {}),
-                utc_now_iso(),
-            )
-        return field
+        return await self._context_store.save_context_field(field)
 
     async def get_context_field(self, subject_id: str, key: str) -> Any | None:
         """Return the context field for ``(subject_id, key)``, or None."""
-        from himmy.services.context.models import ContextField
-
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT payload FROM context_fields WHERE subject_id = $1 AND key = $2",
-                subject_id,
-                key,
-            )
-        if row is None:
-            return None
-        return ContextField.model_validate(row["payload"])
+        return await self._context_store.get_context_field(subject_id, key)
 
     async def list_context_fields(self, subject_id: str) -> list[Any]:
         """Return all context fields for a subject."""
-        from himmy.services.context.models import ContextField
-
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT payload FROM context_fields WHERE subject_id = $1", subject_id
-            )
-        return [ContextField.model_validate(r["payload"]) for r in rows]
+        return await self._context_store.list_context_fields(subject_id)
 
     async def save_snapshot(self, snapshot: Any) -> Any:
         """Upsert a context snapshot keyed by ``snapshot_id``."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO context_snapshots
-                    (snapshot_id, subject_id, task_id, payload, metadata, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (snapshot_id) DO UPDATE SET
-                    subject_id = EXCLUDED.subject_id,
-                    task_id = EXCLUDED.task_id,
-                    payload = EXCLUDED.payload,
-                    metadata = EXCLUDED.metadata
-                """,
-                snapshot.snapshot_id,
-                snapshot.subject_id,
-                getattr(snapshot, "task_id", None),
-                snapshot.model_dump(mode="json"),
-                dict(getattr(snapshot, "metadata", {}) or {}),
-                snapshot.created_at,
-            )
-        return snapshot
+        return await self._context_store.save_snapshot(snapshot)
 
     async def load_snapshot(self, snapshot_id: str) -> Any | None:
         """Return a stored snapshot by id, or None."""
-        from himmy.services.context.models import ContextSnapshot
-
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT payload FROM context_snapshots WHERE snapshot_id = $1",
-                snapshot_id,
-            )
-        if row is None:
-            return None
-        return ContextSnapshot.model_validate(row["payload"])
+        return await self._context_store.load_snapshot(snapshot_id)
 
     async def save_context_evidence(self, record: Any) -> Any:
         """Persist a context evidence record (idempotent on its id)."""
-        pool = self._require_pool()
-        # Accept either a ContextEvidenceRecord or an EvidenceRef-like object.
-        evidence_id = getattr(record, "evidence_id", None) or new_uuid_safe()
-        payload = (
-            record.model_dump(mode="json")
-            if hasattr(record, "model_dump")
-            else dict(record)
-        )
-        created_at = getattr(record, "created_at", None) or _utc_now()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO context_evidence
-                    (evidence_id, subject_id, snapshot_id, key, payload, metadata,
-                     created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (evidence_id) DO UPDATE SET
-                    subject_id = EXCLUDED.subject_id,
-                    snapshot_id = EXCLUDED.snapshot_id,
-                    key = EXCLUDED.key,
-                    payload = EXCLUDED.payload,
-                    metadata = EXCLUDED.metadata
-                """,
-                evidence_id,
-                getattr(record, "subject_id", None),
-                getattr(record, "snapshot_id", None),
-                getattr(record, "key", None),
-                payload,
-                dict(getattr(record, "metadata", {}) or {}),
-                created_at,
-            )
-        return record
+        return await self._context_store.save_context_evidence(record)
 
     # --------------------------------------------------------------------- runs
     async def save_run(self, run: RunRecord) -> RunRecord:
-        """Upsert a run record keyed by ``run_id``; storage stamps ``updated_at``.
-
-        Storage owns ``updated_at`` so it can never drift. The partial UNIQUE
-        index ``runs_idempotency_idx`` is the source of truth for the idempotency
-        constraint; this method is a plain upsert by ``run_id`` (use
-        :meth:`save_run_if_absent_by_idempotency` for the race-free create).
-        """
-        from himmy.core.ids import utc_now_iso
-
-        run.updated_at = utc_now_iso()
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(self._RUN_UPSERT_BY_ID, *self._run_params(run))
-        return run
+        """Upsert a run record keyed by ``run_id``; storage stamps ``updated_at``."""
+        return await self._run_store.save_run(run)
 
     async def save_run_if_absent_by_idempotency(
         self, run: RunRecord
     ) -> tuple[RunRecord, bool]:
-        """Atomically create a run unless its idempotency key already exists.
-
-        Returns ``(run, created)``. The DB partial UNIQUE index closes the race:
-        ``INSERT ... ON CONFLICT (workspace_id, idempotency_key) DO NOTHING`` lets
-        exactly one concurrent writer win. On conflict the existing row is read
-        back and returned with ``created=False``. Runs without an idempotency key
-        are always inserted (the partial index does not apply to NULL keys).
-        """
-        from himmy.core.ids import utc_now_iso
-
-        run.updated_at = utc_now_iso()
-        pool = self._require_pool()
-        if run.idempotency_key is None:
-            async with pool.acquire() as conn:
-                await conn.execute(self._RUN_UPSERT_BY_ID, *self._run_params(run))
-            return run, True
-
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO runs
-                    (run_id, workspace_id, subject_id, task_id, thread_id,
-                     snapshot_id, persona_name, model_key, idempotency_key, status,
-                     output_text, output_structured, error, trace_id, metadata,
-                     created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                        $14, $15, $16, $17)
-                ON CONFLICT (workspace_id, idempotency_key)
-                    WHERE idempotency_key IS NOT NULL
-                    DO NOTHING
-                RETURNING run_id
-                """,
-                *self._run_params(run),
-            )
-            if row is not None:
-                return run, True
-            existing = await conn.fetchrow(
-                """
-                SELECT * FROM runs
-                WHERE workspace_id = $1 AND idempotency_key = $2
-                """,
-                run.workspace_id,
-                run.idempotency_key,
-            )
-        return self._row_to_run(existing), False
-
-    _RUN_UPSERT_BY_ID = """
-        INSERT INTO runs
-            (run_id, workspace_id, subject_id, task_id, thread_id, snapshot_id,
-             persona_name, model_key, idempotency_key, status, output_text,
-             output_structured, error, trace_id, metadata, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                $16, $17)
-        ON CONFLICT (run_id) DO UPDATE SET
-            workspace_id = EXCLUDED.workspace_id,
-            subject_id = EXCLUDED.subject_id,
-            task_id = EXCLUDED.task_id,
-            thread_id = EXCLUDED.thread_id,
-            snapshot_id = EXCLUDED.snapshot_id,
-            persona_name = EXCLUDED.persona_name,
-            model_key = EXCLUDED.model_key,
-            idempotency_key = EXCLUDED.idempotency_key,
-            status = EXCLUDED.status,
-            output_text = EXCLUDED.output_text,
-            output_structured = EXCLUDED.output_structured,
-            error = EXCLUDED.error,
-            trace_id = EXCLUDED.trace_id,
-            metadata = EXCLUDED.metadata,
-            updated_at = EXCLUDED.updated_at
-    """
-
-    @staticmethod
-    def _run_params(run: RunRecord) -> list[Any]:
-        """Positional params for the runs upsert (output_structured as jsonb)."""
-        structured = run.output_structured
-        # output_structured is a jsonb column: the codec encodes dict/list; wrap
-        # scalars/None so the bind type is unambiguous.
-        if structured is not None and not isinstance(structured, (dict, list)):
-            structured = {"value": structured}
-        return [
-            run.run_id,
-            run.workspace_id,
-            run.subject_id,
-            run.task_id,
-            run.thread_id,
-            run.snapshot_id,
-            run.persona_name,
-            run.model_key,
-            run.idempotency_key,
-            run.status.value,
-            run.output_text,
-            structured,
-            run.error,
-            run.trace_id,
-            dict(run.metadata or {}),
-            run.created_at,
-            run.updated_at,
-        ]
+        """Atomically create a run unless its idempotency key already exists."""
+        return await self._run_store.save_run_if_absent_by_idempotency(run)
 
     async def get_run(self, run_id: str) -> RunRecord | None:
         """Return a run record by id, or None."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM runs WHERE run_id = $1", run_id)
-        return self._row_to_run(row) if row else None
+        return await self._run_store.get_run(run_id)
 
     async def list_runs(
         self,
@@ -867,92 +1423,26 @@ class PostgresStorageService:
         status: RunStatus | None = None,
     ) -> list[RunRecord]:
         """List runs filtered by workspace, subject, and/or status."""
-        pool = self._require_pool()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if workspace_id is not None:
-            params.append(workspace_id)
-            clauses.append(f"workspace_id = ${len(params)}")
-        if subject_id is not None:
-            params.append(subject_id)
-            clauses.append(f"subject_id = ${len(params)}")
-        if status is not None:
-            params.append(status.value)
-            clauses.append(f"status = ${len(params)}")
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"SELECT * FROM runs{where} ORDER BY created_at ASC", *params
-            )
-        return [self._row_to_run(r) for r in rows]
+        return await self._run_store.list_runs(workspace_id, subject_id, status)
 
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str
     ) -> RunRecord | None:
         """Return the existing run for an idempotency key, or None."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM runs WHERE workspace_id = $1 AND idempotency_key = $2",
-                workspace_id,
-                idempotency_key,
-            )
-        return self._row_to_run(row) if row else None
+        return await self._run_store.load_run_by_idempotency(
+            workspace_id, idempotency_key
+        )
 
     # ---------------------------------------------------------- recommendations
     async def save_recommendation(self, item: RecommendationItem) -> RecommendationItem:
         """Upsert a recommendation keyed by ``recommendation_id``."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO recommendations
-                    (recommendation_id, run_id, workspace_id, subject_id, kind,
-                     title, summary, rationale, confidence, evidence_refs, status,
-                     notes, metadata, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-                ON CONFLICT (recommendation_id) DO UPDATE SET
-                    run_id = EXCLUDED.run_id,
-                    workspace_id = EXCLUDED.workspace_id,
-                    subject_id = EXCLUDED.subject_id,
-                    kind = EXCLUDED.kind,
-                    title = EXCLUDED.title,
-                    summary = EXCLUDED.summary,
-                    rationale = EXCLUDED.rationale,
-                    confidence = EXCLUDED.confidence,
-                    evidence_refs = EXCLUDED.evidence_refs,
-                    status = EXCLUDED.status,
-                    notes = EXCLUDED.notes,
-                    metadata = EXCLUDED.metadata
-                """,
-                item.recommendation_id,
-                item.run_id,
-                item.workspace_id,
-                item.subject_id,
-                item.kind,
-                item.title,
-                item.summary,
-                item.rationale,
-                item.confidence,
-                list(item.evidence_refs or []),
-                item.status.value,
-                item.notes,
-                dict(item.metadata or {}),
-                item.created_at,
-            )
-        return item
+        return await self._recommendation_store.save_recommendation(item)
 
     async def get_recommendation(
         self, recommendation_id: str
     ) -> RecommendationItem | None:
         """Return a recommendation by id, or None."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM recommendations WHERE recommendation_id = $1",
-                recommendation_id,
-            )
-        return self._row_to_recommendation(row) if row else None
+        return await self._recommendation_store.get_recommendation(recommendation_id)
 
     async def list_recommendations(
         self,
@@ -963,26 +1453,9 @@ class PostgresStorageService:
         status: RecommendationStatus | None = None,
     ) -> list[RecommendationItem]:
         """List recommendations filtered by the given dimensions."""
-        pool = self._require_pool()
-        clauses: list[str] = []
-        params: list[Any] = []
-        for column, value in (
-            ("workspace_id", workspace_id),
-            ("subject_id", subject_id),
-            ("run_id", run_id),
-            ("kind", kind),
-            ("status", status.value if status is not None else None),
-        ):
-            if value is not None:
-                params.append(value)
-                clauses.append(f"{column} = ${len(params)}")
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"SELECT * FROM recommendations{where} ORDER BY created_at ASC",
-                *params,
-            )
-        return [self._row_to_recommendation(r) for r in rows]
+        return await self._recommendation_store.list_recommendations(
+            workspace_id, subject_id, run_id, kind, status
+        )
 
     async def update_recommendation(
         self,
@@ -992,320 +1465,103 @@ class PostgresStorageService:
         notes: str | None = None,
     ) -> RecommendationItem | None:
         """Update a recommendation's status/notes; return it or None."""
-        pool = self._require_pool()
-        sets: list[str] = []
-        params: list[Any] = []
-        if status is not None:
-            params.append(status.value)
-            sets.append(f"status = ${len(params)}")
-        if notes is not None:
-            params.append(notes)
-            sets.append(f"notes = ${len(params)}")
-        if not sets:
-            return await self.get_recommendation(recommendation_id)
-        params.append(recommendation_id)
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"UPDATE recommendations SET {', '.join(sets)} "
-                f"WHERE recommendation_id = ${len(params)} RETURNING *",
-                *params,
-            )
-        return self._row_to_recommendation(row) if row else None
+        return await self._recommendation_store.update_recommendation(
+            recommendation_id, status=status, notes=notes
+        )
 
     # --------------------------------------------------------------- evaluation
     async def save_evaluation_run(self, run: Any) -> Any:
         """Upsert an evaluation run keyed by ``run_id``."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO evaluation_runs
-                    (run_id, suite_id, suite_name, aggregate_score, payload,
-                     created_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (run_id) DO UPDATE SET
-                    suite_id = EXCLUDED.suite_id,
-                    suite_name = EXCLUDED.suite_name,
-                    aggregate_score = EXCLUDED.aggregate_score,
-                    payload = EXCLUDED.payload
-                """,
-                run.run_id,
-                getattr(run, "suite_id", None),
-                getattr(run, "suite_name", None),
-                getattr(run, "aggregate_score", 0.0),
-                run.model_dump(mode="json"),
-                getattr(run, "created_at", None) or _utc_now(),
-            )
-        return run
+        return await self._evaluation_store.save_evaluation_run(run)
 
     async def get_evaluation_run(self, run_id: str) -> Any | None:
         """Return an evaluation run by id, or None."""
-        from himmy.services.evaluation.models import EvaluationRun
-
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT payload FROM evaluation_runs WHERE run_id = $1", run_id
-            )
-        if row is None:
-            return None
-        return EvaluationRun.model_validate(row["payload"])
+        return await self._evaluation_store.get_evaluation_run(run_id)
 
     async def list_evaluation_runs(self, suite_id: str | None = None) -> list[Any]:
         """List evaluation runs, optionally filtered by suite id."""
-        from himmy.services.evaluation.models import EvaluationRun
-
-        pool = self._require_pool()
-        if suite_id is None:
-            sql = "SELECT payload FROM evaluation_runs ORDER BY created_at ASC"
-            params: list[Any] = []
-        else:
-            sql = (
-                "SELECT payload FROM evaluation_runs WHERE suite_id = $1 "
-                "ORDER BY created_at ASC"
-            )
-            params = [suite_id]
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(sql, *params)
-        return [EvaluationRun.model_validate(r["payload"]) for r in rows]
+        return await self._evaluation_store.list_evaluation_runs(suite_id)
 
     # --------------------------------------------- memory + orchestration records
     async def save_memory(self, obj: MemoryObject) -> MemoryObject:
         """Upsert a cognitive memory object."""
-        await self._save_keyed(
-            "memory_objects",
-            "memory_id",
-            obj.memory_id,
-            obj,
-            extra={"subject_id": obj.subject_id, "agent_id": obj.agent_id},
-        )
-        return obj
+        return await self._orchestration_store.save_memory(obj)
 
     async def get_memory(self, memory_id: str) -> MemoryObject | None:
         """Return a memory object by id, or None."""
-        row = await self._fetch_keyed("memory_objects", "memory_id", memory_id)
-        return MemoryObject.model_validate(row["payload"]) if row else None
+        return await self._orchestration_store.get_memory(memory_id)
 
     async def list_memory(self, subject_id: str | None = None) -> list[MemoryObject]:
         """List memory objects, optionally filtered by subject."""
-        rows = await self._list_by_subject("memory_objects", subject_id)
-        return [MemoryObject.model_validate(r["payload"]) for r in rows]
+        return await self._orchestration_store.list_memory(subject_id)
 
     async def save_episodic_memory(
         self, obj: EpisodicMemoryObject
     ) -> EpisodicMemoryObject:
         """Upsert an episodic memory object."""
-        await self._save_keyed(
-            "episodic_memory_objects",
-            "episode_id",
-            obj.episode_id,
-            obj,
-            extra={"subject_id": obj.subject_id, "agent_id": obj.agent_id},
-        )
-        return obj
+        return await self._orchestration_store.save_episodic_memory(obj)
 
     async def get_episodic_memory(self, episode_id: str) -> EpisodicMemoryObject | None:
         """Return an episodic memory object by id, or None."""
-        row = await self._fetch_keyed(
-            "episodic_memory_objects", "episode_id", episode_id
-        )
-        return EpisodicMemoryObject.model_validate(row["payload"]) if row else None
+        return await self._orchestration_store.get_episodic_memory(episode_id)
 
     async def list_episodic_memory(
         self, subject_id: str | None = None
     ) -> list[EpisodicMemoryObject]:
         """List episodic memory objects, optionally filtered by subject."""
-        rows = await self._list_by_subject("episodic_memory_objects", subject_id)
-        return [EpisodicMemoryObject.model_validate(r["payload"]) for r in rows]
+        return await self._orchestration_store.list_episodic_memory(subject_id)
 
     async def save_agent_state(self, record: AgentStateRecord) -> AgentStateRecord:
         """Upsert an agent state record."""
-        await self._save_keyed(
-            "agent_states",
-            "state_id",
-            record.state_id,
-            record,
-            extra={
-                "agent_id": record.agent_id,
-                "environment_name": record.environment_name,
-                "round": record.round,
-            },
-        )
-        return record
+        return await self._orchestration_store.save_agent_state(record)
 
     async def get_agent_state(self, state_id: str) -> AgentStateRecord | None:
         """Return an agent state record by id, or None."""
-        row = await self._fetch_keyed("agent_states", "state_id", state_id)
-        return AgentStateRecord.model_validate(row["payload"]) if row else None
+        return await self._orchestration_store.get_agent_state(state_id)
 
     async def list_agent_states(
         self, environment_name: str | None = None, round: int | None = None
     ) -> list[AgentStateRecord]:
         """List agent state records filtered by environment and/or round."""
-        rows = await self._list_by_env_round("agent_states", environment_name, round)
-        return [AgentStateRecord.model_validate(r["payload"]) for r in rows]
+        return await self._orchestration_store.list_agent_states(
+            environment_name, round
+        )
 
     async def save_action(self, record: ActionRecord) -> ActionRecord:
         """Upsert an action record."""
-        await self._save_keyed(
-            "actions",
-            "action_id",
-            record.action_id,
-            record,
-            extra={
-                "agent_id": record.agent_id,
-                "environment_name": record.environment_name,
-                "round": record.round,
-            },
-        )
-        return record
+        return await self._orchestration_store.save_action(record)
 
     async def get_action(self, action_id: str) -> ActionRecord | None:
         """Return an action record by id, or None."""
-        row = await self._fetch_keyed("actions", "action_id", action_id)
-        return ActionRecord.model_validate(row["payload"]) if row else None
+        return await self._orchestration_store.get_action(action_id)
 
     async def list_actions(
         self, environment_name: str | None = None, round: int | None = None
     ) -> list[ActionRecord]:
         """List action records filtered by environment and/or round."""
-        rows = await self._list_by_env_round("actions", environment_name, round)
-        return [ActionRecord.model_validate(r["payload"]) for r in rows]
+        return await self._orchestration_store.list_actions(environment_name, round)
 
     async def save_environment_state(
         self, record: EnvironmentStateRecord
     ) -> EnvironmentStateRecord:
         """Upsert an environment state record."""
-        await self._save_keyed(
-            "environment_states",
-            "environment_state_id",
-            record.environment_state_id,
-            record,
-            extra={
-                "environment_name": record.environment_name,
-                "round": record.round,
-            },
-        )
-        return record
+        return await self._orchestration_store.save_environment_state(record)
 
     async def get_environment_state(
         self, environment_state_id: str
     ) -> EnvironmentStateRecord | None:
         """Return an environment state record by id, or None."""
-        row = await self._fetch_keyed(
-            "environment_states", "environment_state_id", environment_state_id
+        return await self._orchestration_store.get_environment_state(
+            environment_state_id
         )
-        return EnvironmentStateRecord.model_validate(row["payload"]) if row else None
 
     async def list_environment_states(
         self, environment_name: str | None = None, round: int | None = None
     ) -> list[EnvironmentStateRecord]:
         """List environment state records filtered by environment and/or round."""
-        rows = await self._list_by_env_round(
-            "environment_states", environment_name, round
+        return await self._orchestration_store.list_environment_states(
+            environment_name, round
         )
-        return [EnvironmentStateRecord.model_validate(r["payload"]) for r in rows]
-
-    # ------------------------------------------------------------- generic helpers
-    async def _save_keyed(
-        self, table: str, pk: str, pk_value: str, obj: Any, *, extra: dict[str, Any]
-    ) -> None:
-        """Upsert a record whose columns are (pk, <extra...>, payload, created_at).
-
-        The full model is stored in ``payload``; ``extra`` carries the indexed
-        filter columns (subject_id/agent_id/environment_name/round).
-        """
-        pool = self._require_pool()
-        columns = [pk, *extra.keys(), "payload", "created_at"]
-        values = [
-            pk_value,
-            *extra.values(),
-            obj.model_dump(mode="json"),
-            getattr(obj, "created_at", None) or _utc_now(),
-        ]
-        placeholders = ", ".join(f"${i + 1}" for i in range(len(columns)))
-        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c != pk)
-        async with pool.acquire() as conn:
-            await conn.execute(
-                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders}) "
-                f"ON CONFLICT ({pk}) DO UPDATE SET {updates}",
-                *values,
-            )
-
-    async def _fetch_keyed(self, table: str, pk: str, pk_value: str) -> Any | None:
-        """Fetch a single row's payload by primary key."""
-        pool = self._require_pool()
-        async with pool.acquire() as conn:
-            return await conn.fetchrow(
-                f"SELECT payload FROM {table} WHERE {pk} = $1", pk_value
-            )
-
-    async def _list_by_subject(self, table: str, subject_id: str | None) -> list[Any]:
-        """List rows optionally filtered by subject_id, ordered by created_at."""
-        pool = self._require_pool()
-        if subject_id is None:
-            sql = f"SELECT payload FROM {table} ORDER BY created_at ASC"
-            params: list[Any] = []
-        else:
-            sql = (
-                f"SELECT payload FROM {table} WHERE subject_id = $1 "
-                "ORDER BY created_at ASC"
-            )
-            params = [subject_id]
-        async with pool.acquire() as conn:
-            return list(await conn.fetch(sql, *params))
-
-    async def _list_by_env_round(
-        self, table: str, environment_name: str | None, round: int | None
-    ) -> list[Any]:
-        """List rows filtered by environment_name and/or round."""
-        pool = self._require_pool()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if environment_name is not None:
-            params.append(environment_name)
-            clauses.append(f"environment_name = ${len(params)}")
-        if round is not None:
-            params.append(round)
-            clauses.append(f"round = ${len(params)}")
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        async with pool.acquire() as conn:
-            return list(
-                await conn.fetch(
-                    f"SELECT payload FROM {table}{where} ORDER BY created_at ASC",
-                    *params,
-                )
-            )
-
-    # ------------------------------------------------------------- row mappers
-    @staticmethod
-    def _row_to_event(row: Any) -> RunEvent:
-        """Map a run_events row to a RunEvent (payload is native via the codec)."""
-        data = dict(row)
-        data["timestamp"] = _iso(data.get("timestamp"))
-        data["payload"] = data.get("payload") or {}
-        return RunEvent.model_validate(data)
-
-    @staticmethod
-    def _row_to_run(row: Any) -> RunRecord:
-        """Map a runs row to a RunRecord (timestamps normalised to ISO)."""
-        data = dict(row)
-        data["created_at"] = _iso(data.get("created_at"))
-        data["updated_at"] = _iso(data.get("updated_at"))
-        data["metadata"] = data.get("metadata") or {}
-        structured = data.get("output_structured")
-        if isinstance(structured, dict) and set(structured.keys()) == {"value"}:
-            data["output_structured"] = structured["value"]
-        return RunRecord.model_validate(data)
-
-    @staticmethod
-    def _row_to_recommendation(row: Any) -> RecommendationItem:
-        """Map a recommendations row to a RecommendationItem."""
-        data = dict(row)
-        data["created_at"] = _iso(data.get("created_at"))
-        data["metadata"] = data.get("metadata") or {}
-        data["evidence_refs"] = data.get("evidence_refs") or []
-        return RecommendationItem.model_validate(data)
 
 
 def _utc_now() -> str:

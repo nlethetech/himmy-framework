@@ -64,15 +64,15 @@ class RunEvent(BaseModel):
     ) -> EntityRecord:
         """Project this event into its canonical ``EntityRecord`` (kind ``run_event``)."""
         # Imported lazily to avoid a core <-> entities import cycle.
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.event_id, namespace="run_event")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=version,
+        return project(
+            self,
+            stable_value=self.event_id,
+            namespace="run_event",
             kind="run_event",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=version,
+            metadata=metadata,
         )
 
 

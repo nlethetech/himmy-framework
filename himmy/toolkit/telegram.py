@@ -16,7 +16,7 @@ Two surfaces over the Telegram Bot API (HTTP, ``httpx`` only — no SDK):
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 from himmy.core.errors import HimmyError
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
@@ -64,11 +64,14 @@ class TelegramClient:
 
     async def get_me(self) -> dict[str, Any]:
         """Return the bot's own profile (``getMe``) — a cheap token-validity check."""
-        return await self._post("getMe", {})
+        return cast(dict[str, Any], await self._post("getMe", {}))
 
     async def send_message(self, chat_id: Any, text: str) -> dict[str, Any]:
         """Send ``text`` to ``chat_id`` (returns the sent Message)."""
-        return await self._post("sendMessage", {"chat_id": chat_id, "text": text})
+        return cast(
+            dict[str, Any],
+            await self._post("sendMessage", {"chat_id": chat_id, "text": text}),
+        )
 
     async def get_updates(
         self, *, offset: int | None = None, timeout: int = 25

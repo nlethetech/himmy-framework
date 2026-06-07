@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict
 
 from himmy.core.errors import HimmyError
+from himmy.core.metadata import RouteMetadata
 from himmy.services.inference.cache import InferenceCache, NoopInferenceCache
 from himmy.services.inference.models import (
     RETRYABLE_ERROR_CODES,
@@ -156,7 +157,8 @@ class InferenceService:
                 hit = cached.model_copy(deep=True)
                 hit.request_id = request.request_id
                 hit.latency_ms = (time.perf_counter() - started) * 1000.0
-                hit.metadata = {**hit.metadata, "cache_hit": True}
+                cache_meta: RouteMetadata = {"cache_hit": True}
+                hit.metadata = {**hit.metadata, **cache_meta}
                 await self._emit(
                     EventType.INFERENCE_SUCCEEDED,
                     request_id=request.request_id,
@@ -358,7 +360,7 @@ class InferenceService:
 
     def _backoff_delay(self, attempt: int) -> float:
         """Exponential backoff with jitter for retry attempt ``attempt`` (0-based)."""
-        base = self._retry_base_delay_seconds * (2**attempt)
+        base: float = self._retry_base_delay_seconds * (2**attempt)
         return base + random.uniform(0.0, self._retry_jitter_seconds)
 
     async def _emit(self, event_type: EventType, **kwargs: object) -> None:

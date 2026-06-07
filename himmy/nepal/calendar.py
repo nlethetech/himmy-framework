@@ -9,6 +9,8 @@ and resolve the Nepal fiscal year (which starts on Shrawan 1, the 4th BS month).
 from __future__ import annotations
 
 import datetime
+import types
+from typing import cast
 
 from pydantic import BaseModel
 
@@ -67,7 +69,7 @@ NEPALI_WEEKDAYS_NE = [
 _FISCAL_START_MONTH = 4
 
 
-def _require_nepali_datetime():  # noqa: ANN202 - returns the module
+def _require_nepali_datetime() -> types.ModuleType:
     try:
         import nepali_datetime
     except ImportError as exc:  # pragma: no cover - only without the extra
@@ -75,7 +77,7 @@ def _require_nepali_datetime():  # noqa: ANN202 - returns the module
             "Bikram Sambat support requires the [nepal] extra "
             "(pip install 'himmy[nepal]')."
         ) from exc
-    return nepali_datetime
+    return cast(types.ModuleType, nepali_datetime)
 
 
 class BikramDate(BaseModel):
@@ -96,7 +98,9 @@ class BikramDate(BaseModel):
     def to_ad(self) -> datetime.date:
         """Convert this BS date to its Gregorian (AD) ``datetime.date``."""
         nd = _require_nepali_datetime()
-        return nd.date(self.year, self.month, self.day).to_datetime_date()
+        return cast(
+            datetime.date, nd.date(self.year, self.month, self.day).to_datetime_date()
+        )
 
     def weekday(self) -> int:
         """Day of week, 0 = Sunday (the Nepali week start)."""

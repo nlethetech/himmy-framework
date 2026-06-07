@@ -31,9 +31,10 @@ from tests.conftest import run_async
 class _ApprovalGateManager:
     """Calls the (approval-gated) bound tool until a tool result exists, then finals.
 
-    This exercises the REAL approval gate: turn 1 invokes the bound tool's handler
-    (which routes through ToolService.execute and gets denied for lack of
-    approval); once a tool result is in the conversation it answers and stops.
+    This exercises the REAL approval gate: turn 1 invokes the bound tool via the
+    request's tool_executor (which routes through ToolService.execute and gets
+    denied for lack of approval); once a tool result is in the conversation it
+    answers and stops.
     """
 
     def resolve(self, model_key: str) -> str:
@@ -44,7 +45,7 @@ class _ApprovalGateManager:
             getattr(m, "role", "") == "tool" for m in request.messages
         )
         if not tool_in_history and request.bound_tools:
-            ret = await request.bound_tools[0].handler({})
+            ret = await request.tool_executor(request.bound_tools[0].name, {})
             return InferenceResponse(
                 request_id=request.request_id,
                 status=InferenceStatus.SUCCESS,

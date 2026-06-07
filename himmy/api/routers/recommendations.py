@@ -6,7 +6,7 @@ is tenant-scoped on ``workspace_id`` (AAEO-4) and declares a 404 shape (AAEO-9).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
@@ -100,7 +100,7 @@ async def update_recommendation(
     )
     if item is None:
         raise HTTPException(status_code=404, detail="recommendation not found")
-    return item
+    return cast(RecommendationItem, item)
 
 
 @router.get(

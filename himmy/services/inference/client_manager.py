@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import AsyncIterator
+from typing import Any, Protocol, cast, runtime_checkable
 
 from himmy.core.errors import HimmyError
 from himmy.services.inference.models import (
@@ -22,6 +23,7 @@ from himmy.services.inference.models import (
     InferenceStatus,
     ResponseFormat,
     ToolCallRecord,
+    ToolExecutor,
     ToolReturnRecord,
     synthesize_from_schema,
 )
@@ -280,7 +282,7 @@ class StubClientManager:
         """Call each bound tool once and reference the outputs in the final text."""
         outputs: list[str] = []
         for tool in request.bound_tools:
-            call, ret = await self._invoke_tool(tool, user_text)
+            call, ret = await self._invoke_tool(tool, user_text, request.tool_executor)
             response.tool_calls.append(call)
             response.tool_returns.append(ret)
             outputs.append(f"{tool.name}->{ret.content!r}")
@@ -306,14 +308,18 @@ class StubClientManager:
             raise HimmyError(
                 f"workflow step tool '{tool_name}' not found in bound_tools"
             )
-        call, ret = await self._invoke_tool(tool, _last_user_message(request))
+        call, ret = await self._invoke_tool(
+            tool, _last_user_message(request), request.tool_executor
+        )
         response.tool_calls.append(call)
         response.tool_returns.append(ret)
         response.output_text = f"[stub] step '{tool_name}' -> {ret.content!r}"
         # Pointer is returned UNCHANGED; the caller drives progression.
         response.workflow = state
 
-    async def generate_stream(self, request: InferenceRequest):
+    async def generate_stream(
+        self, request: InferenceRequest
+    ) -> AsyncIterator[str | InferenceResponse]:
         """Stream the echo as deterministic chunked text deltas, then the response.
 
         Yields ``str`` deltas (the offline analogue of provider token streaming)
@@ -327,9 +333,9 @@ class StubClientManager:
         yield response
 
     async def _invoke_tool(
-        self, tool: Any, user_text: str
+        self, tool: Any, user_text: str, executor: ToolExecutor | None
     ) -> tuple[ToolCallRecord, ToolReturnRecord]:
-        """Synthesize args, run the handler if present, and record the exchange."""
+        """Synthesize args, run via the executor if present, and record the exchange."""
         args = synthesize_from_schema(tool.args_json_schema or {}, seed_text=user_text)
         if not isinstance(args, dict):
             args = {}
@@ -338,8 +344,8 @@ class StubClientManager:
             tool_name=tool.name,
             args=args,
         )
-        if tool.handler is not None:
-            ret = await tool.handler(args)
+        if executor is not None:
+            ret = await executor(tool.name, args)
             # Preserve the synthesized call id for clean pairing.
             ret = ret.model_copy(update={"tool_call_id": call.tool_call_id})
         else:
@@ -436,7 +442,7 @@ class GatewayClientManager:
             # once and route the full request envelope through it.
             if self._delegate is None:
                 self._delegate = self._build_delegate()
-            return await self._delegate.generate(request)
+            return cast(InferenceResponse, await self._delegate.generate(request))
 
         if os.environ.get("HIMMY_GATEWAY_STUB_FALLBACK"):
             if self._stub is None:

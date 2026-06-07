@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import random
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -64,15 +64,15 @@ class WorkflowStep(BaseModel):
         self, version: int = 1, metadata: dict[str, Any] | None = None
     ) -> EntityRecord:
         """Project this step into its canonical ``EntityRecord`` (kind ``workflow_step``)."""
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.name, namespace="workflow_step")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=version,
+        return project(
+            self,
+            stable_value=self.name,
+            namespace="workflow_step",
             kind="workflow_step",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=version,
+            metadata=metadata,
         )
 
 
@@ -89,15 +89,15 @@ class Workflow(BaseModel):
         self, version: int = 1, metadata: dict[str, Any] | None = None
     ) -> EntityRecord:
         """Project this workflow into its canonical ``EntityRecord`` (kind ``workflow``)."""
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.workflow_id, namespace="workflow")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=version,
+        return project(
+            self,
+            stable_value=self.workflow_id,
+            namespace="workflow",
             kind="workflow",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=version,
+            metadata=metadata,
         )
 
 
@@ -461,7 +461,7 @@ class WorkflowOrchestrator:
     def _backoff_delay(self, attempt: int) -> float:
         """Exponential backoff with jitter for retry attempt ``attempt`` (0-based)."""
         base = self._retry_base_delay_seconds * (2**attempt)
-        return base + random.uniform(0.0, self._retry_jitter_seconds)
+        return cast(float, base + random.uniform(0.0, self._retry_jitter_seconds))
 
     async def _run_single(
         self,
@@ -653,7 +653,7 @@ class WorkflowOrchestrator:
         )
 
 
-def _timeout(seconds: float):
+def _timeout(seconds: float) -> asyncio.Timeout:
     """Return an ``asyncio.timeout(seconds)`` context manager (RO-1).
 
     Available on Python 3.11+ (the project targets 3.12); raises
@@ -665,7 +665,7 @@ def _timeout(seconds: float):
         from himmy.core.errors import HimmyError
 
         raise HimmyError("workflow timeouts require Python 3.11+ (asyncio.timeout)")
-    return timeout_cm(seconds)
+    return cast(asyncio.Timeout, timeout_cm(seconds))
 
 
 __all__ = [

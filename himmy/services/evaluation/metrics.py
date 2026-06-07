@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Awaitable
-from typing import Any, Protocol, Union, runtime_checkable
+from typing import Any, Protocol, Union, cast, runtime_checkable
 
 from himmy.services.evaluation.models import EvaluationCase, MetricScore
 
@@ -50,7 +50,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
         return value
     if hasattr(value, "model_dump"):
         try:
-            return value.model_dump()
+            return cast("dict[str, Any]", value.model_dump())
         except Exception:  # pragma: no cover - defensive
             pass
     return {}

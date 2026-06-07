@@ -18,7 +18,7 @@ import base64
 import secrets as _secrets
 import time
 from email.message import EmailMessage
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlencode
 
 import httpx
@@ -196,7 +196,7 @@ async def _fetch_email(client: httpx.AsyncClient, access: str) -> str | None:
             _USERINFO_URL, headers={"Authorization": f"Bearer {access}"}
         )
         if resp.status_code == 200:
-            return resp.json().get("email")
+            return cast(str | None, resp.json().get("email"))
     except Exception:  # noqa: BLE001 - email is a nicety, never fatal
         return None
     return None
@@ -228,7 +228,7 @@ async def _access_token() -> str:
     w = _writable()
     w.set(ACCESS_TOKEN, new_access)
     w.set(TOKEN_EXPIRY, str(int(time.time()) + int(tok.get("expires_in", 3600)) - 60))
-    return new_access
+    return cast(str, new_access)
 
 
 # ---- Gmail --------------------------------------------------------------
@@ -392,7 +392,7 @@ def _http() -> httpx.AsyncClient:
 def _json_or_raise(resp: httpx.Response, what: str) -> dict[str, Any]:
     if resp.status_code != 200:
         raise GoogleError(f"{what} failed: {_error_detail(resp)}")
-    return resp.json()
+    return cast(dict[str, Any], resp.json())
 
 
 def _error_detail(resp: httpx.Response) -> str:

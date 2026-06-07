@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 import operator
 from datetime import UTC, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
 
@@ -37,9 +37,12 @@ def _eval_node(node: ast.AST) -> float:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return float(node.value)
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        return _BIN_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+        return cast(
+            float,
+            _BIN_OPS[type(node.op)](_eval_node(node.left), _eval_node(node.right)),
+        )
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
-        return _UNARY_OPS[type(node.op)](_eval_node(node.operand))
+        return cast(float, _UNARY_OPS[type(node.op)](_eval_node(node.operand)))
     raise ValueError("expression contains an unsupported or unsafe term")
 
 

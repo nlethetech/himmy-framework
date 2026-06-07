@@ -16,7 +16,7 @@ import importlib
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from himmy.config.agent_spec import AgentSpec, load_agent_spec
 
@@ -62,7 +62,7 @@ def resolve_tools_module(dotted: str) -> Callable[[Any], Any]:
     fn = getattr(module, attr, None)
     if not callable(fn):
         raise ValueError(f"tools_module {dotted!r} has no callable {attr!r}")
-    return fn
+    return cast("Callable[[Any], Any]", fn)
 
 
 async def ingest_knowledge_sources(registry: Any, sources: list[str]) -> int:
@@ -155,13 +155,23 @@ def build_runtime_for_spec(
     if checkpoint_store is not None:
         overrides["checkpoint_store"] = checkpoint_store
 
-    pipeline = None
-    if spec.guardrails:
-        from himmy.services.guardrails import build_guardrail_pipeline
+    from himmy.services.guardrails import build_guardrail_pipeline
 
-        pipeline = build_guardrail_pipeline(spec.guardrails)
+    # Input + tool-argument guardrails: exactly what the spec declares (prompt/arg
+    # redaction or blocking, e.g. pii/injection/dlp). ``pipeline`` is reused below to
+    # guard tool arguments too.
+    pipeline = build_guardrail_pipeline(spec.guardrails) if spec.guardrails else None
+    if pipeline is not None:
         overrides["input_guardrail"] = pipeline
-        overrides["output_guardrail"] = pipeline
+
+    # Output guardrails: ALWAYS enforce grounding (an institutional default — block any
+    # answer that falls back to stale built-in knowledge instead of grounding in a
+    # tool), plus whatever the spec declares. This applies to EVERY spec-built agent —
+    # including ones a user creates in Studio — and cannot be silently turned off, so
+    # the framework's anti-hallucination guarantee is enforced, not just advised. The
+    # grounding guard is a no-op on the input stage, so adding it to output only is safe.
+    output_names = list(dict.fromkeys(["grounding", *spec.guardrails]))
+    overrides["output_guardrail"] = build_guardrail_pipeline(output_names)
 
     if spec.memory:
         from himmy import build_storage

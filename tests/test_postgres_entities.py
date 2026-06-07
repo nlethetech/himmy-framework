@@ -39,6 +39,12 @@ pytestmark = pytest.mark.skipif(
 async def _fresh_registry() -> PostgresEntityRegistry:
     reg = await PostgresEntityRegistry.connect(_DSN)
     await reg.create_schema()
+    # Truncate so each test starts from a genuinely clean table: the entity tables
+    # are shared and the Docker volume persists, so count/containment assertions
+    # (e.g. "exactly one team=alpha record") need real isolation to be re-runnable.
+    pool = reg._require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE entity_records, entity_links CASCADE")
     return reg
 
 

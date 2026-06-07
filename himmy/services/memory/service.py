@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 from himmy.services.knowledge.embedder import DeterministicEmbedder, EmbedderProtocol
 from himmy.services.memory.store import (
@@ -56,7 +57,7 @@ class MemoryService:
         *,
         subject_id: str = "default",
         kind: str = "semantic",
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> MemoryRecord:
         """Persist ``text`` as a memory for ``subject_id`` and return the record."""
         record = MemoryRecord(

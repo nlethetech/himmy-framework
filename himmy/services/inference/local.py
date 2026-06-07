@@ -20,7 +20,7 @@ import json
 import os
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 from himmy.core.ids import new_uuid
 from himmy.services.inference.models import (
@@ -32,6 +32,7 @@ from himmy.services.inference.models import (
     InferenceStatus,
     ResponseFormat,
     ToolCallRecord,
+    ToolExecutor,
     ToolReturnRecord,
 )
 from himmy.services.inference.tool_protocol import parse_text_tool_calls
@@ -155,14 +156,17 @@ def _parse_react_tool_calls(
 
 
 async def _execute_tool_calls(
-    bound_tools: list[BoundTool], tool_calls: list[ToolCallRecord]
+    bound_tools: list[BoundTool],
+    tool_calls: list[ToolCallRecord],
+    executor: ToolExecutor | None,
 ) -> list[ToolReturnRecord]:
-    """Run each tool call's bound handler and return the paired ToolReturnRecords.
+    """Run each tool call via the executor and return the paired ToolReturnRecords.
 
     A provider that emits tool calls (Ollama/Claude CLI) must also EXECUTE them and
     populate ``tool_returns`` — the runtime only replays existing call/return pairs
     onto the thread, so without this the model never sees a result and loops. Mirrors
-    :class:`StubClientManager`'s handler-execution path.
+    :class:`StubClientManager`'s execution path; ``bound_tools`` is still used to
+    validate/repair the call's tool name before invoking the executor.
     """
     by_name = {t.name: t for t in bound_tools}
     available = list(by_name)
@@ -175,8 +179,8 @@ async def _execute_tool_calls(
             resolution = resolve_tool_name(call.tool_name, available)
             if resolution.name is not None:
                 tool = by_name[resolution.name]
-        if tool is not None and tool.handler is not None:
-            ret = await tool.handler(call.args)
+        if tool is not None and executor is not None:
+            ret = await executor(tool.name, call.args)
             ret = ret.model_copy(update={"tool_call_id": call.tool_call_id})
             if tool.name != call.tool_name:  # record the auto-correction
                 ret = ret.model_copy(
@@ -278,7 +282,9 @@ class OllamaClientManager:
             tool_calls = parse_text_tool_calls(text, known)
             if tool_calls:
                 text = ""  # the reply was a tool call, not a final answer
-        tool_returns = await _execute_tool_calls(request.bound_tools, tool_calls)
+        tool_returns = await _execute_tool_calls(
+            request.bound_tools, tool_calls, request.tool_executor
+        )
         output_structured = None
         if structured_requested and text:
             try:
@@ -307,7 +313,7 @@ class OllamaClientManager:
             result = self._transport(path, payload)
             if isinstance(result, Awaitable):
                 return await result  # type: ignore[no-any-return]
-            return result
+            return cast(dict[str, Any], result)
         import httpx
 
         async with httpx.AsyncClient(timeout=timeout or self._timeout) as client:
@@ -438,7 +444,9 @@ class ClaudeCliClientManager:
             if request.bound_tools
             else []
         )
-        tool_returns = await _execute_tool_calls(request.bound_tools, tool_calls)
+        tool_returns = await _execute_tool_calls(
+            request.bound_tools, tool_calls, request.tool_executor
+        )
         return InferenceResponse(
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,

@@ -20,11 +20,13 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Protocol,
+    cast,
     runtime_checkable,
 )
 
 from himmy.core.errors import HimmyError
 from himmy.core.events import EventType, RunEvent
+from himmy.core.metadata import AssistantMessageMetadata
 from himmy.runtime.checkpoint import (
     APPROVED,
     AWAITING_APPROVAL,
@@ -43,6 +45,7 @@ from himmy.services.inference.models import (
     LLMConfig,
     ResponseFormat,
     ToolCallRecord,
+    ToolExecutor,
     ToolReturnRecord,
 )
 
@@ -56,7 +59,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.services.inference.service import InferenceService, StreamDelta
     from himmy.services.prompts.manager import PromptManager
     from himmy.services.prompts.mapper import ContextPromptMapper
-    from himmy.services.storage.service import MemoryStore
+    from himmy.services.storage.service import ThreadEventStore
 
 
 # An optional caller-facing event callback (RO-6). Invoked best-effort inside
@@ -71,13 +74,18 @@ class ToolServiceProtocol(Protocol):
 
     Replaces the previous ``Any`` typing of ``tool_service`` with a structural
     contract: anything exposing ``bound_tools(names) -> list[BoundTool]`` (the
-    offline binding the runtime feeds to ``InferenceRequest.bound_tools``)
+    pure-data binding the runtime feeds to ``InferenceRequest.bound_tools``) and
+    ``tool_executor() -> ToolExecutor`` (the execution seam attached to the request)
     satisfies the runtime. ``ToolService`` conforms to this without inheritance.
     """
 
     def bound_tools(
         self, names: list[str] | None = None
     ) -> list[BoundTool]:  # pragma: no cover - structural typing
+        ...
+
+    def tool_executor(self) -> ToolExecutor:  # pragma: no cover - structural typing
+        """Return the callback that executes the bound tools by name."""
         ...
 
     async def execute(self, invocation: Any) -> Any:  # pragma: no cover - structural
@@ -263,7 +271,7 @@ class SingleAgentRuntime:
         self,
         *,
         inference_service: InferenceService,
-        memory_store: MemoryStore | None = None,
+        memory_store: ThreadEventStore | None = None,
         tool_service: ToolServiceProtocol | None = None,
         context_service: ContextService | None = None,
         prompt_manager: PromptManager | None = None,
@@ -1342,7 +1350,7 @@ class SingleAgentRuntime:
         )
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
-        assistant_metadata: dict[str, Any] = {
+        assistant_metadata: AssistantMessageMetadata = {
             "request_id": request.request_id,
             "trace_id": trace_id,
             "latency_ms": response.latency_ms,
@@ -1363,7 +1371,9 @@ class SingleAgentRuntime:
         assistant_message = Message(
             role=MessageRole.ASSISTANT,
             content=assistant_text or "",
-            metadata=assistant_metadata,
+            # dict() widens the TypedDict to the open dict[str, Any] the model field
+            # expects (metadata stays extensible; the TypedDict only types the write).
+            metadata=dict(assistant_metadata),
         )
         thread.append_message(assistant_message)
 
@@ -1474,7 +1484,7 @@ class SingleAgentRuntime:
                     },
                 )
             )
-        return verdict.text
+        return cast(str, verdict.text)
 
     async def _resolve_snapshot(
         self,
@@ -1766,6 +1776,12 @@ class SingleAgentRuntime:
             generation_params=generation_params,
             route_override=route_override,
             bound_tools=bound_tools,
+            # The single execution seam for the bound tools (see ToolExecutor).
+            tool_executor=(
+                self.tool_service.tool_executor()
+                if self.tool_service is not None
+                else None
+            ),
             tool_names_override=tool_names_override,
         )
         if timeout_seconds is not None:
@@ -2022,7 +2038,7 @@ def message_timestamp() -> str:
     return utc_now_iso()
 
 
-def _timeout(seconds: float):
+def _timeout(seconds: float) -> asyncio.Timeout:
     """Return an ``asyncio.timeout(seconds)`` context manager (RO-1).
 
     ``asyncio.timeout`` exists on Python 3.11+ (the project targets 3.12). It
@@ -2034,7 +2050,7 @@ def _timeout(seconds: float):
     timeout_cm = getattr(asyncio, "timeout", None)
     if timeout_cm is None:  # pragma: no cover - 3.10 fallback only
         raise HimmyError("deadline_seconds requires Python 3.11+ (asyncio.timeout)")
-    return timeout_cm(seconds)
+    return cast(asyncio.Timeout, timeout_cm(seconds))
 
 
 __all__ = [

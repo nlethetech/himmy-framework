@@ -80,13 +80,14 @@ class RecommendationItem(BaseModel):
         deliberately excluded so the content-addressed ``record_id`` stays stable
         across status transitions (re-registration remains idempotent).
         """
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.recommendation_id, namespace="recommendation")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=1,
+        return project(
+            self,
+            stable_value=self.recommendation_id,
+            namespace="recommendation",
             kind="recommendation",
+            version=1,
             payload={
                 "recommendation_id": self.recommendation_id,
                 "run_id": self.run_id,

@@ -54,13 +54,13 @@ class Agent(BaseModel):
         self, version: int = 1, metadata: dict[str, Any] | None = None
     ) -> EntityRecord:
         """Project this agent into its canonical ``EntityRecord`` (kind ``agent``)."""
-        from himmy.entities.records import EntityRecord, stable_id_for
+        from himmy.entities.projection import project
 
-        stable_id = stable_id_for(self.agent_id, namespace="agent")
-        return EntityRecord.create(
-            stable_id=stable_id,
-            version=version,
+        return project(
+            self,
+            stable_value=self.agent_id,
+            namespace="agent",
             kind="agent",
-            payload=self.model_dump(mode="json"),
-            metadata=metadata or {},
+            version=version,
+            metadata=metadata,
         )
