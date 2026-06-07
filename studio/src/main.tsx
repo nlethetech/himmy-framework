@@ -19,6 +19,7 @@ import Lineage from "./screens/Lineage";
 import Calendar from "./screens/Calendar";
 import Notes from "./screens/Notes";
 import Tasks from "./screens/Tasks";
+import Compare from "./screens/Compare";
 import Cookbook from "./screens/Cookbook";
 import Models from "./screens/Models";
 import Tools from "./screens/Tools";
@@ -41,6 +42,7 @@ const router = createBrowserRouter([
       { path: "tasks", element: <Tasks /> },
       { path: "cookbook", element: <Cookbook /> },
       { path: "models", element: <Models /> },
+      { path: "compare", element: <Compare /> },
       { path: "tools", element: <Tools /> },
       { path: "brain", element: <Brain /> },
       { path: "theme", element: <Theme /> },

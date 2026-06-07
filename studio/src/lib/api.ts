@@ -183,6 +183,29 @@ export const upsertRecipe = (r: {
 export const deleteRecipe = (id: string) =>
   api.del<{ ok: boolean }>(`/cookbook/${id}`);
 
+// ---- Compare -------------------------------------------------------------
+
+export interface CompareTarget {
+  provider: string;
+  model: string;
+}
+export interface CompareResult {
+  provider: string;
+  model: string;
+  ok: boolean;
+  output: string;
+  error: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost: number | null;
+  latency_ms: number | null;
+}
+export const compare = (
+  prompt: string,
+  targets: CompareTarget[],
+  system?: string | null,
+) => api.post<CompareResult[]>("/compare", { prompt, targets, system });
+
 // ---- Tasks ---------------------------------------------------------------
 
 export interface Task {

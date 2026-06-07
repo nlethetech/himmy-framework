@@ -386,6 +386,103 @@ async def models() -> list[dict[str, Any]]:
     return out
 
 
+# ---- Compare (one prompt, N models, side-by-side) -----------------------
+
+
+class CompareTarget(BaseModel):
+    """One provider+model cell in a comparison."""
+
+    provider: str = Field(..., max_length=40)
+    model: str = Field(..., max_length=80)
+
+
+class CompareRequest(BaseModel):
+    """A single prompt fanned out across several models."""
+
+    prompt: str = Field(..., min_length=1, max_length=8000)
+    system: str | None = Field(None, max_length=4000)
+    targets: list[CompareTarget] = Field(..., min_length=1, max_length=6)
+    timeout_seconds: float = Field(120.0, ge=1, le=600)
+
+
+class CompareResult(BaseModel):
+    """The outcome of running the prompt against one target."""
+
+    provider: str
+    model: str
+    ok: bool
+    output: str = ""
+    error: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cost: float | None = None
+    latency_ms: float | None = None
+
+
+@router.post("/compare", response_model=list[CompareResult])
+async def compare(body: CompareRequest) -> list[CompareResult]:
+    """Run one prompt across several models concurrently; return outputs + usage.
+
+    Each target is an isolated model call (no tools, no run history) so the cells
+    are directly comparable on output, tokens, cost, and latency.
+    """
+    import asyncio
+
+    from himmy.cli.provider import build_manager_for
+    from himmy.services.inference.models import (
+        InferenceMessage,
+        InferenceRequest,
+        InferenceStatus,
+    )
+
+    def _messages() -> list[InferenceMessage]:
+        msgs: list[InferenceMessage] = []
+        if body.system:
+            msgs.append(InferenceMessage(role="system", content=body.system))
+        msgs.append(InferenceMessage(role="user", content=body.prompt))
+        return msgs
+
+    async def _one(target: CompareTarget) -> CompareResult:
+        try:
+            manager = build_manager_for(target.provider, target.model)
+        except Exception as exc:  # noqa: BLE001 - report per-cell, never 500
+            return CompareResult(
+                provider=target.provider,
+                model=target.model,
+                ok=False,
+                error=str(exc),
+            )
+        request = InferenceRequest(
+            model_key=target.model,
+            messages=_messages(),
+            timeout_seconds=body.timeout_seconds,
+        )
+        try:
+            resp = await manager.generate(request)
+        except Exception as exc:  # noqa: BLE001 - report per-cell
+            return CompareResult(
+                provider=target.provider,
+                model=target.model,
+                ok=False,
+                error=str(exc),
+            )
+        ok = resp.status == InferenceStatus.SUCCESS
+        err_msg = resp.error.message if resp.error else "model call failed"
+        return CompareResult(
+            provider=target.provider,
+            model=target.model,
+            ok=ok,
+            output=resp.output_text or "",
+            error=None if ok else err_msg,
+            input_tokens=resp.input_tokens,
+            output_tokens=resp.output_tokens,
+            cost=resp.cost,
+            latency_ms=resp.latency_ms,
+        )
+
+    return list(await asyncio.gather(*(_one(t) for t in body.targets)))
+
+
 # ---- Tasks --------------------------------------------------------------
 
 
