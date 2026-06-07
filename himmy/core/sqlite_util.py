@@ -20,7 +20,9 @@ def connect_hardened(path: str, *, busy_timeout_ms: int = 5000) -> sqlite3.Conne
     - ``busy_timeout`` so a contended write waits instead of raising immediately.
     - ``synchronous=NORMAL`` — durable enough for a local cache, far faster than FULL.
     """
-    conn = sqlite3.connect(path, check_same_thread=False, timeout=busy_timeout_ms / 1000)
+    conn = sqlite3.connect(
+        path, check_same_thread=False, timeout=busy_timeout_ms / 1000
+    )
     try:
         if path != ":memory:":  # WAL is meaningless (and noisy) for in-memory DBs
             conn.execute("PRAGMA journal_mode=WAL")
