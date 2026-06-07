@@ -20,6 +20,9 @@ import Calendar from "./screens/Calendar";
 import Notes from "./screens/Notes";
 import Cookbook from "./screens/Cookbook";
 import Models from "./screens/Models";
+import Tools from "./screens/Tools";
+import Brain from "./screens/Brain";
+import Theme from "./screens/Theme";
 import "./index.css";
 
 // New task-first IA. Screens not yet built (Home/Connections/Approvals) render a
@@ -36,6 +39,10 @@ const router = createBrowserRouter([
       { path: "notes", element: <Notes /> },
       { path: "cookbook", element: <Cookbook /> },
       { path: "models", element: <Models /> },
+      { path: "tools", element: <Tools /> },
+      { path: "brain", element: <Brain /> },
+      { path: "theme", element: <Theme /> },
+      { path: "library", element: <Knowledge /> },
       { path: "approvals", element: <Approvals /> },
       { path: "activity", element: <Activity /> },
       { path: "activity/:runId", element: <RunDetail /> },

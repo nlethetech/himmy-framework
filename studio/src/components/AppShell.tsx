@@ -19,6 +19,7 @@ import {
   PlusIcon,
 } from "./icons";
 import { useTheme } from "./ui/useTheme";
+import { useAccent } from "./ui/useAccent";
 
 type NavItem = {
   to: string;
@@ -32,8 +33,15 @@ const WORKSPACE: NavItem[] = [
   { to: "/chat", label: "Chat", Icon: ChatIcon },
   { to: "/approvals", label: "Approvals", Icon: BellIcon },
   { to: "/activity", label: "Activity", Icon: RunsIcon },
+];
+
+const APPS: NavItem[] = [
   { to: "/calendar", label: "Calendar", Icon: CalendarIcon },
   { to: "/notes", label: "Notes", Icon: BookIcon },
+  { to: "/brain", label: "Brain", Icon: MemoryIcon },
+  { to: "/tools", label: "Tools", Icon: BuildIcon },
+  { to: "/library", label: "Library", Icon: BookIcon },
+  { to: "/theme", label: "Theme", Icon: GlobeIcon },
 ];
 
 const BUILD: NavItem[] = [
@@ -82,6 +90,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [connectionsOk, setConnectionsOk] = useState<number | null>(null);
   const [approvalsCount, setApprovalsCount] = useState(0);
   const { theme, toggleTheme } = useTheme();
+  useAccent(); // apply the saved brand accent on load
 
   useEffect(() => {
     const refresh = () =>
@@ -162,6 +171,13 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SearchIcon className="ico" />
           <span className="sb-item-label">Search</span>
         </NavLink>
+
+        <div className="sb-section" style={{ cursor: "default" }}>
+          Apps
+        </div>
+        {APPS.map((i) => (
+          <SidebarItem key={i.to} item={i} />
+        ))}
 
         <div className="sb-section" style={{ cursor: "default" }}>
           Build
