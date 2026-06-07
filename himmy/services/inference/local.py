@@ -342,6 +342,29 @@ def _parse_cli_output(out: str) -> tuple[str, int, int, float]:
     return result.strip(), in_tok, out_tok, cost
 
 
+# The ``claude`` CLI is a full agent: by default it will use its OWN built-in tools
+# (web search/fetch, bash, file edits, …) to satisfy a prompt. Himmy drives tools
+# itself via the ReAct protocol, so we disable the CLI's tools — otherwise it goes off
+# doing its own multi-turn research and hangs instead of just emitting our TOOL_CALL.
+_CLI_BUILTIN_TOOLS = (
+    "WebSearch",
+    "WebFetch",
+    "Bash",
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "Task",
+    "NotebookEdit",
+    "TodoWrite",
+)
+
+# The local CLI is slow (cold starts, queueing): even a trivial prompt can take ~20s.
+# Never let a low per-request timeout kill a legitimately slow-but-valid call — floor it.
+_CLI_MIN_TIMEOUT = 150.0
+
+
 class ClaudeCliClientManager:
     """A :class:`ClientManager` that drives the local ``claude`` CLI (Claude Max)."""
 
@@ -383,13 +406,24 @@ class ClaudeCliClientManager:
         argv = [self._executable, "-p", "--model", model]
         if not any("--output-format" in a for a in self._extra_args):
             argv += ["--output-format", "json"]
+        # Drive the CLI as a pure text model: disable its own agentic tools unless the
+        # caller already configured tool flags. Keeps it from doing its own research
+        # (and hanging) instead of emitting the ReAct TOOL_CALL we ask for.
+        if not any(
+            "--tools" in a or "isallowedTools" in a or "allowedTools" in a
+            for a in self._extra_args
+        ):
+            argv += ["--disallowedTools", *_CLI_BUILTIN_TOOLS]
         argv += self._extra_args
         prompt = _compose_prompt(request)
         if request.bound_tools:
             # Text-only CLI: a best-effort ReAct protocol the runtime loop drives.
             prompt = f"{prompt}\n\n{_react_tool_manifest(request.bound_tools)}"
+        # Floor the per-call timeout: the local CLI is slow, and a 30s framework
+        # default would kill valid ~20-30s responses (then retry, wasting minutes).
+        effective_timeout = max(request.timeout_seconds or 0.0, _CLI_MIN_TIMEOUT)
         try:
-            out = await self._run(argv, prompt, request.timeout_seconds)
+            out = await self._run(argv, prompt, effective_timeout)
         except Exception as exc:  # noqa: BLE001 - normalize to FAILED
             return _failed(
                 request,
