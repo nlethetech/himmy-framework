@@ -860,3 +860,11 @@ export function streamRun(
 ): Promise<void> {
   return streamSse("/api/studio/run", body, onEvent, signal);
 }
+
+export function streamResearch(
+  body: { query: string; provider?: string | null; model?: string | null },
+  onEvent: (e: RunEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return streamSse("/api/studio/research", body, onEvent, signal);
+}

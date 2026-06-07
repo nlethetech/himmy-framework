@@ -210,6 +210,72 @@ async def run_team(body: RunTeamRequest) -> StreamingResponse:
     )
 
 
+# ---- Deep Research (plan → search → synthesize) -------------------------
+
+RESEARCH_INSTRUCTIONS = [
+    "You are a thorough research analyst. Investigate the user's question and "
+    "produce a well-structured, source-grounded report.",
+    "Method: (1) briefly plan the angles worth investigating; (2) use web_search "
+    "to find sources across several distinct angles, and web_fetch to read the most "
+    "promising ones; (3) cross-check claims across sources before stating them.",
+    "Write the final answer in Markdown with: a one-paragraph **Summary**, then "
+    "**Key findings** as bullets (each with the fact and which source supports it), "
+    "then **Sources** as a list of the URLs you actually used. Prefer primary "
+    "sources. Be explicit about uncertainty and note where sources disagree.",
+]
+
+
+class ResearchRequest(BaseModel):
+    """POST /api/studio/research: a question to investigate across the web."""
+
+    query: str = Field(..., min_length=1, max_length=4000)
+    provider: str | None = None
+    model: str | None = None
+    deep: bool = True  # deep → also allow fetching pages, not just search
+
+
+@router.post("/research")
+async def research(body: ResearchRequest) -> StreamingResponse:
+    """Run a deep-research agent (web search + fetch) for one question over SSE.
+
+    Builds an ephemeral research-configured :class:`AgentSpec` (web tools + a
+    plan→search→synthesize methodology) and streams the same cognition/tool/message
+    frames as a normal run — so the client can show the live search trail and the
+    final report. Reuses all existing run machinery; nothing is persisted as an agent.
+    """
+    from himmy.config.agent_spec import AgentSpec
+
+    spec = AgentSpec(
+        name="Deep Research",
+        description="Investigates a question across the web and writes a report.",
+        instructions=list(RESEARCH_INSTRUCTIONS),
+        tool_packs=["web"],
+        tool_router=False,
+        temperature=0.2,
+        provider=body.provider,
+        model=body.model or "default",
+    )
+
+    async def _stream() -> AsyncIterator[str]:
+        try:
+            async for event in studio_service.stream_agent_run(
+                spec,
+                body.query,
+                provider=body.provider,
+                model=body.model,
+                agent_path="(deep-research)",
+            ):
+                yield _sse(event)
+        except Exception as exc:  # noqa: BLE001 - terminal error frame
+            yield _sse({"type": "error", "message": str(exc)})
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/runs", response_model=StudioRunListResponse)
 async def list_runs(limit: int = 50, offset: int = 0) -> StudioRunListResponse:
     """List past Studio runs (newest first), paginated."""

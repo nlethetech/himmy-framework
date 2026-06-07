@@ -34,6 +34,7 @@ const WORKSPACE: NavItem[] = [
   { to: "/", label: "Home", Icon: HomeIcon },
   { to: "/chat", label: "Chat", Icon: ChatIcon },
   { to: "/chats", label: "Chats", Icon: ChatIcon },
+  { to: "/research", label: "Research", Icon: SearchIcon },
   { to: "/approvals", label: "Approvals", Icon: BellIcon },
   { to: "/activity", label: "Activity", Icon: RunsIcon },
 ];

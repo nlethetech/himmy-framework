@@ -3867,3 +3867,74 @@ label.field > .hint {
   width: 13px;
   height: 13px;
 }
+
+/* Deep Research screen */
+.rsch-input {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.rsch-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.rsch-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+.rsch-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.rsch-example {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  text-align: left;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.rsch-example:hover {
+  background: var(--hover);
+  border-color: var(--brand);
+}
+.rsch-grid {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+  align-items: start;
+}
+.rsch-report {
+  min-height: 200px;
+}
+.rsch-working {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+.rsch-side {
+  position: sticky;
+  top: 16px;
+}
+.rsch-side-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+.rsch-side-head svg {
+  width: 13px;
+  height: 13px;
+}
