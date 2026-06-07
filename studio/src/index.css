@@ -243,7 +243,7 @@ select {
 
 .shell {
   display: grid;
-  grid-template-columns: var(--rail-w) var(--sidebar-w) 1fr;
+  grid-template-columns: var(--sidebar-w) 1fr;
   height: 100vh;
 }
 

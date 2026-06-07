@@ -14,7 +14,6 @@ import {
   BookIcon,
   GlobeIcon,
   CalendarIcon,
-  GearIcon,
   SearchIcon,
   PlusIcon,
   CheckIcon,
@@ -68,16 +67,6 @@ const ADVANCED: NavItem[] = [
   { to: "/advanced/doctor", label: "Doctor", Icon: DoctorIcon },
 ];
 
-// The narrow rail mirrors the most-used destinations as icon-only quick nav.
-const RAIL: NavItem[] = [
-  { to: "/", label: "Home", Icon: HomeIcon },
-  { to: "/chat", label: "Chat", Icon: ChatIcon },
-  { to: "/approvals", label: "Approvals", Icon: BellIcon },
-  { to: "/calendar", label: "Calendar", Icon: CalendarIcon },
-  { to: "/agents", label: "Agents", Icon: BuildIcon },
-  { to: "/connections", label: "Connections", Icon: PlugIcon },
-];
-
 function SidebarItem({ item }: { item: NavItem }) {
   return (
     <NavLink
@@ -129,36 +118,6 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <div className="shell">
-      {/* Far-left icon rail */}
-      <aside className="icon-rail">
-        {RAIL.map((i) => (
-          <NavLink
-            key={i.to}
-            to={i.to}
-            end={i.to === "/"}
-            data-label={i.label}
-            className={({ isActive }) => "rail-btn" + (isActive ? " active" : "")}
-          >
-            <i.Icon className="ico" />
-          </NavLink>
-        ))}
-        <div className="rail-spacer" />
-        <button
-          className="rail-btn"
-          data-label={`${theme === "dark" ? "Light" : "Dark"} mode`}
-          onClick={toggleTheme}
-        >
-          {theme === "dark" ? "☾" : "☀"}
-        </button>
-        <NavLink
-          to="/advanced/doctor"
-          data-label="Doctor"
-          className={({ isActive }) => "rail-btn" + (isActive ? " active" : "")}
-        >
-          <GearIcon className="ico" />
-        </NavLink>
-      </aside>
-
       {/* Labeled sidebar */}
       <aside className="sidebar">
         <div className="sb-brand">
