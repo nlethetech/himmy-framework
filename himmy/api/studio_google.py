@@ -152,7 +152,9 @@ def auth_url(redirect_uri: str) -> str:
     return f"{_AUTH_BASE}?{urlencode(params)}"
 
 
-async def exchange_code(code: str, redirect_uri: str, state: str | None) -> GoogleStatus:
+async def exchange_code(
+    code: str, redirect_uri: str, state: str | None
+) -> GoogleStatus:
     """Exchange an authorization ``code`` for tokens and persist them."""
     if state is not None:
         # Best-effort CSRF check; a restart drops pending states, so don't hard-fail
