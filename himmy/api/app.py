@@ -180,6 +180,7 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
         return {"status": "ok"}
 
     _install_security_headers(app)
+    _install_studio_guard(app)
     _install_openapi_security(app, authenticator)
     # Mount the built Studio SPA last so its catch-all never shadows an API route.
     _mount_studio(app)
@@ -255,6 +256,67 @@ def _mount_studio(app: FastAPI) -> None:
             status_code=exc.status_code,
             headers=getattr(exc, "headers", None),
         )
+
+
+def _studio_host(value: str) -> str:
+    """The host part of a ``Host`` header (port + IPv6 brackets stripped)."""
+    value = value.strip().lower()
+    if not value:
+        return ""
+    if value.startswith("["):  # [::1]:8800
+        return value[1:].split("]", 1)[0]
+    return value.rsplit(":", 1)[0] if ":" in value else value
+
+
+def _origin_host(value: str) -> str:
+    """The host of an Origin/Referer URL."""
+    from urllib.parse import urlparse
+
+    try:
+        return (urlparse(value).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _install_studio_guard(app: FastAPI) -> None:
+    """Block DNS-rebinding + cross-site access to the loopback Studio API (WS3.5).
+
+    Studio runs agents that take real actions (send email/Telegram) and stores
+    credentials, so its ``/api/studio`` surface must only answer requests whose
+    ``Host`` is loopback and whose ``Origin``/``Referer`` (when present) is same-site.
+    This defeats a malicious web page (or DNS rebinding) reaching the local API.
+    Disable with ``HIMMY_STUDIO_GUARD=0``; allow extra hosts (e.g. a reverse proxy)
+    via ``HIMMY_STUDIO_ALLOW_HOSTS=host1,host2``.
+    """
+    import os
+
+    if os.environ.get("HIMMY_STUDIO_GUARD", "1").lower() in ("0", "false", "no"):
+        return
+    # "testserver" is Starlette's TestClient default Host. Browsers cannot forge a
+    # Host header via fetch (it's a forbidden header), so allowing it opens no hole
+    # while keeping the test suite green.
+    allowed = {"127.0.0.1", "localhost", "::1", "testserver"} | {
+        h.strip().lower()
+        for h in (os.environ.get("HIMMY_STUDIO_ALLOW_HOSTS") or "").split(",")
+        if h.strip()
+    }
+
+    @app.middleware("http")
+    async def _guard(request: Request, call_next: Callable) -> Response:
+        if request.url.path.startswith("/api/studio"):
+            host = _studio_host(request.headers.get("host", ""))
+            if host and host not in allowed:
+                return JSONResponse(
+                    status_code=403, content={"detail": "host not allowed"}
+                )
+            ref = request.headers.get("origin") or request.headers.get("referer")
+            if ref:
+                rh = _origin_host(ref)
+                if rh and rh not in allowed:
+                    return JSONResponse(
+                        status_code=403, content={"detail": "cross-origin blocked"}
+                    )
+        return await call_next(request)
 
 
 def _install_security_headers(app: FastAPI) -> None:
