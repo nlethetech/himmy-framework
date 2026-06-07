@@ -1,0 +1,27 @@
+# keep the build context small + reproducible
+.git
+.github
+**/__pycache__
+**/*.pyc
+.venv
+venv
+.mypy_cache
+.ruff_cache
+.pytest_cache
+htmlcov
+*.egg-info
+himmy.egg-info
+sbom.cdx.json
+
+# node + build artifacts (the image rebuilds the SPA itself)
+studio/node_modules
+himmy/api/_studio_static/assets
+himmy/api/_studio_static/index.html
+
+# local state + examples (never bake into the image)
+.himmy
+examples
+tests
+docs
+*.md
+!README.md

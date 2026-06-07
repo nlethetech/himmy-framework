@@ -44,6 +44,25 @@ from himmy.api.studio_runs import (
 router = APIRouter(prefix="/api/studio", tags=["studio"])
 
 
+@router.get("/health")
+async def health() -> dict[str, Any]:
+    """Fast readiness probe: version, writable secrets, and provider availability."""
+    import shutil
+
+    from himmy import __version__
+    from himmy.config.secrets import get_writable_provider
+
+    return {
+        "status": "ok",
+        "version": __version__,
+        "secrets_writable": get_writable_provider() is not None,
+        "providers": {
+            "claude_cli": shutil.which("claude") is not None,
+            "ollama": shutil.which("ollama") is not None,
+        },
+    }
+
+
 @router.get("/doctor")
 async def doctor() -> dict:
     """Environment diagnostics: extras, providers, keys, and the next step.

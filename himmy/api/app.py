@@ -181,6 +181,7 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
 
     _install_security_headers(app)
     _install_studio_guard(app)
+    _install_request_context(app)
     _install_openapi_security(app, authenticator)
     # Mount the built Studio SPA last so its catch-all never shadows an API route.
     _mount_studio(app)
@@ -256,6 +257,37 @@ def _mount_studio(app: FastAPI) -> None:
             status_code=exc.status_code,
             headers=getattr(exc, "headers", None),
         )
+
+
+def _install_request_context(app: FastAPI) -> None:
+    """Tag every request with an id, echo it back, and log unhandled errors.
+
+    Adds an ``X-Request-ID`` to every response (reusing an inbound one if present)
+    and turns any *unhandled* exception into a clean 500 JSON carrying that id —
+    while logging the full traceback under it, so a GUI error can be traced to a
+    server log line. Framework errors (HimmyError) + HTTPException are still handled
+    by their dedicated handlers; this only catches the truly-unexpected.
+    """
+    import uuid
+
+    @app.middleware("http")
+    async def _ctx(request: Request, call_next: Callable) -> Response:
+        rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        try:
+            response = await call_next(request)
+        except Exception:  # noqa: BLE001 - log + clean 500, never leak a traceback
+            logger.exception(
+                "unhandled error rid=%s %s %s",
+                rid,
+                request.method,
+                request.url.path,
+            )
+            response = JSONResponse(
+                status_code=500,
+                content={"detail": "internal server error", "request_id": rid},
+            )
+        response.headers["X-Request-ID"] = rid
+        return response
 
 
 def _studio_host(value: str) -> str:
