@@ -343,6 +343,89 @@ async def reject(checkpoint_id: str) -> StreamingResponse:
     return _resolve_stream(checkpoint_id, False)
 
 
+# ---- Models (available providers + models) ------------------------------
+
+
+@router.get("/models")
+async def models() -> list[dict[str, Any]]:
+    """Available providers + their models, with any cached benchmark stats."""
+    import shutil
+
+    from himmy.api import studio_bench
+
+    # model name → {accuracy, latency} from prior `himmy bench` runs
+    stats: dict[str, dict[str, Any]] = {}
+    for e in studio_bench.list_cached():
+        m = e.get("model")
+        if m:
+            stats[m] = {"accuracy": e.get("accuracy"), "latency": e.get("latency")}
+
+    out: list[dict[str, Any]] = []
+
+    ollama = await studio_bench._ollama_models()
+    out.append(
+        {
+            "provider": "ollama",
+            "available": bool(ollama),
+            "models": [{"name": m, **stats.get(m, {})} for m in ollama],
+        }
+    )
+
+    claude = shutil.which("claude") is not None
+    out.append(
+        {
+            "provider": "claude-cli",
+            "available": claude,
+            "models": [
+                {"name": n, **stats.get(n, {})} for n in ("haiku", "sonnet", "opus")
+            ]
+            if claude
+            else [],
+        }
+    )
+    return out
+
+
+# ---- Cookbook (saved agent + prompt recipes) ----------------------------
+
+
+class RecipeUpsertRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(..., min_length=1, max_length=200)
+    agent_path: str = Field("", max_length=500)
+    prompt: str = Field("", max_length=20_000)
+    notes: str = Field("", max_length=4000)
+
+
+@router.get("/cookbook")
+async def cookbook_list() -> list[Any]:
+    from himmy.api.studio_cookbook import get_cookbook_store
+
+    return get_cookbook_store().list()
+
+
+@router.put("/cookbook")
+async def cookbook_upsert(body: RecipeUpsertRequest) -> Any:
+    from himmy.api.studio_cookbook import Recipe, get_cookbook_store
+
+    r = Recipe(
+        name=body.name,
+        agent_path=body.agent_path,
+        prompt=body.prompt,
+        notes=body.notes,
+    )
+    if body.id:
+        r.id = body.id
+    return get_cookbook_store().upsert(r)
+
+
+@router.delete("/cookbook/{recipe_id}")
+async def cookbook_delete(recipe_id: str) -> dict[str, bool]:
+    from himmy.api.studio_cookbook import get_cookbook_store
+
+    return {"ok": get_cookbook_store().delete(recipe_id)}
+
+
 # ---- Notes --------------------------------------------------------------
 
 

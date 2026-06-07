@@ -38,6 +38,8 @@ const WORKSPACE: NavItem[] = [
 
 const BUILD: NavItem[] = [
   { to: "/agents", label: "Agents", Icon: BuildIcon },
+  { to: "/cookbook", label: "Cookbook", Icon: BookIcon },
+  { to: "/models", label: "Models", Icon: DoctorIcon },
   { to: "/connections", label: "Connections", Icon: PlugIcon },
 ];
 

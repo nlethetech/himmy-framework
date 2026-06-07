@@ -3293,3 +3293,79 @@ label.field > .hint {
   resize: vertical;
   line-height: 1.6;
 }
+
+/* ---- Cookbook ---------------------------------------------------------- */
+.cook-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--sp-4);
+}
+.cook-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.cook-name {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--fg);
+}
+.cook-agent {
+  font-size: var(--fs-xs);
+  color: var(--red);
+}
+.cook-prompt {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  line-height: 1.5;
+  max-height: 60px;
+  overflow: hidden;
+}
+.cook-notes {
+  font-size: var(--fs-xs);
+}
+.cook-actions {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: auto;
+}
+
+/* ---- Models ------------------------------------------------------------ */
+.models-provider {
+  margin-bottom: var(--sp-5);
+}
+.models-provider-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+.models-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.models-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  font-size: var(--fs-sm);
+}
+.models-name {
+  flex: 1;
+  color: var(--fg);
+}
+.models-stat {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}

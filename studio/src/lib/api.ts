@@ -146,6 +146,41 @@ export const runEval = (
   provider?: string | null,
 ) => api.post<EvalRun>("/evals/run", { suite_path, agent_path, provider });
 
+// ---- Models --------------------------------------------------------------
+
+export interface ModelEntry {
+  name: string;
+  accuracy?: number;
+  latency?: number;
+}
+export interface ModelProvider {
+  provider: string;
+  available: boolean;
+  models: ModelEntry[];
+}
+export const listModels = () => api.get<ModelProvider[]>("/models");
+
+// ---- Cookbook ------------------------------------------------------------
+
+export interface Recipe {
+  id: string;
+  name: string;
+  agent_path: string;
+  prompt: string;
+  notes: string;
+  created_at: string;
+}
+export const listRecipes = () => api.get<Recipe[]>("/cookbook");
+export const upsertRecipe = (r: {
+  id?: string;
+  name: string;
+  agent_path: string;
+  prompt: string;
+  notes?: string;
+}) => api.put<Recipe>("/cookbook", r);
+export const deleteRecipe = (id: string) =>
+  api.del<{ ok: boolean }>(`/cookbook/${id}`);
+
 // ---- Notes ---------------------------------------------------------------
 
 export interface Note {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   api,
   streamRun,
@@ -69,6 +69,18 @@ export default function Chat() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const [params, setParams] = useSearchParams();
+
+  // A Cookbook recipe (or any deep link) can prefill the agent + prompt via
+  // ?agent=<path>&q=<prompt>. Consume them once on mount.
+  useEffect(() => {
+    const a = params.get("agent");
+    const q = params.get("q");
+    if (a) setPath(a);
+    if (q) setInput(q);
+    if (a || q) setParams({}, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Auto-grow the composer textarea with its content (and reset when cleared).
   useEffect(() => {
