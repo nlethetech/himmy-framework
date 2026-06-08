@@ -216,6 +216,30 @@ def test_default_threshold_drops_orthogonal_chunks() -> None:
     assert kept[0].similarity == 0.0
 
 
+def test_explicit_positive_threshold_filters_weak_hits() -> None:
+    """A positive threshold keeps a strongly-related chunk and drops a weak one."""
+    kb = KnowledgeBase(storage=StorageService(), embedder=DeterministicEmbedder())
+    rec = run_async(kb.create_kb(workspace_id="w", client_id="c", name="kb"))
+    run_async(
+        kb.ingest_text(rec.kb_id, "apple pear orchard fruit harvest season today")
+    )
+    run_async(kb.ingest_text(rec.kb_id, "apple pear telescope astronomy nebula galaxy"))
+    query = "apple pear orchard fruit harvest season"
+
+    # Without a cutoff both chunks score > 0 (the second shares "apple pear").
+    unfiltered = run_async(kb.search(rec.kb_id, query))
+    sims = sorted((c.similarity for c in unfiltered), reverse=True)
+    assert len(unfiltered) == 2
+    assert sims[0] > sims[1] > 0.0
+
+    # A threshold set between the two similarities keeps only the strong, on-topic hit.
+    cutoff = (sims[0] + sims[1]) / 2
+    filtered = run_async(kb.search(rec.kb_id, query, similarity_threshold=cutoff))
+    assert len(filtered) == 1
+    assert filtered[0].similarity >= cutoff
+    assert "orchard" in (filtered[0].text or "")
+
+
 # --------------------------------------------------------------------- CK-8
 def test_chunker_clamps_overlap_no_near_duplicate_microchunks() -> None:
     """Large overlap relative to a boundary cut never yields a tiny all-overlap chunk."""

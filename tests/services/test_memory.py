@@ -57,6 +57,40 @@ def test_sqlite_durability_across_reopen(tmp_path: Path) -> None:
     assert "bees" in hits[0].record.text
 
 
+def test_recall_default_always_returns_top_hit_even_if_irrelevant() -> None:
+    """With no threshold, recall still surfaces the single best (possibly zero-sim) hit."""
+    svc = MemoryService(InMemoryMemoryStore())
+    svc.remember("the pond holds fish and ducks", subject_id="u")
+    # The query shares no tokens with the only memory -> similarity 0.0 for the
+    # offline embedder, but the default behaviour returns it anyway.
+    hits = run_async(svc.recall("quantum chromodynamics", subject_id="u"))
+    assert len(hits) == 1
+    assert hits[0].similarity == 0.0
+
+
+def test_recall_threshold_filters_irrelevant_hits() -> None:
+    """An explicit threshold lets recall return ZERO results for an off-topic query."""
+    svc = MemoryService(InMemoryMemoryStore())
+    svc.remember("the orchard has apple and pear trees", subject_id="u")
+    svc.remember("the pond holds fish and ducks", subject_id="u")
+
+    # On-topic: the orchard memory clears the bar, the (orthogonal) pond memory does not.
+    relevant = run_async(
+        svc.recall(
+            "apple and pear trees orchard", subject_id="u", similarity_threshold=0.1
+        )
+    )
+    assert len(relevant) == 1
+    assert relevant[0].record.text.startswith("the orchard")
+    assert relevant[0].similarity >= 0.1
+
+    # Off-topic: nothing clears the bar, so recall correctly returns nothing.
+    irrelevant = run_async(
+        svc.recall("quantum chromodynamics", subject_id="u", similarity_threshold=0.1)
+    )
+    assert irrelevant == []
+
+
 def test_forget_removes_memory() -> None:
     svc = MemoryService(InMemoryMemoryStore())
     rec = svc.remember("temporary note", subject_id="u")

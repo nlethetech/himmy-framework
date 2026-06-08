@@ -28,6 +28,13 @@ __all__ = [
     "AgentTeam",
     "TeamMember",
     "MultiAgentOrchestrator",
+    "GroupChatOrchestrator",
+    "RoundRobinSelector",
+    "LLMSelector",
+    "CallableSelector",
+    "SubtaskSpec",
+    "SubtaskResult",
+    "fan_out",
     "PlannerOrchestrator",
     "MemoryService",
     "AgentEvalHarness",
@@ -38,6 +45,9 @@ __all__ = [
     "Skill",
     "SkillRegistry",
     "resolve_skills",
+    "TypedAgent",
+    "TypedAgentRunResult",
+    "RunContext",
 ]
 
 # The full-stack builder pulls in the heavier runtime/inference/tools kernels, so
@@ -50,9 +60,17 @@ _LAZY_ORCH = {
     "AgentTeam",
     "TeamMember",
     "MultiAgentOrchestrator",
+    "GroupChatOrchestrator",
+    "RoundRobinSelector",
+    "LLMSelector",
+    "CallableSelector",
+    "SubtaskSpec",
+    "SubtaskResult",
+    "fan_out",
     "PlannerOrchestrator",
 }
 _LAZY_SKILLS = {"Skill", "SkillRegistry", "resolve_skills"}
+_LAZY_TYPED = {"TypedAgent", "TypedAgentRunResult", "RunContext"}
 
 
 def __getattr__(name: str) -> Any:
@@ -93,4 +111,8 @@ def __getattr__(name: str) -> Any:
         from himmy import skills
 
         return getattr(skills, name)
+    if name in _LAZY_TYPED:
+        from himmy import typed_agent
+
+        return getattr(typed_agent, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

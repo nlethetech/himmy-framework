@@ -947,6 +947,8 @@ class MemoryRecallRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2_000)
     subject_id: str = Field("default", max_length=200)
     top_k: int = Field(5, ge=1, le=50)
+    # Optional cutoff: below it a memory is not recalled (None = always return the top).
+    similarity_threshold: float | None = Field(None, ge=0.0, le=1.0)
 
 
 @router.get("/memory/subjects", response_model=list[str])
@@ -984,7 +986,10 @@ async def memory_recall(body: MemoryRecallRequest) -> list[Any]:
     from himmy.api import studio_memory
 
     return await studio_memory.recall(
-        body.query, subject_id=body.subject_id, top_k=body.top_k
+        body.query,
+        subject_id=body.subject_id,
+        top_k=body.top_k,
+        similarity_threshold=body.similarity_threshold,
     )
 
 

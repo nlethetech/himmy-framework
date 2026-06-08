@@ -190,9 +190,16 @@ def build_runtime_for_spec(
             if tk.memory_path
             else InMemoryMemoryStore()
         )
-        memory = MemoryService(store, embedder=tk.build_embedder_and_dim()[0])
+        memory = MemoryService(
+            store,
+            embedder=tk.build_embedder_and_dim()[0],
+            min_similarity=tk.memory_min_similarity,
+        )
         adapter = MemoryContextAdapter(
-            memory, top_k=spec.memory_top_k, subject_id=tk.memory_subject
+            memory,
+            top_k=spec.memory_top_k,
+            subject_id=tk.memory_subject,
+            similarity_threshold=tk.memory_min_similarity,
         )
         overrides["context_service"] = ContextService(
             storage_service=build_storage(), adapters=[adapter]

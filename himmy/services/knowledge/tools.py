@@ -11,14 +11,47 @@ call: the KB is resolved by ``(workspace_id, client_id, kb_name)``, so a raw
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from himmy.core.errors import HimmyError
+from himmy.services.knowledge.retrieval.config import RetrievalMode
 from himmy.services.knowledge.service import KnowledgeBase, build_kb_context_field
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a tools<->knowledge cycle
     from himmy.services.tools.models import ToolDefinition
     from himmy.services.tools.registry import ToolRegistry
+
+
+@contextlib.asynccontextmanager
+async def _mode_override(
+    kb_service: KnowledgeBase, mode: str | None
+) -> AsyncIterator[None]:
+    """Temporarily flip the KB's dense/hybrid retrieval mode for one call.
+
+    ``mode=None`` leaves the KB's configured default untouched. A requested mode
+    rebuilds the active :class:`RetrievalConfig` with only ``mode`` changed (so
+    rerank/rewrite stages and tuning knobs are inherited), and the original config
+    is always restored on exit — even if the search raises.
+    """
+    if mode is None or mode == kb_service._retrieval.mode:
+        yield
+        return
+    new_mode: RetrievalMode
+    if mode == "dense":
+        new_mode = "dense"
+    elif mode == "hybrid":
+        new_mode = "hybrid"
+    else:
+        raise HimmyError(f"kb_search mode must be 'dense' or 'hybrid', got {mode!r}.")
+    original = kb_service._retrieval
+    kb_service._retrieval = replace(original, mode=new_mode)
+    try:
+        yield
+    finally:
+        kb_service._retrieval = original
 
 
 #: JSON schema for ``kb_search`` arguments (drives pydantic-ai arg validation when
@@ -36,6 +69,15 @@ KB_SEARCH_ARGS_SCHEMA: dict[str, Any] = {
         "top_k": {"type": "integer", "minimum": 1},
         "similarity_threshold": {"type": "number"},
         "metadata_filters": {"type": "object"},
+        "mode": {
+            "type": "string",
+            "enum": ["dense", "hybrid"],
+            "description": (
+                "Retrieval mode for this call. 'hybrid' fuses BM25 (lexical) and "
+                "dense vectors via RRF; 'dense' is pure semantic cosine. Omit to use "
+                "the knowledge base's configured default."
+            ),
+        },
     },
     "required": ["query", "kb_name"],
 }
@@ -89,16 +131,24 @@ def register_kb_search_tool(
             )
 
         threshold = args.get("similarity_threshold")
-        chunks = await kb_service.search(
-            kb.kb_id,
-            str(query),
-            top_k=int(args.get("top_k", 5)),
-            similarity_threshold=(float(threshold) if threshold is not None else None),
-            metadata_filters=args.get("metadata_filters"),
-            # Re-verify tenancy at the service boundary (defence in depth).
-            workspace_id=str(workspace_id),
-            client_id=str(client_id),
-        )
+        # An optional per-call ``mode`` override turns this lookup hybrid (or back
+        # to dense) without reconfiguring the shared KB. The override only flips the
+        # dense/hybrid mode and inherits the KB's rerank/rewrite stages; the original
+        # config is always restored, even on error.
+        mode = args.get("mode")
+        async with _mode_override(kb_service, mode):
+            chunks = await kb_service.search(
+                kb.kb_id,
+                str(query),
+                top_k=int(args.get("top_k", 5)),
+                similarity_threshold=(
+                    float(threshold) if threshold is not None else None
+                ),
+                metadata_filters=args.get("metadata_filters"),
+                # Re-verify tenancy at the service boundary (defence in depth).
+                workspace_id=str(workspace_id),
+                client_id=str(client_id),
+            )
 
         field = build_kb_context_field(
             key=str(kb_name),

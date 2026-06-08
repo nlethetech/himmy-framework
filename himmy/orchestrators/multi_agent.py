@@ -233,6 +233,12 @@ class MultiAgentOrchestrator:
                 source = active.name
                 active = self._team.require(target)
                 chain.append(active.name)
+                # The shared thread still carries the SOURCE persona's SYSTEM message;
+                # re-render + re-inject the TARGET persona's so the next turn actually
+                # runs under the new persona's instructions (not the old one).
+                await self._runtime.reinject_system_prompt(
+                    active.persona, thread, task_context=self._ctx(active)
+                )
                 await self._emit(
                     RunEvent(
                         event_type=EventType.AGENT_HANDOFF,

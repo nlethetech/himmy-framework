@@ -47,6 +47,18 @@ class ToolRegistry:
         """Return the definition for ``name`` or ``None`` when unknown."""
         return self._definitions.get(name)
 
+    def remove(self, name: str) -> bool:
+        """Drop a tool definition and its handler; return True if one existed.
+
+        Used by short-lived registrations (e.g. a typed agent binding per-run,
+        deps-closing tools) to keep a shared registry clean across runs. The entity
+        projection is append-only by design, so a removal does not retract any
+        already-registered ``tool_definition`` record from the audit spine.
+        """
+        existed = self._definitions.pop(name, None) is not None
+        self._handlers.pop(name, None)
+        return existed
+
     def list(self) -> list[ToolDefinition]:
         """Return every registered tool definition."""
         return list(self._definitions.values())

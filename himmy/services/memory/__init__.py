@@ -10,20 +10,36 @@ hits = await memory.recall("units preference", subject_id="alice")
 from __future__ import annotations
 
 from himmy.services.memory.adapter import MemoryContextAdapter
+from himmy.services.memory.consolidation import (
+    ConsolidationAction,
+    ConsolidationResult,
+    MemoryConsolidator,
+)
+from himmy.services.memory.projection import MEMORY_FACT_KIND, memory_to_record
 from himmy.services.memory.service import MemoryHit, MemoryService
 from himmy.services.memory.store import (
+    MEMORY_TIERS,
     InMemoryMemoryStore,
     MemoryRecord,
     MemoryStore,
     SqliteMemoryStore,
 )
+from himmy.services.memory.temporal import filter_as_of, is_valid_at
 
 __all__ = [
-    "MemoryService",
+    "MEMORY_FACT_KIND",
+    "MEMORY_TIERS",
+    "ConsolidationAction",
+    "ConsolidationResult",
+    "InMemoryMemoryStore",
+    "MemoryConsolidator",
+    "MemoryContextAdapter",
     "MemoryHit",
     "MemoryRecord",
+    "MemoryService",
     "MemoryStore",
-    "InMemoryMemoryStore",
     "SqliteMemoryStore",
-    "MemoryContextAdapter",
+    "filter_as_of",
+    "is_valid_at",
+    "memory_to_record",
 ]

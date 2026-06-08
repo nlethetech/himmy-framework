@@ -120,9 +120,22 @@ def forget(memory_id: str) -> bool:
 
 
 async def recall(
-    query: str, *, subject_id: str = "default", top_k: int = 5
+    query: str,
+    *,
+    subject_id: str = "default",
+    top_k: int = 5,
+    similarity_threshold: float | None = None,
+    as_of: str | None = None,
+    active_only: bool = False,
 ) -> list[MemoryHitItem]:
-    hits = await get_memory_service().recall(query, subject_id=subject_id, top_k=top_k)
+    hits = await get_memory_service().recall(
+        query,
+        subject_id=subject_id,
+        top_k=top_k,
+        similarity_threshold=similarity_threshold,
+        as_of=as_of,
+        active_only=active_only,
+    )
     return [
         MemoryHitItem(
             memory_id=h.record.memory_id, text=h.record.text, similarity=h.similarity
@@ -131,9 +144,52 @@ async def recall(
     ]
 
 
+class MemoryTimelineItem(BaseModel):
+    """One point in a fact's bi-temporal life (for the GUI timeline)."""
+
+    memory_id: str
+    text: str
+    valid_from: str
+    valid_to: str | None
+    superseded_by: str | None
+    tier: str
+    source: str
+
+
+def list_memory_history(
+    stable_key: str, *, subject_id: str = "default"
+) -> list[MemoryTimelineItem]:
+    """All versions of a fact (by ``stable_key``) ordered oldest-first.
+
+    Surfaces the bi-temporal evolution of a single fact — original value, each
+    supersession, and the current truth — so a GUI can render "how this changed
+    over time". Falls back to a single record when a fact was remembered without an
+    explicit ``stable_key`` (its ``memory_id`` is its own key).
+    """
+    records = [
+        r
+        for r in _store().list(subject_id)
+        if (r.stable_key or r.memory_id) == stable_key
+    ]
+    records.sort(key=lambda r: r.valid_from)
+    return [
+        MemoryTimelineItem(
+            memory_id=r.memory_id,
+            text=r.text,
+            valid_from=r.valid_from,
+            valid_to=r.valid_to,
+            superseded_by=r.superseded_by,
+            tier=r.tier,
+            source=r.source,
+        )
+        for r in records
+    ]
+
+
 __all__ = [
     "MemoryItem",
     "MemoryHitItem",
+    "MemoryTimelineItem",
     "get_memory_service",
     "reset_memory_service",
     "list_subjects",
@@ -141,4 +197,5 @@ __all__ = [
     "add_memory",
     "forget",
     "recall",
+    "list_memory_history",
 ]

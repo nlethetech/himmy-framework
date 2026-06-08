@@ -629,6 +629,62 @@ class SingleAgentRuntime:
             persona, thread, ctx, trace_id, llm_config=llm_config
         )
 
+    async def reinject_system_prompt(
+        self,
+        persona: Persona,
+        thread: ChatThread,
+        *,
+        task_context: dict[str, Any] | None = None,
+    ) -> str:
+        """Re-render and (re)inject ``persona``'s system prompt onto ``thread``.
+
+        When control transfers between personas on a SHARED thread (a multi-agent
+        handoff), the thread still carries the PREVIOUS persona's SYSTEM message, so a
+        plain :meth:`continue_turn` would run the new persona under the old persona's
+        instructions. This re-renders the system prompt for ``persona`` (honoring the
+        same ``task_context`` knobs as a fresh run — ``role``/``objectives``/``skills``/
+        ``system_prefix``) and REPLACES the leading SYSTEM message in place (appending
+        one when none exists). The replacement Message is registered into the audit
+        spine and the thread version is bumped, so the persona switch is provenance-
+        native and replayable. Returns the rendered system prompt (``""`` when no
+        prompt manager is wired). No-op for a persona whose prompt already matches.
+        """
+        from himmy.agents.base_agent.task import Task
+        from himmy.agents.base_agent.thread import Message, MessageRole
+
+        ctx = dict(task_context or {})
+        # A synthetic, promptless task so the renderer can build the system block
+        # (the task prompt is irrelevant here — we only swap the SYSTEM message).
+        task = Task(title=f"{persona.name}-handoff", prompt="", context=ctx)
+        snapshot, _snapshot_id, _err = await self._resolve_snapshot(
+            persona, task, ctx, None
+        )
+        system_prompt, _task_prompt, _missing = self._render_prompts(
+            persona, task, ctx, snapshot
+        )
+
+        existing = next(
+            (m for m in thread.messages if m.role == MessageRole.SYSTEM), None
+        )
+        if existing is not None and existing.content == system_prompt:
+            return system_prompt  # already the right persona — nothing to do
+
+        new_system = Message(
+            role=MessageRole.SYSTEM,
+            content=system_prompt,
+            metadata={"persona": persona.name, "agent_id": persona.agent_id},
+        )
+        if existing is not None:
+            index = thread.messages.index(existing)
+            thread.messages[index] = new_system
+        else:
+            # No SYSTEM yet: it must lead the thread so the model reads it first.
+            thread.messages.insert(0, new_system)
+        thread.version += 1
+        self._register_message(new_system)
+        self._register_thread_version(thread)
+        return system_prompt
+
     async def stream_task(
         self,
         persona: Persona,

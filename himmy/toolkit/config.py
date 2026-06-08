@@ -41,7 +41,9 @@ class ToolkitConfig(BaseModel):
 
     # knowledge / memory embeddings ----------------------------------------
     kb_dsn: str | None = None  # Postgres+pgvector DSN → durable KB; None → in-process
-    embedder: str = "deterministic"  # deterministic | ollama | fastembed | openai
+    # auto | deterministic | ollama | fastembed | openai. "auto" prefers a real local
+    # embedder (fastembed, else a reachable Ollama) and falls back to deterministic.
+    embedder: str = "deterministic"
     embedder_model: str | None = None
     embedder_dim: int | None = None
     ollama_base_url: str | None = None
@@ -68,17 +70,33 @@ class ToolkitConfig(BaseModel):
     # memory pack -----------------------------------------------------------
     memory_path: str | None = None  # sqlite file → durable; None → in-process
     memory_subject: str = "default"
+    # Optional recall floor (HIMMY_MEMORY_MIN_SIM): below it a memory is not
+    # recalled. None preserves the always-return-the-top-hit default.
+    memory_min_similarity: float | None = None
+    # Opt-in audited consolidation on remember (HIMMY_MEMORY_CONSOLIDATE): a new
+    # fact is reconciled (ADD/UPDATE/DELETE/NOOP) against existing ones instead of
+    # blindly appended. Off by default so a default agent incurs no extra cost.
+    memory_consolidate: bool = False
 
     def build_embedder_and_dim(self) -> tuple[Any, int]:
-        """Build the configured embedder and its effective embedding dimension."""
+        """Build the configured embedder and its effective embedding dimension.
+
+        ``embedder="auto"`` is resolved to a concrete backend exactly once here, so
+        the returned ``dim`` matches the embedder that is actually built even when the
+        reachability of a local Ollama probe could otherwise differ between calls.
+        """
         from himmy.services.knowledge.local_embedders import (
             build_embedder,
             default_dim_for,
+            resolve_auto_backend,
         )
 
-        dim = self.embedder_dim or default_dim_for(self.embedder)
+        backend = self.embedder
+        if backend == "auto":
+            backend = resolve_auto_backend(ollama_base_url=self.ollama_base_url)
+        dim = self.embedder_dim or default_dim_for(backend)
         embedder = build_embedder(
-            self.embedder,
+            backend,
             model=self.embedder_model,
             dim=dim,
             base_url=self.ollama_base_url,
@@ -145,6 +163,14 @@ class ToolkitConfig(BaseModel):
             sandbox_engine=env.get("HIMMY_SANDBOX_ENGINE", "docker"),
             memory_path=env.get("HIMMY_MEMORY_PATH"),
             memory_subject=env.get("HIMMY_MEMORY_SUBJECT", "default"),
+            memory_min_similarity=(
+                float(env["HIMMY_MEMORY_MIN_SIM"])
+                if env.get("HIMMY_MEMORY_MIN_SIM")
+                else None
+            ),
+            memory_consolidate=_env_bool(
+                env.get("HIMMY_MEMORY_CONSOLIDATE"), default=False
+            ),
         )
 
     @classmethod
@@ -178,6 +204,8 @@ _TOOLKIT_ENV_KEYS: dict[str, str] = {
     "ollama_base_url": "HIMMY_OLLAMA_URL",
     "memory_path": "HIMMY_MEMORY_PATH",
     "memory_subject": "HIMMY_MEMORY_SUBJECT",
+    "memory_min_similarity": "HIMMY_MEMORY_MIN_SIM",
+    "memory_consolidate": "HIMMY_MEMORY_CONSOLIDATE",
 }
 
 

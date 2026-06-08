@@ -93,6 +93,52 @@ class KnowledgeBackendProtocol(Protocol):
         ...
 
 
+@runtime_checkable
+class LexicalSearchProtocol(Protocol):
+    """Optional backend capability: ranked lexical (BM25/full-text) search.
+
+    Kept SEPARATE from :class:`KnowledgeBackendProtocol` so existing backends stay
+    valid without a lexical leg. The hybrid pipeline probes a backend with
+    ``isinstance(backend, LexicalSearchProtocol)``; a backend that lacks it (or
+    whose lexical index is absent) reports unavailable and the KB degrades to
+    dense-only.
+    """
+
+    async def search_lexical(
+        self,
+        kb_id: str,
+        query: str,
+        *,
+        top_k: int,
+        metadata_filters: dict[str, Any] | None,
+    ) -> list[tuple[str, float]]:
+        """Return up to ``top_k`` ``(chunk_id, score)`` lexical matches, best first."""
+        ...
+
+    async def lexical_available(self, kb_id: str) -> bool:
+        """True when a usable lexical index exists for this KB."""
+        ...
+
+
+def build_lexical_index_ddl() -> str:
+    """Return ADDITIVE, idempotent DDL adding a full-text index to knowledge_chunks.
+
+    Adds a generated ``text_tsv`` ``tsvector`` column (derived from the existing
+    ``text`` column) plus a GIN index. It is ``IF NOT EXISTS`` throughout and does
+    NOT touch the base schema DDL, so it can be run on a live database to enable the
+    lexical leg without a migration of existing rows. When this column/index is
+    absent, :meth:`PgVectorKnowledgeBackend.lexical_available` returns False and the
+    KB falls back to dense-only retrieval.
+    """
+    return (
+        "ALTER TABLE knowledge_chunks "
+        "ADD COLUMN IF NOT EXISTS text_tsv tsvector "
+        "GENERATED ALWAYS AS (to_tsvector('simple', coalesce(text, ''))) STORED;\n"
+        "CREATE INDEX IF NOT EXISTS knowledge_chunks_text_tsv_idx "
+        "ON knowledge_chunks USING gin (text_tsv);"
+    )
+
+
 def resolve_column_and_index(
     vector_dim: int,
     *,
@@ -518,6 +564,135 @@ class PgVectorKnowledgeBackend:
             )
         return results
 
+    # --------------------------------------------------------------- lexical
+    async def create_lexical_index(self) -> None:
+        """Run the additive full-text DDL so :meth:`search_lexical` works.
+
+        Idempotent: adds the generated ``text_tsv`` column + GIN index if missing.
+        Call once (alongside :meth:`create_knowledge_schema`) to enable the lexical
+        leg of hybrid retrieval on Postgres.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(build_lexical_index_ddl())
+
+    async def lexical_available(self, kb_id: str) -> bool:
+        """True when the ``text_tsv`` full-text column exists on knowledge_chunks."""
+        sql = """
+        SELECT 1
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        WHERE c.relname = 'knowledge_chunks'
+          AND a.attname = 'text_tsv'
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(sql)
+        return row is not None
+
+    async def search_lexical(
+        self,
+        kb_id: str,
+        query: str,
+        *,
+        top_k: int,
+        metadata_filters: dict[str, Any] | None,
+    ) -> list[tuple[str, float]]:
+        """Full-text top-k via ``ts_rank`` over the generated ``text_tsv`` column.
+
+        Postgres native FTS (``plainto_tsquery`` + ``ts_rank``) stands in for true
+        BM25; it ranks by lexical overlap which is the property hybrid fusion needs.
+        ``metadata_filters`` is pushed into SQL via JSONB containment, mirroring the
+        dense path. Returns ``(chunk_id, rank)`` pairs, best first.
+        """
+        params: list[Any] = [kb_id, query]
+        where = ["c.kb_id = $1", "c.text_tsv @@ plainto_tsquery('simple', $2)"]
+        if metadata_filters:
+            import json
+
+            params.append(json.dumps(metadata_filters))
+            where.append(f"c.metadata @> ${len(params)}::jsonb")
+        params.append(int(top_k))
+        limit_param = f"${len(params)}"
+        sql = f"""
+        SELECT c.chunk_id,
+               ts_rank(c.text_tsv, plainto_tsquery('simple', $2)) AS rank
+        FROM knowledge_chunks c
+        WHERE {" AND ".join(where)}
+        ORDER BY rank DESC
+        LIMIT {limit_param}
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [(str(row["chunk_id"]), float(row["rank"])) for row in rows]
+
+    async def get_chunk(self, kb_id: str, chunk_id: str) -> RetrievedChunk | None:
+        """Re-hydrate one chunk by id (used by the hybrid pipeline's fusion cut)."""
+        sql = """
+        SELECT
+            c.chunk_id, c.document_id, c.text, c.start_pos, c.end_pos,
+            c.chunk_kind, c.image_uri, c.caption, c.metadata,
+            d.source_uri AS doc_source_uri, d.text AS doc_text
+        FROM knowledge_chunks c
+        JOIN knowledge_documents d ON d.document_id = c.document_id
+        WHERE c.kb_id = $1 AND c.chunk_id = $2
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(sql, kb_id, chunk_id)
+        if row is None:
+            return None
+        return RetrievedChunk(
+            text=row["text"],
+            similarity=0.0,
+            context_window=self._window(
+                row["doc_text"], row["start_pos"], row["end_pos"], row["text"]
+            ),
+            document_id=row["document_id"],
+            source_uri=row["doc_source_uri"],
+            chunk_kind=row["chunk_kind"],
+            metadata={
+                **self._jsonb(row["metadata"]),
+                "chunk_id": row["chunk_id"],
+                "start_pos": row["start_pos"],
+                "end_pos": row["end_pos"],
+            },
+        )
+
+    async def dense_ranked(
+        self,
+        kb_id: str,
+        query_vec: list[float],
+        *,
+        top_k: int,
+        metadata_filters: dict[str, Any] | None,
+    ) -> list[tuple[str, float]]:
+        """Return ``(chunk_id, cosine_similarity)`` for the dense leg of fusion.
+
+        Unlike :meth:`search`, this returns ids+scores only (no re-hydration) and
+        applies no threshold, so the fused candidate pool can be wide. The hybrid
+        pipeline re-hydrates the survivors via :meth:`get_chunk`.
+        """
+        cast = self._cast()
+        params: list[Any] = [_vector_literal(query_vec), kb_id]
+        where = ["c.kb_id = $2"]
+        if metadata_filters:
+            import json
+
+            params.append(json.dumps(metadata_filters))
+            where.append(f"c.metadata @> ${len(params)}::jsonb")
+        params.append(int(top_k))
+        limit_param = f"${len(params)}"
+        sql = f"""
+        SELECT c.chunk_id, (1 - (c.embedding <=> $1{cast})) AS similarity
+        FROM knowledge_chunks c
+        WHERE {" AND ".join(where)}
+        ORDER BY c.embedding <=> $1{cast} ASC
+        LIMIT {limit_param}
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [(str(row["chunk_id"]), float(row["similarity"])) for row in rows]
+
     # ---------------------------------------------------------------- helpers
     @staticmethod
     def _window(
@@ -561,8 +736,10 @@ class PgVectorKnowledgeBackend:
 
 __all__ = [
     "KnowledgeBackendProtocol",
+    "LexicalSearchProtocol",
     "PgVectorKnowledgeBackend",
     "build_knowledge_schema_ddl",
+    "build_lexical_index_ddl",
     "resolve_column_and_index",
     "VECTOR_MAX_DIM",
     "HALFVEC_MAX_DIM",

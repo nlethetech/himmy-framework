@@ -1,6 +1,16 @@
-"""Knowledge kernel: the SemanticChunker that segments documents for embedding."""
+"""Knowledge kernel: chunkers that segment documents for embedding.
+
+:class:`SemanticChunker` is the offline default — a char-window splitter on natural
+boundaries. :class:`MarkdownAwareChunker` is the opt-in, structure-aware upgrade
+(2026 RAG best practice): it splits on markdown headers FIRST so a chunk never
+straddles a section boundary, then applies the same char-window logic within each
+section. Both return ``(start, end, text)`` triples whose offsets index the
+ORIGINAL document, so parent-document windows still resolve.
+"""
 
 from __future__ import annotations
+
+import re
 
 
 class SemanticChunker:
@@ -94,4 +104,88 @@ class SemanticChunker:
         return end
 
 
-__all__ = ["SemanticChunker"]
+#: A markdown ATX header line: 1-6 ``#`` then a space then the heading text.
+_HEADER_RE = re.compile(r"^(#{1,6})\s+\S")
+
+
+class MarkdownAwareChunker:
+    """Heading-aware chunker: split on markdown headers, then char-window each section.
+
+    A header at a level in ``header_split_levels`` starts a new section, so a chunk
+    never merges content across (say) two H1s or H2s — keeping each chunk topically
+    coherent, which measurably lifts retrieval precision over a blind char-window
+    split. Within a section the proven :class:`SemanticChunker` window logic runs, so
+    a long section is still split into overlapping windows and offsets stay valid
+    into the original document (parent-doc windows resolve unchanged).
+
+    Documents with no headers degrade to exactly the :class:`SemanticChunker`
+    behaviour, so this is a safe drop-in for mixed corpora.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_chars: int = 800,
+        overlap: int = 100,
+        min_new_chars: int = 1,
+        header_split_levels: tuple[int, ...] = (1, 2, 3),
+    ) -> None:
+        """Configure window sizing (see :class:`SemanticChunker`) + split levels.
+
+        ``header_split_levels`` lists the markdown header depths that begin a new
+        section (default H1/H2/H3). A header at a deeper, non-listed level stays
+        inside its current section (it is ordinary content there).
+        """
+        if not header_split_levels:
+            raise ValueError("header_split_levels must list at least one level")
+        if any(lvl < 1 or lvl > 6 for lvl in header_split_levels):
+            raise ValueError("header_split_levels entries must be in [1, 6]")
+        self._levels = frozenset(header_split_levels)
+        self._inner = SemanticChunker(
+            max_chars=max_chars, overlap=overlap, min_new_chars=min_new_chars
+        )
+
+    @property
+    def max_chars(self) -> int:
+        """Target chunk size, delegated to the inner window chunker."""
+        return self._inner.max_chars
+
+    def chunk(self, text: str) -> list[tuple[int, int, str]]:
+        """Return ``(start, end, text)`` triples, never crossing a split header.
+
+        Sections are cut at qualifying header boundaries; each section is then
+        windowed by the inner :class:`SemanticChunker`, with the inner offsets
+        shifted back into the original document so the triples index ``text``.
+        """
+        if not text:
+            return []
+        sections = self._split_sections(text)
+        chunks: list[tuple[int, int, str]] = []
+        for sec_start, sec_end in sections:
+            section_text = text[sec_start:sec_end]
+            for start, end, _ in self._inner.chunk(section_text):
+                abs_start = sec_start + start
+                abs_end = sec_start + end
+                chunks.append((abs_start, abs_end, text[abs_start:abs_end]))
+        return chunks
+
+    def _split_sections(self, text: str) -> list[tuple[int, int]]:
+        """Return ``(start, end)`` spans split at qualifying header line starts."""
+        boundaries = [0]
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            match = _HEADER_RE.match(line)
+            if match is not None and len(match.group(1)) in self._levels:
+                if offset != 0 and offset not in boundaries:
+                    boundaries.append(offset)
+            offset += len(line)
+        boundaries.append(len(text))
+        spans: list[tuple[int, int]] = []
+        for i in range(len(boundaries) - 1):
+            start, end = boundaries[i], boundaries[i + 1]
+            if end > start:
+                spans.append((start, end))
+        return spans
+
+
+__all__ = ["SemanticChunker", "MarkdownAwareChunker"]

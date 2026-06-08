@@ -31,10 +31,19 @@ from himmy.services.knowledge.models import (
     RetrievedChunk,
 )
 from himmy.services.knowledge.readers import DocumentReaderFactory
+from himmy.services.knowledge.retrieval.config import (
+    DEFAULT_RETRIEVAL_CONFIG,
+    RetrievalConfig,
+)
+from himmy.services.knowledge.retrieval.hybrid import HybridRetriever
+from himmy.services.knowledge.retrieval.lexical import BM25Index
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.knowledge.backend import KnowledgeBackendProtocol
+    from himmy.services.knowledge.chunker import MarkdownAwareChunker
     from himmy.services.storage.service import StorageService
+
+    AnyChunker = SemanticChunker | MarkdownAwareChunker
 
 
 def _content_hash(text: str) -> str:
@@ -74,17 +83,25 @@ class KnowledgeBase:
         *,
         storage: StorageService | Any,
         embedder: EmbedderProtocol | None = None,
-        chunker: SemanticChunker | None = None,
+        chunker: AnyChunker | None = None,
         reader_factory: DocumentReaderFactory | None = None,
         max_embed_batch: int = 512,
         max_concurrent_embeds: int = 4,
         backend: KnowledgeBackendProtocol | None = None,
+        retrieval: RetrievalConfig | None = None,
     ) -> None:
         """Wire the KB with a storage backend, embedder, chunker, and readers.
 
         The injected ``embedder`` is asserted to satisfy :class:`EmbedderProtocol`
         at construction time so a missing ``embed_query``/``embed_documents`` is a
         clear early error rather than a deferred failure at search time.
+
+        ``retrieval`` selects the retrieval pipeline. The default
+        (:data:`DEFAULT_RETRIEVAL_CONFIG`, ``mode='dense'``) reproduces the original
+        dense cosine path byte-for-byte; ``RetrievalConfig(mode='hybrid')`` turns on
+        BM25+dense RRF fusion (and optional rerank / query rewrite). A lexical index
+        is maintained for the in-memory path only when hybrid is selected, so the
+        pure-dense default carries no extra work.
         """
         self._storage = storage
         self._embedder: EmbedderProtocol = embedder or DeterministicEmbedder()
@@ -93,16 +110,19 @@ class KnowledgeBase:
                 "embedder must implement EmbedderProtocol "
                 "(async embed_query + embed_documents)."
             )
-        self._chunker = chunker or SemanticChunker()
+        self._chunker: AnyChunker = chunker or SemanticChunker()
         self._readers = reader_factory or DocumentReaderFactory()
         self.max_embed_batch = max_embed_batch
         self.max_concurrent_embeds = max_concurrent_embeds
         self._backend: KnowledgeBackendProtocol | None = backend
+        self._retrieval: RetrievalConfig = retrieval or DEFAULT_RETRIEVAL_CONFIG
         self._kbs: dict[str, KnowledgeBaseRecord] = {}
         # kb_id -> {document_id: KnowledgeDocument}
         self._documents: dict[str, dict[str, KnowledgeDocument]] = {}
         # kb_id -> {chunk_id: KnowledgeChunk}
         self._chunks: dict[str, dict[str, KnowledgeChunk]] = {}
+        # kb_id -> BM25 lexical index (in-memory hybrid path; built on demand).
+        self._lexical: dict[str, BM25Index] = {}
 
     # ------------------------------------------------------------------ kb crud
     async def create_kb(
@@ -186,6 +206,7 @@ class KnowledgeBase:
         del self._kbs[kb_id]
         self._documents.pop(kb_id, None)
         self._chunks.pop(kb_id, None)
+        self._lexical.pop(kb_id, None)
         return True
 
     # ------------------------------------------------------------------ ingest
@@ -368,6 +389,9 @@ class KnowledgeBase:
                 self._documents[kb_id][document.document_id] = document
             for chunk in all_chunks:
                 self._chunks[kb_id][chunk.chunk_id] = chunk
+            # The lexical index is derived from self._chunks; invalidate so the
+            # next hybrid search rebuilds it in lock-step with the dense store.
+            self._invalidate_lexical(kb_id)
 
         return [slot for slot in slots if slot is not None]
 
@@ -449,6 +473,7 @@ class KnowledgeBase:
         else:
             self._documents[kb_id][document.document_id] = document
             self._chunks[kb_id][chunk.chunk_id] = chunk
+            self._invalidate_lexical(kb_id)
         return document
 
     # ------------------------------------------------------------------ search
@@ -480,6 +505,15 @@ class KnowledgeBase:
         cannot reach this KB's chunks.
         """
         await self._authorize_kb(kb_id, workspace_id, client_id)
+
+        if self._retrieval.mode == "hybrid":
+            return await self._search_hybrid(
+                kb_id,
+                query,
+                top_k=top_k,
+                similarity_threshold=similarity_threshold,
+                metadata_filters=metadata_filters,
+            )
 
         def _keep(sim: float) -> bool:
             if similarity_threshold is None:
@@ -531,6 +565,179 @@ class KnowledgeBase:
             )
         return results
 
+    # ------------------------------------------------------------- hybrid search
+    async def _search_hybrid(
+        self,
+        kb_id: str,
+        query: str,
+        *,
+        top_k: int,
+        similarity_threshold: float | None,
+        metadata_filters: dict[str, Any] | None,
+    ) -> list[RetrievedChunk]:
+        """Run BM25+dense RRF fusion (and optional rerank/rewrite) for ``query``.
+
+        Builds the dense and lexical legs over either the in-memory store or a
+        lexical-capable backend, then delegates ranking to :class:`HybridRetriever`.
+        When the backend cannot serve a lexical leg, the lexical leg yields nothing
+        and the result degrades to dense-only (RRF over a single list) — never an
+        error.
+        """
+        if self._backend is not None:
+            dense_leg, lexical_leg, hydrate, text_lookup = self._backend_legs(
+                kb_id, metadata_filters
+            )
+        else:
+            dense_leg, lexical_leg, hydrate, text_lookup = self._inmemory_legs(
+                kb_id, metadata_filters
+            )
+        retriever = HybridRetriever(
+            dense_leg=dense_leg,
+            lexical_leg=lexical_leg,
+            hydrate=hydrate,
+            text_lookup=text_lookup,
+            config=self._retrieval,
+        )
+        return await retriever.retrieve(
+            query, top_k=top_k, similarity_threshold=similarity_threshold
+        )
+
+    def _inmemory_legs(
+        self, kb_id: str, metadata_filters: dict[str, Any] | None
+    ) -> tuple[Any, Any, Any, Any]:
+        """Build the dense/lexical/hydrate/text legs over the in-memory store."""
+        kb_chunks = self._chunks.get(kb_id, {})
+
+        def _passes(chunk: KnowledgeChunk) -> bool:
+            if not metadata_filters:
+                return True
+            return not any(
+                chunk.metadata.get(k) != v for k, v in metadata_filters.items()
+            )
+
+        async def dense_leg(q: str, pool: int) -> list[tuple[str, float]]:
+            query_vec = await self._embedder.embed_query(q)
+            scored: list[tuple[str, float]] = []
+            for chunk in kb_chunks.values():
+                if not _passes(chunk):
+                    continue
+                sim = _cosine(query_vec, chunk.embedding)
+                if sim > 0.0:
+                    scored.append((chunk.chunk_id, sim))
+            scored.sort(key=lambda pair: (-pair[1], pair[0]))
+            return scored[:pool]
+
+        async def lexical_leg(q: str, pool: int) -> list[tuple[str, float]]:
+            index = self._lexical_index(kb_id)
+            hits = index.search(q, top_k=pool * 2 if metadata_filters else pool)
+            if not metadata_filters:
+                return hits[:pool]
+            kept = [(cid, s) for (cid, s) in hits if _passes(kb_chunks[cid])]
+            return kept[:pool]
+
+        async def hydrate(chunk_id: str) -> RetrievedChunk | None:
+            chunk = kb_chunks.get(chunk_id)
+            if chunk is None:
+                return None
+            document = self._documents.get(kb_id, {}).get(chunk.document_id)
+            return RetrievedChunk(
+                text=chunk.text,
+                similarity=0.0,
+                context_window=self._context_window(document, chunk),
+                document_id=chunk.document_id,
+                source_uri=document.source_uri if document else None,
+                chunk_kind=chunk.chunk_kind,
+                metadata={
+                    **chunk.metadata,
+                    "chunk_id": chunk.chunk_id,
+                    "start_pos": chunk.start_pos,
+                    "end_pos": chunk.end_pos,
+                },
+            )
+
+        async def text_lookup(chunk_id: str) -> str | None:
+            chunk = kb_chunks.get(chunk_id)
+            return chunk.text if chunk is not None else None
+
+        return dense_leg, lexical_leg, hydrate, text_lookup
+
+    def _backend_legs(
+        self, kb_id: str, metadata_filters: dict[str, Any] | None
+    ) -> tuple[Any, Any, Any, Any]:
+        """Build the legs over a backend (lexical only if it advertises the capability)."""
+        from himmy.services.knowledge.backend import LexicalSearchProtocol
+
+        backend = self._backend
+        assert backend is not None  # noqa: S101 - only called with a backend
+        lexical_backend = (
+            backend if isinstance(backend, LexicalSearchProtocol) else None
+        )
+
+        async def dense_leg(q: str, pool: int) -> list[tuple[str, float]]:
+            query_vec = await self._embedder.embed_query(q)
+            dense_ranked = getattr(backend, "dense_ranked", None)
+            if dense_ranked is not None:
+                ranked: list[tuple[str, float]] = await dense_ranked(
+                    kb_id, query_vec, top_k=pool, metadata_filters=metadata_filters
+                )
+                return ranked
+            # A backend without the helper: fall back to its top-k search and read
+            # chunk ids out of the returned RetrievedChunks.
+            chunks = await backend.search(
+                kb_id,
+                query_vec,
+                top_k=pool,
+                similarity_threshold=None,
+                metadata_filters=metadata_filters,
+            )
+            return [
+                (str(c.metadata.get("chunk_id")), c.similarity)
+                for c in chunks
+                if c.metadata.get("chunk_id") is not None
+            ]
+
+        async def lexical_leg(q: str, pool: int) -> list[tuple[str, float]]:
+            if lexical_backend is None:
+                return []
+            if not await lexical_backend.lexical_available(kb_id):
+                return []
+            return await lexical_backend.search_lexical(
+                kb_id, q, top_k=pool, metadata_filters=metadata_filters
+            )
+
+        async def hydrate(chunk_id: str) -> RetrievedChunk | None:
+            get_chunk = getattr(backend, "get_chunk", None)
+            if get_chunk is None:
+                return None
+            chunk: RetrievedChunk | None = await get_chunk(kb_id, chunk_id)
+            return chunk
+
+        async def text_lookup(chunk_id: str) -> str | None:
+            chunk = await hydrate(chunk_id)
+            return chunk.text if chunk is not None else None
+
+        return dense_leg, lexical_leg, hydrate, text_lookup
+
+    def _lexical_index(self, kb_id: str) -> BM25Index:
+        """Return the kb's BM25 index, (re)building it from the chunk store if stale.
+
+        The index is rebuilt lazily on the first hybrid search after a mutation
+        (ingest/delete invalidate it), so the dense default never pays for it and the
+        lexical leg stays in lock-step with the dense store.
+        """
+        index = self._lexical.get(kb_id)
+        if index is None:
+            index = BM25Index()
+            for chunk in self._chunks.get(kb_id, {}).values():
+                if chunk.text:
+                    index.add(chunk.chunk_id, chunk.text)
+            self._lexical[kb_id] = index
+        return index
+
+    def _invalidate_lexical(self, kb_id: str) -> None:
+        """Drop the cached lexical index so the next hybrid search rebuilds it."""
+        self._lexical.pop(kb_id, None)
+
     async def delete_document(
         self,
         kb_id: str,
@@ -555,6 +762,7 @@ class KnowledgeBase:
         chunks = self._chunks.get(kb_id, {})
         for cid in [c for c, ch in chunks.items() if ch.document_id == document_id]:
             del chunks[cid]
+        self._invalidate_lexical(kb_id)
         return True
 
     # ------------------------------------------------------------------ helpers

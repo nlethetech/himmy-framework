@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from himmy import build_runtime
+from himmy.agents.base_agent.thread import MessageRole
 from himmy.agents.personas.persona import Persona
 from himmy.core.events import EventType
 from himmy.orchestrators import AgentTeam, MultiAgentOrchestrator, TeamMember
@@ -16,6 +17,14 @@ def _team_runtime() -> tuple[Any, ToolRegistry]:
     registry = ToolRegistry()
     runtime, _inf, _tools = build_runtime(tool_registry=registry)
     return runtime, registry
+
+
+def _system_message(thread: Any) -> str:
+    """The current leading SYSTEM message content of a thread (or "")."""
+    for message in thread.messages:
+        if message.role == MessageRole.SYSTEM:
+            return message.content
+    return ""
 
 
 def test_handoff_transfers_control_and_terminates() -> None:
@@ -104,6 +113,66 @@ def test_single_agent_no_edges_answers_directly() -> None:
     assert res.final_agent == "solo"
     assert res.stopped_reason == "final"
     assert res.turn_count == 1
+
+
+def test_handoff_reinjects_target_persona_system_prompt() -> None:
+    """Regression: after a handoff the TARGET persona's system prompt is in effect.
+
+    The shared thread carries the entry persona's SYSTEM message; without re-injecting
+    the target persona's prompt on handoff, the specialist would run under the triage
+    persona. We assert (a) the thread's leading SYSTEM message is now the specialist's
+    and (b) the specialist's distinctive description reaches the model (the offline
+    stub echoes the system prompt head, so the final answer carries it).
+    """
+    runtime, registry = _team_runtime()
+    team = AgentTeam(
+        members=[
+            TeamMember(
+                name="triage",
+                persona=Persona(name="triage", description="ZEBRA_TRIAGE_DESK"),
+                handoffs=["specialist"],
+            ),
+            TeamMember(
+                name="specialist",
+                persona=Persona(
+                    name="specialist", description="QUOKKA_SPECIALIST_DESK"
+                ),
+            ),
+        ],
+        entry="triage",
+    )
+    res = run_async(MultiAgentOrchestrator(runtime, team, registry).run("help me"))
+
+    assert res.final_agent == "specialist"
+    system = _system_message(res.thread)
+    # The specialist's identity is in the SYSTEM message, the triage's is gone.
+    assert "specialist agent" in system
+    assert "QUOKKA_SPECIALIST_DESK" in system
+    assert "triage agent" not in system
+    assert "ZEBRA_TRIAGE_DESK" not in system
+    # The offline stub echoes the system head into its answer — proof the SWITCHED
+    # persona prompt is what actually drove the specialist's turn.
+    assert res.output_text is not None
+    assert "specialist agent" in res.output_text
+
+
+def test_handoff_system_message_is_not_duplicated() -> None:
+    """A handoff REPLACES the SYSTEM message in place — it does not append a 2nd one."""
+    runtime, registry = _team_runtime()
+    team = AgentTeam(
+        members=[
+            TeamMember(
+                name="a",
+                persona=Persona(name="a", description="AAA"),
+                handoffs=["b"],
+            ),
+            TeamMember(name="b", persona=Persona(name="b", description="BBB")),
+        ],
+        entry="a",
+    )
+    res = run_async(MultiAgentOrchestrator(runtime, team, registry).run("go"))
+    system_count = sum(1 for m in res.thread.messages if m.role == MessageRole.SYSTEM)
+    assert system_count == 1
 
 
 def test_unknown_handoff_target_raises() -> None:

@@ -10,11 +10,19 @@ and memory subsystems while staying local/keyless:
   ``embeddings`` extra (no server, downloads a small model on first use).
 
 :func:`build_embedder` selects one by name so config/CLI can switch backends without
-code. All satisfy :class:`~himmy.services.knowledge.embedder.EmbedderProtocol`.
+code. The ``"auto"`` name asks for *genuine semantic* retrieval when it is locally
+available and degrades gracefully otherwise: it prefers ``fastembed`` (if the optional
+dep is importable, no network), then a reachable local Ollama (a fast, fail-closed
+localhost probe — never a hard dependency), and finally falls back to the offline
+:class:`DeterministicEmbedder`. So zero-config callers that opt into ``"auto"`` still
+import and run with no keys, no new required deps, and no working network.
+
+All embedders satisfy :class:`~himmy.services.knowledge.embedder.EmbedderProtocol`.
 """
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -125,10 +133,68 @@ _DEFAULT_DIMS = {
     "openai": 1536,
 }
 
+#: Default base URL for the local Ollama server (also the reachability probe target).
+_DEFAULT_OLLAMA_URL = "http://localhost:11434"
+
 
 def default_dim_for(name: str) -> int:
-    """Return the conventional embedding dimension for a backend name."""
+    """Return the conventional embedding dimension for a backend name.
+
+    ``"auto"`` reports the dim of whichever backend it would actually resolve to
+    *right now* (see :func:`resolve_auto_backend`), so a KB's ``vector_dim`` always
+    matches the embedder it is paired with.
+    """
+    if name == "auto":
+        return _DEFAULT_DIMS.get(resolve_auto_backend(), 64)
     return _DEFAULT_DIMS.get(name, 64)
+
+
+def fastembed_available() -> bool:
+    """True when the ``fastembed`` optional dep is importable (no import side effects).
+
+    Uses :func:`importlib.util.find_spec` so probing for availability never triggers
+    fastembed's heavier import or model download — that is deferred to first embed.
+    """
+    try:
+        return importlib.util.find_spec("fastembed") is not None
+    except (ImportError, ValueError):  # pragma: no cover - exotic import machinery
+        return False
+
+
+def ollama_reachable(
+    base_url: str = _DEFAULT_OLLAMA_URL, *, timeout: float = 0.25
+) -> bool:
+    """True when a local Ollama server answers at ``base_url`` within ``timeout``.
+
+    A fast, fail-closed probe: any connection error, timeout, missing ``httpx``, or
+    non-2xx/3xx response returns False so a reachable server is *preferred* but never
+    *required*. The default short timeout keeps the offline path snappy — when nothing
+    is listening the OS refuses the connection immediately. Localhost-only by default.
+    """
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a core dependency
+        return False
+    url = base_url.rstrip("/") + "/api/tags"
+    try:
+        response = httpx.get(url, timeout=timeout)
+    except Exception:  # noqa: BLE001 - any probe failure means "not reachable"
+        return False
+    return response.status_code < 400
+
+
+def resolve_auto_backend(*, ollama_base_url: str | None = None) -> str:
+    """Resolve ``"auto"`` to a concrete backend name, preferring real semantics.
+
+    Order: ``fastembed`` (local ONNX, no network) → a reachable local ``ollama`` →
+    the offline ``deterministic`` fallback. The result is a plain backend name so
+    callers can both build the embedder and look up its conventional dim coherently.
+    """
+    if fastembed_available():
+        return "fastembed"
+    if ollama_reachable(ollama_base_url or _DEFAULT_OLLAMA_URL):
+        return "ollama"
+    return "deterministic"
 
 
 def build_embedder(
@@ -138,7 +204,23 @@ def build_embedder(
     dim: int | None = None,
     base_url: str | None = None,
 ) -> EmbedderProtocol:
-    """Build an embedder by backend name (``deterministic|ollama|fastembed|openai``)."""
+    """Build an embedder by backend name.
+
+    Names: ``auto | deterministic | ollama | fastembed | openai | nepali``.
+    ``"auto"`` resolves to a real local embedder when one is available and otherwise
+    falls back to the offline :class:`DeterministicEmbedder` (see
+    :func:`resolve_auto_backend`). When ``"auto"`` resolves to a real backend, an
+    explicit ``dim`` is ignored unless it matches that backend's native dimension —
+    a foreign dim would silently mis-size the vector store.
+    """
+    if name == "auto":
+        resolved = resolve_auto_backend(ollama_base_url=base_url)
+        # Only forward an explicit dim when it matches the resolved backend's native
+        # dim; otherwise honour the backend's own dimension (e.g. fastembed's 384).
+        resolved_dim = dim if dim == _DEFAULT_DIMS.get(resolved) else None
+        return build_embedder(
+            resolved, model=model, dim=resolved_dim, base_url=base_url
+        )
     if name == "deterministic":
         return DeterministicEmbedder(dim=dim or _DEFAULT_DIMS["deterministic"])
     if name == "ollama":
@@ -166,7 +248,7 @@ def build_embedder(
         )
     raise HimmyError(
         f"unknown embedder {name!r} "
-        "(expected deterministic | ollama | fastembed | openai)"
+        "(expected auto | deterministic | ollama | fastembed | openai)"
     )
 
 
@@ -175,4 +257,7 @@ __all__ = [
     "FastEmbedEmbedder",
     "build_embedder",
     "default_dim_for",
+    "fastembed_available",
+    "ollama_reachable",
+    "resolve_auto_backend",
 ]

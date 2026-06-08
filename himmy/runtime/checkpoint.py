@@ -99,6 +99,137 @@ CREATE INDEX IF NOT EXISTS agent_checkpoints_status_idx
 """
 
 
+#: Graph-run lifecycle states (used by :class:`GraphCheckpoint`).
+GRAPH_RUNNING = "running"
+GRAPH_COMPLETED = "completed"
+GRAPH_INTERRUPTED = "interrupted"
+GRAPH_FAILED = "failed"
+
+
+class GraphCheckpoint(BaseModel):
+    """A durable snapshot of a :class:`~himmy.orchestrators.state_graph.StateGraph` run.
+
+    Persisted after every completed superstep so a long graph run survives a
+    process restart and resumes deterministically from where it stopped. Carries
+    the accumulated shared ``state``, the ``frontier`` of node names scheduled for
+    the next superstep, the superstep counter, and the visit counts used by the
+    loop guard. ``graph_name`` ties the checkpoint to the graph definition that
+    must be re-supplied on resume (the topology itself is code, not serialized).
+    """
+
+    checkpoint_id: str = Field(default_factory=new_uuid)
+    graph_name: str = ""
+    status: str = GRAPH_RUNNING
+    state: dict[str, Any] = Field(default_factory=dict)
+    frontier: list[str] = Field(default_factory=list)
+    superstep: int = 0
+    visit_counts: dict[str, int] = Field(default_factory=dict)
+    completed_nodes: list[str] = Field(default_factory=list)
+    error: str | None = None
+    created_at: str = Field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+
+@runtime_checkable
+class GraphCheckpointStore(Protocol):
+    """Persists and retrieves :class:`GraphCheckpoint`s (save upserts by id)."""
+
+    def save(self, checkpoint: GraphCheckpoint) -> None:
+        """Insert or replace a graph checkpoint by its id."""
+        ...
+
+    def load(self, checkpoint_id: str) -> GraphCheckpoint | None:
+        """Return a graph checkpoint by id, or None."""
+        ...
+
+
+class InMemoryGraphCheckpointStore:
+    """A volatile, process-local :class:`GraphCheckpointStore` (the default)."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, GraphCheckpoint] = {}
+
+    def save(self, checkpoint: GraphCheckpoint) -> None:
+        """Store the checkpoint (a deep copy, so later mutation can't leak in)."""
+        self._store[checkpoint.checkpoint_id] = checkpoint.model_copy(deep=True)
+
+    def load(self, checkpoint_id: str) -> GraphCheckpoint | None:
+        """Return a deep copy of the stored checkpoint, or None."""
+        found = self._store.get(checkpoint_id)
+        return found.model_copy(deep=True) if found is not None else None
+
+
+_GRAPH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS graph_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    graph_name    TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    data          TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS graph_checkpoints_status_idx
+    ON graph_checkpoints (status);
+"""
+
+
+class SqliteGraphCheckpointStore:
+    """A durable, file-backed :class:`GraphCheckpointStore` (stdlib ``sqlite3``).
+
+    Survives process restarts so a graph interrupted mid-run (a deadline, a
+    crash, or a human-in-the-loop pause) can resume from its last completed
+    superstep in a fresh process — the durable-resume guarantee.
+    """
+
+    def __init__(self, path: str = ":memory:") -> None:
+        """Open (or create) the SQLite database at ``path``."""
+        from himmy.core.sqlite_util import connect_hardened
+
+        self._conn = connect_hardened(path)
+        self._conn.executescript(_GRAPH_SCHEMA)
+        self._conn.commit()
+
+    def save(self, checkpoint: GraphCheckpoint) -> None:
+        """Upsert the checkpoint as a JSON row keyed by id."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO graph_checkpoints "
+            "(checkpoint_id, graph_name, status, data, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                checkpoint.checkpoint_id,
+                checkpoint.graph_name,
+                checkpoint.status,
+                checkpoint.model_dump_json(),
+                checkpoint.created_at,
+                checkpoint.updated_at,
+            ),
+        )
+        self._conn.commit()
+
+    def load(self, checkpoint_id: str) -> GraphCheckpoint | None:
+        """Read + deserialize a graph checkpoint by id, or None."""
+        row = self._conn.execute(
+            "SELECT data FROM graph_checkpoints WHERE checkpoint_id = ?",
+            (checkpoint_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return GraphCheckpoint.model_validate(json.loads(row[0]))
+
+    def list_by_status(self, status: str) -> list[GraphCheckpoint]:
+        """All graph checkpoints with the given status, newest first."""
+        rows = self._conn.execute(
+            "SELECT data FROM graph_checkpoints WHERE status = ? "
+            "ORDER BY updated_at DESC",
+            (status,),
+        ).fetchall()
+        return [GraphCheckpoint.model_validate(json.loads(r[0])) for r in rows]
+
+    def close(self) -> None:
+        """Close the underlying connection (idempotent)."""
+        self._conn.close()
+
+
 class SqliteCheckpointStore:
     """A durable, file-backed :class:`CheckpointStore` (stdlib ``sqlite3``)."""
 
@@ -157,4 +288,12 @@ __all__ = [
     "CheckpointStore",
     "InMemoryCheckpointStore",
     "SqliteCheckpointStore",
+    "GRAPH_RUNNING",
+    "GRAPH_COMPLETED",
+    "GRAPH_INTERRUPTED",
+    "GRAPH_FAILED",
+    "GraphCheckpoint",
+    "GraphCheckpointStore",
+    "InMemoryGraphCheckpointStore",
+    "SqliteGraphCheckpointStore",
 ]

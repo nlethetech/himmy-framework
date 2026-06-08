@@ -6,11 +6,13 @@ from himmy.services.knowledge.backend import (
     HALFVEC_MAX_DIM,
     VECTOR_MAX_DIM,
     KnowledgeBackendProtocol,
+    LexicalSearchProtocol,
     PgVectorKnowledgeBackend,
     build_knowledge_schema_ddl,
+    build_lexical_index_ddl,
     resolve_column_and_index,
 )
-from himmy.services.knowledge.chunker import SemanticChunker
+from himmy.services.knowledge.chunker import MarkdownAwareChunker, SemanticChunker
 from himmy.services.knowledge.embedder import (
     DeterministicEmbedder,
     EmbedderProtocol,
@@ -33,11 +35,30 @@ from himmy.services.knowledge.readers import (
     PDFReader,
     TextReader,
 )
+from himmy.services.knowledge.retrieval import (
+    DEFAULT_RETRIEVAL_CONFIG,
+    DEFAULT_RRF_K,
+    BM25Index,
+    FastEmbedReranker,
+    HybridRetriever,
+    HyDERewriter,
+    IdentityRewriter,
+    LexicalIndex,
+    MultiQueryRewriter,
+    QueryRewriterProtocol,
+    RerankerProtocol,
+    RetrievalConfig,
+    RetrievalMode,
+    build_reranker,
+    fastembed_rerank_available,
+    reciprocal_rank_fusion,
+)
 from himmy.services.knowledge.retrieval_eval import (
     RetrievalEvalCase,
     RetrievalEvalReport,
     RetrievalScore,
     aggregate_scores,
+    compare_retrieval,
     evaluate_retrieval,
     score_retrieval,
 )
@@ -66,6 +87,7 @@ __all__ = [
     "OpenAIMultimodalEmbeddingModel",
     "build_openai_compatible_embedder",
     "SemanticChunker",
+    "MarkdownAwareChunker",
     "DocumentReader",
     "TextReader",
     "PDFReader",
@@ -75,13 +97,32 @@ __all__ = [
     # pgvector backend (requires [postgres,knowledge] + a live DB)
     "PgVectorKnowledgeBackend",
     "KnowledgeBackendProtocol",
+    "LexicalSearchProtocol",
     "build_knowledge_schema_ddl",
+    "build_lexical_index_ddl",
     "resolve_column_and_index",
     "VECTOR_MAX_DIM",
     "HALFVEC_MAX_DIM",
     # in-run kb_search tool
     "register_kb_search_tool",
     "KB_SEARCH_ARGS_SCHEMA",
+    # hybrid retrieval (BM25 + dense RRF, optional rerank / query rewrite)
+    "RetrievalConfig",
+    "RetrievalMode",
+    "DEFAULT_RETRIEVAL_CONFIG",
+    "reciprocal_rank_fusion",
+    "DEFAULT_RRF_K",
+    "BM25Index",
+    "LexicalIndex",
+    "HybridRetriever",
+    "RerankerProtocol",
+    "FastEmbedReranker",
+    "build_reranker",
+    "fastembed_rerank_available",
+    "QueryRewriterProtocol",
+    "IdentityRewriter",
+    "MultiQueryRewriter",
+    "HyDERewriter",
     # retrieval-quality evaluation
     "RetrievalEvalCase",
     "RetrievalScore",
@@ -89,4 +130,5 @@ __all__ = [
     "score_retrieval",
     "aggregate_scores",
     "evaluate_retrieval",
+    "compare_retrieval",
 ]

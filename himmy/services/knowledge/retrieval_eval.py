@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.knowledge.models import RetrievedChunk
+    from himmy.services.knowledge.retrieval.config import RetrievalConfig
     from himmy.services.knowledge.service import KnowledgeBase
 
 
@@ -173,6 +174,53 @@ async def evaluate_retrieval(
     return aggregate_scores(scores)
 
 
+async def compare_retrieval(
+    kb: KnowledgeBase,
+    kb_id: str,
+    cases: list[RetrievalEvalCase],
+    configs: dict[str, RetrievalConfig],
+    *,
+    workspace_id: str | None = None,
+    client_id: str | None = None,
+    metadata_filters: dict[str, Any] | None = None,
+) -> dict[str, RetrievalEvalReport]:
+    """Score the SAME golden set under several retrieval configs and compare.
+
+    This is the proof gate for every retrieval knob: run ``{label: RetrievalConfig}``
+    over one KB and one golden set and assert (in a test) that, e.g.,
+    ``hybrid``'s ``mean_ndcg_at_k`` / ``mean_recall_at_k`` is ``>=`` ``dense``'s
+    before turning hybrid on. Each config is applied by temporarily swapping the
+    KB's active :class:`RetrievalConfig`; the KB's original config is always
+    restored, even on error, so the comparison never leaves the KB reconfigured.
+
+    Args:
+        kb: The knowledge base (its ``_retrieval`` is swapped per config and
+            restored).
+        kb_id: The KB to evaluate.
+        cases: The golden set (shared across every config for a fair comparison).
+        configs: ``{label: RetrievalConfig}`` — the configs to compare.
+
+    Returns:
+        ``{label: RetrievalEvalReport}`` — one scorecard per config.
+    """
+    original = kb._retrieval
+    reports: dict[str, RetrievalEvalReport] = {}
+    try:
+        for label, config in configs.items():
+            kb._retrieval = config
+            reports[label] = await evaluate_retrieval(
+                kb,
+                kb_id,
+                cases,
+                workspace_id=workspace_id,
+                client_id=client_id,
+                metadata_filters=metadata_filters,
+            )
+    finally:
+        kb._retrieval = original
+    return reports
+
+
 __all__ = [
     "RetrievalEvalCase",
     "RetrievalScore",
@@ -180,4 +228,5 @@ __all__ = [
     "score_retrieval",
     "aggregate_scores",
     "evaluate_retrieval",
+    "compare_retrieval",
 ]

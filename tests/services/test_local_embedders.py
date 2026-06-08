@@ -5,12 +5,14 @@ from __future__ import annotations
 import pytest
 
 from himmy.core import HimmyError
+from himmy.services.knowledge import local_embedders
 from himmy.services.knowledge.embedder import DeterministicEmbedder
 from himmy.services.knowledge.local_embedders import (
     FastEmbedEmbedder,
     OllamaEmbedder,
     build_embedder,
     default_dim_for,
+    resolve_auto_backend,
 )
 from tests.conftest import run_async
 
@@ -82,3 +84,87 @@ def test_config_build_embedder_and_dim() -> None:
         embedder="deterministic", embedder_dim=32
     ).build_embedder_and_dim()
     assert dim2 == 32
+
+
+# ---- "auto": prefer a real local embedder, fall back to deterministic ----
+
+
+def test_auto_prefers_fastembed_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When fastembed is importable, "auto" selects the fastembed backend (no network)."""
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: True)
+    # The Ollama probe must never run when fastembed already won the selection.
+    monkeypatch.setattr(
+        local_embedders,
+        "ollama_reachable",
+        lambda *a, **k: pytest.fail("ollama probe should not run when fastembed wins"),
+    )
+    assert resolve_auto_backend() == "fastembed"
+    emb = build_embedder("auto")
+    assert isinstance(emb, FastEmbedEmbedder)
+    assert emb.dim == 384  # fastembed's native dim, not the deterministic default
+
+
+def test_auto_prefers_ollama_when_reachable_and_no_fastembed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No fastembed but a reachable local Ollama -> "auto" picks the Ollama backend."""
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: True)
+    assert resolve_auto_backend() == "ollama"
+    emb = build_embedder("auto")
+    assert isinstance(emb, OllamaEmbedder)
+    assert emb.dim == 768
+
+
+def test_auto_falls_back_to_deterministic_when_nothing_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No fastembed and no reachable Ollama -> "auto" degrades to deterministic."""
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: False)
+    assert resolve_auto_backend() == "deterministic"
+    emb = build_embedder("auto")
+    assert isinstance(emb, DeterministicEmbedder)
+    # An offline embedder still embeds with no network.
+    assert len(run_async(emb.embed_query("hello world"))) == 64
+
+
+def test_auto_default_dim_tracks_resolved_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """default_dim_for("auto") reports the dim of the backend it actually resolves to."""
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: True)
+    assert default_dim_for("auto") == 384
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: False)
+    assert default_dim_for("auto") == 64
+
+
+def test_config_auto_resolves_embedder_and_matching_dim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ToolkitConfig(embedder="auto") builds a real embedder + a matching dim."""
+    from himmy.toolkit.config import ToolkitConfig
+
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: True)
+    emb, dim = ToolkitConfig(embedder="auto").build_embedder_and_dim()
+    assert isinstance(emb, OllamaEmbedder)
+    assert dim == 768  # the dim matches the resolved backend, not the "auto" alias
+
+    monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: False)
+    emb2, dim2 = ToolkitConfig(embedder="auto").build_embedder_and_dim()
+    assert isinstance(emb2, DeterministicEmbedder)
+    assert dim2 == 64
+
+
+def test_ollama_reachable_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Ollama probe returns False on any transport error (never raises)."""
+    import httpx
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "get", _boom)
+    # An unreachable server must fail closed, not propagate the connection error.
+    assert local_embedders.ollama_reachable("http://localhost:11434") is False
