@@ -3,8 +3,9 @@ name: Security
 # Supply-chain & secure-SDLC gates (WS5): dependency audit, SBOM, secret scan, and a
 # filesystem vulnerability/misconfig scan. Runs alongside the main quality gate.
 on:
-  push:
-    branches: [main]
+  # NOT on every push to main — these four scans (gitleaks/trivy/pip-audit/sbom) were the
+  # bulk of the per-push notification noise. They still run on PRs, weekly (so new CVEs
+  # surface), and on demand; local `make gate` covers pre-push secret/lint checks.
   pull_request:
   workflow_dispatch:
   schedule:

@@ -4,8 +4,9 @@ name: Integration (real provider)
 # never again hide a broken core path (e.g. a tool agent returning an empty answer).
 # Mark this job "required" in branch protection so the regression can't merge.
 on:
-  push:
-    branches: [main]
+  # NOT on every push to main — this real-Ollama suite is heavy and was creating
+  # notification noise on a push-often workflow. It still runs on PRs (so a regression
+  # can't merge), nightly (pass-rate tracking), and on demand (the "Run workflow" button).
   pull_request:
   workflow_dispatch:
   schedule:
