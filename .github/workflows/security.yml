@@ -57,10 +57,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0 # full history so a secret in any commit is caught
-      - uses: gitleaks/gitleaks-action@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0 # full history available for the scan
+      - name: gitleaks (secret scan)
+        # Use the free, MIT-licensed gitleaks CLI image rather than gitleaks/gitleaks-action,
+        # which requires a paid GITLEAKS_LICENSE secret for GitHub *organizations* (this repo
+        # is mirrored to an org). `dir` scans the checked-out tree with no git shell-out (so no
+        # container ownership issues) and exits non-zero on any finding, failing the job.
+        run: >
+          docker run --rm -v "${{ github.workspace }}:/repo"
+          ghcr.io/gitleaks/gitleaks:latest dir /repo --redact --verbose
 
   vuln-scan:
     name: trivy (filesystem)
