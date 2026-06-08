@@ -65,7 +65,7 @@ jobs:
         # container ownership issues) and exits non-zero on any finding, failing the job.
         run: >
           docker run --rm -v "${{ github.workspace }}:/repo"
-          ghcr.io/gitleaks/gitleaks:latest dir /repo --redact --verbose
+          ghcr.io/gitleaks/gitleaks:latest dir /repo -c /repo/.gitleaks.toml --redact --verbose
 
   vuln-scan:
     name: trivy (filesystem)

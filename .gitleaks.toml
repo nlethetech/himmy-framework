@@ -1,0 +1,19 @@
+# gitleaks configuration for the himmy secret scan.
+#
+# The CI job (`.github/workflows/security.yml`) runs `gitleaks dir /repo` over the WHOLE
+# working tree (stricter than the gitleaks-action default, which only diffs new commits on
+# push). That whole-tree scan correctly flags placeholder credentials baked into test
+# fixtures — e.g. the RFC 2617 "Aladdin:open sesame" base64 string, fake API keys, and
+# dummy tokens used to exercise secret-redaction / auth code paths. Those are not real
+# secrets, so the `tests/` tree is allowlisted while everything else stays fully scanned.
+
+title = "himmy"
+
+[extend]
+useDefault = true # keep the full default gitleaks ruleset
+
+[[allowlists]]
+description = "Test fixtures use fake/placeholder credentials, not real secrets"
+paths = [
+  '''(^|/)tests/''',
+]
