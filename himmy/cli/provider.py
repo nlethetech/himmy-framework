@@ -19,7 +19,11 @@ from himmy.services.inference.service import InferenceService
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.client_manager import ClientManager
 
-PROVIDERS = ("stub", "claude-cli", "ollama", "pydantic-ai")
+PROVIDERS = ("stub", "claude-cli", "ollama", "pydantic-ai", "openrouter")
+
+#: OpenRouter is an OpenAI-compatible aggregator; route through the pydantic-ai path.
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_DEFAULT_MODEL = "mistralai/mistral-small-3.2-24b-instruct"
 
 
 class ProviderError(HimmyError):
@@ -67,6 +71,34 @@ def build_manager_for(
         if model:
             return PydanticAIClientManager({"default": model}, default_model=model)
         return PydanticAIClientManager()
+
+    if provider == "openrouter":
+        import os
+
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ProviderError(
+                "provider 'openrouter' needs OPENROUTER_API_KEY in the environment "
+                "(get a key at https://openrouter.ai/keys)."
+            )
+        try:
+            from himmy.services.inference.pydantic_ai_manager import (
+                PydanticAIClientManager,
+            )
+        except Exception as exc:  # pragma: no cover - optional extra missing
+            raise ProviderError(
+                "provider 'openrouter' needs the 'providers' extra: "
+                "pip install 'himmy[providers]'"
+            ) from exc
+        chosen = model if model and model != "default" else OPENROUTER_DEFAULT_MODEL
+        model_string = f"openai:{chosen}"
+        return PydanticAIClientManager(
+            {"default": model_string},
+            default_model=model_string,
+            base_url=OPENROUTER_BASE_URL,
+            api_key=api_key,
+            provider_name="openrouter",
+        )
 
     raise ProviderError(
         f"unknown provider {provider!r}; choose one of {', '.join(PROVIDERS)}"

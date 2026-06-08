@@ -121,7 +121,7 @@ role: Research Analyst
 instructions:
   - Provide actionable insights backed by clear reasoning.
 model: default
-# provider: ollama   # stub | claude-cli | ollama | pydantic-ai (default: auto)
+# provider: ollama   # stub | claude-cli | ollama | pydantic-ai | openrouter (default: auto)
 ```
 
 `agent.yaml` is a thin declarative façade over `Persona` + `Task` + `LLMConfig`.
@@ -429,9 +429,11 @@ Import from `himmy.orchestrators` (not re-exported at top-level `himmy`).
 
 # Providers & choosing one
 
-The `--provider` choices everywhere are `stub`, `claude-cli`, `ollama`, `pydantic-ai`. When
-unspecified, the CLI **auto-selects**: `pydantic-ai` when a key **and** the `providers` extra
-**and** a model are all present, otherwise the offline deterministic stub.
+The `--provider` choices everywhere are `stub`, `claude-cli`, `ollama`, `pydantic-ai`,
+`openrouter`. When unspecified, the CLI **auto-selects**: `pydantic-ai` when a key **and**
+the `providers` extra **and** a model are all present, otherwise the offline deterministic
+stub. (Setting only `OPENROUTER_API_KEY` does **not** auto-route to OpenRouter — pass
+`--provider openrouter` explicitly.)
 
 | Provider | What it is | Keys / deps | Cost reported |
 |---|---|---|---|
@@ -439,6 +441,13 @@ unspecified, the CLI **auto-selects**: `pydantic-ai` when a key **and** the `pro
 | `ollama` | Local Ollama over HTTP (`/api/chat`); native tool schema + structured output | local Ollama (default model `llama3.2`) | `$0.0` |
 | `claude-cli` | Drives the local `claude` CLI via subprocess (not HTTP); disables the CLI's own built-in tools so it acts as a pure text model | local `claude` CLI (default model `haiku`) | real `total_cost_usd` from the CLI |
 | `pydantic-ai` | Cloud / gateway via `pydantic-ai` (OpenAI, Anthropic, Gemini, OpenAI-compatible base_url) | `providers` extra + a provider key | from a pricing table |
+| `openrouter` | OpenAI-compatible [OpenRouter](https://openrouter.ai) via `pydantic-ai` (`base_url=https://openrouter.ai/api/v1`); default model `mistralai/mistral-small-3.2-24b-instruct` | `providers` extra + `OPENROUTER_API_KEY` | from a pricing table |
+
+```bash
+# One-off run through OpenRouter (override the default model with --model):
+export OPENROUTER_API_KEY=sk-or-...
+himmy run --provider openrouter --model anthropic/claude-3.5-sonnet -p "hello"
+```
 
 There's also a self-hosted `HimalayaGptClientManager` (HF Transformers,
 `HimalayaAI/HimalayaGPT-0.5B`, `trust_remote_code=True`) — real but not exercised in CI.

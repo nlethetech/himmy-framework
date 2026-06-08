@@ -147,14 +147,17 @@ register_packs(registry, ["web", "utils"], ToolkitConfig.from_env())
 ## Choosing a provider
 
 Pick a provider per run with `--provider`/`--model` (e.g. `--provider claude-cli
---model haiku` to use a local Claude Max session, or `--provider ollama --model
-llama3.2`). With no flag, Himmy uses a real pydantic-ai provider when a key + the
-`providers` extra are present, otherwise the offline stub. Set the default in
-`agent.yaml`:
+--model haiku` to use a local Claude Max session, `--provider ollama --model
+llama3.2`, or `--provider openrouter` to route through OpenRouter — set
+`OPENROUTER_API_KEY`, default model `mistralai/mistral-small-3.2-24b-instruct`).
+With no flag, Himmy uses a real pydantic-ai provider when a key + the
+`providers` extra are present, otherwise the offline stub (`OPENROUTER_API_KEY`
+alone does not auto-route to OpenRouter — pass `--provider openrouter`). Set the
+default in `agent.yaml`:
 
 ```yaml
 model: default
-# provider: claude-cli   # stub | claude-cli | ollama | pydantic-ai (default: auto)
+# provider: claude-cli   # stub | claude-cli | ollama | pydantic-ai | openrouter (default: auto)
 ```
 
 `himmy doctor` reports which providers, keys, and extras are available, and ends

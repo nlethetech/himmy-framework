@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from himmy.cli.__main__ import main
-from himmy.cli.provider import ProviderError, build_inference_for
+from himmy.cli.provider import (
+    PROVIDERS,
+    ProviderError,
+    build_inference_for,
+    build_manager_for,
+)
 from himmy.services.inference.service import InferenceService
 
 
@@ -25,6 +30,54 @@ def test_provider_factory_unknown_raises() -> None:
     """An unknown provider name is a clear ProviderError."""
     with pytest.raises(ProviderError):
         build_inference_for("nope")
+
+
+def test_openrouter_in_provider_choices() -> None:
+    """`openrouter` is a first-class --provider/agent.yaml choice."""
+    assert "openrouter" in PROVIDERS
+
+
+def test_provider_factory_openrouter_missing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without OPENROUTER_API_KEY, openrouter raises a clear, named ProviderError."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with pytest.raises(ProviderError) as exc:
+        build_inference_for("openrouter")
+    assert "OPENROUTER_API_KEY" in str(exc.value)
+
+
+def test_provider_factory_openrouter_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a key set, openrouter builds an InferenceService wired for OpenRouter.
+
+    No network: we only assert the manager is configured with the OpenRouter
+    base_url, the provided key, the default model, and the `openrouter` name.
+    """
+    pytest.importorskip("pydantic_ai")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    # Must NOT require OPENAI_API_KEY to be set as well.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    assert isinstance(build_inference_for("openrouter"), InferenceService)
+
+    manager = build_manager_for("openrouter")
+    assert manager.provider_name == "openrouter"
+    assert manager._base_url == "https://openrouter.ai/api/v1"
+    assert manager._api_key == "sk-or-test"
+    # The default model is registered as an openai-format slug (with the '/').
+    assert manager.resolve("default") == (
+        "openai:mistralai/mistral-small-3.2-24b-instruct"
+    )
+
+
+def test_provider_factory_openrouter_custom_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit --model overrides the OpenRouter default, keeping the slug."""
+    pytest.importorskip("pydantic_ai")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    manager = build_manager_for("openrouter", "anthropic/claude-3.5-sonnet")
+    assert manager.resolve("default") == "openai:anthropic/claude-3.5-sonnet"
 
 
 def test_run_prints_output(capsys: pytest.CaptureFixture[str]) -> None:

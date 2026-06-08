@@ -626,7 +626,7 @@ instructions:
   - Be concise and accurate.
   - Cite reasoning when it helps the user decide.
 model: default
-# provider: claude-cli      # stub | claude-cli | ollama | pydantic-ai (default: auto)
+# provider: claude-cli      # stub | claude-cli | ollama | pydantic-ai | openrouter (default: auto)
 # skills: [web_research]    # capability bundles: tools + know-how (run `himmy skills`)
 # tool_packs: [web, utils]  # built-in tool packs (run `himmy tools` to list them)
 tools: []                   # names to bind (from tool_packs and/or tools_module)
@@ -700,7 +700,7 @@ members:
 _HIMMY_TOML = """\
 # Project defaults for the himmy CLI. Precedence: CLI flag > env > this file > built-in.
 [defaults]
-# provider = "ollama"          # stub | claude-cli | ollama | pydantic-ai
+# provider = "ollama"          # stub | claude-cli | ollama | pydantic-ai | openrouter
 # model = "qwen2.5:3b-instruct"
 # tool_packs = ["web", "utils"]
 # guardrails = ["pii"]

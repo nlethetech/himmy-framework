@@ -69,13 +69,21 @@ class PydanticAIClientManager:
         *,
         default_model: str = "openai:gpt-4o-mini",
         base_url: str | None = None,
+        api_key: str | None = None,
         runtime_config: GatewayRuntimeConfig | None = None,
         provider_name: str = "pydantic_ai",
     ) -> None:
-        """Store a ``model_key -> pydantic-ai model string`` registry + options."""
+        """Store a ``model_key -> pydantic-ai model string`` registry + options.
+
+        ``api_key`` is forwarded to the OpenAI-compatible provider when ``base_url``
+        is set (e.g. OpenRouter). Leaving it ``None`` preserves the prior behavior:
+        the provider reads its key from the environment (the gateway path relies on
+        ``OPENAI_API_KEY``/``PYDANTIC_AI_GATEWAY_API_KEY`` being present).
+        """
         self._model_registry = dict(model_registry or {})
         self._default_model = default_model
         self._base_url = base_url
+        self._api_key = api_key
         self._runtime_config = runtime_config
         self.provider_name = provider_name
 
@@ -97,7 +105,9 @@ class PydanticAIClientManager:
 
                 # model_string looks like 'openai:gpt-4o-mini'; take the suffix.
                 model_name = model_string.split(":", 1)[-1]
-                provider = OpenAIProvider(base_url=self._base_url)
+                provider = OpenAIProvider(
+                    base_url=self._base_url, api_key=self._api_key
+                )
                 return OpenAIModel(model_name, provider=provider)
             except Exception:  # noqa: BLE001 - fall back to plain inference
                 pass

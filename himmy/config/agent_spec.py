@@ -11,7 +11,7 @@ user can describe an agent in a single ``agent.yaml`` file and drive it from the
     instructions:
       - Provide actionable insights backed by clear reasoning.
     model: default            # model_key handed to the active provider
-    provider: claude-cli      # optional: stub | claude-cli | ollama | pydantic-ai
+    provider: claude-cli      # optional: stub | claude-cli | ollama | pydantic-ai | openrouter
     tools: []                 # tool names to bind (registered via tools_module)
     tools_module: tools:register   # optional dotted path to register(registry)
     output_schema: null       # inline JSON Schema dict, or a path to a .json file

@@ -44,7 +44,8 @@ class TeamMemberSpec(BaseModel):
     description: str = ""
     instructions: list[str] = []
     role: str | None = None
-    provider: str | None = None  # claude-cli | ollama | pydantic-ai | stub (per member)
+    # per member: claude-cli | ollama | pydantic-ai | openrouter | stub
+    provider: str | None = None
     model: str = "default"
     tools: list[str] = []
     tool_packs: list[str] = []
