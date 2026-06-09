@@ -8,6 +8,17 @@ providers, Postgres/pgvector, and observability.
 ## [Unreleased]
 
 ### Added
+- **RAG quality, measured on real data (not toy queries).** Two complementary evals:
+  a fast **regression gate** (`tests/integration/test_rag_eval.py`, `-m integration`) on a
+  hand-built confusable corpus with floors derived from live qwen3-embedding numbers; and
+  a re-runnable **real-benchmark** script (`scripts/rag_nfcorpus_benchmark.py`) that
+  downloads/caches the **BEIR NFCorpus** medical-IR dataset (real queries + human qrels)
+  and reports recall@k / MRR / nDCG@k / hit-rate for dense vs hybrid. Measured (20 queries,
+  439-doc subsample, top_k=10): qwen3-embedding dense **nDCG@10 0.279** (hybrid 0.289) vs the
+  offline deterministic embedder's **0.082** (hybrid 0.174) — the real embedder is ~3.4x
+  better on a real benchmark, and the hybrid BM25 leg's lift is largest exactly when the
+  embedder is weak (+0.092 nDCG) and small when it is strong (+0.010). nDCG@10 ≈ 0.28 is in
+  line with the published BEIR literature for NFCorpus.
 - **Institutional-grade upgrade pass (7 workstreams).** Each landed in its own
   file-ownership cluster, was adversarially verified, and ships with deterministic offline
   tests; the offline-first invariant holds throughout.
