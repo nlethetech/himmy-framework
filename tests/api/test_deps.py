@@ -15,6 +15,25 @@ def test_build_default_is_in_memory_and_offline() -> None:
     assert container.evaluation is not None
 
 
+def test_offline_privacy_audit_wiring_is_transparent() -> None:
+    """WS4.7 B4: the always-wired privacy auditor leaves the offline path untouched.
+
+    The zero-config container keeps a *bare* ``StorageService`` (not the governed
+    ``ConsentGatedStorage`` wrapper), the runtime carries no ``consent_decider``, the
+    consent governance singletons are ``None``, and the wired ``privacy_audit`` is inert:
+    its provider gate is off (the stub manager), so no LLM metric ever lights up.
+    """
+    container = ApiContainer.build_default()
+    # Bare store + runtime, exactly as before WS4.6/WS4.7.
+    assert type(container.storage) is StorageService
+    assert container.runtime._consent_decider is None  # noqa: SLF001 - invariant proof
+    assert container.consent_ledger is None
+    assert container.consent_policy is None
+    # The privacy auditor is wired but the provider gate is off (stub ⇒ no LLM metric).
+    assert container.privacy_audit is not None
+    assert container.privacy_audit._provider_is_real() is False  # noqa: SLF001
+
+
 def test_build_default_async_falls_back_to_memory_without_dsn(monkeypatch) -> None:
     """Without HIMMY_DATABASE_URL, the async builder uses the in-memory store."""
     monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)

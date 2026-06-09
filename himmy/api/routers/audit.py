@@ -45,12 +45,14 @@ async def list_security_events(
 
 @router.get("/bundle", response_model=AuditBundle, dependencies=_AUDIT_READ)
 async def export_audit_bundle_route(request: Request) -> AuditBundle:
-    """Export a signed, tamper-evident bundle over the security-audit trail (WS4.5).
+    """Export a signed, tamper-evident bundle over the security-audit trail (WS4.5/WS4.7).
 
     Signs with Ed25519 when ``HIMMY_AUDIT_PRIVATE_KEY`` (PEM) is configured — an
     auditor then verifies offline with the public key alone — else HMAC with
-    ``HIMMY_AUDIT_SECRET``. The bundle commits to every ``security_event`` entity, so
-    tampering with the log after the fact is detectable.
+    ``HIMMY_AUDIT_SECRET``. The bundle commits to every ``security_event`` entity AND
+    every ``privacy_audit_report`` (WS4.7 B4 — so a privacy posture report is genuinely
+    covered by the same signed evidence), so tampering with either after the fact is
+    detectable.
     """
     from himmy.config.secrets import get_secret
     from himmy.entities.integrity import (
@@ -58,9 +60,15 @@ async def export_audit_bundle_route(request: Request) -> AuditBundle:
         export_audit_bundle_ed25519,
     )
     from himmy.services.audit.log import SECURITY_EVENT_KIND
+    from himmy.services.evaluation.privacy import PRIVACY_AUDIT_REPORT_KIND
 
     registry = _container(request).entity_registry
-    records = registry.list_by_kind(SECURITY_EVENT_KIND)
+    # WS4.7 B4: union the security-event trail with the privacy audit reports so the one
+    # signed bundle now genuinely covers the privacy posture evidence too.
+    records = [
+        *registry.list_by_kind(SECURITY_EVENT_KIND),
+        *registry.list_by_kind(PRIVACY_AUDIT_REPORT_KIND),
+    ]
     private_pem = get_secret("HIMMY_AUDIT_PRIVATE_KEY")
     if private_pem:
         return export_audit_bundle_ed25519(records, [], private_pem=private_pem)

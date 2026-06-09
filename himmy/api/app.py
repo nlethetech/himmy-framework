@@ -28,9 +28,11 @@ from himmy.api.models import ErrorResponse
 from himmy.api.ratelimit import build_rate_limiter
 from himmy.api.routers import (
     audit,
+    consent,
     context,
     dashboard,
     evaluation,
+    privacy_audit,
     recommendations,
     runs,
     studio,
@@ -155,6 +157,12 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
     app.state.security_audit = SecurityAuditLog(container.entity_registry)
     # Rate limiting: per-principal/IP token bucket (WS3.2), off unless configured.
     app.state.rate_limiter = build_rate_limiter()
+    # Consent governance (WS4.6): only present in a governed deployment (HIMMY_CONSENT on).
+    # The /v1/consent router reads these; they are None on the zero-config path so the
+    # router is inert (404) and nothing about the offline surface changes.
+    app.state.consent_ledger = getattr(container, "consent_ledger", None)
+    app.state.consent_policy = getattr(container, "consent_policy", None)
+    app.state.retention_service = getattr(container, "retention_service", None)
 
     instrument_fastapi(app)
 
@@ -173,7 +181,9 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
     app.include_router(recommendations.router)
     app.include_router(dashboard.router)
     app.include_router(evaluation.router)
+    app.include_router(privacy_audit.router)
     app.include_router(audit.router)
+    app.include_router(consent.router)
     app.include_router(studio.router)
 
     @app.get("/health", tags=["health"])

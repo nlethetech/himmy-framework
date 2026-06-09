@@ -10,6 +10,7 @@ from himmy.services.memory import (
     MemoryService,
     SqliteMemoryStore,
 )
+from himmy.services.memory.service import ALWAYS_INCLUDE
 from tests.conftest import run_async
 
 
@@ -18,9 +19,17 @@ def test_remember_then_recall_ranks_by_overlap() -> None:
     svc = MemoryService(InMemoryMemoryStore())
     svc.remember("the orchard has apple and pear trees", subject_id="u")
     svc.remember("the pond holds fish and ducks", subject_id="u")
+    # Both share the leading "the ... has/holds" tokens, so ALWAYS_INCLUDE surfaces
+    # both and lets us assert the ordering without the noise floor intervening.
     hits = run_async(
-        svc.recall("apple and pear trees orchard", subject_id="u", top_k=2)
+        svc.recall(
+            "apple and pear trees orchard",
+            subject_id="u",
+            top_k=2,
+            similarity_threshold=ALWAYS_INCLUDE,
+        )
     )
+    assert len(hits) == 2
     assert hits[0].record.text.startswith("the orchard")
     assert hits[0].similarity > hits[1].similarity
 
@@ -57,13 +66,47 @@ def test_sqlite_durability_across_reopen(tmp_path: Path) -> None:
     assert "bees" in hits[0].record.text
 
 
-def test_recall_default_always_returns_top_hit_even_if_irrelevant() -> None:
-    """With no threshold, recall still surfaces the single best (possibly zero-sim) hit."""
+def test_recall_default_applies_noise_floor() -> None:
+    """The default now drops a zero-overlap hit (the safe ``> 0.0`` noise floor).
+
+    Previously recall always surfaced the single best (possibly similarity-0.0) hit;
+    aligning with the sibling knowledge service, the default now recalls NOTHING for an
+    orthogonal query instead of a best-of-the-irrelevant one.
+    """
     svc = MemoryService(InMemoryMemoryStore())
     svc.remember("the pond holds fish and ducks", subject_id="u")
-    # The query shares no tokens with the only memory -> similarity 0.0 for the
-    # offline embedder, but the default behaviour returns it anyway.
+    # The query shares no tokens with the only memory -> similarity 0.0, so the
+    # default noise floor drops it.
     hits = run_async(svc.recall("quantum chromodynamics", subject_id="u"))
+    assert hits == []
+
+
+def test_recall_always_include_returns_top_hit_even_at_zero() -> None:
+    """The explicit ALWAYS_INCLUDE path still returns the top hit at similarity 0.0.
+
+    This is the always-in-context working set used by the ``core`` tier: it must keep
+    returning its set even when nothing clears the noise floor.
+    """
+    svc = MemoryService(InMemoryMemoryStore())
+    svc.remember("the pond holds fish and ducks", subject_id="u")
+    hits = run_async(
+        svc.recall(
+            "quantum chromodynamics",
+            subject_id="u",
+            similarity_threshold=ALWAYS_INCLUDE,
+        )
+    )
+    assert len(hits) == 1
+    assert hits[0].similarity == 0.0
+
+
+def test_explicit_zero_threshold_keeps_zero_similarity_hits() -> None:
+    """An explicit threshold of 0.0 keeps similarity>=0.0 hits (caller opts in)."""
+    svc = MemoryService(InMemoryMemoryStore())
+    svc.remember("the pond holds fish and ducks", subject_id="u")
+    hits = run_async(
+        svc.recall("quantum chromodynamics", subject_id="u", similarity_threshold=0.0)
+    )
     assert len(hits) == 1
     assert hits[0].similarity == 0.0
 

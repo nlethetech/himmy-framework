@@ -1,0 +1,117 @@
+"""WS4.6 — ConsentAwareRegistry: the spine gate (skip-on-deny + encrypt-on-allow)."""
+
+from __future__ import annotations
+
+import pytest
+
+from himmy.entities.records import EntityRecord
+from himmy.entities.registry import EntityRegistry
+from himmy.services.audit.log import SecurityAuditLog
+from himmy.services.governance.consent import ConsentPolicy, Purpose
+from himmy.services.governance.consent_ledger import ConsentLedger
+from himmy.services.governance.consent_registry import ConsentAwareRegistry
+
+_GATED = {"run_event"}
+
+
+def _subject_of(record: EntityRecord) -> str | None:
+    value = record.payload.get("subject_id")
+    return str(value) if value else None
+
+
+def _event(
+    subject_id: str | None, *, stable: str, text: str = "secret"
+) -> EntityRecord:
+    payload: dict[str, object] = {"text": text}
+    if subject_id is not None:
+        payload["subject_id"] = subject_id
+    return EntityRecord.create(
+        stable_id=stable, version=1, kind="run_event", payload=payload
+    )
+
+
+def _wrap(
+    inner: EntityRegistry, **kw: object
+) -> tuple[ConsentAwareRegistry, ConsentLedger, SecurityAuditLog]:
+    audit = SecurityAuditLog(inner)
+    ledger = ConsentLedger(inner, policy=ConsentPolicy(governed=True))
+    reg = ConsentAwareRegistry(
+        inner,
+        decider=ledger.decision,
+        gated_kinds=_GATED,
+        subject_extractor=_subject_of,
+        audit=audit,
+        **kw,  # type: ignore[arg-type]
+    )
+    return reg, ledger, audit
+
+
+def test_consented_subject_event_reaches_spine() -> None:
+    inner = EntityRegistry()
+    reg, ledger, _ = _wrap(inner)
+    ledger.grant("alice", Purpose.RETAIN)
+    rec = _event("alice", stable="ev1")
+    reg.register(rec)
+    assert inner.get(rec.record_id) is not None
+
+
+def test_unconsented_subject_never_reaches_spine() -> None:
+    inner = EntityRegistry()
+    reg, _, audit = _wrap(inner)
+    rec = _event("bob", stable="ev2")  # no consent → governed DENY
+    reg.register(rec)
+    assert inner.get(rec.record_id) is None
+    assert inner.list_by_kind("run_event") == []
+    assert audit.recent(event_type="consent_denied_persist")
+
+
+def test_unresolved_subject_fails_closed() -> None:
+    inner = EntityRegistry()
+    reg, _, audit = _wrap(inner)
+    rec = _event(None, stable="ev3")  # subject-bearing kind, no subject in payload
+    reg.register(rec)
+    assert inner.get(rec.record_id) is None
+    assert audit.recent(event_type="consent_denied_persist")
+
+
+def test_infrastructure_kind_passes_through_untouched() -> None:
+    inner = EntityRegistry()
+    reg, _, _ = _wrap(inner)
+    persona = EntityRecord.create(
+        stable_id="p1", version=1, kind="persona", payload={"name": "tutor"}
+    )
+    reg.register(persona)
+    stored = inner.get(persona.record_id)
+    assert stored is not None and stored.payload == {
+        "name": "tutor"
+    }  # not gated, not encrypted
+
+
+def test_allow_encrypts_subject_fields_under_shreddable_key() -> None:
+    pytest.importorskip("cryptography")
+    from himmy.services.governance.retention import SubjectKeyVault
+    from himmy.services.storage.encryption import ENC_PREFIX
+
+    inner = EntityRegistry()
+    vault = SubjectKeyVault()
+    reg, ledger, _ = _wrap(
+        inner, key_vault=vault, encrypted_fields_for=lambda _kind: ("text",)
+    )
+    ledger.grant("carol", Purpose.RETAIN)
+    rec = _event("carol", stable="ev4", text="carol's prompt")
+    reg.register(rec)
+
+    stored = inner.get(rec.record_id)
+    assert stored is not None
+    # The content-addressed id is unchanged; the payload field is now ciphertext.
+    assert stored.record_id == rec.record_id
+    assert stored.payload["text"].startswith(ENC_PREFIX)
+    assert "carol's prompt" not in stored.payload["text"]
+
+    # Crypto-shred: destroying the subject key makes the ciphertext unrecoverable.
+    token = stored.payload["text"]
+    vault.destroy("carol")
+    from cryptography.exceptions import InvalidTag
+
+    with pytest.raises(InvalidTag):
+        vault.encryptor_for("carol").decrypt(token, aad=b"carol")

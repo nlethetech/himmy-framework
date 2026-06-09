@@ -171,7 +171,8 @@ def build_runtime_for_spec(
     # the framework's anti-hallucination guarantee is enforced, not just advised. The
     # grounding guard is a no-op on the input stage, so adding it to output only is safe.
     output_names = list(dict.fromkeys(["grounding", *spec.guardrails]))
-    overrides["output_guardrail"] = build_guardrail_pipeline(output_names)
+    output_guardrail = build_guardrail_pipeline(output_names)
+    overrides["output_guardrail"] = output_guardrail
 
     if spec.memory:
         from himmy import build_storage
@@ -256,12 +257,23 @@ def build_runtime_for_spec(
                 registry, inference=inference, skill_registry=build_skill_registry()
             )
         if pipeline is not None:
-            # Guard tool arguments too (the highest-risk "act" surface).
-            from himmy.services.guardrails import build_guardrail_pre_hook
+            # Guard tool arguments (pre) AND tool return content (post). The pre-hook
+            # stops PII/blocked args reaching the tool; the post-hook stops a tool
+            # handing back unredacted PII/secrets that would otherwise land on the
+            # thread + next-turn context + final answer unfiltered. The post-hook uses
+            # the OUTPUT pipeline (redact/tokenize per DLP policy; BLOCK-class →
+            # withheld placeholder). Both are wired ONLY when guardrails are
+            # configured, so the zero-config path stays untouched.
+            from himmy.services.guardrails import (
+                build_guardrail_post_hook,
+                build_guardrail_pre_hook,
+            )
             from himmy.services.tools.service import ToolService
 
             overrides["tool_service"] = ToolService(
-                registry, pre_execution_hook=build_guardrail_pre_hook(pipeline)
+                registry,
+                pre_execution_hook=build_guardrail_pre_hook(pipeline),
+                post_execution_hook=build_guardrail_post_hook(output_guardrail),
             )
         else:
             overrides["tool_registry"] = registry

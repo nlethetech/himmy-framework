@@ -84,6 +84,17 @@ class EvaluationService:
         self._case_pass_threshold = case_pass_threshold
         self._veto_metrics = tuple(veto_metrics)
 
+    @property
+    def storage(self) -> StorageService | None:
+        """The wired storage service, if any (the read-side a privacy audit prefetches).
+
+        Exposed read-only so a downstream auditor (the WS4.7
+        :class:`~himmy.services.evaluation.privacy.service.PrivacyAuditService`) can
+        ``await`` the same recorded-data surface this kernel persists into, without
+        reaching past the encapsulation boundary.
+        """
+        return self._storage
+
     async def run_suite(
         self,
         *,

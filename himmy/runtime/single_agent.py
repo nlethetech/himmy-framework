@@ -12,9 +12,11 @@ runtime degrades cleanly when one is absent.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -55,17 +57,43 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.agents.personas.persona import Persona
     from himmy.entities.registry import EntityRegistry
     from himmy.services.context.service import ContextService
+    from himmy.services.governance.consent import Decision, Purpose
     from himmy.services.guardrails.base import GuardrailPipeline
     from himmy.services.inference.service import InferenceService, StreamDelta
     from himmy.services.prompts.manager import PromptManager
     from himmy.services.prompts.mapper import ContextPromptMapper
     from himmy.services.storage.service import ThreadEventStore
 
+    # The runtime TRAIN gate (WS4.6). Resolves a Decision for (subject, purpose);
+    # ConsentLedger.decision conforms. ``None`` ⇒ ungoverned, gate inert.
+    ConsentDecider = Callable[[str, Purpose], Decision]
+
 
 # An optional caller-facing event callback (RO-6). Invoked best-effort inside
 # ``_emit`` alongside the storage/registry/observability sinks so a UI driving a
 # long run can receive incremental progress without polling storage.
 OnEvent = Callable[[RunEvent], Awaitable[None]]
+
+
+# WS4.6 — the human data subject participating in the *current* run, set ONLY when a
+# ``consent_decider`` is wired (governed deployments) and the task carries a
+# ``context_subject_id``. It is published by ``_subject_scope`` around EVERY public entry
+# point that emits subject-bearing spine records — all FIVE of them: ``run_task`` (and its
+# ``run_task_detailed`` alias), ``run_agent_loop``, ``continue_turn``, ``stream_task``, and
+# ``resume_agent_loop`` (the HITL-resume path, which rebuilds ``ctx`` from the checkpoint
+# and then emits resumed run events / tool messages / a bumped thread version) — so the
+# multi-turn, streaming AND resume paths are governed too (not just ``run_task``).
+# Otherwise their records would be subject-less and the ConsentAwareRegistry would fail
+# closed and silently drop them even for a consented subject.
+# ``_emit`` / ``_register_message`` / ``_register_thread_version`` stamp this onto
+# the ``run_event`` / ``message`` / ``chat_thread`` record metadata so a
+# ``ConsentAwareRegistry`` can resolve (and gate / crypto-shred) the subject behind those
+# otherwise subject-less spine records. A :class:`contextvars.ContextVar` keeps this
+# correct under concurrent runs and the default ``None`` keeps the ungoverned path
+# byte-identical — no metadata is ever stamped when no decider is configured.
+_CURRENT_SUBJECT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "himmy_run_subject", default=None
+)
 
 
 @runtime_checkable
@@ -286,6 +314,7 @@ class SingleAgentRuntime:
         input_guardrail: GuardrailPipeline | None = None,
         output_guardrail: GuardrailPipeline | None = None,
         capture_io: bool | None = None,
+        consent_decider: ConsentDecider | None = None,
     ) -> None:
         """Wire the runtime; auto-create prompt manager/mapper when omitted.
 
@@ -297,6 +326,11 @@ class SingleAgentRuntime:
         ``strict_snapshot`` (RO-11) makes an explicitly-requested-but-failed
         snapshot raise instead of degrading silently. ``on_event`` (RO-6) is an
         optional caller-facing callback (or list) for streaming/progress.
+        ``consent_decider`` (WS4.6) is the opt-in TRAIN gate: when set (governed
+        deployments only) a participating human subject lacking TRAIN consent has
+        raw-I/O capture forced off and ``rendered_prompt`` stripped from the
+        ``INFERENCE_REQUESTED`` event; ``None`` (the default) leaves capture
+        byte-identical to a pre-WS4.6 runtime.
         """
         self.inference_service = inference_service
         self.memory_store = memory_store
@@ -317,6 +351,10 @@ class SingleAgentRuntime:
             if capture_io is not None
             else os.environ.get("HIMMY_CAPTURE_IO", "").lower() in ("1", "true", "yes")
         )
+        # WS4.6 TRAIN gate. When wired (governed deployments only), a participating human
+        # subject (ctx['context_subject_id']) lacking TRAIN consent suppresses raw-I/O
+        # capture AND the persisted ``rendered_prompt`` for that run. ``None`` ⇒ unchanged.
+        self._consent_decider = consent_decider
         self._on_event: list[OnEvent] = self._coerce_callbacks(on_event)
 
         # Auto-create the prompt primitives when available; they have no required
@@ -337,6 +375,25 @@ class SingleAgentRuntime:
                 context_prompt_mapper = None
         self.prompt_manager = prompt_manager
         self.context_prompt_mapper = context_prompt_mapper
+
+    def _train_suppressed(self, ctx: dict[str, Any]) -> bool:
+        """Whether this run's raw I/O / rendered prompt must be suppressed (WS4.6).
+
+        The TRAIN gate fires only when a ``consent_decider`` is wired (governed
+        deployments) AND the participating **human** subject — ``ctx['context_subject_id']``,
+        never ``persona.agent_id`` (an agent is not a data subject) — lacks an ``ALLOW``
+        decision for :attr:`~himmy.services.governance.consent.Purpose.TRAIN`. With no
+        decider the result is always ``False`` so capture behaviour is byte-identical to a
+        pre-WS4.6 runtime.
+        """
+        if self._consent_decider is None:
+            return False
+        subject = ctx.get("context_subject_id")
+        if not subject:
+            return False
+        from himmy.services.governance.consent import Effect, Purpose
+
+        return self._consent_decider(subject, Purpose.TRAIN).effect is not Effect.ALLOW
 
     @staticmethod
     def _coerce_callbacks(
@@ -420,46 +477,54 @@ class SingleAgentRuntime:
             else self.default_deadline_seconds
         )
 
-        try:
-            if deadline is not None and deadline > 0:
-                async with _timeout(deadline):
-                    return await self._run_task_body(
-                        persona,
-                        task,
-                        thread,
-                        ctx,
-                        trace_id,
-                        is_new_thread=is_new_thread,
-                        llm_config=llm_config,
-                        snapshot_id=snapshot_id,
-                    )
-            return await self._run_task_body(
-                persona,
-                task,
-                thread,
-                ctx,
-                trace_id,
-                is_new_thread=is_new_thread,
-                llm_config=llm_config,
-                snapshot_id=snapshot_id,
-            )
-        except (TimeoutError, asyncio.CancelledError):
-            # RO-1: a cancelled run (external cancellation -> CancelledError) or a
-            # deadline expiry (asyncio.timeout surfaces TimeoutError on exit) still
-            # records a terminal event and persists the partial thread. We always
-            # re-raise CancelledError so the run unwinds as a cancellation.
-            await self._emit(
-                RunEvent(
-                    event_type=EventType.AGENT_RUN_FINISHED,
-                    trace_id=trace_id,
-                    thread_id=thread.thread_id,
-                    agent_id=persona.agent_id,
-                    error="cancelled",
-                    payload={"status": "CANCELLED"},
+        # WS4.6: wrap the whole try/except (not just _run_task_body's own inner scope) in
+        # the subject scope so that the deadline-expiry / cancellation terminal
+        # AGENT_RUN_FINISHED event and the final _maybe_save_thread — emitted in the except
+        # block, OUTSIDE _run_task_body's scope — are still subject-tagged for a consented
+        # subject; otherwise the fail-closed ConsentAwareRegistry would silently drop the
+        # cancellation event and partial-thread save in governed mode. Governed only; a
+        # no-op when no consent_decider is wired. The inner _run_task_body scope nests.
+        with self._subject_scope(ctx):
+            try:
+                if deadline is not None and deadline > 0:
+                    async with _timeout(deadline):
+                        return await self._run_task_body(
+                            persona,
+                            task,
+                            thread,
+                            ctx,
+                            trace_id,
+                            is_new_thread=is_new_thread,
+                            llm_config=llm_config,
+                            snapshot_id=snapshot_id,
+                        )
+                return await self._run_task_body(
+                    persona,
+                    task,
+                    thread,
+                    ctx,
+                    trace_id,
+                    is_new_thread=is_new_thread,
+                    llm_config=llm_config,
+                    snapshot_id=snapshot_id,
                 )
-            )
-            await self._maybe_save_thread(thread)
-            raise asyncio.CancelledError() from None
+            except (TimeoutError, asyncio.CancelledError):
+                # RO-1: a cancelled run (external cancellation -> CancelledError) or a
+                # deadline expiry (asyncio.timeout surfaces TimeoutError on exit) still
+                # records a terminal event and persists the partial thread. We always
+                # re-raise CancelledError so the run unwinds as a cancellation.
+                await self._emit(
+                    RunEvent(
+                        event_type=EventType.AGENT_RUN_FINISHED,
+                        trace_id=trace_id,
+                        thread_id=thread.thread_id,
+                        agent_id=persona.agent_id,
+                        error="cancelled",
+                        payload={"status": "CANCELLED"},
+                    )
+                )
+                await self._maybe_save_thread(thread)
+                raise asyncio.CancelledError() from None
 
     async def run_agent_loop(
         self,
@@ -499,32 +564,40 @@ class SingleAgentRuntime:
         if route_tools:
             task = await self._route_tools(task, route_max_tools)
 
-        first = await self.run_task_detailed(
-            persona, task, thread, llm_config=llm_config
-        )
-        thread = first.thread
+        # WS4.6: publish the subject for the WHOLE loop so the turn-completed events,
+        # the per-turn continuation messages, and any synthesis turn — all of which emit
+        # subject-bearing spine records OUTSIDE the first turn's own scope — resolve to
+        # the subject (governed only; a no-op when no consent_decider is wired). The
+        # inner run_task_detailed scope nests cleanly inside this one.
         ctx = dict(task.context or {})
-        trace_id = f"{thread.thread_id}:{task.task_id}"
-        await self._emit_turn_completed(trace_id, thread, persona, 1, first)
+        with self._subject_scope(ctx):
+            first = await self.run_task_detailed(
+                persona, task, thread, llm_config=llm_config
+            )
+            thread = first.thread
+            trace_id = f"{thread.thread_id}:{task.task_id}"
+            await self._emit_turn_completed(trace_id, thread, persona, 1, first)
 
-        result = await self._drive_loop(
-            persona,
-            task,
-            thread,
-            ctx,
-            trace_id,
-            turns=[first],
-            max_turns=max_turns,
-            cost_budget=cost_budget,
-            llm_config=llm_config,
-            hitl=hitl,
-            stop_on_no_progress=stop_on_no_progress,
-            turns_offset=0,
-            cost_offset=0.0,
-        )
-        if synthesize_empty:
-            result = await self._maybe_synthesize(result, persona, trace_id, llm_config)
-        return result
+            result = await self._drive_loop(
+                persona,
+                task,
+                thread,
+                ctx,
+                trace_id,
+                turns=[first],
+                max_turns=max_turns,
+                cost_budget=cost_budget,
+                llm_config=llm_config,
+                hitl=hitl,
+                stop_on_no_progress=stop_on_no_progress,
+                turns_offset=0,
+                cost_offset=0.0,
+            )
+            if synthesize_empty:
+                result = await self._maybe_synthesize(
+                    result, persona, trace_id, llm_config
+                )
+            return result
 
     async def _route_tools(self, task: Task, max_tools: int) -> Task:
         """Narrow the bound tools to the relevant few for this task (Tier 1.3).
@@ -625,9 +698,12 @@ class SingleAgentRuntime:
         """
         ctx = dict(task_context or {})
         trace_id = f"{thread.thread_id}:continue"
-        return await self._continue_turn(
-            persona, thread, ctx, trace_id, llm_config=llm_config
-        )
+        # WS4.6: publish the subject so this turn's message/thread/event records resolve
+        # to it (governed only; a no-op when no consent_decider is wired).
+        with self._subject_scope(ctx):
+            return await self._continue_turn(
+                persona, thread, ctx, trace_id, llm_config=llm_config
+            )
 
     async def reinject_system_prompt(
         self,
@@ -707,35 +783,39 @@ class SingleAgentRuntime:
         if thread is None:
             thread = ChatThread(agent_id=persona.agent_id)
         ctx = dict(task.context or {})
-        snapshot, _snapshot_id, _err = await self._resolve_snapshot(
-            persona, task, ctx, None
-        )
-        system_prompt, task_prompt, _missing = self._render_prompts(
-            persona, task, ctx, snapshot
-        )
-        if not any(m.role == MessageRole.SYSTEM for m in thread.messages):
-            sys_msg = Message(role=MessageRole.SYSTEM, content=system_prompt)
-            thread.append_message(sys_msg)
-            self._register_message(sys_msg)
-        user_msg = Message(
-            role=MessageRole.USER,
-            content=await self._guard_input(task_prompt, agent_id=persona.agent_id),
-        )
-        thread.append_message(user_msg)
-        self._register_message(user_msg)
+        # WS4.6: publish the subject so the streamed turn's system/user/assistant
+        # messages and the bumped thread version resolve to it (governed only; a no-op
+        # when no consent_decider is wired).
+        with self._subject_scope(ctx):
+            snapshot, _snapshot_id, _err = await self._resolve_snapshot(
+                persona, task, ctx, None
+            )
+            system_prompt, task_prompt, _missing = self._render_prompts(
+                persona, task, ctx, snapshot
+            )
+            if not any(m.role == MessageRole.SYSTEM for m in thread.messages):
+                sys_msg = Message(role=MessageRole.SYSTEM, content=system_prompt)
+                thread.append_message(sys_msg)
+                self._register_message(sys_msg)
+            user_msg = Message(
+                role=MessageRole.USER,
+                content=await self._guard_input(task_prompt, agent_id=persona.agent_id),
+            )
+            thread.append_message(user_msg)
+            self._register_message(user_msg)
 
-        request, _tool_names = self._build_request(thread, ctx, llm_config)
-        async for delta in self.inference_service.run_stream(request):
-            if delta.done and delta.response is not None:
-                assistant = Message(
-                    role=MessageRole.ASSISTANT,
-                    content=delta.response.output_text or "",
-                    metadata={"request_id": request.request_id, "streamed": True},
-                )
-                thread.append_message(assistant)
-                self._register_message(assistant)
-                self._register_thread_version(thread)
-            yield delta
+            request, _tool_names = self._build_request(thread, ctx, llm_config)
+            async for delta in self.inference_service.run_stream(request):
+                if delta.done and delta.response is not None:
+                    assistant = Message(
+                        role=MessageRole.ASSISTANT,
+                        content=delta.response.output_text or "",
+                        metadata={"request_id": request.request_id, "streamed": True},
+                    )
+                    thread.append_message(assistant)
+                    self._register_message(assistant)
+                    self._register_thread_version(thread)
+                yield delta
 
     async def resume_agent_loop(
         self,
@@ -781,113 +861,124 @@ class SingleAgentRuntime:
         if resume_llm is None and checkpoint.llm_config is not None:
             resume_llm = LLMConfig.model_validate(checkpoint.llm_config)
 
-        # Apply the human decision to each pending tool call, recording the outcome
-        # on the thread as a TOOL message (so the next model turn sees it).
-        for call in checkpoint.pending_tool_calls:
-            if approved:
-                assert self.tool_service is not None
-                execution = await self.tool_service.execute(
-                    ToolInvocation(
-                        tool_name=call.tool_name,
-                        args=dict(call.args),
-                        metadata={"approved": True},
+        # WS4.6: publish the subject (rebuilt from the checkpoint's ``ctx``, which carries
+        # ``context_subject_id``) for the WHOLE resume path so the resumed tool messages,
+        # the APPROVAL_* / turn events, the bumped thread version, the inner _continue_turn
+        # (which does NOT self-wrap — only the public continue_turn does), and _drive_loop
+        # all emit subject-tagged spine records — otherwise a HITL-resumed run for a fully
+        # consented subject would emit subject-less records the fail-closed
+        # ConsentAwareRegistry silently drops. Governed only; a no-op when no
+        # consent_decider is wired. Inner scopes nest cleanly.
+        with self._subject_scope(ctx):
+            # Apply the human decision to each pending tool call, recording the outcome
+            # on the thread as a TOOL message (so the next model turn sees it).
+            for call in checkpoint.pending_tool_calls:
+                if approved:
+                    assert self.tool_service is not None
+                    execution = await self.tool_service.execute(
+                        ToolInvocation(
+                            tool_name=call.tool_name,
+                            args=dict(call.args),
+                            metadata={"approved": True},
+                        )
                     )
+                    tool_returns = [
+                        ToolReturnRecord(
+                            tool_call_id=call.tool_call_id,
+                            tool_name=call.tool_name,
+                            content=execution.result,
+                            outcome=execution.outcome,
+                            metadata={
+                                "approved_by": "human",
+                                "error_code": execution.error_code.value
+                                if execution.error_code
+                                else None,
+                            },
+                        )
+                    ]
+                    event_type = EventType.APPROVAL_GRANTED
+                else:
+                    tool_returns = [
+                        ToolReturnRecord(
+                            tool_call_id=call.tool_call_id,
+                            tool_name=call.tool_name,
+                            content={"rejected": True, "reason": "rejected by human"},
+                            outcome="rejected",
+                            metadata={"approved_by": "human"},
+                        )
+                    ]
+                    event_type = EventType.APPROVAL_REJECTED
+                synthetic = InferenceResponse(
+                    request_id=f"resume:{checkpoint_id}",
+                    status=InferenceStatus.SUCCESS,
+                    tool_calls=[
+                        ToolCallRecord(
+                            tool_call_id=call.tool_call_id,
+                            tool_name=call.tool_name,
+                            args=dict(call.args),
+                        )
+                    ],
+                    tool_returns=tool_returns,
                 )
-                tool_returns = [
-                    ToolReturnRecord(
-                        tool_call_id=call.tool_call_id,
-                        tool_name=call.tool_name,
-                        content=execution.result,
-                        outcome=execution.outcome,
-                        metadata={
-                            "approved_by": "human",
-                            "error_code": execution.error_code.value
-                            if execution.error_code
-                            else None,
+                await self._append_tool_messages(
+                    thread,
+                    synthetic,
+                    request_id=synthetic.request_id,
+                    trace_id=trace_id,
+                    agent_id=persona.agent_id,
+                )
+                await self._emit(
+                    RunEvent(
+                        event_type=event_type,
+                        trace_id=trace_id,
+                        thread_id=thread.thread_id,
+                        agent_id=persona.agent_id,
+                        payload={
+                            "checkpoint_id": checkpoint_id,
+                            "tool_name": call.tool_name,
                         },
                     )
-                ]
-                event_type = EventType.APPROVAL_GRANTED
-            else:
-                tool_returns = [
-                    ToolReturnRecord(
-                        tool_call_id=call.tool_call_id,
-                        tool_name=call.tool_name,
-                        content={"rejected": True, "reason": "rejected by human"},
-                        outcome="rejected",
-                        metadata={"approved_by": "human"},
-                    )
-                ]
-                event_type = EventType.APPROVAL_REJECTED
-            synthetic = InferenceResponse(
-                request_id=f"resume:{checkpoint_id}",
-                status=InferenceStatus.SUCCESS,
-                tool_calls=[
-                    ToolCallRecord(
-                        tool_call_id=call.tool_call_id,
-                        tool_name=call.tool_name,
-                        args=dict(call.args),
-                    )
-                ],
-                tool_returns=tool_returns,
+                )
+
+            # Resolve the checkpoint exactly once (idempotency guard above).
+            self._checkpoint_store.save(
+                checkpoint.model_copy(
+                    update={"status": APPROVED if approved else REJECTED}
+                )
             )
-            await self._append_tool_messages(
-                thread,
-                synthetic,
-                request_id=synthetic.request_id,
-                trace_id=trace_id,
-                agent_id=persona.agent_id,
-            )
+            thread.version += 1
+            self._register_thread_version(thread)
+
+            # One continuation turn so the model reacts to the decision, then drive on.
+            index = checkpoint.turns_completed + 1
             await self._emit(
                 RunEvent(
-                    event_type=event_type,
+                    event_type=EventType.AGENT_TURN_STARTED,
                     trace_id=trace_id,
                     thread_id=thread.thread_id,
                     agent_id=persona.agent_id,
-                    payload={
-                        "checkpoint_id": checkpoint_id,
-                        "tool_name": call.tool_name,
-                    },
+                    payload={"turn": index},
                 )
             )
-
-        # Resolve the checkpoint exactly once (idempotency guard above).
-        self._checkpoint_store.save(
-            checkpoint.model_copy(update={"status": APPROVED if approved else REJECTED})
-        )
-        thread.version += 1
-        self._register_thread_version(thread)
-
-        # One continuation turn so the model reacts to the decision, then drive on.
-        index = checkpoint.turns_completed + 1
-        await self._emit(
-            RunEvent(
-                event_type=EventType.AGENT_TURN_STARTED,
-                trace_id=trace_id,
-                thread_id=thread.thread_id,
-                agent_id=persona.agent_id,
-                payload={"turn": index},
+            result = await self._continue_turn(
+                persona, thread, ctx, trace_id, llm_config=resume_llm
             )
-        )
-        result = await self._continue_turn(
-            persona, thread, ctx, trace_id, llm_config=resume_llm
-        )
-        await self._emit_turn_completed(trace_id, thread, persona, index, result)
-        return await self._drive_loop(
-            persona,
-            task,
-            thread,
-            ctx,
-            trace_id,
-            turns=[result],
-            max_turns=checkpoint.max_turns,
-            cost_budget=checkpoint.cost_budget,
-            llm_config=resume_llm,
-            hitl=hitl,
-            stop_on_no_progress=False,
-            turns_offset=checkpoint.turns_completed,
-            cost_offset=checkpoint.cost_completed,
-        )
+            await self._emit_turn_completed(trace_id, thread, persona, index, result)
+            return await self._drive_loop(
+                persona,
+                task,
+                thread,
+                ctx,
+                trace_id,
+                turns=[result],
+                max_turns=checkpoint.max_turns,
+                cost_budget=checkpoint.cost_budget,
+                llm_config=resume_llm,
+                hitl=hitl,
+                stop_on_no_progress=False,
+                turns_offset=checkpoint.turns_completed,
+                cost_offset=checkpoint.cost_completed,
+            )
 
     async def _drive_loop(
         self,
@@ -1160,6 +1251,8 @@ class SingleAgentRuntime:
         """
         from himmy.agents.base_agent.thread import Message, MessageRole
 
+        # WS4.6: a TRAIN-denied subject forces raw-I/O capture OFF for this turn.
+        capture_io = self._capture_io and not self._train_suppressed(ctx)
         await self._maybe_compact(persona, thread, ctx, trace_id, llm_config)
         request, tool_names = self._build_request(thread, ctx, llm_config)
         await self._emit(
@@ -1192,7 +1285,7 @@ class SingleAgentRuntime:
                     "output_tokens": response.output_tokens,
                     **(
                         {"io": build_io_capture(request, response)}
-                        if self._capture_io
+                        if capture_io
                         else {}
                     ),
                 },
@@ -1266,8 +1359,76 @@ class SingleAgentRuntime:
         llm_config: LLMConfig | None,
         snapshot_id: str | None,
     ) -> RunResult:
-        """The actual run pipeline (wrapped by ``run_task_detailed`` for deadline)."""
+        """Publish the run's subject (WS4.6) then run the pipeline; reset on exit.
+
+        Splitting the subject-contextvar set/reset from the pipeline keeps the spine-record
+        stampers (``_emit`` / ``_register_*``) correct under concurrent runs while leaving
+        the pipeline body unchanged. The subject is ``None`` (no stamping) unless a
+        governed ``consent_decider`` is wired and the task names a ``context_subject_id``.
+        """
+        with self._subject_scope(ctx):
+            return await self._run_task_pipeline(
+                persona,
+                task,
+                thread,
+                ctx,
+                trace_id,
+                is_new_thread=is_new_thread,
+                llm_config=llm_config,
+                snapshot_id=snapshot_id,
+            )
+
+    def _run_subject(self, ctx: dict[str, Any]) -> str | None:
+        """The governed run's human data subject (``None`` unless a decider is wired)."""
+        if self._consent_decider is None:
+            return None
+        subject = ctx.get("context_subject_id")
+        return str(subject) if subject else None
+
+    @contextlib.contextmanager
+    def _subject_scope(self, ctx: dict[str, Any]) -> Iterator[None]:
+        """Publish the run's human subject on ``_CURRENT_SUBJECT`` for the scope's life.
+
+        Every public runtime entry point that emits subject-bearing spine records
+        (``run_task``/``run_agent_loop``/``continue_turn``/``stream_task``/
+        ``resume_agent_loop``) wraps its body in this so a governed
+        :class:`ConsentAwareRegistry` can resolve (and gate / crypto-shred) the subject
+        behind the otherwise subject-less ``run_event`` / ``message`` / ``chat_thread``
+        records — preventing silent fail-closed data loss for a fully-consented subject
+        on the multi-turn / streaming / HITL-resume paths.
+
+        The published subject is ``None`` (no stamping) unless a governed
+        ``consent_decider`` is wired AND the task names a ``context_subject_id``, so the
+        ungoverned path is byte-identical (``_subject_metadata`` returns ``None`` and
+        ``to_record(metadata=None)`` is unchanged). The :class:`contextvars.ContextVar`
+        keeps this correct under concurrent runs.
+        """
+        token = _CURRENT_SUBJECT.set(self._run_subject(ctx))
+        try:
+            yield
+        finally:
+            _CURRENT_SUBJECT.reset(token)
+
+    async def _run_task_pipeline(
+        self,
+        persona: Persona,
+        task: Task,
+        thread: ChatThread,
+        ctx: dict[str, Any],
+        trace_id: str,
+        *,
+        is_new_thread: bool,
+        llm_config: LLMConfig | None,
+        snapshot_id: str | None,
+    ) -> RunResult:
+        """The run pipeline proper (subject contextvar set by ``_run_task_body``)."""
         from himmy.agents.base_agent.thread import Message, MessageRole
+
+        # WS4.6 TRAIN gate: a participating human subject lacking TRAIN consent forces
+        # raw-I/O capture OFF and strips the persisted ``rendered_prompt`` for this run.
+        # Inert (False) whenever no ``consent_decider`` is wired (offline path unchanged).
+        train_suppressed = self._train_suppressed(ctx)
+        capture_io = self._capture_io and not train_suppressed
 
         # --- 1. snapshot resolve/build -------------------------------------
         snapshot, snapshot_id, snapshot_error = await self._resolve_snapshot(
@@ -1317,6 +1478,21 @@ class SingleAgentRuntime:
         # --- 6. build the inference request -------------------------------
         request, tool_names = self._build_request(thread, ctx, llm_config)
 
+        requested_payload: dict[str, Any] = {
+            "model_key": request.model_key,
+            "route_override": request.route_override,
+            "response_format": request.response_format.value
+            if request.response_format
+            else None,
+            "retrieval_ctx": list((snapshot.fields or {}).keys())
+            if snapshot is not None
+            else [],
+            "tool_names": tool_names,
+        }
+        # WS4.6: omit the full user prompt for a TRAIN-denied subject so no cleartext
+        # prompt lands on the event log / spine. Present verbatim otherwise.
+        if not train_suppressed:
+            requested_payload["rendered_prompt"] = task_prompt
         await self._emit(
             RunEvent(
                 event_type=EventType.INFERENCE_REQUESTED,
@@ -1324,18 +1500,7 @@ class SingleAgentRuntime:
                 thread_id=thread.thread_id,
                 agent_id=persona.agent_id,
                 request_id=request.request_id,
-                payload={
-                    "model_key": request.model_key,
-                    "route_override": request.route_override,
-                    "response_format": request.response_format.value
-                    if request.response_format
-                    else None,
-                    "rendered_prompt": task_prompt,
-                    "retrieval_ctx": list((snapshot.fields or {}).keys())
-                    if snapshot is not None
-                    else [],
-                    "tool_names": tool_names,
-                },
+                payload=requested_payload,
             )
         )
 
@@ -1362,7 +1527,7 @@ class SingleAgentRuntime:
                         "provider_name": response.provider_name,
                         **(
                             {"io": build_io_capture(request, response)}
-                            if self._capture_io
+                            if capture_io
                             else {}
                         ),
                     },
@@ -1955,22 +2120,42 @@ class SingleAgentRuntime:
             )
 
     # --------------------------------------------------------------- entities
-    def _register_entity(self, obj: Any) -> Any:
-        """Register a domain object's record when a registry is wired; else None."""
+    @staticmethod
+    def _subject_metadata() -> dict[str, Any] | None:
+        """The ``{subject_id: ...}`` stamp for the current run, or ``None`` (ungoverned).
+
+        Returns ``None`` whenever no governed run subject is published (the offline /
+        ungoverned path), so ``to_record(metadata=None)`` keeps the projected record
+        byte-identical to a pre-WS4.6 runtime. When a governed run names a subject, the
+        stamp lets a :class:`ConsentAwareRegistry` resolve + gate the otherwise
+        subject-less spine records.
+        """
+        subject = _CURRENT_SUBJECT.get()
+        return {"subject_id": subject} if subject else None
+
+    def _register_entity(self, obj: Any, *, stamp_subject: bool = False) -> Any:
+        """Register a domain object's record when a registry is wired; else None.
+
+        ``stamp_subject`` is only set for the genuinely subject-bearing run artefacts
+        (messages, threads); infrastructure records (persona/prompt/agent) are never
+        stamped so a governed ``registry.query(metadata={'subject_id': ...})`` returns
+        only real subject data.
+        """
         if self.entity_registry is None:
             return None
         to_record = getattr(obj, "to_record", None)
         if to_record is None:
             return None
         try:
-            record = to_record()
+            metadata = self._subject_metadata() if stamp_subject else None
+            record = to_record(metadata=metadata)
             return self.entity_registry.register(record)
         except Exception:  # pragma: no cover - defensive
             return None
 
     def _register_message(self, message: Any) -> Any:
         """Register a Message entity (kind="message") when a registry is present."""
-        return self._register_entity(message)
+        return self._register_entity(message, stamp_subject=True)
 
     def _register_thread_version(self, thread: Any) -> Any:
         """Project the current chat_thread version into a record (when a registry).
@@ -1982,7 +2167,7 @@ class SingleAgentRuntime:
         if self.entity_registry is None:
             return None
         try:
-            record = thread.to_record()
+            record = thread.to_record(metadata=self._subject_metadata())
             return self.entity_registry.register(record)
         except Exception:  # pragma: no cover - defensive
             return None
@@ -2056,7 +2241,9 @@ class SingleAgentRuntime:
                     pass
         if self.entity_registry is not None:
             try:
-                self.entity_registry.register(event.to_record())
+                self.entity_registry.register(
+                    event.to_record(metadata=self._subject_metadata())
+                )
             except Exception:  # pragma: no cover - defensive
                 pass
         try:

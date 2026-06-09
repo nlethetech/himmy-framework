@@ -85,9 +85,11 @@ def test_tier_scoped_recall() -> None:
     svc.remember("a recall-tier fact", subject_id="u", tier="recall")
     svc.remember("cold archival note", subject_id="u", tier="archival")
 
-    core = run_async(svc.recall("fact", subject_id="u", tier="core"))
+    # Each query overlaps only its own tier's fact (so the default noise floor keeps
+    # the on-tier hit), proving the recall is scoped to the requested tier.
+    core = run_async(svc.recall("profile fact", subject_id="u", tier="core"))
     assert [h.record.text for h in core] == ["core profile fact"]
-    archival = run_async(svc.recall("fact", subject_id="u", tier="archival"))
+    archival = run_async(svc.recall("archival note", subject_id="u", tier="archival"))
     assert [h.record.text for h in archival] == ["cold archival note"]
 
 

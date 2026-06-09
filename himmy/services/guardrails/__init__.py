@@ -32,7 +32,11 @@ from himmy.services.guardrails.dlp import (
     TokenVault,
     build_dlp_guardrail,
 )
-from himmy.services.guardrails.tool_hook import build_guardrail_pre_hook
+from himmy.services.guardrails.tool_hook import (
+    BLOCKED_OUTPUT_PLACEHOLDER,
+    build_guardrail_post_hook,
+    build_guardrail_pre_hook,
+)
 
 __all__ = [
     "Guardrail",
@@ -47,6 +51,8 @@ __all__ = [
     "BUILTIN_GUARDRAILS",
     "build_guardrail_pipeline",
     "build_guardrail_pre_hook",
+    "build_guardrail_post_hook",
+    "BLOCKED_OUTPUT_PLACEHOLDER",
     "DlpAction",
     "DlpPolicy",
     "DlpGuardrail",

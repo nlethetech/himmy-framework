@@ -17,6 +17,8 @@ from collections.abc import Sequence
 
 from himmy import __version__
 from himmy.cli import commands
+from himmy.cli.audit import add_audit_parser
+from himmy.cli.consent import add_consent_parser
 from himmy.cli.provider import PROVIDERS
 from himmy.core import HimmyError
 
@@ -193,6 +195,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_trace.add_argument("thread", nargs="?", help="thread id to show the timeline for")
     p_trace.add_argument("--limit", type=int, default=10, help="recent runs to list")
     p_trace.set_defaults(func=commands.cmd_trace)
+
+    add_consent_parser(sub)
+    add_audit_parser(sub)
 
     return parser
 

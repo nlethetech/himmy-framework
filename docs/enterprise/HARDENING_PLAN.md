@@ -268,7 +268,24 @@ block per class, reversible `TokenVault`, audited counts, optional Presidio); **
 `tests/storage/test_encryption.py`, `tests/config/test_residency.py`,
 `tests/entities/test_audit_signing.py`, `tests/governance/test_retention.py`,
 `tests/api/test_audit_bundle.py`. NOTE (4.4): ships the encryption capability + helpers;
-transparent whole-store wiring is the documented opt-in deployment step.*
+transparent whole-store wiring is the documented opt-in deployment step. **4.6** consent &
+purpose-limitation (`himmy/services/governance/consent*.py`) — a pure PDP + append-only
+consent ledger enforced at four points (storage facade, the immutable spine, the runtime
+TRAIN gate, the export funnel), withdraw ⇒ crypto-shred, `himmy consent` CLI + `/v1/consent`
+router + `data_subject` RBAC role; entirely opt-in via `HIMMY_CONSENT` (offline path
+byte-identical). Doc `docs/enterprise/consent.md`, worked example
+`examples/deepgyan_consent/main.py`; tested across `tests/governance/test_consent_*.py`,
+`tests/api/test_consent_router.py`, `tests/examples/test_deepgyan_consent.py`. **4.7**
+Ragas-inspired privacy & compliance **audit harness** (`himmy/services/evaluation/privacy/`)
+— one auditable experiment with a live adversarial **probe half** (`AgentEvalHarness`,
+zero harness change) + a deterministic **recorded-data half** (`pii_leakage` /
+`audit_integrity` / `retention_compliance` / `erasure_completeness` + None-guarded
+consent-derived metrics), rolling into one signed `PrivacyAuditReport`
+(`kind="privacy_audit_report"`); `himmy audit privacy` CI gate + `/v1/audit/privacy` router
+(`audit:run`), with `GET /v1/audit/bundle` widened to cover the report. Read-only/opt-in
+(offline path unchanged). Doc `docs/enterprise/privacy_audit.md`; tested across
+`tests/services/evaluation/privacy/`, `tests/api/test_privacy_audit_route.py`,
+`tests/cli/`.*
 
 ### 4-orig — Data Governance & Compliance
 
@@ -322,6 +339,88 @@ transparent whole-store wiring is the documented opt-in deployment step.*
 - **Acceptance:** an auditor exports a signed bundle and verifies it offline; tampering with a
   row is detected with the exact record id.
 - **Verify:** extend `tests/entities/test_integrity.py`.
+
+### 4.6 — Consent & purpose-limitation enforcement — ✅ DONE
+- **Current:** himmy had strong enforcement primitives (DLP, crypto-shred erasure, envelope
+  encryption, RBAC, signed audit bundles) but **no consent / purpose-limitation** concept, so
+  it could not honour "a subject who did not opt in ⇒ their data is not retained or used for
+  training" (the DeepGyan scenario) nor prove it.
+- **Target:** a generic, `subject_id`-agnostic consent layer with a pure Policy-Decision-Point
+  (`ConsentPolicy.decide`, structurally cloned from `AccessPolicy`, `governed` flag, env-built
+  by `build_consent_policy`) over an append-only `kind="consent"` version chain
+  (`ConsentLedger`). Three purposes — `RETAIN` / `TRAIN` / `INFER` — enforced at **four
+  points**, all consulting the one decider: (1) `ConsentGatedStorage` over the `StorageService`
+  facade; (2) `ConsentAwareRegistry` over the immutable spine (the linchpin — the runtime
+  writes transcripts to the registry in parallel with storage, so a storage-only gate would
+  leave cleartext on the spine; non-`ALLOW` ⇒ never registered, `ALLOW` ⇒ subject fields
+  encrypted under the shreddable key); (3) a runtime `consent_decider` `TRAIN` gate that forces
+  raw-I/O capture off + strips the verbatim `rendered_prompt`; (4) `ConsentFilteredExporter` +
+  a `RecordingClientManager` shim as the single `TRAIN` export funnel. Withdrawal appends
+  `WITHDRAWN` and routes through `RetentionService.erase_subject` (crypto-shred + tombstone).
+  Surfaces: `himmy consent {grant,deny,status,history,revoke}`, a `consent:read`/`consent:write`
+  RBAC pair + a self-scoped `data_subject` role, and a `/v1/consent` router.
+- **Offline-first:** entirely opt-in via `HIMMY_CONSENT` (+ `HIMMY_CONSENT_FILE` to override
+  the `UNKNOWN` defaults). Off ⇒ `decide()` returns `ALLOW`, the gates/wrappers/decider are
+  **not constructed**, and `create_app()` / `himmy run` is byte-identical to pre-WS4.6 — exactly
+  how RBAC/encryption stay inert until configured. Secure-by-default *only when governed*:
+  `UNKNOWN` defaults to `DENY` for `RETAIN`/`TRAIN`, `EPHEMERAL` for `INFER`; unresolved
+  subject-bearing records **fail closed**.
+- **Files:** `himmy/services/governance/{consent,consent_ledger,consent_storage,consent_registry,consent_resolver,training_export}.py`;
+  wiring in `himmy/api/deps.py` (governed branch), `himmy/api/routers/consent.py`,
+  `himmy/cli/consent.py`, `himmy/api/auth/rbac.py`; TRAIN gate in
+  `himmy/runtime/single_agent.py` + `himmy/services/inference/replay.py`. Operator doc:
+  `docs/enterprise/consent.md`. Worked example: `examples/deepgyan_consent/main.py`.
+- **Acceptance:** zero-config persistence is byte-identical (bare storage, `consent_decider`
+  is `None`); a governed opted-out subject leaves zero cleartext on BOTH storage AND the spine
+  while infrastructure records still register; a no-`TRAIN`-consent subject appears in no event
+  payload, no cassette, and no export; withdrawal renders persisted ciphertext unrecoverable
+  with the tombstone present and the signed bundle still verifying.
+- **Verify:** `tests/governance/test_consent_{pdp,ledger,storage,registry,train,wiring}.py`,
+  `tests/api/test_consent_router.py`, `tests/cli/`, and the end-to-end worked example in
+  `tests/examples/test_deepgyan_consent.py`.
+
+### 4.7 — Privacy & compliance audit harness (Ragas-inspired) — ✅ DONE
+- **Current:** WS4.1–4.6 gave himmy strong *enforcement* primitives plus a *passive* signed
+  audit **log**, but no way to *actively assess* its own privacy posture — i.e. to **measure
+  and prove** that the controls held (no PII in stored outputs, nothing past retention, every
+  erasure complete, the audit trail untampered, and — once WS4.6 is wired — consent honoured).
+- **Target:** a `PrivacyAuditService` (`himmy/services/evaluation/privacy/`) running one
+  auditable "experiment" with two halves that roll into one signed scorecard: (a) a **probe
+  half** — a seeded, offline-deterministic adversarial `EvaluationSuite` run against the *live*
+  agent through the **unchanged** `AgentEvalHarness` (cases use `input={'prompt':...}`, the
+  default key — zero harness change), graded by the existing `SafetyMetric` offline + gated LLM
+  aspect-critics when a real provider is wired; (b) a **recorded-data half** — deterministic,
+  synchronous `RecordedDataMetric`s over a **pre-materialized** `RecordedDataContext` (the
+  service `await`s storage *first*, then hands metrics concrete lists — no sync-awaits-async):
+  `pii_leakage` (DLP over `_PII_RULES + _NEPAL_PII_RULES`), `audit_integrity` (content-hash vs
+  the last signed bundle; first run ⇒ skipped), `retention_compliance`, `erasure_completeness`,
+  plus None-guarded `consent_coverage` / `purpose_limitation` / `denial_enforcement` that stay
+  **skipped** (never `0`) until WS4.6 injects a consent ledger. Both halves roll into one
+  `PrivacyAuditReport` registered as its own `EntityRecord(kind="privacy_audit_report")`;
+  findings carry **counts + reference ids only — no value field**, so the report can never
+  become a PII sink. Surfaces: `himmy audit privacy` (a CI gate — **exits non-zero on a failing
+  posture**, optional `--export-bundle`) and a `/v1/audit/privacy` router (run/trend/get,
+  `audit:run`/`audit:read`); `GET /v1/audit/bundle` is **widened** to union
+  `SECURITY_EVENT_KIND + PRIVACY_AUDIT_REPORT_KIND` so the report is genuinely bundle-covered.
+- **Offline-first:** the audit runs no model and needs no keys — the service is a passive,
+  read-only auditor an operator *invokes*, never on the hot path, so a zero-config `himmy run`
+  / `create_app()` is unchanged. Over an empty store it is a clean recorded-only scan that
+  registers a passing report; LLM metrics are gated on `provider not in (None, 'stub')` and the
+  consent-derived metrics stay skipped until WS4.6 lands. **Part B ships and tests green before
+  Part A exists** (consumed through an injected, None-guarded seam), and the consent metrics +
+  the `from_consent_ledger` probe refresh light up automatically once consent is wired.
+- **Files:** `himmy/services/evaluation/privacy/{models,metrics,probes,catalog,service,__init__}.py`;
+  `himmy/cli/audit.py` (+ `cli/__main__.py`, `cli/commands.py`); `himmy/api/routers/privacy_audit.py`,
+  the bundle union in `himmy/api/routers/audit.py`, wiring in `himmy/api/deps.py` / `app.py`,
+  `audit:run` for `auditor` in `himmy/api/auth/rbac.py`. Operator doc:
+  `docs/enterprise/privacy_audit.md`.
+- **Acceptance:** `himmy audit privacy` on a clean store exits 0 with a scorecard; a planted
+  PII leak / retention gap / erasure gap drops the matching metric below threshold with a
+  findings ref but **no raw value anywhere in the report**; tampering a cited record flips the
+  signed-bundle verification to `ok=False`; the `privacy_audit_report` appears in
+  `GET /v1/audit/bundle`; operator/auditor allowed per role, viewer 403, bundle-without-key ⇒ 503.
+- **Verify:** `tests/services/evaluation/privacy/`, `tests/api/test_privacy_audit_route.py`,
+  `tests/cli/`.
 
 ---
 

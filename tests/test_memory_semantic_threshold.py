@@ -1,30 +1,53 @@
-"""Semantic recall threshold tests: the recall floor and its baseline-preserving default.
+"""Semantic recall threshold tests: the recall noise floor and its override knobs.
 
-Proves (a) a positive floor drops a fact the historical code WOULD have returned, and
-(b) the zero/None default reproduces the exact current ordering — so the 1216-test
-baseline (and the always-return-the-top-hit contract) is untouched.
+Proves (a) a positive floor drops a fact the zero/explicit-0.0 path WOULD return, (b)
+a per-call threshold overrides the service default, and (c) the ``None`` default applies
+the safe ``> 0.0`` noise floor (an orthogonal query recalls nothing) — aligning memory
+recall with the sibling knowledge service rather than always surfacing the top hit.
 """
 
 from __future__ import annotations
 
 from himmy.services.memory import InMemoryMemoryStore, MemoryService
+from himmy.services.memory.service import ALWAYS_INCLUDE
 from tests.conftest import run_async
 
 
 def test_service_min_similarity_floor_drops_irrelevant_fact() -> None:
-    """A ctor-level min_similarity drops a fact the default would have surfaced."""
+    """A ctor-level min_similarity drops a fact the explicit-0.0 path would surface."""
     svc = MemoryService(InMemoryMemoryStore(), min_similarity=0.5)
     svc.remember("the pond holds fish and ducks", subject_id="u")
 
-    # The default (no floor) WOULD return this orthogonal fact at similarity 0.0.
+    # An explicit 0.0 threshold WOULD return this orthogonal fact at similarity 0.0.
     baseline = MemoryService(InMemoryMemoryStore())
     baseline.remember("the pond holds fish and ducks", subject_id="u")
-    baseline_hits = run_async(baseline.recall("quantum chromodynamics", subject_id="u"))
+    baseline_hits = run_async(
+        baseline.recall(
+            "quantum chromodynamics", subject_id="u", similarity_threshold=0.0
+        )
+    )
     assert len(baseline_hits) == 1 and baseline_hits[0].similarity == 0.0
 
-    # With the floor, the orthogonal query correctly recalls nothing.
+    # With the service floor, the orthogonal query correctly recalls nothing.
     hits = run_async(svc.recall("quantum chromodynamics", subject_id="u"))
     assert hits == []
+
+
+def test_default_none_applies_noise_floor() -> None:
+    """The ``None`` default now applies the safe ``> 0.0`` noise floor."""
+    svc = MemoryService(InMemoryMemoryStore())  # no explicit floor
+    svc.remember("the pond holds fish and ducks", subject_id="u")
+    # Zero-overlap query: the default floor drops the only (similarity-0.0) memory.
+    assert run_async(svc.recall("quantum chromodynamics", subject_id="u")) == []
+    # ALWAYS_INCLUDE bypasses the floor and still returns it.
+    forced = run_async(
+        svc.recall(
+            "quantum chromodynamics",
+            subject_id="u",
+            similarity_threshold=ALWAYS_INCLUDE,
+        )
+    )
+    assert len(forced) == 1 and forced[0].similarity == 0.0
 
 
 def test_per_call_threshold_overrides_service_default() -> None:
@@ -39,16 +62,29 @@ def test_per_call_threshold_overrides_service_default() -> None:
     assert len(hits) == 1
 
 
-def test_default_none_reproduces_top_hit_ordering() -> None:
-    """min_similarity=None (the default) preserves always-return-the-top-hit."""
-    svc = MemoryService(InMemoryMemoryStore())  # no floor
+def test_default_floor_drops_zero_overlap_while_always_include_keeps_order() -> None:
+    """The default floors the zero-overlap memory; ALWAYS_INCLUDE keeps both ordered."""
+    svc = MemoryService(InMemoryMemoryStore())  # no explicit floor
     svc.remember("the orchard has apple and pear trees", subject_id="u")
     svc.remember("the pond holds fish and ducks", subject_id="u")
+
+    # Default: the orchard memory clears the floor, the orthogonal pond memory (0.0)
+    # is dropped.
     hits = run_async(svc.recall("apple and pear trees orchard", subject_id="u"))
-    # Both returned, most-similar first — identical to the historical contract.
-    assert len(hits) == 2
+    assert len(hits) == 1
     assert hits[0].record.text.startswith("the orchard")
-    assert hits[0].similarity >= hits[1].similarity
+
+    # ALWAYS_INCLUDE bypasses the floor and returns both, most-similar first.
+    forced = run_async(
+        svc.recall(
+            "apple and pear trees orchard",
+            subject_id="u",
+            similarity_threshold=ALWAYS_INCLUDE,
+        )
+    )
+    assert len(forced) == 2
+    assert forced[0].record.text.startswith("the orchard")
+    assert forced[0].similarity >= forced[1].similarity
 
 
 def test_floor_keeps_relevant_drops_irrelevant() -> None:

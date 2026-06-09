@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
@@ -31,6 +32,16 @@ from himmy.core.errors import HimmyError
 from himmy.services.inference.cache import compute_cache_key
 from himmy.services.inference.client_manager import ClientManager
 from himmy.services.inference.models import InferenceRequest, InferenceResponse
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from collections.abc import Callable
+
+    from himmy.services.governance.consent import Decision, Purpose
+
+    #: A TRAIN decider: resolve a Decision for (subject_id, purpose). ConsentLedger.decision
+    #: conforms. Cassettes are a ready-made training corpus that escapes ``erase_subject``,
+    #: so recording is gated at purpose=TRAIN when a decider + subject are supplied.
+    ConsentDecider = Callable[[str, Purpose], Decision]
 
 CASSETTE_VERSION = 1
 
@@ -77,26 +88,55 @@ def _preview(request: InferenceRequest) -> str:
 
 
 class RecordingClientManager:
-    """Wrap a real :class:`ClientManager`, recording every exchange to a cassette."""
+    """Wrap a real :class:`ClientManager`, recording every exchange to a cassette.
 
-    def __init__(self, inner: ClientManager, *, label: str = "") -> None:
+    WS4.6 (opt-in): pass ``consent_decider`` + ``subject_id`` to gate recording at
+    purpose ``TRAIN``. When the subject lacks an ``ALLOW`` TRAIN decision the exchange is
+    still *generated* (the live answer is served) but **no** cassette entry is written —
+    so neither the response nor the human-readable ``request_preview`` of a
+    non-consenting subject ever lands in the replay artifact. With ``consent_decider=None``
+    (the default) recording is unchanged: every exchange is captured verbatim.
+    """
+
+    def __init__(
+        self,
+        inner: ClientManager,
+        *,
+        label: str = "",
+        consent_decider: ConsentDecider | None = None,
+        subject_id: str | None = None,
+    ) -> None:
         self._inner = inner
         self.cassette = InferenceCassette(label=label)
         self.provider_name = getattr(inner, "provider_name", "recording")
+        self._consent_decider = consent_decider
+        self._subject_id = subject_id
 
     def resolve(self, model_key: str) -> str:
         return self._inner.resolve(model_key)
 
+    def _may_record(self) -> bool:
+        """Whether this subject's I/O may be recorded (TRAIN-gated, opt-in)."""
+        if self._consent_decider is None or not self._subject_id:
+            return True
+        from himmy.services.governance.consent import Effect, Purpose
+
+        return (
+            self._consent_decider(self._subject_id, Purpose.TRAIN).effect
+            is Effect.ALLOW
+        )
+
     async def generate(self, request: InferenceRequest) -> InferenceResponse:
         response = await self._inner.generate(request)
-        self.cassette.entries.append(
-            CassetteEntry(
-                cache_key=compute_cache_key(request),
-                model_key=request.model_key,
-                response=response,
-                request_preview=_preview(request),
+        if self._may_record():
+            self.cassette.entries.append(
+                CassetteEntry(
+                    cache_key=compute_cache_key(request),
+                    model_key=request.model_key,
+                    response=response,
+                    request_preview=_preview(request),
+                )
             )
-        )
         return response
 
     def dump(self, path: str | Path) -> Path:

@@ -23,6 +23,15 @@ from himmy.services.evaluation.models import (
     EvaluationSuite,
     MetricScore,
 )
+from himmy.services.evaluation.privacy import (
+    PRIVACY_AUDIT_REPORT_KIND,
+    PrivacyAuditConfig,
+    PrivacyAuditReport,
+    PrivacyAuditService,
+    PrivacyFinding,
+    PrivacyMetricResult,
+    build_privacy_probe_suite,
+)
 from himmy.services.evaluation.service import EvaluationService
 
 __all__ = [
@@ -44,4 +53,12 @@ __all__ = [
     "build_registry",
     "bucketed_ece",
     "default_metric_registry",
+    # WS4.7 privacy & compliance audit harness (Part B) — re-exported public API.
+    "PRIVACY_AUDIT_REPORT_KIND",
+    "PrivacyAuditService",
+    "PrivacyAuditConfig",
+    "PrivacyAuditReport",
+    "PrivacyMetricResult",
+    "PrivacyFinding",
+    "build_privacy_probe_suite",
 ]

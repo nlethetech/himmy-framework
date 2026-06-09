@@ -1202,3 +1202,31 @@ def cmd_skills(args: argparse.Namespace) -> int:
         print(f"\nproject skill dirs scanned: {', '.join(scanned)}")
     print("\nDetail: himmy skills <name>")
     return 0
+
+
+# The consent (WS4.6) and privacy-audit (WS4.7 B4) subcommand trees live in their own
+# modules (each has a richer parser); re-exported here so call sites that reference CLI
+# handlers via ``commands`` keep working.
+from himmy.cli.audit import (  # noqa: E402
+    add_audit_parser,
+    cmd_audit_privacy,
+)
+from himmy.cli.consent import (  # noqa: E402
+    add_consent_parser,
+    cmd_consent_deny,
+    cmd_consent_grant,
+    cmd_consent_history,
+    cmd_consent_revoke,
+    cmd_consent_status,
+)
+
+__all__ = [
+    "add_consent_parser",
+    "cmd_consent_grant",
+    "cmd_consent_deny",
+    "cmd_consent_status",
+    "cmd_consent_history",
+    "cmd_consent_revoke",
+    "add_audit_parser",
+    "cmd_audit_privacy",
+]

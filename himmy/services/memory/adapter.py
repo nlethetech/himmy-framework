@@ -12,7 +12,7 @@ from typing import Any
 
 from himmy.services.context.adapters import ContextAdapter
 from himmy.services.context.models import ContextField
-from himmy.services.memory.service import MemoryService
+from himmy.services.memory.service import ALWAYS_INCLUDE, MemoryService
 
 
 class MemoryContextAdapter(ContextAdapter):
@@ -34,10 +34,11 @@ class MemoryContextAdapter(ContextAdapter):
 
         ``subject_id`` pins the recall subject (overriding the run's scope) so the
         adapter reads the same subject that facts were remembered under.
-        ``similarity_threshold`` (optional) drops weakly-related memories so an
-        off-topic turn injects no memory context instead of a best-of-the-irrelevant
-        one; ``None`` (the default) preserves the always-inject-the-top-hit behaviour.
-        ``tiers`` (optional) restricts injection to the given Letta tiers — e.g.
+        ``similarity_threshold`` (optional) raises/lowers the recall floor that drops
+        weakly-related memories so an off-topic turn injects no memory context instead
+        of a best-of-the-irrelevant one; ``None`` (the default) uses the service's safe
+        ``> 0.0`` noise floor. ``tiers`` (optional) restricts injection to the given
+        Letta tiers — e.g.
         ``("core", "recall")`` injects always-on core facts plus thresholded recall
         facts but leaves ``archival`` for an explicit ``recall`` tool call; ``None``
         (the default) injects from every tier. ``active_only`` drops invalidated facts.
@@ -104,8 +105,9 @@ class MemoryContextAdapter(ContextAdapter):
         seen: set[str] = set()
         for tier in self._tiers:
             # ``core`` is the always-in-context working set: inject it regardless of
-            # query similarity (no threshold). Other tiers go through the floor.
-            threshold = None if tier == "core" else self._similarity_threshold
+            # query similarity (the explicit always-include path). Other tiers go
+            # through the floor (``None`` is the service's safe ``> 0.0`` noise floor).
+            threshold = ALWAYS_INCLUDE if tier == "core" else self._similarity_threshold
             tier_hits = await self._memory.recall(
                 query,
                 subject_id=subject_id,

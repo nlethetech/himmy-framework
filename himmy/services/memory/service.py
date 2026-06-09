@@ -34,6 +34,24 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from himmy.entities.registry import EntityRegistry
 
 
+class _AlwaysInclude:
+    """Sentinel ``similarity_threshold`` requesting an unconditional recall.
+
+    Distinct from ``None`` (the general default, which now applies a ``> 0.0`` noise
+    floor): passing :data:`ALWAYS_INCLUDE` returns the top hits regardless of similarity,
+    preserving the ``core`` tier's "always-in-context working set" contract.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "ALWAYS_INCLUDE"
+
+
+ALWAYS_INCLUDE = _AlwaysInclude()
+"""Sentinel for :meth:`MemoryService.recall`'s ``similarity_threshold``: always return."""
+
+
 @dataclass
 class MemoryHit:
     """A recalled memory paired with its similarity to the query."""
@@ -71,9 +89,12 @@ class MemoryService:
         """Wire a (durable or in-memory) store and an embedder for recall.
 
         ``min_similarity`` is a default recall floor applied when a call does not pass
-        its own ``similarity_threshold``; ``None`` (the default) preserves the
-        historical always-return-the-top-hit behaviour. ``registry``/``event_sink``
-        opt the service into spine projection + audit (both default off).
+        its own ``similarity_threshold``; ``None`` (the default) applies the safe
+        ``> 0.0`` noise floor (an orthogonal query recalls nothing) — mirroring the
+        sibling knowledge service. Pass a float to raise/lower that floor. The
+        ``core``-tier always-in-context path uses :data:`ALWAYS_INCLUDE` to bypass it.
+        ``registry``/``event_sink`` opt the service into spine projection + audit
+        (both default off).
         """
         self._store = store or InMemoryMemoryStore()
         self._embedder = embedder or DeterministicEmbedder()
@@ -143,21 +164,24 @@ class MemoryService:
         *,
         subject_id: str = "default",
         top_k: int = 5,
-        similarity_threshold: float | None = None,
+        similarity_threshold: float | _AlwaysInclude | None = None,
         as_of: str | None = None,
         tier: str | None = None,
         active_only: bool = False,
     ) -> list[MemoryHit]:
         """Return the ``top_k`` memories most similar to ``query`` for ``subject_id``.
 
-        ``similarity_threshold`` lets recall return ZERO results when nothing is
-        relevant instead of always surfacing a best-of-the-irrelevant hit:
+        ``similarity_threshold`` closes the "best-of-the-irrelevant" footgun, mirroring
+        the sibling knowledge service's noise floor:
 
-        - ``None`` (and no service-level ``min_similarity``) preserves the historical
-          behaviour — the single most similar memory is always returned even at
-          similarity ``0.0`` (a guaranteed-non-empty recall for subjects with memory).
-        - An explicit float (or the service default ``min_similarity``) drops every hit
-          below the floor, so an orthogonal query can correctly recall nothing.
+        - ``None`` (and no service-level ``min_similarity``) applies the safe ``> 0.0``
+          noise floor: a hit with zero overlap is dropped, so an orthogonal query
+          correctly recalls nothing instead of surfacing a similarity-``0.0`` hit.
+        - An explicit float (or the service default ``min_similarity``) keeps every hit
+          with ``similarity >= threshold`` — so a caller who deliberately wants ``0.0``
+          (or any cutoff) gets exactly that.
+        - :data:`ALWAYS_INCLUDE` bypasses the floor entirely and returns the top hits
+          regardless of similarity — the ``core``-tier always-in-context working set.
 
         ``as_of`` (ISO timestamp) restricts to facts whose ``[valid_from, valid_to)``
         window contains that instant — bi-temporal point-in-time recall. ``active_only``
@@ -187,10 +211,15 @@ class MemoryService:
             if similarity_threshold is not None
             else self._min_similarity
         )
-        if threshold is not None:
-            hits = [h for h in scored if h.similarity >= threshold][:top_k]
-        else:
+        if isinstance(threshold, _AlwaysInclude):
+            # Always-in-context working set (e.g. the core tier): no floor at all.
             hits = scored[: max(1, top_k)]
+        elif threshold is None:
+            # General default: the safe ``> 0.0`` noise floor — an orthogonal query
+            # recalls nothing instead of a best-of-the-irrelevant similarity-0.0 hit.
+            hits = [h for h in scored if h.similarity > 0.0][:top_k]
+        else:
+            hits = [h for h in scored if h.similarity >= threshold][:top_k]
         self._emit(
             EventType.MEMORY_RECALLED,
             {
@@ -312,4 +341,4 @@ class MemoryService:
                 pass
 
 
-__all__ = ["MemoryService", "MemoryHit"]
+__all__ = ["MemoryService", "MemoryHit", "ALWAYS_INCLUDE"]
