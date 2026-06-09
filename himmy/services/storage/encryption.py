@@ -331,7 +331,9 @@ def build_kek_provider() -> KekProvider | None:
         key_b64 = get_secret("HIMMY_ENCRYPTION_KEY")
         return LocalKekProvider.from_key_b64(key_b64) if key_b64 else None
     if mode == "aws-kms":
-        _require_extra("boto3", "kms-aws", "aws-kms")
+        # boto3 is required only to construct the *real* KMS client; an injected client
+        # (offline tests) needs no SDK, so the SDK check lives lazily in the provider's
+        # ``_ensure`` rather than eagerly here (which would also mask the key-id error).
         from himmy.services.storage.kms_providers import AwsKmsKekProvider
 
         key_id = get_secret("HIMMY_AWS_KMS_KEY_ID")

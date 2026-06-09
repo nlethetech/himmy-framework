@@ -50,7 +50,13 @@ class AwsKmsKekProvider:
 
     def _ensure(self) -> Any:
         if self._client is None:
-            import boto3
+            try:
+                import boto3
+            except ImportError as exc:  # pragma: no cover - only without boto3
+                raise RuntimeError(
+                    "the 'aws-kms' KEK provider needs the 'kms-aws' extra "
+                    "(install it: pip install 'himmy[kms-aws]')"
+                ) from exc
 
             self._client = boto3.client("kms", region_name=self._region)
         return self._client
