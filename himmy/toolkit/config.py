@@ -41,9 +41,10 @@ class ToolkitConfig(BaseModel):
 
     # knowledge / memory embeddings ----------------------------------------
     kb_dsn: str | None = None  # Postgres+pgvector DSN → durable KB; None → in-process
-    # auto | deterministic | ollama | fastembed | openai. "auto" prefers a real local
-    # embedder (fastembed, else a reachable Ollama) and falls back to deterministic.
-    embedder: str = "deterministic"
+    # auto | deterministic | ollama | fastembed | openai. "auto" (the default) prefers
+    # a real local embedder (fastembed, else a reachable Ollama) and falls back to the
+    # offline deterministic embedder, so the default path stays keyless and offline.
+    embedder: str = "auto"
     embedder_model: str | None = None
     embedder_dim: int | None = None
     ollama_base_url: str | None = None
@@ -139,7 +140,7 @@ class ToolkitConfig(BaseModel):
             sql_dsn=get_secret("HIMMY_SQL_DSN"),
             sql_read_only=_env_bool(env.get("HIMMY_SQL_READONLY"), default=True),
             kb_dsn=get_secret("HIMMY_KB_DSN"),
-            embedder=env.get("HIMMY_EMBEDDER", "deterministic"),
+            embedder=env.get("HIMMY_EMBEDDER", "auto"),
             embedder_model=env.get("HIMMY_EMBEDDER_MODEL"),
             embedder_dim=(
                 int(env["HIMMY_EMBEDDER_DIM"])

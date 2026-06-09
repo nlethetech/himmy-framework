@@ -29,6 +29,7 @@ class MemoryContextAdapter(ContextAdapter):
         similarity_threshold: float | None = None,
         tiers: tuple[str, ...] | None = None,
         active_only: bool = False,
+        max_hops: int | None = None,
     ) -> None:
         """Wrap a :class:`MemoryService`; ``top_k`` caps how many memories inject.
 
@@ -42,6 +43,12 @@ class MemoryContextAdapter(ContextAdapter):
         ``("core", "recall")`` injects always-on core facts plus thresholded recall
         facts but leaves ``archival`` for an explicit ``recall`` tool call; ``None``
         (the default) injects from every tier. ``active_only`` drops invalidated facts.
+
+        ``max_hops`` (default ``None`` = off) opts into *relational* injection: after
+        the semantic hits, each hit's graph neighbourhood is walked up to ``max_hops``
+        hops (honouring ``active_only`` and the recall subject) and the related
+        memories are injected as a separate, deduped ``related_memories`` section. With
+        ``None`` the rendered output is byte-for-byte the historical behaviour.
         """
         self._memory = memory
         self._top_k = top_k
@@ -49,6 +56,7 @@ class MemoryContextAdapter(ContextAdapter):
         self._similarity_threshold = similarity_threshold
         self._tiers = tiers
         self._active_only = active_only
+        self._max_hops = max_hops
 
     async def fetch(self, key: str, scope: dict[str, Any]) -> ContextField | None:
         """Recall memories for the scope's subject and render them as a field.
@@ -84,12 +92,49 @@ class MemoryContextAdapter(ContextAdapter):
                 for h in hits
             ],
         }
+        if self._max_hops is not None:
+            related = await self._gather_related(subject_id, hits)
+            if related:
+                value["related_memories"] = [
+                    {"text": r.text, "tier": r.tier} for r in related
+                ]
+                related_text = "\n".join(f"- {r.text}" for r in related)
+                value["rendered_text"] = (
+                    f"{rendered}\nRelated memories:\n{related_text}"
+                )
         return ContextField(
             key=key,
             value=value,
             source="memory",
             confidence=hits[0].similarity,
         )
+
+    async def _gather_related(self, subject_id: str, hits: list[Any]) -> list[Any]:
+        """Walk each hit's graph neighbourhood and return deduped related memories.
+
+        Deduped against the semantic hits and each other; the seed hits themselves are
+        excluded (they already render in the main section). Returns a list of
+        :class:`~himmy.services.memory.store.MemoryRecord`. Only called when
+        ``max_hops`` is set, so the ``None`` path injects no related section at all.
+        """
+        max_hops = self._max_hops
+        if max_hops is None:  # pragma: no cover - guarded by caller
+            return []
+        seen = {h.record.memory_id for h in hits}
+        related: list[Any] = []
+        for hit in hits:
+            graph = await self._memory.traverse_graph(
+                hit.record.memory_id,
+                max_depth=max_hops,
+                active_only=self._active_only,
+                subject_id=subject_id,
+            )
+            for memory_id, record in graph.nodes.items():
+                if memory_id in seen:
+                    continue
+                seen.add(memory_id)
+                related.append(record)
+        return related
 
     async def _gather(self, subject_id: str, query: str) -> list[Any]:
         """Collect the hits to inject, honoring tier semantics (core always-on)."""

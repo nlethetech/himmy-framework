@@ -19,7 +19,15 @@ from himmy.services.inference.service import InferenceService
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.client_manager import ClientManager
 
-PROVIDERS = ("stub", "claude-cli", "ollama", "pydantic-ai", "openrouter")
+PROVIDERS = (
+    "stub",
+    "claude-cli",
+    "ollama",
+    "pydantic-ai",
+    "openrouter",
+    "anthropic",
+    "openai",
+)
 
 #: OpenRouter is an OpenAI-compatible aggregator; route through the pydantic-ai path.
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -71,6 +79,32 @@ def build_manager_for(
         if model:
             return PydanticAIClientManager({"default": model}, default_model=model)
         return PydanticAIClientManager()
+
+    if provider == "anthropic":
+        try:
+            from himmy.services.inference.anthropic_manager import (
+                DEFAULT_ANTHROPIC_MODEL,
+                AnthropicClientManager,
+            )
+        except Exception as exc:  # pragma: no cover - optional extra missing
+            raise ProviderError(
+                "provider 'anthropic' needs the 'anthropic' extra: "
+                "pip install 'himmy[anthropic]'"
+            ) from exc
+        return AnthropicClientManager(model=model or DEFAULT_ANTHROPIC_MODEL)
+
+    if provider == "openai":
+        try:
+            from himmy.services.inference.openai_manager import (
+                DEFAULT_OPENAI_MODEL,
+                OpenAIClientManager,
+            )
+        except Exception as exc:  # pragma: no cover - optional extra missing
+            raise ProviderError(
+                "provider 'openai' needs the 'openai' extra: "
+                "pip install 'himmy[openai]'"
+            ) from exc
+        return OpenAIClientManager(model=model or DEFAULT_OPENAI_MODEL)
 
     if provider == "openrouter":
         import os

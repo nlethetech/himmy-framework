@@ -7,6 +7,7 @@ the gateway are optional extras behind lazy imports.
 
 from __future__ import annotations
 
+from himmy.services.inference.anthropic_manager import AnthropicClientManager
 from himmy.services.inference.cache import (
     InferenceCache,
     InMemoryTTLCache,
@@ -45,6 +46,7 @@ from himmy.services.inference.models import (
     WorkflowState,
     synthesize_from_schema,
 )
+from himmy.services.inference.openai_manager import OpenAIClientManager
 from himmy.services.inference.pydantic_ai_manager import (
     PydanticAIClientManager,
 )
@@ -85,6 +87,8 @@ __all__ = [
     "OllamaClientManager",
     "ClaudeCliClientManager",
     "HimalayaGptClientManager",
+    "AnthropicClientManager",
+    "OpenAIClientManager",
     "synthesize_from_schema",
     "ModelPrice",
     "StreamDelta",

@@ -55,7 +55,7 @@ def test_factory_unknown_raises() -> None:
 
 
 def test_default_dims() -> None:
-    assert default_dim_for("ollama") == 768
+    assert default_dim_for("ollama") == 4096  # qwen3-embedding's native dim
     assert default_dim_for("fastembed") == 384
     assert default_dim_for("deterministic") == 64
 
@@ -79,7 +79,7 @@ def test_config_build_embedder_and_dim() -> None:
 
     emb, dim = ToolkitConfig(embedder="ollama").build_embedder_and_dim()
     assert isinstance(emb, OllamaEmbedder)
-    assert dim == 768
+    assert dim == 4096
     emb2, dim2 = ToolkitConfig(
         embedder="deterministic", embedder_dim=32
     ).build_embedder_and_dim()
@@ -107,13 +107,32 @@ def test_auto_prefers_fastembed_when_available(monkeypatch: pytest.MonkeyPatch) 
 def test_auto_prefers_ollama_when_reachable_and_no_fastembed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No fastembed but a reachable local Ollama -> "auto" picks the Ollama backend."""
+    """No fastembed but a reachable Ollama WITH the embed model pulled -> "auto" = ollama."""
     monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
     monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(
+        local_embedders, "ollama_embed_model_available", lambda *a, **k: True
+    )
     assert resolve_auto_backend() == "ollama"
     emb = build_embedder("auto")
     assert isinstance(emb, OllamaEmbedder)
-    assert emb.dim == 768
+    assert emb.dim == 4096  # qwen3-embedding's native dim
+
+
+def test_auto_skips_ollama_when_embed_model_not_pulled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reachable Ollama with NO embed model pulled -> "auto" degrades to deterministic.
+
+    This is the robustness fix: auto-selecting a reachable-but-embed-less Ollama would
+    404 at embed time, so the embed-model gate sends "auto" to the offline fallback.
+    """
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(
+        local_embedders, "ollama_embed_model_available", lambda *a, **k: False
+    )
+    assert resolve_auto_backend() == "deterministic"
 
 
 def test_auto_falls_back_to_deterministic_when_nothing_available(
@@ -148,9 +167,12 @@ def test_config_auto_resolves_embedder_and_matching_dim(
 
     monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
     monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(
+        local_embedders, "ollama_embed_model_available", lambda *a, **k: True
+    )
     emb, dim = ToolkitConfig(embedder="auto").build_embedder_and_dim()
     assert isinstance(emb, OllamaEmbedder)
-    assert dim == 768  # the dim matches the resolved backend, not the "auto" alias
+    assert dim == 4096  # the dim matches the resolved backend, not the "auto" alias
 
     monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: False)
     emb2, dim2 = ToolkitConfig(embedder="auto").build_embedder_and_dim()

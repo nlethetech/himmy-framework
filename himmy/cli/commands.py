@@ -1050,6 +1050,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for key in report.keys:
         print(f"  [{'ok ' if key.present else '-- '}] {key.name}")
 
+    print(f"\nembedders (auto cascade, selected: {report.embedder_selected}):")
+    for emb in report.embedder_statuses:
+        flag = "ok " if emb.available else "-- "
+        suffix = " (selected)" if emb.name == report.embedder_selected else ""
+        if not suffix and emb.reason:
+            suffix = f" ({emb.reason})"
+        print(f"  [{flag}] {emb.name}{suffix}")
+
     print(
         f"\nguardrails (agent.yaml `guardrails: [...]`): {', '.join(report.guardrails)}"
     )

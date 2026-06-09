@@ -59,6 +59,13 @@ class KeyStatus:
 
 
 @dataclass
+class EmbedderStatus:
+    name: str  # backend name: fastembed | ollama | deterministic
+    available: bool
+    reason: str | None = None
+
+
+@dataclass
 class NextStep:
     kind: str  # "install_model" | "scaffold" | "run"
     message: str
@@ -76,6 +83,8 @@ class DoctorReport:
     has_real_model: bool = False
     has_agent: bool = False
     next_step: NextStep | None = None
+    embedder_selected: str = "deterministic"
+    embedder_statuses: list[EmbedderStatus] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly dict (nested dataclasses flattened)."""
@@ -89,6 +98,60 @@ def _can_import(module: str) -> bool:
     except Exception:
         return False
     return True
+
+
+#: Default base URL for the local Ollama embedder reachability probe (display only).
+_OLLAMA_PROBE_URL = "http://localhost:11434"
+
+
+def _collect_embedder_statuses() -> tuple[str, list[EmbedderStatus]]:
+    """Probe the auto-embedder cascade (fastembed → ollama → deterministic).
+
+    Returns the backend ``"auto"`` would resolve to right now plus a status per
+    candidate, in cascade order. The probes are import-/connection-only — they never
+    construct a model or trigger a download (``fastembed`` is checked with
+    :func:`importlib.util.find_spec`, ``ollama`` with a fast fail-closed localhost
+    probe), so ``doctor`` stays cheap and offline.
+    """
+    from himmy.services.knowledge.local_embedders import (
+        default_ollama_embed_model,
+        fastembed_available,
+        ollama_embed_model_available,
+        ollama_reachable,
+        resolve_auto_backend,
+    )
+
+    selected = resolve_auto_backend()
+    fast_ok = fastembed_available()
+    ollama_up = ollama_reachable(_OLLAMA_PROBE_URL)
+    embed_model = default_ollama_embed_model()
+    # "auto" picks Ollama only when the embed model is actually pulled, so the doctor
+    # row reflects embed-readiness (and tells the user how to fix a half-ready server).
+    ollama_ok = ollama_up and ollama_embed_model_available(base_url=_OLLAMA_PROBE_URL)
+    if ollama_ok:
+        ollama_reason: str | None = None
+    elif not ollama_up:
+        ollama_reason = f"{_OLLAMA_PROBE_URL} not reachable"
+    else:
+        ollama_reason = (
+            f"embed model {embed_model!r} not pulled (ollama pull {embed_model})"
+        )
+    statuses = [
+        EmbedderStatus(
+            name="fastembed",
+            available=fast_ok,
+            reason=(
+                None if fast_ok else "not installed (pip install 'himmy[embeddings]')"
+            ),
+        ),
+        EmbedderStatus(
+            name="ollama",
+            available=ollama_ok,
+            reason=ollama_reason,
+        ),
+        EmbedderStatus(name="deterministic", available=True, reason="fallback"),
+    ]
+    return selected, statuses
 
 
 def collect_doctor_report() -> DoctorReport:
@@ -115,6 +178,8 @@ def collect_doctor_report() -> DoctorReport:
         present = bool(os.environ.get(key))
         have_key = have_key or present
         keys.append(KeyStatus(name=key, present=present))
+
+    embedder_selected, embedder_statuses = _collect_embedder_statuses()
 
     cfg = find_project_config()
     has_real_model = have_local_provider or have_key
@@ -151,6 +216,8 @@ def collect_doctor_report() -> DoctorReport:
         has_real_model=has_real_model,
         has_agent=has_agent,
         next_step=next_step,
+        embedder_selected=embedder_selected,
+        embedder_statuses=embedder_statuses,
     )
 
 
@@ -159,6 +226,7 @@ __all__ = [
     "ExtraStatus",
     "ProviderStatus",
     "KeyStatus",
+    "EmbedderStatus",
     "NextStep",
     "collect_doctor_report",
 ]

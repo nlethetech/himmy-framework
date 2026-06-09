@@ -25,7 +25,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable, Iterable
 
     from himmy.entities.registry import EntityRegistry
-    from himmy.services.storage.encryption import FieldEncryptor
+    from himmy.services.storage.encryption import FieldEncryptor, KekProvider
 
 #: EntityRecord kind for an erasure tombstone (the immutable proof of erasure).
 ERASURE_KIND = "erasure_tombstone"
@@ -46,10 +46,29 @@ class SubjectKeyVault:
         return key
 
     def encryptor_for(self, subject_id: str) -> FieldEncryptor:
-        """A :class:`FieldEncryptor` bound to the subject's key."""
+        """A :class:`FieldEncryptor` bound to the subject's key (local KEK provider)."""
         from himmy.services.storage.encryption import FieldEncryptor
 
         return FieldEncryptor(self.key_for(subject_id))
+
+    def rotate_subject_key(
+        self, subject_id: str, new_provider: KekProvider, tokens: Iterable[str]
+    ) -> list[str]:
+        """Re-wrap a subject's ciphertext DEKs under ``new_provider`` (no plaintext touch).
+
+        The subject's per-subject key currently wraps each token's DEK (the local KEK).
+        This unwraps each token's DEK with that subject key and re-wraps it under
+        ``new_provider`` (e.g. a cloud KMS), returning the rotated tokens in order. The
+        protected plaintext is never decrypted — only the ``wrapped_dek`` and version
+        change — so the audit/ciphertext is untouched and crypto-shred semantics survive.
+
+        The subject must still hold a key (i.e. not be erased); rotating onto a cloud KEK
+        moves custody of the wrapping key without re-encrypting any data.
+        """
+        if not self.has(subject_id):
+            raise KeyError(f"subject {subject_id!r} has no key (erased?)")
+        enc = self.encryptor_for(subject_id)
+        return [enc.rotate_kek(token, new_provider) for token in tokens]
 
     def has(self, subject_id: str) -> bool:
         """Whether the subject still has a key (i.e. is not yet erased)."""

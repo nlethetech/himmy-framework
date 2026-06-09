@@ -18,7 +18,7 @@ import asyncio
 import random
 import time
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -49,6 +49,14 @@ class StreamDelta(BaseModel):
     Emitted by :meth:`InferenceService.run_stream`. ``delta`` is the incremental
     text since the previous chunk; ``done`` marks the final chunk, which also
     carries the fully-materialized :class:`InferenceResponse` in ``response``.
+
+    ``event_type`` / ``event_payload`` are OPTIONAL structured-event fields used by
+    the multi-turn streaming loop (``SingleAgentRuntime.stream_agent_loop``) to
+    interleave non-text events — ``"tool_call"``, ``"tool_result"`` and
+    ``"turn_end"`` — between text deltas across the tool loop. A plain text delta
+    leaves both ``None`` (so ``event_type is None`` reliably identifies text), and
+    callers that only read ``delta`` / ``done`` / ``response`` are unaffected: the
+    additions are backward-compatible.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -58,6 +66,12 @@ class StreamDelta(BaseModel):
     index: int = 0
     done: bool = False
     response: InferenceResponse | None = None
+    #: A structured-event tag (``"tool_call"`` / ``"tool_result"`` / ``"turn_end"``)
+    #: for non-text deltas; ``None`` for ordinary text deltas (the default path).
+    event_type: str | None = None
+    #: The payload for a structured event (e.g. the tool name + args / result);
+    #: ``None`` for ordinary text deltas.
+    event_payload: dict[str, Any] | None = None
 
 
 # Exception types (by name) the providers may raise that map to known codes. We

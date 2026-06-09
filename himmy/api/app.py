@@ -77,6 +77,16 @@ def _build_lifespan(
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Durable-defaults: mark this process as a server context so any agent wired by
+        # the shared spec-builder (himmy.runtime.from_spec) inside the app picks the
+        # durable store instead of the one-shot in-memory one. Cleared on shutdown so a
+        # later in-process CLI/test run reverts to the in-memory default.
+        from himmy.services.storage.factory import (
+            reset_server_context,
+            set_server_context,
+        )
+
+        server_ctx_token = set_server_context(True)
         # Startup: sweep runs left non-terminal by a previous process so they
         # reach a terminal state instead of hanging in QUEUED/RUNNING forever.
         run_app = getattr(container, "run_app", None)
@@ -110,6 +120,12 @@ def _build_lifespan(
                     logger.warning("run drain failed on shutdown", exc_info=True)
             try:
                 await container.aclose()
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
+            # Clear the server-context flag so a subsequent in-process CLI/test run
+            # reverts to the in-memory one-shot default.
+            try:
+                reset_server_context(server_ctx_token)
             except Exception:  # pragma: no cover - shutdown best-effort
                 pass
 

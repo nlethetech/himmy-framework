@@ -140,6 +140,7 @@ def build_runtime_for_spec(
     """
     from himmy import build_runtime
     from himmy.cli.provider import build_inference_for
+    from himmy.services.storage.factory import StoreFactory
     from himmy.services.tools.registry import ToolRegistry
 
     provider = provider or spec.provider
@@ -147,7 +148,14 @@ def build_runtime_for_spec(
     if inference is None:
         inference = build_inference_for(provider, model)
 
-    overrides: dict[str, Any] = {"inference": inference}
+    # Durable-defaults: pick the storage backend from the current run context. In a
+    # server entrypoint (the FastAPI app set ``_SERVER_CONTEXT``) this is the durable
+    # file-backed SQLite store so an agent's runs/lineage survive restarts; on the
+    # one-shot CLI path it is the in-memory store (zero setup). The same instance is
+    # reused for the runtime and any memory ContextService below so they share state.
+    storage: Any = StoreFactory.for_context()
+
+    overrides: dict[str, Any] = {"inference": inference, "storage": storage}
     if on_event is not None:
         overrides["on_event"] = on_event
     if capture_io:
@@ -175,7 +183,6 @@ def build_runtime_for_spec(
     overrides["output_guardrail"] = output_guardrail
 
     if spec.memory:
-        from himmy import build_storage
         from himmy.services.context.service import ContextService
         from himmy.services.memory import (
             InMemoryMemoryStore,
@@ -202,8 +209,10 @@ def build_runtime_for_spec(
             subject_id=tk.memory_subject,
             similarity_threshold=tk.memory_min_similarity,
         )
+        # Reuse the context-selected ``storage`` (durable on a server, in-memory on the
+        # CLI) so the runtime and the memory ContextService share one backend.
         overrides["context_service"] = ContextService(
-            storage_service=build_storage(), adapters=[adapter]
+            storage_service=storage, adapters=[adapter]
         )
 
     registry = None

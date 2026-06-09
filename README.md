@@ -297,6 +297,14 @@ Import from `himmy.services.memory` (only `MemoryService` is re-exported at top-
   `promote(memory_id, tier)` moves a fact between them.
 - **Invalidate-not-delete.** `invalidate(...)` stamps `valid_to`/`superseded_by` rather than
   removing rows, so history is preserved.
+- **Relational / graph memory (multi-hop).** Facts can be linked with typed `MemoryLink`
+  relations (`relates_to`, `caused_by`, `contradicts`, `about_entity`, `supersedes`,
+  `part_of`, `depends_on`). `MemoryService.traverse_graph(seed_id, max_depth=N)` runs a
+  deterministic bounded BFS that honours bi-temporal validity (`as_of`), tier, and subject
+  scoping and returns a `MemoryGraph` (with a `truncated` flag). Links persist in **both**
+  `InMemoryMemoryStore` and `SqliteMemoryStore` (additive, idempotent migration). `recall`
+  and `MemoryContextAdapter` accept an optional `max_hops` to auto-expand hits with related
+  memories — **off by default**, so single-hop behaviour is byte-for-byte unchanged.
 
 **Offline default:** `MemoryService()` uses an **in-memory** store (volatile, lost on
 restart) and the `DeterministicEmbedder` (lexical-overlap cosine, not real semantics).
@@ -307,7 +315,14 @@ off-topic query is opt-in (set `similarity_threshold` or service `min_similarity
 **Opt-in:**
 - **Durability:** pass `SqliteMemoryStore(path)`. (It additively migrates legacy 6-column
   DBs up to the bi-temporal 7-extra-column schema, idempotently.)
-- **Real semantic recall:** configure a real embedder (`fastembed` / Ollama / OpenAI).
+- **Real semantic recall:** the embedder now defaults to **`"auto"`** —
+  `fastembed` (local ONNX, the `[embeddings]` extra) → a local **Ollama** *with the
+  configured embed model pulled* (`HIMMY_OLLAMA_EMBED_MODEL`, default `qwen3-embedding`,
+  4096-d) → the offline `DeterministicEmbedder`. The Ollama leg is gated on the embed model
+  being *present* (not just the server being reachable), so a half-ready Ollama degrades to
+  deterministic instead of 404-ing at embed time. Resolution is network-free unless an
+  Ollama is actually up. `himmy doctor` shows the active backend (and how to enable a better
+  one); override with `HIMMY_EMBEDDER=deterministic|ollama|fastembed|openai|auto`.
 - **Spine projection + audit:** with the **default** constructor (`registry=None`,
   `event_sink=None`) there are **no** spine records and **no** events. Wire a registry +
   event sink to project facts to `EntityRecord(kind='memory_fact')` and emit

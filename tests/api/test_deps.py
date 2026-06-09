@@ -34,11 +34,23 @@ def test_offline_privacy_audit_wiring_is_transparent() -> None:
     assert container.privacy_audit._provider_is_real() is False  # noqa: SLF001
 
 
-def test_build_default_async_falls_back_to_memory_without_dsn(monkeypatch) -> None:
-    """Without HIMMY_DATABASE_URL, the async builder uses the in-memory store."""
+def test_build_default_async_is_durable_sqlite_without_dsn(
+    monkeypatch, tmp_path
+) -> None:
+    """Without HIMMY_DATABASE_URL, the async (server) builder defaults to durable SQLite.
+
+    The durable-default policy (item #3): server/multi-worker entrypoints persist by
+    default — SQLite at ``HIMMY_STORE_PATH`` when no Postgres DSN is set — so background
+    runs and idempotency survive restarts. The sync ``build_default`` still wires the
+    in-memory store for zero-config offline use (covered above). ``HIMMY_STORE_PATH`` is
+    steered into ``tmp_path`` so the test never writes a stray ``.himmy/storage.db``.
+    """
+    from himmy.services.storage.sqlite import SqliteStorageService
+
     monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.setenv("HIMMY_STORE_PATH", str(tmp_path / "storage.db"))
     container = run_async(ApiContainer.build_default_async())
-    assert isinstance(container.storage, StorageService)
+    assert isinstance(container.storage, SqliteStorageService)
 
 
 def test_build_storage_selects_postgres_when_dsn_set(monkeypatch) -> None:

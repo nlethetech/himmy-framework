@@ -817,6 +817,352 @@ class SingleAgentRuntime:
                     self._register_thread_version(thread)
                 yield delta
 
+    async def stream_agent_loop(
+        self,
+        persona: Persona,
+        task: Task,
+        thread: ChatThread | None = None,
+        *,
+        max_turns: int = 6,
+        cost_budget: float | None = None,
+        llm_config: LLMConfig | None = None,
+        hitl: bool = False,
+        stop_on_no_progress: bool = False,
+        synthesize_empty: bool = True,
+        route_tools: bool = False,
+        route_max_tools: int = 4,
+    ) -> AsyncIterator[StreamDelta]:
+        """Stream tokens THROUGH the whole multi-turn tool loop (opt-in).
+
+        :meth:`stream_task` only streams a single turn, so a tool-using run surfaces
+        nothing until the final answer. This generator mirrors
+        :meth:`run_agent_loop`'s EXACT bounding — the same stop-condition /
+        no-progress / cost-budget / HITL logic — but interleaves the work as
+        :class:`~himmy.services.inference.service.StreamDelta` chunks: text deltas
+        (``event_type=None``), ``"tool_call"`` and ``"tool_result"`` events (one per
+        tool exchange, carrying the tool name + args / result), and a ``"turn_end"``
+        marker between turns. The terminal ``done=True`` delta carries the
+        materialized :class:`AgentLoopResult` in ``event_payload['result']`` so a
+        caller can read the typed outcome exactly as :meth:`run_agent_loop` returns.
+
+        The first turn streams its tokens via :meth:`stream_task` (so a UI sees the
+        provider's real incremental output); each continuation turn buffers then
+        re-chunks at 24 chars for deterministic offline replay. ``run_agent_loop``
+        (non-streaming) is unchanged — this is a parallel, additive surface that
+        reuses the same checkpoint / pending-approval helpers, so the bounding,
+        spend accrual, and ``AGENT_TURN_COMPLETED`` emission are identical.
+
+        With ``hitl=True`` (requires a ``checkpoint_store``) the loop PAUSES exactly
+        as the non-streaming loop does: it persists a checkpoint, emits
+        ``APPROVAL_REQUIRED`` and yields a final ``done`` delta whose
+        ``AgentLoopResult`` has ``stopped_reason='awaiting_approval'`` and a
+        ``checkpoint_id`` for :meth:`resume_agent_loop`.
+        """
+        from himmy.services.inference.service import StreamDelta
+
+        if max_turns < 1:
+            raise HimmyError("stream_agent_loop requires max_turns >= 1.")
+        if hitl and self._checkpoint_store is None:
+            raise HimmyError("hitl=True requires a checkpoint_store on the runtime.")
+
+        if route_tools:
+            task = await self._route_tools(task, route_max_tools)
+
+        from himmy.agents.base_agent.thread import ChatThread as _ChatThread
+
+        # Own the thread reference up front so we keep operating on the SAME thread
+        # stream_task mutates (it creates one internally when None — we pre-create it
+        # here instead so the continuation turns and tool replay land on it).
+        if thread is None:
+            thread = _ChatThread(agent_id=persona.agent_id)
+
+        ctx = dict(task.context or {})
+        # WS4.6: publish the subject for the WHOLE streamed loop (governed only; a
+        # no-op when no consent_decider is wired) so the per-turn continuation
+        # messages, turn-completed events, and any synthesis turn — all emitted
+        # OUTSIDE the first turn's own scope — resolve to the subject. The inner
+        # stream_task / run_task_detailed scopes nest cleanly inside this one.
+        with self._subject_scope(ctx):
+            # --- first turn: stream tokens via stream_task, then materialize it ---
+            first_response: InferenceResponse | None = None
+            async for delta in self.stream_task(
+                persona, task, thread, llm_config=llm_config
+            ):
+                if delta.done:
+                    # Swallow the single-turn ``done`` delta: this loop owns the one
+                    # terminal ``done`` (carrying the AgentLoopResult). Capture the
+                    # materialized response so we can reconstruct the turn result.
+                    first_response = delta.response
+                    continue
+                yield delta
+
+            assert first_response is not None  # run_stream always yields a done delta
+            trace_id = f"{thread.thread_id}:{task.task_id}"
+
+            first = self._result_from_response(first_response, trace_id=trace_id)
+            first.thread = thread  # the real thread stream_task ran on
+            # stream_task does NOT replay TOOL exchanges; replay them now (so a
+            # continuation turn sees the tool results) and surface them as events.
+            await self._append_tool_messages(
+                thread,
+                first_response,
+                request_id=first.request_id or first_response.request_id,
+                trace_id=trace_id,
+                agent_id=persona.agent_id,
+            )
+            for tool_delta in self._tool_deltas(first):
+                yield tool_delta
+            await self._emit_turn_completed(trace_id, thread, persona, 1, first)
+            yield StreamDelta(
+                request_id=first.request_id or first_response.request_id,
+                event_type="turn_end",
+                event_payload={"turn": 1, "tool_calls": len(first.tool_calls)},
+            )
+
+            # --- continuation turns: mirror _drive_loop, streaming each turn ---
+            result: AgentLoopResult | None = None
+            async for item in self._stream_drive_loop(
+                persona,
+                task,
+                thread,
+                ctx,
+                trace_id,
+                turns=[first],
+                max_turns=max_turns,
+                cost_budget=cost_budget,
+                llm_config=llm_config,
+                hitl=hitl,
+                stop_on_no_progress=stop_on_no_progress,
+            ):
+                if isinstance(item, AgentLoopResult):
+                    result = item
+                    break
+                yield item
+
+            assert result is not None
+            if synthesize_empty:
+                # Reuse the exact non-streaming synthesis rescue so an empty
+                # tool-using answer is converted to a text answer identically.
+                result = await self._maybe_synthesize(
+                    result, persona, trace_id, llm_config
+                )
+            yield StreamDelta(
+                request_id=first.request_id or first_response.request_id,
+                done=True,
+                event_type="done",
+                event_payload={"result": result},
+            )
+
+    async def _stream_drive_loop(
+        self,
+        persona: Persona,
+        task: Task,
+        thread: ChatThread,
+        ctx: dict[str, Any],
+        trace_id: str,
+        *,
+        turns: list[RunResult],
+        max_turns: int,
+        cost_budget: float | None,
+        llm_config: LLMConfig | None,
+        hitl: bool,
+        stop_on_no_progress: bool,
+    ) -> AsyncIterator[StreamDelta | AgentLoopResult]:
+        """Drive streamed continuation turns until a stop condition.
+
+        Mirrors :meth:`_drive_loop`'s EXACT stop-condition / no-progress /
+        cost-budget / HITL logic (run from a continuation perspective, so the
+        ``turns_offset`` / ``cost_offset`` are zero), but per continuation turn it
+        runs the turn and yields its text + ``tool_call`` / ``tool_result`` /
+        ``turn_end`` :class:`StreamDelta`s. The final yielded item is the terminal
+        :class:`AgentLoopResult` (so the caller stops iterating and owns the single
+        ``done`` delta). The checkpoint / pending-approval helpers are shared with
+        the non-streaming loop — nothing is duplicated.
+        """
+        from himmy.services.inference.service import StreamDelta
+
+        while True:
+            last = turns[-1]
+            if not last.succeeded:
+                yield AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="error"
+                )
+                return
+            if hitl:
+                pending = self._pending_approvals(last)
+                if pending:
+                    checkpoint = self._save_checkpoint(
+                        persona,
+                        task,
+                        thread,
+                        ctx,
+                        llm_config,
+                        max_turns,
+                        cost_budget,
+                        len(turns),
+                        sum(t.cost for t in turns),
+                        pending,
+                    )
+                    await self._emit(
+                        RunEvent(
+                            event_type=EventType.APPROVAL_REQUIRED,
+                            trace_id=trace_id,
+                            thread_id=thread.thread_id,
+                            agent_id=persona.agent_id,
+                            payload={
+                                "checkpoint_id": checkpoint.checkpoint_id,
+                                "tools": [p.tool_name for p in pending],
+                            },
+                        )
+                    )
+                    yield AgentLoopResult(
+                        thread=thread,
+                        turns=turns,
+                        stopped_reason="awaiting_approval",
+                        checkpoint_id=checkpoint.checkpoint_id,
+                    )
+                    return
+            if not last.tool_calls:
+                yield AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="final"
+                )
+                return
+            if last.round_trip_complete:
+                yield AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="final"
+                )
+                return
+            if final_answer_text(last) is not None:
+                yield AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="final_answer"
+                )
+                return
+            if stop_on_no_progress and is_no_progress(turns):
+                yield AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="no_progress"
+                )
+                return
+            if len(turns) >= max_turns:
+                yield AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="max_turns"
+                )
+                return
+            if cost_budget is not None and sum(t.cost for t in turns) >= cost_budget:
+                yield AgentLoopResult(
+                    thread=thread, turns=turns, stopped_reason="budget"
+                )
+                return
+            index = len(turns) + 1
+            await self._emit(
+                RunEvent(
+                    event_type=EventType.AGENT_TURN_STARTED,
+                    trace_id=trace_id,
+                    thread_id=thread.thread_id,
+                    agent_id=persona.agent_id,
+                    payload={"turn": index},
+                )
+            )
+            # Continuation turns buffer then re-chunk for deterministic offline
+            # replay (the stub streams in 24-char chunks; matching that keeps the
+            # reassembled text identical across turns).
+            result = await self._continue_turn(
+                persona, thread, ctx, trace_id, llm_config=llm_config
+            )
+            turns.append(result)
+            for text_delta in self._text_deltas(result):
+                yield text_delta
+            for tool_delta in self._tool_deltas(result):
+                yield tool_delta
+            await self._emit_turn_completed(trace_id, thread, persona, index, result)
+            yield StreamDelta(
+                request_id=result.request_id or "",
+                event_type="turn_end",
+                event_payload={"turn": index, "tool_calls": len(result.tool_calls)},
+            )
+
+    @staticmethod
+    def _result_from_response(
+        response: InferenceResponse, *, trace_id: str
+    ) -> RunResult:
+        """Reconstruct a :class:`RunResult` from a streamed first turn's response.
+
+        :meth:`stream_task` yields its terminal ``done`` delta carrying the
+        materialized :class:`InferenceResponse` but no typed result; this rebuilds
+        the same :class:`RunResult` shape :meth:`_continue_turn` produces so the
+        streamed first turn drives the loop identically to a non-streamed one.
+        """
+        assistant_text = response.output_text
+        if assistant_text is None and response.output_structured is not None:
+            assistant_text = json.dumps(response.output_structured, default=str)
+        error_message = response.error.message if response.error else None
+        error_code = response.error.code.value if response.error else None
+        return RunResult(
+            thread=cast("ChatThread", None),  # not used by the loop's stop logic
+            status=response.status.value,
+            output_text=assistant_text,
+            output_structured=response.output_structured,
+            tool_calls=list(response.tool_calls),
+            tool_returns=list(response.tool_returns),
+            error=error_message,
+            error_code=error_code,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            cost=response.cost,
+            latency_ms=response.latency_ms,
+            model_path=response.model_path,
+            provider_name=response.provider_name,
+            request_id=response.request_id,
+            trace_id=trace_id,
+            workflow=response.workflow,
+            workflow_complete=(
+                response.workflow.is_complete if response.workflow is not None else None
+            ),
+            round_trip_complete=bool(response.metadata.get("round_trip_complete")),
+        )
+
+    @staticmethod
+    def _text_deltas(result: RunResult) -> Iterator[StreamDelta]:
+        """Re-chunk a continuation turn's text at 24 chars (stub-faithful)."""
+        from himmy.services.inference.service import StreamDelta
+
+        text = result.output_text or ""
+        request_id = result.request_id or ""
+        index = 0
+        for start in range(0, len(text), 24):
+            yield StreamDelta(
+                request_id=request_id, delta=text[start : start + 24], index=index
+            )
+            index += 1
+
+    @staticmethod
+    def _tool_deltas(result: RunResult) -> Iterator[StreamDelta]:
+        """Yield a ``tool_call`` + paired ``tool_result`` delta per tool exchange."""
+        from himmy.services.inference.service import StreamDelta
+
+        returns_by_id = {r.tool_call_id: r for r in result.tool_returns}
+        request_id = result.request_id or ""
+        for call in result.tool_calls:
+            yield StreamDelta(
+                request_id=request_id,
+                event_type="tool_call",
+                event_payload={
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.tool_name,
+                    "tool_args": dict(call.args),
+                },
+            )
+            ret = returns_by_id.get(call.tool_call_id)
+            yield StreamDelta(
+                request_id=request_id,
+                event_type="tool_result",
+                event_payload={
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.tool_name,
+                    "outcome": ret.outcome if ret is not None else "unknown",
+                    "content": ret.content if ret is not None else None,
+                },
+            )
+
     async def resume_agent_loop(
         self,
         checkpoint_id: str,

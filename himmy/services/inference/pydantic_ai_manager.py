@@ -55,6 +55,22 @@ def _require_pydantic_ai() -> Any:
     return pydantic_ai
 
 
+def _openai_chat_model(model_name: str, provider: Any) -> Any:
+    """Build the OpenAI-compatible chat model, preferring the un-deprecated class.
+
+    pydantic-ai renamed ``OpenAIModel`` to ``OpenAIChatModel`` (the old name now emits a
+    ``DeprecationWarning`` on instantiation). Prefer ``OpenAIChatModel`` when the
+    installed version exposes it, and fall back to ``OpenAIModel`` so older pydantic-ai
+    still works — both take ``(model_name, provider=...)``.
+    """
+    from pydantic_ai.models import openai as openai_models  # type: ignore
+
+    model_cls = (
+        getattr(openai_models, "OpenAIChatModel", None) or openai_models.OpenAIModel
+    )
+    return model_cls(model_name, provider=provider)
+
+
 class PydanticAIClientManager:
     """pydantic-ai client manager (local-dev and gateway-delegate path).
 
@@ -100,7 +116,6 @@ class PydanticAIClientManager:
         if self._base_url:
             # Gateway / OpenAI-compatible: route through the configured base_url.
             try:
-                from pydantic_ai.models.openai import OpenAIModel  # type: ignore
                 from pydantic_ai.providers.openai import OpenAIProvider  # type: ignore
 
                 # model_string looks like 'openai:gpt-4o-mini'; take the suffix.
@@ -108,7 +123,7 @@ class PydanticAIClientManager:
                 provider = OpenAIProvider(
                     base_url=self._base_url, api_key=self._api_key
                 )
-                return OpenAIModel(model_name, provider=provider)
+                return _openai_chat_model(model_name, provider)
             except Exception:  # noqa: BLE001 - fall back to plain inference
                 pass
         return pydantic_ai.models.infer_model(model_string)  # type: ignore[attr-defined]

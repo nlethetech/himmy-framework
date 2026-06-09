@@ -8,6 +8,50 @@ providers, Postgres/pgvector, and observability.
 ## [Unreleased]
 
 ### Added
+- **Institutional-grade upgrade pass (7 workstreams).** Each landed in its own
+  file-ownership cluster, was adversarially verified, and ships with deterministic offline
+  tests; the offline-first invariant holds throughout.
+  - **Real relational / graph memory.** New `MemoryLink` (typed relations) +
+    `MemoryService.traverse_graph(seed_id, max_depth=…)` deterministic bounded BFS honouring
+    `as_of` / tier / subject scoping, returning a `MemoryGraph`. Links persist in both the
+    in-memory and SQLite stores (additive, idempotent migration). `recall` /
+    `MemoryContextAdapter` gain an optional `max_hops` (off by default — single-hop output is
+    byte-for-byte unchanged). The "graph memory" claim is now genuinely true.
+  - **Local semantic embedding by default, via Ollama.** The toolkit embedder now defaults
+    to `"auto"`: `fastembed` → a local **Ollama with the embed model actually pulled**
+    (`HIMMY_OLLAMA_EMBED_MODEL`, default `qwen3-embedding`, 4096-d; override dim with
+    `HIMMY_OLLAMA_EMBED_DIM`) → the offline `DeterministicEmbedder`. The Ollama leg is gated
+    on `ollama_embed_model_available()` (probes `/api/tags`) so a reachable-but-embed-less
+    server degrades to deterministic instead of 404-ing. `himmy doctor` reports the active
+    backend + how to enable a better one. New live integration tests
+    (`tests/integration/test_ollama_live.py`, `-m integration`) exercise real
+    `qwen3-embedding` semantic ranking, end-to-end knowledge + memory recall, and a live
+    `qwen2.5` LLM agent turn. The unit suite stays hermetic via an autouse fixture that pins
+    non-integration tests to the deterministic backend.
+  - **Durable storage by default for servers.** New `StoreFactory` + `SqliteStorageService`
+    (WAL, `asyncio.to_thread`). `himmy serve` / `himmy studio` / the BFF default to durable
+    SQLite at `HIMMY_STORE_PATH` (default `.himmy/storage.db`), or Postgres when
+    `HIMMY_DATABASE_URL` is a `postgres://` DSN; one-shot `himmy run` / `himmy chat` stay
+    zero-setup in-memory. `ApiContainer.build_default()` (sync) remains in-memory for offline
+    programmatic use.
+  - **Token streaming through the multi-turn tool loop.** New
+    `SingleAgentRuntime.stream_agent_loop(...)` async generator interleaves text deltas with
+    `tool_call` / `tool_result` / `turn_end` events across every turn; `StreamDelta` gains
+    optional `event_type` / `event_payload`. `run_agent_loop()` is unchanged.
+  - **Direct Anthropic + OpenAI client managers.** `AnthropicClientManager` /
+    `OpenAIClientManager` (lazy SDK imports via the new `[anthropic]` / `[openai]` extras)
+    implement the `ClientManager` never-raises contract directly (no pydantic-ai
+    indirection); `build_inference()` auto-prefers them when a matching key + SDK is present.
+    Fixed the pydantic-ai `OpenAIModel` → `OpenAIChatModel` deprecation (version-guarded).
+  - **Cloud KMS for field encryption.** Pluggable `KekProvider` abstraction
+    (`LocalKekProvider` default, no new dep) + `AwsKmsKekProvider` (the `[kms-aws]` extra)
+    + key rotation (`FieldEncryptor.rotate_kek`, `SubjectKeyVault.rotate_subject_key`) that
+    re-wraps DEKs without touching ciphertext; GCP/Azure are documented seams. The token
+    gains a key-version segment and **legacy version-less ciphertext still decrypts
+    transparently** (verified against a real pre-change token — no migration required).
+  - **Load / concurrency profiling harness** (`tests/load/`, `-m slow`, `make test-load`):
+    concurrent BFF run/lineage/list load, cProfile hot-path profiling, and an optional
+    pgvector latency bench (skipped without Postgres) — all deterministic and offline.
 - **Himmy Studio — a local web GUI (`himmy studio`).** A no-code front door served by
   the same FastAPI BFF (loopback-bound): **Chat** with an agent (live SSE token
   streaming, multi-turn, tool calls), an **Agent builder** that reads/validates/saves

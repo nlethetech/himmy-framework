@@ -21,13 +21,20 @@ from typing import TYPE_CHECKING, Any
 
 from himmy.core.events import EventType, RunEvent
 from himmy.services.knowledge.embedder import DeterministicEmbedder, EmbedderProtocol
+from himmy.services.memory.graph import (
+    DEFAULT_TRAVERSAL_DEPTH,
+    traverse_memory_graph,
+)
 from himmy.services.memory.store import (
     MEMORY_TIERS,
+    RELATES_TO,
     InMemoryMemoryStore,
+    MemoryGraph,
+    MemoryLink,
     MemoryRecord,
     MemoryStore,
 )
-from himmy.services.memory.temporal import filter_as_of
+from himmy.services.memory.temporal import filter_as_of, is_valid_at
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from himmy.core.events import EventSink
@@ -168,6 +175,7 @@ class MemoryService:
         as_of: str | None = None,
         tier: str | None = None,
         active_only: bool = False,
+        max_hops: int | None = None,
     ) -> list[MemoryHit]:
         """Return the ``top_k`` memories most similar to ``query`` for ``subject_id``.
 
@@ -187,6 +195,13 @@ class MemoryService:
         window contains that instant — bi-temporal point-in-time recall. ``active_only``
         drops invalidated facts; ``tier`` scopes to one Letta tier. The result is
         capped at ``top_k`` and ordered most-similar-first.
+
+        ``max_hops`` (default ``None`` = off, exactly the historical behaviour) opts
+        into *relational* recall: after ranking, each hit's graph neighbourhood is
+        walked up to ``max_hops`` hops (honouring the same ``as_of``/``active_only``/
+        ``tier``/``subject_id`` scoping) and the related memories are appended as extra
+        hits (similarity ``0.0``, deduped against the semantic hits and each other).
+        The semantic ``top_k`` hits always lead; related memories follow.
         """
         records = self._store.list(subject_id, active_only=active_only, tier=tier)
         if as_of is not None:
@@ -220,6 +235,15 @@ class MemoryService:
             hits = [h for h in scored if h.similarity > 0.0][:top_k]
         else:
             hits = [h for h in scored if h.similarity >= threshold][:top_k]
+        if max_hops is not None and max_hops > 0 and hits:
+            hits = self._expand_with_related(
+                hits,
+                max_hops=max_hops,
+                as_of=as_of,
+                active_only=active_only,
+                tier=tier,
+                subject_id=subject_id,
+            )
         self._emit(
             EventType.MEMORY_RECALLED,
             {
@@ -230,6 +254,140 @@ class MemoryService:
             },
         )
         return hits
+
+    def _expand_with_related(
+        self,
+        hits: list[MemoryHit],
+        *,
+        max_hops: int,
+        as_of: str | None,
+        active_only: bool,
+        tier: str | None,
+        subject_id: str,
+    ) -> list[MemoryHit]:
+        """Append each hit's related memories (graph-reachable) as similarity-0.0 hits.
+
+        Deduped against the semantic hits and each other; the semantic hits always
+        lead and keep their order. Used only when ``recall(max_hops=...)`` is set.
+        """
+        seen = {h.record.memory_id for h in hits}
+        expanded = list(hits)
+        for hit in hits:
+            graph = self._traverse(
+                hit.record.memory_id,
+                max_depth=max_hops,
+                as_of=as_of,
+                active_only=active_only,
+                tier=tier,
+                subject_id=subject_id,
+            )
+            for memory_id, record in graph.nodes.items():
+                if memory_id in seen:
+                    continue
+                seen.add(memory_id)
+                expanded.append(MemoryHit(record=record, similarity=0.0))
+        return expanded
+
+    # -- relational / graph memory ---------------------------------------------
+
+    def link(
+        self,
+        from_memory_id: str,
+        to_memory_id: str,
+        *,
+        relation: str = RELATES_TO,
+        metadata: dict[str, Any] | None = None,
+    ) -> MemoryLink:
+        """Draw a typed directed link from one memory to another and persist it.
+
+        ``relation`` is an open string; the canonical vocabulary lives in
+        :data:`himmy.services.memory.store.MEMORY_RELATIONS` (``relates_to``,
+        ``caused_by``, ``contradicts``, ``about_entity``, ``supersedes``, ``part_of``,
+        ``depends_on``). The link is stored alongside the memories so a later
+        :meth:`traverse_graph` (or ``recall(max_hops=...)``) can walk it. Persisting a
+        link is content-neutral, so unlike :meth:`remember` it draws no spine record
+        and emits no event (graph edges are read-side only).
+        """
+        link = MemoryLink(
+            from_memory_id=from_memory_id,
+            to_memory_id=to_memory_id,
+            relation=relation,
+            metadata=dict(metadata or {}),
+        )
+        return self._store.save_link(link)
+
+    async def traverse_graph(
+        self,
+        seed_memory_id: str,
+        *,
+        max_depth: int = DEFAULT_TRAVERSAL_DEPTH,
+        as_of: str | None = None,
+        active_only: bool = False,
+        tier: str | None = None,
+        subject_id: str | None = None,
+    ) -> MemoryGraph:
+        """Walk the typed memory graph from ``seed_memory_id`` and return the subgraph.
+
+        Breadth-first up to ``max_depth`` hops over the persisted :class:`MemoryLink`s
+        (both directions), honouring the same scoping recall uses: ``as_of`` skips
+        endpoints whose ``[valid_from, valid_to)`` window does not contain that instant
+        (bi-temporal point-in-time), ``active_only`` drops invalidated endpoints,
+        ``tier`` scopes to one Letta tier, and ``subject_id`` (optional) confines the
+        walk to one subject — an endpoint failing any filter is pruned (not surfaced
+        and not expanded). The returned :class:`MemoryGraph` carries the reached
+        records and traversed links; ``truncated`` is True when the depth budget cut
+        off an accepted, reachable, unexpanded neighbour.
+
+        ``async`` for API symmetry with :meth:`recall` (it does no awaiting itself).
+        """
+        return self._traverse(
+            seed_memory_id,
+            max_depth=max_depth,
+            as_of=as_of,
+            active_only=active_only,
+            tier=tier,
+            subject_id=subject_id,
+        )
+
+    def _traverse(
+        self,
+        seed_memory_id: str,
+        *,
+        max_depth: int,
+        as_of: str | None,
+        active_only: bool,
+        tier: str | None,
+        subject_id: str | None,
+    ) -> MemoryGraph:
+        """Shared sync traversal core for ``traverse_graph`` and ``recall`` expansion.
+
+        Builds the neighbour + endpoint-acceptance callables (the I/O policy) and
+        delegates the pure walk to :func:`traverse_memory_graph`.
+        """
+        store = self._store
+
+        def neighbors(memory_id: str) -> list[MemoryLink]:
+            # Combine both directions; the pure walker dedups edges by ``link_id``.
+            return [*store.links_from(memory_id), *store.links_to(memory_id)]
+
+        def accept(record: MemoryRecord) -> bool:
+            if subject_id is not None and record.subject_id != subject_id:
+                return False
+            if active_only and record.valid_to is not None:
+                return False
+            if tier is not None and record.tier != tier:
+                return False
+            if as_of is not None and not is_valid_at(record, as_of):
+                return False
+            return True
+
+        return traverse_memory_graph(
+            seed_memory_id,
+            neighbors=neighbors,
+            get=store.get,
+            accept=accept,
+            max_depth=max_depth,
+        )
 
     def forget(self, memory_id: str) -> bool:
         """Delete a memory by id (and drop its cached vector)."""
@@ -341,4 +499,10 @@ class MemoryService:
                 pass
 
 
-__all__ = ["MemoryService", "MemoryHit", "ALWAYS_INCLUDE"]
+__all__ = [
+    "ALWAYS_INCLUDE",
+    "MemoryGraph",
+    "MemoryHit",
+    "MemoryLink",
+    "MemoryService",
+]

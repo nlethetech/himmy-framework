@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -21,6 +22,99 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
 
 #: The Letta-style memory tiers, in promotion order (hot -> cold).
 MEMORY_TIERS: tuple[str, ...] = ("core", "recall", "archival")
+
+# -- typed relations between memories ---------------------------------------
+#: The canonical relation vocabulary for :class:`MemoryLink`. ``relation`` stays an
+#: open ``str`` (callers may coin their own), but these names are the recommended
+#: set so graph recall and downstream tooling can reason about edge semantics:
+#:
+#: * ``relates_to`` — a generic, untyped association (the safe default);
+#: * ``caused_by`` — the target fact is a cause of the source fact;
+#: * ``contradicts`` — the two facts disagree (drives invalidation review);
+#: * ``about_entity`` — the source fact is about the target entity/fact;
+#: * ``supersedes`` — the source fact replaces the (now-stale) target;
+#: * ``part_of`` — the source fact is a component of the target whole;
+#: * ``depends_on`` — the source fact is only true if the target is.
+RELATES_TO = "relates_to"
+CAUSED_BY = "caused_by"
+CONTRADICTS = "contradicts"
+ABOUT_ENTITY = "about_entity"
+SUPERSEDES = "supersedes"
+PART_OF = "part_of"
+DEPENDS_ON = "depends_on"
+
+#: The canonical relation names as a tuple (for validation/iteration helpers).
+MEMORY_RELATIONS: tuple[str, ...] = (
+    RELATES_TO,
+    CAUSED_BY,
+    CONTRADICTS,
+    ABOUT_ENTITY,
+    SUPERSEDES,
+    PART_OF,
+    DEPENDS_ON,
+)
+
+
+class MemoryLink(BaseModel):
+    """A typed directed relationship between two :class:`MemoryRecord`s.
+
+    Mirrors :class:`himmy.entities.records.EntityLink` but lives entirely inside the
+    memory module: memory links are synchronous, store-local, and have their own
+    relation vocabulary (:data:`MEMORY_RELATIONS`), so they deliberately do NOT reuse
+    the entities lineage graph (whose async model and relation set differ).
+    ``relation`` is an open ``str`` — the canonical names in :data:`MEMORY_RELATIONS`
+    are the recommended set, but a caller may coin its own.
+    """
+
+    link_id: str = Field(default_factory=new_uuid)
+    from_memory_id: str
+    to_memory_id: str
+    relation: str = RELATES_TO
+    metadata: dict[str, Any] = {}
+    created_at: str = Field(default_factory=utc_now_iso)
+
+
+@dataclass
+class MemoryGraph:
+    """A traced subgraph of memory: the records reached and the links between.
+
+    ``nodes`` maps ``memory_id -> MemoryRecord`` (the root is included when it exists
+    and passes the traversal's filters); ``edges`` are the typed links traversed.
+    ``truncated`` is True when a ``max_depth`` cutoff stopped the walk while reachable
+    nodes remained — so a caller can tell "this is the whole story" apart from "there
+    is more, deeper". Mirrors :class:`himmy.entities.lineage.LineageGraph`, but it is
+    a plain dataclass (no spine coupling) over memory records.
+    """
+
+    root_memory_id: str
+    nodes: dict[str, MemoryRecord] = field(default_factory=dict)
+    edges: list[MemoryLink] = field(default_factory=list)
+    truncated: bool = False
+
+    @property
+    def node_count(self) -> int:
+        """Number of distinct memories in the graph."""
+        return len(self.nodes)
+
+    @property
+    def edge_count(self) -> int:
+        """Number of distinct links in the graph."""
+        return len(self.edges)
+
+    def memory_ids(self) -> set[str]:
+        """The set of memory ids present as nodes."""
+        return set(self.nodes)
+
+    def relations(self) -> set[str]:
+        """The distinct relation names present among the edges."""
+        return {edge.relation for edge in self.edges}
+
+
+#: Alias for a list of links. Because the store classes below define a method named
+#: ``list``, the bare ``list[...]`` subscript would (under PEP 563 string annotations)
+#: resolve to that method inside the class body; this module-level alias keeps the
+#: link-method return annotations referring to the builtin ``list``.
+_MemoryLinkList = list[MemoryLink]
 
 
 class MemoryRecord(BaseModel):
@@ -89,6 +183,13 @@ class MemoryStore(Protocol):
 
     def delete(self, memory_id: str) -> bool: ...
 
+    # -- typed relational links (graph memory) ------------------------------
+    def save_link(self, link: MemoryLink) -> MemoryLink: ...
+
+    def links_from(self, memory_id: str) -> _MemoryLinkList: ...
+
+    def links_to(self, memory_id: str) -> _MemoryLinkList: ...
+
 
 def _passes_filters(
     record: MemoryRecord, *, active_only: bool, tier: str | None
@@ -106,6 +207,7 @@ class InMemoryMemoryStore:
 
     def __init__(self) -> None:
         self._records: dict[str, MemoryRecord] = {}
+        self._links: dict[str, MemoryLink] = {}
 
     def save(self, record: MemoryRecord) -> MemoryRecord:
         self._records[record.memory_id] = record
@@ -132,6 +234,19 @@ class InMemoryMemoryStore:
     def delete(self, memory_id: str) -> bool:
         return self._records.pop(memory_id, None) is not None
 
+    # -- typed relational links (graph memory) ------------------------------
+    def save_link(self, link: MemoryLink) -> MemoryLink:
+        self._links[link.link_id] = link
+        return link
+
+    def links_from(self, memory_id: str) -> _MemoryLinkList:
+        return [
+            link for link in self._links.values() if link.from_memory_id == memory_id
+        ]
+
+    def links_to(self, memory_id: str) -> _MemoryLinkList:
+        return [link for link in self._links.values() if link.to_memory_id == memory_id]
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -143,6 +258,26 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS memories_subject_idx ON memories (subject_id);
+"""
+
+#: Columns persisted for a :class:`MemoryLink` row (insert/select order).
+_LINK_COLS = "link_id, from_memory_id, to_memory_id, relation, metadata, created_at"
+
+#: Additive DDL for the typed-link table + its lookup indexes. Created on every
+#: open (``CREATE TABLE IF NOT EXISTS``) and also folded into ``_MIGRATIONS`` so a
+#: legacy ``.himmy/memory.db`` (pre-graph) gains the table in place with no data
+#: loss. Kept out of ``_SCHEMA`` only so the migration table-existence guard owns it.
+_LINK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_links (
+    link_id        TEXT PRIMARY KEY,
+    from_memory_id TEXT NOT NULL,
+    to_memory_id   TEXT NOT NULL,
+    relation       TEXT NOT NULL DEFAULT 'relates_to',
+    metadata       TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_links_from_idx ON memory_links (from_memory_id);
+CREATE INDEX IF NOT EXISTS memory_links_to_idx ON memory_links (to_memory_id);
 """
 
 #: Columns added after the original 6-column schema, with the ``ALTER TABLE``
@@ -180,7 +315,13 @@ class SqliteMemoryStore:
         self._conn.commit()
 
     def _migrate(self) -> None:
-        """Additively add any bi-temporal/tier columns missing on a legacy db."""
+        """Additively add any missing columns/tables on a legacy db (idempotent).
+
+        Bi-temporal/tier columns are backfilled per-column (PRAGMA-guarded), and the
+        typed-link table (graph memory) is created in place — both upgrade an existing
+        ``.himmy/memory.db`` with no data loss. ``CREATE TABLE IF NOT EXISTS`` makes
+        the link DDL safe to re-run, so the whole migration stays idempotent.
+        """
         existing = {
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()
@@ -188,6 +329,8 @@ class SqliteMemoryStore:
         for column, ddl in _MIGRATIONS:
             if column not in existing:
                 self._conn.execute(ddl)  # noqa: S608 - constant DDL, no interpolation
+        # Additive graph-memory link table (created in place on a pre-graph db).
+        self._conn.executescript(_LINK_SCHEMA)
 
     def save(self, record: MemoryRecord) -> MemoryRecord:
         self._conn.execute(
@@ -256,6 +399,53 @@ class SqliteMemoryStore:
         """Close the underlying connection (idempotent)."""
         self._conn.close()
 
+    # -- typed relational links (graph memory) ------------------------------
+    def save_link(self, link: MemoryLink) -> MemoryLink:
+        """Persist a typed link (insert-or-replace by ``link_id``)."""
+        self._conn.execute(
+            f"INSERT OR REPLACE INTO memory_links ({_LINK_COLS}) "  # noqa: S608
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                link.link_id,
+                link.from_memory_id,
+                link.to_memory_id,
+                link.relation,
+                json.dumps(link.metadata),
+                link.created_at,
+            ),
+        )
+        self._conn.commit()
+        return link
+
+    def links_from(self, memory_id: str) -> _MemoryLinkList:
+        """Return all links originating from a memory."""
+        rows = self._conn.execute(
+            f"SELECT {_LINK_COLS} FROM memory_links "  # noqa: S608
+            "WHERE from_memory_id = ?",
+            (memory_id,),
+        ).fetchall()
+        return [self._row_to_link(r) for r in rows]
+
+    def links_to(self, memory_id: str) -> _MemoryLinkList:
+        """Return all links pointing INTO a memory (the reverse of ``links_from``)."""
+        rows = self._conn.execute(
+            f"SELECT {_LINK_COLS} FROM memory_links "  # noqa: S608
+            "WHERE to_memory_id = ?",
+            (memory_id,),
+        ).fetchall()
+        return [self._row_to_link(r) for r in rows]
+
+    @staticmethod
+    def _row_to_link(row: sqlite3.Row) -> MemoryLink:
+        return MemoryLink(
+            link_id=row["link_id"],
+            from_memory_id=row["from_memory_id"],
+            to_memory_id=row["to_memory_id"],
+            relation=row["relation"],
+            metadata=json.loads(row["metadata"]),
+            created_at=row["created_at"],
+        )
+
     @staticmethod
     def _row(row: sqlite3.Row) -> MemoryRecord:
         keys = set(row.keys())
@@ -283,9 +473,19 @@ class SqliteMemoryStore:
 
 
 __all__ = [
+    "ABOUT_ENTITY",
+    "CAUSED_BY",
+    "CONTRADICTS",
+    "DEPENDS_ON",
+    "MEMORY_RELATIONS",
     "MEMORY_TIERS",
+    "PART_OF",
+    "RELATES_TO",
+    "SUPERSEDES",
+    "InMemoryMemoryStore",
+    "MemoryGraph",
+    "MemoryLink",
     "MemoryRecord",
     "MemoryStore",
-    "InMemoryMemoryStore",
     "SqliteMemoryStore",
 ]

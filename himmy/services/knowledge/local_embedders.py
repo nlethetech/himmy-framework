@@ -12,10 +12,15 @@ and memory subsystems while staying local/keyless:
 :func:`build_embedder` selects one by name so config/CLI can switch backends without
 code. The ``"auto"`` name asks for *genuine semantic* retrieval when it is locally
 available and degrades gracefully otherwise: it prefers ``fastembed`` (if the optional
-dep is importable, no network), then a reachable local Ollama (a fast, fail-closed
-localhost probe — never a hard dependency), and finally falls back to the offline
-:class:`DeterministicEmbedder`. So zero-config callers that opt into ``"auto"`` still
-import and run with no keys, no new required deps, and no working network.
+dep is importable, no network), then a local Ollama **that has the configured embedding
+model actually pulled** (``HIMMY_OLLAMA_EMBED_MODEL``, default ``qwen3-embedding``) — a
+fast, fail-closed localhost probe of ``/api/tags``, never a hard dependency — and
+finally falls back to the offline :class:`DeterministicEmbedder`. The Ollama leg is
+gated on the model being present (not just the server being up) so a reachable Ollama
+with no embed model degrades to deterministic instead of 404-ing at embed time. So
+zero-config callers that opt into ``"auto"`` still import and run with no keys, no new
+required deps, and no working network — yet a user who has pulled an Ollama embedding
+model gets genuine local semantic recall automatically.
 
 All embedders satisfy :class:`~himmy.services.knowledge.embedder.EmbedderProtocol`.
 """
@@ -23,6 +28,7 @@ All embedders satisfy :class:`~himmy.services.knowledge.embedder.EmbedderProtoco
 from __future__ import annotations
 
 import importlib.util
+import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -43,15 +49,21 @@ class OllamaEmbedder:
     def __init__(
         self,
         *,
-        model: str = "nomic-embed-text",
+        model: str | None = None,
         base_url: str = "http://localhost:11434",
-        dim: int = 768,
+        dim: int | None = None,
         transport: OllamaTransport | None = None,
         timeout: float = 60.0,
     ) -> None:
-        """Configure the model, server URL, embedding dim, and (test) transport."""
+        """Configure the model, server URL, embedding dim, and (test) transport.
+
+        ``model``/``dim`` default to the configured Ollama embedding model
+        (``HIMMY_OLLAMA_EMBED_MODEL``, default ``qwen3-embedding`` at 4096-d) and its
+        native dimension, so a bare ``OllamaEmbedder()`` matches what ``"auto"`` selects.
+        """
+        model = model or default_ollama_embed_model()
         self.model = model
-        self.dim = dim
+        self.dim = dim if dim is not None else default_ollama_embed_dim(model)
         self._base_url = base_url.rstrip("/")
         self._transport = transport
         self._timeout = timeout
@@ -128,10 +140,41 @@ class FastEmbedEmbedder:
 _DEFAULT_DIMS = {
     "deterministic": 64,
     "nepali": 64,
-    "ollama": 768,
+    "ollama": 4096,
     "fastembed": 384,
     "openai": 1536,
 }
+
+#: Native embedding dim per known Ollama embedding model (used when no dim is given).
+_OLLAMA_EMBED_DIMS = {
+    "qwen3-embedding": 4096,
+    "nomic-embed-text": 768,
+    "mxbai-embed-large": 1024,
+    "all-minilm": 384,
+    "bge-m3": 1024,
+}
+
+#: The default Ollama embedding model. ``qwen3-embedding`` is a strong multilingual
+#: local model; override with ``HIMMY_OLLAMA_EMBED_MODEL``.
+_DEFAULT_OLLAMA_EMBED_MODEL = "qwen3-embedding"
+
+
+def default_ollama_embed_model() -> str:
+    """The configured Ollama embedding model (``HIMMY_OLLAMA_EMBED_MODEL`` or default)."""
+    return os.environ.get("HIMMY_OLLAMA_EMBED_MODEL") or _DEFAULT_OLLAMA_EMBED_MODEL
+
+
+def default_ollama_embed_dim(model: str | None = None) -> int:
+    """Native dim for an Ollama embed model: ``HIMMY_OLLAMA_EMBED_DIM`` → known map → 4096."""
+    env = os.environ.get("HIMMY_OLLAMA_EMBED_DIM")
+    if env:
+        try:
+            return int(env)
+        except ValueError:  # pragma: no cover - defensive
+            pass
+    name = (model or default_ollama_embed_model()).split(":", 1)[0]
+    return _OLLAMA_EMBED_DIMS.get(name, _DEFAULT_DIMS["ollama"])
+
 
 #: Default base URL for the local Ollama server (also the reachability probe target).
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -183,16 +226,54 @@ def ollama_reachable(
     return response.status_code < 400
 
 
-def resolve_auto_backend(*, ollama_base_url: str | None = None) -> str:
-    """Resolve ``"auto"`` to a concrete backend name, preferring real semantics.
+def ollama_embed_model_available(
+    model: str | None = None,
+    base_url: str = _DEFAULT_OLLAMA_URL,
+    *,
+    timeout: float = 0.5,
+) -> bool:
+    """True when a local Ollama server has the embedding ``model`` actually pulled.
 
-    Order: ``fastembed`` (local ONNX, no network) → a reachable local ``ollama`` →
-    the offline ``deterministic`` fallback. The result is a plain backend name so
-    callers can both build the embedder and look up its conventional dim coherently.
+    A fast, fail-closed probe of ``/api/tags`` (the model registry): selecting Ollama for
+    ``"auto"`` requires the embed model to be *present*, not merely the server to be up —
+    otherwise the first embed call 404s. Any connection error, timeout, missing ``httpx``,
+    or absent model returns False so the offline ``deterministic`` fallback is used. The
+    match is tag-insensitive (``qwen3-embedding`` matches ``qwen3-embedding:latest``).
+    """
+    want = (model or default_ollama_embed_model()).split(":", 1)[0]
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a core dependency
+        return False
+    try:
+        response = httpx.get(base_url.rstrip("/") + "/api/tags", timeout=timeout)
+    except Exception:  # noqa: BLE001 - any probe failure means "not available"
+        return False
+    if response.status_code >= 400:
+        return False
+    try:
+        models = response.json().get("models", [])
+    except Exception:  # noqa: BLE001 - malformed body ⇒ treat as unavailable
+        return False
+    return any(str(m.get("name", "")).split(":", 1)[0] == want for m in models)
+
+
+def resolve_auto_backend(*, ollama_base_url: str | None = None) -> str:
+    """Resolve ``"auto"`` to a concrete backend name, preferring real local semantics.
+
+    Order: ``fastembed`` (local ONNX, when the ``[embeddings]`` extra is installed) → a
+    local Ollama **that has the configured embedding model pulled** → the offline
+    ``deterministic`` fallback. The Ollama leg is gated on
+    :func:`ollama_embed_model_available` (not merely :func:`ollama_reachable`) so a
+    reachable server without the embed model degrades to deterministic instead of 404-ing
+    at embed time — making ``"auto"`` both robust and genuinely semantic when the user has
+    pulled an Ollama embedding model. The result is a plain backend name so callers can
+    both build the embedder and look up its conventional dim coherently.
     """
     if fastembed_available():
         return "fastembed"
-    if ollama_reachable(ollama_base_url or _DEFAULT_OLLAMA_URL):
+    base = ollama_base_url or _DEFAULT_OLLAMA_URL
+    if ollama_reachable(base) and ollama_embed_model_available(base_url=base):
         return "ollama"
     return "deterministic"
 

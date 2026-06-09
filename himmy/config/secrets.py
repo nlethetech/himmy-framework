@@ -16,6 +16,12 @@ so offline/zero-config is unchanged. Select another backend with ``HIMMY_SECRETS
 
 All non-``env`` backends are chained with an env fallback, so a partially-migrated
 deployment keeps working.
+
+Field encryption sources its key-encryption key (KEK) through this same provider. The
+KEK backend is chosen by ``HIMMY_KEK_PROVIDER`` (default ``local``): ``local`` reads the
+raw KEK from ``HIMMY_ENCRYPTION_KEY`` (base64), while ``aws-kms`` resolves the CMK id from
+``HIMMY_AWS_KMS_KEY_ID`` and delegates DEK wrap/unwrap to AWS KMS. See
+:mod:`himmy.services.storage.encryption` for the provider abstraction.
 """
 
 from __future__ import annotations

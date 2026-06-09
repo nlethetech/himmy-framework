@@ -46,6 +46,30 @@ def executor_from(
     return _exec
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_embedder_cascade(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep the unit suite offline + deterministic regardless of ambient services.
+
+    The ``"auto"`` embedder cascade prefers fastembed, then a local Ollama that has the
+    embed model pulled, then deterministic. On a developer box with Ollama running and an
+    embed model pulled, ``"auto"`` would otherwise route the entire knowledge/memory suite
+    through a live model — slow and environment-dependent. Force the cascade to the offline
+    deterministic backend for every test EXCEPT those marked ``integration`` (which exercise
+    live Ollama on purpose). Tests that specifically assert cascade behaviour re-patch these
+    probes themselves and win, because their ``setattr`` runs after this fixture's.
+    """
+    if request.node.get_closest_marker("integration"):
+        return
+    from himmy.services.knowledge import local_embedders
+
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(
+        local_embedders, "ollama_embed_model_available", lambda *a, **k: False
+    )
+
+
 # ----------------------------------------------------------------- core builders
 @pytest.fixture()
 def storage() -> Any:

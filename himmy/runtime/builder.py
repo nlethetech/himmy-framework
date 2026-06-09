@@ -57,17 +57,64 @@ def _provider_key_present() -> bool:
     )
 
 
+def _sdk_available(module: str) -> bool:
+    """True only when the optional direct-SDK extra (``anthropic``/``openai``) imports."""
+    from importlib.util import find_spec
+
+    try:
+        return find_spec(module) is not None
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _direct_manager_for(model: str) -> ClientManager | None:
+    """Pick a direct-SDK :class:`ClientManager` for an explicitly named model.
+
+    Preferred over :class:`PydanticAIClientManager` when the matching API key is set
+    and the SDK extra is installed: a ``claude*``/``anthropic:`` model routes to
+    :class:`AnthropicClientManager`, a ``gpt*``/``openai:`` model to
+    :class:`OpenAIClientManager`. Returns ``None`` when no direct manager applies, so
+    the caller falls back to pydantic-ai or the offline stub. Honours offline-first:
+    nothing here imports an SDK or hits the network until the manager is actually used.
+    """
+    name = model.split(":", 1)[-1] if ":" in model else model
+    is_anthropic = model.startswith("anthropic:") or name.startswith("claude")
+    is_openai = model.startswith("openai:") or name.startswith(("gpt", "o1", "o3"))
+
+    if (
+        is_anthropic
+        and os.environ.get("ANTHROPIC_API_KEY")
+        and _sdk_available("anthropic")
+    ):
+        from himmy.services.inference.anthropic_manager import AnthropicClientManager
+
+        return AnthropicClientManager(model=name)
+    if is_openai and os.environ.get("OPENAI_API_KEY") and _sdk_available("openai"):
+        from himmy.services.inference.openai_manager import OpenAIClientManager
+
+        return OpenAIClientManager(model=name)
+    return None
+
+
 def build_inference() -> InferenceService:
     """Build the default :class:`InferenceService`.
 
-    Uses :class:`PydanticAIClientManager` only when ``pydantic_ai`` is installed
-    AND a provider key is present AND ``HIMMY_EXAMPLES_MODEL`` names a model;
-    otherwise defaults to the offline :class:`StubClientManager`.
+    Resolution order (first match wins), gated on ``HIMMY_EXAMPLES_MODEL`` naming a
+    model so the zero-config default stays the offline :class:`StubClientManager`:
+
+    1. A direct provider SDK — :class:`AnthropicClientManager` / :class:`OpenAIClientManager`
+       — when the model routes to it, the matching API key is set, and the SDK extra
+       (``himmy[anthropic]`` / ``himmy[openai]``) is installed.
+    2. :class:`PydanticAIClientManager` when ``pydantic_ai`` is installed and a key is present.
+    3. The offline :class:`StubClientManager` (no network, no keys).
     """
     configure_observability()
     manager: ClientManager
     model = os.environ.get("HIMMY_EXAMPLES_MODEL")
-    if model and _pydantic_ai_available() and _provider_key_present():
+    direct = _direct_manager_for(model) if model else None
+    if direct is not None:
+        manager = direct
+    elif model and _pydantic_ai_available() and _provider_key_present():
         from himmy.services.inference.pydantic_ai_manager import (
             PydanticAIClientManager,
         )
@@ -79,8 +126,16 @@ def build_inference() -> InferenceService:
 
 
 def build_storage() -> StorageService:
-    """Build a fresh in-memory :class:`StorageService` (EventSink + ThreadEventStore)."""
-    return StorageService()
+    """Build the one-shot CLI store: a fresh in-memory :class:`StorageService`.
+
+    Delegates to :meth:`StoreFactory.for_cli`, which is always the in-memory backend
+    (EventSink + ThreadEventStore) — a ``himmy run`` / ``himmy chat`` stays zero-setup
+    and never touches a durable file or DSN. The durable, server-side default lives in
+    :class:`~himmy.services.storage.factory.StoreFactory` (``for_server``).
+    """
+    from himmy.services.storage.factory import StoreFactory
+
+    return StoreFactory.for_cli()
 
 
 def build_runtime(

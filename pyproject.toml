@@ -40,7 +40,14 @@ encryption = ["cryptography>=42"]
 secrets-aws = ["boto3>=1.34"]
 secrets-gcp = ["google-cloud-secret-manager>=2.16"]
 secrets-azure = ["azure-identity>=1.15", "azure-keyvault-secrets>=4.7"]
+# Cloud KMS for field-level encryption (envelope KEK provider). AWS is the
+# reference impl; GCP/Azure are documented seams that reuse the secrets-* deps.
+kms-aws = ["boto3>=1.34"]
 providers = ["pydantic-ai>=0.0.1"]
+# Direct provider SDKs (no pydantic-ai indirection). Optional; the runtime
+# auto-detects them when the matching API key is present.
+anthropic = ["anthropic>=0.28"]
+openai = ["openai>=1.0"]
 postgres = ["asyncpg>=0.29"]
 knowledge = ["pgvector>=0.2", "openai>=1.0", "pypdf>=4.0"]
 observability = ["logfire>=0.30"]
@@ -73,11 +80,13 @@ all = [
     "uvicorn>=0.29",
     "starlette>=0.49.1",
     "pydantic-ai>=0.0.1",
+    "anthropic>=0.28",
     "asyncpg>=0.29",
     "pgvector>=0.2",
     "openai>=1.0",
     "pypdf>=4.0",
     "logfire>=0.30",
+    "boto3>=1.34",
     "feedparser>=6",
     "openpyxl>=3",
     "nepali-datetime>=1.0",
@@ -107,6 +116,7 @@ testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: end-to-end tests against a real provider (Ollama); skip when absent",
+    "slow: heavy load/concurrency/profiling tests; excluded from the default run",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning:pytest_asyncio.*",

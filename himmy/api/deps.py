@@ -148,35 +148,31 @@ class ApiContainer:
     async def build_default_async(cls) -> ApiContainer:
         """Async container builder that honours ``HIMMY_DATABASE_URL`` (AAEO-2).
 
-        When ``HIMMY_DATABASE_URL`` is set, constructs a
-        :class:`PostgresStorageService` (creating + migrating the pool) and wires
-        it as the durable backend so background runs and idempotency survive
-        restarts and span workers. Otherwise falls back to the in-memory store, so
-        this is safe to call in any environment.
+        Durable by default (item #3): when ``HIMMY_DATABASE_URL`` is set, constructs a
+        :class:`PostgresStorageService` (creating + migrating the pool); otherwise a
+        file-backed :class:`SqliteStorageService` at ``HIMMY_STORE_PATH``. Both wire a
+        durable backend so background runs and idempotency survive restarts and span
+        workers. The sync :meth:`build_default` still wires the in-memory store for
+        zero-config offline use.
         """
         storage = await cls._build_storage()
         return cls._assemble(storage)
 
     @staticmethod
     async def _build_storage() -> Any:
-        """Construct the storage backend from env (Postgres when DSN set, else memory).
+        """Construct the DURABLE server storage backend via :class:`StoreFactory`.
 
-        ``HIMMY_DATABASE_URL`` selects Postgres; the pool is created with the
-        JSONB codec + timeouts, then migrated. When unset (the default), the
-        in-memory store keeps the framework offline-green.
+        Delegates to :meth:`StoreFactory.for_server`, the single source of truth for the
+        durable-default policy: Postgres when ``HIMMY_DATABASE_URL`` is a ``postgres://``
+        DSN (pool created with the JSONB codec + timeouts, then migrated), otherwise a
+        file-backed SQLite store at ``HIMMY_STORE_PATH`` (default ``.himmy/storage.db``).
+        Both survive restarts and span workers — what a server/multi-worker entrypoint
+        needs. ``build_default`` (sync) still wires the in-memory store so direct
+        programmatic/offline use is unchanged.
         """
-        from himmy.config.secrets import get_secret
+        from himmy.services.storage.factory import StoreFactory
 
-        dsn = get_secret("HIMMY_DATABASE_URL")
-        if dsn:
-            from himmy.services.storage.postgres import PostgresStorageService
-
-            storage = await PostgresStorageService.connect(dsn)
-            await storage.migrate()
-            return storage
-        from himmy.services.storage.service import StorageService
-
-        return StorageService()
+        return await StoreFactory.for_server()
 
     @classmethod
     def _assemble(cls, storage: Any) -> ApiContainer:
