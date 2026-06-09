@@ -18,7 +18,12 @@ providers, Postgres/pgvector, and observability.
   offline deterministic embedder's **0.082** (hybrid 0.174) — the real embedder is ~3.4x
   better on a real benchmark, and the hybrid BM25 leg's lift is largest exactly when the
   embedder is weak (+0.092 nDCG) and small when it is strong (+0.010). nDCG@10 ≈ 0.28 is in
-  line with the published BEIR literature for NFCorpus.
+  line with the published BEIR literature for NFCorpus. The benchmark also measures the
+  opt-in **cross-encoder reranker** (`hybrid+rerank`, the `[embeddings]` extra) when
+  installed: on NFCorpus it is the biggest precision lever (nDCG@10 0.285 → 0.373, +31%),
+  but the *default* general MS-MARCO MiniLM reranker trades away recall/coverage on
+  out-of-domain medical text (recall@10 0.234 → 0.095, hit-rate 0.70 → 0.40) — a measured
+  "use a domain-appropriate reranker and verify on your corpus before enabling it" finding.
 - **Institutional-grade upgrade pass (7 workstreams).** Each landed in its own
   file-ownership cluster, was adversarially verified, and ships with deterministic offline
   tests; the offline-first invariant holds throughout.

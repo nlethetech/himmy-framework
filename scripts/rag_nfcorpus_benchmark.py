@@ -39,6 +39,10 @@ from pathlib import Path
 
 from himmy.services.knowledge import RetrievalConfig
 from himmy.services.knowledge.local_embedders import build_embedder, default_dim_for
+from himmy.services.knowledge.retrieval.reranker import (
+    build_reranker,
+    fastembed_rerank_available,
+)
 from himmy.services.knowledge.retrieval_eval import RetrievalEvalCase, compare_retrieval
 from himmy.services.knowledge.service import KnowledgeBase
 from himmy.services.storage.service import StorageService
@@ -155,37 +159,48 @@ async def _run() -> None:
         for q in chosen_q
     ]
 
+    configs = {
+        "dense": RetrievalConfig(mode="dense"),
+        "hybrid": RetrievalConfig(mode="hybrid"),
+    }
+    # The cross-encoder reranker is the highest-precision lever: it re-scores the fused
+    # candidate_pool with a local ONNX cross-encoder. Measured only when fastembed is
+    # installed (the [embeddings] extra); the model downloads on first use.
+    pool = int(os.environ.get("HIMMY_RAG_RERANK_POOL", "100"))
+    if fastembed_rerank_available():
+        configs["hybrid+rerank"] = RetrievalConfig(
+            mode="hybrid",
+            rerank=True,
+            reranker=build_reranker("fastembed"),
+            candidate_pool=pool,
+        )
+    else:
+        print("  (hybrid+rerank skipped — fastembed not installed)", flush=True)
+
     t1 = time.perf_counter()
     reports = await compare_retrieval(
-        kb,
-        rec.kb_id,
-        cases,
-        {
-            "dense": RetrievalConfig(mode="dense"),
-            "hybrid": RetrievalConfig(mode="hybrid"),
-        },
-        workspace_id="bench",
-        client_id="bench",
+        kb, rec.kb_id, cases, configs, workspace_id="bench", client_id="bench"
     )
     print(f"  retrieval+scoring in {time.perf_counter() - t1:.0f}s\n", flush=True)
 
     print(
-        f"{'config':8} {'recall@' + str(top_k):>10} {'mrr':>8} {'ndcg@' + str(top_k):>10} {'hit_rate':>9}"
+        f"{'config':14} {'recall@' + str(top_k):>10} {'mrr':>8} {'ndcg@' + str(top_k):>10} {'hit_rate':>9}"
     )
-    for name in ("dense", "hybrid"):
+    for name in configs:
         r = reports[name]
         print(
-            f"{name:8} {r.mean_recall_at_k:>10.3f} {r.mean_mrr:>8.3f} "
+            f"{name:14} {r.mean_recall_at_k:>10.3f} {r.mean_mrr:>8.3f} "
             f"{r.mean_ndcg_at_k:>10.3f} {r.hit_rate:>9.3f}"
         )
-    d, h = reports["dense"], reports["hybrid"]
-    delta = h.mean_ndcg_at_k - d.mean_ndcg_at_k
-    verdict = (
-        "hybrid helps"
-        if delta > 0.01
-        else ("dense sufficient" if abs(delta) <= 0.01 else "hybrid hurts")
-    )
-    print(f"\nnDCG@{top_k} delta (hybrid - dense) = {delta:+.3f} → {verdict}")
+    base = reports["dense"].mean_ndcg_at_k
+    for name in configs:
+        if name == "dense":
+            continue
+        delta = reports[name].mean_ndcg_at_k - base
+        verb = (
+            "helps" if delta > 0.01 else ("neutral" if abs(delta) <= 0.01 else "hurts")
+        )
+        print(f"\nnDCG@{top_k} delta ({name} - dense) = {delta:+.3f} → {verb}")
 
 
 if __name__ == "__main__":
