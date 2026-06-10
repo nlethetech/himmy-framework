@@ -43,7 +43,7 @@ export default function Tasks() {
     <>
       <Topbar title="Tasks" sub="A shared to-do board you and your agents both use" />
       <Page>
-        <div className="card card-pad" style={{ maxWidth: 640 }}>
+        <div className="card card-pad" style={{ maxWidth: 640, margin: "0 auto" }}>
           <div className="row gap6">
             <input
               className="input"

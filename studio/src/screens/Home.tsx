@@ -84,7 +84,7 @@ export default function Home() {
               <span className="qtile-label">{t.label}</span>
               {t.missing && (
                 <span className="qtile-warn" title="Needs a connection">
-                  ●
+                  set up
                 </span>
               )}
             </button>
