@@ -15,6 +15,15 @@ const BUILD = [
   { to: "/models", label: "Models", sub: "providers and model routing" },
   { to: "/compare", label: "Compare", sub: "run two agents side by side" },
   { to: "/connections", label: "Connections", sub: "email, Telegram, Google" },
+  { to: "/mcp", label: "MCP servers", sub: "connect external tool servers" },
+];
+
+// Automation surfaces: long-running and scheduled work plus project grouping.
+// Listed here so they stay reachable even when their sidebar apps are hidden.
+const AUTOMATION = [
+  { to: "/missions", label: "Missions", sub: "long-running autonomous runs" },
+  { to: "/routines", label: "Routines", sub: "scheduled agent runs" },
+  { to: "/projects", label: "Projects", sub: "group chats, knowledge, agents" },
 ];
 
 const ADVANCED = [
@@ -87,6 +96,18 @@ export default function Settings() {
               show the first-run wizard and tour again
             </span>
           </button>
+        </section>
+
+        <section className="home-sec">
+          <div className="home-sec-head">
+            <span>Automation</span>
+          </div>
+          {AUTOMATION.map((b) => (
+            <Link className="run-line" to={b.to} key={b.to}>
+              <span className="run-line-prompt">{b.label}</span>
+              <span className="run-line-meta mono">{b.sub}</span>
+            </Link>
+          ))}
         </section>
 
         <section className="home-sec">

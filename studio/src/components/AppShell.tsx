@@ -16,7 +16,9 @@ import {
   CheckIcon,
   MailIcon,
   FilesIcon,
+  BuildIcon,
 } from "./icons";
+import NotificationBell from "./NotificationBell";
 import { useTheme } from "./ui/useTheme";
 import { APP_DEFS, APPS_CHANGED, enabledApps } from "../lib/apps";
 import { useAccent } from "./ui/useAccent";
@@ -42,6 +44,7 @@ const WORKSPACE: NavItem[] = [
   { to: "/chats", label: "Chats", Icon: SearchIcon },
   { to: "/approvals", label: "Approvals", Icon: BellIcon },
   { to: "/activity", label: "Activity", Icon: RunsIcon },
+  { to: "/missions", label: "Missions", Icon: BuildIcon },
 ];
 
 // Apps are user-customizable (Settings → Sidebar apps); icons keyed off the
@@ -55,6 +58,8 @@ const APP_ICONS: Record<string, NavItem["Icon"]> = {
   research: SearchIcon,
   files: FilesIcon,
   brain: MemoryIcon,
+  routines: CalendarIcon,
+  projects: BookIcon,
 };
 
 function SidebarItem({ item }: { item: NavItem }) {
@@ -191,6 +196,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               ? "local"
               : `${connectionsOk} connection${connectionsOk === 1 ? "" : "s"}`}
           </span>
+          <NotificationBell />
           <NavLink
             to="/settings"
             className={({ isActive }) =>

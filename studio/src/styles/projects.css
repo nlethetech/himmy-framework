@@ -1,0 +1,168 @@
+/* Projects — sustained work gets a home.
+   The index and the project page are both single centered ledgers (.home-col):
+   sections are micro-labels over hairlines, rows are .run-line. Everything in
+   this file is the quiet furniture around those global patterns — back link,
+   masthead actions, attach rows, hover-revealed detach. No boxes, no fills. */
+
+/* index + chat rows are buttons/divs riding .run-line — flatten the chrome */
+.prj-row {
+  background: none;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* quiet inline notes: loading, load failures */
+.prj-quiet {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  padding: 22px 2px;
+}
+.prj-linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.prj-linkish:hover {
+  color: var(--red);
+}
+
+/* back to the index — a mono whisper above the masthead */
+.prj-back {
+  background: none;
+  border: none;
+  padding: 18px 0 0;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  cursor: pointer;
+  align-self: flex-start;
+}
+.prj-back:hover {
+  color: var(--text);
+}
+
+/* project masthead: dateline + name come from the global .masthead pattern */
+.prj-masthead {
+  margin-bottom: 6px;
+}
+.prj-desc {
+  margin: 6px 0 0;
+  color: var(--text-dim);
+  font-size: 13.5px;
+  line-height: 1.55;
+  max-width: 60ch;
+}
+
+/* rename · delete — bare mono verbs under the name, red only for the erasure */
+.prj-acts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.prj-act {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.prj-act:hover {
+  color: var(--text);
+}
+.prj-act.danger:hover {
+  color: var(--red);
+}
+
+/* per-chat detach — invisible until the row is hovered */
+.prj-detach {
+  background: none;
+  border: none;
+  padding: 0 0 0 10px;
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 1;
+  opacity: 0;
+}
+.run-line:hover .prj-detach,
+.prj-detach:focus-visible {
+  opacity: 1;
+}
+.prj-detach:hover {
+  color: var(--red);
+}
+@media (hover: none) {
+  .prj-detach {
+    opacity: 0.55;
+  }
+}
+
+/* attach-a-chat: a hairline continuation row under the chat ledger */
+.prj-attach-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.prj-attach-label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* knowledge / agent settings: one ledger row, picker on the right */
+.prj-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.prj-setting-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13.5px;
+  color: var(--text);
+  min-width: 0;
+}
+.prj-note {
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+/* create-project modal form */
+.prj-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.prj-desc-input {
+  resize: vertical;
+  min-height: 64px;
+}
+.prj-confirm {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+}

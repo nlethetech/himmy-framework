@@ -2,13 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   api,
-  streamRun,
   streamTeamRun,
   getChat,
   saveChat,
   type AgentSummary,
   type TeamSummary,
-  type RunEvent,
 } from "../lib/api";
 import { Topbar } from "../components/Page";
 import { Markdown } from "../components/Markdown";
@@ -40,7 +38,27 @@ import {
   artifactsFromSteps,
   resolveApprovalStream,
 } from "../lib/artifactsApi";
+import { PlanCard } from "../components/PlanCard";
+import {
+  interruptMission,
+  startMission,
+  steerMission,
+  streamMission,
+  type MissionEvent,
+  type PlanStep,
+} from "../lib/missionsApi";
 import "../styles/chatsurfaces.css";
+import "../styles/missions.css";
+
+// Quiet inline glyph for the "run in background" composer action (no icon in
+// the shared set carries this meaning; mono-weight strokes match the others).
+const BgIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 3v10" />
+    <path d="m8 9 4 4 4-4" />
+    <path d="M4 17h16v4H4z" />
+  </svg>
+);
 
 // Domain-agnostic starter prompts for the empty state (fill the input, don't send).
 const EXAMPLES = [
@@ -70,6 +88,11 @@ interface Msg {
   streaming?: boolean;
   runId?: string;
   approvals?: ApprovalState[]; // inline HITL pauses raised during this turn
+  missionId?: string; // single-agent runs flow through the missions registry
+  plan?: PlanStep[]; // plan-first checklist (updates in place per plan frame)
+  steers?: string[]; // guidance queued mid-run (rendered as quiet rows)
+  backgrounded?: boolean; // a mission chip entry, not an inline stream
+  agentLabel?: string; // chip label (the agent that runs in the background)
 }
 
 type Pick =
@@ -86,6 +109,24 @@ export default function Chat() {
   const [busy, setBusy] = useState(false);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // Plan-first: ask the agent to publish + maintain a step checklist.
+  const [planMode, setPlanMode] = useState<boolean>(
+    () => localStorage.getItem("himmy.chat.planmode") === "1",
+  );
+  const togglePlanMode = () => {
+    setPlanMode((v) => {
+      localStorage.setItem("himmy.chat.planmode", v ? "0" : "1");
+      return !v;
+    });
+  };
+  // The mission backing the CURRENT foreground stream (single-agent runs all
+  // flow through the missions registry — one code path for fg/bg/steering).
+  const [activeMission, setActiveMission] = useState<string | null>(null);
+  const activeMissionRef = useRef<string | null>(null);
+  // A ?project=<id> deep link (from Projects → new chat) assigns saved
+  // transcripts to that project. Held in a ref so the persist closure always
+  // sees the latest value without re-subscribing the busy→idle effect.
+  const projectIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -150,6 +191,8 @@ export default function Chat() {
     const q = params.get("q");
     const s = params.get("session");
     const hl = params.get("hl");
+    const project = params.get("project");
+    if (project) projectIdRef.current = project;
     if (hl) setPendingHl(hl);
     if (s) {
       getChat(s)
@@ -165,7 +208,7 @@ export default function Chat() {
     }
     if (a) setPath(a);
     if (q) setInput(q);
-    if (a || q || s || hl) setParams({}, { replace: true });
+    if (a || q || s || hl || project) setParams({}, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -230,6 +273,7 @@ export default function Chat() {
         id: sessionId,
         agent_path: path || null,
         provider: provider || null,
+        project_id: projectIdRef.current,
         messages: rows,
       });
       if (!sessionId) setSessionId(saved.id);
@@ -290,8 +334,16 @@ export default function Chat() {
     const addStep = (s: CogStep) =>
       patchAt(idx, (m) => ({ ...m, steps: [...(m.steps ?? []), s] }));
 
-    const handler = (e: RunEvent) => {
+    const handler = (e: MissionEvent) => {
       switch (e.type) {
+        case "plan":
+          // Plan-first checklist — replaced in place as new frames arrive.
+          patchAt(idx, (m) => ({ ...m, plan: e.steps }));
+          break;
+        case "steer":
+          // Guidance queued mid-run, surfaced as a quiet row in the entry.
+          patchAt(idx, (m) => ({ ...m, steers: [...(m.steers ?? []), e.text] }));
+          break;
         case "token": {
           const lead = resume && firstToken ? sep : "";
           firstToken = false;
@@ -436,15 +488,46 @@ export default function Chat() {
     }
   };
 
-  const send = async () => {
-    const prompt = input.trim();
-    if (!prompt || !path || busy) return;
-    setInput("");
+  const chatModel = () =>
+    provider === "openrouter" && orModel && orModel !== "__loading"
+      ? orModel
+      : null;
 
-    const history = messages.map((m) => ({
+  const historyOf = () =>
+    messages.map((m) => ({
       role: m.role === "agent" ? ("assistant" as const) : ("user" as const),
       content: m.text,
     }));
+
+  // While a foreground mission streams, the composer is a STEERING input:
+  // submitting queues the text, which the loop injects before its next turn.
+  const queueSteer = async (text: string) => {
+    const mid = activeMissionRef.current;
+    if (!mid) return;
+    setInput("");
+    try {
+      await steerMission(mid, text.slice(0, 4000));
+      // the `steer` frame arrives over the live stream and renders the row
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const idx = messagesRef.current.length - 1;
+      patchAt(idx, (m) => ({
+        ...m,
+        steers: [...(m.steers ?? []), `(not delivered — ${msg})`],
+      }));
+    }
+  };
+
+  const send = async () => {
+    const prompt = input.trim();
+    if (!prompt || !path) return;
+    if (busy) {
+      // Streaming → the same box steers (single-agent missions only).
+      if (activeMissionRef.current) void queueSteer(prompt);
+      return;
+    }
+    setInput("");
+    const history = historyOf();
 
     // The agent reply lands right after the user turn we are about to append.
     const agentIdx = messages.length + 1;
@@ -471,20 +554,20 @@ export default function Chat() {
       if (isTeam) {
         await streamTeamRun({ team_path: path, prompt }, onEvent, ac.signal);
       } else {
-        await streamRun(
-          {
-            agent_path: path,
-            prompt,
-            provider: provider || null,
-            model:
-              provider === "openrouter" && orModel && orModel !== "__loading"
-                ? orModel
-                : null,
-            history,
-          },
-          onEvent,
-          ac.signal,
-        );
+        // Single-agent runs flow through the missions registry — ONE code path
+        // for foreground/background, steering, interrupt, and reconnects.
+        const { mission_id } = await startMission({
+          agent_path: path,
+          prompt,
+          provider: provider || null,
+          model: chatModel(),
+          history,
+          plan_mode: planMode,
+        });
+        activeMissionRef.current = mission_id;
+        setActiveMission(mission_id);
+        patchLast((m) => ({ ...m, missionId: mission_id }));
+        await streamMission(mission_id, onEvent, ac.signal);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -497,10 +580,72 @@ export default function Chat() {
       patchLast((m) => ({ ...m, streaming: false }));
       setBusy(false);
       abortRef.current = null;
+      activeMissionRef.current = null;
+      setActiveMission(null);
       // NOTE: do NOT persist() here — patchLast/setBusy are async, so messagesRef
       // hasn't yet flushed the final reply and we'd save a partial transcript
       // (e.g. the user turn without the assistant answer). The busy→false effect
       // below persists once state has committed and messagesRef is current.
+    }
+  };
+
+  // Quiet background action: run the CURRENT prompt as a mission and drop a
+  // chip entry in the thread instead of streaming inline.
+  const sendBackground = async () => {
+    const prompt = input.trim();
+    if (!prompt || !path || busy || isTeam) return;
+    setInput("");
+    const history = historyOf();
+    const label = picked?.item.name ?? "agent";
+    const chipIdx = messages.length + 1;
+    setMessages((m) => [
+      ...m,
+      { role: "user", text: prompt },
+      { role: "agent", text: "", backgrounded: true, agentLabel: label },
+    ]);
+    try {
+      const { mission_id } = await startMission({
+        agent_path: path,
+        prompt,
+        provider: provider || null,
+        model: chatModel(),
+        history,
+        plan_mode: planMode,
+      });
+      patchAt(chipIdx, (m) => ({ ...m, missionId: mission_id }));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      patchAt(chipIdx, (m) => ({
+        ...m,
+        backgrounded: false,
+        text: "⚠ " + msg,
+      }));
+    }
+  };
+
+  // Stop replaces send while streaming. Missions are interrupted server-side
+  // (checkpoint-pause when one exists, else an honest cooperative cancel);
+  // team runs just stop the stream.
+  const stop = async () => {
+    const mid = activeMissionRef.current;
+    if (!mid) {
+      abortRef.current?.abort();
+      return;
+    }
+    try {
+      const r = await interruptMission(mid);
+      if (r.mode === "checkpoint") {
+        const idx = messagesRef.current.length - 1;
+        patchAt(idx, (m) => ({
+          ...m,
+          text:
+            (m.text ? m.text + "\n\n" : "") +
+            "paused — resume from Approvals/Missions",
+        }));
+      }
+      // mode "cancelled": the stream delivers the interrupted error frame.
+    } catch {
+      /* already finished — the stream is about to end on its own */
     }
   };
 
@@ -581,6 +726,16 @@ export default function Chat() {
                   <div className="who">
                     {m.role === "user" ? "You" : picked?.item.name ?? "Agent"}
                   </div>
+                  {/* A backgrounded run renders a quiet mission chip, not a stream. */}
+                  {m.backgrounded && (
+                    <div className="mission-chip">
+                      <span className="mc-agent">{m.agentLabel}</span>
+                      <span className="mc-meta">
+                        running in background ·
+                      </span>
+                      <Link to="/missions">view in Missions</Link>
+                    </div>
+                  )}
                   {/* While running, the trace IS the feedback. Once the answer
                       lands it folds to one quiet line — the answer takes the room. */}
                   {m.streaming && m.steps && m.steps.length > 0 && (
@@ -608,6 +763,16 @@ export default function Chat() {
                   {m.role === "agent" && m.usage && (
                     <UsageHud usage={m.usage} live={m.streaming} />
                   )}
+                  {/* Plan-first checklist — updates in place per plan frame. */}
+                  {m.role === "agent" && m.plan && <PlanCard steps={m.plan} />}
+                  {/* Steering queued mid-run, in the order it was given. */}
+                  {m.role === "agent" &&
+                    (m.steers ?? []).map((s, k) => (
+                      <div className="steer-row" key={k}>
+                        <span className="steer-tag">steer</span>
+                        <span>{s}</span>
+                      </div>
+                    ))}
                   {m.text &&
                     (m.role === "agent" ? (
                       <Markdown>{m.text}</Markdown>
@@ -660,12 +825,14 @@ export default function Chat() {
             placeholder={
               !hasAny
                 ? "Create an agent or add a team first…"
-                : isTeam
-                  ? "Ask the team to manage something…"
-                  : "Message your agent…"
+                : busy && activeMission
+                  ? "Steer the run — guidance lands before its next turn…"
+                  : isTeam
+                    ? "Ask the team to manage something…"
+                    : "Message your agent…"
             }
             value={input}
-            disabled={busy || !hasAny}
+            disabled={!hasAny || (busy && !activeMission)}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKey}
           />
@@ -731,6 +898,17 @@ export default function Chat() {
                 />
               )}
 
+              {!isTeam && (
+                <button
+                  className={"plan-toggle" + (planMode ? " on" : "")}
+                  onClick={togglePlanMode}
+                  title="Plan-first: the agent publishes a step checklist and keeps it current"
+                  type="button"
+                >
+                  plan
+                </button>
+              )}
+
               <button
                 className="composer-icon"
                 onClick={load}
@@ -755,15 +933,43 @@ export default function Chat() {
               )}
             </div>
 
-            <button
-              className="composer-send"
-              onClick={send}
-              disabled={busy || !input.trim() || !hasAny}
-              title="Send (Enter)"
-              type="button"
-            >
-              {busy ? <span className="spinner" /> : <SendIcon />}
-            </button>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              {!isTeam && !busy && (
+                <button
+                  className="composer-icon"
+                  onClick={() => void sendBackground()}
+                  disabled={!input.trim() || !hasAny}
+                  title="Run in background — steer and follow it under Missions"
+                  type="button"
+                >
+                  <BgIcon />
+                </button>
+              )}
+              {busy ? (
+                <button
+                  className="composer-send"
+                  onClick={() => void stop()}
+                  title={
+                    activeMission
+                      ? "Stop — pauses at a checkpoint when one exists, else cancels"
+                      : "Stop"
+                  }
+                  type="button"
+                >
+                  <span className="stop-glyph" />
+                </button>
+              ) : (
+                <button
+                  className="composer-send"
+                  onClick={send}
+                  disabled={!input.trim() || !hasAny}
+                  title="Send (Enter)"
+                  type="button"
+                >
+                  <SendIcon />
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>

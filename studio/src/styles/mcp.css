@@ -1,0 +1,221 @@
+/* MCP — the connector ledger. Sections come from .home-sec / .run-line
+   (index.css); this file adds the inline server form, the tool-list rows,
+   the agent attach checkboxes, and the quiet mono action affordances.
+   No boxes, no fills, no glow. */
+
+.mcp-col {
+  padding-top: 12px;
+}
+
+/* right-aligned mono annotations on a ledger row */
+.mcp-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}
+.mcp-meta.err {
+  color: var(--red); /* red's third job: errors */
+}
+
+/* row actions — mono text, not buttons */
+.mcp-act {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mcp-act:hover {
+  color: var(--text);
+}
+.mcp-act.active {
+  color: var(--red); /* red's second job: the active state */
+}
+.mcp-act.danger:hover,
+.mcp-act.armed {
+  color: var(--red); /* a destructive confirm — red carries the warning */
+}
+.mcp-act:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* indented detail panels under a server row, closed by a hairline */
+.mcp-panel {
+  padding: 4px 0 10px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* one discovered tool: mono name, dim prose description */
+.mcp-tool-line {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 2px;
+  font-size: 12.5px;
+}
+.mcp-tool-name {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  flex: none;
+}
+.mcp-tool-desc {
+  color: var(--text-dim);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* quiet single-line states inside a panel (testing…, errors, empties) */
+.mcp-note {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 6px 2px;
+}
+.mcp-note.err {
+  color: var(--red);
+}
+
+/* agent attachment rows — hairline checkbox, name, mono path */
+.mcp-agent-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 2px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.mcp-agent-line.busy {
+  opacity: 0.55;
+  cursor: default;
+}
+.mcp-agent-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcp-agent-path {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.mcp-check {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  flex: none;
+  align-self: center;
+  border: 1px solid var(--border);
+  background: transparent;
+  cursor: inherit;
+}
+.mcp-check:hover {
+  border-color: var(--text-dim);
+}
+.mcp-check:checked {
+  border-color: var(--red); /* attached — an active state */
+  background: color-mix(in srgb, var(--red) 32%, transparent);
+}
+
+/* the inline add/edit form — labeled hairline rows, no card */
+.mcp-form {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 0 14px;
+}
+.mcp-form-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 7px 2px;
+}
+.mcp-form-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  width: 110px;
+  flex: none;
+}
+.mcp-form-row .input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.mcp-form-row textarea.input {
+  resize: vertical;
+  min-height: 34px;
+  line-height: 1.5;
+}
+.mcp-form-hint {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  padding: 0 2px 4px 124px;
+}
+.mcp-form-flags {
+  display: flex;
+  gap: 22px;
+  padding: 8px 2px 4px 124px;
+}
+.mcp-flag {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.mcp-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 2px 0 124px;
+}
+.mcp-form-err {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--red);
+  padding: 8px 2px 0 124px;
+  white-space: pre-wrap;
+}
+
+/* the one-paragraph explainer under the empty state */
+.mcp-empty-copy {
+  max-width: 460px;
+  margin: 0 auto;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-dim);
+}
+
+/* quiet inline retry for a failed fetch */
+.mcp-retry {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-decoration: underline;
+  cursor: pointer;
+}

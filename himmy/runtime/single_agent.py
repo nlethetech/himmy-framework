@@ -16,6 +16,7 @@ import contextlib
 import contextvars
 import json
 import os
+import queue
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import (
@@ -727,6 +728,7 @@ class SingleAgentRuntime:
         synthesize_empty: bool = True,
         route_tools: bool = False,
         route_max_tools: int = 4,
+        steer_queue: queue.Queue[str] | None = None,
     ) -> AgentLoopResult:
         """Run a bounded, runtime-owned agentic loop: act -> observe -> re-invoke.
 
@@ -742,6 +744,14 @@ class SingleAgentRuntime:
         :class:`~himmy.runtime.checkpoint.AgentCheckpoint`, emits
         ``APPROVAL_REQUIRED``, and returns with ``stopped_reason='awaiting_approval'``
         and a ``checkpoint_id`` for :meth:`resume_agent_loop`.
+
+        ``steer_queue`` (optional) is the between-turns steering seam: a
+        thread-safe queue of user guidance texts that the drive loop drains at the
+        top of EACH continuation turn, appending every queued text as a USER
+        message before the next request is built — so the model reacts to live
+        human steering mid-mission. ``None`` (the default) leaves loop behavior
+        byte-identical. Turn bounds (``max_turns`` / :data:`HARD_MAX_TURNS`) are
+        unchanged by steering.
         """
         _validate_max_turns(max_turns, "run_agent_loop")
         # Reject a malformed context BEFORE the tool router / first turn runs.
@@ -780,6 +790,7 @@ class SingleAgentRuntime:
                 stop_on_no_progress=stop_on_no_progress,
                 turns_offset=0,
                 cost_offset=0.0,
+                steer_queue=steer_queue,
             )
             if synthesize_empty:
                 result = await self._maybe_synthesize(
@@ -1652,6 +1663,7 @@ class SingleAgentRuntime:
         stop_on_no_progress: bool,
         turns_offset: int,
         cost_offset: float,
+        steer_queue: queue.Queue[str] | None = None,
     ) -> AgentLoopResult:
         """Drive continuation turns until a stop condition (shared by run/resume)."""
         while True:
@@ -1724,6 +1736,10 @@ class SingleAgentRuntime:
                     thread=thread, turns=turns, stopped_reason="budget"
                 )
             index = turns_offset + len(turns) + 1
+            # Between-turns steering (opt-in): drain queued user guidance at the
+            # top of this continuation turn so the next request includes it.
+            if steer_queue is not None:
+                self._drain_steer_queue(steer_queue, thread)
             await self._emit(
                 RunEvent(
                     event_type=EventType.AGENT_TURN_STARTED,
@@ -1738,6 +1754,38 @@ class SingleAgentRuntime:
             )
             turns.append(result)
             await self._emit_turn_completed(trace_id, thread, persona, index, result)
+
+    def _drain_steer_queue(
+        self, steer_queue: queue.Queue[str], thread: ChatThread
+    ) -> None:
+        """Append every queued steering text as a USER message on the thread.
+
+        Each non-empty text becomes one USER message (``metadata={'steer': True}``)
+        in arrival order, so the very next ``_continue_turn`` request — built from
+        the thread as-is — carries the guidance. Thread-safe by construction:
+        ``queue.Queue`` may be fed from any thread (an HTTP handler steering a
+        background mission) while the loop drains it here on the event loop.
+        """
+        from himmy.agents.base_agent.thread import Message, MessageRole
+
+        injected = False
+        while True:
+            try:
+                text = steer_queue.get_nowait()
+            except queue.Empty:
+                break
+            content = str(text).strip()
+            if not content:
+                continue
+            message = Message(
+                role=MessageRole.USER, content=content, metadata={"steer": True}
+            )
+            thread.append_message(message)
+            self._register_message(message)
+            injected = True
+        if injected:
+            thread.version += 1
+            self._register_thread_version(thread)
 
     @staticmethod
     def _pending_approvals(result: RunResult) -> list[PendingToolCall]:

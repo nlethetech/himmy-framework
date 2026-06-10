@@ -13,9 +13,14 @@ from himmy.api.routers import (
     studio_files,
     studio_knowledge_upload,
     studio_lineage,
+    studio_mcp,
     studio_memory,
+    studio_missions,
     studio_models,
+    studio_notify,
     studio_privacy,
+    studio_projects,
+    studio_routines,
     studio_teams,
 )
 
@@ -30,8 +35,13 @@ __all__ = [
     "studio_files",
     "studio_knowledge_upload",
     "studio_lineage",
+    "studio_mcp",
     "studio_memory",
+    "studio_missions",
     "studio_models",
+    "studio_notify",
     "studio_privacy",
+    "studio_projects",
+    "studio_routines",
     "studio_teams",
 ]

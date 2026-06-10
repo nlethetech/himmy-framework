@@ -630,7 +630,11 @@ async def openrouter_catalog(refresh: bool = False) -> dict[str, Any]:
     """
     now = time.monotonic()
     cached = _OPENROUTER_CACHE["data"]
-    if cached is not None and not refresh and now - _OPENROUTER_CACHE["at"] < _OPENROUTER_TTL_S:
+    if (
+        cached is not None
+        and not refresh
+        and now - _OPENROUTER_CACHE["at"] < _OPENROUTER_TTL_S
+    ):
         return {"models": cached, "cached": True}
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:

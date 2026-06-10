@@ -1,0 +1,191 @@
+/* Routines — scheduled agent runs. Ledger grammar only: sections come from
+   .home-sec / .home-sec-head (index.css); this file adds the form rows
+   (micro-label left, hairline-under control right) and the per-routine row
+   annotations. No boxes, no fills — red carries action/active/error only. */
+
+.rt-col {
+  padding-top: 12px;
+}
+
+/* section-head action ("cancel", "delete routine") — reads like a head link */
+.rt-head-act {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.rt-head-act:hover {
+  color: var(--text-muted);
+}
+.rt-delete:hover {
+  color: var(--red);
+}
+
+/* ---- form rows: micro-label left, quiet control right ------------------- */
+
+.rt-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.rt-row-top {
+  align-items: flex-start;
+}
+.rt-row-top .rt-row-label {
+  padding-top: 4px;
+}
+.rt-row-label {
+  width: 86px;
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+}
+
+/* hairline-under inputs so a form row stays a ledger row */
+.rt-input,
+.rt-textarea {
+  flex: 1;
+  min-width: 80px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid transparent;
+  border-radius: 0;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  padding: 2px 0;
+}
+.rt-input::placeholder,
+.rt-textarea::placeholder {
+  color: var(--text-dim);
+}
+.rt-input:hover,
+.rt-textarea:hover {
+  border-bottom-color: var(--border);
+}
+.rt-input:focus,
+.rt-textarea:focus {
+  outline: none;
+  border-bottom-color: var(--red); /* focus — red's active-state job */
+}
+.rt-input.short {
+  flex: 0 1 110px;
+}
+.rt-input.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.rt-textarea {
+  resize: vertical;
+  line-height: 1.5;
+}
+.rt-unit {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.rt-row .pick {
+  flex: none;
+}
+
+/* ---- form actions + errors ----------------------------------------------- */
+
+.rt-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 2px 0;
+}
+.rt-form-err {
+  color: var(--red);
+  font-size: 12.5px;
+}
+.rt-actions .rt-delete {
+  margin-left: auto;
+}
+
+/* ---- routine rows ---------------------------------------------------------- */
+
+.rt-line {
+  gap: 10px;
+  align-items: center; /* the checkbox is a box, not a glyph — center the row */
+}
+.rt-line .task-check {
+  flex: none;
+}
+.rt-name {
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  font-family: var(--sans);
+}
+.rt-name.off {
+  color: var(--text-dim);
+}
+.rt-name:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+
+/* status annotation: quiet mono; red only when it carries a failure */
+.rt-note {
+  flex: none;
+  font-size: 10.5px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+.rt-note.bad {
+  color: var(--red);
+}
+
+/* per-row action ("run now") — hairline mono, red on hover (primary action) */
+.rt-line-act {
+  flex: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.rt-line-act:hover:not(:disabled) {
+  color: var(--red);
+}
+.rt-line-act:disabled {
+  cursor: default;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+/* ---- quiet states ------------------------------------------------------------ */
+
+.rt-quiet {
+  padding: 24px 2px;
+  font-size: 11px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+.rt-error {
+  padding: 12px 2px;
+  font-size: 11px;
+  color: var(--red);
+  border-bottom: 1px solid var(--border);
+}
+.rt-empty-act {
+  margin-top: 16px;
+}

@@ -261,6 +261,7 @@ export const saveChat = (body: {
   title?: string | null;
   agent_path?: string | null;
   provider?: string | null;
+  project_id?: string | null;
   messages: ChatMessageRow[];
 }) => api.post<ChatSessionSummary>("/chats", body);
 export const renameChat = (id: string, title: string) =>

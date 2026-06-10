@@ -796,6 +796,7 @@ class ChatSaveRequest(BaseModel):
     title: str | None = Field(None, max_length=200)
     agent_path: str | None = Field(None, max_length=500)
     provider: str | None = Field(None, max_length=40)
+    project_id: str | None = Field(None, max_length=64)
     messages: list[ChatMessageIn] = Field(default_factory=list)
 
 
@@ -829,6 +830,7 @@ async def chats_save(body: ChatSaveRequest) -> Any:
         title=body.title,
         agent_path=body.agent_path,
         provider=body.provider,
+        project_id=body.project_id,
         messages=[ChatMessage(role=m.role, text=m.text) for m in body.messages],
     )
 

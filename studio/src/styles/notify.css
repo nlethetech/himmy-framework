@@ -1,0 +1,180 @@
+/* Notifications — a hairline ledger popover off the sidebar-footer bell.
+   No cards, no fills: a bordered panel, a mono micro-label head over a
+   hairline, .run-line-shaped rows. Unread rows carry a left red hairline
+   (red's active-state job); the count badge reuses .sb-badge. */
+
+.nb {
+  position: relative;
+  display: inline-flex;
+}
+
+.nb-btn {
+  position: relative;
+}
+
+/* unread count: the existing .sb-badge, shrunk onto the glyph's shoulder */
+.nb-count {
+  position: absolute;
+  top: -5px;
+  right: -7px;
+  font-size: 9px;
+  min-width: 14px;
+  height: 13px;
+  padding: 0 3px;
+  pointer-events: none;
+}
+
+/* ---- popover ------------------------------------------------------------ */
+
+.nb-pop {
+  position: fixed;
+  z-index: 60;
+  width: 320px;
+  max-width: calc(100vw - 16px);
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  font-family: var(--sans);
+}
+
+/* mono 10px uppercase micro-label over a hairline — the .home-sec-head form */
+.nb-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--text-dim);
+  padding: 10px 12px 7px;
+  border-bottom: 1px solid var(--border);
+}
+.nb-head-n {
+  letter-spacing: 0.6px;
+  text-transform: none;
+  color: var(--red); /* unread is the live state */
+}
+
+.nb-list {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ledger rows: title flex-1, mono dim time right, hairline bottom */
+.nb-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 12px 9px 11px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-left: 1px solid transparent;
+  font-family: var(--sans);
+  font-size: 12.5px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.nb-row:hover {
+  background: var(--card);
+}
+.nb-row.unread {
+  border-left: 1px solid var(--red); /* the left red hairline */
+}
+.nb-row-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nb-row.unread .nb-row-title {
+  font-weight: 600;
+}
+.nb-row-meta {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* quiet states — never a spinner */
+.nb-quiet {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 14px 12px;
+}
+.nb-quiet.nb-err {
+  color: var(--red);
+}
+
+/* ---- footer: setting + mark-all ------------------------------------------ */
+
+.nb-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.nb-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.nb-check:hover {
+  color: var(--text);
+}
+/* hairline checkbox: a 12px square, mark + border carry the active state */
+.nb-box {
+  width: 12px;
+  height: 12px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--red);
+}
+.nb-box.on {
+  border-color: var(--red);
+}
+
+.nb-act {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.nb-act:hover:not(:disabled) {
+  color: var(--red); /* the panel's primary action */
+}
+.nb-act:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

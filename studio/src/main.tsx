@@ -31,6 +31,10 @@ import Theme from "./screens/Theme";
 import Settings from "./screens/Settings";
 import Privacy from "./screens/Privacy";
 import Files from "./screens/Files";
+import Missions from "./screens/Missions";
+import Routines from "./screens/Routines";
+import Projects from "./screens/Projects";
+import Mcp from "./screens/Mcp";
 import "./index.css";
 
 // New task-first IA. Screens not yet built (Home/Connections/Approvals) render a
@@ -53,6 +57,11 @@ const router = createBrowserRouter([
       { path: "email", element: <Email /> },
       { path: "notes", element: <Notes /> },
       { path: "tasks", element: <Tasks /> },
+      { path: "missions", element: <Missions /> },
+      { path: "routines", element: <Routines /> },
+      { path: "projects", element: <Projects /> },
+      { path: "projects/:id", element: <Projects /> },
+      { path: "mcp", element: <Mcp /> },
       { path: "cookbook", element: <Cookbook /> },
       { path: "models", element: <Models /> },
       { path: "compare", element: <Compare /> },

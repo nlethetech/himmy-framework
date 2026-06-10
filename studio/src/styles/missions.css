@@ -1,0 +1,247 @@
+/* Missions lane: the missions ledger screen, the plan-first checklist, the
+   in-chat mission chip and steer rows. Ledger language only — hairlines, mono
+   micro-labels, no boxes, no fills. */
+
+/* ---- PlanCard: the agent's own checklist, updated in place ---------------- */
+
+.plan-card {
+  margin: 10px 0 12px;
+}
+.plan-head {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--text-dim);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.plan-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text);
+}
+.plan-num {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.plan-title {
+  flex: 1;
+  min-width: 0;
+}
+.plan-status {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.plan-row.active .plan-title {
+  color: var(--text);
+}
+.plan-row.active .plan-status,
+.plan-row.active .plan-num {
+  color: var(--red); /* the active step — red's active-state job */
+}
+.plan-row.done .plan-title {
+  color: var(--text-dim);
+  text-decoration: line-through;
+  text-decoration-color: var(--border);
+}
+.plan-row.skipped .plan-title {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* ---- In-chat mission chip (backgrounded run) ------------------------------ */
+
+.mission-chip {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.mission-chip .mc-agent {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+}
+.mission-chip .mc-meta {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.mission-chip a {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.mission-chip a:hover {
+  color: var(--text);
+}
+
+/* ---- Steer rows (guidance queued mid-run) --------------------------------- */
+
+.steer-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 2px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.steer-row .steer-tag {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* ---- Composer: plan-first toggle + stop button ----------------------------- */
+
+.plan-toggle {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+.plan-toggle:hover {
+  color: var(--text-muted);
+}
+.plan-toggle.on {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+/* the stop glyph (replaces send while a run streams) */
+.stop-glyph {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+}
+
+/* ---- Missions screen (ledger) ---------------------------------------------- */
+
+.missions-col {
+  max-width: 720px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 24px 32px 64px;
+}
+.missions-note {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-family: var(--mono);
+  padding: 10px 2px 0;
+}
+.mission-line {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  border-top: none;
+  border-left: none;
+  border-right: none;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  font-family: var(--sans);
+}
+.mission-line:hover {
+  background: var(--card);
+}
+.mission-line .ml-prompt {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mission-line .ml-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.mission-line .ml-meta .st-error {
+  color: var(--red); /* errors — red's third job */
+}
+.mission-line.sel .ml-prompt {
+  color: var(--red);
+}
+
+/* detail */
+.mission-detail-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 4px 2px 12px;
+}
+.mission-detail-head .md-prompt {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  color: var(--text);
+}
+.mission-detail-head .md-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.mission-detail-head .md-meta .st-error {
+  color: var(--red);
+}
+.mission-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 0 0;
+}
+.mission-actions .steer-input {
+  flex: 1;
+  min-width: 0;
+}
+.mission-output {
+  padding: 12px 2px 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.mission-error {
+  padding: 10px 2px 0;
+  font-size: 12.5px;
+  color: var(--red);
+  font-family: var(--mono);
+}
+.mission-back {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  padding: 0 0 14px;
+  cursor: pointer;
+}
+.mission-back:hover {
+  color: var(--text-muted);
+}

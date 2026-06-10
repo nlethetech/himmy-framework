@@ -4515,3 +4515,15 @@ mark.hl.hl-first {
 .pick-search:focus {
   border-color: var(--red);
 }
+
+/* footer rail buttons: native <button> chrome stripped to the hairline form */
+.sb-foot .rail-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0;
+  cursor: pointer;
+}
+.sb-foot .rail-btn:hover {
+  border-color: var(--border-strong);
+}

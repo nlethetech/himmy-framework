@@ -17,6 +17,8 @@ export const APP_DEFS: AppDef[] = [
   { key: "research", to: "/research", label: "Research" },
   { key: "files", to: "/files", label: "Files" },
   { key: "brain", to: "/brain", label: "Brain" },
+  { key: "routines", to: "/routines", label: "Routines" },
+  { key: "projects", to: "/projects", label: "Projects" },
 ];
 
 const KEY = "himmy.apps.enabled";

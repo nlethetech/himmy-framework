@@ -9,6 +9,7 @@ root (the directory ``himmy studio`` was launched in).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -227,6 +228,109 @@ def _cap(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+# ---- Plan-first contract: the synthetic `update_plan` tool ---------------
+
+#: The synthetic planning tool's name (mirrors `final_answer`: registered into the
+#: run's registry, surfaced as its own frame type, never as an ordinary tool step).
+PLAN_TOOL = "update_plan"
+#: Bounds on a plan payload — a hostile/confused model can't bloat the stream.
+PLAN_MAX_STEPS = 12
+PLAN_TITLE_MAX = 200
+_PLAN_STATUSES = ("pending", "active", "done", "skipped")
+
+_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "steps": {
+            "type": "array",
+            "maxItems": PLAN_MAX_STEPS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "maxLength": PLAN_TITLE_MAX,
+                        "description": "One short step of the plan.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": list(_PLAN_STATUSES),
+                        "description": "The step's current status.",
+                    },
+                },
+                "required": ["title", "status"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["steps"],
+    "additionalProperties": False,
+}
+
+#: One-paragraph system nudge prepended when a run starts in plan mode.
+PLAN_NUDGE = (
+    "Plan-first mode: before doing anything else, call the `update_plan` tool "
+    "with a short ordered list of the steps you intend to take (each step a "
+    "title plus a status of pending/active/done/skipped, at most "
+    f"{PLAN_MAX_STEPS} steps). As you work, call `update_plan` again whenever a "
+    "step's status changes — mark the step you are working on `active` and "
+    "completed steps `done` — so the plan always reflects your real progress. "
+    "Then continue with the task itself."
+)
+
+
+def _normalize_plan_steps(raw: Any) -> list[dict[str, str]]:
+    """Coerce a model-supplied ``steps`` payload into the bounded plan shape.
+
+    Keeps at most :data:`PLAN_MAX_STEPS` entries; each must be a mapping with a
+    non-empty ``title`` (capped at :data:`PLAN_TITLE_MAX` chars). An unknown or
+    missing ``status`` degrades to ``pending`` rather than rejecting the call —
+    small local models get the shape almost-right more often than exactly-right.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw[:PLAN_MAX_STEPS]:
+        if not isinstance(item, dict):
+            continue
+        title = _cap(str(item.get("title", "")).strip(), PLAN_TITLE_MAX)
+        if not title:
+            continue
+        status = str(item.get("status", "pending")).strip().lower()
+        if status not in _PLAN_STATUSES:
+            status = "pending"
+        out.append({"title": title, "status": status})
+    return out
+
+
+def register_update_plan_tool(registry: Any) -> None:
+    """Register the synthetic ``update_plan`` tool into a run's tool registry.
+
+    The handler just validates/bounds the payload — the interesting part happens
+    in :class:`_Cognition`, which turns each completed call into a
+    ``{"type": "plan", "steps": [...]}`` GUI frame instead of a tool step.
+    """
+    from himmy.services.tools.registry import register_local_tool
+
+    def _handler(args: dict[str, Any]) -> dict[str, Any]:
+        steps = _normalize_plan_steps(args.get("steps"))
+        return {"ok": bool(steps), "steps": steps}
+
+    register_local_tool(
+        registry,
+        name=PLAN_TOOL,
+        handler=_handler,
+        description=(
+            "Publish or update your step-by-step plan for this task. Call it "
+            "first with the full plan, then again whenever a step's status "
+            "changes (pending/active/done/skipped)."
+        ),
+        args_json_schema=_PLAN_SCHEMA,
+        read_only=True,
+        metadata={"synthetic": "planning"},
+    )
+
+
 # Tools whose result grounds the answer in retrieved evidence (recall = memory,
 # *kb_search* / *knowledge* = RAG). Matched by name; the result is parsed for
 # citations so the GUI can show what the agent actually relied on.
@@ -398,6 +502,16 @@ class _Cognition:
 
         if et in (E.TOOL_COMPLETED, E.TOOL_FAILED):
             name = payload.get("tool_name") or ""
+            if name == PLAN_TOOL:
+                # The plan-first synthetic tool: surfaced as its OWN frame type
+                # (a live, updatable checklist), never as an ordinary tool step.
+                steps = _normalize_plan_steps(
+                    dict(payload.get("tool_args") or {}).get("steps")
+                )
+                if et == E.TOOL_COMPLETED and steps:
+                    out.append({"type": "plan", "agent": self.active, "steps": steps})
+                    self._record(kind="plan", agent=self.active, steps=steps, ts=ts)
+                return out
             if name.startswith(_SYNTHETIC_TOOLS) or name == "final_answer":
                 return out
             args = dict(payload.get("tool_args") or {})
@@ -465,13 +579,27 @@ class _Cognition:
             return out
 
         if et == E.APPROVAL_REQUIRED:
+            tools = list(payload.get("tools") or [])
             out.append(
                 {
                     "type": "approval_required",
                     "agent": self.active,
                     "checkpoint_id": payload.get("checkpoint_id"),
-                    "tools": list(payload.get("tools") or []),
+                    "tools": tools,
                 }
+            )
+            # The one event that *waits on the human* — ring the notification
+            # bell so the pause is seen even when the run's tab is closed.
+            # Every Studio approval funnels through this translator (fresh
+            # runs and resumed runs that pause again), so this is the single
+            # creation point. record_notification never raises by contract.
+            from himmy.api.routers.studio_notify import record_notification
+
+            record_notification(
+                "approval",
+                "Approval required: " + (", ".join(tools) if tools else "a gated tool"),
+                body=f"{self.active} paused and is waiting for your decision",
+                link="/approvals",
             )
             return out
 
@@ -522,9 +650,13 @@ async def _drain_cognition(
     """Yield cognition frames live as runtime events arrive, until the run finishes."""
     while True:
         getter = asyncio.create_task(queue.get())
-        done, _pending = await asyncio.wait(
-            {getter, run_task}, return_when=asyncio.FIRST_COMPLETED
-        )
+        try:
+            done, _pending = await asyncio.wait(
+                {getter, run_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            getter.cancel()  # never leave the queue getter pending behind us
+            raise
         if getter in done:
             for frame in cog.frames(getter.result()):
                 yield frame
@@ -588,6 +720,8 @@ async def stream_agent_run(
     provider: str | None = None,
     model: str | None = None,
     agent_path: str | None = None,
+    steer_queue: Any | None = None,
+    plan_mode: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run an agent for one user turn, yielding GUI events.
 
@@ -595,6 +729,7 @@ async def stream_agent_run(
       * ``{"type": "start", "agent": name, "streaming": bool}``
       * ``{"type": "token", "delta": str}``         — incremental text (no-tool agents)
       * ``{"type": "tool", "name": str}``           — a tool the agent invoked
+      * ``{"type": "plan", "steps": [...]}``        — plan-first checklist updates
       * ``{"type": "message", "text": str}``        — full assistant text (tool agents)
       * ``{"type": "done", "output_text", "thread_id", "succeeded"}``
       * ``{"type": "error", "message": str}``
@@ -602,6 +737,15 @@ async def stream_agent_run(
     No-tool agents stream token-by-token; tool-using agents run the bounded
     act→observe loop (which can't stream mid-loop) and return the final answer plus
     the tools they touched.
+
+    ``steer_queue`` (optional, a thread-safe ``queue.Queue[str]``) is drained by
+    the runtime at the top of each continuation turn — every queued text lands as
+    a USER message before the next model call (between-turns steering; only
+    meaningful for tool-using agents, whose runs are multi-turn loops).
+    ``plan_mode=True`` registers the synthetic ``update_plan`` tool and prepends a
+    system nudge instructing the agent to publish its plan first and keep step
+    statuses current; each call surfaces as a ``plan`` frame. Plan mode is a
+    no-op for agents without tools (there is no tool loop to call it from).
     """
     history = history or []
     collected_events: list[Any] = []
@@ -629,6 +773,11 @@ async def stream_agent_run(
         )
     )
     has_tools = registry is not None
+    if plan_mode and registry is not None:
+        # Mirror the final_answer pattern: a synthetic tool registered into this
+        # run's registry. Done BEFORE the read-only map / cognition wiring below
+        # so the tool is bound and classified like any other.
+        register_update_plan_tool(registry)
     thread = _rebuild_thread(spec, history)
     cog = _Cognition(_read_only_map(registry), spec.name)
 
@@ -646,10 +795,23 @@ async def stream_agent_run(
     status = "ok"
     error_msg: str | None = None
     checkpoint_id: str | None = None
+    run_task: asyncio.Task[Any] | None = None
+    interrupted = False
 
     yield {"type": "start", "agent": spec.name, "streaming": not has_tools}
     try:
         task = spec.make_task(prompt)
+        if plan_mode and has_tools:
+            # Plan-first: nudge the agent (system prefix renders into the system
+            # prompt on the first turn) and make sure update_plan stays bound
+            # even when the spec pinned an explicit tool list.
+            prior = str(task.context.get("system_prefix") or "")
+            task.context["system_prefix"] = (
+                f"{PLAN_NUDGE}\n\n{prior}".strip() if prior else PLAN_NUDGE
+            )
+            pinned = task.context.get("tool_names")
+            if isinstance(pinned, list) and PLAN_TOOL not in pinned:
+                task.context["tool_names"] = [*pinned, PLAN_TOOL]
         if has_tools:
             # Tool-using agents stream their cognition (act → observe) live, and
             # PAUSE (hitl) when a tool needs approval instead of auto-denying it.
@@ -662,6 +824,7 @@ async def stream_agent_run(
                     max_turns=8,
                     route_tools=spec.tool_router,
                     hitl=True,
+                    steer_queue=steer_queue,
                 )
             )
             async for frame in _drain_cognition(queue, run_task, cog):
@@ -727,6 +890,18 @@ async def stream_agent_run(
                 for frame in cog.frames(queue.get_nowait()):
                     if frame["type"] != "reason":
                         yield frame
+    except asyncio.CancelledError:
+        # The consumer was cancelled (e.g. a mission interrupt). The inner loop
+        # task would otherwise keep running the model as an orphan — cancel it
+        # (the runtime persists the partial thread + emits a terminal event),
+        # record the run honestly as interrupted, then re-raise below.
+        interrupted = True
+        status = "error"
+        error_msg = "interrupted — the run was cancelled before it finished"
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await run_task
     except Exception as exc:  # noqa: BLE001 - record the failed run, then surface it
         status = "error"
         error_msg = str(exc)
@@ -762,6 +937,10 @@ async def stream_agent_run(
     except Exception:  # noqa: BLE001 - persistence must never break the stream
         pass
 
+    if interrupted:
+        # An interrupted (cancelled) consumer must observe the cancellation, not
+        # a normal frame — the run was already recorded as an error above.
+        raise asyncio.CancelledError()
     if status == "error":
         yield {"type": "error", "message": error_msg or "run failed", "run_id": run_id}
         return
@@ -1139,6 +1318,10 @@ def _record_team_run(
 
 
 __all__ = [
+    "PLAN_MAX_STEPS",
+    "PLAN_NUDGE",
+    "PLAN_TITLE_MAX",
+    "PLAN_TOOL",
     "AgentSummary",
     "TeamSummary",
     "TeamMemberInfo",
@@ -1146,6 +1329,7 @@ __all__ = [
     "list_teams",
     "load_studio_spec",
     "load_team",
+    "register_update_plan_tool",
     "resolve_spec_path",
     "stream_agent_run",
     "stream_team_run",
