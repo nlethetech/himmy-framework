@@ -66,8 +66,13 @@ class AgentSpec(BaseModel):
     allow_spawn: bool = False
     # Give the agent a dispatch_skill tool (run a named capability as a sub-agent):
     allow_skill_dispatch: bool = False
-    # Route to the few relevant tools per query (helps small models pick correctly):
-    tool_router: bool = False
+    # Route to the few relevant tools per query. Tri-state: True/False are
+    # explicit; None (the default) is ADAPTIVE — the runtime routes
+    # automatically when the bound toolset is large (>8 tools), where routing
+    # pays for itself on every provider (one small routing call instead of
+    # resending the full tool-schema block each turn) and rescues small local
+    # models from tool-choice overload. Small toolsets skip routing entirely.
+    tool_router: bool | None = None
     guardrails: list[str] = []
     memory: bool = False  # auto-recall long-term memory into the prompt each run
     memory_top_k: int = 5

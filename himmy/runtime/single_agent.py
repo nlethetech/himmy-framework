@@ -726,7 +726,7 @@ class SingleAgentRuntime:
         hitl: bool = False,
         stop_on_no_progress: bool = False,
         synthesize_empty: bool = True,
-        route_tools: bool = False,
+        route_tools: bool | None = None,
         route_max_tools: int = 4,
         steer_queue: queue.Queue[str] | None = None,
     ) -> AgentLoopResult:
@@ -759,7 +759,7 @@ class SingleAgentRuntime:
         if hitl and self._checkpoint_store is None:
             raise HimmyError("hitl=True requires a checkpoint_store on the runtime.")
 
-        if route_tools:
+        if self._should_route(route_tools):
             task = await self._route_tools(task, route_max_tools)
 
         # WS4.6: publish the subject for the WHOLE loop so the turn-completed events,
@@ -797,6 +797,24 @@ class SingleAgentRuntime:
                     result, persona, trace_id, llm_config
                 )
             return result
+
+    #: Adaptive routing threshold: with MORE bound tools than this, an unset
+    #: ``route_tools`` (None) routes automatically — the schema block for a big
+    #: toolset costs more per turn than the one small routing call, and small
+    #: local models pick badly from large catalogs. At or below it, no routing.
+    AUTO_ROUTE_OVER_TOOLS = 8
+
+    def _should_route(self, route_tools: bool | None) -> bool:
+        """Resolve the tri-state routing flag (explicit wins; None = adaptive)."""
+        if route_tools is not None:
+            return route_tools
+        registry = getattr(self.tool_service, "registry", None)
+        if registry is None:
+            return False
+        try:
+            return len(registry.list()) > self.AUTO_ROUTE_OVER_TOOLS
+        except Exception:  # noqa: BLE001 - routing is an optimization, never a crash
+            return False
 
     async def _route_tools(self, task: Task, max_tools: int) -> Task:
         """Narrow the bound tools to the relevant few for this task (Tier 1.3).
@@ -1101,7 +1119,7 @@ class SingleAgentRuntime:
         hitl: bool = False,
         stop_on_no_progress: bool = False,
         synthesize_empty: bool = True,
-        route_tools: bool = False,
+        route_tools: bool | None = None,
         route_max_tools: int = 4,
     ) -> AsyncGenerator[StreamDelta, None]:
         """Stream tokens THROUGH the whole multi-turn tool loop (opt-in).
@@ -1145,7 +1163,7 @@ class SingleAgentRuntime:
         if hitl and self._checkpoint_store is None:
             raise HimmyError("hitl=True requires a checkpoint_store on the runtime.")
 
-        if route_tools:
+        if self._should_route(route_tools):
             task = await self._route_tools(task, route_max_tools)
 
         from himmy.agents.base_agent.thread import ChatThread as _ChatThread

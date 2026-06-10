@@ -145,7 +145,7 @@ async def _answer(
     llm_config: Any = None,
     has_tools: bool = False,
     max_turns: int = 8,
-    route_tools: bool = False,
+    route_tools: bool | None = None,
 ) -> Any:
     """Produce a final answer, driving the tool loop when the agent has tools.
 
