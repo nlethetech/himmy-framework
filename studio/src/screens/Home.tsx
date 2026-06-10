@@ -6,10 +6,15 @@ import {
   type RunSummary,
   type ConnectionStatus,
 } from "../lib/api";
-import { Topbar, Page } from "../components/Page";
+import { Topbar } from "../components/Page";
 import { ComposeModal, type ComposeMode } from "../components/ComposeModal";
 import { MailIcon, TelegramIcon, GlobeIcon, ChatIcon } from "../components/icons";
 import { relativeTime, statusClass } from "../lib/format";
+
+/* Home as a single centered column — everything on one axis. No card boxes:
+   sections are a micro-label over a hairline, ledger rows beneath. Status is
+   only shown when it is NOT ok (six green tags in a row is noise; one red
+   tag is information). */
 
 export default function Home() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
@@ -34,23 +39,20 @@ export default function Home() {
     {
       key: "email",
       label: "Send email",
-      hue: "email",
       Icon: MailIcon,
-      onClick: () => setCompose("email"),
+      onClick: () => setCompose("email" as ComposeMode),
       missing: needs("email"),
     },
     {
       key: "telegram",
       label: "Message Telegram",
-      hue: "telegram",
       Icon: TelegramIcon,
-      onClick: () => setCompose("telegram"),
+      onClick: () => setCompose("telegram" as ComposeMode),
       missing: needs("telegram"),
     },
     {
       key: "research",
       label: "Research",
-      hue: "web",
       Icon: GlobeIcon,
       onClick: () => nav("/chat"),
       missing: false,
@@ -58,7 +60,6 @@ export default function Home() {
     {
       key: "ask",
       label: "Ask / Run",
-      hue: "memory",
       Icon: ChatIcon,
       onClick: () => nav("/chat"),
       missing: false,
@@ -68,7 +69,13 @@ export default function Home() {
   const now = new Date();
   const hour = now.getHours();
   const greeting =
-    hour < 5 ? "Working late" : hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+    hour < 5
+      ? "Working late"
+      : hour < 12
+        ? "Good morning"
+        : hour < 18
+          ? "Good afternoon"
+          : "Good evening";
   const dateline = now
     .toLocaleDateString("en-GB", {
       weekday: "long",
@@ -81,7 +88,7 @@ export default function Home() {
   return (
     <>
       <Topbar title="Home" sub="Your workspace" />
-      <Page>
+      <div className="home-col">
         <div className="masthead">
           <div className="masthead-date">{dateline}</div>
           <h2 className="masthead-greeting">{greeting}.</h2>
@@ -101,78 +108,66 @@ export default function Home() {
           ))}
         </div>
 
-        <div className="home-cols">
-          <div className="home-main">
-            <div className="card">
-              <div className="card-head">
-                <h2>Recent activity</h2>
-                <Link to="/activity" className="dim" style={{ fontSize: 13 }}>
-                  View all →
-                </Link>
-              </div>
-              {runs.length === 0 ? (
-                <div className="card-pad dim">
-                  No runs yet. Start one from Chat or a quick action above.
-                </div>
-              ) : (
-                runs.map((r) => (
-                  <Link className="list-row" to={`/activity/${r.id}`} key={r.id}>
-                    <div className="lead">
-                      <div className="row gap10">
-                        <span className="title">{r.agent_name ?? "agent"}</span>
-                        <span className={"pill " + statusClass(r.status)}>
-                          <span className="dot" />
-                          {r.status}
-                        </span>
-                      </div>
-                      <span className="meta">{r.prompt || "(no prompt)"}</span>
-                    </div>
-                    <span className="meta">{relativeTime(r.created_at)}</span>
-                  </Link>
-                ))
-              )}
-            </div>
+        <section className="home-sec">
+          <div className="home-sec-head">
+            <span>Recent</span>
+            <Link to="/activity">view all →</Link>
           </div>
-
-          <div className="home-side">
-            <div className="card card-pad">
-              <span className="section-title">Connections</span>
-              <div className="conn-mini">
-                {conns.map((c) => (
-                  <Link className="conn-mini-row" to="/connections" key={c.type}>
-                    <span
-                      className="dot"
-                      style={{
-                        color: c.configured ? "var(--ok)" : "var(--text-dim)",
-                      }}
-                    />
-                    <span className="conn-mini-name">{c.title}</span>
-                    <span className="conn-mini-state">
-                      {c.configured ? "connected" : "connect"}
-                    </span>
-                  </Link>
-                ))}
-              </div>
+          {runs.length === 0 ? (
+            <div className="home-empty">
+              No runs yet — start one from Chat or an action above.
             </div>
+          ) : (
+            runs.map((r) => (
+              <Link className="run-line" to={`/activity/${r.id}`} key={r.id}>
+                <span className="run-line-prompt">
+                  {r.prompt || "(no prompt)"}
+                </span>
+                {statusClass(r.status) !== "ok" && (
+                  <span className={"pill " + statusClass(r.status)}>
+                    {r.status}
+                  </span>
+                )}
+                <span className="run-line-meta mono">
+                  {r.agent_name ?? "agent"} · {relativeTime(r.created_at)}
+                </span>
+              </Link>
+            ))
+          )}
+        </section>
 
-            <div className="card card-pad">
-              <span className="section-title">Templates</span>
-              <div className="tpl-list">
-                {[
-                  { name: "Email assistant", to: "/agents" },
-                  { name: "Research agent", to: "/agents" },
-                  { name: "Telegram bot", to: "/agents" },
-                ].map((t) => (
-                  <Link className="tpl-row" to={t.to} key={t.name}>
-                    {t.name}
-                    <span className="dim">→</span>
-                  </Link>
-                ))}
-              </div>
-            </div>
+        <section className="home-sec">
+          <div className="home-sec-head">
+            <span>Connections</span>
+            <Link to="/connections">manage →</Link>
           </div>
-        </div>
-      </Page>
+          <div className="home-inline">
+            {conns.map((c) => (
+              <Link className="home-inline-item" to="/connections" key={c.type}>
+                {c.title}
+                <span className={"mono state" + (c.configured ? " on" : "")}>
+                  {c.configured ? "connected" : "connect"}
+                </span>
+              </Link>
+            ))}
+          </div>
+        </section>
+
+        <section className="home-sec">
+          <div className="home-sec-head">
+            <span>Templates</span>
+            <Link to="/agents">all agents →</Link>
+          </div>
+          <div className="home-inline">
+            {["Email assistant", "Research agent", "Telegram bot"].map((t) => (
+              <Link className="home-inline-item" to="/agents" key={t}>
+                {t}
+                <span className="mono state">→</span>
+              </Link>
+            ))}
+          </div>
+        </section>
+      </div>
 
       {compose && (
         <ComposeModal

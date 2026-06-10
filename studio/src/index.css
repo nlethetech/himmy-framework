@@ -178,7 +178,15 @@ a {
   text-decoration: none;
 }
 a:hover {
+  text-decoration: none; /* rows/nav are not prose; .md a opts back in */
+}
+.md a {
   text-decoration: underline;
+  text-decoration-color: var(--brand-line);
+  text-underline-offset: 2px;
+}
+.md a:hover {
+  text-decoration-color: var(--brand);
 }
 code,
 pre,
@@ -4343,4 +4351,97 @@ mark.hl.hl-first {
 .sb-collapsed .sb-newchat:hover::after {
   opacity: 1;
   transform: translateY(-50%);
+}
+
+
+/* ---- Home (single centered column) -------------------------------------- */
+.home-col {
+  max-width: 640px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 28px 32px 64px;
+}
+.home-col .masthead {
+  padding: 22px 0 28px;
+}
+.home-col .quick-row {
+  margin-bottom: 40px;
+}
+.home-sec {
+  margin-bottom: 36px;
+}
+.home-sec-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--text-dim);
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+}
+.home-sec-head a {
+  color: var(--text-dim);
+  letter-spacing: 0.6px;
+  text-transform: none;
+}
+.home-sec-head a:hover {
+  color: var(--text-muted);
+}
+.run-line {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+}
+.run-line:hover {
+  background: var(--card);
+}
+.run-line-prompt {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-line-meta {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.home-empty {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  padding: 14px 2px;
+}
+.home-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 28px;
+  padding: 12px 2px 0;
+}
+.home-inline-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+.home-inline-item:hover {
+  color: var(--text);
+}
+.home-inline-item .state {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.home-inline-item .state.on {
+  color: var(--ok);
+}
+.home-inline-item:hover .state {
+  color: var(--text-muted);
 }
