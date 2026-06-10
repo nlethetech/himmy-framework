@@ -17,9 +17,7 @@ import {
   WorldLedger,
   GroundingPanel,
   SafetyPanel,
-  OrchestrationGraph,
   type CogStep,
-  type GraphMember,
 } from "../components/Cognition";
 import {
   UsageHud,
@@ -194,13 +192,6 @@ export default function Chat() {
   })();
   const isTeam = picked?.kind === "team";
   const hasAny = agents.length + teams.length > 0;
-  const teamMembers: GraphMember[] = isTeam
-    ? (picked!.item as TeamSummary).members.map((m) => ({
-        name: m.name,
-        role: m.role,
-      }))
-    : [];
-  const teamEntry = isTeam ? (picked!.item as TeamSummary).entry : "";
 
   const send = async () => {
     const prompt = input.trim();
@@ -439,17 +430,6 @@ export default function Chat() {
                   <div className="who">
                     {m.role === "user" ? "You" : picked?.item.name ?? "Agent"}
                   </div>
-                  {m.role === "agent" &&
-                    m.team &&
-                    teamMembers.length > 1 &&
-                    (m.steps?.length ?? 0) > 0 && (
-                      <OrchestrationGraph
-                        members={teamMembers}
-                        entry={teamEntry}
-                        steps={m.steps ?? []}
-                        active={m.streaming ? m.active : null}
-                      />
-                    )}
                   {m.steps && m.steps.length > 0 && (
                     <CognitionTrace steps={m.steps} />
                   )}
