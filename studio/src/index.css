@@ -487,14 +487,15 @@ select {
   padding-bottom: calc(var(--sp-8) + 10vh); /* optical centering (golden bias) */
 }
 .empty-icon {
-  width: 56px;
-  height: 56px;
-  border-radius: var(--radius-lg);
   display: grid;
   place-items: center;
-  font-size: 24px;
-  background: var(--brand-soft);
-  color: var(--brand);
+  font-size: 20px;
+  color: var(--text-dim); /* a bare glyph — no tile, no fill */
+  margin-bottom: 2px;
+}
+.empty-icon svg {
+  width: 22px;
+  height: 22px;
 }
 .empty-title {
   font-size: var(--fs-xl);
@@ -635,6 +636,7 @@ select {
 .btn {
   display: inline-flex;
   align-items: center;
+  white-space: nowrap;
   gap: 7px;
   padding: 6px 13px;
   border-radius: var(--radius-sm);
@@ -4071,4 +4073,20 @@ mark.hl.hl-first {
   color: var(--text-dim);
   font-size: 12.5px;
   padding: 26px 2px;
+}
+
+
+/* Control bars above centered content share the same centered measure. */
+.kb-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.kb-head .row {
+  justify-content: center;
+}
+.mem-bar {
+  margin-left: auto;
+  margin-right: auto;
 }
