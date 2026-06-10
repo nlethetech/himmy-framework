@@ -63,3 +63,4 @@ tests/live/
 deploy/compose/secrets/*
 !deploy/compose/secrets/.gitkeep
 deploy/compose/.env
+benchmarks/results/*.log

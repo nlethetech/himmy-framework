@@ -1,0 +1,2184 @@
+{
+  "suite": "core",
+  "trials": 3,
+  "min_category_tasks": 5,
+  "models": [
+    {
+      "name": "ollama:qwen2.5:0.5b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:0.5b-instruct",
+      "tool_router": false,
+      "accuracy": 0.5,
+      "accuracy_ci": [
+        0.42099012028854144,
+        0.5790098797114586
+      ],
+      "tool_call_accuracy": 0.8333333333333334,
+      "p50_latency_s": 0.6487378124948009,
+      "p95_latency_s": 1.591409978504089,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "arithmetic": 1.0,
+        "files": 0.4,
+        "sql": 0.6,
+        "multistep": 0.0,
+        "rag": 0.4,
+        "memory": 0.6,
+        "reasoning": 0.8,
+        "nepal": 0.6,
+        "agentic": 0.2,
+        "regression": 0.4
+      },
+      "category_counts": {
+        "arithmetic": 5,
+        "files": 5,
+        "sql": 5,
+        "multistep": 5,
+        "rag": 5,
+        "memory": 5,
+        "reasoning": 5,
+        "nepal": 5,
+        "agentic": 5,
+        "regression": 5
+      },
+      "trajectory_failures": 15,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "arithmetic",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5603323339892086,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_division",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5909857920050854,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_percentage",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.50875991700741,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_unit_conversion",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5857486250024522,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_multistep_word",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5339147920021787,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_read",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5283458339981735,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_list_then_read",
+          "category": "files",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.9741094159981003,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_write_then_read",
+          "category": "files",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.0855354169907514,
+          "errors": 0,
+          "trajectory_failures": 3
+        },
+        {
+          "id": "file_large_excerpt",
+          "category": "files",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 0.0,
+          "p50_latency_s": 0.37869045899424236,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_count_lines",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.7083686669939198,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_count",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.6493360829917947,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_aggregate",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.8265811250021216,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_join",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5523523750016466,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_date_filter",
+          "category": "sql",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.129872792007518,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_null_handling",
+          "category": "sql",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.8696356669970555,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_file_math",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 0.0,
+          "p50_latency_s": 0.3238746249990072,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_schema_discovery",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.8132046250102576,
+          "errors": 0,
+          "trajectory_failures": 3
+        },
+        {
+          "id": "multistep_sql_then_math",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.4726037090003956,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_two_files_sum",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.5947686660074396,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_write_compute_read",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 0.0,
+          "p50_latency_s": 0.9867079579998972,
+          "errors": 0,
+          "trajectory_failures": 3
+        },
+        {
+          "id": "rag_grounded",
+          "category": "rag",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 0.0,
+          "p50_latency_s": 0.28096683300100267,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_ingest_then_recall",
+          "category": "rag",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.402695542012225,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_two_facts",
+          "category": "rag",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 0.6666666666666666,
+          "p50_latency_s": 1.2163121670018882,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_abstain_unknown",
+          "category": "rag",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 0.0,
+          "p50_latency_s": 1.2447056669916492,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_grounded_quote",
+          "category": "rag",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 0.0,
+          "p50_latency_s": 0.9306841250072466,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_recall",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.4374002499971539,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_store_then_recall_fact",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5093136250070529,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_recall_after_store",
+          "category": "memory",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.41464529099175707,
+          "errors": 0,
+          "trajectory_failures": 3
+        },
+        {
+          "id": "memory_overwrite_update",
+          "category": "memory",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.6263072919973638,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_two_facts_selective",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.47201983400736935,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_noTool",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.1344237500015879,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_syllogism",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.14428237499669194,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_counterfactual",
+          "category": "reasoning",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.13770512500195764,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_instruction_priority",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.12353487500513438,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_odd_one_out",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.14229079100186937,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_date",
+          "category": "nepal",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.6900181670062011,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_format",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.7146652910014382,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_fiscal_year",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.6481395419978071,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_transliterate",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.570093917005579,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_date_new_year",
+          "category": "nepal",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.6807481249998091,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad",
+          "category": "agentic",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.6762148339912528,
+          "errors": 0,
+          "trajectory_failures": 3
+        },
+        {
+          "id": "agentic_todo_plan",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.7433720419940073,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad_overwrite",
+          "category": "agentic",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 0.0,
+          "p50_latency_s": 0.6995239579991903,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_todo_complete",
+          "category": "agentic",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.9164162499946542,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad_two_keys",
+          "category": "agentic",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.9407247500057565,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_sql_literal_recovery",
+          "category": "regression",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5470082499959972,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_todo_flat_array",
+          "category": "regression",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.9648507500096457,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_synthesis_after_tool",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5095304999995278,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_no_tool_hallucination",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.19390183300129138,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_numeric_not_prose",
+          "category": "regression",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.6449727080034791,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    },
+    {
+      "name": "ollama:qwen2.5:3b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:3b-instruct",
+      "tool_router": false,
+      "accuracy": 0.8133333333333334,
+      "accuracy_ci": [
+        0.7434428016958636,
+        0.8675758451668085
+      ],
+      "tool_call_accuracy": 1.0,
+      "p50_latency_s": 2.391407604496635,
+      "p95_latency_s": 10.003679297396593,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "arithmetic": 1.0,
+        "files": 1.0,
+        "sql": 0.8,
+        "multistep": 0.6,
+        "rag": 0.06666666666666667,
+        "memory": 0.8666666666666667,
+        "reasoning": 1.0,
+        "nepal": 1.0,
+        "agentic": 0.8,
+        "regression": 1.0
+      },
+      "category_counts": {
+        "arithmetic": 5,
+        "files": 5,
+        "sql": 5,
+        "multistep": 5,
+        "rag": 5,
+        "memory": 5,
+        "reasoning": 5,
+        "nepal": 5,
+        "agentic": 5,
+        "regression": 5
+      },
+      "trajectory_failures": 0,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "arithmetic",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.0444697909988463,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_division",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.2486324999917997,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_percentage",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.129228208999848,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_unit_conversion",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.2157297919911798,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_multistep_word",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.1274729580036364,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_read",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.0292984590050764,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_list_then_read",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.9596498750033788,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_write_then_read",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 8.179153374992893,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_large_excerpt",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.1298150410002563,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_count_lines",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.1190253749955446,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_count",
+          "category": "sql",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.3009325839957455,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_aggregate",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.2927901250077412,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_join",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.8876615409972146,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_date_filter",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.0028940420015715,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_null_handling",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.1744362089957576,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_file_math",
+          "category": "multistep",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.5050544590048958,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_schema_discovery",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.7515555410063826,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_sql_then_math",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.9591090829926543,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_two_files_sum",
+          "category": "multistep",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.2213787919899914,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_write_compute_read",
+          "category": "multistep",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 10.774795208009891,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_grounded",
+          "category": "rag",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 6.345461874996545,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_ingest_then_recall",
+          "category": "rag",
+          "pass_rate": 0.3333333333333333,
+          "pass_ci": [
+            0.06149194472039615,
+            0.7923403991979523
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 10.457339999993565,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_two_facts",
+          "category": "rag",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 17.58860120800091,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_abstain_unknown",
+          "category": "rag",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.049344166996889,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_grounded_quote",
+          "category": "rag",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.659907834007754,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_recall",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 6.770500499987975,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_store_then_recall_fact",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 7.486023916993872,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_recall_after_store",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.743525291996775,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_overwrite_update",
+          "category": "memory",
+          "pass_rate": 0.3333333333333333,
+          "pass_ci": [
+            0.06149194472039615,
+            0.7923403991979523
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 8.19761670799926,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_two_facts_selective",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.573909624989028,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_noTool",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.13999179200618528,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_syllogism",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.5989562089962419,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_counterfactual",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.14407487500284333,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_instruction_priority",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.14713374999701045,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_odd_one_out",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.15984370801015757,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_date",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.1907747910008766,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_format",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.939385000005132,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_fiscal_year",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.9720972909999546,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_transliterate",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.4420908339961898,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_date_new_year",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.1015394999994896,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 6.585116916001425,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_todo_plan",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.6531549170031212,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad_overwrite",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.745352208003169,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_todo_complete",
+          "category": "agentic",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.719178875006037,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad_two_keys",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.6255560829886235,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_sql_literal_recovery",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.0501398330088705,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_todo_flat_array",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.763691167012439,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_synthesis_after_tool",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.0481331659975694,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_no_tool_hallucination",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.3441420000017388,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_numeric_not_prose",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.9553797919943463,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    },
+    {
+      "name": "ollama:qwen2.5:7b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:7b-instruct",
+      "tool_router": false,
+      "accuracy": 0.9266666666666666,
+      "accuracy_ci": [
+        0.8734642066329596,
+        0.9585611848396149
+      ],
+      "tool_call_accuracy": 0.9772727272727273,
+      "p50_latency_s": 3.8568636670024716,
+      "p95_latency_s": 15.027656418752303,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "arithmetic": 1.0,
+        "files": 1.0,
+        "sql": 1.0,
+        "multistep": 0.6,
+        "rag": 1.0,
+        "memory": 0.8666666666666667,
+        "reasoning": 1.0,
+        "nepal": 1.0,
+        "agentic": 1.0,
+        "regression": 0.8
+      },
+      "category_counts": {
+        "arithmetic": 5,
+        "files": 5,
+        "sql": 5,
+        "multistep": 5,
+        "rag": 5,
+        "memory": 5,
+        "reasoning": 5,
+        "nepal": 5,
+        "agentic": 5,
+        "regression": 5
+      },
+      "trajectory_failures": 3,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "arithmetic",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.055162541990285,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_division",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.1929091250058264,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_percentage",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.8992809999908786,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_unit_conversion",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.197554083002615,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "arithmetic_multistep_word",
+          "category": "arithmetic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.0931518329889514,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_read",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.6087557909922907,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_list_then_read",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.755591249995632,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_write_then_read",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 19.046021957998164,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_large_excerpt",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.6907511669996893,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "file_count_lines",
+          "category": "files",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.4271964590006974,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_count",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.271269583987305,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_aggregate",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.4038140829943586,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_join",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.9344277909985976,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_date_filter",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.5934729580039857,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_null_handling",
+          "category": "sql",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.275078709004447,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_file_math",
+          "category": "multistep",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.8813542910065735,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "sql_schema_discovery",
+          "category": "multistep",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 11.140684375001001,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_sql_then_math",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 15.069829125000979,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_two_files_sum",
+          "category": "multistep",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.182852583006024,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "multistep_write_compute_read",
+          "category": "multistep",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 0.0,
+          "p50_latency_s": 6.279496957999072,
+          "errors": 0,
+          "trajectory_failures": 3
+        },
+        {
+          "id": "rag_grounded",
+          "category": "rag",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.7576940419967286,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_ingest_then_recall",
+          "category": "rag",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 5.56088533300499,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_two_facts",
+          "category": "rag",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 16.39450091701292,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_abstain_unknown",
+          "category": "rag",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.764704916990013,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rag_grounded_quote",
+          "category": "rag",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.26966237500892,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_recall",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.8965440830070293,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_store_then_recall_fact",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.5427645000017947,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_recall_after_store",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.0128464169974905,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_overwrite_update",
+          "category": "memory",
+          "pass_rate": 0.3333333333333333,
+          "pass_ci": [
+            0.06149194472039615,
+            0.7923403991979523
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 6.968727792002028,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "memory_two_facts_selective",
+          "category": "memory",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.796843250005622,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_noTool",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.17837166700337548,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_syllogism",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 1.5203849999961676,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_counterfactual",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 2.663155000002007,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_instruction_priority",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.18498058400291484,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "reasoning_odd_one_out",
+          "category": "reasoning",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.21799941700010095,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_date",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.4353981250023935,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_format",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 5.457896792009706,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_fiscal_year",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.138075666007353,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_transliterate",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.244584000000032,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepal_date_new_year",
+          "category": "nepal",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 7.447866290996899,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.7101492499932647,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_todo_plan",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 5.311850874990341,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad_overwrite",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.969109874989954,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_todo_complete",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.749227499996778,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "agentic_scratchpad_two_keys",
+          "category": "agentic",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.281806917002541,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_sql_literal_recovery",
+          "category": "regression",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 9.081525041998248,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_todo_flat_array",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 7.829908041996532,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_synthesis_after_tool",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.6951381670078263,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_no_tool_hallucination",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 1.1804358749941457,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "rx_numeric_not_prose",
+          "category": "regression",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.864957041994785,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    }
+  ],
+  "pairwise_alpha": 0.05,
+  "pairwise_correction": "holm",
+  "pairwise_n_comparisons": 3,
+  "pairwise": [
+    {
+      "a": "ollama:qwen2.5:0.5b-instruct",
+      "b": "ollama:qwen2.5:3b-instruct",
+      "b_wins": 8,
+      "c_wins": 55,
+      "n_pairs": 150,
+      "p_value": 9.761673086614714e-10,
+      "leader": "ollama:qwen2.5:3b-instruct",
+      "significant": true,
+      "discordant_task_ids": [
+        "agentic_scratchpad",
+        "agentic_scratchpad_overwrite",
+        "agentic_scratchpad_two_keys",
+        "file_large_excerpt",
+        "file_list_then_read",
+        "file_write_then_read",
+        "memory_overwrite_update",
+        "memory_recall_after_store",
+        "multistep_file_math",
+        "multistep_two_files_sum",
+        "multistep_write_compute_read",
+        "nepal_date",
+        "nepal_date_new_year",
+        "rag_abstain_unknown",
+        "rag_ingest_then_recall",
+        "reasoning_counterfactual",
+        "rx_numeric_not_prose",
+        "rx_sql_literal_recovery",
+        "rx_todo_flat_array",
+        "sql_count",
+        "sql_date_filter",
+        "sql_null_handling"
+      ]
+    },
+    {
+      "a": "ollama:qwen2.5:0.5b-instruct",
+      "b": "ollama:qwen2.5:7b-instruct",
+      "b_wins": 0,
+      "c_wins": 64,
+      "n_pairs": 150,
+      "p_value": 1.0842021724855044e-19,
+      "leader": "ollama:qwen2.5:7b-instruct",
+      "significant": true,
+      "discordant_task_ids": [
+        "agentic_scratchpad",
+        "agentic_scratchpad_overwrite",
+        "agentic_scratchpad_two_keys",
+        "agentic_todo_complete",
+        "file_large_excerpt",
+        "file_list_then_read",
+        "file_write_then_read",
+        "memory_overwrite_update",
+        "memory_recall_after_store",
+        "multistep_file_math",
+        "multistep_two_files_sum",
+        "nepal_date",
+        "nepal_date_new_year",
+        "rag_grounded",
+        "rag_grounded_quote",
+        "rag_two_facts",
+        "reasoning_counterfactual",
+        "rx_numeric_not_prose",
+        "rx_todo_flat_array",
+        "sql_date_filter",
+        "sql_null_handling",
+        "sql_schema_discovery"
+      ]
+    },
+    {
+      "a": "ollama:qwen2.5:3b-instruct",
+      "b": "ollama:qwen2.5:7b-instruct",
+      "b_wins": 6,
+      "c_wins": 23,
+      "n_pairs": 150,
+      "p_value": 0.002315700054168701,
+      "leader": "ollama:qwen2.5:7b-instruct",
+      "significant": true,
+      "discordant_task_ids": [
+        "agentic_todo_complete",
+        "multistep_write_compute_read",
+        "rag_abstain_unknown",
+        "rag_grounded",
+        "rag_grounded_quote",
+        "rag_ingest_then_recall",
+        "rag_two_facts",
+        "rx_sql_literal_recovery",
+        "sql_count",
+        "sql_schema_discovery"
+      ]
+    }
+  ]
+}

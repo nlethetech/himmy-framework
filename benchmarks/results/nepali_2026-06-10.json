@@ -1,0 +1,373 @@
+{
+  "suite": "nepali",
+  "trials": 3,
+  "min_category_tasks": 5,
+  "models": [
+    {
+      "name": "ollama:qwen2.5:0.5b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:0.5b-instruct",
+      "tool_router": false,
+      "accuracy": 0.75,
+      "accuracy_ci": [
+        0.4676946650664343,
+        0.9110583316059452
+      ],
+      "tool_call_accuracy": 1.0,
+      "p50_latency_s": 0.6131611249948037,
+      "p95_latency_s": 1.3051134374989481,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "nepali": 0.75
+      },
+      "category_counts": {
+        "nepali": 4
+      },
+      "trajectory_failures": 0,
+      "judge": {
+        "judge_models": [
+          "claude-cli:haiku"
+        ],
+        "pass_rate": 0.0,
+        "total_trials": 3,
+        "ungraded": 0,
+        "tasks": [
+          {
+            "id": "nepali_summarization",
+            "category": "nepali",
+            "judge_pass_rate": 0.0,
+            "judge_passes": 0,
+            "graded": 3,
+            "ungraded": 0
+          }
+        ]
+      },
+      "tasks": [
+        {
+          "id": "devanagari_instruction",
+          "category": "nepali",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.5942071669996949,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "code_switched_query",
+          "category": "nepali",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.13900499998999294,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "transliteration_roundtrip",
+          "category": "nepali",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.7123308330046711,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "bs_calendar_reasoning",
+          "category": "nepali",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.6506476659997134,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepali_summarization",
+          "category": "nepali",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 1.7658150839997688,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    },
+    {
+      "name": "ollama:qwen2.5:3b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:3b-instruct",
+      "tool_router": false,
+      "accuracy": 0.5,
+      "accuracy_ci": [
+        0.2537815976337061,
+        0.7462184023662939
+      ],
+      "tool_call_accuracy": 1.0,
+      "p50_latency_s": 1.4746571459982079,
+      "p95_latency_s": 4.780513257846177,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "nepali": 0.5
+      },
+      "category_counts": {
+        "nepali": 4
+      },
+      "trajectory_failures": 0,
+      "judge": {
+        "judge_models": [
+          "claude-cli:haiku"
+        ],
+        "pass_rate": 0.0,
+        "total_trials": 3,
+        "ungraded": 0,
+        "tasks": [
+          {
+            "id": "nepali_summarization",
+            "category": "nepali",
+            "judge_pass_rate": 0.0,
+            "judge_passes": 0,
+            "graded": 3,
+            "ungraded": 0
+          }
+        ]
+      },
+      "tasks": [
+        {
+          "id": "devanagari_instruction",
+          "category": "nepali",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.14001291700697038,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "code_switched_query",
+          "category": "nepali",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.2033614999963902,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "transliteration_roundtrip",
+          "category": "nepali",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.051454583997838,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "bs_calendar_reasoning",
+          "category": "nepali",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.9960350829933304,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepali_summarization",
+          "category": "nepali",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 4.761316667005303,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    },
+    {
+      "name": "ollama:qwen2.5:7b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:7b-instruct",
+      "tool_router": false,
+      "accuracy": 0.5,
+      "accuracy_ci": [
+        0.2537815976337061,
+        0.7462184023662939
+      ],
+      "tool_call_accuracy": 1.0,
+      "p50_latency_s": 2.5285890414961614,
+      "p95_latency_s": 7.804623887655179,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "nepali": 0.5
+      },
+      "category_counts": {
+        "nepali": 4
+      },
+      "trajectory_failures": 0,
+      "judge": {
+        "judge_models": [
+          "claude-cli:haiku"
+        ],
+        "pass_rate": 0.6666666666666666,
+        "total_trials": 3,
+        "ungraded": 0,
+        "tasks": [
+          {
+            "id": "nepali_summarization",
+            "category": "nepali",
+            "judge_pass_rate": 0.6666666666666666,
+            "judge_passes": 2,
+            "graded": 3,
+            "ungraded": 0
+          }
+        ]
+      },
+      "tasks": [
+        {
+          "id": "devanagari_instruction",
+          "category": "nepali",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.17030504198919516,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "code_switched_query",
+          "category": "nepali",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.2928893749922281,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "transliteration_roundtrip",
+          "category": "nepali",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 3.1787371250102296,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "bs_calendar_reasoning",
+          "category": "nepali",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 4.780369959000382,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "nepali_summarization",
+          "category": "nepali",
+          "pass_rate": 0.6666666666666666,
+          "pass_ci": [
+            0.20765960080204765,
+            0.9385080552796037
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 4.574371791997692,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    }
+  ],
+  "pairwise_alpha": 0.05,
+  "pairwise_correction": "holm",
+  "pairwise_n_comparisons": 3,
+  "pairwise": [
+    {
+      "a": "ollama:qwen2.5:0.5b-instruct",
+      "b": "ollama:qwen2.5:3b-instruct",
+      "b_wins": 3,
+      "c_wins": 0,
+      "n_pairs": 12,
+      "p_value": 0.25,
+      "leader": "ollama:qwen2.5:0.5b-instruct",
+      "significant": false,
+      "discordant_task_ids": [
+        "bs_calendar_reasoning"
+      ]
+    },
+    {
+      "a": "ollama:qwen2.5:0.5b-instruct",
+      "b": "ollama:qwen2.5:7b-instruct",
+      "b_wins": 3,
+      "c_wins": 0,
+      "n_pairs": 12,
+      "p_value": 0.25,
+      "leader": "ollama:qwen2.5:0.5b-instruct",
+      "significant": false,
+      "discordant_task_ids": [
+        "bs_calendar_reasoning"
+      ]
+    },
+    {
+      "a": "ollama:qwen2.5:3b-instruct",
+      "b": "ollama:qwen2.5:7b-instruct",
+      "b_wins": 0,
+      "c_wins": 0,
+      "n_pairs": 12,
+      "p_value": 1.0,
+      "leader": null,
+      "significant": false,
+      "discordant_task_ids": []
+    }
+  ]
+}

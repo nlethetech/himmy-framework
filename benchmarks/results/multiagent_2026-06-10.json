@@ -1,0 +1,286 @@
+{
+  "suite": "multiagent",
+  "trials": 3,
+  "min_category_tasks": 5,
+  "models": [
+    {
+      "name": "ollama:qwen2.5:0.5b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:0.5b-instruct",
+      "tool_router": false,
+      "accuracy": 0.75,
+      "accuracy_ci": [
+        0.4676946650664343,
+        0.9110583316059452
+      ],
+      "tool_call_accuracy": null,
+      "p50_latency_s": 0.6924794170045061,
+      "p95_latency_s": 2.401968706399929,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "multiagent": 0.75
+      },
+      "category_counts": {
+        "multiagent": 4
+      },
+      "trajectory_failures": 0,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "handoff_routing",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.8527583750110352,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "delegation_synthesis",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 1.5666823749925243,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "no_handoff_control",
+          "category": "multiagent",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.3634764579910552,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "group_chat_selection",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.2564274159958586,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    },
+    {
+      "name": "ollama:qwen2.5:3b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:3b-instruct",
+      "tool_router": false,
+      "accuracy": 0.9166666666666666,
+      "accuracy_ci": [
+        0.646120088858883,
+        0.9851349055950829
+      ],
+      "tool_call_accuracy": null,
+      "p50_latency_s": 3.7415936250035884,
+      "p95_latency_s": 7.793729426596838,
+      "mean_cost": 0.0,
+      "error_rate": 0.08333333333333333,
+      "by_category": {
+        "multiagent": 0.9166666666666666
+      },
+      "category_counts": {
+        "multiagent": 4
+      },
+      "trajectory_failures": 0,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "handoff_routing",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 3.7654031670099357,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "delegation_synthesis",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 7.778929957989021,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "no_handoff_control",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.49694279200048186,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "group_chat_selection",
+          "category": "multiagent",
+          "pass_rate": 0.6666666666666666,
+          "pass_ci": [
+            0.20765960080204765,
+            0.9385080552796037
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 1.9090380420093425,
+          "errors": 1,
+          "trajectory_failures": 0
+        }
+      ]
+    },
+    {
+      "name": "ollama:qwen2.5:7b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:7b-instruct",
+      "tool_router": false,
+      "accuracy": 1.0,
+      "accuracy_ci": [
+        0.7575059933447592,
+        1.0
+      ],
+      "tool_call_accuracy": null,
+      "p50_latency_s": 7.959561208001105,
+      "p95_latency_s": 12.537157395650866,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "multiagent": 1.0
+      },
+      "category_counts": {
+        "multiagent": 4
+      },
+      "trajectory_failures": 0,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "handoff_routing",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 7.730592959007481,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "delegation_synthesis",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 12.11953470800654,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "no_handoff_control",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.49176179099595174,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "group_chat_selection",
+          "category": "multiagent",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 8.178880457999185,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    }
+  ],
+  "pairwise_alpha": 0.05,
+  "pairwise_correction": "holm",
+  "pairwise_n_comparisons": 3,
+  "pairwise": [
+    {
+      "a": "ollama:qwen2.5:0.5b-instruct",
+      "b": "ollama:qwen2.5:3b-instruct",
+      "b_wins": 1,
+      "c_wins": 3,
+      "n_pairs": 12,
+      "p_value": 0.625,
+      "leader": "ollama:qwen2.5:3b-instruct",
+      "significant": false,
+      "discordant_task_ids": [
+        "group_chat_selection",
+        "no_handoff_control"
+      ]
+    },
+    {
+      "a": "ollama:qwen2.5:0.5b-instruct",
+      "b": "ollama:qwen2.5:7b-instruct",
+      "b_wins": 0,
+      "c_wins": 3,
+      "n_pairs": 12,
+      "p_value": 0.25,
+      "leader": "ollama:qwen2.5:7b-instruct",
+      "significant": false,
+      "discordant_task_ids": [
+        "no_handoff_control"
+      ]
+    },
+    {
+      "a": "ollama:qwen2.5:3b-instruct",
+      "b": "ollama:qwen2.5:7b-instruct",
+      "b_wins": 0,
+      "c_wins": 1,
+      "n_pairs": 12,
+      "p_value": 1.0,
+      "leader": "ollama:qwen2.5:7b-instruct",
+      "significant": false,
+      "discordant_task_ids": [
+        "group_chat_selection"
+      ]
+    }
+  ]
+}

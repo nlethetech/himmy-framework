@@ -130,9 +130,15 @@ def test_transliteration_grade_matches_toolkit_ground_truth() -> None:
 def test_bs_calendar_grade_matches_toolkit_ground_truth() -> None:
     suite = nepali_suite()
     task = _task(suite, "bs_calendar_reasoning")
-    truth_year = str(ad_to_bs(datetime.date(2026, 4, 14)).year)
-    assert task.grade["value"] == truth_year
+    truth_year = str(ad_to_bs(datetime.date(2020, 6, 15)).year)
+    devanagari_year = truth_year.translate(str.maketrans("0123456789", "०१२३४५६७८९"))
+    values = [leaf["value"] for leaf in task.grade["of"]]
+    assert truth_year in values
+    # The grade must accept the year in either script: a model answering the Nepali
+    # question in Nepali writes २०७७, which an ASCII-only contains can't see.
+    assert devanagari_year in values
     assert grade(task.grade, f"The year is {truth_year} BS.") is True
+    assert grade(task.grade, f"त्यो मिति {devanagari_year} सालमा पर्छ।") is True
 
 
 # --- deterministic tasks end-to-end against the stub provider -------------------------
@@ -181,15 +187,29 @@ def test_transliteration_roundtrip_end_to_end() -> None:
 
 
 def test_bs_calendar_reasoning_end_to_end() -> None:
-    year = str(ad_to_bs(datetime.date(2026, 4, 14)).year)
+    year = str(ad_to_bs(datetime.date(2020, 6, 15)).year)
     make = lambda: _ToolThenAnswer(  # noqa: E731
         "nepali_date",
-        {"ad": "2026-04-14", "bs": f"{year}-01-01", "bs_month_en": "Baishakh"},
+        {"ad": "2020-06-15", "bs": f"{year}-03-01", "bs_month_en": "Ashadh"},
         f"त्यो मिति {year} सालमा पर्छ।",
     )
     card = _run_task("bs_calendar_reasoning", make)
     assert card.accuracy == 1.0
     assert all(t.trajectory_ok is True for t in card.task_scores[0].trials)
+
+
+def test_bs_calendar_target_year_is_not_the_current_bs_year() -> None:
+    # Guard against the lucky-pass flaw the first sweep exposed: when the task's expected
+    # BS year equals the CURRENT BS year, a model that calls nepali_date with no/today's
+    # date passes by accident (qwen2.5:0.5b did exactly that, 3/3). The target date must
+    # stay in a different BS year.
+    task = next(t for t in nepali_suite().tasks if t.id == "bs_calendar_reasoning")
+    current_year = str(ad_to_bs(datetime.date.today()).year)
+    current_devanagari = current_year.translate(
+        str.maketrans("0123456789", "०१२३४५६७८९")
+    )
+    for leaf in task.grade["of"]:
+        assert leaf["value"] not in (current_year, current_devanagari)
 
 
 def test_wrong_answer_fails_deterministic_task() -> None:

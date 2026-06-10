@@ -1,0 +1,244 @@
+{
+  "suite": "skills",
+  "trials": 3,
+  "min_category_tasks": 5,
+  "models": [
+    {
+      "name": "ollama:qwen2.5:0.5b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:0.5b-instruct",
+      "tool_router": false,
+      "accuracy": 0.6666666666666666,
+      "accuracy_ci": [
+        0.3542021355803963,
+        0.879416181613089
+      ],
+      "tool_call_accuracy": 1.0,
+      "p50_latency_s": 0.4938364999979967,
+      "p95_latency_s": 1.3842520082049299,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "skills": 0.6666666666666666
+      },
+      "category_counts": {
+        "skills": 3
+      },
+      "trajectory_failures": 0,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "skill_sql",
+          "category": "skills",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.5382533339870861,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "skill_file",
+          "category": "skills",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 0.4938364999979967,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "skill_summarize",
+          "category": "skills",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.29660758400859777,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    },
+    {
+      "name": "ollama:qwen2.5:3b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:3b-instruct",
+      "tool_router": false,
+      "accuracy": 0.6666666666666666,
+      "accuracy_ci": [
+        0.3542021355803963,
+        0.879416181613089
+      ],
+      "tool_call_accuracy": 1.0,
+      "p50_latency_s": 1.285778500008746,
+      "p95_latency_s": 3.161561658000573,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "skills": 0.6666666666666666
+      },
+      "category_counts": {
+        "skills": 3
+      },
+      "trajectory_failures": 0,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "skill_sql",
+          "category": "skills",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.285778500008746,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "skill_file",
+          "category": "skills",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.462096957999165,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "skill_summarize",
+          "category": "skills",
+          "pass_rate": 0.0,
+          "pass_ci": [
+            0.0,
+            0.5614970317550455
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 0.5693742910079891,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    },
+    {
+      "name": "ollama:qwen2.5:7b-instruct",
+      "provider": "ollama",
+      "model": "qwen2.5:7b-instruct",
+      "tool_router": false,
+      "accuracy": 1.0,
+      "accuracy_ci": [
+        0.7008549515804559,
+        1.0
+      ],
+      "tool_call_accuracy": 1.0,
+      "p50_latency_s": 2.1623551249940647,
+      "p95_latency_s": 4.83106545000337,
+      "mean_cost": 0.0,
+      "error_rate": 0.0,
+      "by_category": {
+        "skills": 1.0
+      },
+      "category_counts": {
+        "skills": 3
+      },
+      "trajectory_failures": 0,
+      "judge": null,
+      "tasks": [
+        {
+          "id": "skill_sql",
+          "category": "skills",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 2.2474410830036504,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "skill_file",
+          "category": "skills",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": 1.0,
+          "p50_latency_s": 1.8157149580074474,
+          "errors": 0,
+          "trajectory_failures": 0
+        },
+        {
+          "id": "skill_summarize",
+          "category": "skills",
+          "pass_rate": 1.0,
+          "pass_ci": [
+            0.43850296824495455,
+            1.0
+          ],
+          "tool_call_rate": null,
+          "p50_latency_s": 1.1725319170072908,
+          "errors": 0,
+          "trajectory_failures": 0
+        }
+      ]
+    }
+  ],
+  "pairwise_alpha": 0.05,
+  "pairwise_correction": "holm",
+  "pairwise_n_comparisons": 3,
+  "pairwise": [
+    {
+      "a": "ollama:qwen2.5:0.5b-instruct",
+      "b": "ollama:qwen2.5:3b-instruct",
+      "b_wins": 0,
+      "c_wins": 0,
+      "n_pairs": 9,
+      "p_value": 1.0,
+      "leader": null,
+      "significant": false,
+      "discordant_task_ids": []
+    },
+    {
+      "a": "ollama:qwen2.5:0.5b-instruct",
+      "b": "ollama:qwen2.5:7b-instruct",
+      "b_wins": 0,
+      "c_wins": 3,
+      "n_pairs": 9,
+      "p_value": 0.25,
+      "leader": "ollama:qwen2.5:7b-instruct",
+      "significant": false,
+      "discordant_task_ids": [
+        "skill_summarize"
+      ]
+    },
+    {
+      "a": "ollama:qwen2.5:3b-instruct",
+      "b": "ollama:qwen2.5:7b-instruct",
+      "b_wins": 0,
+      "c_wins": 3,
+      "n_pairs": 9,
+      "p_value": 0.25,
+      "leader": "ollama:qwen2.5:7b-instruct",
+      "significant": false,
+      "discordant_task_ids": [
+        "skill_summarize"
+      ]
+    }
+  ]
+}

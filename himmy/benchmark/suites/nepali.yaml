@@ -44,14 +44,24 @@ tasks:
   # --- 4. BS-calendar reasoning in Nepali (DETERMINISTIC — nepali_date is ground truth) -
   - id: bs_calendar_reasoning
     category: nepali
-    # The question is in Nepali: "What is the date 2026-04-14 AD in Bikram Sambat? Use the
-    # nepali_date tool and report the year." Ground truth: ad_to_bs(2026-04-14) -> 2083 BS
-    # (Nepali New Year 2083-01-01), computed by the toolkit in the test, never hand-coded.
-    prompt: "२०२६-०४-१४ ई. लाई विक्रम सम्बत्‌मा कुन वर्ष पर्छ? nepali_date उपकरण प्रयोग गरी वर्ष बताउनुहोस्।"
+    # The question is in Nepali: "What is the date 2020-06-15 AD in Bikram Sambat? Use the
+    # nepali_date tool and report the year." Ground truth: ad_to_bs(2020-06-15) -> 2077 BS,
+    # computed by the toolkit in the test, never hand-coded. The target date must lie in a
+    # PAST BS year: the first sweep used 2026-04-14 -> 2083, which equals the CURRENT BS
+    # year, so a model that called nepali_date with no/today's date passed by accident
+    # (qwen2.5:0.5b did exactly that, 3/3).
+    prompt: "२०२०-०६-१५ ई. लाई विक्रम सम्बत्‌मा कुन वर्ष पर्छ? nepali_date उपकरण प्रयोग गरी वर्ष बताउनुहोस्।"
     packs: [nepal]
     expect_tools: [nepali_date]
-    instructions: ["Use the nepali_date tool for the AD date 2026-04-14 and report the BS year."]
-    grade: { type: contains, value: "2083" }
+    instructions: ["Use the nepali_date tool for the AD date 2020-06-15 and report the BS year."]
+    # Accept the year in either script: a model answering the Nepali question in Nepali
+    # writes २०७७, which an ASCII-only `contains "2077"` can't see (the first sweep failed
+    # qwen2.5:7b on exactly this despite a correct conversion).
+    grade:
+      type: any_of
+      of:
+        - { type: contains, value: "2077" }
+        - { type: contains, value: "२०७७" }
     trajectory: { type: tool_called, value: nepali_date }
 
   # --- 5. Nepali summarization (JUDGE-graded — open-ended, reported NOT gated) ----------
