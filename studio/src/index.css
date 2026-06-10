@@ -1020,12 +1020,10 @@ label.field > .hint {
 /* ledger entries */
 .msg {
   display: block;
-  padding: 16px 0 18px;
-  border-bottom: 1px solid var(--border);
+  padding: 14px 0 18px;
+  /* no rules between turns — the speaker labels carry the rhythm; the canvas
+     stays one immersive surface */
   animation: rise 0.18s ease;
-}
-.chat-thread .msg:last-child {
-  border-bottom: none;
 }
 .msg .avatar {
   display: none; /* speakers are labels, not chips */
