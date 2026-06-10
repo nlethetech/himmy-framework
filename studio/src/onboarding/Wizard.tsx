@@ -9,6 +9,7 @@ import {
 import { markDone, setPreferredProvider } from "./firstRun";
 import {
   DEFAULT_FIRST_PROMPT,
+  DEFAULT_TOOL_PACKS,
   TEMPLATES,
   type AgentTemplate,
 } from "./templates";
@@ -174,6 +175,13 @@ export default function Wizard({
       .filter(Boolean)
       .slice(0, 40);
     if (lines.length) spec.instructions = lines;
+    // A first agent must be CAPABLE, not a bare prompt: bind the template's
+    // tool packs (or the default set), durable memory, and the tool router so
+    // it can actually research, fetch news, and keep the boards — instead of
+    // hallucinating "[News Article 1]" placeholders.
+    spec.tool_packs = tpl?.toolPacks ?? DEFAULT_TOOL_PACKS;
+    spec.memory = true;
+    spec.tool_router = true;
     const path = (slugify(agentName) || "my-agent") + ".agent.yaml";
     try {
       const saved = await api.put<AgentSummary>("/agents", {
@@ -193,7 +201,7 @@ export default function Wizard({
     } finally {
       setCreating(false);
     }
-  }, [name, desc, instructions, creating, created]);
+  }, [name, desc, instructions, creating, created, tpl]);
 
   const advance = useCallback(() => {
     if (step === 1 || step === 2) setStep(step + 1);

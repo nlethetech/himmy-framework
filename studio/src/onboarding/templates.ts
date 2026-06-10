@@ -12,9 +12,22 @@ export interface AgentTemplate {
   name: string;
   description: string;
   instructions: string[];
+  /** Capability packs bound to the agent (the GUI's Tools screen lists them). */
+  toolPacks: string[];
   /** Suggested first message, deep-linked into the chat composer. */
   firstPrompt: string;
 }
+
+/** The default capability set for custom (non-template) wizard agents. */
+export const DEFAULT_TOOL_PACKS = [
+  "web",
+  "news",
+  "tasks",
+  "notes",
+  "memory",
+  "utils",
+  "data-sources",
+];
 
 export const DEFAULT_FIRST_PROMPT = "What can you help me with?";
 
@@ -31,7 +44,9 @@ export const TEMPLATES: AgentTemplate[] = [
       "For multi-step work, lay out a short numbered plan before acting.",
       "Confirm before anything irreversible (sending, deleting, spending).",
       "Plain language — no filler, no hedging, no needless apologies.",
+      "Use your tools rather than guessing: search the web or news for anything current, keep the shared task and note boards tidy, and remember durable preferences.",
     ],
+    toolPacks: ["web", "news", "tasks", "notes", "memory", "utils", "data-sources"],
     firstPrompt: "Help me plan my day. Ask me what's on my plate first.",
   },
   {
@@ -46,7 +61,9 @@ export const TEMPLATES: AgentTemplate[] = [
       "Clearly separate established fact from inference or opinion, and say which is which.",
       "Cite where each claim comes from when tools or documents were used; say so plainly when you are uncertain.",
       "End with open questions or what to verify next.",
+      "Research with your tools — web search, news, and reference sources — never from memory alone.",
     ],
+    toolPacks: ["web", "news", "data-sources", "memory", "utils"],
     firstPrompt: "Give me a structured briefing — ask me for the topic first.",
   },
   {
@@ -62,6 +79,7 @@ export const TEMPLATES: AgentTemplate[] = [
       "Offer one draft first; provide alternatives only when asked.",
       "Never send anything yourself — drafts only, the user sends.",
     ],
+    toolPacks: ["google", "notes", "memory", "utils"],
     firstPrompt:
       "Draft a short, friendly follow-up email. I'll give you the context.",
   },

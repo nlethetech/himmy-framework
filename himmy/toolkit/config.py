@@ -71,6 +71,10 @@ class ToolkitConfig(BaseModel):
     # memory pack -----------------------------------------------------------
     memory_path: str | None = None  # sqlite file → durable; None → in-process
     memory_subject: str = "default"
+    #: Explicit server-context marker for pack registration: the Studio BFF sets
+    #: this when building runtimes so packs default to durable stores without
+    #: relying on the lifespan ContextVar crossing task boundaries.
+    server_context: bool = False
     # Optional recall floor (HIMMY_MEMORY_MIN_SIM): below it a memory is not
     # recalled. None preserves the always-return-the-top-hit default.
     memory_min_similarity: float | None = None

@@ -770,6 +770,7 @@ async def stream_agent_run(
             on_event=_on_event,
             capture_io=True,  # power the cognition stream + trace inspector
             checkpoint_store=get_checkpoint_store(),  # pause on approval-gated tools
+            durable_defaults=True,
         )
     )
     has_tools = registry is not None

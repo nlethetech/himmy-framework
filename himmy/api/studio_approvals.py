@@ -183,6 +183,7 @@ async def resolve(
             on_event=_on_event,
             capture_io=True,
             checkpoint_store=store,
+            durable_defaults=True,
         )
     )
     cog = ss._Cognition(ss._read_only_map(registry), spec.name)

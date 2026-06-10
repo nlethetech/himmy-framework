@@ -109,8 +109,12 @@ class StoreFactory:
         return cls._sqlite_store()
 
     @classmethod
-    def for_context(cls) -> object:
+    def for_context(cls, server: bool | None = None) -> object:
         """Return a store chosen by the current :data:`_SERVER_CONTEXT` (sync).
+
+        ``server`` overrides the context flag explicitly (the flag is set in the
+        app lifespan task and does not survive every task/thread boundary —
+        callers that KNOW they are the server pass ``True``).
 
         Used by the shared ``build_runtime_for_spec`` wiring, which is synchronous and so
         cannot ``await`` a Postgres pool. In a server context it returns the file-backed
@@ -118,7 +122,7 @@ class StoreFactory:
         CLI path it returns the in-memory store. The async, Postgres-capable
         :meth:`for_server` is used by the API container where an event loop is available.
         """
-        if in_server_context():
+        if server if server is not None else in_server_context():
             return cls._sqlite_store()
         return cls.for_cli()
 

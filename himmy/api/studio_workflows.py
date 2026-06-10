@@ -81,7 +81,9 @@ async def run_workflow(
     wf = load_workflow_spec(str(resolve_spec_path(workflow_path)))
     spec = load_studio_spec(agent_path, provider=provider, model=model)
     runtime, _registry = await asyncio.to_thread(
-        lambda: from_spec.build_runtime_for_spec(spec, provider=provider, model=model)
+        lambda: from_spec.build_runtime_for_spec(
+            spec, provider=provider, model=model, durable_defaults=True
+        )
     )
     orch = WorkflowOrchestrator(runtime)
     return await orch.run(wf, spec.to_persona(), initial_state=initial_state or {})

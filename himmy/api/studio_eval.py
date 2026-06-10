@@ -62,7 +62,9 @@ async def run_eval(
     suite = load_eval_suite(str(resolve_spec_path(suite_path)))
     spec = load_studio_spec(agent_path, provider=provider, model=model)
     runtime, _registry = await asyncio.to_thread(
-        lambda: from_spec.build_runtime_for_spec(spec, provider=provider, model=model)
+        lambda: from_spec.build_runtime_for_spec(
+            spec, provider=provider, model=model, durable_defaults=True
+        )
     )
     harness = AgentEvalHarness(runtime, EvaluationService())
     return await harness.evaluate_agent(

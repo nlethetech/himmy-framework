@@ -126,6 +126,7 @@ def build_runtime_for_spec(
     on_log: Callable[[str], None] | None = None,
     capture_io: bool = False,
     checkpoint_store: Any = None,
+    durable_defaults: bool | None = None,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring provider/model overrides + tools.
 
@@ -137,6 +138,12 @@ def build_runtime_for_spec(
 
     Knowledge ingestion runs an inner ``asyncio.run``; call this from a worker thread
     (``asyncio.to_thread``) when invoking from inside an event loop.
+
+    ``durable_defaults`` makes the server-vs-CLI storage decision EXPLICIT: the
+    Studio BFF passes ``True`` so agent memory (and storage) land in the durable
+    project stores; ``None`` falls back to the server-context flag, which does
+    not survive every task/thread boundary (it is set in the app lifespan task)
+    — explicit beats inferred at this seam.
     """
     from himmy import build_runtime
     from himmy.cli.provider import build_inference_for
@@ -153,7 +160,12 @@ def build_runtime_for_spec(
     # file-backed SQLite store so an agent's runs/lineage survive restarts; on the
     # one-shot CLI path it is the in-memory store (zero setup). The same instance is
     # reused for the runtime and any memory ContextService below so they share state.
-    storage: Any = StoreFactory.for_context()
+    from himmy.services.storage.factory import in_server_context
+
+    server = durable_defaults if durable_defaults is not None else in_server_context()
+    storage: Any = (
+        StoreFactory.for_context(server=True) if server else StoreFactory.for_context()
+    )
 
     overrides: dict[str, Any] = {"inference": inference, "storage": storage}
     if on_event is not None:
@@ -191,13 +203,11 @@ def build_runtime_for_spec(
             SqliteMemoryStore,
         )
         from himmy.toolkit import ToolkitConfig
+        from himmy.toolkit.memory import effective_memory_path
 
         tk = ToolkitConfig.from_sources(load_project().get("toolkit"))
-        store = (
-            SqliteMemoryStore(tk.memory_path)
-            if tk.memory_path
-            else InMemoryMemoryStore()
-        )
+        memory_db = effective_memory_path(tk, server=server)
+        store = SqliteMemoryStore(memory_db) if memory_db else InMemoryMemoryStore()
         memory = MemoryService(
             store,
             embedder=tk.build_embedder_and_dim()[0],
@@ -230,6 +240,7 @@ def build_runtime_for_spec(
             from himmy.toolkit import ToolkitConfig, register_packs
 
             tk_config = ToolkitConfig.from_sources(load_project().get("toolkit"))
+            tk_config.server_context = server
             register_packs(registry, spec.tool_packs, tk_config)
         if spec.knowledge:
             # Auto-ingest the declared docs into a local knowledge base and give the
@@ -237,11 +248,9 @@ def build_runtime_for_spec(
             from himmy.toolkit import ToolkitConfig, register_packs
 
             if "knowledge" not in spec.tool_packs:
-                register_packs(
-                    registry,
-                    ["knowledge"],
-                    ToolkitConfig.from_sources(load_project().get("toolkit")),
-                )
+                _kb_config = ToolkitConfig.from_sources(load_project().get("toolkit"))
+                _kb_config.server_context = server
+                register_packs(registry, ["knowledge"], _kb_config)
             n = asyncio.run(ingest_knowledge_sources(registry, spec.knowledge))
             if on_log is not None:
                 on_log(f"ingested {n} document(s) into the knowledge base")

@@ -71,6 +71,32 @@ _CONSOLIDATE_SCHEMA = {
 }
 
 
+def effective_memory_path(
+    config: ToolkitConfig, server: bool | None = None
+) -> str | None:
+    """The memory store path agents should actually use.
+
+    Explicit config (``HIMMY_MEMORY_PATH`` / project toolkit config) always wins.
+    Otherwise, inside a SERVER entrypoint (Studio/BFF) memories default to the
+    SAME durable store the Memory API reads — ``.himmy/memory.db`` under the
+    project root — so an agent's ``remember`` survives the run and shows up in
+    the GUI. On the one-shot CLI path the default stays in-memory (zero setup),
+    unchanged. (Found live: agents remembered into an ephemeral store while the
+    Brain/Memory screens read the durable one — memories silently vanished.)
+    """
+    if config.memory_path:
+        return config.memory_path
+    from himmy.services.storage.factory import in_server_context
+
+    if not (server if server is not None else in_server_context()):
+        return None
+    from pathlib import Path
+
+    d = Path(".himmy")
+    d.mkdir(exist_ok=True)
+    return str(d / "memory.db")
+
+
 def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     """Register ``remember`` + ``recall`` (and ``consolidate`` when enabled).
 
@@ -79,11 +105,8 @@ def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     blindly appending — the consolidation decision is itself audited on the spine when
     a registry/event sink is wired.
     """
-    store = (
-        SqliteMemoryStore(config.memory_path)
-        if config.memory_path
-        else InMemoryMemoryStore()
-    )
+    path = effective_memory_path(config, server=config.server_context or None)
+    store = SqliteMemoryStore(path) if path else InMemoryMemoryStore()
     embedder, _dim = config.build_embedder_and_dim()
     memory = MemoryService(
         store, embedder=embedder, min_similarity=config.memory_min_similarity

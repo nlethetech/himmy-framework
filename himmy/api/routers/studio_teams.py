@@ -384,7 +384,10 @@ async def _workflow_stream(
     try:
         runtime, _registry = await asyncio.to_thread(
             lambda: from_spec.build_runtime_for_spec(
-                spec, provider=body.provider, model=body.model
+                spec,
+                provider=body.provider,
+                model=body.model,
+                durable_defaults=True,
             )
         )
     except Exception as exc:  # noqa: BLE001 - a missing provider is a clean frame
