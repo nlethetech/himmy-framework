@@ -4459,3 +4459,22 @@ mark.hl.hl-first {
 .home-inline-item:hover .state {
   color: var(--text-muted);
 }
+
+/* Settings: app toggle rows are buttons — strip native chrome to ledger form */
+.run-line.set-toggle {
+  display: flex;
+  width: 100%;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  align-items: center;
+  gap: 12px;
+}
+.run-line.set-toggle:hover {
+  background: var(--card);
+}

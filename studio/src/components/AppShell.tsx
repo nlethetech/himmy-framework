@@ -6,20 +6,18 @@ import {
   ChatIcon,
   BellIcon,
   RunsIcon,
-  BuildIcon,
-  PlugIcon,
-  DoctorIcon,
   ChevronIcon,
   MemoryIcon,
   BookIcon,
-  GlobeIcon,
   CalendarIcon,
   SearchIcon,
+  GearIcon,
   PlusIcon,
   CheckIcon,
   MailIcon,
 } from "./icons";
 import { useTheme } from "./ui/useTheme";
+import { APP_DEFS, APPS_CHANGED, enabledApps } from "../lib/apps";
 import { useAccent } from "./ui/useAccent";
 
 type NavItem = {
@@ -45,34 +43,17 @@ const WORKSPACE: NavItem[] = [
   { to: "/activity", label: "Activity", Icon: RunsIcon },
 ];
 
-const APPS: NavItem[] = [
-  { to: "/calendar", label: "Calendar", Icon: CalendarIcon },
-  { to: "/email", label: "Email", Icon: MailIcon },
-  { to: "/tasks", label: "Tasks", Icon: CheckIcon },
-  { to: "/notes", label: "Notes", Icon: BookIcon },
-  { to: "/research", label: "Research", Icon: SearchIcon },
-  { to: "/brain", label: "Brain", Icon: MemoryIcon },
-];
-
-const BUILD: NavItem[] = [
-  { to: "/agents", label: "Agents", Icon: BuildIcon },
-  { to: "/tools", label: "Tools", Icon: BuildIcon },
-  { to: "/cookbook", label: "Cookbook", Icon: BookIcon },
-  { to: "/models", label: "Models", Icon: DoctorIcon },
-  { to: "/compare", label: "Compare", Icon: DoctorIcon },
-  { to: "/connections", label: "Connections", Icon: PlugIcon },
-];
-
-const ADVANCED: NavItem[] = [
-  { to: "/advanced/teams", label: "Teams", Icon: BuildIcon },
-  { to: "/advanced/workflows", label: "Workflows", Icon: RunsIcon },
-  { to: "/advanced/knowledge", label: "Knowledge", Icon: BookIcon },
-  { to: "/advanced/memory", label: "Memory", Icon: MemoryIcon },
-  { to: "/advanced/eval", label: "Evaluation", Icon: GlobeIcon },
-  { to: "/advanced/lineage", label: "Lineage", Icon: GlobeIcon },
-  { to: "/advanced/doctor", label: "Doctor", Icon: DoctorIcon },
-  { to: "/theme", label: "Theme", Icon: GlobeIcon },
-];
+// Apps are user-customizable (Settings → Sidebar apps); icons keyed off the
+// shared registry. Build + Advanced live inside Settings now — the sidebar
+// carries only daily work.
+const APP_ICONS: Record<string, NavItem["Icon"]> = {
+  calendar: CalendarIcon,
+  email: MailIcon,
+  tasks: CheckIcon,
+  notes: BookIcon,
+  research: SearchIcon,
+  brain: MemoryIcon,
+};
 
 function SidebarItem({ item }: { item: NavItem }) {
   return (
@@ -128,8 +109,15 @@ function Section({
 
 export function AppShell({ children }: { children: ReactNode }) {
   const apps = useSection("apps", true);
-  const build = useSection("build", false);
-  const advanced = useSection("advanced", false);
+  const [enabled, setEnabled] = useState<Set<string>>(() => enabledApps());
+  useEffect(() => {
+    const onChange = () => setEnabled(enabledApps());
+    window.addEventListener(APPS_CHANGED, onChange);
+    return () => window.removeEventListener(APPS_CHANGED, onChange);
+  }, []);
+  const appItems: NavItem[] = APP_DEFS.filter((a) => enabled.has(a.key)).map(
+    (a) => ({ to: a.to, label: a.label, Icon: APP_ICONS[a.key] }),
+  );
   const [collapsed, setCollapsed] = useState<boolean>(
     () => localStorage.getItem("himmy.sb.collapsed") === "1",
   );
@@ -189,13 +177,13 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem key={i.to} item={i} />
         ))}
 
-        {!collapsed && (
-          <>
-            <Section label="Apps" items={APPS} state={apps} />
-            <Section label="Build" items={BUILD} state={build} />
-            <Section label="Advanced" items={ADVANCED} state={advanced} />
-          </>
+        {!collapsed && appItems.length > 0 && (
+          <Section label="Apps" items={appItems} state={apps} />
         )}
+
+        <SidebarItem
+          item={{ to: "/settings", label: "Settings", Icon: GearIcon }}
+        />
 
         <div className="sb-foot">
           <span className="sb-foot-avatar" />

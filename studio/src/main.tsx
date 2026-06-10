@@ -28,6 +28,7 @@ import Models from "./screens/Models";
 import Tools from "./screens/Tools";
 import Brain from "./screens/Brain";
 import Theme from "./screens/Theme";
+import Settings from "./screens/Settings";
 import "./index.css";
 
 // New task-first IA. Screens not yet built (Home/Connections/Approvals) render a
@@ -42,6 +43,7 @@ const router = createBrowserRouter([
       { path: "chat", element: <Chat /> },
       { path: "chats", element: <Chats /> },
       { path: "search", element: <Chats /> },
+      { path: "settings", element: <Settings /> },
       { path: "research", element: <Research /> },
       { path: "calendar", element: <Calendar /> },
       { path: "email", element: <Email /> },
