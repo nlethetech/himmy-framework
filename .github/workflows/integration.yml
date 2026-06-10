@@ -74,6 +74,10 @@ jobs:
           # payloads). Bump deliberately, watching the live multi-agent tests.
           curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
           ollama -v
+          # The installer auto-starts a systemd service that ignores this job's
+          # env (OLLAMA_NUM_PARALLEL etc.) — stop it so OUR serve below, which
+          # inherits the env, is the one that binds.
+          sudo systemctl stop ollama 2>/dev/null || true
           ollama serve &
           # Wait for the daemon to accept connections.
           for _ in $(seq 1 30); do
@@ -128,6 +132,10 @@ jobs:
           # payloads). Bump deliberately, watching the live multi-agent tests.
           curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
           ollama -v
+          # The installer auto-starts a systemd service that ignores this job's
+          # env (OLLAMA_NUM_PARALLEL etc.) — stop it so OUR serve below, which
+          # inherits the env, is the one that binds.
+          sudo systemctl stop ollama 2>/dev/null || true
           ollama serve &
           for _ in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags >/dev/null && break || sleep 2
@@ -183,6 +191,10 @@ jobs:
           # payloads). Bump deliberately, watching the live multi-agent tests.
           curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
           ollama -v
+          # The installer auto-starts a systemd service that ignores this job's
+          # env (OLLAMA_NUM_PARALLEL etc.) — stop it so OUR serve below, which
+          # inherits the env, is the one that binds.
+          sudo systemctl stop ollama 2>/dev/null || true
           ollama serve &
           for _ in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags >/dev/null && break || sleep 2
