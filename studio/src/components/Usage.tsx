@@ -217,7 +217,7 @@ export function AnalyticsPanel({ a }: { a: RunAnalytics }) {
       <div className="analytics-cols">
         {byDay.length > 0 && (
           <div className="analytics-card">
-            <div className="analytics-head">Activity</div>
+            <div className="analytics-head">Daily</div>
             <div className="spark">
               {byDay.map((d) => {
                 const h =
@@ -245,7 +245,7 @@ export function AnalyticsPanel({ a }: { a: RunAnalytics }) {
 
         {byModel.length > 0 && (
           <div className="analytics-card">
-            <div className="analytics-head">By model</div>
+            <div className="analytics-head">Models</div>
             <div className="model-table">
               {byModel.map((m) => (
                 <div className="model-row" key={m.model}>

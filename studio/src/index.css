@@ -1725,24 +1725,25 @@ mark.hl.hl-first {
 
 /* ---- Analytics dashboard (Runs header) ------------------------------ */
 .analytics {
-  margin-bottom: 16px;
+  margin-bottom: 34px;
 }
+/* the stat band: figures between two rules, like a report's key-numbers row */
 .kpis {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
-  gap: 10px;
-  margin-bottom: 12px;
+  gap: 18px;
+  padding: 18px 2px;
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 30px;
 }
 .kpi {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 12px 10px;
-  text-align: center;
+  text-align: left;
 }
 .kpi-val {
-  font-size: 20px;
+  font-size: 21px;
   font-weight: 600;
+  letter-spacing: -0.2px;
   color: var(--text);
 }
 .kpi.ok .kpi-val {
@@ -1755,68 +1756,82 @@ mark.hl.hl-first {
   color: var(--err);
 }
 .kpi-lab {
-  font-size: 10.5px;
+  font-family: var(--mono);
+  font-size: 9.5px;
   color: var(--text-dim);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-top: 3px;
+  letter-spacing: 1.3px;
+  margin-top: 5px;
 }
 .analytics-cols {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 36px;
+  align-items: start;
 }
 .analytics-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 12px 14px;
+  background: none;
+  border: none;
+  padding: 0;
 }
 .analytics-head {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-muted);
-  margin-bottom: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--text-dim);
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
 }
 .spark {
   display: flex;
   align-items: flex-end;
-  gap: 3px;
-  height: 72px;
+  gap: 6px;
+  height: 104px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0;
 }
 .spark-bar {
   flex: 1;
-  min-width: 3px;
-  background: var(--cyan);
+  max-width: 26px;
+  min-width: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-bottom: none;
   border-radius: 2px 2px 0 0;
-  opacity: 0.8;
-  transition: opacity 0.15s;
+  transition: background 0.12s;
 }
 .spark-bar:hover {
-  opacity: 1;
+  background: var(--hover);
+}
+.spark-bar:last-child {
+  background: var(--brand-soft);
+  border-color: var(--brand-line); /* today */
 }
 .spark-axis {
   display: flex;
   justify-content: space-between;
-  font-size: 10px;
+  font-size: 9.5px;
+  letter-spacing: 0.8px;
   color: var(--text-dim);
-  margin-top: 5px;
+  margin-top: 6px;
 }
 .model-table {
   display: flex;
   flex-direction: column;
-  gap: 2px;
 }
 .model-row {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: baseline;
+  gap: 10px;
   font-size: 11.5px;
-  padding: 5px 0;
-  border-top: 1px solid var(--border);
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--border);
 }
-.model-row:first-child {
-  border-top: none;
+.model-row:last-child {
+  border-bottom: none;
 }
 .model-name {
   flex: 1;
@@ -1834,7 +1849,7 @@ mark.hl.hl-first {
   text-align: right;
 }
 .model-cost {
-  color: var(--warn);
+  color: var(--text-muted);
   min-width: 56px;
   text-align: right;
 }

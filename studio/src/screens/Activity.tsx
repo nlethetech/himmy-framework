@@ -61,52 +61,45 @@ export default function Activity() {
         ) : data ? (
           <>
             {analytics && <AnalyticsPanel a={analytics} />}
-            <div className="card">
-              {data.items.map((r: RunSummary) => (
-                <div
-                  className="list-row"
-                  key={r.id}
-                  onClick={() => nav(`/activity/${r.id}`)}
-                >
-                  <div className="lead">
-                    <div className="row gap10">
-                      <span className="title">{r.agent_name ?? "agent"}</span>
+            <section className="home-sec">
+              <div className="home-sec-head">
+                <span>Runs</span>
+                <span>{data.total} total</span>
+              </div>
+              {data.items.map((r: RunSummary) => {
+                const tok = (r.input_tokens || 0) + (r.output_tokens || 0);
+                const meta = [
+                  r.agent_name ?? "agent",
+                  duration(r.duration_ms),
+                  tok > 0 ? fmtTokens(tok) : null,
+                  (r.cost || 0) > 0 ? fmtUsd(r.cost) : null,
+                  r.tool_count > 0 ? `${r.tool_count} tools` : null,
+                  relativeTime(r.created_at),
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                return (
+                  <div
+                    className="run-line"
+                    role="button"
+                    tabIndex={0}
+                    key={r.id}
+                    onClick={() => nav(`/activity/${r.id}`)}
+                    style={{ cursor: "pointer" }}
+                  >
+                    <span className="run-line-prompt">
+                      {r.prompt || "(no prompt)"}
+                    </span>
+                    {statusClass(r.status) !== "ok" && (
                       <span className={"pill " + statusClass(r.status)}>
-                        <span className="dot" />
                         {statusLabel(r.status)}
                       </span>
-                      {r.tool_count > 0 && (
-                        <span className="pill dim">⚙ {r.tool_count}</span>
-                      )}
-                    </div>
-                    <span className="meta">{r.prompt || "(no prompt)"}</span>
+                    )}
+                    <span className="run-line-meta mono">{meta}</span>
                   </div>
-                  <div className="stack gap6" style={{ textAlign: "right" }}>
-                    <span className="meta">{relativeTime(r.created_at)}</span>
-                    <span className="meta">
-                      {r.provider ?? "auto"} · {duration(r.duration_ms)}
-                      {(r.input_tokens || 0) + (r.output_tokens || 0) > 0 && (
-                        <>
-                          {" · "}
-                          <span className="mono">
-                            {fmtTokens(
-                              (r.input_tokens || 0) + (r.output_tokens || 0),
-                            )}{" "}
-                            tok
-                          </span>
-                          {(r.cost || 0) > 0 && (
-                            <>
-                              {" · "}
-                              <span className="mono">{fmtUsd(r.cost)}</span>
-                            </>
-                          )}
-                        </>
-                      )}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
+                );
+              })}
+            </section>
           </>
         ) : null}
       </Page>
