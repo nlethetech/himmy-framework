@@ -7,6 +7,7 @@ validated :class:`~himmy.skills.models.Skill`).
 
 from __future__ import annotations
 
+from himmy.skills.builtin.cli_video import CLI_VIDEO
 from himmy.skills.models import Skill, SkillExample
 
 BUILTIN_SKILLS: dict[str, Skill] = {
@@ -132,6 +133,7 @@ BUILTIN_SKILLS: dict[str, Skill] = {
             ),
         ],
     ),
+    "cli_video": CLI_VIDEO,
 }
 
 __all__ = ["BUILTIN_SKILLS"]

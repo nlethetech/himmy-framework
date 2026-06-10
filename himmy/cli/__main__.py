@@ -162,6 +162,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_init.set_defaults(func=commands.cmd_init)
 
+    p_demo = sub.add_parser(
+        "demo-video",
+        help="scaffold or render a cinematic all-terminal product demo (MP4)",
+    )
+    p_demo.add_argument("directory", nargs="?", default=".", help="workspace directory")
+    p_demo.add_argument(
+        "--render",
+        action="store_true",
+        help="record the chapters in script.json and stitch demo.mp4 "
+        "(needs playwright + chromium + ffmpeg)",
+    )
+    p_demo.add_argument("--only", help="with --render: re-record just this chapter id")
+    p_demo.add_argument(
+        "--output", default="demo.mp4", help="output filename (default: demo.mp4)"
+    )
+    p_demo.set_defaults(func=commands.cmd_demo_video)
+
     p_serve = sub.add_parser("serve", help="serve the FastAPI BFF (needs api extra)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)

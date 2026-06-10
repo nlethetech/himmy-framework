@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>demo player</title>
+<!--
+  The himmy demo-video terminal player. Reads window.DEMO_SCRIPT (written by the
+  recorder as script.js, from your script.json) and performs one chapter per load:
+  player.html?chapter=<id>. It sets window.__sceneDone = true when the chapter ends —
+  the recorder records until that flag.
+-->
+<script src="script.js"></script>
+<style>
+  @font-face { font-family: 'Fira Code'; src: url('assets/FiraCode-Regular.woff2') format('woff2'); font-weight: 400; }
+  @font-face { font-family: 'Fira Code'; src: url('assets/FiraCode-Medium.woff2') format('woff2'); font-weight: 500; }
+  @font-face { font-family: 'Fira Code'; src: url('assets/FiraCode-SemiBold.woff2') format('woff2'); font-weight: 600; }
+
+  :root {
+    --bg: #131210;
+    --ink: #E9E6DC;
+    --dim: #97917F;
+    --faint: #5C5749;
+    --accent: #E8294A;
+    --gold: #C9A227;
+    --green: #7FA56A;
+    --snow: #F5F2E9;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); }
+  body { font-family: 'Fira Code', ui-monospace, monospace; color: var(--ink); position: relative; }
+
+  .grain {
+    position: fixed; inset: 0; pointer-events: none; z-index: 99; opacity: .05;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  .scan {
+    position: fixed; inset: 0; pointer-events: none; z-index: 98; opacity: .04;
+    background: repeating-linear-gradient(0deg, transparent 0 3px, #000 3px 4px);
+  }
+
+  .titlebar {
+    position: absolute; top: 44px; left: 120px; right: 120px; z-index: 5;
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 15px; letter-spacing: .2em; text-transform: uppercase; color: var(--faint);
+  }
+  .titlebar .dotrow { display: flex; gap: 10px; }
+  .titlebar .dotrow i { width: 11px; height: 11px; border-radius: 50%; background: #3A372F; }
+  .titlebar .dotrow i:first-child { background: var(--accent); }
+  .titlebar .mark { color: var(--accent); letter-spacing: 0; margin-right: 10px; }
+
+  .pane {
+    position: absolute; inset: 110px 120px 80px;
+    font-size: 26px; line-height: 1.66; white-space: pre-wrap;
+    overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end;
+  }
+  .pane.center { justify-content: center; }
+
+  .prompt { color: var(--accent); font-weight: 600; }
+  .cmd { color: var(--ink); font-weight: 500; }
+  .out { color: var(--dim); }
+  .out-bright { color: var(--ink); }
+  .faint { color: var(--faint); }
+  .gold { color: var(--gold); }
+  .green { color: var(--green); }
+  .crimson { color: var(--accent); }
+  .snow { color: var(--snow); font-weight: 600; }
+  .badge { color: var(--ink); font-weight: 600; background: color-mix(in srgb, var(--accent) 22%, transparent); padding: 0 8px; }
+  .art { line-height: 1.04; font-size: 30px; }
+  .wordmark { font-size: 100px; font-weight: 600; line-height: 1.2; letter-spacing: -0.02em; color: var(--snow); }
+  .wordmark-dot { font-size: 100px; font-weight: 600; line-height: 1.2; color: var(--accent); }
+  .chapter-rule { color: var(--faint); }
+  .chapter-label { color: var(--accent); font-weight: 600; letter-spacing: .12em; }
+
+  .cursor {
+    display: inline-block; width: 15px; height: 32px; background: var(--ink);
+    vertical-align: -6px; animation: blink 1.06s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+<div class="grain"></div>
+<div class="scan"></div>
+
+<div class="titlebar">
+  <span class="dotrow"><i></i><i></i><i></i></span>
+  <span><span class="mark" id="tb-mark"></span><span id="tb-title"></span></span>
+  <span id="tb-right"></span>
+</div>
+<div class="pane" id="pane"><div id="term"></div></div>
+
+<script>
+const SCRIPT = window.DEMO_SCRIPT || { brand: {}, chapters: [] };
+const brand = SCRIPT.brand || {};
+const qs = new URLSearchParams(location.search);
+const chapterId = qs.get('chapter') || (SCRIPT.chapters[0] && SCRIPT.chapters[0].id);
+const chapter = (SCRIPT.chapters || []).find(c => c.id === chapterId);
+window.__sceneDone = false;
+
+document.documentElement.style.setProperty('--accent', brand.accent || '#E8294A');
+document.getElementById('tb-mark').textContent = brand.prompt || '▲';
+document.getElementById('tb-title').textContent = brand.titlebar || '';
+document.getElementById('tb-right').textContent = brand.titlebar_right || '';
+
+const term = document.getElementById('term');
+const pane = document.getElementById('pane');
+const cur = document.createElement('span'); cur.className = 'cursor';
+let line = null;
+const newline = (cls) => { line = document.createElement('div'); if (cls) line.className = cls; term.appendChild(line); line.appendChild(cur); };
+const put = (txt, cls) => { const s = document.createElement('span'); if (cls) s.className = cls; s.textContent = txt; line.insertBefore(s, cur); };
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+async function type(text, cls, cps) {
+  for (const ch of text) { put(ch, cls); await sleep(1000 / (cps || 27) + Math.random() * 24); }
+}
+/* "x" | ["x","cls"] | [["a","c1"],["b","c2"]] → list of [text, cls] segments */
+function segmentsOf(lineSpec) {
+  if (typeof lineSpec === 'string') return [[lineSpec, 'out']];
+  if (Array.isArray(lineSpec) && typeof lineSpec[0] === 'string') return [lineSpec];
+  return lineSpec;
+}
+async function lines(specs, delay) {
+  for (const spec of specs) {
+    newline();
+    for (const [txt, cls] of segmentsOf(spec)) put(txt, cls || 'out');
+    await sleep(delay);
+  }
+}
+const prompt = () => { newline(); put((brand.prompt || '▲') + ' ', 'prompt'); };
+
+const STEPS = {
+  art: async (s) => {
+    for (const spec of (brand.art || [])) {
+      newline('art');
+      for (const [txt, cls] of segmentsOf(spec)) put(txt, cls || 'snow');
+      await sleep(s.pace_ms);
+    }
+  },
+  wordmark: async () => { newline(); put(brand.wordmark || brand.name || '', 'wordmark'); put('.', 'wordmark-dot'); },
+  tagline: async () => { newline(); put(brand.tagline || '', 'out-bright'); },
+  head: async (s) => {
+    newline();
+    put('── ', 'chapter-rule'); put(`ENTRY ${s.no} · ${s.name}`, 'chapter-label');
+    put(' ' + '─'.repeat(Math.max(4, 70 - s.name.length)), 'chapter-rule');
+    await sleep(420);
+    newline(); put('   ' + s.tag, 'faint');
+    await sleep(1500);
+    newline();
+  },
+  cmd: async (s) => { prompt(); await sleep(450); await type(s.text, 'cmd', s.cps); await sleep(600); },
+  typed: async (s) => { prompt(); await type(s.text, s.cls, s.cps); },
+  lines: async (s) => { await lines(s.lines, s.delay_ms); },
+  note: async (s) => { newline(); put(s.text, 'faint'); },
+  pause: async (s) => { await sleep(s.ms); },
+  blank: async () => { newline(); },
+};
+
+(async () => {
+  if (!chapter) { document.title = 'chapter not found: ' + chapterId; window.__sceneDone = true; return; }
+  if (chapter.centered) pane.classList.add('center');
+  newline();
+  await sleep(900);
+  for (const step of chapter.steps) await STEPS[step.do](step);
+  newline();
+  window.__sceneDone = true;
+})();
+</script>
+</body>
+</html>

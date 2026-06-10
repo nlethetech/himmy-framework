@@ -934,6 +934,30 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ demo-video
+
+
+def cmd_demo_video(args: argparse.Namespace) -> int:
+    """Scaffold a demo-video workspace, or render it to an MP4 with ``--render``."""
+    from himmy.demovideo import render, scaffold
+
+    target = Path(args.directory).expanduser()
+    if args.render:
+        render(target, only=args.only, output_name=args.output)
+        return 0
+    written = scaffold(target)
+    for path in written:
+        print(f"wrote {path}")
+    if not written:
+        print(f"{target} already scaffolded (files left untouched)")
+    print(
+        "\nNext: capture REAL command output, write it into "
+        f"{target / 'script.json'} (see the README's two rules), then:\n"
+        f"  himmy demo-video {target} --render"
+    )
+    return 0
+
+
 # ----------------------------------------------------------------------- serve
 
 

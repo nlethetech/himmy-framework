@@ -237,12 +237,13 @@ project-local).
 > level of recursion). The 47 count is the catalog total; the registered-tool count per
 > agent varies with which packs and conditional tools are wired.
 
-### Built-in skills (9)
+### Built-in skills (10)
 
-`clarify`, `data_analysis` (binds `data`), `file_ops` (binds `files`), `knowledge_base`
-(binds `knowledge`), `nepal_brief` (binds `nepal`), `python_compute` (binds `code`),
-`research_writer` (composes `web_research` + `summarize`), `summarize`, `web_research`
-(binds `web`).
+`clarify`, `cli_video` (binds `files` + `code` — cinematic all-terminal demo videos
+from REAL captured output; see `himmy demo-video`), `data_analysis` (binds `data`),
+`file_ops` (binds `files`), `knowledge_base` (binds `knowledge`), `nepal_brief`
+(binds `nepal`), `python_compute` (binds `code`), `research_writer` (composes
+`web_research` + `summarize`), `summarize`, `web_research` (binds `web`).
 
 Author your own as a one-file YAML in `skills/` (auto-discovered, non-recursive; a
 project skill whose name matches a built-in **shadows** it and logs that it did):
@@ -756,6 +757,7 @@ himmy team     -f team.yaml -p "…"      # multi-agent handoff/delegation
 himmy eval     -f suite.yaml --agent agent.yaml   # eval cases (--team to eval a team)
 himmy bench    --models ollama:qwen2.5:3b-instruct  # standing LLM benchmark (--fail-under is a CI floor)
 himmy init     my-agent                 # scaffold agent.yaml + tools.py + himmy.toml + skill (--template, --team)
+himmy demo-video my-demo [--render]     # cinematic all-terminal product demo → MP4 (playwright + ffmpeg)
 himmy serve                             # FastAPI BFF (needs the `api` extra)  [127.0.0.1:8000]
 himmy studio                            # local GUI (needs the `studio` extra + built SPA)  [127.0.0.1:8765]
 himmy doctor                            # extras / providers / keys + next step
@@ -765,7 +767,7 @@ himmy prices [sync|show|list]           # token pricing table (USD per 1M tokens
 himmy trace  [thread]                   # read .himmy/trace.db: timeline or recent runs
 ```
 
-14 subcommands total. Note: `team` and `eval` do **not** accept the shared `--name`/
+15 subcommands total. Note: `team` and `eval` do **not** accept the shared `--name`/
 `--instruction` flags (only `run`/`chat`/`telegram` do). Several arguments are enforced at
 runtime (exit 2) rather than by argparse — e.g. `run`/`team` `--prompt`, `telegram` token,
 `prices show <model>`.

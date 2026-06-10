@@ -119,6 +119,7 @@ himmy = [
     "services/prompts/configs/prompts/*.yaml",
     "benchmark/suites/*.yaml",
     "services/inference/prices.json",
+    "demovideo/player.html",
     # Himmy Studio: the built (Vite) frontend, emitted here by `npm run build`.
     # Globs match nothing in a source checkout that hasn't built the GUI yet.
     "api/_studio_static/*",
