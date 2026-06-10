@@ -210,6 +210,20 @@ async def _execute_tool_calls(
     return returns
 
 
+def _default_ollama_timeout() -> float:
+    """Per-request timeout: ``HIMMY_OLLAMA_TIMEOUT`` env when set, else 120s.
+
+    Invalid values fall back to the default rather than failing construction —
+    a misconfigured env var must not take the offline path down.
+    """
+    raw = os.environ.get("HIMMY_OLLAMA_TIMEOUT", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 120.0
+    return value if value > 0 else 120.0
+
+
 class OllamaClientManager:
     """A :class:`ClientManager` backed by a local Ollama server's chat API."""
 
@@ -220,15 +234,20 @@ class OllamaClientManager:
         base_url: str = "http://localhost:11434",
         model_registry: dict[str, str] | None = None,
         transport: Callable[[str, dict[str, Any]], Any] | None = None,
-        timeout: float = 120.0,
+        timeout: float | None = None,
         provider_name: str = "ollama",
     ) -> None:
-        """Configure the default model, server URL, and (test) transport."""
+        """Configure the default model, server URL, and (test) transport.
+
+        ``timeout`` defaults to the ``HIMMY_OLLAMA_TIMEOUT`` env var when unset
+        (else 120s) — an operational knob for slow hosts (CPU-only CI runners,
+        small boards) where generation legitimately exceeds the default budget.
+        """
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._registry = dict(model_registry or {})
         self._transport = transport
-        self._timeout = timeout
+        self._timeout = timeout if timeout is not None else _default_ollama_timeout()
         self.provider_name = provider_name
 
     def resolve(self, model_key: str) -> str:

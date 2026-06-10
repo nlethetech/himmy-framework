@@ -2,9 +2,10 @@
 
 UUID5 derivation must be a pure function — same inputs always give the same id,
 distinct inputs give distinct ids, external UUIDs round-trip unchanged, and
-unicode / empty-string keys never crash. Namespaces and kinds are constrained to
-be colon-free, matching real usage (they are code-controlled identifiers; the
-``namespace:key`` join is only unambiguous when the prefix is colon-free).
+unicode / empty-string keys never crash. Prefix components (namespaces, kinds,
+stable ids) are escaped before joining, so the derivation string is unambiguous
+even for inputs containing ``:`` or ``\\`` — while colon/backslash-free prefixes
+(all real usage) derive byte-identical ids to the pre-escape formula (pinned).
 Skips gracefully when ``hypothesis`` is not installed (dev-only dependency).
 """
 
@@ -37,13 +38,9 @@ def _parses_as_uuid(value: str) -> bool:
         return False
 
 
-#: Code-controlled identifiers (namespaces/kinds): colon-free so the joined
-#: ``prefix:key`` derivation string is unambiguous.
-_IDENTIFIERS = st.text(
-    alphabet=st.characters(codec="utf-8", exclude_characters=":"),
-    min_size=1,
-    max_size=20,
-)
+#: Code-controlled identifiers (namespaces/kinds): arbitrary unicode INCLUDING
+#: ``:`` and ``\\`` — prefix escaping keeps the joined derivation unambiguous.
+_IDENTIFIERS = st.text(min_size=1, max_size=20)
 #: Semantic keys: arbitrary unicode, excluding strings that already parse as a
 #: UUID (those intentionally bypass derivation and round-trip unchanged).
 _KEYS = st.text(min_size=1, max_size=60).filter(lambda s: not _parses_as_uuid(s))
@@ -109,6 +106,36 @@ def test_record_id_is_deterministic_and_collision_free(
     assert uuid.UUID(id_a).version == 5
     assume(a != b)
     assert id_a != record_id_for(stable_id=stable_b, version=version_b, kind=kind_b)
+
+
+def test_crafted_colon_inputs_no_longer_collide() -> None:
+    """Regression: the exact boundary-ambiguity collisions found by the audit.
+
+    Pre-escape, both pairs below joined to the same derivation string
+    (``x:a:b`` and ``k:s:7:1``) and silently derived the SAME id.
+    """
+    assert stable_id_for("b", namespace="x:a") != stable_id_for("a:b", namespace="x")
+    assert record_id_for(kind="k", stable_id="s:7", version=1) != record_id_for(
+        kind="k:s", stable_id="7", version=1
+    )
+
+
+@_SETTINGS
+@given(value=_KEYS, namespace=st.text(min_size=1, max_size=20))
+def test_clean_prefixes_pin_pre_escape_derivation(value: str, namespace: str) -> None:
+    """Backward compat: colon/backslash-free prefixes derive the HISTORICAL id.
+
+    Every id ever derived before prefix escaping existed used the raw
+    ``f"{namespace}:{key}"`` formula; this pins that ids for all real-world
+    (clean-prefix) inputs are unchanged, so stored registries stay consistent.
+    """
+    assume(":" not in namespace and "\\" not in namespace)
+    historical = str(
+        uuid.uuid5(
+            uuid.UUID("6f1d3a2e-7c4b-5a9e-8d12-0a1b2c3d4e5f"), f"{namespace}:{value}"
+        )
+    )
+    assert stable_id_for(value, namespace=namespace) == historical
 
 
 @_SETTINGS

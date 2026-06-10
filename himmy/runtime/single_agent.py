@@ -995,15 +995,32 @@ class SingleAgentRuntime:
             thread.append_message(user_msg)
             self._register_message(user_msg)
 
+            trace_id = f"{thread.thread_id}:{task.task_id}"
+            # Audit parity with run_task_detailed: a streamed run is a run — it
+            # opens with AGENT_RUN_STARTED and ALWAYS closes with a terminal
+            # AGENT_RUN_FINISHED (success, failure, or 'cancelled' when the client
+            # drops the stream / the consuming task is cancelled mid-run).
+            await self._emit(
+                RunEvent(
+                    event_type=EventType.AGENT_RUN_STARTED,
+                    trace_id=trace_id,
+                    thread_id=thread.thread_id,
+                    agent_id=persona.agent_id,
+                    payload={
+                        "model_key": self._effective_model_key(ctx, llm_config),
+                        "persona_name": persona.name,
+                        "streamed": True,
+                    },
+                )
+            )
+
             request, _tool_names = self._build_request(
-                thread, ctx, llm_config, trace_id=f"{thread.thread_id}:{task.task_id}"
+                thread, ctx, llm_config, trace_id=trace_id
             )
             # ``run_stream`` is an async generator; own the reference so an early
             # close/cancellation of THIS generator can close it in the finally.
-            stream = cast(
-                "AsyncGenerator[StreamDelta, None]",
-                self.inference_service.run_stream(request),
-            )
+            stream = self.inference_service.run_stream(request)
+            run_finished = False
             try:
                 async for delta in stream:
                     if delta.done and delta.response is not None:
@@ -1018,7 +1035,43 @@ class SingleAgentRuntime:
                         thread.append_message(assistant)
                         self._register_message(assistant)
                         self._register_thread_version(thread)
+                        await self._emit(
+                            RunEvent(
+                                event_type=EventType.AGENT_RUN_FINISHED,
+                                trace_id=trace_id,
+                                thread_id=thread.thread_id,
+                                agent_id=persona.agent_id,
+                                latency_ms=delta.response.latency_ms,
+                                cost=delta.response.cost,
+                                error=(
+                                    delta.response.error.message
+                                    if delta.response.error is not None
+                                    and delta.response.status != InferenceStatus.SUCCESS
+                                    else None
+                                ),
+                                payload={
+                                    "status": delta.response.status.value,
+                                    "streamed": True,
+                                },
+                            )
+                        )
+                        run_finished = True
                     yield delta
+            except (GeneratorExit, asyncio.CancelledError):
+                # Early termination at a yield point: record the terminal event
+                # (mirrors run_task_detailed's cancellation leg) before unwinding.
+                if not run_finished:
+                    await self._emit(
+                        RunEvent(
+                            event_type=EventType.AGENT_RUN_FINISHED,
+                            trace_id=trace_id,
+                            thread_id=thread.thread_id,
+                            agent_id=persona.agent_id,
+                            error="cancelled",
+                            payload={"status": "CANCELLED", "streamed": True},
+                        )
+                    )
+                raise
             finally:
                 # GeneratorExit (client closed the stream) / CancelledError land
                 # here at a yield point; close the provider stream NOW so its own

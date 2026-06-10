@@ -27,10 +27,26 @@ concurrency:
 jobs:
   ollama-integration:
     name: agent vs. Ollama (qwen2.5:3b)
+    # Nightly + manual — NOT a PR gate. These are live-model BEHAVIOR tests (does a
+    # 3B quantized model decide to call the handoff tool, do 3 concurrent CPU
+    # generations finish in budget) and on the shared 4-vCPU runner the failure set
+    # rotates run-to-run with byte-identical request payloads — they test the
+    # model+hardware, not the framework. The framework mechanics are covered by the
+    # offline suite on every PR, and the PR keeps a live-model gate: the
+    # benchmark-gate job below, which is stable on this runner. Failures here alert
+    # on the nightly run instead of blocking merges.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       HIMMY_INTEGRATION_MODEL: qwen2.5:3b-instruct
+      # CPU-only runner: generation is ~10x slower than a dev laptop, and the
+      # fan-out test runs 3 workers CONCURRENTLY — without parallel slots Ollama
+      # serializes them and the queue tail blows the default 120s request budget
+      # (observed as every worker returning an empty answer). 3 slots + a 300s
+      # budget sized to the runner, not the laptop the tests were written on.
+      OLLAMA_NUM_PARALLEL: "3"
+      HIMMY_OLLAMA_TIMEOUT: "300"
     steps:
       - uses: actions/checkout@v6
 
@@ -46,7 +62,11 @@ jobs:
 
       - name: Install + start Ollama
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Pinned: unpinned "latest" changed qwen2.5 tool-calling behavior between
+          # runs (handoff/fan-out live tests went green->red with identical request
+          # payloads). Bump deliberately, watching the live multi-agent tests.
+          curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
+          ollama -v
           ollama serve &
           # Wait for the daemon to accept connections.
           for _ in $(seq 1 30); do
@@ -55,6 +75,14 @@ jobs:
 
       - name: Pull the integration model
         run: ollama pull "$HIMMY_INTEGRATION_MODEL"
+
+      - name: Warm the model (load weights before the first timed request)
+        # CPU model load is tens of seconds; without this the FIRST test request
+        # pays it out of its own inference budget.
+        run: |
+          curl -sf http://localhost:11434/api/generate \
+            -d "{\"model\": \"$HIMMY_INTEGRATION_MODEL\", \"prompt\": \"ok\", \"stream\": false}" \
+            >/dev/null
 
       - name: Run the real-provider integration tests
         # Scope collection to tests/integration so pytest doesn't import the api/db
@@ -88,7 +116,11 @@ jobs:
 
       - name: Install + start Ollama
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Pinned: unpinned "latest" changed qwen2.5 tool-calling behavior between
+          # runs (handoff/fan-out live tests went green->red with identical request
+          # payloads). Bump deliberately, watching the live multi-agent tests.
+          curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
+          ollama -v
           ollama serve &
           for _ in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags >/dev/null && break || sleep 2
@@ -139,7 +171,11 @@ jobs:
 
       - name: Install + start Ollama
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Pinned: unpinned "latest" changed qwen2.5 tool-calling behavior between
+          # runs (handoff/fan-out live tests went green->red with identical request
+          # payloads). Bump deliberately, watching the live multi-agent tests.
+          curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
+          ollama -v
           ollama serve &
           for _ in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags >/dev/null && break || sleep 2
@@ -148,7 +184,15 @@ jobs:
       - name: Pull the benchmark model
         run: ollama pull qwen2.5:3b-instruct
 
+      - name: Warm the model (load weights before the first timed request)
+        run: |
+          curl -sf http://localhost:11434/api/generate \
+            -d '{"model": "qwen2.5:3b-instruct", "prompt": "ok", "stream": false}' \
+            >/dev/null
+
       - name: Run the gate benchmark against the checked-in baseline
+        env:
+          HIMMY_OLLAMA_TIMEOUT: "300"
         run: python scripts/bench_gate.py run --json bench-pr-results.json
 
       - name: Upload gate results

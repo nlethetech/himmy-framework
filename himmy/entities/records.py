@@ -22,6 +22,19 @@ def _is_uuid(value: str) -> bool:
         return False
 
 
+def _escape_prefix(component: str) -> str:
+    """Escape ``\\`` and ``:`` so a joined derivation string parses unambiguously.
+
+    Only the *prefix* components of a derivation string are escaped; the trailing
+    key is left raw. Prefixes are code-controlled identifiers (namespaces, kinds)
+    or canonical UUIDs, which never contain ``:`` or ``\\`` in practice — so every
+    id derived before this guard existed is byte-identical, while crafted inputs
+    like ``(namespace="x:a", key="b")`` vs ``(namespace="x", key="a:b")`` can no
+    longer collide.
+    """
+    return component.replace("\\", "\\\\").replace(":", "\\:")
+
+
 def stable_id_for(
     value: str, *, namespace: str, fallback_key: str | None = None
 ) -> str:
@@ -34,12 +47,17 @@ def stable_id_for(
     key = value or fallback_key or ""
     if _is_uuid(key):
         return str(key)
-    return str(uuid.uuid5(_HIMMY_NAMESPACE, f"{namespace}:{key}"))
+    return str(uuid.uuid5(_HIMMY_NAMESPACE, f"{_escape_prefix(namespace)}:{key}"))
 
 
 def record_id_for(*, stable_id: str, version: int, kind: str) -> str:
     """Derive the deterministic physical record id from (kind, stable_id, version)."""
-    return str(uuid.uuid5(_HIMMY_NAMESPACE, f"{kind}:{stable_id}:{version}"))
+    return str(
+        uuid.uuid5(
+            _HIMMY_NAMESPACE,
+            f"{_escape_prefix(kind)}:{_escape_prefix(stable_id)}:{version}",
+        )
+    )
 
 
 def metadata_contains(haystack: Any, needle: Any) -> bool:
