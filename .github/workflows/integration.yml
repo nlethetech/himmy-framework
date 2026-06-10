@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   ollama-integration:
-    name: agent vs. Ollama (qwen2.5:3b)
+    name: agent vs. Ollama (qwen2.5:7b)
     # Nightly + manual — NOT a PR gate. These are live-model BEHAVIOR tests (does a
     # 3B quantized model decide to call the handoff tool, do 3 concurrent CPU
     # generations finish in budget) and on the shared 4-vCPU runner the failure set
@@ -37,9 +37,16 @@ jobs:
     # on the nightly run instead of blocking merges.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 7b on a CPU runner is slow but RELIABLE; 45 min covers pull + 12 tests.
+    timeout-minutes: 45
     env:
-      HIMMY_INTEGRATION_MODEL: qwen2.5:3b-instruct
+      # 3b proved below the capability floor for the agentic-BEHAVIOR tests on
+      # the shared CPU runner (handoff tool-calls never fired, fan-out answers
+      # empty across retries/env-tuning/version pins — nightly red since
+      # 2026-06-10) while 7b is consistently reliable. The tests assert
+      # behavior, so the model must be capable of the behavior; the benchmark
+      # job keeps 3b for its relative metrics.
+      HIMMY_INTEGRATION_MODEL: qwen2.5:7b-instruct
       # CPU-only runner: generation is ~10x slower than a dev laptop, and the
       # fan-out test runs 3 workers CONCURRENTLY — without parallel slots Ollama
       # serializes them and the queue tail blows the default 120s request budget
