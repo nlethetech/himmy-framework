@@ -13,6 +13,7 @@ the offline-first runtime so the common case needs no keys::
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 
 from himmy import __version__
@@ -218,8 +219,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments and dispatch to the selected command handler."""
+    args_list = list(argv) if argv is not None else sys.argv[1:]
+    if not args_list:
+        # Bare `himmy` is a first contact, not a mistake: show the splash, not an error.
+        from himmy.cli.banner import print_banner
+
+        return print_banner()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(args_list)
     try:
         return int(args.func(args))
     except HimmyError as exc:
