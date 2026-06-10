@@ -5,6 +5,12 @@ Studio is the no-code front door to himmy: chat with an agent, build/edit an
 router is intentionally GUI-shaped (not the tenant-scoped ``/v1`` surface): it is
 meant to be served on loopback by ``himmy studio`` for a single local user.
 
+When an authenticator IS configured (API keys / OIDC), every Studio route
+additionally requires the ``studio:use`` permission — Studio holds credentials
+(SMTP/Telegram), approvals, and run triggers, so a tenant-scoped key without that
+grant must not reach it once the app is proxied beyond loopback. The zero-config
+(no-auth) loopback default is unchanged.
+
 Endpoints:
   * ``GET  /api/studio/doctor``  — environment diagnostics as JSON.
   * ``GET  /api/studio/agents``  — discover agent.yaml files in the project.
@@ -17,7 +23,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -27,6 +33,7 @@ from himmy.api import (
     studio_connections,
     studio_service,
 )
+from himmy.api.auth import require_permission
 from himmy.api.studio_approvals import ApprovalDetail, ApprovalSummary
 from himmy.api.studio_connections import (
     ConnectionStatus,
@@ -41,7 +48,30 @@ from himmy.api.studio_runs import (
     get_run_store,
 )
 
-router = APIRouter(prefix="/api/studio", tags=["studio"])
+
+async def _studio_permission(request: Request) -> None:
+    """Require ``studio:use`` on every Studio route once auth is configured.
+
+    No authenticator configured ⇒ no-op (the zero-config loopback default is
+    unchanged). With auth on, the principal must hold a role granting
+    ``studio:use`` (``admin`` — including the shared ``HIMMY_INTERNAL_API_KEY``
+    boundary — qualifies via its ``*:*`` wildcard; grant it to other roles via
+    ``HIMMY_RBAC_FILE``). Escape hatch: ``HIMMY_STUDIO_AUTH=off`` skips this
+    check — DANGEROUS, as it re-opens connections/approvals/run triggers to any
+    authenticated principal; only for a trusted single-user deployment.
+    """
+    import os
+
+    if os.environ.get("HIMMY_STUDIO_AUTH", "on").lower() in ("off", "0", "false", "no"):
+        return
+    await require_permission("studio", "use")(request)
+
+
+router = APIRouter(
+    prefix="/api/studio",
+    tags=["studio"],
+    dependencies=[Depends(_studio_permission)],
+)
 
 
 @router.get("/health")

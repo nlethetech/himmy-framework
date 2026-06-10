@@ -14,6 +14,13 @@ the missing integrity layer WITHOUT changing the record identity:
 * :func:`verify_audit_bundle` — re-derive hashes from a (possibly tampered) graph
   and check them against a bundle, reporting exactly which records/links were
   altered, added, or dropped, and whether the signature itself is intact.
+* :func:`export_audit_chain` / :func:`verify_audit_chain` — an OPT-IN hash-chain
+  mode for ordered audit trails. The Merkle root above is order-INdependent (leaves
+  are sorted), so record *reordering* is invisible to it; the chain binds each
+  record to its predecessor via ``prev_hash`` and signs the chain tip, so
+  verification walks the chain and pinpoints exactly where it first breaks
+  (tamper, reorder, deletion, or insertion). The Merkle bundle stays the default
+  for unordered graph snapshots.
 
 Everything is stdlib (``hashlib``/``hmac``/``json``) and fully offline.
 """
@@ -203,6 +210,190 @@ def verify_audit_bundle(
     )
 
 
+# ------------------------------------------------------------ hash chain (opt-in)
+# The Merkle bundle above is deliberately order-independent (sorted leaves), which is
+# right for unordered graph snapshots but means a reordered audit TRAIL still produces
+# the same root. The chain mode below is the opt-in alternative for append-only,
+# ordered histories: each entry carries the hash of its predecessor, the export signs
+# only the chain TIP, and verification walks the chain so the FIRST divergent position
+# is pinpointed rather than just "something changed".
+
+#: The ``prev_hash`` of the first chain entry (a fixed, content-free genesis value).
+CHAIN_GENESIS_HASH = hashlib.sha256(b"himmy-audit-chain:genesis").hexdigest()
+
+
+def _chain_step(prev_hash: str, leaf: str) -> str:
+    """Advance the chain: hash the predecessor's chain hash with the next leaf."""
+    return hashlib.sha256(f"{prev_hash}:{leaf}".encode()).hexdigest()
+
+
+class ChainEntry(BaseModel):
+    """One link of an audit hash chain.
+
+    ``content_hash`` fingerprints the record itself (:func:`content_hash`);
+    ``prev_hash`` is the predecessor entry's ``chain_hash`` (``CHAIN_GENESIS_HASH``
+    for the first entry); ``chain_hash`` commits to the entire prefix up to and
+    including this record, so any earlier edit/reorder/deletion changes it.
+    """
+
+    record_id: str
+    content_hash: str
+    prev_hash: str
+    chain_hash: str
+
+
+class AuditChainBundle(BaseModel):
+    """A signed, ORDER-SENSITIVE snapshot of an append-only record sequence.
+
+    ``entries`` mirror the records in their stored order; ``tip_hash`` is the last
+    entry's ``chain_hash`` (the genesis hash for an empty sequence) and commits to
+    the full ordered history; ``signature`` is an HMAC-SHA256 over the tip with the
+    caller's secret. Unlike :class:`AuditBundle`, reordering records changes the tip.
+    """
+
+    bundle_version: int = AUDIT_BUNDLE_VERSION
+    entries: list[ChainEntry] = Field(default_factory=list)
+    tip_hash: str = CHAIN_GENESIS_HASH
+    signature: str = ""
+    algorithm: str = "HMAC-SHA256"
+
+
+class ChainVerificationResult(BaseModel):
+    """The outcome of verifying a live record sequence against a chain bundle.
+
+    ``chain_intact`` is True when the chain tip recomputed from the live sequence
+    equals the signed tip (i.e. the ordered history is byte-for-byte what was
+    signed). ``first_break_index`` is the earliest position where the live sequence
+    diverges from the bundle, and the ``*_record_ids`` lists classify every
+    divergent id exactly once: content edited in place (``tampered``), present on
+    both sides but at a different position (``reordered``), in the bundle but gone
+    from the live sequence (``missing``), or live but never signed (``added``).
+    """
+
+    ok: bool
+    signature_valid: bool
+    chain_intact: bool
+    first_break_index: int | None = None
+    tampered_record_ids: list[str] = Field(default_factory=list)
+    reordered_record_ids: list[str] = Field(default_factory=list)
+    missing_record_ids: list[str] = Field(default_factory=list)
+    added_record_ids: list[str] = Field(default_factory=list)
+
+
+def export_audit_chain(
+    records: list[EntityRecord],
+    *,
+    secret: str | bytes,
+) -> AuditChainBundle:
+    """Freeze + sign an ORDERED record sequence into an :class:`AuditChainBundle`.
+
+    ``records`` must be in their canonical stored order (e.g. registration order /
+    ascending version order) — the chain commits to that order, which is the whole
+    point: pass the same order at verification time.
+    """
+    entries: list[ChainEntry] = []
+    prev = CHAIN_GENESIS_HASH
+    for record in records:
+        leaf = content_hash(record)
+        chained = _chain_step(prev, leaf)
+        entries.append(
+            ChainEntry(
+                record_id=record.record_id,
+                content_hash=leaf,
+                prev_hash=prev,
+                chain_hash=chained,
+            )
+        )
+        prev = chained
+    return AuditChainBundle(
+        entries=entries,
+        tip_hash=prev,
+        signature=_sign(prev, secret),
+    )
+
+
+def verify_audit_chain(
+    bundle: AuditChainBundle,
+    records: list[EntityRecord],
+    *,
+    secret: str | bytes,
+) -> ChainVerificationResult:
+    """Walk a live record sequence against a signed chain, pinpointing any break.
+
+    Checks, in order: (1) the bundle's signature is intact for its chain tip
+    (catches a forged/edited bundle); (2) the chain tip recomputed from the live
+    sequence matches the signed tip — because each link binds its predecessor, ANY
+    in-place edit, reorder, mid-history deletion, or insertion changes the live
+    tip; (3) a positional walk classifies each divergent id (tampered / reordered /
+    missing / added) and reports the first break index. ``ok`` is True only when
+    the signature is valid AND the live tip equals the signed tip.
+    """
+    signature_valid = hmac.compare_digest(
+        bundle.signature, _sign(bundle.tip_hash, secret)
+    )
+
+    live = [(r.record_id, content_hash(r)) for r in records]
+    live_tip = CHAIN_GENESIS_HASH
+    for _, leaf in live:
+        live_tip = _chain_step(live_tip, leaf)
+    chain_intact = live_tip == bundle.tip_hash
+
+    bundle_ids = {entry.record_id for entry in bundle.entries}
+    live_ids = {rid for rid, _ in live}
+    tampered: list[str] = []
+    reordered: list[str] = []
+    missing: list[str] = []
+    added: list[str] = []
+    flagged: set[str] = set()
+    first_break: int | None = None
+
+    def _flag(bucket: list[str], rid: str) -> None:
+        if rid not in flagged:
+            flagged.add(rid)
+            bucket.append(rid)
+
+    for i in range(max(len(bundle.entries), len(live))):
+        entry = bundle.entries[i] if i < len(bundle.entries) else None
+        pair = live[i] if i < len(live) else None
+        diverged = False
+        if entry is not None and pair is not None:
+            rid, leaf = pair
+            if rid == entry.record_id:
+                if leaf != entry.content_hash:
+                    _flag(tampered, rid)
+                    diverged = True
+            else:
+                diverged = True
+                _flag(reordered if rid in bundle_ids else added, rid)
+                _flag(
+                    reordered if entry.record_id in live_ids else missing,
+                    entry.record_id,
+                )
+        elif pair is not None:  # live sequence is longer than the signed one
+            rid = pair[0]
+            diverged = True
+            _flag(reordered if rid in bundle_ids else added, rid)
+        elif entry is not None:  # signed sequence is longer than the live one
+            diverged = True
+            _flag(
+                reordered if entry.record_id in live_ids else missing,
+                entry.record_id,
+            )
+        if diverged and first_break is None:
+            first_break = i
+
+    return ChainVerificationResult(
+        ok=signature_valid and chain_intact,
+        signature_valid=signature_valid,
+        chain_intact=chain_intact,
+        first_break_index=first_break,
+        tampered_record_ids=tampered,
+        reordered_record_ids=reordered,
+        missing_record_ids=missing,
+        added_record_ids=added,
+    )
+
+
 # --------------------------------------------------------- Ed25519 (asymmetric)
 # An asymmetric option (WS4.5): the auditor verifies with only the PUBLIC key, so the
 # signing secret never has to be shared with verifiers — stronger non-repudiation than
@@ -308,12 +499,18 @@ def verify_audit_bundle_ed25519(
 
 __all__ = [
     "AUDIT_BUNDLE_VERSION",
+    "CHAIN_GENESIS_HASH",
     "AuditBundle",
+    "AuditChainBundle",
+    "ChainEntry",
+    "ChainVerificationResult",
     "VerificationResult",
     "content_hash",
     "link_hash",
     "export_audit_bundle",
     "verify_audit_bundle",
+    "export_audit_chain",
+    "verify_audit_chain",
     "generate_ed25519_keypair",
     "export_audit_bundle_ed25519",
     "verify_audit_bundle_ed25519",

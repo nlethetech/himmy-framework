@@ -59,3 +59,44 @@ def test_symlink_escape_is_rejected(tmp_path: Path) -> None:
 def test_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         _registry(tmp_path).handler_for("read_file")({"path": "nope.txt"})
+
+
+def test_symlink_to_outside_rejected_for_read_and_write(tmp_path: Path) -> None:
+    outside = tmp_path / "secret.txt"
+    outside.write_text("top secret")
+    root = tmp_path / "jail"
+    root.mkdir()
+    (root / "link").symlink_to(outside)
+    reg = _registry(root)
+    with pytest.raises(ToolSecurityError):
+        reg.handler_for("read_file")({"path": "link"})
+    with pytest.raises(ToolSecurityError):
+        reg.handler_for("write_file")({"path": "link", "content": "clobbered"})
+    assert outside.read_text() == "top secret"  # nothing written through the link
+
+
+def test_symlink_rejected_even_when_target_is_inside_root(tmp_path: Path) -> None:
+    # A link whose *current* target is inside the jail is still rejected: it could
+    # be retargeted outside between the check and the actual open (TOCTOU).
+    (tmp_path / "real.txt").write_text("data")
+    (tmp_path / "link.txt").symlink_to(tmp_path / "real.txt")
+    reg = _registry(tmp_path)
+    with pytest.raises(ToolSecurityError):
+        reg.handler_for("read_file")({"path": "link.txt"})
+    with pytest.raises(ToolSecurityError):
+        reg.handler_for("write_file")({"path": "link.txt", "content": "x"})
+    assert (tmp_path / "real.txt").read_text() == "data"
+
+
+def test_symlinked_directory_component_is_rejected(tmp_path: Path) -> None:
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "f.txt").write_text("secret")
+    root = tmp_path / "jail"
+    root.mkdir()
+    (root / "sub").symlink_to(outside_dir)
+    reg = _registry(root)
+    with pytest.raises(ToolSecurityError):
+        reg.handler_for("read_file")({"path": "sub/f.txt"})
+    with pytest.raises(ToolSecurityError):
+        reg.handler_for("write_file")({"path": "sub/f.txt", "content": "x"})

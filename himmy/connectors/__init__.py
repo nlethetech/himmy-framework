@@ -12,8 +12,10 @@ from __future__ import annotations
 
 from himmy.connectors.fetcher import DEFAULT_USER_AGENT, Fetcher, HttpxFetcher
 from himmy.connectors.models import (
+    FeedFailure,
     ForexRate,
     MacroReport,
+    NewsFetchResult,
     NewsItem,
     NewsSource,
     Workbook,
@@ -29,6 +31,8 @@ __all__ = [
     "DEFAULT_USER_AGENT",
     "NewsSource",
     "NewsItem",
+    "FeedFailure",
+    "NewsFetchResult",
     "ForexRate",
     "MacroReport",
     "Workbook",

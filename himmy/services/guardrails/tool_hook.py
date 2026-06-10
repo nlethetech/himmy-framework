@@ -18,10 +18,15 @@ Two seams onto the :class:`~himmy.services.tools.service.ToolService` hooks:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 
-from himmy.services.guardrails.base import GuardrailPipeline, GuardrailVerdict
+from himmy.services.guardrails.base import (
+    GuardrailPipeline,
+    GuardrailTrigger,
+    GuardrailVerdict,
+)
 from himmy.services.tools.models import (
     ToolDefinition,
     ToolExecutionResult,
@@ -33,6 +38,32 @@ from himmy.services.tools.models import (
 #: returns a BLOCK-class verdict (e.g. a credit-card number). The secret is never
 #: surfaced; only a redaction marker reaches the model/thread.
 BLOCKED_OUTPUT_PLACEHOLDER = "[BLOCKED: tool output withheld by data-loss policy]"
+
+#: How many levels of JSON-documents-serialized-inside-string-leaves the post-hook
+#: unwraps and guards. A regex over the *serialized* form misses content that only
+#: appears after decoding (e.g. ``\\u0040`` for ``@``), so parsed re-inspection is a
+#: real bypass fix — but it must be bounded or a "JSON-in-string-in-JSON…" depth
+#: bomb would make the hook do unbounded work. Beyond this depth the raw string
+#: inspection (which already ran) is the guard.
+_JSON_STRING_MAX_DEPTH = 3
+
+#: String leaves larger than this are not parsed as JSON (raw inspection still
+#: applies); caps the cost of repeated parse/re-serialize on adversarial payloads.
+_JSON_STRING_MAX_CHARS = 1_000_000
+
+
+def _parse_json_container(text: str) -> dict[str, Any] | list[Any] | None:
+    """Parse ``text`` as a JSON object/array, else ``None`` (cheap heuristic first)."""
+    if len(text) > _JSON_STRING_MAX_CHARS:
+        return None
+    stripped = text.lstrip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
 
 
 def build_guardrail_pre_hook(pipeline: GuardrailPipeline) -> Any:
@@ -54,7 +85,8 @@ def build_guardrail_pre_hook(pipeline: GuardrailPipeline) -> Any:
             if not verdict.allowed:
                 return ToolPolicyDecision(
                     allow=False,
-                    reason=f"guardrail blocked arg {key!r}: "
+                    reason=f"guardrail blocked arg {key!r} "
+                    f"[{_attribution(verdict.triggers)}]: "
                     + "; ".join(verdict.reasons),
                 )
             transformed[key] = verdict.text
@@ -67,6 +99,12 @@ def build_guardrail_pre_hook(pipeline: GuardrailPipeline) -> Any:
     return _hook
 
 
+def _attribution(triggers: list[GuardrailTrigger]) -> str:
+    """Render triggers as a compact ``guardrail:label`` attribution string."""
+    fired = sorted({f"{t.guardrail}:{t.label}" for t in triggers})
+    return ", ".join(fired) if fired else "guardrail:unknown"
+
+
 def _guard_value(
     pipeline: GuardrailPipeline,
     value: Any,
@@ -74,34 +112,76 @@ def _guard_value(
     context: dict[str, Any],
     flags: list[str],
     blocked: list[str],
+    triggers: list[GuardrailTrigger],
+    depth: int = 0,
 ) -> Any:
-    """Guard one value, recursing into containers; collect flags + block reasons.
+    """Guard one value, recursing into containers; collect flags/triggers/blocks.
 
     String leaves are inspected by ``pipeline`` and replaced with the (possibly
     redacted/tokenized) verdict text. Dicts/lists/tuples are walked so PII nested in
-    a structured tool result is guarded too. A BLOCK verdict anywhere records its
+    a structured tool result is guarded too. A string leaf that is itself a serialized
+    JSON object/array (a common tool-return shape) is additionally parsed and the
+    *decoded* structure guarded recursively — bounded by :data:`_JSON_STRING_MAX_DEPTH`
+    parse hops and :data:`_JSON_STRING_MAX_CHARS` per leaf — because escape sequences
+    in the serialized form can hide PII from the raw-text inspection; redactions found
+    that way are re-serialized back into the leaf. A BLOCK verdict anywhere records its
     reasons in ``blocked`` (the caller then withholds the *whole* result); non-block
-    redactions are applied in place so partial structures stay usable.
+    redactions are applied in place so partial structures stay usable. Every firing is
+    attributed in ``triggers`` (guardrail name + matched label).
     """
     if isinstance(value, str):
         verdict: GuardrailVerdict = pipeline.inspect(value, context=context)
         flags.extend(verdict.flags)
+        triggers.extend(verdict.triggers)
         if not verdict.allowed:
             blocked.extend(verdict.reasons or [f"blocked content in {context['arg']}"])
+            return verdict.text
+        if depth >= _JSON_STRING_MAX_DEPTH:
+            return verdict.text
+        parsed = _parse_json_container(verdict.text)
+        if parsed is None:
+            return verdict.text
+        guarded = _guard_value(
+            pipeline,
+            parsed,
+            context=context,
+            flags=flags,
+            blocked=blocked,
+            triggers=triggers,
+            depth=depth + 1,
+        )
+        if guarded != parsed:
+            # Redactions inside the decoded document: re-serialize so the leaf
+            # stays a valid JSON string, now with the redactions applied.
+            return json.dumps(guarded, ensure_ascii=False)
         return verdict.text
     if isinstance(value, dict):
         return {
             key: _guard_value(
-                pipeline, item, context=context, flags=flags, blocked=blocked
+                pipeline,
+                item,
+                context=context,
+                flags=flags,
+                blocked=blocked,
+                triggers=triggers,
+                depth=depth,
             )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        guarded = [
-            _guard_value(pipeline, item, context=context, flags=flags, blocked=blocked)
+        guarded_items = [
+            _guard_value(
+                pipeline,
+                item,
+                context=context,
+                flags=flags,
+                blocked=blocked,
+                triggers=triggers,
+                depth=depth,
+            )
             for item in value
         ]
-        return type(value)(guarded) if isinstance(value, tuple) else guarded
+        return type(value)(guarded_items) if isinstance(value, tuple) else guarded_items
     # Non-textual leaf (int/float/bool/None): nothing to inspect.
     return value
 
@@ -115,30 +195,40 @@ def build_guardrail_post_hook(
 
     Mirrors :func:`build_guardrail_pre_hook` but on the output path: the tool result's
     ``result`` is walked (strings, and strings nested in dicts/lists) and run through
-    ``pipeline``. PII is redacted/tokenized per the policy *in place* so the structure
-    stays usable; a BLOCK-class match (e.g. ``card``) withholds the *entire* result and
-    substitutes :data:`BLOCKED_OUTPUT_PLACEHOLDER`, so the secret never reaches the
-    model, the thread, or the next-turn context. Per-class detection *counts* — the
-    number of result leaves that raised each guardrail flag, derived from the flags
-    and never the values — are reported to ``audit_sink`` when supplied (the DLP
-    guardrail additionally reports its own per-match counts via its own sink).
+    ``pipeline``. String leaves that are themselves serialized JSON documents are
+    decoded and guarded recursively (bounded depth/size) so PII hidden behind JSON
+    escape sequences cannot bypass the guard. PII is redacted/tokenized per the policy
+    *in place* so the structure stays usable; a BLOCK-class match (e.g. ``card``)
+    withholds the *entire* result and substitutes :data:`BLOCKED_OUTPUT_PLACEHOLDER`,
+    so the secret never reaches the model, the thread, or the next-turn context.
+    Per-class detection *counts* — the number of result leaves that raised each
+    guardrail flag, derived from the flags and never the values — are reported to
+    ``audit_sink`` when supplied (the DLP guardrail additionally reports its own
+    per-match counts via its own sink), alongside attributed
+    ``<action>:<guardrail>:<label>`` counts (e.g. ``block:dlp:card``) recording WHICH
+    guardrail fired for every block/redaction — still counts-only, never values.
     """
 
     async def _hook(result: ToolExecutionResult, definition: ToolDefinition) -> Any:
         context = {"stage": "tool_output", "tool": definition.name, "arg": "result"}
         flags: list[str] = []
         blocked: list[str] = []
+        triggers: list[GuardrailTrigger] = []
         guarded = _guard_value(
             pipeline,
             result.result,
             context=context,
             flags=flags,
             blocked=blocked,
+            triggers=triggers,
         )
-        if audit_sink is not None and flags:
+        if audit_sink is not None and (flags or triggers):
             counts: dict[str, int] = {}
             for flag in flags:
                 counts[flag] = counts.get(flag, 0) + 1
+            for trigger in triggers:
+                key = f"{trigger.action}:{trigger.guardrail}:{trigger.label}"
+                counts[key] = counts.get(key, 0) + 1
             audit_sink(counts)
         if blocked:
             # A BLOCK-class match: withhold the entire result so the secret never

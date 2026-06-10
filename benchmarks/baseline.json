@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "suite": "core-gate",
+  "baselined_at": {
+    "sha": "c1ce40987f16",
+    "date": "2026-06-09",
+    "trials": 5
+  },
+  "gate": {
+    "tasks": [
+      "arithmetic",
+      "file_read",
+      "sql_count",
+      "multistep_file_math",
+      "rag_grounded",
+      "rx_synthesis_after_tool"
+    ],
+    "trials": 5,
+    "min_trials": 5
+  },
+  "models": {
+    "ollama:qwen2.5:3b-instruct": {
+      "measured": {
+        "accuracy": 0.6666666666666666,
+        "tool_call_accuracy": 1.0,
+        "error_rate": 0.0,
+        "by_category": {
+          "arithmetic": 1.0,
+          "files": 1.0,
+          "sql": 0.0,
+          "multistep": 1.0,
+          "rag": 0.0,
+          "regression": 1.0
+        }
+      },
+      "floors": {
+        "accuracy": 0.517,
+        "tool_call_accuracy": 0.85
+      },
+      "ceilings": {
+        "error_rate": 0.15
+      }
+    }
+  }
+}

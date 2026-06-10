@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import random
 from typing import Any
 
 import pytest
@@ -169,3 +171,162 @@ def test_build_field_encryptor_off_by_default(monkeypatch: Any) -> None:
     monkeypatch.delenv("HIMMY_ENCRYPTION_KEY", raising=False)
     configure_secrets(None)
     assert build_field_encryptor() is None
+
+
+# ---------------------------------------------------------------------------
+# Seeded fuzz: legacy-token layout equivalence (crypto-critical claim in
+# FieldEncryptor._split_blob's docstring — "the two AES-GCM wrap layouts are
+# byte-identical"). Deterministic (fixed seed), stdlib-only.
+# ---------------------------------------------------------------------------
+
+#: AES-GCM wrap of a 32-byte DEK: 32 bytes + 16-byte tag (excludes the wrap nonce).
+_GCM_WRAPPED_DEK_LEN = 48
+#: 96-bit AES-GCM nonce, used for both the wrap and the data layer.
+_NONCE_LEN = 12
+
+
+def _reframe_as_legacy(token: str) -> str:
+    """Re-frame a current versioned token into the historical version-less layout.
+
+    Current blob framing is ``[edek_len] || (wrap_nonce(12) || gcm_wrapped) ||
+    data_nonce(12) || ct`` where the length byte covers the folded-in wrap nonce. The
+    historical framing kept the wrap nonce as a separate field — ``[edek_len] ||
+    wrap_nonce(12) || gcm_wrapped(edek_len) || data_nonce(12) || ct`` — with the length
+    byte covering only the GCM-wrapped DEK. The payload bytes are identical; only the
+    length byte differs (by the 12-byte nonce) and the version segment is dropped.
+    """
+    version, blob = FieldEncryptor._parse_token(token)
+    assert version == LOCAL_VERSION
+    edek_len = blob[0]
+    assert edek_len == _NONCE_LEN + _GCM_WRAPPED_DEK_LEN  # local provider invariant
+    legacy_blob = bytes([edek_len - _NONCE_LEN]) + blob[1:]
+    # Same shape as the genuine pre-change artifact above (edek_len byte == 48).
+    assert legacy_blob[0] == _GCM_WRAPPED_DEK_LEN
+    b64 = base64.urlsafe_b64encode(legacy_blob).decode("ascii")
+    return f"{ENC_PREFIX}{b64}"
+
+
+def _fuzz_plaintext(rng: random.Random, i: int) -> str:
+    """Deterministic varied plaintexts: empty / 1-byte / ascii / unicode / large."""
+    kind = i % 5
+    if kind == 0:
+        return ""
+    if kind == 1:
+        return chr(rng.randrange(0x20, 0x7F))
+    if kind == 2:  # short ascii
+        return "".join(
+            chr(rng.randrange(0x20, 0x7F)) for _ in range(rng.randrange(1, 65))
+        )
+    if kind == 3:  # unicode incl. multi-byte codepoints (no surrogates)
+        chars = []
+        for _ in range(rng.randrange(1, 33)):
+            cp = rng.randrange(0x20, 0x110000)
+            while 0xD800 <= cp <= 0xDFFF:
+                cp = rng.randrange(0x20, 0x110000)
+            chars.append(chr(cp))
+        return "".join(chars)
+    # large (up to ~8 KiB)
+    return "".join(
+        chr(rng.randrange(0x20, 0x7F)) for _ in range(rng.randrange(1024, 8193))
+    )
+
+
+def test_fuzz_legacy_layout_roundtrips_byte_for_byte() -> None:
+    """encrypt → reparse as legacy layout → decrypt round-trips, 300 seeded cases.
+
+    Proves the docstring claim that the legacy and current wrap layouts carry identical
+    bytes: a ciphertext produced by today's ``encrypt()`` decrypts identically when
+    re-framed into the historical version-less token (separate wrap-nonce field, no
+    VERSION segment). Covers empty/1-byte/ascii/unicode/large plaintexts and random AAD.
+    """
+    rng = random.Random(0x48494D4D)  # fixed seed → fully deterministic
+    enc = FieldEncryptor(rng.randbytes(32))
+    for i in range(300):
+        plaintext = _fuzz_plaintext(rng, i)
+        aad = rng.randbytes(rng.randrange(0, 17)) if i % 3 == 0 else b""
+        token = enc.encrypt(plaintext, aad=aad)
+        # Current-format round-trip, byte-for-byte.
+        current = enc.decrypt(token, aad=aad)
+        assert current == plaintext
+        assert current.encode("utf-8") == plaintext.encode("utf-8")
+        # Legacy-layout round-trip of the SAME ciphertext bytes.
+        legacy_token = _reframe_as_legacy(token)
+        assert FieldEncryptor._is_legacy_token(legacy_token)
+        legacy = enc.decrypt(legacy_token, aad=aad)
+        assert legacy == plaintext
+        assert legacy.encode("utf-8") == plaintext.encode("utf-8")
+        # And the legacy form can be rotated forward without touching the plaintext.
+        if i % 50 == 0:
+            new_provider = LocalKekProvider(rng.randbytes(32))
+            rotated = enc.rotate_kek(legacy_token, new_provider)
+            assert (
+                FieldEncryptor.from_provider(new_provider).decrypt(rotated, aad=aad)
+                == plaintext
+            )
+
+
+def _tampered(blob: bytes, pos: int, rng: random.Random) -> bytes:
+    """Flip a random bit of ``blob[pos]`` (guaranteed to differ)."""
+    return blob[:pos] + bytes([blob[pos] ^ (1 << rng.randrange(8))]) + blob[pos + 1 :]
+
+
+def _legacy_and_current_tokens(blob: bytes) -> tuple[str, str]:
+    """Encode ``blob`` as (current LOCAL-versioned token, legacy version-less token)."""
+    current_b64 = base64.urlsafe_b64encode(blob).decode("ascii")
+    legacy_blob = bytes([blob[0] - _NONCE_LEN]) + blob[1:]
+    legacy_b64 = base64.urlsafe_b64encode(legacy_blob).decode("ascii")
+    return f"{ENC_PREFIX}{LOCAL_VERSION}:{current_b64}", f"{ENC_PREFIX}{legacy_b64}"
+
+
+def test_fuzz_tampered_ciphertext_nonce_tag_fail_authentication() -> None:
+    """Any flipped bit in nonce/ciphertext/tag/wrap regions → InvalidTag, both layouts."""
+    rng = random.Random(0x54414D50)  # fixed seed
+    enc = FieldEncryptor(rng.randbytes(32))
+    for i in range(100):
+        plaintext = _fuzz_plaintext(rng, i)
+        _version, blob = FieldEncryptor._parse_token(enc.encrypt(plaintext))
+        edek_len = blob[0]
+        ct_start = 1 + edek_len + _NONCE_LEN
+        # One byte from each authenticated region: wrap nonce, wrapped DEK (incl. its
+        # GCM tag), data nonce, ciphertext body, and the trailing data GCM tag.
+        positions = [
+            rng.randrange(1, 1 + _NONCE_LEN),  # wrap nonce
+            rng.randrange(1 + _NONCE_LEN, 1 + edek_len),  # wrapped DEK + wrap tag
+            rng.randrange(1 + edek_len, ct_start),  # data nonce
+            rng.randrange(ct_start, len(blob)),  # ciphertext or data tag
+            rng.randrange(len(blob) - 16, len(blob)),  # data GCM tag specifically
+        ]
+        for pos in positions:
+            current_token, legacy_token = _legacy_and_current_tokens(
+                _tampered(blob, pos, rng)
+            )
+            with pytest.raises(InvalidTag):
+                enc.decrypt(current_token)
+            with pytest.raises(InvalidTag):
+                enc.decrypt(legacy_token)
+        # The length byte isn't GCM-authenticated; corrupting it must still fail
+        # loudly (misframed slices → InvalidTag, or a structural ValueError).
+        bad_len = _tampered(blob, 0, rng)
+        current_token, legacy_token = (
+            f"{ENC_PREFIX}{LOCAL_VERSION}:"
+            f"{base64.urlsafe_b64encode(bad_len).decode('ascii')}",
+            f"{ENC_PREFIX}{base64.urlsafe_b64encode(bad_len).decode('ascii')}",
+        )
+        for token in (current_token, legacy_token):
+            with pytest.raises((InvalidTag, ValueError)):
+                enc.decrypt(token)
+
+
+def test_fuzz_wrong_kek_fails_cleanly() -> None:
+    """Decrypting with a different KEK raises InvalidTag for both token layouts."""
+    rng = random.Random(0x4B454B)  # fixed seed
+    enc = FieldEncryptor(rng.randbytes(32))
+    wrong = FieldEncryptor(rng.randbytes(32))
+    for i in range(60):
+        plaintext = _fuzz_plaintext(rng, i)
+        token = enc.encrypt(plaintext)
+        legacy_token = _reframe_as_legacy(token)
+        with pytest.raises(InvalidTag):
+            wrong.decrypt(token)
+        with pytest.raises(InvalidTag):
+            wrong.decrypt(legacy_token)

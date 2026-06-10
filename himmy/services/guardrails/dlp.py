@@ -10,17 +10,23 @@ detection beyond the regex rules.
 
 ``tokenize`` uses a :class:`TokenVault` (a reversible token↔value map) so a downstream
 workflow can round-trip the original via :meth:`TokenVault.detokenize` while the model
-only ever sees the token.
+only ever sees the token. Storage is pluggable via :class:`TokenVaultBackend`:
+the default :class:`InMemoryTokenVaultBackend` is process-local and bounded (LRU),
+while :class:`SqliteTokenVaultBackend` keeps tokens reversible across restarts.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import sqlite3
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
+from himmy.core.sqlite_util import connect_hardened
 from himmy.services.guardrails.base import GuardrailVerdict
 from himmy.services.guardrails.builtins import _PII_RULES
 
@@ -28,6 +34,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable
 
     from himmy.services.guardrails.builtins import PIIRule
+
+logger = logging.getLogger("himmy.guardrails")
 
 
 class DlpAction(str, Enum):
@@ -72,28 +80,196 @@ class DlpPolicy:
         return cls(actions=actions, default=resolved_default)
 
 
-class TokenVault:
-    """A reversible token↔value map for ``tokenize`` actions (in-memory by default)."""
+#: Default capacity of the in-memory token vault backend. Beyond this many unique
+#: values the least-recently-used token is evicted (and becomes irreversible).
+DEFAULT_VAULT_CAPACITY = 100_000
 
-    def __init__(self) -> None:
-        self._by_value: dict[str, str] = {}
-        self._by_token: dict[str, str] = {}
+#: Tokens produced by :meth:`TokenVault.tokenize` — ``[LABEL:12-hex-digest]``.
+_TOKEN_RE = re.compile(r"\[[^\[\]]+:[0-9a-f]{12}\]")
+
+
+class TokenVaultBackend(Protocol):
+    """Storage seam for :class:`TokenVault` so durable backends can be plugged in.
+
+    Implementations should treat ``get_token``/``get_value`` as a *use* of the
+    mapping (an LRU touch) when they enforce a capacity.
+    """
+
+    def get_token(self, value: str) -> str | None:
+        """The token previously stored for ``value``, or ``None``."""
+        ...  # pragma: no cover - protocol
+
+    def get_value(self, token: str) -> str | None:
+        """The original value behind ``token``, or ``None`` (e.g. evicted)."""
+        ...  # pragma: no cover - protocol
+
+    def store(self, value: str, token: str) -> None:
+        """Persist the ``value`` ↔ ``token`` pair."""
+        ...  # pragma: no cover - protocol
+
+
+class InMemoryTokenVaultBackend:
+    """Process-local LRU-bounded storage (the default :class:`TokenVault` backend).
+
+    Capacity defaults to :data:`DEFAULT_VAULT_CAPACITY`; pass ``max_entries=None``
+    for unbounded. **Evicted tokens become irreversible** — ``detokenize`` leaves
+    them in place — so a one-time warning is logged on the first eviction.
+    """
+
+    def __init__(self, *, max_entries: int | None = DEFAULT_VAULT_CAPACITY) -> None:
+        self._tokens_by_value: OrderedDict[str, str] = OrderedDict()
+        self._values_by_token: dict[str, str] = {}
+        self._max_entries = max_entries
+        self._evict_warned = False
+
+    def get_token(self, value: str) -> str | None:
+        """The token for ``value`` (LRU touch), or ``None``."""
+        token = self._tokens_by_value.get(value)
+        if token is not None:
+            self._tokens_by_value.move_to_end(value)
+        return token
+
+    def get_value(self, token: str) -> str | None:
+        """The value behind ``token`` (LRU touch), or ``None`` if evicted/unknown."""
+        value = self._values_by_token.get(token)
+        if value is not None:
+            self._tokens_by_value.move_to_end(value)
+        return value
+
+    def store(self, value: str, token: str) -> None:
+        """Store the pair, evicting the least-recently-used entry at capacity."""
+        self._tokens_by_value[value] = token
+        self._tokens_by_value.move_to_end(value)
+        self._values_by_token[token] = value
+        if self._max_entries is None:
+            return
+        while len(self._tokens_by_value) > self._max_entries:
+            _, evicted_token = self._tokens_by_value.popitem(last=False)
+            self._values_by_token.pop(evicted_token, None)
+            if not self._evict_warned:
+                self._evict_warned = True
+                logger.warning(
+                    "TokenVault at capacity (%d): evicting least-recently-used "
+                    "tokens; evicted tokens can no longer be detokenized. "
+                    "Raise max_entries or use SqliteTokenVaultBackend.",
+                    self._max_entries,
+                )
+
+
+class SqliteTokenVaultBackend:
+    """SQLite-file-backed storage: tokens stay reversible across process restarts.
+
+    A reference durable backend (stdlib only). Multiple vault instances — even in
+    separate processes — can share one ``path`` and resolve each other's tokens.
+    ``max_entries`` (default unbounded — it's disk, not memory) enables the same
+    LRU eviction semantics as :class:`InMemoryTokenVaultBackend`. Note the vault
+    stores **plaintext sensitive values**; protect the file accordingly.
+    """
+
+    def __init__(self, path: str, *, max_entries: int | None = None) -> None:
+        self._conn: sqlite3.Connection = connect_hardened(path)
+        self._max_entries = max_entries
+        self._evict_warned = False
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS token_vault ("
+            " value TEXT PRIMARY KEY,"
+            " token TEXT NOT NULL UNIQUE,"
+            " seq INTEGER NOT NULL)"
+        )
+        self._conn.commit()
+
+    def get_token(self, value: str) -> str | None:
+        """The token for ``value`` (LRU touch), or ``None``."""
+        row = self._conn.execute(
+            "SELECT token FROM token_vault WHERE value = ?", (value,)
+        ).fetchone()
+        if row is None:
+            return None
+        self._touch(value)
+        return str(row[0])
+
+    def get_value(self, token: str) -> str | None:
+        """The value behind ``token`` (LRU touch), or ``None`` if evicted/unknown."""
+        row = self._conn.execute(
+            "SELECT value FROM token_vault WHERE token = ?", (token,)
+        ).fetchone()
+        if row is None:
+            return None
+        value = str(row[0])
+        self._touch(value)
+        return value
+
+    def store(self, value: str, token: str) -> None:
+        """Store the pair, evicting the least-recently-used rows at capacity."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO token_vault (value, token, seq) VALUES"
+            " (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM token_vault))",
+            (value, token),
+        )
+        self._evict_if_needed()
+        self._conn.commit()
+
+    def _touch(self, value: str) -> None:
+        """Mark ``value`` as most-recently-used."""
+        self._conn.execute(
+            "UPDATE token_vault SET seq ="
+            " (SELECT COALESCE(MAX(seq), 0) + 1 FROM token_vault)"
+            " WHERE value = ?",
+            (value,),
+        )
+        self._conn.commit()
+
+    def _evict_if_needed(self) -> None:
+        """Delete the lowest-``seq`` (least-recently-used) rows beyond capacity."""
+        if self._max_entries is None:
+            return
+        row = self._conn.execute("SELECT COUNT(*) FROM token_vault").fetchone()
+        overflow = int(row[0]) - self._max_entries
+        if overflow <= 0:
+            return
+        self._conn.execute(
+            "DELETE FROM token_vault WHERE value IN"
+            " (SELECT value FROM token_vault ORDER BY seq ASC LIMIT ?)",
+            (overflow,),
+        )
+        if not self._evict_warned:
+            self._evict_warned = True
+            logger.warning(
+                "TokenVault at capacity (%d): evicting least-recently-used "
+                "tokens; evicted tokens can no longer be detokenized.",
+                self._max_entries,
+            )
+
+
+class TokenVault:
+    """A reversible token↔value map for ``tokenize`` actions.
+
+    Storage is delegated to a :class:`TokenVaultBackend`. The default is a
+    bounded :class:`InMemoryTokenVaultBackend` (process-local, LRU-evicting —
+    evicted tokens become irreversible); pass a :class:`SqliteTokenVaultBackend`
+    to keep tokens reversible across restarts.
+    """
+
+    def __init__(self, *, backend: TokenVaultBackend | None = None) -> None:
+        self._backend: TokenVaultBackend = backend or InMemoryTokenVaultBackend()
 
     def tokenize(self, label: str, value: str) -> str:
         """Return a stable token for ``value`` (same value → same token)."""
-        token = self._by_value.get(value)
+        token = self._backend.get_token(value)
         if token is None:
             digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
             token = f"[{label.upper()}:{digest}]"
-            self._by_value[value] = token
-            self._by_token[token] = value
+            self._backend.store(value, token)
         return token
 
     def detokenize(self, text: str) -> str:
-        """Restore original values for any tokens present in ``text``."""
-        for token, value in self._by_token.items():
-            text = text.replace(token, value)
-        return text
+        """Restore original values for any live (non-evicted) tokens in ``text``."""
+
+        def _restore(match: re.Match[str]) -> str:
+            value = self._backend.get_value(match.group(0))
+            return value if value is not None else match.group(0)
+
+        return _TOKEN_RE.sub(_restore, text)
 
 
 class DlpGuardrail:
@@ -243,7 +419,11 @@ class PresidioAnalyzerAdapter:
 def build_dlp_guardrail(
     *, audit_sink: Callable[[dict[str, int]], None] | None = None
 ) -> DlpGuardrail:
-    """Build a DLP guardrail from env (``HIMMY_DLP_POLICY`` / ``HIMMY_DLP_BACKEND``)."""
+    """Build a DLP guardrail from env (``HIMMY_DLP_POLICY`` / ``HIMMY_DLP_BACKEND``).
+
+    ``HIMMY_DLP_VAULT_PATH`` (optional) opts the token vault into the durable
+    :class:`SqliteTokenVaultBackend` at that path; default stays in-memory.
+    """
     import os
 
     spec = os.environ.get("HIMMY_DLP_POLICY", "")
@@ -256,13 +436,23 @@ def build_dlp_guardrail(
         if os.environ.get("HIMMY_DLP_BACKEND", "").lower() == "presidio"
         else None
     )
-    return DlpGuardrail(policy=policy, audit_sink=audit_sink, analyzer=analyzer)
+    vault_path = os.environ.get("HIMMY_DLP_VAULT_PATH", "")
+    vault = (
+        TokenVault(backend=SqliteTokenVaultBackend(vault_path)) if vault_path else None
+    )
+    return DlpGuardrail(
+        policy=policy, vault=vault, audit_sink=audit_sink, analyzer=analyzer
+    )
 
 
 __all__ = [
+    "DEFAULT_VAULT_CAPACITY",
     "DlpAction",
     "DlpPolicy",
     "TokenVault",
+    "TokenVaultBackend",
+    "InMemoryTokenVaultBackend",
+    "SqliteTokenVaultBackend",
     "DlpGuardrail",
     "PresidioAnalyzerAdapter",
     "build_dlp_guardrail",

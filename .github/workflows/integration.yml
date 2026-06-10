@@ -9,6 +9,11 @@ on:
   # can't merge), nightly (pass-rate tracking), and on demand (the "Run workflow" button).
   pull_request:
   workflow_dispatch:
+    inputs:
+      trials:
+        description: "benchmark trials per task (nightly benchmark job)"
+        required: false
+        default: "10"
   schedule:
     - cron: "0 7 * * *" # nightly: track agent pass-rate over time
 
@@ -58,11 +63,16 @@ jobs:
 
   benchmark:
     name: agent benchmark vs. Ollama (qwen2.5:3b)
-    # Post-merge + nightly + manual — NOT on PRs (CPU Ollama is too slow to gate every PR).
-    # This is the standing eval that answers "did this change make agents better or worse?"
+    # Nightly + manual — NOT on PRs (the full suite at >= 10 trials is too slow to gate
+    # every PR; the PR-sized gate below covers that). This is the standing eval that
+    # answers "did this change make agents better or worse?" with tight CIs: 10 trials
+    # per task gives a pooled n of 150 (vs the old 2 trials / n=30, whose ±15% CI could
+    # not see a 5% regression).
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
+    env:
+      BENCH_TRIALS: ${{ github.event.inputs.trials || '10' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -93,7 +103,7 @@ jobs:
         run: |
           python -m himmy bench \
             --models ollama:qwen2.5:3b-instruct \
-            --trials 2 \
+            --trials "$BENCH_TRIALS" \
             --fail-under 0.6 \
             --json bench-results.json
 
@@ -103,3 +113,47 @@ jobs:
         with:
           name: benchmark-results
           path: bench-results.json
+
+  benchmark-gate:
+    name: benchmark PR gate (baseline floors)
+    # PR-sized companion to the nightly benchmark: a 6-task subset of the core suite at
+    # 5 trials (the `gate` block of benchmarks/baseline.json) compared against
+    # checked-in metric floors + the SHA that produced them. Fails the PR when accuracy
+    # / tool-call accuracy / error rate regress past the floors. Re-baselining after an
+    # intentional quality shift is `make bench-rebaseline` (commit the JSON diff).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install himmy with the packs the gate subset exercises
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,knowledge]"
+
+      - name: Install + start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:11434/api/tags >/dev/null && break || sleep 2
+          done
+
+      - name: Pull the benchmark model
+        run: ollama pull qwen2.5:3b-instruct
+
+      - name: Run the gate benchmark against the checked-in baseline
+        run: python scripts/bench_gate.py run --json bench-pr-results.json
+
+      - name: Upload gate results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-pr-gate-results
+          path: bench-pr-results.json

@@ -14,10 +14,12 @@ from himmy.services.knowledge.backend import (
 )
 from himmy.services.knowledge.chunker import MarkdownAwareChunker, SemanticChunker
 from himmy.services.knowledge.embedder import (
+    EMBEDDER_FINGERPRINT_KEY,
     DeterministicEmbedder,
     EmbedderProtocol,
     OpenAIMultimodalEmbeddingModel,
     build_openai_compatible_embedder,
+    embedder_fingerprint,
     embedder_is_multimodal,
 )
 from himmy.services.knowledge.models import (
@@ -83,6 +85,8 @@ __all__ = [
     "DocumentInput",
     "DeterministicEmbedder",
     "EmbedderProtocol",
+    "EMBEDDER_FINGERPRINT_KEY",
+    "embedder_fingerprint",
     "embedder_is_multimodal",
     "OpenAIMultimodalEmbeddingModel",
     "build_openai_compatible_embedder",

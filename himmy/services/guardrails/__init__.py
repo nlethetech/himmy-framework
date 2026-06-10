@@ -12,6 +12,7 @@ from __future__ import annotations
 from himmy.services.guardrails.base import (
     Guardrail,
     GuardrailPipeline,
+    GuardrailTrigger,
     GuardrailVerdict,
 )
 from himmy.services.guardrails.builtins import (
@@ -25,11 +26,15 @@ from himmy.services.guardrails.builtins import (
     build_guardrail_pipeline,
 )
 from himmy.services.guardrails.dlp import (
+    DEFAULT_VAULT_CAPACITY,
     DlpAction,
     DlpGuardrail,
     DlpPolicy,
+    InMemoryTokenVaultBackend,
     PresidioAnalyzerAdapter,
+    SqliteTokenVaultBackend,
     TokenVault,
+    TokenVaultBackend,
     build_dlp_guardrail,
 )
 from himmy.services.guardrails.tool_hook import (
@@ -40,6 +45,7 @@ from himmy.services.guardrails.tool_hook import (
 
 __all__ = [
     "Guardrail",
+    "GuardrailTrigger",
     "GuardrailVerdict",
     "GuardrailPipeline",
     "PIIRule",
@@ -53,10 +59,14 @@ __all__ = [
     "build_guardrail_pre_hook",
     "build_guardrail_post_hook",
     "BLOCKED_OUTPUT_PLACEHOLDER",
+    "DEFAULT_VAULT_CAPACITY",
     "DlpAction",
     "DlpPolicy",
     "DlpGuardrail",
     "TokenVault",
+    "TokenVaultBackend",
+    "InMemoryTokenVaultBackend",
+    "SqliteTokenVaultBackend",
     "PresidioAnalyzerAdapter",
     "build_dlp_guardrail",
 ]

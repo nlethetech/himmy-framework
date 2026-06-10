@@ -16,6 +16,7 @@ re-runnable without truncation.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 
@@ -30,7 +31,10 @@ from himmy.services.storage import (
     RunRecord,
     RunStatus,
 )
-from himmy.services.storage.postgres import PostgresStorageService
+from himmy.services.storage.postgres import (
+    MIGRATION_ADVISORY_LOCK_KEY,
+    PostgresStorageService,
+)
 from tests.conftest import run_async
 
 _DSN = os.environ.get("HIMMY_TEST_POSTGRES_DSN")
@@ -70,6 +74,41 @@ def test_migrate_is_idempotent_and_tracked() -> None:
             assert second == []  # nothing left to apply
         finally:
             await storage.close()
+
+    run_async(scenario())
+
+
+def test_migrate_blocks_behind_advisory_lock() -> None:
+    """migrate() waits on the cross-process advisory lock before reading versions.
+
+    A second connection holds ``pg_advisory_lock(MIGRATION_ADVISORY_LOCK_KEY)``;
+    migrate() must not complete until it is released (the concurrent-migrator
+    serialisation guarantee, mock-seam version in
+    ``test_postgres_migrate_advisory_lock.py``).
+    """
+
+    async def scenario() -> None:
+        storage = await PostgresStorageService.connect(_DSN)
+        blocker = await PostgresStorageService.connect(_DSN)
+        try:
+            pool = blocker._require_pool()  # type: ignore[attr-defined]
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "SELECT pg_advisory_lock($1)", MIGRATION_ADVISORY_LOCK_KEY
+                )
+                try:
+                    task = asyncio.ensure_future(storage.migrate())
+                    await asyncio.sleep(0.3)
+                    assert not task.done()  # parked on the advisory lock
+                finally:
+                    await conn.execute(
+                        "SELECT pg_advisory_unlock($1)", MIGRATION_ADVISORY_LOCK_KEY
+                    )
+                # Released: migrate() proceeds ([] on a migrated DB, [1] fresh).
+                assert await asyncio.wait_for(task, timeout=30) in ([], [1])
+        finally:
+            await storage.close()
+            await blocker.close()
 
     run_async(scenario())
 

@@ -14,16 +14,22 @@ Stores: :class:`InMemoryCheckpointStore` (default, volatile) and
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
+from himmy.core.errors import HimmyError
 from himmy.core.ids import new_uuid, utc_now_iso
 
 #: Checkpoint lifecycle states.
 AWAITING_APPROVAL = "awaiting_approval"
 APPROVED = "approved"
 REJECTED = "rejected"
+
+#: Current :class:`AgentCheckpoint` serialization format. Bump this (and add a
+#: step to ``_MIGRATIONS``) whenever a persisted field changes shape.
+CHECKPOINT_SCHEMA_VERSION = 2
 
 
 class PendingToolCall(BaseModel):
@@ -43,6 +49,7 @@ class AgentCheckpoint(BaseModel):
     ``rejected`` exactly once.
     """
 
+    schema_version: int = CHECKPOINT_SCHEMA_VERSION
     checkpoint_id: str = Field(default_factory=new_uuid)
     status: str = AWAITING_APPROVAL
     persona: dict[str, Any] = Field(default_factory=dict)
@@ -55,7 +62,58 @@ class AgentCheckpoint(BaseModel):
     turns_completed: int = 0
     cost_completed: float = 0.0
     pending_tool_calls: list[PendingToolCall] = Field(default_factory=list)
+    #: Idempotency ledger for HITL resume: serialized ``ToolExecutionResult`` dumps
+    #: keyed by ``tool_call_id``, written (and persisted) immediately after each
+    #: approved tool executes. A repeated resume — including a retry after a crash
+    #: BETWEEN executing a state-mutating tool and resolving the checkpoint —
+    #: replays the recorded result instead of executing the tool a second time.
+    executed_tool_results: dict[str, dict[str, Any]] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)
+
+
+def _migrate_v0_to_v1(raw: dict[str, Any]) -> dict[str, Any]:
+    """v0 (pre-versioning) -> v1: same field shapes, only the version stamp is new."""
+    return raw
+
+
+def _migrate_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    """v1 -> v2: adds ``executed_tool_results`` (empty — nothing had executed)."""
+    raw.setdefault("executed_tool_results", {})
+    return raw
+
+
+#: Stepwise upgraders keyed by the *from* version; each returns the raw dict at
+#: version ``from + 1``. Every historical format must have an unbroken chain here.
+_MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    0: _migrate_v0_to_v1,
+    1: _migrate_v1_to_v2,
+}
+
+
+def _migrate_checkpoint(raw: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a raw checkpoint dict to :data:`CHECKPOINT_SCHEMA_VERSION` stepwise.
+
+    A missing ``schema_version`` means a legacy (pre-versioning) checkpoint and is
+    treated as version 0. A version *newer* than this build understands raises a
+    clear :class:`~himmy.core.errors.HimmyError` instead of a confusing pydantic
+    validation error.
+    """
+    version = raw.get("schema_version", 0)
+    if not isinstance(version, int) or version < 0:
+        raise HimmyError(
+            f"Invalid checkpoint schema_version {version!r}; expected a "
+            f"non-negative int <= {CHECKPOINT_SCHEMA_VERSION}."
+        )
+    if version > CHECKPOINT_SCHEMA_VERSION:
+        raise HimmyError(
+            f"Checkpoint schema_version {version} is newer than this himmy build "
+            f"supports (max {CHECKPOINT_SCHEMA_VERSION}); upgrade himmy to resume it."
+        )
+    while version < CHECKPOINT_SCHEMA_VERSION:
+        raw = _MIGRATIONS[version](raw)
+        version += 1
+        raw["schema_version"] = version
+    return raw
 
 
 @runtime_checkable
@@ -105,6 +163,10 @@ GRAPH_COMPLETED = "completed"
 GRAPH_INTERRUPTED = "interrupted"
 GRAPH_FAILED = "failed"
 
+#: Current :class:`GraphCheckpoint` serialization format. Bump this (and add a
+#: step to ``_GRAPH_MIGRATIONS``) whenever a persisted field changes shape.
+GRAPH_CHECKPOINT_SCHEMA_VERSION = 1
+
 
 class GraphCheckpoint(BaseModel):
     """A durable snapshot of a :class:`~himmy.orchestrators.state_graph.StateGraph` run.
@@ -117,6 +179,7 @@ class GraphCheckpoint(BaseModel):
     must be re-supplied on resume (the topology itself is code, not serialized).
     """
 
+    schema_version: int = GRAPH_CHECKPOINT_SCHEMA_VERSION
     checkpoint_id: str = Field(default_factory=new_uuid)
     graph_name: str = ""
     status: str = GRAPH_RUNNING
@@ -128,6 +191,45 @@ class GraphCheckpoint(BaseModel):
     error: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
+
+
+def _migrate_graph_v0_to_v1(raw: dict[str, Any]) -> dict[str, Any]:
+    """v0 (pre-versioning) -> v1: same field shapes, only the version stamp is new."""
+    return raw
+
+
+#: Stepwise upgraders keyed by the *from* version; each returns the raw dict at
+#: version ``from + 1``. Every historical format must have an unbroken chain here.
+_GRAPH_MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    0: _migrate_graph_v0_to_v1,
+}
+
+
+def _migrate_graph_checkpoint(raw: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a raw graph checkpoint dict to the current version stepwise.
+
+    A missing ``schema_version`` means a legacy (pre-versioning) checkpoint and is
+    treated as version 0. A version *newer* than this build understands raises a
+    clear :class:`~himmy.core.errors.HimmyError` instead of a confusing pydantic
+    validation error — the same contract as :func:`_migrate_checkpoint`.
+    """
+    version = raw.get("schema_version", 0)
+    if not isinstance(version, int) or version < 0:
+        raise HimmyError(
+            f"Invalid graph checkpoint schema_version {version!r}; expected a "
+            f"non-negative int <= {GRAPH_CHECKPOINT_SCHEMA_VERSION}."
+        )
+    if version > GRAPH_CHECKPOINT_SCHEMA_VERSION:
+        raise HimmyError(
+            f"Graph checkpoint schema_version {version} is newer than this himmy "
+            f"build supports (max {GRAPH_CHECKPOINT_SCHEMA_VERSION}); upgrade himmy "
+            f"to resume it."
+        )
+    while version < GRAPH_CHECKPOINT_SCHEMA_VERSION:
+        raw = _GRAPH_MIGRATIONS[version](raw)
+        version += 1
+        raw["schema_version"] = version
+    return raw
 
 
 @runtime_checkable
@@ -214,7 +316,9 @@ class SqliteGraphCheckpointStore:
         ).fetchone()
         if row is None:
             return None
-        return GraphCheckpoint.model_validate(json.loads(row[0]))
+        return GraphCheckpoint.model_validate(
+            _migrate_graph_checkpoint(json.loads(row[0]))
+        )
 
     def list_by_status(self, status: str) -> list[GraphCheckpoint]:
         """All graph checkpoints with the given status, newest first."""
@@ -223,7 +327,10 @@ class SqliteGraphCheckpointStore:
             "ORDER BY updated_at DESC",
             (status,),
         ).fetchall()
-        return [GraphCheckpoint.model_validate(json.loads(r[0])) for r in rows]
+        return [
+            GraphCheckpoint.model_validate(_migrate_graph_checkpoint(json.loads(r[0])))
+            for r in rows
+        ]
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
@@ -263,7 +370,7 @@ class SqliteCheckpointStore:
         ).fetchone()
         if row is None:
             return None
-        return AgentCheckpoint.model_validate(json.loads(row[0]))
+        return AgentCheckpoint.model_validate(_migrate_checkpoint(json.loads(row[0])))
 
     def list_by_status(self, status: str) -> list[AgentCheckpoint]:
         """All checkpoints with the given status, newest first (for an approvals UI)."""
@@ -272,7 +379,10 @@ class SqliteCheckpointStore:
             "ORDER BY created_at DESC",
             (status,),
         ).fetchall()
-        return [AgentCheckpoint.model_validate(json.loads(r[0])) for r in rows]
+        return [
+            AgentCheckpoint.model_validate(_migrate_checkpoint(json.loads(r[0])))
+            for r in rows
+        ]
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
@@ -283,6 +393,7 @@ __all__ = [
     "AWAITING_APPROVAL",
     "APPROVED",
     "REJECTED",
+    "CHECKPOINT_SCHEMA_VERSION",
     "PendingToolCall",
     "AgentCheckpoint",
     "CheckpointStore",
@@ -292,6 +403,7 @@ __all__ = [
     "GRAPH_COMPLETED",
     "GRAPH_INTERRUPTED",
     "GRAPH_FAILED",
+    "GRAPH_CHECKPOINT_SCHEMA_VERSION",
     "GraphCheckpoint",
     "GraphCheckpointStore",
     "InMemoryGraphCheckpointStore",

@@ -16,7 +16,7 @@ import contextlib
 import contextvars
 import json
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -25,6 +25,8 @@ from typing import (
     cast,
     runtime_checkable,
 )
+
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from himmy.core.errors import HimmyError
 from himmy.core.events import EventType, RunEvent
@@ -63,6 +65,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.services.prompts.manager import PromptManager
     from himmy.services.prompts.mapper import ContextPromptMapper
     from himmy.services.storage.service import ThreadEventStore
+    from himmy.services.tools.models import ToolExecutionResult
 
     # The runtime TRAIN gate (WS4.6). Resolves a Decision for (subject, purpose);
     # ConsentLedger.decision conforms. ``None`` ⇒ ungoverned, gate inert.
@@ -73,6 +76,151 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
 # ``_emit`` alongside the storage/registry/observability sinks so a UI driving a
 # long run can receive incremental progress without polling storage.
 OnEvent = Callable[[RunEvent], Awaitable[None]]
+
+
+# The framework-enforced ceiling on agent-loop turns. ``max_turns`` is caller-
+# supplied, but the runtime's drive loops are ``while True`` underneath — a
+# typo'd or hostile value (say ``10**9``) must not turn them into unbounded
+# spend. Every loop entry point validates against this hard cap (the runtime
+# counterpart of the state graph's ``recursion_limit``); raise it deliberately
+# here if a workload genuinely needs more turns. The default ``max_turns=6``
+# is unaffected.
+HARD_MAX_TURNS = 100
+
+
+def _validate_max_turns(max_turns: int, entry_point: str) -> None:
+    """Reject an out-of-range ``max_turns`` before any loop work starts.
+
+    Raises :class:`HimmyError` when ``max_turns`` is below 1 or above the
+    framework ceiling :data:`HARD_MAX_TURNS`. Shared by every public loop
+    entry point (``run_agent_loop`` / ``stream_agent_loop`` /
+    ``resume_agent_loop``) so the bound is enforced uniformly.
+    """
+    if max_turns < 1:
+        raise HimmyError(f"{entry_point} requires max_turns >= 1.")
+    if max_turns > HARD_MAX_TURNS:
+        raise HimmyError(
+            f"{entry_point} requires max_turns <= {HARD_MAX_TURNS} "
+            f"(got {max_turns}): the runtime enforces a hard turn ceiling."
+        )
+
+
+# Turn-level transient tool retry. The tool service marks a transiently-failed
+# call (timeout / rate-limited / provider-unavailable — its own
+# ``RETRYABLE_TOOL_CODES`` taxonomy) as a failed ``ToolReturnRecord``, and unless
+# the tool declares ``retry_hints`` that failure flows straight into the turn —
+# the loop just carries on with the failure in the transcript. The runtime
+# therefore retries the affected TOOL execution (never the whole inference) a
+# bounded number of extra times with a short exponential backoff, emitting a
+# trace event per retry. Both knobs are per-task overridable via the
+# ``tool_retry_attempts`` / ``tool_retry_backoff_seconds`` context keys.
+DEFAULT_TOOL_RETRY_ATTEMPTS = 2
+DEFAULT_TOOL_RETRY_BACKOFF_SECONDS = 0.2
+
+
+def _transient_tool_codes() -> frozenset[str]:
+    """The tool error codes the runtime treats as transient (turn-level retry).
+
+    Sourced from the tools kernel's own ``RETRYABLE_TOOL_CODES`` taxonomy
+    (timeout / rate-limited / provider-unavailable) so the two layers can never
+    drift; imported lazily because the tools kernel is not on this kernel's
+    import path.
+    """
+    from himmy.services.tools.service import RETRYABLE_TOOL_CODES
+
+    return frozenset(code.value for code in RETRYABLE_TOOL_CODES)
+
+
+class TaskContext(BaseModel):
+    """The typed contract for every ``task.context`` key the runtime recognizes.
+
+    ``task.context`` threads through the whole runtime as a plain ``dict``, so a
+    malformed value for a recognized key (say ``tool_names`` as a bare string, or
+    ``compaction_spec`` as a non-mapping) used to surface as a confusing mid-run
+    failure — or worse, mis-run silently (a string iterates as characters). Every
+    public entry point now validates its incoming context against this model via
+    :func:`_validated_ctx` and fails fast with a clear error naming the offending
+    field(s). Unknown extra keys pass through untouched (``extra='allow'``) so
+    application-level context and forward/backward compatibility are preserved.
+    Internally the runtime keeps threading the plain dict — this model is the
+    boundary contract, not a new in-band type.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # --- inference / tools ----------------------------------------------------
+    model_key: str | None = None
+    tool_names: list[str] | None = None
+    skill_routing_hints: list[str] | None = None
+    response_format: ResponseFormat | str | None = None
+    output_schema: dict[str, Any] | None = None
+
+    # --- prompt rendering -------------------------------------------------------
+    role: str | None = None
+    objectives: list[str] | None = None
+    skills: list[str] | None = None
+    datetime: str = ""
+    output_format: str = ""
+    system_prefix: str | None = None
+
+    # --- context snapshot ---------------------------------------------------
+    snapshot_id: str | None = None
+    context_subject_id: str | None = None
+    #: ``ContextBuildSpec | dict`` — validated by ``ContextService.build_snapshot``.
+    context_build_spec: Any = None
+    context_metadata: dict[str, Any] | None = None
+    #: ``ContextPromptMapSpec | dict`` — validated by ``ContextPromptMapper.project``.
+    context_prompt_map_spec: Any = None
+
+    # --- loop behavior --------------------------------------------------------
+    compaction_spec: dict[str, Any] | None = None
+    #: Extra turn-level retries for a TRANSIENT tool failure (timeout /
+    #: rate-limited / provider-unavailable). ``None`` -> the default
+    #: (:data:`DEFAULT_TOOL_RETRY_ATTEMPTS`); ``0`` disables the retry.
+    tool_retry_attempts: int | None = None
+    #: Base backoff (seconds) between those retries; doubles per attempt.
+    tool_retry_backoff_seconds: float | None = None
+
+
+def _validated_ctx(context: dict[str, Any] | None, entry_point: str) -> dict[str, Any]:
+    """Validate the runtime-recognized context keys at a public entry point.
+
+    Returns a plain ``dict`` copy of ``context`` (the runtime keeps threading the
+    dict internally — the :class:`TaskContext` model is only the boundary
+    contract, so a valid context's runtime behavior is byte-identical). A
+    malformed value for a KNOWN key raises a :class:`HimmyError` naming the
+    entry point and the offending field(s) instead of a confusing mid-run
+    failure; unknown extra keys pass through untouched.
+    """
+    raw = dict(context or {})
+    try:
+        TaskContext.model_validate(raw)
+    except ValidationError as exc:
+        raise HimmyError(f"{entry_point}: invalid task context: {exc}") from exc
+    return raw
+
+
+def _cache_scope_metadata(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Derive tenant-isolation metadata for the inference cache from ``ctx``.
+
+    Stamps the :data:`~himmy.services.inference.cache.CACHE_SCOPE_METADATA_KEYS`
+    that the runtime knows about (``subject_id`` from ``context_subject_id`` and
+    any ``tenant_id``/``workspace_id`` carried on ``context_metadata``) onto
+    ``InferenceRequest.metadata`` so the response cache partitions per principal.
+    Only non-empty values are emitted; an unscoped run yields ``{}`` so the cache
+    key — and any recorded replay cassette — is byte-for-byte unchanged.
+    """
+    meta: dict[str, Any] = {}
+    subject_id = ctx.get("context_subject_id")
+    if subject_id:
+        meta["subject_id"] = subject_id
+    context_metadata = ctx.get("context_metadata")
+    if isinstance(context_metadata, dict):
+        for key in ("tenant_id", "workspace_id"):
+            value = context_metadata.get(key)
+            if value:
+                meta[key] = value
+    return meta
 
 
 # WS4.6 — the human data subject participating in the *current* run, set ONLY when a
@@ -116,9 +264,48 @@ class ToolServiceProtocol(Protocol):
         """Return the callback that executes the bound tools by name."""
         ...
 
-    async def execute(self, invocation: Any) -> Any:  # pragma: no cover - structural
-        """Execute one tool invocation (used by HITL resume to run an approved tool)."""
+    async def execute(
+        self, invocation: Any, *, idempotency_store: Any = None
+    ) -> Any:  # pragma: no cover - structural typing
+        """Execute one tool invocation (used by HITL resume to run an approved tool).
+
+        ``idempotency_store`` (a ``ToolIdempotencyStore``, optional) lets resume
+        paths replay an already-executed call instead of running it twice;
+        implementations that never dedup may accept and ignore it.
+        """
         ...
+
+
+class _CheckpointToolIdempotencyStore:
+    """Adapts a checkpoint's ``executed_tool_results`` to ``ToolIdempotencyStore``.
+
+    The HITL-resume idempotency record: ``put`` writes the serialized execution
+    result onto the checkpoint AND persists it IMMEDIATELY — before the resume
+    proceeds to transcript writes, further pending calls, or the status flip to
+    ``approved``. So once a state-mutating tool has run, a crash (or any failure)
+    anywhere before the checkpoint is resolved cannot re-execute it: the next
+    ``resume_agent_loop`` finds the record and the tool service replays the
+    recorded result instead.
+    """
+
+    def __init__(self, checkpoint: AgentCheckpoint, store: CheckpointStore) -> None:
+        self._checkpoint = checkpoint
+        self._store = store
+
+    def get(self, key: str) -> ToolExecutionResult | None:
+        """Return the recorded result for ``key``, or None if never executed."""
+        raw = self._checkpoint.executed_tool_results.get(key)
+        if raw is None:
+            return None
+        # Imported lazily: the tools kernel is not on this kernel's import path.
+        from himmy.services.tools.models import ToolExecutionResult
+
+        return ToolExecutionResult.model_validate(raw)
+
+    def put(self, key: str, result: ToolExecutionResult) -> None:
+        """Record ``result`` on the checkpoint and persist it durably, NOW."""
+        self._checkpoint.executed_tool_results[key] = result.model_dump(mode="json")
+        self._store.save(self._checkpoint)
 
 
 @dataclass
@@ -465,7 +652,7 @@ class SingleAgentRuntime:
         """
         from himmy.agents.base_agent.thread import ChatThread
 
-        ctx = dict(task.context or {})
+        ctx = _validated_ctx(task.context, "run_task")
         is_new_thread = thread is None
         if thread is None:
             thread = ChatThread(agent_id=persona.agent_id)
@@ -556,8 +743,9 @@ class SingleAgentRuntime:
         ``APPROVAL_REQUIRED``, and returns with ``stopped_reason='awaiting_approval'``
         and a ``checkpoint_id`` for :meth:`resume_agent_loop`.
         """
-        if max_turns < 1:
-            raise HimmyError("run_agent_loop requires max_turns >= 1.")
+        _validate_max_turns(max_turns, "run_agent_loop")
+        # Reject a malformed context BEFORE the tool router / first turn runs.
+        _validated_ctx(task.context, "run_agent_loop")
         if hitl and self._checkpoint_store is None:
             raise HimmyError("hitl=True requires a checkpoint_store on the runtime.")
 
@@ -696,7 +884,7 @@ class SingleAgentRuntime:
         is the public seam over the runtime's own continuation step (used by
         :meth:`run_agent_loop`).
         """
-        ctx = dict(task_context or {})
+        ctx = _validated_ctx(task_context, "continue_turn")
         trace_id = f"{thread.thread_id}:continue"
         # WS4.6: publish the subject so this turn's message/thread/event records resolve
         # to it (governed only; a no-op when no consent_decider is wired).
@@ -728,7 +916,7 @@ class SingleAgentRuntime:
         from himmy.agents.base_agent.task import Task
         from himmy.agents.base_agent.thread import Message, MessageRole
 
-        ctx = dict(task_context or {})
+        ctx = _validated_ctx(task_context, "reinject_system_prompt")
         # A synthetic, promptless task so the renderer can build the system block
         # (the task prompt is irrelevant here — we only swap the SYSTEM message).
         task = Task(title=f"{persona.name}-handoff", prompt="", context=ctx)
@@ -768,7 +956,7 @@ class SingleAgentRuntime:
         thread: ChatThread | None = None,
         *,
         llm_config: LLMConfig | None = None,
-    ) -> AsyncIterator[StreamDelta]:
+    ) -> AsyncGenerator[StreamDelta, None]:
         """Stream one task's assistant reply as :class:`StreamDelta` chunks.
 
         Mirrors :meth:`run_task_detailed`'s pre-inference setup (snapshot, prompt
@@ -776,13 +964,16 @@ class SingleAgentRuntime:
         :meth:`InferenceService.run_stream`, yielding incremental text. The final
         ``done`` delta carries the materialized response; the assistant message is
         appended to the thread before that delta is yielded. Single-turn (no tool
-        loop) — intended for streaming a chat reply to a UI/stdout.
+        loop) — intended for streaming a chat reply to a UI/stdout. Closing the
+        generator early (the client dropping the stream) closes the underlying
+        provider stream deterministically rather than leaving it to the event
+        loop's lazy async-generator finalizer.
         """
         from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
 
         if thread is None:
             thread = ChatThread(agent_id=persona.agent_id)
-        ctx = dict(task.context or {})
+        ctx = _validated_ctx(task.context, "stream_task")
         # WS4.6: publish the subject so the streamed turn's system/user/assistant
         # messages and the bumped thread version resolve to it (governed only; a no-op
         # when no consent_decider is wired).
@@ -804,18 +995,35 @@ class SingleAgentRuntime:
             thread.append_message(user_msg)
             self._register_message(user_msg)
 
-            request, _tool_names = self._build_request(thread, ctx, llm_config)
-            async for delta in self.inference_service.run_stream(request):
-                if delta.done and delta.response is not None:
-                    assistant = Message(
-                        role=MessageRole.ASSISTANT,
-                        content=delta.response.output_text or "",
-                        metadata={"request_id": request.request_id, "streamed": True},
-                    )
-                    thread.append_message(assistant)
-                    self._register_message(assistant)
-                    self._register_thread_version(thread)
-                yield delta
+            request, _tool_names = self._build_request(
+                thread, ctx, llm_config, trace_id=f"{thread.thread_id}:{task.task_id}"
+            )
+            # ``run_stream`` is an async generator; own the reference so an early
+            # close/cancellation of THIS generator can close it in the finally.
+            stream = cast(
+                "AsyncGenerator[StreamDelta, None]",
+                self.inference_service.run_stream(request),
+            )
+            try:
+                async for delta in stream:
+                    if delta.done and delta.response is not None:
+                        assistant = Message(
+                            role=MessageRole.ASSISTANT,
+                            content=delta.response.output_text or "",
+                            metadata={
+                                "request_id": request.request_id,
+                                "streamed": True,
+                            },
+                        )
+                        thread.append_message(assistant)
+                        self._register_message(assistant)
+                        self._register_thread_version(thread)
+                    yield delta
+            finally:
+                # GeneratorExit (client closed the stream) / CancelledError land
+                # here at a yield point; close the provider stream NOW so its own
+                # cleanup runs before we unwind, then the exception re-raises.
+                await stream.aclose()
 
     async def stream_agent_loop(
         self,
@@ -831,7 +1039,7 @@ class SingleAgentRuntime:
         synthesize_empty: bool = True,
         route_tools: bool = False,
         route_max_tools: int = 4,
-    ) -> AsyncIterator[StreamDelta]:
+    ) -> AsyncGenerator[StreamDelta, None]:
         """Stream tokens THROUGH the whole multi-turn tool loop (opt-in).
 
         :meth:`stream_task` only streams a single turn, so a tool-using run surfaces
@@ -857,11 +1065,19 @@ class SingleAgentRuntime:
         ``APPROVAL_REQUIRED`` and yields a final ``done`` delta whose
         ``AgentLoopResult`` has ``stopped_reason='awaiting_approval'`` and a
         ``checkpoint_id`` for :meth:`resume_agent_loop`.
+
+        Early termination is clean: a client closing the stream mid-run
+        (``GeneratorExit`` — e.g. an SSE consumer disconnecting) or a task
+        cancellation (``CancelledError``) closes the in-flight inner turn
+        generators deterministically in a ``finally`` before the exception
+        re-raises, so no suspended generators or provider streams are left
+        dangling for the event loop's lazy async-generator finalizer.
         """
         from himmy.services.inference.service import StreamDelta
 
-        if max_turns < 1:
-            raise HimmyError("stream_agent_loop requires max_turns >= 1.")
+        _validate_max_turns(max_turns, "stream_agent_loop")
+        # Reject a malformed context BEFORE the tool router / first turn runs.
+        _validated_ctx(task.context, "stream_agent_loop")
         if hitl and self._checkpoint_store is None:
             raise HimmyError("hitl=True requires a checkpoint_store on the runtime.")
 
@@ -883,75 +1099,94 @@ class SingleAgentRuntime:
         # OUTSIDE the first turn's own scope — resolve to the subject. The inner
         # stream_task / run_task_detailed scopes nest cleanly inside this one.
         with self._subject_scope(ctx):
-            # --- first turn: stream tokens via stream_task, then materialize it ---
-            first_response: InferenceResponse | None = None
-            async for delta in self.stream_task(
+            # Own the inner turn generators so EARLY termination — the client
+            # closing this generator (GeneratorExit) or the consuming task being
+            # cancelled (CancelledError) at any yield point — closes the in-flight
+            # turn in the ``finally`` below instead of leaving the suspended inner
+            # generators (and the provider stream beneath them) dangling until the
+            # event loop's lazy async-generator finalizer runs.
+            first_stream = self.stream_task(
                 persona, task, thread, llm_config=llm_config
-            ):
-                if delta.done:
-                    # Swallow the single-turn ``done`` delta: this loop owns the one
-                    # terminal ``done`` (carrying the AgentLoopResult). Capture the
-                    # materialized response so we can reconstruct the turn result.
-                    first_response = delta.response
-                    continue
-                yield delta
-
-            assert first_response is not None  # run_stream always yields a done delta
-            trace_id = f"{thread.thread_id}:{task.task_id}"
-
-            first = self._result_from_response(first_response, trace_id=trace_id)
-            first.thread = thread  # the real thread stream_task ran on
-            # stream_task does NOT replay TOOL exchanges; replay them now (so a
-            # continuation turn sees the tool results) and surface them as events.
-            await self._append_tool_messages(
-                thread,
-                first_response,
-                request_id=first.request_id or first_response.request_id,
-                trace_id=trace_id,
-                agent_id=persona.agent_id,
             )
-            for tool_delta in self._tool_deltas(first):
-                yield tool_delta
-            await self._emit_turn_completed(trace_id, thread, persona, 1, first)
-            yield StreamDelta(
-                request_id=first.request_id or first_response.request_id,
-                event_type="turn_end",
-                event_payload={"turn": 1, "tool_calls": len(first.tool_calls)},
-            )
+            drive: AsyncGenerator[StreamDelta | AgentLoopResult, None] | None = None
+            try:
+                # --- first turn: stream tokens via stream_task, materialize it ---
+                first_response: InferenceResponse | None = None
+                async for delta in first_stream:
+                    if delta.done:
+                        # Swallow the single-turn ``done`` delta: this loop owns the
+                        # one terminal ``done`` (carrying the AgentLoopResult).
+                        # Capture the materialized response so we can reconstruct
+                        # the turn result.
+                        first_response = delta.response
+                        continue
+                    yield delta
 
-            # --- continuation turns: mirror _drive_loop, streaming each turn ---
-            result: AgentLoopResult | None = None
-            async for item in self._stream_drive_loop(
-                persona,
-                task,
-                thread,
-                ctx,
-                trace_id,
-                turns=[first],
-                max_turns=max_turns,
-                cost_budget=cost_budget,
-                llm_config=llm_config,
-                hitl=hitl,
-                stop_on_no_progress=stop_on_no_progress,
-            ):
-                if isinstance(item, AgentLoopResult):
-                    result = item
-                    break
-                yield item
+                # run_stream always yields a done delta
+                assert first_response is not None
+                trace_id = f"{thread.thread_id}:{task.task_id}"
 
-            assert result is not None
-            if synthesize_empty:
-                # Reuse the exact non-streaming synthesis rescue so an empty
-                # tool-using answer is converted to a text answer identically.
-                result = await self._maybe_synthesize(
-                    result, persona, trace_id, llm_config
+                first = self._result_from_response(first_response, trace_id=trace_id)
+                first.thread = thread  # the real thread stream_task ran on
+                # stream_task does NOT replay TOOL exchanges; replay them now (so a
+                # continuation turn sees the tool results), surface them as events.
+                await self._append_tool_messages(
+                    thread,
+                    first_response,
+                    request_id=first.request_id or first_response.request_id,
+                    trace_id=trace_id,
+                    agent_id=persona.agent_id,
                 )
-            yield StreamDelta(
-                request_id=first.request_id or first_response.request_id,
-                done=True,
-                event_type="done",
-                event_payload={"result": result},
-            )
+                for tool_delta in self._tool_deltas(first):
+                    yield tool_delta
+                await self._emit_turn_completed(trace_id, thread, persona, 1, first)
+                yield StreamDelta(
+                    request_id=first.request_id or first_response.request_id,
+                    event_type="turn_end",
+                    event_payload={"turn": 1, "tool_calls": len(first.tool_calls)},
+                )
+
+                # --- continuation turns: mirror _drive_loop, streaming each turn ---
+                result: AgentLoopResult | None = None
+                drive = self._stream_drive_loop(
+                    persona,
+                    task,
+                    thread,
+                    ctx,
+                    trace_id,
+                    turns=[first],
+                    max_turns=max_turns,
+                    cost_budget=cost_budget,
+                    llm_config=llm_config,
+                    hitl=hitl,
+                    stop_on_no_progress=stop_on_no_progress,
+                )
+                async for item in drive:
+                    if isinstance(item, AgentLoopResult):
+                        result = item
+                        break
+                    yield item
+
+                assert result is not None
+                if synthesize_empty:
+                    # Reuse the exact non-streaming synthesis rescue so an empty
+                    # tool-using answer is converted to a text answer identically.
+                    result = await self._maybe_synthesize(
+                        result, persona, trace_id, llm_config
+                    )
+                yield StreamDelta(
+                    request_id=first.request_id or first_response.request_id,
+                    done=True,
+                    event_type="done",
+                    event_payload={"result": result},
+                )
+            finally:
+                # Runs on normal completion (both acloses are no-ops on exhausted
+                # generators) AND on GeneratorExit/CancelledError, which then
+                # re-raise naturally after the inner generators are closed.
+                await first_stream.aclose()
+                if drive is not None:
+                    await drive.aclose()
 
     async def _stream_drive_loop(
         self,
@@ -967,7 +1202,7 @@ class SingleAgentRuntime:
         llm_config: LLMConfig | None,
         hitl: bool,
         stop_on_no_progress: bool,
-    ) -> AsyncIterator[StreamDelta | AgentLoopResult]:
+    ) -> AsyncGenerator[StreamDelta | AgentLoopResult, None]:
         """Drive streamed continuation turns until a stop condition.
 
         Mirrors :meth:`_drive_loop`'s EXACT stop-condition / no-progress /
@@ -1176,8 +1411,12 @@ class SingleAgentRuntime:
         Rehydrates the checkpoint, applies the decision to each pending tool call
         — executing it (``approved=True``) and recording the real result, or
         recording a rejection — then drives one more model turn (so the model sees
-        the outcome) and continues the loop. Idempotency is enforced: a checkpoint
-        already ``approved``/``rejected`` cannot be resumed twice.
+        the outcome) and continues the loop. Idempotency is enforced twice over: a
+        checkpoint already ``approved``/``rejected`` cannot be resumed again, and
+        each approved execution is recorded on the checkpoint the moment it
+        completes (``executed_tool_results``), so a resume retried after a partial
+        failure replays recorded results instead of re-executing state-mutating
+        tools.
         """
         if self._checkpoint_store is None:
             raise HimmyError("resume_agent_loop requires a checkpoint_store.")
@@ -1188,6 +1427,9 @@ class SingleAgentRuntime:
             raise HimmyError(
                 f"checkpoint {checkpoint_id!r} already resolved ({checkpoint.status})."
             )
+        # Checkpoints written by the validated entry points always pass; this guards
+        # the resumed drive loop against a hand-crafted/tampered checkpoint row.
+        _validate_max_turns(checkpoint.max_turns, "resume_agent_loop")
         if approved and self.tool_service is None:
             raise HimmyError(
                 "cannot resume approved: no tool_service to execute the action."
@@ -1201,7 +1443,9 @@ class SingleAgentRuntime:
         persona = _Persona.model_validate(checkpoint.persona)
         task = _Task.model_validate(checkpoint.task)
         thread = _ChatThread.model_validate(checkpoint.thread)
-        ctx = dict(checkpoint.ctx)
+        # Like the max_turns guard above: contexts checkpointed by the validated
+        # entry points always pass; this catches a hand-crafted/tampered ctx row.
+        ctx = _validated_ctx(checkpoint.ctx, "resume_agent_loop")
         trace_id = f"{thread.thread_id}:{task.task_id}"
         resume_llm = llm_config
         if resume_llm is None and checkpoint.llm_config is not None:
@@ -1215,6 +1459,14 @@ class SingleAgentRuntime:
         # consented subject would emit subject-less records the fail-closed
         # ConsentAwareRegistry silently drops. Governed only; a no-op when no
         # consent_decider is wired. Inner scopes nest cleanly.
+        # The per-checkpoint idempotency record: each approved execution is recorded
+        # (and persisted) the moment it completes, so a repeated resume — including a
+        # retry after a crash between executing a state-mutating tool and resolving
+        # the checkpoint — replays the recorded result instead of running it twice.
+        idempotency = _CheckpointToolIdempotencyStore(
+            checkpoint, self._checkpoint_store
+        )
+
         with self._subject_scope(ctx):
             # Apply the human decision to each pending tool call, recording the outcome
             # on the thread as a TOOL message (so the next model turn sees it).
@@ -1223,10 +1475,15 @@ class SingleAgentRuntime:
                     assert self.tool_service is not None
                     execution = await self.tool_service.execute(
                         ToolInvocation(
+                            tool_call_id=call.tool_call_id,
                             tool_name=call.tool_name,
                             args=dict(call.args),
-                            metadata={"approved": True},
-                        )
+                            metadata={
+                                "approved": True,
+                                "idempotency_key": call.tool_call_id,
+                            },
+                        ),
+                        idempotency_store=idempotency,
                     )
                     tool_returns = [
                         ToolReturnRecord(
@@ -1543,6 +1800,7 @@ class SingleAgentRuntime:
                 InferenceMessage(role="system", content=SUMMARY_INSTRUCTION),
                 InferenceMessage(role="user", content=span_text),
             ],
+            metadata=_cache_scope_metadata(ctx),
         )
         summary_resp = await self.inference_service.run(summary_req)
         summary_text = (summary_resp.output_text or "").strip()
@@ -1600,7 +1858,9 @@ class SingleAgentRuntime:
         # WS4.6: a TRAIN-denied subject forces raw-I/O capture OFF for this turn.
         capture_io = self._capture_io and not self._train_suppressed(ctx)
         await self._maybe_compact(persona, thread, ctx, trace_id, llm_config)
-        request, tool_names = self._build_request(thread, ctx, llm_config)
+        request, tool_names = self._build_request(
+            thread, ctx, llm_config, trace_id=trace_id
+        )
         await self._emit(
             RunEvent(
                 event_type=EventType.INFERENCE_REQUESTED,
@@ -1822,7 +2082,9 @@ class SingleAgentRuntime:
         )
 
         # --- 6. build the inference request -------------------------------
-        request, tool_names = self._build_request(thread, ctx, llm_config)
+        request, tool_names = self._build_request(
+            thread, ctx, llm_config, trace_id=trace_id
+        )
 
         requested_payload: dict[str, Any] = {
             "model_key": request.model_key,
@@ -2246,8 +2508,15 @@ class SingleAgentRuntime:
         thread: Any,
         ctx: dict[str, Any],
         llm_config: LLMConfig | None,
+        *,
+        trace_id: str | None = None,
     ) -> tuple[InferenceRequest, list[str] | None]:
-        """Build the typed InferenceRequest with llm_config-over-context precedence."""
+        """Build the typed InferenceRequest with llm_config-over-context precedence.
+
+        ``trace_id`` (optional) threads onto the transient-retry events the
+        wrapped tool executor emits, so retries link to the run like every
+        other emission.
+        """
         from himmy.agents.base_agent.thread import MessageRole
 
         messages = [
@@ -2342,10 +2611,18 @@ class SingleAgentRuntime:
             workflow=workflow,
             generation_params=generation_params,
             route_override=route_override,
+            metadata=_cache_scope_metadata(ctx),
             bound_tools=bound_tools,
-            # The single execution seam for the bound tools (see ToolExecutor).
+            # The single execution seam for the bound tools (see ToolExecutor),
+            # wrapped with bounded turn-level retry for transient failures.
             tool_executor=(
-                self.tool_service.tool_executor()
+                self._wrap_executor_with_retry(
+                    self.tool_service.tool_executor(),
+                    ctx,
+                    thread_id=getattr(thread, "thread_id", None),
+                    agent_id=getattr(thread, "agent_id", None),
+                    trace_id=trace_id,
+                )
                 if self.tool_service is not None
                 else None
             ),
@@ -2354,6 +2631,76 @@ class SingleAgentRuntime:
         if timeout_seconds is not None:
             request.timeout_seconds = timeout_seconds
         return request, tool_names_override or tool_names
+
+    def _wrap_executor_with_retry(
+        self,
+        executor: ToolExecutor,
+        ctx: dict[str, Any],
+        *,
+        thread_id: str | None,
+        agent_id: str | None,
+        trace_id: str | None,
+    ) -> ToolExecutor:
+        """Bound turn-level retry for TRANSIENT tool failures (timeout / rate-limit).
+
+        Provider-level errors are retried inside the inference service, but a
+        transiently-failed TOOL call used to land in the turn as a failed
+        ``ToolReturnRecord`` the loop just carried on with. This wraps the tool
+        executor so a failure whose ``error_code`` is in the tools kernel's own
+        retryable taxonomy (:func:`_transient_tool_codes`) re-executes the
+        affected tool — never the whole inference — up to
+        ``ctx['tool_retry_attempts']`` extra times (default
+        :data:`DEFAULT_TOOL_RETRY_ATTEMPTS`; ``0`` disables and returns the
+        executor unwrapped) with a short exponential backoff
+        (``ctx['tool_retry_backoff_seconds']`` base, default
+        :data:`DEFAULT_TOOL_RETRY_BACKOFF_SECONDS`). Each retry emits a
+        ``TOOL_CALLED`` event tagged ``transient_retry`` so the trace shows it.
+        Non-transient failures (and exhausted retries) keep the current
+        behavior exactly: the last failed record flows into the turn.
+        """
+        raw_attempts = ctx.get("tool_retry_attempts")
+        retries = (
+            DEFAULT_TOOL_RETRY_ATTEMPTS
+            if raw_attempts is None
+            else max(0, int(raw_attempts))
+        )
+        if retries == 0:
+            return executor
+        raw_backoff = ctx.get("tool_retry_backoff_seconds")
+        backoff = (
+            DEFAULT_TOOL_RETRY_BACKOFF_SECONDS
+            if raw_backoff is None
+            else max(0.0, float(raw_backoff))
+        )
+        transient = _transient_tool_codes()
+
+        async def _execute(tool_name: str, args: dict[str, Any]) -> ToolReturnRecord:
+            record = await executor(tool_name, args)
+            for attempt in range(1, retries + 1):
+                code = (record.metadata or {}).get("error_code")
+                if record.outcome != "failed" or code not in transient:
+                    return record
+                await self._emit(
+                    RunEvent(
+                        event_type=EventType.TOOL_CALLED,
+                        trace_id=trace_id,
+                        thread_id=thread_id,
+                        agent_id=agent_id,
+                        tool_call_id=record.tool_call_id,
+                        payload={
+                            "tool_name": tool_name,
+                            "transient_retry": attempt,
+                            "max_retries": retries,
+                            "error_code": code,
+                        },
+                    )
+                )
+                if backoff > 0.0:
+                    await asyncio.sleep(backoff * (2 ** (attempt - 1)))
+                record = await executor(tool_name, args)
+            return record
+
+        return _execute
 
     # ------------------------------------------------------- tool messages
     async def _append_tool_messages(

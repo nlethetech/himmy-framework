@@ -7,8 +7,11 @@ writes (durability), and upserts/idempotent creates behave exactly like the in-m
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
 from himmy.core.events import EventType, RunEvent
@@ -248,3 +251,133 @@ def test_path_property_and_memory_backend() -> None:
     mem: Any = MemoryObject(subject_id="s", payload={"k": 1})
     run_async(storage.save_memory(mem))
     assert run_async(storage.get_memory(mem.memory_id)) is not None
+
+
+# ---------------------------------------------------------- transactional hygiene
+class _FlakyCommitConnection:
+    """Delegating connection wrapper whose next ``commit`` raises (failure injection)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.fail_next_commit = False
+
+    def commit(self) -> None:
+        if self.fail_next_commit:
+            self.fail_next_commit = False
+            raise sqlite3.OperationalError("disk I/O error (injected)")
+        self._conn.commit()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def test_failed_commit_rolls_back_and_releases_write_lock(tmp_path: Path) -> None:
+    """A mid-write failure leaves no open transaction and no torn pending write.
+
+    Without rollback-on-failure the shared connection would stay inside the open
+    transaction: the WAL write lock would block other connections ('database is
+    locked') and the next caller's commit would silently fold the torn write in.
+    """
+    storage = _store(tmp_path)
+    flaky = _FlakyCommitConnection(storage._conn)
+    storage._conn = flaky  # type: ignore[assignment]
+    flaky.fail_next_commit = True
+    with pytest.raises(sqlite3.OperationalError):
+        run_async(storage.save_memory(MemoryObject(subject_id="s", payload={"k": 1})))
+
+    # The failed write was rolled back: no open-transaction residue...
+    assert flaky.in_transaction is False
+    # ...so a second connection to the same file can write immediately.
+    other = sqlite3.connect(str(tmp_path / "storage.db"), timeout=0.2)
+    try:
+        other.execute("PRAGMA busy_timeout=200")
+        other.execute(
+            "INSERT INTO chat_threads (thread_id, payload, updated_at) "
+            "VALUES ('t-probe', '{}', 'now')"
+        )
+        other.commit()
+    finally:
+        other.close()
+    # The torn write is gone and is NOT resurrected by the next caller's commit.
+    assert run_async(storage.list_memory()) == []
+    ok = MemoryObject(subject_id="s", payload={"k": 2})
+    run_async(storage.save_memory(ok))
+    assert [m.memory_id for m in run_async(storage.list_memory())] == [ok.memory_id]
+
+
+def test_constraint_violation_leaves_no_open_transaction(tmp_path: Path) -> None:
+    """An insert aborted by ``runs_idempotency_idx`` rolls back; later writes work."""
+    storage = _store(tmp_path)
+    run_async(
+        storage.save_run(
+            RunRecord(workspace_id="w", subject_id="s", idempotency_key="k")
+        )
+    )
+    dupe = RunRecord(workspace_id="w", subject_id="s", idempotency_key="k")
+    with pytest.raises(sqlite3.IntegrityError):
+        run_async(storage.save_run(dupe))
+    assert storage._conn.in_transaction is False
+    # Subsequent writes commit cleanly and the aborted run never landed.
+    run_async(
+        storage.save_run(
+            RunRecord(workspace_id="w", subject_id="s", idempotency_key="k2")
+        )
+    )
+    runs = run_async(storage.list_runs(workspace_id="w"))
+    assert len(runs) == 2
+    assert dupe.run_id not in {r.run_id for r in runs}
+
+
+def test_update_recommendation_atomic_read_modify_write_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recommendation read-modify-write is one transaction; failure rolls it back."""
+    storage = _store(tmp_path)
+    item = RecommendationItem(
+        run_id="r", workspace_id="w", subject_id="s", kind="advice", title="t"
+    )
+    run_async(storage.save_recommendation(item))
+
+    in_txn_at_modify: list[bool] = []
+
+    def failing_dump(obj: Any) -> str:
+        in_txn_at_modify.append(storage._conn.in_transaction)
+        raise sqlite3.OperationalError("injected mid read-modify-write")
+
+    monkeypatch.setattr(SqliteStorageService, "_dump", staticmethod(failing_dump))
+    with pytest.raises(sqlite3.OperationalError):
+        run_async(
+            storage.update_recommendation(
+                item.recommendation_id, status=RecommendationStatus.ACCEPTED
+            )
+        )
+    # The read ran inside the write transaction (atomic read-modify-write)...
+    assert in_txn_at_modify == [True]
+    # ...and the aborted update was rolled back, leaving the stored row untouched.
+    assert storage._conn.in_transaction is False
+    monkeypatch.undo()
+    stored = run_async(storage.get_recommendation(item.recommendation_id))
+    assert stored is not None and stored.status is RecommendationStatus.PROPOSED
+    updated = run_async(
+        storage.update_recommendation(
+            item.recommendation_id, status=RecommendationStatus.ACCEPTED
+        )
+    )
+    assert updated is not None and updated.status is RecommendationStatus.ACCEPTED
+    assert storage._conn.in_transaction is False
+
+
+def test_idempotent_create_paths_leave_no_open_transaction(tmp_path: Path) -> None:
+    """Both branches of the idempotent run create end their explicit transaction."""
+    storage = _store(tmp_path)
+    first = RunRecord(workspace_id="w", subject_id="s", idempotency_key="k")
+    _, created = run_async(storage.save_run_if_absent_by_idempotency(first))
+    assert created is True
+    assert storage._conn.in_transaction is False
+    second = RunRecord(workspace_id="w", subject_id="s", idempotency_key="k")
+    got, created = run_async(storage.save_run_if_absent_by_idempotency(second))
+    assert created is False and got.run_id == first.run_id
+    assert storage._conn.in_transaction is False
+    # A missing update target also ends its transaction cleanly.
+    assert run_async(storage.update_recommendation("nope")) is None
+    assert storage._conn.in_transaction is False

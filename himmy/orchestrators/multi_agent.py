@@ -21,6 +21,8 @@ and reuses the runtime's own continuation step via ``runtime.continue_turn``.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,7 +34,7 @@ from himmy.agents.base_agent.thread import ChatThread
 from himmy.agents.personas.persona import Persona
 from himmy.core import HimmyError
 from himmy.core.events import EventType, RunEvent
-from himmy.runtime.single_agent import RunResult, SingleAgentRuntime
+from himmy.runtime.single_agent import _SYNTHESIS_NUDGE, RunResult, SingleAgentRuntime
 from himmy.runtime.termination import (
     FINAL_ANSWER_TOOL,
     final_answer_text,
@@ -46,6 +48,35 @@ OnEvent = Callable[[RunEvent], Awaitable[None]]
 
 HANDOFF_PREFIX = "transfer_to_"
 DELEGATE_PREFIX = "ask_"
+
+#: Serializes synthetic-tool registration on a SHARED :class:`ToolRegistry`. Two
+#: orchestrators constructed concurrently (e.g. per-request wiring on different
+#: threads) must not interleave the check-then-register sequence below, or a genuine
+#: name collision could slip past the identity check and silently clobber a tool.
+_REGISTRATION_LOCK = threading.Lock()
+
+#: WS4.6 — the caller-supplied ``task_context`` of the *current* team run. Published by
+#: :meth:`MultiAgentOrchestrator.run` for the life of the run so per-turn contexts and
+#: the delegate handlers (constructed at wiring time but executed mid-turn) can thread
+#: ``context_subject_id`` into every member turn and worker sub-run. A
+#: :class:`contextvars.ContextVar` keeps this correct under concurrent runs.
+_RUN_TASK_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("himmy_team_run_ctx", default=None)
+)
+
+
+def _subject_ctx() -> dict[str, Any]:
+    """The active run's propagated ``context_subject_id`` (``{}`` outside a run).
+
+    Merged into every member-turn / delegate-sub-run task context so the runtime's
+    own per-entry-point subject scopes resolve the SAME subject as the team run —
+    otherwise each nested scope would re-publish ``None`` and the turn's spine
+    records would lose their subject (and be dropped by a fail-closed
+    ``ConsentAwareRegistry``) after a handoff.
+    """
+    base = _RUN_TASK_CONTEXT.get() or {}
+    subject = base.get("context_subject_id")
+    return {"context_subject_id": subject} if subject else {}
 
 
 class TeamMember(BaseModel):
@@ -86,7 +117,8 @@ class MultiAgentResult:
     final_agent: str = ""
     output_text: str | None = None
     handoff_chain: list[str] = field(default_factory=list)
-    stopped_reason: str = "final"  # final | max_turns | error
+    # final | final_answer | no_progress | max_turns | max_turns_synthesized | error
+    stopped_reason: str = "final"
     total_cost: float = 0.0
 
     @property
@@ -108,14 +140,22 @@ class MultiAgentOrchestrator:
         max_turns: int = 12,
         default_temperature: float = 0.1,
         delegate_max_turns: int = 6,
+        synthesize_on_max_turns: bool = True,
     ) -> None:
-        """Wire the team and register the synthetic handoff/delegate tools."""
+        """Wire the team and register the synthetic handoff/delegate tools.
+
+        ``synthesize_on_max_turns`` mirrors the runtime's ``synthesize_empty``: when
+        the team hits ``max_turns`` mid-act (tool calls, no ``final_answer``), run one
+        forced tool-less turn so the caller gets a plain-text answer instead of raw
+        tool output. Pass ``False`` to keep the bare ``max_turns`` stop.
+        """
         self._runtime = runtime
         self._team = team
         self._registry = tool_registry
         self._max_turns = max_turns
         self._temperature = default_temperature
         self._delegate_max_turns = delegate_max_turns
+        self._synthesize_on_max_turns = synthesize_on_max_turns
         if on_event is None:
             self._on_event: list[OnEvent] = []
         elif callable(on_event):
@@ -127,40 +167,74 @@ class MultiAgentOrchestrator:
     # --------------------------------------------------------------- synthetic tools
 
     def _register_synthetic_tools(self) -> None:
-        """Register ``transfer_to_<peer>``, ``ask_<worker>``, and ``final_answer``."""
-        register_final_answer_tool(self._registry)
+        """Register ``transfer_to_<peer>``, ``ask_<worker>``, and ``final_answer``.
+
+        Registration on a possibly SHARED registry is serialized by a module-level
+        lock and identity-checked: re-registering an equivalent synthetic tool (same
+        kind + target — e.g. a second orchestrator wired onto the same registry) is
+        idempotent and rebinds the handler to this orchestrator, while a genuine name
+        collision with a foreign tool (a user tool that happens to be called
+        ``ask_<member>``) raises instead of silently clobbering it.
+        """
         handoff_targets = {t for m in self._team.members for t in m.handoffs}
         delegate_targets = {t for m in self._team.members for t in m.delegates}
 
-        for target in handoff_targets:
-            self._team.require(target)
-            register_local_tool(
-                self._registry,
-                name=f"{HANDOFF_PREFIX}{target}",
-                handler=self._make_handoff_handler(target),
-                description=f"Transfer control of the conversation to {target}.",
-                args_json_schema={
-                    "type": "object",
-                    "properties": {"reason": {"type": "string"}},
-                    "additionalProperties": False,
-                },
-                metadata={"synthetic": "handoff", "target": target},
-            )
-        for target in delegate_targets:
-            self._team.require(target)
-            register_local_tool(
-                self._registry,
-                name=f"{DELEGATE_PREFIX}{target}",
-                handler=self._make_delegate_handler(target),
-                description=f"Ask {target} to handle a subtask and return its answer.",
-                args_json_schema={
-                    "type": "object",
-                    "properties": {"task": {"type": "string"}},
-                    "required": ["task"],
-                    "additionalProperties": False,
-                },
-                metadata={"synthetic": "delegate", "target": target},
-            )
+        with _REGISTRATION_LOCK:
+            self._check_collision(FINAL_ANSWER_TOOL, "termination", None)
+            register_final_answer_tool(self._registry)
+            for target in handoff_targets:
+                self._team.require(target)
+                self._check_collision(f"{HANDOFF_PREFIX}{target}", "handoff", target)
+                register_local_tool(
+                    self._registry,
+                    name=f"{HANDOFF_PREFIX}{target}",
+                    handler=self._make_handoff_handler(target),
+                    description=f"Transfer control of the conversation to {target}.",
+                    args_json_schema={
+                        "type": "object",
+                        "properties": {"reason": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    metadata={"synthetic": "handoff", "target": target},
+                )
+            for target in delegate_targets:
+                self._team.require(target)
+                self._check_collision(f"{DELEGATE_PREFIX}{target}", "delegate", target)
+                register_local_tool(
+                    self._registry,
+                    name=f"{DELEGATE_PREFIX}{target}",
+                    handler=self._make_delegate_handler(target),
+                    description=(
+                        f"Ask {target} to handle a subtask and return its answer."
+                    ),
+                    args_json_schema={
+                        "type": "object",
+                        "properties": {"task": {"type": "string"}},
+                        "required": ["task"],
+                        "additionalProperties": False,
+                    },
+                    metadata={"synthetic": "delegate", "target": target},
+                )
+
+    def _check_collision(self, name: str, kind: str, target: str | None) -> None:
+        """Raise when ``name`` is already registered as anything but OUR synthetic tool.
+
+        An existing definition with the same synthetic identity (``kind`` + ``target``)
+        is an equivalent tool from another (or a prior) orchestrator — re-registration
+        is idempotent, so it passes. Anything else under that name belongs to someone
+        else and must not be silently replaced.
+        """
+        existing = self._registry.get(name)
+        if existing is None:
+            return
+        meta = existing.metadata or {}
+        if meta.get("synthetic") == kind and meta.get("target") == target:
+            return
+        raise HimmyError(
+            f"synthetic tool name collision: {name!r} is already registered on this "
+            f"ToolRegistry and is not a synthetic {kind} tool for target {target!r} — "
+            "rename the team member or give this team its own ToolRegistry."
+        )
 
     def _make_handoff_handler(
         self, target: str
@@ -181,10 +255,17 @@ class MultiAgentOrchestrator:
             worker = self._team.require(worker_name)
             subtask = str(args.get("task", ""))
             sub_thread = ChatThread()
+            # WS4.6: thread the run's subject into the worker's sub-run; without it the
+            # worker's run_agent_loop would publish a None subject and its sub-thread
+            # records would be dropped by a fail-closed ConsentAwareRegistry.
             task = Task(
                 title=f"delegate-{worker_name}",
                 prompt=subtask,
-                context={"tool_names": worker.tools, "model_key": worker.model_key},
+                context={
+                    "tool_names": worker.tools,
+                    "model_key": worker.model_key,
+                    **_subject_ctx(),
+                },
             )
             loop = await self._runtime.run_agent_loop(
                 worker.persona,
@@ -209,9 +290,37 @@ class MultiAgentOrchestrator:
     # ------------------------------------------------------------------------- run
 
     async def run(
-        self, prompt: str, *, initial_thread: ChatThread | None = None
+        self,
+        prompt: str,
+        *,
+        initial_thread: ChatThread | None = None,
+        task_context: dict[str, Any] | None = None,
     ) -> MultiAgentResult:
-        """Route ``prompt`` through the team until a final answer or ``max_turns``."""
+        """Route ``prompt`` through the team until a final answer or ``max_turns``.
+
+        ``task_context`` carries run-level context; the recognized key today is the
+        WS4.6 ``context_subject_id`` of the participating human subject. It is
+        published around the WHOLE run (mirroring the single-agent runtime's
+        ``_subject_scope`` on every public entry point) and threaded into every
+        member turn and delegate sub-run, so the orchestrator's own
+        ``AGENT_HANDOFF``/``AGENT_DELEGATED`` events — emitted BETWEEN runtime turns,
+        outside any per-turn scope — and every turn's spine records keep their
+        subject under a governed ``ConsentAwareRegistry``. A no-op without a
+        governed ``consent_decider`` on the runtime (the zero-config path is
+        unchanged).
+        """
+        base_ctx = dict(task_context or {})
+        token = _RUN_TASK_CONTEXT.set(base_ctx)
+        try:
+            with self._runtime._subject_scope(base_ctx):
+                return await self._run_team(prompt, initial_thread)
+        finally:
+            _RUN_TASK_CONTEXT.reset(token)
+
+    async def _run_team(
+        self, prompt: str, initial_thread: ChatThread | None
+    ) -> MultiAgentResult:
+        """The routing loop proper (subject scope published by :meth:`run`)."""
         active = self._team.require(self._team.entry)
         thread = initial_thread or ChatThread()
         turns: list[tuple[str, RunResult]] = []
@@ -261,6 +370,21 @@ class MultiAgentOrchestrator:
                     )
 
             if len(turns) >= self._max_turns:
+                if (
+                    self._synthesize_on_max_turns
+                    and result.tool_calls
+                    and final_answer_text(result) is None
+                ):
+                    synth = await self._synthesize(thread, active)
+                    turns.append((active.name, synth))
+                    return self._finish(
+                        thread,
+                        turns,
+                        active.name,
+                        chain,
+                        "max_turns_synthesized",
+                        final_answer_text(synth) or synth.output_text,
+                    )
                 return self._finish(thread, turns, active.name, chain, "max_turns")
 
             result = await self._runtime.continue_turn(
@@ -272,6 +396,33 @@ class MultiAgentOrchestrator:
             turns.append((active.name, result))
 
     # --------------------------------------------------------------------- helpers
+
+    async def _synthesize(self, thread: ChatThread, member: TeamMember) -> RunResult:
+        """One forced final turn when the team hit ``max_turns`` mid-act.
+
+        Mirrors the runtime's ``_maybe_synthesize``: the loop stopped while the active
+        agent was still calling tools (no ``final_answer``), so the caller would get
+        raw tool output. Run one more turn with tools unbound and an explicit
+        instruction to answer from the results already gathered.
+        """
+        nudge = Task(
+            title="synthesis",
+            prompt=_SYNTHESIS_NUDGE,
+            # Unbind tools to force a text answer; keep the run's subject (WS4.6).
+            context={
+                "model_key": member.model_key,
+                "tool_names": [],
+                **_subject_ctx(),
+            },
+        )
+        return await self._runtime.run_task_detailed(
+            member.persona,
+            nudge,
+            thread=thread,
+            llm_config=LLMConfig(
+                model_key=member.model_key, temperature=self._temperature
+            ),
+        )
 
     def _detect_handoff(self, result: RunResult, active: TeamMember) -> str | None:
         """Return the declared handoff target the agent transferred to, if any."""
@@ -295,7 +446,9 @@ class MultiAgentOrchestrator:
         # spinning; a tool-less member already terminates via a plain text answer.
         if names:
             names.append(FINAL_ANSWER_TOOL)
-        return {"model_key": member.model_key, "tool_names": names}
+        # WS4.6: every member turn carries the run's subject so the runtime's nested
+        # per-entry-point subject scopes resolve the SAME subject across handoffs.
+        return {"model_key": member.model_key, "tool_names": names, **_subject_ctx()}
 
     def _cfg(self, member: TeamMember) -> LLMConfig:
         """LLMConfig for a member: AUTO_TOOLS when it has any callable edges/tools."""
@@ -342,7 +495,12 @@ class MultiAgentOrchestrator:
         registry = getattr(self._runtime, "entity_registry", None)
         if registry is not None:
             try:
-                registry.register(event.to_record())
+                # WS4.6: stamp the published run subject (None ⇒ unchanged record) so a
+                # governed ConsentAwareRegistry can resolve — rather than fail closed
+                # and drop — the orchestrator's handoff/delegation events.
+                stamp = getattr(self._runtime, "_subject_metadata", None)
+                metadata = stamp() if callable(stamp) else None
+                registry.register(event.to_record(metadata=metadata))
             except Exception:  # pragma: no cover - defensive
                 pass
         for callback in self._on_event:

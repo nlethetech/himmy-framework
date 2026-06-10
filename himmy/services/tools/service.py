@@ -22,7 +22,7 @@ import inspect
 import os
 import time
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from himmy.core.events import EventType, RunEvent
 from himmy.services.tools.models import (
@@ -65,6 +65,28 @@ RETRYABLE_TOOL_CODES: frozenset[ToolErrorCode] = frozenset(
 #: Default per-tool execution timeout when neither the definition nor the HTTP
 #: config specifies one.
 DEFAULT_TOOL_TIMEOUT_SECONDS: float = 30.0
+
+
+@runtime_checkable
+class ToolIdempotencyStore(Protocol):
+    """Records completed tool executions by idempotency key (exactly-once seam).
+
+    The dedup point for resume-style paths (HITL approve/resume today, any future
+    replay path): when :meth:`ToolService.execute` is given a store and the
+    invocation carries ``metadata["idempotency_key"]``, a previously recorded
+    result is replayed instead of executing the tool a second time, and new
+    results are recorded via :meth:`put` — which should persist durably BEFORE
+    returning, so a crash right after a state-mutating tool ran cannot lose the
+    record and re-execute on retry.
+    """
+
+    def get(self, key: str) -> ToolExecutionResult | None:
+        """Return the recorded result for ``key``, or None if never executed."""
+        ...
+
+    def put(self, key: str, result: ToolExecutionResult) -> None:
+        """Durably record ``result`` under ``key``."""
+        ...
 
 
 def _validate_against_schema(value: Any, schema: dict[str, Any]) -> str | None:
@@ -205,8 +227,43 @@ class ToolService:
     # Alias for callers that expect a sync-style name.
     close = aclose
 
-    async def execute(self, invocation: ToolInvocation) -> ToolExecutionResult:
-        """Execute one tool invocation end-to-end and return its result."""
+    async def execute(
+        self,
+        invocation: ToolInvocation,
+        *,
+        idempotency_store: ToolIdempotencyStore | None = None,
+    ) -> ToolExecutionResult:
+        """Execute one tool invocation end-to-end and return its result.
+
+        When ``idempotency_store`` is provided AND the invocation carries a string
+        ``metadata["idempotency_key"]``, execution is at-most-once per key: a
+        previously recorded result is replayed verbatim (no handler call, no
+        duplicate tool events, ``metadata["idempotent_replay"] = True``), and a
+        fresh result is recorded via ``put`` before being returned — including
+        failures, since a post-dispatch failure (timeout, upstream error) may
+        already have mutated state and must not be silently re-attempted by a
+        resume retry. ``denied`` outcomes are never recorded, so a later
+        *approved* execution of the same key still runs. Invocations without a
+        key — or calls without a store — behave exactly as before; the seam is
+        fully opt-in.
+        """
+        key = invocation.metadata.get("idempotency_key")
+        if idempotency_store is None or not isinstance(key, str) or not key:
+            return await self._execute_invocation(invocation)
+        cached = idempotency_store.get(key)
+        if cached is not None:
+            replay = cached.model_copy(deep=True)
+            replay.metadata = {**replay.metadata, "idempotent_replay": True}
+            return replay
+        result = await self._execute_invocation(invocation)
+        if result.outcome != "denied":
+            idempotency_store.put(key, result)
+        return result
+
+    async def _execute_invocation(
+        self, invocation: ToolInvocation
+    ) -> ToolExecutionResult:
+        """The uncached execution pipeline behind :meth:`execute`."""
         start = time.perf_counter()
         definition = self._registry.get(invocation.tool_name)
 

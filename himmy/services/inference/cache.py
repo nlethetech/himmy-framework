@@ -9,6 +9,15 @@ that would yield the same model call share a result.
 The default :class:`NoopInferenceCache` does nothing — behavior is unchanged unless
 a real cache is wired into :class:`InferenceService`. :class:`InMemoryTTLCache` is a
 process-local, TTL-bounded implementation usable offline and in tests.
+
+Tenant isolation: the key also carries a *cache scope* derived from the request's
+``metadata`` (:func:`derive_cache_scope`), so in a multi-tenant deployment two
+principals with identical prompts NEVER share a cached response. Any of the
+:data:`CACHE_SCOPE_METADATA_KEYS` (``cache_scope``, ``tenant_id``, ``workspace_id``,
+``subject_id``) present on ``request.metadata`` partitions the cache automatically —
+no constructor flag to forget. Requests with no scope metadata keep today's
+single-tenant, zero-config behavior (and byte-identical keys, so recorded replay
+cassettes still match).
 """
 
 from __future__ import annotations
@@ -20,12 +29,42 @@ from typing import Protocol, runtime_checkable
 
 from himmy.services.inference.models import InferenceRequest, InferenceResponse
 
+#: ``InferenceRequest.metadata`` keys (in precedence order) that scope a cached
+#: response to a principal. ALL present keys are folded into the scope, so e.g.
+#: tenant+workspace combinations never alias each other; sharing can only narrow.
+CACHE_SCOPE_METADATA_KEYS: tuple[str, ...] = (
+    "cache_scope",
+    "tenant_id",
+    "workspace_id",
+    "subject_id",
+)
+
+
+def derive_cache_scope(request: InferenceRequest) -> str | None:
+    """Derive the tenant-isolation scope for ``request`` from its ``metadata``.
+
+    Every :data:`CACHE_SCOPE_METADATA_KEYS` key with a non-empty value contributes
+    a ``key=value`` part; the joined parts form the scope. ``None`` (no scope
+    metadata at all) means the single-tenant default: all unscoped requests share
+    one partition, exactly as before this dimension existed.
+    """
+    parts = [
+        f"{key}={request.metadata[key]}"
+        for key in CACHE_SCOPE_METADATA_KEYS
+        if request.metadata.get(key) not in (None, "")
+    ]
+    return "|".join(parts) if parts else None
+
 
 def compute_cache_key(request: InferenceRequest) -> str:
     """Compute a stable cache key from a request's caching-relevant surface.
 
     ``request_id`` (random) and ``use_cache`` itself are excluded so identical
     logical calls collide; everything that changes the model's output is included.
+    The :func:`derive_cache_scope` dimension partitions the key per principal so
+    a cached response can never leak across tenants/workspaces/subjects; it is
+    OMITTED (not ``None``-stamped) when absent so unscoped keys — including
+    previously recorded replay-cassette keys — are byte-for-byte unchanged.
     """
     gen = {
         k: v for k, v in sorted(request.generation_params.items()) if k != "use_cache"
@@ -52,6 +91,9 @@ def compute_cache_key(request: InferenceRequest) -> str:
         "tool_names": sorted(t.name for t in request.bound_tools),
         "generation_params": gen,
     }
+    scope = derive_cache_scope(request)
+    if scope is not None:
+        payload["cache_scope"] = scope
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 

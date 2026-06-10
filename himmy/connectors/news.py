@@ -8,11 +8,15 @@ fetched DIRECTLY — never via that VPS), normalized into :class:`NewsItem`s.
 
 from __future__ import annotations
 
+import logging
 import re
 
+from himmy.connectors._feeds import entry_cap, parse_feed
 from himmy.connectors.fetcher import Fetcher, HttpxFetcher
-from himmy.connectors.models import NewsItem, NewsSource
+from himmy.connectors.models import FeedFailure, NewsFetchResult, NewsItem, NewsSource
 from himmy.core.errors import HimmyError
+
+logger = logging.getLogger("himmy.connectors.news")
 
 #: Curated Nepali news feeds. Fetched directly from each outlet (no intermediary).
 NEPAL_NEWS_SOURCES: list[NewsSource] = [
@@ -93,15 +97,32 @@ class NewsFetcher:
     def fetch_all(
         self, *, per_source: int = 10, sources: list[str] | None = None
     ) -> list[NewsItem]:
-        """Fetch many sources; a single failing feed never breaks the batch."""
+        """Fetch many sources; a single failing feed never breaks the batch.
+
+        Failures are logged but invisible in the return value — when the caller
+        needs to know the batch was incomplete, use :meth:`fetch_all_detailed`.
+        """
+        return self.fetch_all_detailed(per_source=per_source, sources=sources).items
+
+    def fetch_all_detailed(
+        self, *, per_source: int = 10, sources: list[str] | None = None
+    ) -> NewsFetchResult:
+        """Like :meth:`fetch_all`, but report per-source failures instead of hiding them.
+
+        Returns a :class:`NewsFetchResult` whose ``items`` is exactly the
+        :meth:`fetch_all` list and whose ``failures`` names each source that broke
+        (with the error), so callers can tell incomplete data from a quiet news day.
+        Every failure is also logged at WARNING.
+        """
         names = sources if sources is not None else list(self._sources)
-        items: list[NewsItem] = []
+        result = NewsFetchResult()
         for name in names:
             try:
-                items.extend(self.fetch(name, limit=per_source))
-            except Exception:  # noqa: BLE001 - one bad feed must not sink the batch
-                continue
-        return items
+                result.items.extend(self.fetch(name, limit=per_source))
+            except Exception as exc:  # noqa: BLE001 - one bad feed must not sink the batch
+                logger.warning("news feed %r failed: %s", name, exc)
+                result.failures.append(FeedFailure(source=name, error=str(exc)))
+        return result
 
     def search(
         self,
@@ -127,16 +148,9 @@ class NewsFetcher:
 
     @staticmethod
     def _parse(raw: bytes, source: NewsSource, limit: int) -> list[NewsItem]:
-        try:
-            import feedparser
-        except ImportError as exc:  # pragma: no cover - exercised only without extra
-            raise HimmyError(
-                "news connectors require the [connectors] extra "
-                "(pip install 'himmy[connectors]')."
-            ) from exc
-        feed = feedparser.parse(raw)
+        feed = parse_feed(raw, source=source.name)
         items: list[NewsItem] = []
-        for entry in feed.entries[: max(0, limit)]:
+        for entry in feed.entries[: entry_cap(limit)]:
             items.append(
                 NewsItem(
                     title=_clean(entry.get("title", "")),

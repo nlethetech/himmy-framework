@@ -27,6 +27,30 @@ class NewsItem(BaseModel):
     source_url: str = ""
 
 
+class FeedFailure(BaseModel):
+    """One news source that failed during an aggregate fetch (and why)."""
+
+    source: str
+    error: str
+
+
+class NewsFetchResult(BaseModel):
+    """An aggregate news fetch: the items plus any per-source failures.
+
+    ``items`` is exactly what :meth:`NewsFetcher.fetch_all` returns; ``failures``
+    tells the caller which sources were skipped (so "no failures" can be asserted
+    rather than assumed).
+    """
+
+    items: list[NewsItem] = Field(default_factory=list)
+    failures: list[FeedFailure] = Field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        """True when every requested source was fetched successfully."""
+        return not self.failures
+
+
 class ForexRate(BaseModel):
     """One NRB foreign-exchange rate for a currency on a date (per ``unit``)."""
 
@@ -59,4 +83,12 @@ class Workbook(BaseModel):
         return list(self.sheets)
 
 
-__all__ = ["NewsSource", "NewsItem", "ForexRate", "MacroReport", "Workbook"]
+__all__ = [
+    "NewsSource",
+    "NewsItem",
+    "FeedFailure",
+    "NewsFetchResult",
+    "ForexRate",
+    "MacroReport",
+    "Workbook",
+]

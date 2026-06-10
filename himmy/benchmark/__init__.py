@@ -20,6 +20,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from himmy.benchmark.baseline import (
+    build_baseline,
+    compare_to_baseline,
+    load_baseline,
+    subset_suite,
+)
 from himmy.benchmark.models import (
     BenchmarkSuite,
     BenchmarkTask,
@@ -48,4 +54,8 @@ __all__ = [
     "render_markdown",
     "to_json",
     "default_suite",
+    "load_baseline",
+    "subset_suite",
+    "compare_to_baseline",
+    "build_baseline",
 ]

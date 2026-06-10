@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
@@ -85,6 +86,10 @@ class GraphError(HimmyError):
 
 class GraphRecursionError(GraphError):
     """The graph exceeded its recursion limit (a loop guard tripped)."""
+
+
+class GraphStateSizeError(GraphError):
+    """The merged shared state exceeded ``max_state_bytes`` (an OOM guard tripped)."""
 
 
 def add_reducer(existing: Any, incoming: Any) -> Any:
@@ -215,8 +220,18 @@ class StateGraph:
         entity_registry: Any = None,
         on_event: OnEvent | list[OnEvent] | None = None,
         recursion_limit: int = 50,
+        max_state_bytes: int | None = None,
     ) -> CompiledStateGraph:
-        """Validate the topology and return a runnable :class:`CompiledStateGraph`."""
+        """Validate the topology and return a runnable :class:`CompiledStateGraph`.
+
+        ``max_state_bytes`` (optional, default ``None`` = unlimited, today's
+        behavior) bounds the *serialized* size of the merged shared state; an
+        ``add``-style reducer fed by a parallel fan-out or a loop can otherwise
+        grow state without limit. When the bound is exceeded after a superstep
+        the run fails cleanly with :class:`GraphStateSizeError`.
+        """
+        if max_state_bytes is not None and max_state_bytes < 1:
+            raise GraphError("max_state_bytes must be >= 1")
         if self._entry is None:
             raise GraphError("graph has no entry point (call set_entry_point)")
         if self._entry not in self._nodes:
@@ -242,6 +257,7 @@ class StateGraph:
             entity_registry=entity_registry,
             on_event=on_event,
             recursion_limit=max(1, recursion_limit),
+            max_state_bytes=max_state_bytes,
         )
 
 
@@ -262,6 +278,7 @@ class CompiledStateGraph:
         entity_registry: Any,
         on_event: OnEvent | list[OnEvent] | None,
         recursion_limit: int,
+        max_state_bytes: int | None = None,
     ) -> None:
         self.name = name
         self._nodes = nodes
@@ -274,6 +291,7 @@ class CompiledStateGraph:
         self._entity_registry = entity_registry
         self._on_event = self._coerce_callbacks(on_event)
         self._recursion_limit = recursion_limit
+        self._max_state_bytes = max_state_bytes
 
     @staticmethod
     def _coerce_callbacks(
@@ -294,6 +312,7 @@ class CompiledStateGraph:
         checkpoint_id: str | None = None,
         timeout_seconds: float | None = None,
         thread_id: str | None = None,
+        max_state_bytes: int | None = None,
     ) -> GraphRunResult:
         """Run the graph to completion (or until a guard/timeout interrupts it).
 
@@ -302,7 +321,15 @@ class CompiledStateGraph:
         and frontier. ``timeout_seconds`` bounds the whole run; on expiry the run
         is checkpointed as ``interrupted`` and a terminal ``GRAPH_FINISHED`` event
         is emitted, so the caller can resume rather than lose progress.
+        ``max_state_bytes`` (default ``None`` = use the compile-time setting,
+        itself default unlimited) bounds the merged shared state per run; when
+        exceeded the run fails with :class:`GraphStateSizeError`.
         """
+        if max_state_bytes is not None and max_state_bytes < 1:
+            raise GraphError("max_state_bytes must be >= 1")
+        state_limit = (
+            max_state_bytes if max_state_bytes is not None else self._max_state_bytes
+        )
         chk = self._resolve_resume(resume)
         if chk is None:
             chk = GraphCheckpoint(
@@ -336,8 +363,8 @@ class CompiledStateGraph:
         try:
             if timeout_seconds is not None and timeout_seconds > 0:
                 async with _timeout(timeout_seconds):
-                    return await self._run_loop(chk, tid)
-            return await self._run_loop(chk, tid)
+                    return await self._run_loop(chk, tid, state_limit)
+            return await self._run_loop(chk, tid, state_limit)
         except (TimeoutError, asyncio.CancelledError):
             chk.status = GRAPH_INTERRUPTED
             chk.error = "cancelled"
@@ -385,7 +412,9 @@ class CompiledStateGraph:
         chk.status = GRAPH_RUNNING
         return chk
 
-    async def _run_loop(self, chk: GraphCheckpoint, tid: str) -> GraphRunResult:
+    async def _run_loop(
+        self, chk: GraphCheckpoint, tid: str, max_state_bytes: int | None = None
+    ) -> GraphRunResult:
         """The BSP superstep loop: run the frontier, merge, route, checkpoint, repeat."""
         while chk.frontier:
             if chk.superstep >= self._recursion_limit:
@@ -407,6 +436,21 @@ class CompiledStateGraph:
             # Merge every node's delta into shared state (reducers applied).
             for delta in deltas:
                 self._merge(chk.state, delta)
+
+            # OOM guard: bound the merged state size (opt-in via max_state_bytes).
+            if max_state_bytes is not None:
+                size = _state_size_bytes(chk.state)
+                if size > max_state_bytes:
+                    chk.status = GRAPH_FAILED
+                    chk.error = (
+                        f"merged state is {size} bytes, exceeding "
+                        f"max_state_bytes={max_state_bytes} "
+                        f"(superstep {chk.superstep})"
+                    )
+                    chk.updated_at = utc_now_iso()
+                    self._checkpoint_store.save(chk)
+                    await self._emit_finished(tid, chk)
+                    raise GraphStateSizeError(chk.error)
 
             for node_name in frontier:
                 chk.completed_nodes.append(node_name)
@@ -458,10 +502,18 @@ class CompiledStateGraph:
         # Snapshot of state for routers/nodes within this superstep (BSP isolation:
         # every node in a superstep sees the SAME pre-superstep state).
         snapshot = dict(chk.state)
-        results = await asyncio.gather(
-            *(self._run_node(name, snapshot, tid) for name in frontier)
-        )
-        deltas = [delta for delta, _ in results]
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [
+                    tg.create_task(self._run_node(name, snapshot, tid))
+                    for name in frontier
+                ]
+        except BaseExceptionGroup as eg:
+            # The TaskGroup has already cancelled AND awaited every sibling task
+            # (a bare gather would orphan them); surface the first real failure
+            # as a plain exception so callers keep seeing GraphError, not a group.
+            raise _first_failure(eg) from eg
+        deltas = [task.result()[0] for task in tasks]
 
         # Compute next frontier from each node's routing decision, post-merge so a
         # conditional router sees the merged state.
@@ -646,6 +698,27 @@ class CompiledStateGraph:
                 pass
 
 
+def _first_failure(eg: BaseExceptionGroup[BaseException]) -> BaseException:
+    """Unwrap a (possibly nested) exception group to its first leaf exception."""
+    for exc in eg.exceptions:
+        if isinstance(exc, BaseExceptionGroup):
+            return _first_failure(exc)
+        return exc
+    return eg  # pragma: no cover - a TaskGroup group is never empty
+
+
+def _state_size_bytes(state: GraphState) -> int:
+    """Best-effort serialized size of the shared state, for the OOM guard.
+
+    JSON with ``default=str`` covers the common case (graph state is meant to be
+    checkpointable); anything unserializable falls back to ``repr``.
+    """
+    try:
+        return len(json.dumps(state, default=str, ensure_ascii=False).encode("utf-8"))
+    except Exception:  # pragma: no cover - defensive
+        return len(repr(state).encode("utf-8"))
+
+
 def _timeout(seconds: float) -> asyncio.Timeout:
     """Return an ``asyncio.timeout(seconds)`` context manager (Python 3.11+)."""
     timeout_cm = getattr(asyncio, "timeout", None)
@@ -664,6 +737,7 @@ __all__ = [
     "Reducer",
     "GraphError",
     "GraphRecursionError",
+    "GraphStateSizeError",
     "add_reducer",
     "GraphRunResult",
     "StateGraph",

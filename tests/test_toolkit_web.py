@@ -8,7 +8,12 @@ from himmy.services.tools.registry import ToolRegistry
 from himmy.services.tools.security import REDACTED, ToolSecurityError
 from himmy.toolkit._net import guard_url
 from himmy.toolkit.config import ToolkitConfig
-from himmy.toolkit.web import HttpResponse, register_web_pack
+from himmy.toolkit.web import (
+    HttpResponse,
+    HttpStatusError,
+    TavilyBackend,
+    register_web_pack,
+)
 
 # A literal public IP avoids any DNS lookup, keeping these tests fully offline.
 PUBLIC = "http://93.184.216.34/"
@@ -125,3 +130,67 @@ def test_http_request_redacts_secret_headers() -> None:
     assert out["headers"]["Authorization"] == REDACTED
     assert out["headers"]["Content-Type"] == "text/plain"
     assert out["text"] == "ok"
+
+
+def test_http_request_error_status_raises_typed_error() -> None:
+    body = "<html>Server exploded: " + "x" * 1000 + "</html>"
+
+    def caller(method, url, *, headers, json_body, timeout):
+        return HttpResponse(status_code=500, headers={}, text=body)
+
+    handler = _registry(_PAGE_HTML, caller=caller).handler_for("http_request")
+    with pytest.raises(HttpStatusError) as excinfo:
+        handler({"url": PUBLIC, "method": "GET"})
+    err = excinfo.value
+    assert err.status_code == 500  # raw status stays inspectable
+    assert "500" in str(err)
+    assert "Internal Server Error" in str(err)  # reason phrase
+    assert "Server exploded" in str(err)  # body snippet surfaces...
+    assert len(err.body_snippet) <= 300  # ...but truncated, never the full page
+
+
+def test_http_request_4xx_also_raises() -> None:
+    def caller(method, url, *, headers, json_body, timeout):
+        return HttpResponse(status_code=404, headers={}, text="nope")
+
+    handler = _registry(_PAGE_HTML, caller=caller).handler_for("http_request")
+    with pytest.raises(HttpStatusError) as excinfo:
+        handler({"url": PUBLIC, "method": "GET"})
+    assert excinfo.value.status_code == 404
+
+
+def test_search_backend_error_status_raises_typed_error() -> None:
+    def caller(method, url, *, headers, json_body, timeout):
+        return HttpResponse(status_code=429, headers={}, text="slow down")
+
+    backend = TavilyBackend("key", caller, timeout=5.0)
+    with pytest.raises(HttpStatusError) as excinfo:
+        backend.search("hello", 3)
+    assert excinfo.value.status_code == 429
+    assert "slow down" in str(excinfo.value)
+
+
+def test_default_ddg_search_throttle_surfaces_as_error() -> None:
+    """The keyless DuckDuckGo path must not return a throttle page as results."""
+    import httpx
+
+    from himmy.toolkit.web import ddg_post_html
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="rate limited, try later")
+
+    # Patch httpx.Client so ddg_post_html uses a mock transport (no network).
+    real_client = httpx.Client
+
+    def _client(**kwargs: object) -> httpx.Client:
+        kwargs.pop("timeout", None)
+        kwargs.pop("headers", None)
+        kwargs.pop("follow_redirects", None)
+        return real_client(transport=httpx.MockTransport(handler))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(httpx, "Client", _client)
+        with pytest.raises(HttpStatusError) as excinfo:
+            ddg_post_html("hello")
+    assert excinfo.value.status_code == 503
+    assert "rate limited" in str(excinfo.value)

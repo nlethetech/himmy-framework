@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Collection
 from typing import Any
 
 from himmy.core.errors import HimmyError
+from himmy.core.sqlite_util import connect_hardened
 from himmy.entities.integrity import content_hash
 from himmy.entities.lineage import (
     DEFAULT_TRACE_DEPTH,
@@ -68,8 +70,15 @@ class SqliteEntityRegistry:
     """A synchronous, durable SQLite-backed registry mirroring ``EntityRegistry``."""
 
     def __init__(self, path: str = ":memory:") -> None:
-        """Open (or create) the SQLite database at ``path`` (``:memory:`` default)."""
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        """Open (or create) the SQLite database at ``path`` (``:memory:`` default).
+
+        The connection is opened via :func:`connect_hardened` (WAL + busy timeout +
+        ``synchronous=NORMAL``) so concurrent connections coordinate instead of
+        raising ``database is locked`` immediately. A process-level write lock
+        serialises writers sharing this connection across threads.
+        """
+        self._conn = connect_hardened(path)
+        self._write_lock = threading.Lock()
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
@@ -84,8 +93,8 @@ class SqliteEntityRegistry:
         self.close()
 
     # ------------------------------------------------------------------- writes
-    def register(self, record: EntityRecord) -> EntityRecord:
-        """Register a record; idempotent on identical content, raises on collision."""
+    def _insert_record(self, record: EntityRecord) -> EntityRecord:
+        """Check-then-insert a record without committing (callers own the txn)."""
         row = self._conn.execute(
             "SELECT payload, metadata FROM entity_records WHERE record_id = ?",
             (record.record_id,),
@@ -105,22 +114,39 @@ class SqliteEntityRegistry:
             stored = self.get(record.record_id)
             assert stored is not None
             return stored
-        self._conn.execute(
-            f"INSERT INTO entity_records ({_REC_COLS}, content_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                record.record_id,
-                record.stable_id,
-                record.version,
-                record.kind,
-                json.dumps(record.payload),
-                json.dumps(record.metadata),
-                record.created_at,
-                content_hash(record),
-            ),
-        )
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                f"INSERT INTO entity_records ({_REC_COLS}, content_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.record_id,
+                    record.stable_id,
+                    record.version,
+                    record.kind,
+                    json.dumps(record.payload),
+                    json.dumps(record.metadata),
+                    record.created_at,
+                    content_hash(record),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HimmyError(
+                f"Concurrent version conflict for stable_id={record.stable_id!r} "
+                f"(kind={record.kind!r}, version={record.version}): another writer "
+                "registered this version first. Retry new_version()."
+            ) from exc
         return record
+
+    def register(self, record: EntityRecord) -> EntityRecord:
+        """Register a record; idempotent on identical content, raises on collision."""
+        with self._write_lock:
+            try:
+                stored = self._insert_record(record)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return stored
 
     def new_version(
         self,
@@ -131,22 +157,39 @@ class SqliteEntityRegistry:
         metadata: dict[str, Any] | None = None,
         expected_version: int | None = None,
     ) -> EntityRecord:
-        """Create the next version of an artefact with optimistic concurrency."""
-        latest = self.get_latest(stable_id)
-        current_version = latest.version if latest is not None else 0
-        if expected_version is not None and expected_version != current_version:
-            raise HimmyError(
-                f"Optimistic concurrency conflict for stable_id={stable_id!r}: "
-                f"expected version {expected_version}, found {current_version}."
-            )
-        record = EntityRecord.create(
-            stable_id=stable_id,
-            version=current_version + 1,
-            kind=kind,
-            payload=payload,
-            metadata=metadata or {},
-        )
-        return self.register(record)
+        """Create the next version of an artefact with optimistic concurrency.
+
+        The read-latest + insert pair runs under the process write lock inside a
+        ``BEGIN IMMEDIATE`` transaction, so concurrent versioning serialises (across
+        threads sharing this registry and across other connections to the same
+        file) instead of silently losing an update.
+        """
+        with self._write_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                latest = self.get_latest(stable_id)
+                current_version = latest.version if latest is not None else 0
+                if expected_version is not None and expected_version != (
+                    current_version
+                ):
+                    raise HimmyError(
+                        "Optimistic concurrency conflict for "
+                        f"stable_id={stable_id!r}: expected version "
+                        f"{expected_version}, found {current_version}."
+                    )
+                record = EntityRecord.create(
+                    stable_id=stable_id,
+                    version=current_version + 1,
+                    kind=kind,
+                    payload=payload,
+                    metadata=metadata or {},
+                )
+                stored = self._insert_record(record)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return stored
 
     def link(
         self,
@@ -163,18 +206,19 @@ class SqliteEntityRegistry:
             relation=relation,
             metadata=metadata or {},
         )
-        self._conn.execute(
-            f"INSERT INTO entity_links ({_LINK_COLS}) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                link.link_id,
-                link.from_record_id,
-                link.to_record_id,
-                link.relation,
-                json.dumps(link.metadata),
-                link.created_at,
-            ),
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                f"INSERT INTO entity_links ({_LINK_COLS}) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    link.link_id,
+                    link.from_record_id,
+                    link.to_record_id,
+                    link.relation,
+                    json.dumps(link.metadata),
+                    link.created_at,
+                ),
+            )
+            self._conn.commit()
         return link
 
     # -------------------------------------------------------------------- reads

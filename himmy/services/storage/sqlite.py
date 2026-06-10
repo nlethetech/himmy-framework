@@ -235,11 +235,34 @@ class SqliteStorageService:
         await self.close()
 
     # ------------------------------------------------------------- sync primitives
+    def _rollback_quietly(self) -> None:
+        """Roll back the shared connection, swallowing rollback-time errors.
+
+        Called from write-path exception handlers: the original write failure is
+        what the caller must see, so a secondary error rolling back an already-dead
+        connection must not mask it.
+        """
+        try:
+            self._conn.rollback()
+        except sqlite3.Error:  # pragma: no cover - rollback on a dead connection
+            pass
+
     def _write(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        """Run a write statement under the write lock and commit."""
+        """Run a write statement under the write lock and commit.
+
+        Rolls back on any failure (constraint violation, disk error, failed commit)
+        before re-raising, so the shared connection is never left inside an open
+        transaction — open-transaction residue would hold the WAL write lock against
+        other processes and silently fold the torn write into the next caller's
+        commit.
+        """
         with self._lock:
-            self._conn.execute(sql, params)
-            self._conn.commit()
+            try:
+                self._conn.execute(sql, params)
+                self._conn.commit()
+            except BaseException:
+                self._rollback_quietly()
+                raise
 
     def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
         """Run a read returning at most one row."""
@@ -440,20 +463,32 @@ class SqliteStorageService:
         return await asyncio.to_thread(self._save_run_if_absent_sync, run)
 
     def _save_run_if_absent_sync(self, run: RunRecord) -> tuple[RunRecord, bool]:
-        """The locked read-then-insert for the idempotent run create."""
+        """The locked read-then-insert for the idempotent run create.
+
+        Runs as a single ``BEGIN IMMEDIATE`` transaction so the existence check and
+        the insert are atomic even across processes sharing the file (the write lock
+        is taken before the read), and rolls back on failure so a lost race on
+        ``runs_idempotency_idx`` cannot leave the transaction open.
+        """
         with self._lock:
-            if run.idempotency_key is not None:
-                existing = self._conn.execute(
-                    "SELECT payload FROM runs WHERE workspace_id = ? AND "
-                    "idempotency_key = ?",
-                    (run.workspace_id, run.idempotency_key),
-                ).fetchone()
-                if existing is not None:
-                    return _row_to_run(existing), False
-            sql, params = self._run_upsert(run)
-            self._conn.execute(sql, params)
-            self._conn.commit()
-            return run, True
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if run.idempotency_key is not None:
+                    existing = self._conn.execute(
+                        "SELECT payload FROM runs WHERE workspace_id = ? AND "
+                        "idempotency_key = ?",
+                        (run.workspace_id, run.idempotency_key),
+                    ).fetchone()
+                    if existing is not None:
+                        self._conn.commit()
+                        return _row_to_run(existing), False
+                sql, params = self._run_upsert(run)
+                self._conn.execute(sql, params)
+                self._conn.commit()
+                return run, True
+            except BaseException:
+                self._rollback_quietly()
+                raise
 
     @staticmethod
     def _run_upsert(run: RunRecord) -> tuple[str, tuple[Any, ...]]:
@@ -608,26 +643,38 @@ class SqliteStorageService:
         status: RecommendationStatus | None,
         notes: str | None,
     ) -> RecommendationItem | None:
-        """Read-modify-write a recommendation's status/notes under the write lock."""
+        """Read-modify-write a recommendation's status/notes under the write lock.
+
+        The read and the write run in one ``BEGIN IMMEDIATE`` transaction so the
+        update is atomic even across processes sharing the file (no torn update over
+        a concurrent writer), and rolls back on failure so an aborted update cannot
+        leave the transaction open.
+        """
         with self._lock:
-            row = self._conn.execute(
-                "SELECT payload FROM recommendations WHERE recommendation_id = ?",
-                (recommendation_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            item = _row_to_recommendation(row)
-            if status is not None:
-                item.status = status
-            if notes is not None:
-                item.notes = notes
-            self._conn.execute(
-                "UPDATE recommendations SET status = ?, payload = ? "
-                "WHERE recommendation_id = ?",
-                (item.status.value, self._dump(item), recommendation_id),
-            )
-            self._conn.commit()
-            return item
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT payload FROM recommendations WHERE recommendation_id = ?",
+                    (recommendation_id,),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return None
+                item = _row_to_recommendation(row)
+                if status is not None:
+                    item.status = status
+                if notes is not None:
+                    item.notes = notes
+                self._conn.execute(
+                    "UPDATE recommendations SET status = ?, payload = ? "
+                    "WHERE recommendation_id = ?",
+                    (item.status.value, self._dump(item), recommendation_id),
+                )
+                self._conn.commit()
+                return item
+            except BaseException:
+                self._rollback_quietly()
+                raise
 
     # --------------------------------------------------------------- evaluation
     async def save_evaluation_run(self, run: EvaluationRun) -> EvaluationRun:

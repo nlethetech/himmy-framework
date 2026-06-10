@@ -32,6 +32,39 @@ class EmbedderProtocol(Protocol):
         ...
 
 
+#: Reserved chunk-metadata key recording which embedder produced a chunk's vector.
+EMBEDDER_FINGERPRINT_KEY = "embedder_fingerprint"
+
+
+def embedder_fingerprint(embedder: Any) -> str:
+    """Stable identity fingerprint of an embedder (class + model + dimension).
+
+    Hashes the salient configuration — the embedder's class name, its model id
+    (``model`` / ``model_name``, when set), and its output dimension (``dim`` /
+    ``dimensions``, when set) — into a short stable hex token. The KnowledgeBase
+    stamps this on every chunk at ingest (under :data:`EMBEDDER_FINGERPRINT_KEY`)
+    and compares it at search time, so swapping embedding models is *detected*
+    instead of silently scoring garbage similarities against incompatible old
+    vectors. A custom embedder can bypass the inference by exposing a non-empty
+    string ``fingerprint`` attribute, which is used verbatim.
+    """
+    explicit = getattr(embedder, "fingerprint", None)
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    model = getattr(embedder, "model", None) or getattr(embedder, "model_name", None)
+    dim = getattr(embedder, "dim", None)
+    if dim is None:
+        dim = getattr(embedder, "dimensions", None)
+    raw = "|".join(
+        (
+            type(embedder).__name__,
+            str(model) if model is not None else "",
+            str(dim) if dim is not None else "",
+        )
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def embedder_is_multimodal(embedder: Any) -> bool:
     """Return True only when an embedder explicitly declares image capability.
 
@@ -346,9 +379,11 @@ class OpenAIMultimodalEmbeddingModel:
 
 
 __all__ = [
+    "EMBEDDER_FINGERPRINT_KEY",
     "EmbedderProtocol",
     "DeterministicEmbedder",
     "build_openai_compatible_embedder",
     "OpenAIMultimodalEmbeddingModel",
+    "embedder_fingerprint",
     "embedder_is_multimodal",
 ]

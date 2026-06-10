@@ -1,5 +1,5 @@
 # Developer entry points — the same checks CI runs, runnable locally (WS5).
-.PHONY: help install lint format types test test-load gate security sbom audit integration
+.PHONY: help install lint format types test test-load gate security sbom audit integration bench-gate bench-rebaseline
 
 help:
 	@echo "make install     - editable install with dev + enterprise extras"
@@ -12,6 +12,8 @@ help:
 	@echo "make audit       - pip-audit (known-CVE dependency scan)"
 	@echo "make sbom        - generate a CycloneDX SBOM (sbom.cdx.json)"
 	@echo "make integration - run the real-provider integration tests (needs Ollama)"
+	@echo "make bench-gate  - run the PR-sized benchmark gate vs benchmarks/baseline.json (needs Ollama)"
+	@echo "make bench-rebaseline - re-measure and rewrite benchmarks/baseline.json (review + commit the diff)"
 
 install:
 	python -m pip install -e ".[api,postgres,knowledge,connectors,nepal,auth,dev]"
@@ -49,3 +51,12 @@ security: audit sbom
 
 integration:
 	pytest -q -m integration
+
+# The same gate CI runs on every PR (benchmarks/baseline.json `gate` block).
+bench-gate:
+	python scripts/bench_gate.py run
+
+# After an INTENTIONAL quality shift: re-measure, rewrite the baseline (floors =
+# measured - margin, stamped with the current SHA), then review + commit the diff.
+bench-rebaseline:
+	python scripts/bench_gate.py run --rebaseline --sha $$(git rev-parse --short=12 HEAD)

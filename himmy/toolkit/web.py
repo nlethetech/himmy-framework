@@ -10,7 +10,9 @@ reaching the open web — while staying offline-testable and SSRF-safe:
   for GET, an ``HttpCaller`` for full requests) so tests pass fakes and never hit the
   network;
 * ``web_search`` is backend-pluggable: a keyless DuckDuckGo HTML scrape by default,
-  or Tavily/Brave when an API key is configured.
+  or Tavily/Brave when an API key is configured;
+* an upstream HTTP status >= 400 raises :class:`HttpStatusError` (status + reason +
+  truncated body snippet) instead of handing the model an error page as a result.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from http.client import responses as _HTTP_REASONS
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import parse_qs, quote_plus, urlsplit
 
@@ -59,6 +62,47 @@ class HttpCaller(Protocol):
         json_body: Any | None,
         timeout: float,
     ) -> HttpResponse: ...
+
+
+#: How much of an error body to echo back in :class:`HttpStatusError` messages.
+_ERROR_BODY_SNIPPET_CHARS = 300
+
+
+class HttpStatusError(RuntimeError):
+    """An upstream HTTP error (status >= 400), surfaced as a typed tool failure.
+
+    Raised instead of returning the error page as a normal tool result, so the
+    model never reads a 4xx/5xx body (throttle notices, error HTML) as truth — the
+    kernel turns handler exceptions into a *failed* ``ToolExecutionResult``, the
+    same way declarative HTTP tools report ``upstream returned <status>``. The raw
+    ``status_code`` (plus reason and a truncated body snippet) stays available both
+    as attributes and in the message, for flows that branch on specific statuses.
+    """
+
+    def __init__(
+        self, status_code: int, reason: str, url: str, body_snippet: str
+    ) -> None:
+        self.status_code = status_code
+        self.reason = reason
+        self.url = url
+        self.body_snippet = body_snippet
+        label = f"HTTP {status_code}" + (f" {reason}" if reason else "")
+        message = f"upstream returned {label} for {url}"
+        if body_snippet:
+            message += f"; body (truncated): {body_snippet!r}"
+        super().__init__(message)
+
+
+def _check_status(resp: HttpResponse, url: str) -> HttpResponse:
+    """Pass ``resp`` through, raising :class:`HttpStatusError` when status >= 400."""
+    if resp.status_code < 400:
+        return resp
+    raise HttpStatusError(
+        resp.status_code,
+        _HTTP_REASONS.get(resp.status_code, ""),
+        url,
+        resp.text[:_ERROR_BODY_SNIPPET_CHARS].strip(),
+    )
 
 
 def _httpx_caller(
@@ -220,10 +264,18 @@ def ddg_post_html(query: str, timeout: float = 20.0) -> str:
     """Default DuckDuckGo fetch: POST the query (form-encoded) and return the HTML."""
     import httpx
 
+    url = "https://html.duckduckgo.com/html/"
     with httpx.Client(
         timeout=timeout, headers={"User-Agent": _BROWSER_UA}, follow_redirects=True
     ) as client:
-        resp = client.post("https://html.duckduckgo.com/html/", data={"q": query})
+        resp = client.post(url, data={"q": query})
+        if resp.status_code >= 400:
+            raise HttpStatusError(
+                resp.status_code,
+                _HTTP_REASONS.get(resp.status_code, ""),
+                url,
+                resp.text[:_ERROR_BODY_SNIPPET_CHARS].strip(),
+            )
         return resp.text
 
 
@@ -248,16 +300,20 @@ class TavilyBackend:
         self._timeout = timeout
 
     def search(self, query: str, max_results: int) -> list[dict[str, str]]:
-        resp = self._caller(
-            "POST",
-            "https://api.tavily.com/search",
-            headers={"Content-Type": "application/json"},
-            json_body={
-                "api_key": self._key,
-                "query": query,
-                "max_results": max_results,
-            },
-            timeout=self._timeout,
+        url = "https://api.tavily.com/search"
+        resp = _check_status(
+            self._caller(
+                "POST",
+                url,
+                headers={"Content-Type": "application/json"},
+                json_body={
+                    "api_key": self._key,
+                    "query": query,
+                    "max_results": max_results,
+                },
+                timeout=self._timeout,
+            ),
+            url,
         )
         import json
 
@@ -281,12 +337,19 @@ class BraveBackend:
         self._timeout = timeout
 
     def search(self, query: str, max_results: int) -> list[dict[str, str]]:
-        resp = self._caller(
-            "GET",
-            f"https://api.search.brave.com/res/v1/web/search?q={quote_plus(query)}",
-            headers={"X-Subscription-Token": self._key, "Accept": "application/json"},
-            json_body=None,
-            timeout=self._timeout,
+        url = f"https://api.search.brave.com/res/v1/web/search?q={quote_plus(query)}"
+        resp = _check_status(
+            self._caller(
+                "GET",
+                url,
+                headers={
+                    "X-Subscription-Token": self._key,
+                    "Accept": "application/json",
+                },
+                json_body=None,
+                timeout=self._timeout,
+            ),
+            url,
         )
         import json
 
@@ -401,12 +464,15 @@ def register_web_pack(
             allow_private=config.allow_private_hosts,
             allow_hosts=set(config.egress_allow_hosts) or None,
         )
-        resp = caller(
-            method,
+        resp = _check_status(
+            caller(
+                method,
+                url,
+                headers=headers,
+                json_body=json_body,
+                timeout=config.http_timeout,
+            ),
             url,
-            headers=headers,
-            json_body=json_body,
-            timeout=config.http_timeout,
         )
         body = resp.text[: config.http_max_bytes]
         return {
@@ -442,7 +508,11 @@ def register_web_pack(
         # description already signals it can write.
         read_only=None,
         handler=http_request,
-        description="Make an HTTP request (GET/POST/...) to an http(s) URL.",
+        description=(
+            "Make an HTTP request (GET/POST/...) to an http(s) URL. A response "
+            "with status >= 400 is reported as a tool error (status + reason + "
+            "body snippet), never as a normal result."
+        ),
         args_json_schema=_HTTP_SCHEMA,
         sensitive_arg_names=["headers"],
         metadata={"pack": "web"},
@@ -460,4 +530,5 @@ __all__ = [
     "html_to_text",
     "HttpResponse",
     "HttpCaller",
+    "HttpStatusError",
 ]

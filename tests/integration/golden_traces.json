@@ -1,0 +1,70 @@
+{
+  "description": "Golden retrieval traces over the checked-in rag_corpus DOCS using the offline deterministic (hashing) embedder. Each case pins a query to the document that must be retrieved FIRST and to the evidence terms the retrieved chunk itself must contain, so a chunker/cosine/threshold/metadata regression fails on evidence quality, not just a recall floor. decoy_keys name the corpus documents most likely to be confused with the target (they must never outrank it).",
+  "embedder": {"name": "deterministic", "dim": 256},
+  "top_k": 5,
+  "cases": [
+    {
+      "name": "nabil-dividend",
+      "query": "NABIL bank quarterly profit and cash dividend",
+      "expected_top_key": "nabil",
+      "evidence_terms": ["nabil", "quarterly profit", "cash dividend"],
+      "decoy_keys": ["nica", "scbl", "hbl"]
+    },
+    {
+      "name": "rrf-fusion",
+      "query": "Reciprocal Rank Fusion combining two ranked result lists",
+      "expected_top_key": "rrf",
+      "evidence_terms": ["reciprocal rank fusion", "ranked result lists"],
+      "decoy_keys": ["embedding", "cache"]
+    },
+    {
+      "name": "bardaghat-terai",
+      "query": "Bardaghat Terai plain where farmers grow rice and lentils",
+      "expected_top_key": "bardaghat",
+      "evidence_terms": ["bardaghat", "terai", "rice"],
+      "decoy_keys": ["kathmandu", "monsoon"]
+    },
+    {
+      "name": "vitamin-d",
+      "query": "vitamin D from sunlight helps the gut absorb calcium",
+      "expected_top_key": "vitd",
+      "evidence_terms": ["vitamin d", "sunlight", "calcium"],
+      "decoy_keys": ["omega3", "hydration"]
+    },
+    {
+      "name": "black-hole-horizon",
+      "query": "event horizon of a black hole where light cannot escape",
+      "expected_top_key": "blackhole",
+      "evidence_terms": ["event horizon", "black hole", "light"],
+      "decoy_keys": ["neutron", "whitedwarf"]
+    },
+    {
+      "name": "white-dwarf-disambig",
+      "query": "white dwarf supported by electron degeneracy pressure",
+      "expected_top_key": "whitedwarf",
+      "evidence_terms": ["white dwarf", "electron degeneracy pressure"],
+      "decoy_keys": ["redgiant", "neutron"]
+    },
+    {
+      "name": "monsoon-rain",
+      "query": "Nepal monsoon winds off the Bay of Bengal in June",
+      "expected_top_key": "monsoon",
+      "evidence_terms": ["monsoon", "bay of bengal", "june"],
+      "decoy_keys": ["kathmandu", "everest"]
+    },
+    {
+      "name": "hot-compost",
+      "query": "thermophilic compost pile that kills weed seeds and pathogens",
+      "expected_top_key": "compost",
+      "evidence_terms": ["thermophilic", "compost", "weed seeds"],
+      "decoy_keys": ["foodforest", "ducks"]
+    },
+    {
+      "name": "duck-patrol",
+      "query": "runner ducks eating slugs and snails with manure feeding the pond",
+      "expected_top_key": "ducks",
+      "evidence_terms": ["runner ducks", "slugs", "pond"],
+      "decoy_keys": ["bees", "compost"]
+    }
+  ]
+}

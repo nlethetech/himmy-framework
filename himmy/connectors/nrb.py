@@ -22,6 +22,9 @@ import io
 import re
 from datetime import date
 
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+from himmy.connectors._feeds import entry_cap, parse_feed
 from himmy.connectors.fetcher import Fetcher, HttpxFetcher, get_json
 from himmy.connectors.models import ForexRate, MacroReport, Workbook
 from himmy.core.errors import HimmyError
@@ -73,6 +76,68 @@ def _looks_like_workbook(data: bytes) -> bool:
     return data[:4] == b"PK\x03\x04" or data[:4] == b"\xd0\xcf\x11\xe0"
 
 
+# ----------------------------------------------------------- forex payload schema
+# NRB's forex API shape, validated with pydantic so structure drift fails LOUDLY
+# (a clear HimmyError) instead of as KeyErrors or silently empty results. Value-
+# level noise stays tolerated (an unparseable buy/sell becomes None, a missing
+# unit becomes 1) — only the *structure* is load-bearing.
+
+
+class _ForexCurrency(BaseModel):
+    """The ``currency`` object inside one NRB forex rate entry."""
+
+    iso3: str = ""
+    name: str = ""
+    unit: int = 1
+
+    @field_validator("unit", mode="before")
+    @classmethod
+    def _unit_default(cls, value: object) -> object:
+        return value or 1
+
+
+class _ForexEntry(BaseModel):
+    """One per-currency rate entry inside a day's ``rates`` list."""
+
+    currency: _ForexCurrency = Field(default_factory=_ForexCurrency)
+    buy: float | None = None
+    sell: float | None = None
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def _currency_default(cls, value: object) -> object:
+        return value or {}
+
+    @field_validator("buy", "sell", mode="before")
+    @classmethod
+    def _price(cls, value: object) -> float | None:
+        return _to_float(value)
+
+
+class _ForexDay(BaseModel):
+    """One published day: a date plus its per-currency rates."""
+
+    date: str = ""
+    rates: list[_ForexEntry] = Field(default_factory=list)
+
+    @field_validator("rates", mode="before")
+    @classmethod
+    def _rates_default(cls, value: object) -> object:
+        return value if value is not None else []
+
+
+class _ForexData(BaseModel):
+    """The ``data`` envelope: ``payload`` is the list of days."""
+
+    payload: list[_ForexDay]
+
+
+class _ForexResponse(BaseModel):
+    """The top-level NRB forex API response (``{"data": {"payload": [...]}}``)."""
+
+    data: _ForexData
+
+
 class NRBClient:
     """A direct client for NRB forex + macroeconomic-situation reports."""
 
@@ -89,7 +154,9 @@ class NRBClient:
         Dates are ISO ``YYYY-MM-DD``. Each currency's ``unit`` is the quantity the
         buy/sell price is quoted for (e.g. INR is quoted per 100). NRB caps
         ``per_page`` (the number of days per page) at 100; larger values return
-        nothing, so the default and effective maximum is 100.
+        nothing, so the default and effective maximum is 100. The response is
+        schema-validated: if NRB changes the payload structure this raises a clear
+        :class:`HimmyError` rather than mis-parsing or returning silent emptiness.
         """
         per_page = min(per_page, 100)
         to_date = to_date or from_date
@@ -97,22 +164,25 @@ class NRBClient:
             f"{NRB_FOREX_API}?from={from_date}&to={to_date}&per_page={per_page}&page=1"
         )
         data = get_json(self._fetcher, url)
-        rates: list[ForexRate] = []
-        for day in (data.get("data") or {}).get("payload", []) or []:
-            day_date = day.get("date", "")
-            for entry in day.get("rates", []) or []:
-                currency = entry.get("currency", {}) or {}
-                rates.append(
-                    ForexRate(
-                        date=day_date,
-                        currency_iso3=currency.get("iso3", ""),
-                        currency_name=currency.get("name", ""),
-                        unit=int(currency.get("unit", 1) or 1),
-                        buy=_to_float(entry.get("buy")),
-                        sell=_to_float(entry.get("sell")),
-                    )
-                )
-        return rates
+        try:
+            parsed = _ForexResponse.model_validate(data)
+        except ValidationError as exc:
+            raise HimmyError(
+                f"NRB forex response no longer matches the expected "
+                f"{{data: {{payload: [...]}}}} shape (schema drift?): {exc}"
+            ) from exc
+        return [
+            ForexRate(
+                date=day.date,
+                currency_iso3=entry.currency.iso3,
+                currency_name=entry.currency.name,
+                unit=entry.currency.unit,
+                buy=entry.buy,
+                sell=entry.sell,
+            )
+            for day in parsed.data.payload
+            for entry in day.rates
+        ]
 
     def latest_forex(self) -> list[ForexRate]:
         """Convenience: today's published rates."""
@@ -124,19 +194,14 @@ class NRBClient:
 
         Sourced from NRB's category RSS feed (the HTML listing is JS-rendered).
         Each report comes in Nepali / English / Tables variants — the ``language``
-        field distinguishes them, and ``period`` parses the data window.
+        field distinguishes them, and ``period`` parses the data window. An
+        unparseable feed (error page, format drift) raises a clear
+        :class:`HimmyError` instead of returning a silent empty list.
         """
         raw = self._fetcher.get_bytes(NRB_MACRO_FEED)
-        try:
-            import feedparser
-        except ImportError as exc:  # pragma: no cover - only without the extra
-            raise HimmyError(
-                "NRB macro reports require the [connectors] extra "
-                "(pip install 'himmy[connectors]')."
-            ) from exc
-        feed = feedparser.parse(raw)
+        feed = parse_feed(raw, source="nrb-macro")
         reports: list[MacroReport] = []
-        for entry in feed.entries[: max(0, limit)]:
+        for entry in feed.entries[: entry_cap(limit)]:
             title = entry.get("title", "")
             reports.append(
                 MacroReport(

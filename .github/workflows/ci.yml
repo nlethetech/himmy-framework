@@ -15,6 +15,24 @@ jobs:
   quality:
     name: lint · types · tests
     runs-on: ubuntu-latest
+    services:
+      # Real Postgres 16 (+ pgvector, which the knowledge tests' CREATE EXTENSION
+      # needs) so the docker-gated storage/knowledge contract tests and the
+      # migration runner execute per-PR instead of skipping. Mirrors
+      # docker/docker-compose.yml, but on the runner's default port 5432.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: himmy
+          POSTGRES_USER: himmy
+          POSTGRES_PASSWORD: himmy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U himmy -d himmy"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v6
 
@@ -41,9 +59,15 @@ jobs:
       - name: Mypy
         run: mypy himmy
 
-      - name: Pytest (with coverage)
-        # Postgres/provider/observability tests skip without a DB/keys/extras.
-        run: pytest -q --cov=himmy --cov-report=term-missing --cov-report=xml
+      - name: Pytest (with coverage gate)
+        # Provider/observability tests skip without keys/extras; the Postgres
+        # tests now run for real against the service container above.
+        # --cov-fail-under enforces the measured baseline (82%) with headroom.
+        env:
+          HIMMY_TEST_POSTGRES_DSN: postgresql://himmy:himmy@localhost:5432/himmy
+        run: >-
+          pytest -q --cov=himmy --cov-report=term-missing --cov-report=xml
+          --cov-fail-under=80
 
       - name: Upload coverage artifact
         if: always()

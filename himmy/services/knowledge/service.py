@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -19,8 +20,10 @@ from himmy.services.context.adapters import ContextAdapter
 from himmy.services.context.models import ContextField, EvidenceRef
 from himmy.services.knowledge.chunker import SemanticChunker
 from himmy.services.knowledge.embedder import (
+    EMBEDDER_FINGERPRINT_KEY,
     DeterministicEmbedder,
     EmbedderProtocol,
+    embedder_fingerprint,
     embedder_is_multimodal,
 )
 from himmy.services.knowledge.models import (
@@ -44,6 +47,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.storage.service import StorageService
 
     AnyChunker = SemanticChunker | MarkdownAwareChunker
+
+logger = logging.getLogger("himmy.knowledge")
 
 
 def _content_hash(text: str) -> str:
@@ -89,6 +94,7 @@ class KnowledgeBase:
         max_concurrent_embeds: int = 4,
         backend: KnowledgeBackendProtocol | None = None,
         retrieval: RetrievalConfig | None = None,
+        strict_embedder_check: bool = False,
     ) -> None:
         """Wire the KB with a storage backend, embedder, chunker, and readers.
 
@@ -102,6 +108,13 @@ class KnowledgeBase:
         BM25+dense RRF fusion (and optional rerank / query rewrite). A lexical index
         is maintained for the in-memory path only when hybrid is selected, so the
         pure-dense default carries no extra work.
+
+        Every chunk is stamped at ingest with the active embedder's fingerprint
+        (see :func:`~himmy.services.knowledge.embedder.embedder_fingerprint`); at
+        search time a stored-vs-active mismatch logs a warning once per
+        ``(kb, fingerprint)`` by default, or raises when ``strict_embedder_check``
+        is True. Chunks ingested before fingerprinting existed are *unknown*:
+        warn-only, never an error, so legacy indexes keep working.
         """
         self._storage = storage
         self._embedder: EmbedderProtocol = embedder or DeterministicEmbedder()
@@ -116,6 +129,9 @@ class KnowledgeBase:
         self.max_concurrent_embeds = max_concurrent_embeds
         self._backend: KnowledgeBackendProtocol | None = backend
         self._retrieval: RetrievalConfig = retrieval or DEFAULT_RETRIEVAL_CONFIG
+        self._strict_embedder_check = strict_embedder_check
+        # (kb_id, stored_fingerprint) pairs already warned about (once per mismatch).
+        self._fingerprint_warned: set[tuple[str, str]] = set()
         self._kbs: dict[str, KnowledgeBaseRecord] = {}
         # kb_id -> {document_id: KnowledgeDocument}
         self._documents: dict[str, dict[str, KnowledgeDocument]] = {}
@@ -355,6 +371,7 @@ class KnowledgeBase:
         created_docs = [doc for (doc, _, _) in pending]
         all_chunks: list[KnowledgeChunk] = []
         cursor = 0
+        fingerprint = embedder_fingerprint(self._embedder)
         for document, triples, _ in pending:
             for start, end, chunk_text in triples:
                 embedding = embeddings[cursor]
@@ -367,7 +384,10 @@ class KnowledgeBase:
                     end_pos=end,
                     embedding=embedding,
                     chunk_kind="text",
-                    metadata=dict(document.metadata),
+                    metadata={
+                        **document.metadata,
+                        EMBEDDER_FINGERPRINT_KEY: fingerprint,
+                    },
                 )
                 all_chunks.append(chunk)
 
@@ -466,7 +486,10 @@ class KnowledgeBase:
             chunk_kind="image",
             image_uri=image_uri,
             caption=caption,
-            metadata=meta,
+            metadata={
+                **meta,
+                EMBEDDER_FINGERPRINT_KEY: embedder_fingerprint(self._embedder),
+            },
         )
         if self._backend is not None:
             await self._backend.persist_documents(kb_id, [document], [chunk])
@@ -503,17 +526,25 @@ class KnowledgeBase:
         When ``workspace_id``/``client_id`` are supplied they are verified against
         the resolved KB record (tenancy guard) so a raw ``kb_id`` from another tenant
         cannot reach this KB's chunks.
+
+        Stored chunk embedder fingerprints are compared against the active
+        embedder's: a mismatch warns once per ``(kb, fingerprint)`` (or raises with
+        ``strict_embedder_check=True``); fingerprint-less legacy chunks warn only.
         """
         await self._authorize_kb(kb_id, workspace_id, client_id)
+        self._check_embedder_compat(kb_id)
 
         if self._retrieval.mode == "hybrid":
-            return await self._search_hybrid(
+            hybrid_results = await self._search_hybrid(
                 kb_id,
                 query,
                 top_k=top_k,
                 similarity_threshold=similarity_threshold,
                 metadata_filters=metadata_filters,
             )
+            if self._backend is not None:
+                self._check_result_fingerprints(kb_id, hybrid_results)
+            return hybrid_results
 
         def _keep(sim: float) -> bool:
             if similarity_threshold is None:
@@ -523,13 +554,15 @@ class KnowledgeBase:
         query_vec = await self._embedder.embed_query(query)
 
         if self._backend is not None:
-            return await self._backend.search(
+            backend_results = await self._backend.search(
                 kb_id,
                 query_vec,
                 top_k=top_k,
                 similarity_threshold=similarity_threshold,
                 metadata_filters=metadata_filters,
             )
+            self._check_result_fingerprints(kb_id, backend_results)
+            return backend_results
 
         chunks = list(self._chunks.get(kb_id, {}).values())
         scored: list[tuple[float, KnowledgeChunk]] = []
@@ -870,6 +903,83 @@ class KnowledgeBase:
                 raise HimmyError(
                     "Embedder returned a zero-norm embedding vector; refusing to "
                     "ingest an unretrievable chunk."
+                )
+
+    def _check_embedder_compat(self, kb_id: str) -> None:
+        """Detect stored-vs-active embedder mismatches over the in-memory store.
+
+        Scans the KB's chunk fingerprints directly (cheap dict walk) so a swapped
+        embedding model is detected even when the incompatible vectors all score
+        non-positive and would never surface in results. Backend-held chunks are
+        checked from search results instead (:meth:`_check_result_fingerprints`).
+        """
+        if self._backend is not None:
+            return
+        found = {
+            chunk.metadata.get(EMBEDDER_FINGERPRINT_KEY)
+            for chunk in self._chunks.get(kb_id, {}).values()
+        }
+        self._handle_fingerprint_mismatches(kb_id, found)
+
+    def _check_result_fingerprints(
+        self, kb_id: str, results: list[RetrievedChunk]
+    ) -> None:
+        """Detect embedder mismatches from the fingerprints on returned chunks.
+
+        The backend path cannot cheaply enumerate every stored fingerprint, so the
+        check is best-effort over what the search actually returned — exactly the
+        chunks whose similarities the caller is about to trust.
+        """
+        found = {r.metadata.get(EMBEDDER_FINGERPRINT_KEY) for r in results}
+        self._handle_fingerprint_mismatches(kb_id, found)
+
+    def _handle_fingerprint_mismatches(self, kb_id: str, found: set[Any]) -> None:
+        """Warn (default) or raise (strict) on a stored-vs-active embedder mismatch.
+
+        A missing fingerprint (chunks ingested before fingerprinting existed) is
+        *unknown*: warn once, never an error — legacy indexes keep working even in
+        strict mode. A present-but-different fingerprint means the vectors were
+        produced by a different embedder, so cosine similarities against them are
+        meaningless: warn once per ``(kb, fingerprint)`` by default, raise a
+        :class:`HimmyError` when ``strict_embedder_check`` is on.
+        """
+        current = embedder_fingerprint(self._embedder)
+        for fp in found:
+            if fp == current:
+                continue
+            if fp is None:
+                key = (kb_id, "<unknown>")
+                if key not in self._fingerprint_warned:
+                    self._fingerprint_warned.add(key)
+                    logger.warning(
+                        "KnowledgeBase %s contains chunks with no embedder "
+                        "fingerprint (ingested before fingerprinting); cannot "
+                        "verify they match the active embedder (%s). Re-ingest "
+                        "to silence this warning.",
+                        kb_id,
+                        current,
+                    )
+                continue
+            if self._strict_embedder_check:
+                raise HimmyError(
+                    f"KnowledgeBase {kb_id!r} contains chunks embedded by a "
+                    f"different embedder (stored fingerprint {fp!r} != active "
+                    f"{current!r}); similarities against them are meaningless. "
+                    "Re-ingest with the active embedder or search with the "
+                    "original one."
+                )
+            key = (kb_id, str(fp))
+            if key not in self._fingerprint_warned:
+                self._fingerprint_warned.add(key)
+                logger.warning(
+                    "KnowledgeBase %s: stored chunk embedder fingerprint %s does "
+                    "not match the active embedder %s — similarities against "
+                    "those chunks are meaningless. Re-ingest with the active "
+                    "embedder (or set strict_embedder_check=True to make this "
+                    "an error).",
+                    kb_id,
+                    fp,
+                    current,
                 )
 
     @staticmethod

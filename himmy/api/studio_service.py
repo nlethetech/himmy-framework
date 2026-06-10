@@ -177,11 +177,28 @@ def list_teams(root: Path | None = None) -> list[TeamSummary]:
 
 
 def resolve_spec_path(rel_path: str, root: Path | None = None) -> Path:
-    """Resolve a GUI-supplied relative agent path safely under the project root."""
+    """Resolve a GUI-supplied relative agent path safely under the project root.
+
+    Two checks, both required: the fully-resolved target must stay under the root
+    (blocks ``..`` traversal and symlinks whose destination is outside), and no
+    component below the root may be a symlink at all — even one pointing inside.
+    The latter is defense-in-depth: specs are plain project files, so a link is
+    never legitimate, and rejecting it removes the aliasing/swap ambiguity between
+    the path that was checked and the file that gets opened.
+    """
     root = (root or project_root()).resolve()
-    target = (root / rel_path).resolve()
+    candidate = root / rel_path
+    target = candidate.resolve()
     if root != target and root not in target.parents:
         raise ValueError(f"path escapes project root: {rel_path!r}")
+    probe = candidate
+    while probe != root:
+        if probe.is_symlink():
+            raise ValueError(f"symlinked path rejected: {rel_path!r}")
+        parent = probe.parent
+        if parent == probe:  # filesystem root reached without meeting `root`
+            break
+        probe = parent
     if not target.is_file():
         raise FileNotFoundError(f"agent spec not found: {rel_path!r}")
     return target

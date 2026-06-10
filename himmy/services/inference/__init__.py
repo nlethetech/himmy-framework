@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from himmy.services.inference.anthropic_manager import AnthropicClientManager
 from himmy.services.inference.cache import (
+    CACHE_SCOPE_METADATA_KEYS,
     InferenceCache,
     InMemoryTTLCache,
     NoopInferenceCache,
     compute_cache_key,
+    derive_cache_scope,
 )
 from himmy.services.inference.client_manager import (
     ClientManager,
@@ -96,4 +98,6 @@ __all__ = [
     "NoopInferenceCache",
     "InMemoryTTLCache",
     "compute_cache_key",
+    "derive_cache_scope",
+    "CACHE_SCOPE_METADATA_KEYS",
 ]

@@ -293,6 +293,21 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
 ]
 
 
+def _migration_advisory_lock_key() -> int:
+    """Derive the stable signed-64-bit advisory-lock key for the migration runner."""
+    import hashlib
+
+    digest = hashlib.sha256(b"himmy.services.storage.schema_migrations").digest()[:8]
+    value = int.from_bytes(digest, "big", signed=False)
+    # pg_advisory_lock takes a signed bigint; fold into that range.
+    return value - (1 << 63)
+
+
+#: Session-level advisory-lock key that serialises concurrent ``migrate()`` callers
+#: across processes (same derivation style as the entity-registry writer lock).
+MIGRATION_ADVISORY_LOCK_KEY = _migration_advisory_lock_key()
+
+
 def _require_asyncpg() -> Any:
     """Import asyncpg lazily, raising a clear error when the extra is missing."""
     try:
@@ -1316,35 +1331,51 @@ class PostgresStorageService:
         schema (which creates ``schema_migrations``) is migration 1 and uses
         CREATE ... IF NOT EXISTS, so this is safe on a fresh or partially-migrated
         database.
+
+        Concurrent migrators (e.g. two processes booting simultaneously) are
+        serialised by a session-level ``pg_advisory_lock`` on
+        :data:`MIGRATION_ADVISORY_LOCK_KEY`, held for the duration of the run: the
+        loser blocks until the winner finishes, then re-reads ``schema_migrations``
+        and applies nothing. The already-migrated fast path costs one extra
+        lock/unlock round trip.
         """
         pool = self._require_pool()
         applied: list[int] = []
         async with pool.acquire() as conn:
-            # Bootstrap the tracking table so the first migration can record itself.
             await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version    INTEGER PRIMARY KEY,
-                    name       TEXT NOT NULL,
-                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
+                "SELECT pg_advisory_lock($1)", MIGRATION_ADVISORY_LOCK_KEY
             )
-            rows = await conn.fetch("SELECT version FROM schema_migrations")
-            done = {r["version"] for r in rows}
-            for version, name, statements in sorted(STORAGE_MIGRATIONS):
-                if version in done:
-                    continue
-                async with conn.transaction():
-                    for statement in statements:
-                        await conn.execute(statement)
-                    await conn.execute(
-                        "INSERT INTO schema_migrations (version, name) "
-                        "VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
-                        version,
-                        name,
+            try:
+                # Bootstrap the tracking table so the first migration can record
+                # itself.
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        version    INTEGER PRIMARY KEY,
+                        name       TEXT NOT NULL,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
                     )
-                applied.append(version)
+                    """
+                )
+                rows = await conn.fetch("SELECT version FROM schema_migrations")
+                done = {r["version"] for r in rows}
+                for version, name, statements in sorted(STORAGE_MIGRATIONS):
+                    if version in done:
+                        continue
+                    async with conn.transaction():
+                        for statement in statements:
+                            await conn.execute(statement)
+                        await conn.execute(
+                            "INSERT INTO schema_migrations (version, name) "
+                            "VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
+                            version,
+                            name,
+                        )
+                    applied.append(version)
+            finally:
+                await conn.execute(
+                    "SELECT pg_advisory_unlock($1)", MIGRATION_ADVISORY_LOCK_KEY
+                )
         return applied
 
     def _require_pool(self) -> Any:

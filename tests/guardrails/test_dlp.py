@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
+import pytest
+
 from himmy.services.guardrails import build_guardrail_pipeline
 from himmy.services.guardrails.dlp import (
     DlpAction,
     DlpGuardrail,
     DlpPolicy,
+    InMemoryTokenVaultBackend,
     PresidioAnalyzerAdapter,
+    SqliteTokenVaultBackend,
     TokenVault,
 )
 
@@ -31,6 +38,57 @@ def test_token_vault_roundtrip() -> None:
     assert t1 == t2  # stable
     assert vault.tokenize("email", "c@d.com") != t1
     assert vault.detokenize(f"contact {t1} now") == "contact a@b.com now"
+
+
+# ------------------------------------------------------------- vault backends
+def test_sqlite_backend_tokens_stable_across_vault_instances(tmp_path: Path) -> None:
+    db = str(tmp_path / "vault.db")
+    vault1 = TokenVault(backend=SqliteTokenVaultBackend(db))
+    token = vault1.tokenize("email", "a@b.com")
+
+    # A fresh vault + fresh backend on the same file (≈ process restart).
+    vault2 = TokenVault(backend=SqliteTokenVaultBackend(db))
+    assert vault2.tokenize("email", "a@b.com") == token  # same token survives
+    assert vault2.detokenize(f"contact {token} now") == "contact a@b.com now"
+
+
+def test_in_memory_backend_lru_eviction_at_capacity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    vault = TokenVault(backend=InMemoryTokenVaultBackend(max_entries=2))
+    vault.tokenize("email", "a@b.com")
+    t_b = vault.tokenize("email", "b@b.com")
+    vault.tokenize("email", "a@b.com")  # touch a → b becomes least-recently-used
+
+    with caplog.at_level(logging.WARNING, logger="himmy.guardrails"):
+        t_c = vault.tokenize("email", "c@b.com")  # evicts b
+        vault.tokenize("email", "d@b.com")  # evicts a — but warns only once
+
+    # Evicted token is irreversible (left in place); live tokens still round-trip.
+    assert vault.detokenize(t_b) == t_b
+    assert vault.detokenize(f"{t_c} and {vault.tokenize('email', 'd@b.com')}") == (
+        "c@b.com and d@b.com"
+    )
+    evict_warnings = [r for r in caplog.records if "evicting" in r.getMessage()]
+    assert len(evict_warnings) == 1  # one-time warning
+
+
+def test_sqlite_backend_lru_eviction_at_capacity(tmp_path: Path) -> None:
+    db = str(tmp_path / "vault.db")
+    vault = TokenVault(backend=SqliteTokenVaultBackend(db, max_entries=2))
+    t_a = vault.tokenize("email", "a@b.com")
+    t_b = vault.tokenize("email", "b@b.com")
+    vault.tokenize("email", "a@b.com")  # touch a → b is LRU
+    t_c = vault.tokenize("email", "c@b.com")  # evicts b
+
+    assert vault.detokenize(t_b) == t_b  # evicted → irreversible
+    assert vault.detokenize(t_a) == "a@b.com"
+    assert vault.detokenize(t_c) == "c@b.com"
+
+
+def test_unknown_token_left_untouched() -> None:
+    vault = TokenVault()
+    assert vault.detokenize("see [EMAIL:0123456789ab]") == "see [EMAIL:0123456789ab]"
 
 
 # ------------------------------------------------------------------- actions
