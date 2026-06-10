@@ -561,7 +561,8 @@ select {
 .topbar {
   height: 48px;
   flex: none;
-  border-bottom: 1px solid var(--border);
+  /* no rule under the header — the opaque bg masks scrolled content; the
+     canvas reads as one immersive surface */
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1834,7 +1835,6 @@ mark.hl.hl-first {
 .chat-compose {
   padding: 12px 32px 20px;
   background: var(--bg);
-  border-top: 1px solid var(--border);
 }
 /* Flat instrument panel: textarea + a toolbar row, one hairline. */
 .composer {
