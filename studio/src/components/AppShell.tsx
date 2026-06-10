@@ -29,11 +29,17 @@ type NavItem = {
   badge?: number;
 };
 
+// Claude-clean IA: the conversation is the product, so only chat-centric and
+// oversight items live at the top level. Everything else is grouped and
+// collapsible — Apps open by default (daily use), Build & Advanced tucked
+// away. Routes all stay alive; only the nav moved. Library/Theme left the
+// sidebar (Knowledge lives under Advanced + Brain; the footer toggles theme,
+// and /theme stays reachable under Advanced).
 const WORKSPACE: NavItem[] = [
   { to: "/", label: "Home", Icon: HomeIcon },
   { to: "/chat", label: "Chat", Icon: ChatIcon },
   { to: "/chats", label: "Chats", Icon: ChatIcon },
-  { to: "/research", label: "Research", Icon: SearchIcon },
+  { to: "/search", label: "Search", Icon: SearchIcon },
   { to: "/approvals", label: "Approvals", Icon: BellIcon },
   { to: "/activity", label: "Activity", Icon: RunsIcon },
 ];
@@ -43,14 +49,13 @@ const APPS: NavItem[] = [
   { to: "/email", label: "Email", Icon: MailIcon },
   { to: "/tasks", label: "Tasks", Icon: CheckIcon },
   { to: "/notes", label: "Notes", Icon: BookIcon },
+  { to: "/research", label: "Research", Icon: SearchIcon },
   { to: "/brain", label: "Brain", Icon: MemoryIcon },
-  { to: "/tools", label: "Tools", Icon: BuildIcon },
-  { to: "/library", label: "Library", Icon: BookIcon },
-  { to: "/theme", label: "Theme", Icon: GlobeIcon },
 ];
 
 const BUILD: NavItem[] = [
   { to: "/agents", label: "Agents", Icon: BuildIcon },
+  { to: "/tools", label: "Tools", Icon: BuildIcon },
   { to: "/cookbook", label: "Cookbook", Icon: BookIcon },
   { to: "/models", label: "Models", Icon: DoctorIcon },
   { to: "/compare", label: "Compare", Icon: DoctorIcon },
@@ -65,6 +70,7 @@ const ADVANCED: NavItem[] = [
   { to: "/advanced/eval", label: "Evaluation", Icon: GlobeIcon },
   { to: "/advanced/lineage", label: "Lineage", Icon: GlobeIcon },
   { to: "/advanced/doctor", label: "Doctor", Icon: DoctorIcon },
+  { to: "/theme", label: "Theme", Icon: GlobeIcon },
 ];
 
 function SidebarItem({ item }: { item: NavItem }) {
@@ -81,8 +87,47 @@ function SidebarItem({ item }: { item: NavItem }) {
   );
 }
 
+function useSection(key: string, defaultOpen: boolean) {
+  const [open, setOpen] = useState<boolean>(() => {
+    const saved = localStorage.getItem("himmy.sb." + key);
+    return saved === null ? defaultOpen : saved === "1";
+  });
+  const toggle = () =>
+    setOpen((o) => {
+      localStorage.setItem("himmy.sb." + key, o ? "0" : "1");
+      return !o;
+    });
+  return { open, toggle };
+}
+
+function Section({
+  label,
+  items,
+  state,
+}: {
+  label: string;
+  items: NavItem[];
+  state: { open: boolean; toggle: () => void };
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        className={"sb-section" + (state.open ? " open" : "")}
+        onClick={state.toggle}
+      >
+        {label}
+        <ChevronIcon className="chev" />
+      </button>
+      {state.open && items.map((i) => <SidebarItem key={i.to} item={i} />)}
+    </>
+  );
+}
+
 export function AppShell({ children }: { children: ReactNode }) {
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const apps = useSection("apps", true);
+  const build = useSection("build", false);
+  const advanced = useSection("advanced", false);
   const [connectionsOk, setConnectionsOk] = useState<number | null>(null);
   const [approvalsCount, setApprovalsCount] = useState(0);
   const { theme, toggleTheme } = useTheme();
@@ -133,37 +178,9 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem key={i.to} item={i} />
         ))}
 
-        <NavLink
-          to="/search"
-          className={({ isActive }) => "sb-item" + (isActive ? " active" : "")}
-        >
-          <SearchIcon className="ico" />
-          <span className="sb-item-label">Search</span>
-        </NavLink>
-
-        <div className="sb-section" style={{ cursor: "default" }}>
-          Apps
-        </div>
-        {APPS.map((i) => (
-          <SidebarItem key={i.to} item={i} />
-        ))}
-
-        <div className="sb-section" style={{ cursor: "default" }}>
-          Build
-        </div>
-        {BUILD.map((i) => (
-          <SidebarItem key={i.to} item={i} />
-        ))}
-
-        <button
-          type="button"
-          className={"sb-section" + (advancedOpen ? " open" : "")}
-          onClick={() => setAdvancedOpen((o) => !o)}
-        >
-          Advanced
-          <ChevronIcon className="chev" />
-        </button>
-        {advancedOpen && ADVANCED.map((i) => <SidebarItem key={i.to} item={i} />)}
+        <Section label="Apps" items={APPS} state={apps} />
+        <Section label="Build" items={BUILD} state={build} />
+        <Section label="Advanced" items={ADVANCED} state={advanced} />
 
         <div className="sb-foot">
           <span className="sb-foot-avatar" />
