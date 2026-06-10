@@ -65,22 +65,32 @@ export default function Home() {
     },
   ];
 
+  const now = new Date();
+  const hour = now.getHours();
+  const greeting =
+    hour < 5 ? "Working late" : hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+  const dateline = now
+    .toLocaleDateString("en-GB", {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    })
+    .toUpperCase();
+
   return (
     <>
       <Topbar title="Home" sub="Your workspace" />
       <Page>
-        <div className="quick-grid">
+        <div className="masthead">
+          <div className="masthead-date">{dateline}</div>
+          <h2 className="masthead-greeting">{greeting}.</h2>
+        </div>
+
+        <div className="quick-row">
           {tiles.map((t) => (
             <button className="qtile" key={t.key} onClick={t.onClick}>
-              <span
-                className="qtile-icon"
-                style={{
-                  background: `color-mix(in srgb, var(--hue-${t.hue}) 16%, transparent)`,
-                  color: `var(--hue-${t.hue})`,
-                }}
-              >
-                <t.Icon />
-              </span>
+              <t.Icon />
               <span className="qtile-label">{t.label}</span>
               {t.missing && (
                 <span className="qtile-warn" title="Needs a connection">

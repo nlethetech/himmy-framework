@@ -2462,47 +2462,65 @@ mark.hl.hl-first {
   margin-bottom: var(--sp-6);
 }
 .qtile {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
   position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-3);
-  align-items: flex-start;
-  padding: var(--sp-4);
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  padding: 8px 14px;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
   cursor: pointer;
-  text-align: left;
+  color: var(--text-muted);
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
   transition:
-    transform 0.12s var(--spring),
     border-color 0.12s,
-    background 0.12s;
+    color 0.12s;
 }
 .qtile:hover {
-  transform: translateY(-2px);
-  border-color: var(--border-strong);
-  background: var(--card-hover);
-}
-.qtile-icon {
-  width: 42px;
-  height: 42px;
-  border-radius: var(--radius-sm);
-  display: grid;
-  place-items: center;
-}
-.qtile-icon svg {
-  width: 21px;
-  height: 21px;
-}
-.qtile-label {
-  font-weight: 600;
-  font-size: var(--fs-md);
+  border-color: var(--border-accent);
   color: var(--text);
 }
+.qtile svg {
+  width: 15px;
+  height: 15px;
+  color: var(--text-dim);
+}
+.qtile:hover svg {
+  color: var(--text-muted);
+}
+.qtile-label {
+  font-weight: 500;
+}
+.quick-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 28px;
+}
+
+/* Home masthead — the page states the day, then gets out of the way */
+.masthead {
+  padding: 14px 0 26px;
+}
+.masthead-date {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1.6px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.masthead-greeting {
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  color: var(--text);
+  margin: 0;
+}
 .qtile-warn {
-  position: absolute;
-  top: var(--sp-3);
-  right: var(--sp-3);
   color: var(--warn);
   font-family: var(--mono);
   font-size: 9px;
@@ -2511,6 +2529,7 @@ mark.hl.hl-first {
   border: 1px solid currentColor;
   border-radius: var(--radius-sm);
   padding: 1px 5px;
+  margin-left: 2px;
 }
 .home-cols {
   display: grid;
