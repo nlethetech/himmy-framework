@@ -27,6 +27,7 @@ import {
 } from "../components/Usage";
 import { SendIcon, RefreshIcon, PlusIcon } from "../components/icons";
 import { highlightAll } from "../lib/highlight";
+import { PickMenu } from "../components/ui/PickMenu";
 
 // Domain-agnostic starter prompts for the empty state (fill the input, don't send).
 const EXAMPLES = [
@@ -507,47 +508,54 @@ export default function Chat() {
           />
           <div className="composer-bar">
             <div className="composer-tools">
-              <select
-                className="composer-pick"
+              <PickMenu
                 value={path}
-                onChange={(e) => setPath(e.target.value)}
+                onChange={setPath}
                 title="Choose an agent or team"
-              >
-                {!hasAny && <option value="">No agents or teams</option>}
-                {teams.length > 0 && (
-                  <optgroup label="Teams (manager + workers)">
-                    {teams.map((t) => (
-                      <option key={t.path} value={t.path}>
-                        {t.name} · team ({t.members.length})
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                {agents.length > 0 && (
-                  <optgroup label="Agents">
-                    {agents.map((a) => (
-                      <option key={a.path} value={a.path}>
-                        {a.name}
-                        {a.has_tools ? " · tools" : ""}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-              </select>
+                placeholder={hasAny ? "Choose an agent or team" : "No agents or teams"}
+                groups={[
+                  ...(teams.length > 0
+                    ? [
+                        {
+                          label: "Teams",
+                          options: teams.map((t) => ({
+                            value: t.path,
+                            label: t.name,
+                            meta: `team · ${t.members.length}`,
+                          })),
+                        },
+                      ]
+                    : []),
+                  ...(agents.length > 0
+                    ? [
+                        {
+                          label: "Agents",
+                          options: agents.map((a) => ({
+                            value: a.path,
+                            label: a.name,
+                            meta: a.has_tools ? "tools" : undefined,
+                          })),
+                        },
+                      ]
+                    : []),
+                ]}
+              />
 
               {!isTeam && (
-                <select
-                  className="composer-pick"
+                <PickMenu
                   value={provider}
-                  onChange={(e) => setProvider(e.target.value)}
+                  onChange={setProvider}
                   title="Inference provider"
-                >
-                  {PROVIDERS.map((p) => (
-                    <option key={p.value} value={p.value}>
-                      {p.label}
-                    </option>
-                  ))}
-                </select>
+                  groups={[
+                    {
+                      label: "Provider",
+                      options: PROVIDERS.map((p) => ({
+                        value: p.value,
+                        label: p.label,
+                      })),
+                    },
+                  ]}
+                />
               )}
 
               <button
