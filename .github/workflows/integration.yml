@@ -53,7 +53,11 @@ jobs:
 
       - name: Install + start Ollama
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Pinned: unpinned "latest" changed qwen2.5 tool-calling behavior between
+          # runs (handoff/fan-out live tests went green->red with identical request
+          # payloads). Bump deliberately, watching the live multi-agent tests.
+          curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
+          ollama -v
           ollama serve &
           # Wait for the daemon to accept connections.
           for _ in $(seq 1 30); do
@@ -103,7 +107,11 @@ jobs:
 
       - name: Install + start Ollama
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Pinned: unpinned "latest" changed qwen2.5 tool-calling behavior between
+          # runs (handoff/fan-out live tests went green->red with identical request
+          # payloads). Bump deliberately, watching the live multi-agent tests.
+          curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
+          ollama -v
           ollama serve &
           for _ in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags >/dev/null && break || sleep 2
@@ -154,7 +162,11 @@ jobs:
 
       - name: Install + start Ollama
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Pinned: unpinned "latest" changed qwen2.5 tool-calling behavior between
+          # runs (handoff/fan-out live tests went green->red with identical request
+          # payloads). Bump deliberately, watching the live multi-agent tests.
+          curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=0.13.5 sh
+          ollama -v
           ollama serve &
           for _ in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags >/dev/null && break || sleep 2
