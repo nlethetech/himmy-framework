@@ -581,3 +581,76 @@ async def ollama_pull(body: OllamaPullRequest) -> StreamingResponse:
 
 
 __all__ = ["router"]
+
+
+# ---- OpenRouter catalog (public, no key required) -------------------------
+
+#: Server-side cache for the OpenRouter model catalog: the list is ~300 models
+#: and changes rarely, so one upstream fetch per hour is plenty. (data, fetched_at)
+_OPENROUTER_CACHE: dict[str, Any] = {"data": None, "at": 0.0}
+_OPENROUTER_TTL_S = 3600.0
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/models"
+
+
+def _per_million(price_per_token: Any) -> float | None:
+    """OpenRouter prices are $/token strings ('0.0000005') — convert to $/1M."""
+    try:
+        value = float(price_per_token)
+    except (TypeError, ValueError):
+        return None
+    if value < 0:  # OpenRouter marks dynamic pricing as -1
+        return None
+    return round(value * 1_000_000, 4)
+
+
+def _map_openrouter_model(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Trim one upstream catalog entry to what the picker needs."""
+    model_id = raw.get("id")
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    pricing = raw.get("pricing") or {}
+    prompt = _per_million(pricing.get("prompt"))
+    completion = _per_million(pricing.get("completion"))
+    return {
+        "id": model_id,
+        "name": raw.get("name") or model_id,
+        "context_length": raw.get("context_length"),
+        "prompt_per_million": prompt,
+        "completion_per_million": completion,
+        "free": prompt == 0 and completion == 0,
+    }
+
+
+@router.get("/openrouter")
+async def openrouter_catalog(refresh: bool = False) -> dict[str, Any]:
+    """The OpenRouter model catalog with per-million pricing, cached for 1h.
+
+    The endpoint is public upstream (no key needed), so users can browse
+    models and prices before saving a key. ``?refresh=1`` bypasses the cache.
+    """
+    now = time.monotonic()
+    cached = _OPENROUTER_CACHE["data"]
+    if cached is not None and not refresh and now - _OPENROUTER_CACHE["at"] < _OPENROUTER_TTL_S:
+        return {"models": cached, "cached": True}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(_OPENROUTER_URL)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:  # noqa: BLE001 - degrade to the stale cache, then a clear 503
+        if cached is not None:
+            return {"models": cached, "cached": True, "stale": True}
+        raise HTTPException(
+            status_code=503,
+            detail="couldn't reach openrouter.ai for the model catalog — "
+            "check your connection and try again",
+        ) from exc
+    models = [
+        mapped
+        for raw in payload.get("data", [])
+        if isinstance(raw, dict) and (mapped := _map_openrouter_model(raw)) is not None
+    ]
+    models.sort(key=lambda m: str(m["name"]).lower())
+    _OPENROUTER_CACHE["data"] = models
+    _OPENROUTER_CACHE["at"] = now
+    return {"models": models, "cached": False}

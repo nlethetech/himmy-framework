@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 /* A quiet replacement for the composer's native <select>: a flat mono trigger
    that opens an upward hairline menu with grouped options. Closes on outside
@@ -20,15 +20,27 @@ export function PickMenu({
   onChange,
   placeholder = "Choose…",
   title,
+  searchable = false,
 }: {
   value: string;
   groups: PickGroup[];
   onChange: (v: string) => void;
   placeholder?: string;
   title?: string;
+  /** Adds a filter input at the top — for long catalogs (300+ options). */
+  searchable?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+      if (searchable) searchRef.current?.focus();
+    }
+  }, [open, searchable]);
 
   useEffect(() => {
     if (!open) return;
@@ -48,6 +60,23 @@ export function PickMenu({
 
   const flat = groups.flatMap((g) => g.options);
   const current = flat.find((o) => o.value === value);
+  const q = query.trim().toLowerCase();
+  const shown = useMemo(
+    () =>
+      !q
+        ? groups
+        : groups
+            .map((g) => ({
+              ...g,
+              options: g.options.filter(
+                (o) =>
+                  o.label.toLowerCase().includes(q) ||
+                  o.value.toLowerCase().includes(q),
+              ),
+            }))
+            .filter((g) => g.options.length > 0),
+    [groups, q],
+  );
 
   return (
     <div className="pick" ref={rootRef}>
@@ -67,7 +96,28 @@ export function PickMenu({
 
       {open && (
         <div className="pick-menu" role="listbox">
-          {groups.map((g, gi) => (
+          {searchable && (
+            <input
+              ref={searchRef}
+              className="pick-search"
+              placeholder="Filter…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const first = shown.flatMap((g) => g.options)[0];
+                  if (first) {
+                    onChange(first.value);
+                    setOpen(false);
+                  }
+                }
+              }}
+            />
+          )}
+          {searchable && shown.length === 0 && (
+            <div className="pick-group">no matches</div>
+          )}
+          {shown.map((g, gi) => (
             <div key={gi}>
               {g.label && <div className="pick-group">{g.label}</div>}
               {g.options.map((o) => (

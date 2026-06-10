@@ -430,3 +430,89 @@ def test_pull_frames_parses_ollama_lines(monkeypatch: pytest.MonkeyPatch) -> Non
         "completed": 10,
         "total": 100,
     }
+
+
+# ---- OpenRouter catalog ----------------------------------------------------
+
+
+def test_openrouter_catalog_maps_pricing_and_caches(client, monkeypatch) -> None:
+    """Catalog entries are trimmed to picker fields with $/1M pricing; the
+    second call serves from cache without touching the network."""
+    import himmy.api.routers.studio_models as mod
+
+    calls = {"n": 0}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {
+                        "id": "mistralai/mistral-small",
+                        "name": "Mistral Small",
+                        "context_length": 32768,
+                        "pricing": {"prompt": "0.0000005", "completion": "0.0000015"},
+                    },
+                    {
+                        "id": "meta/free-model:free",
+                        "name": "A Free Model",
+                        "context_length": 8192,
+                        "pricing": {"prompt": "0", "completion": "0"},
+                    },
+                    {"pricing": {}},  # malformed: no id — must be skipped
+                ]
+            }
+
+    class _Client:
+        def __init__(self, timeout):  # noqa: ANN001
+            calls["n"] += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):  # noqa: ANN002
+            return None
+
+        async def get(self, url):  # noqa: ANN001
+            return _Resp()
+
+    monkeypatch.setattr(mod, "_OPENROUTER_CACHE", {"data": None, "at": 0.0})
+    monkeypatch.setattr(mod.httpx, "AsyncClient", _Client)
+
+    body = client.get("/api/studio/models/openrouter").json()
+    assert body["cached"] is False
+    assert len(body["models"]) == 2  # malformed entry dropped
+    free = next(m for m in body["models"] if m["free"])
+    paid = next(m for m in body["models"] if not m["free"])
+    assert free["id"] == "meta/free-model:free"
+    assert paid["prompt_per_million"] == 0.5
+    assert paid["completion_per_million"] == 1.5
+
+    body2 = client.get("/api/studio/models/openrouter").json()
+    assert body2["cached"] is True
+    assert calls["n"] == 1  # served from cache
+
+
+def test_openrouter_catalog_unreachable_is_a_clear_503(client, monkeypatch) -> None:
+    import himmy.api.routers.studio_models as mod
+
+    class _Client:
+        def __init__(self, timeout):  # noqa: ANN001
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):  # noqa: ANN002
+            return None
+
+        async def get(self, url):  # noqa: ANN001
+            raise mod.httpx.ConnectError("offline")
+
+    monkeypatch.setattr(mod, "_OPENROUTER_CACHE", {"data": None, "at": 0.0})
+    monkeypatch.setattr(mod.httpx, "AsyncClient", _Client)
+    resp = client.get("/api/studio/models/openrouter")
+    assert resp.status_code == 503
+    assert "openrouter.ai" in resp.json()["detail"]

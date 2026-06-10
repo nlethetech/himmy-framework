@@ -4498,3 +4498,20 @@ mark.hl.hl-first {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* PickMenu filter input (searchable catalogs) */
+.pick-search {
+  width: calc(100% - 10px);
+  margin: 3px 5px 5px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 5px 8px;
+  outline: none;
+}
+.pick-search:focus {
+  border-color: var(--red);
+}

@@ -106,3 +106,33 @@ export async function streamPull(
     }
   }
 }
+
+// ---- OpenRouter catalog (for the chat model picker) -----------------------
+
+export interface OpenRouterModel {
+  id: string;
+  name: string;
+  context_length: number | null;
+  prompt_per_million: number | null;
+  completion_per_million: number | null;
+  free: boolean;
+}
+
+export const fetchOpenRouterCatalog = () =>
+  api.get<{ models: OpenRouterModel[]; cached: boolean; stale?: boolean }>(
+    "/models/openrouter",
+  );
+
+/** "$0.50 · $1.50 /M" — prompt and completion price per million tokens. */
+export function fmtModelPrice(m: OpenRouterModel): string {
+  if (m.free) return "free";
+  const one = (v: number | null) =>
+    v === null ? "?" : v >= 10 ? `$${v.toFixed(0)}` : `$${v.toFixed(2)}`;
+  return `${one(m.prompt_per_million)} · ${one(m.completion_per_million)} /M`;
+}
+
+/** "128k ctx" context-window annotation. */
+export function fmtCtx(m: OpenRouterModel): string {
+  if (!m.context_length) return "";
+  return `${Math.round(m.context_length / 1024)}k`;
+}

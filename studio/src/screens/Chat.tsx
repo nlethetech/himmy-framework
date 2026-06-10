@@ -27,7 +27,13 @@ import {
 } from "../components/Usage";
 import { SendIcon, RefreshIcon, PlusIcon } from "../components/icons";
 import { highlightAll } from "../lib/highlight";
-import { PickMenu } from "../components/ui/PickMenu";
+import { PickMenu, type PickGroup } from "../components/ui/PickMenu";
+import {
+  fetchOpenRouterCatalog,
+  fmtModelPrice,
+  fmtCtx,
+  type OpenRouterModel,
+} from "../lib/modelsApi";
 import { ApprovalCard, type ApprovalState } from "../components/ApprovalCard";
 import { ArtifactCard } from "../components/ArtifactCard";
 import {
@@ -84,6 +90,53 @@ export default function Chat() {
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [params, setParams] = useSearchParams();
+  // OpenRouter model picker: catalog is fetched lazily the first time the
+  // provider is selected; the chosen model persists across sessions.
+  const [orModel, setOrModel] = useState<string>(
+    () => localStorage.getItem("himmy.chat.openrouter.model") ?? "",
+  );
+  const [orCatalog, setOrCatalog] = useState<OpenRouterModel[] | null>(null);
+  const [orError, setOrError] = useState<string | null>(null);
+  useEffect(() => {
+    if (provider !== "openrouter" || orCatalog !== null) return;
+    fetchOpenRouterCatalog()
+      .then((r) => {
+        setOrCatalog(r.models);
+        setOrError(null);
+      })
+      .catch((e) => setOrError(String(e.message ?? e)));
+  }, [provider, orCatalog]);
+  const pickOrModel = (v: string) => {
+    setOrModel(v);
+    localStorage.setItem("himmy.chat.openrouter.model", v);
+  };
+  const orGroups: PickGroup[] = (() => {
+    const def = {
+      value: "",
+      label: "Default (Mistral Small)",
+      meta: "openrouter default",
+    };
+    if (orError) {
+      return [
+        { options: [def] },
+        { label: "catalog unavailable", options: [] },
+      ];
+    }
+    if (orCatalog === null) {
+      return [{ options: [def, { value: "__loading", label: "loading catalog…" }] }];
+    }
+    const toOpt = (m: OpenRouterModel) => ({
+      value: m.id,
+      label: m.name,
+      meta: [fmtModelPrice(m), fmtCtx(m)].filter(Boolean).join(" · "),
+    });
+    return [
+      { options: [def] },
+      { label: "Free", options: orCatalog.filter((m) => m.free).map(toOpt) },
+      { label: "Paid", options: orCatalog.filter((m) => !m.free).map(toOpt) },
+    ];
+  })();
+
   // Search deep link (?hl=): highlight every hit once the session has rendered.
   const [pendingHl, setPendingHl] = useState<string | null>(null);
   const pendingHlRef = useRef<string | null>(null);
@@ -419,7 +472,16 @@ export default function Chat() {
         await streamTeamRun({ team_path: path, prompt }, onEvent, ac.signal);
       } else {
         await streamRun(
-          { agent_path: path, prompt, provider: provider || null, history },
+          {
+            agent_path: path,
+            prompt,
+            provider: provider || null,
+            model:
+              provider === "openrouter" && orModel && orModel !== "__loading"
+                ? orModel
+                : null,
+            history,
+          },
           onEvent,
           ac.signal,
         );
@@ -656,6 +718,16 @@ export default function Chat() {
                       })),
                     },
                   ]}
+                />
+              )}
+              {!isTeam && provider === "openrouter" && (
+                <PickMenu
+                  value={orModel === "__loading" ? "" : orModel}
+                  onChange={pickOrModel}
+                  title={orError ?? "OpenRouter model — price per 1M tokens"}
+                  placeholder="Default (Mistral Small)"
+                  searchable
+                  groups={orGroups}
                 />
               )}
 
