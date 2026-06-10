@@ -36,6 +36,14 @@ from himmy.api.routers import (
     recommendations,
     runs,
     studio,
+    studio_eval,
+    studio_files,
+    studio_knowledge_upload,
+    studio_lineage,
+    studio_memory,
+    studio_models,
+    studio_privacy,
+    studio_teams,
 )
 from himmy.core.errors import HimmyError
 from himmy.services.audit import SecurityAuditLog
@@ -201,6 +209,14 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
     app.include_router(audit.router)
     app.include_router(consent.router)
     app.include_router(studio.router)
+    app.include_router(studio_privacy.router)
+    app.include_router(studio_lineage.router)
+    app.include_router(studio_files.router)
+    app.include_router(studio_knowledge_upload.router)
+    app.include_router(studio_models.router)
+    app.include_router(studio_memory.router)
+    app.include_router(studio_teams.router)
+    app.include_router(studio_eval.router)
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:

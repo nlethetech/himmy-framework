@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { Topbar } from "../components/Page";
 import { CheckIcon } from "../components/icons";
 import { APP_DEFS, enabledApps, setAppEnabled } from "../lib/apps";
+import { resetFirstRun } from "../onboarding/firstRun";
 
 /* Settings: the one door to everything that isn't daily work — which apps
    show in the sidebar, the builder screens, and the advanced machinery. */
@@ -61,6 +62,31 @@ export default function Settings() {
               </span>
             </button>
           ))}
+        </section>
+
+        <section className="home-sec">
+          <div className="home-sec-head">
+            <span>Privacy</span>
+          </div>
+          <Link className="run-line" to="/privacy">
+            <span className="run-line-prompt">Privacy &amp; audit</span>
+            <span className="run-line-meta mono">
+              subjects, consent, signed audit bundles
+            </span>
+          </Link>
+          <button
+            className="run-line set-toggle"
+            type="button"
+            onClick={() => {
+              resetFirstRun();
+              window.location.assign("/");
+            }}
+          >
+            <span className="run-line-prompt">Replay onboarding tour</span>
+            <span className="run-line-meta mono">
+              show the first-run wizard and tour again
+            </span>
+          </button>
         </section>
 
         <section className="home-sec">

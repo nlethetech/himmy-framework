@@ -465,7 +465,7 @@ export function resolveApproval(
   signal?: AbortSignal,
 ): Promise<void> {
   return streamSse(
-    `/approvals/${id}/${approve ? "approve" : "reject"}`,
+    `/api/studio/approvals/${id}/${approve ? "approve" : "reject"}`,
     {},
     onEvent,
     signal,

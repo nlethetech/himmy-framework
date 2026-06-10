@@ -1,0 +1,296 @@
+/* Onboarding — first-run wizard + guided tour.
+   The ledger, full bleed: ink canvas, masthead typography, sections as a mono
+   micro-label over a hairline, choices as ledger rows. No boxes, no fills;
+   red keeps its three jobs (primary action, active/selected state, errors). */
+
+/* ---- Wizard: a full-screen page on the canvas, not a dialog -------------- */
+.ob-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 150; /* above the shell, below toasts is fine either way */
+  background: var(--bg);
+  overflow-y: auto;
+  display: flex;
+  justify-content: center;
+}
+.ob-col {
+  width: 100%;
+  max-width: 560px;
+  padding: 9vh 32px 72px;
+}
+
+/* step counter band — the .home-sec-head pattern */
+.ob-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--text-dim);
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* masthead typography */
+.ob-mast {
+  padding: 36px 0 4px;
+}
+.ob-kicker {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+.ob-wordmark {
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: -0.4px;
+  color: var(--text);
+  margin: 0;
+  line-height: 1.15;
+}
+.ob-wordmark .mark {
+  color: var(--red);
+}
+.ob-title {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  color: var(--text);
+  margin: 0;
+  line-height: 1.2;
+}
+.ob-para {
+  color: var(--text-muted);
+  font-size: 13.5px;
+  line-height: 1.7;
+  max-width: 52ch;
+  margin: 16px 0 0;
+}
+.ob-para.dim {
+  color: var(--text-dim);
+}
+
+/* sections — micro-label over a hairline */
+.ob-sec {
+  margin-top: 30px;
+}
+.ob-sec-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--text-dim);
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* choice rows — the .run-line pattern, as buttons */
+.ob-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 2px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13.5px;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 0.1s,
+    color 0.1s,
+    border-color 0.1s;
+}
+.ob-row:hover {
+  background: var(--card);
+}
+.ob-row.static {
+  cursor: default;
+}
+.ob-row.static:hover {
+  background: none;
+}
+.ob-row-label {
+  flex: 1;
+  min-width: 0;
+}
+.ob-row-sub {
+  display: block;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 2px;
+}
+.ob-row-meta {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  letter-spacing: 0.6px;
+}
+/* selected — red's active-state job; text + meta only, no fills */
+.ob-row.on {
+  color: var(--red);
+  border-bottom-color: var(--brand-line);
+}
+.ob-row.on .ob-row-sub {
+  color: var(--text-muted);
+}
+.ob-row.on .ob-row-meta {
+  color: var(--red);
+}
+
+/* actions */
+.ob-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 32px;
+}
+.ob-skip {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  transition: color 0.1s;
+}
+.ob-skip:hover {
+  color: var(--text-muted);
+}
+.ob-link {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  color: var(--brand);
+}
+.ob-link:hover {
+  color: var(--brand-hover);
+}
+.ob-key-hint {
+  font-size: 10px;
+  letter-spacing: 0.8px;
+  color: var(--text-dim);
+}
+.ob-quiet {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.6;
+  margin: 14px 0 0;
+}
+.ob-err {
+  color: var(--err); /* errors — red's third job, desaturated report grade */
+  font-size: 12.5px;
+  line-height: 1.6;
+  margin: 14px 0 0;
+}
+.ob-field {
+  margin-top: 14px;
+}
+
+/* staggered reveal — CSS only, re-keyed per step */
+.ob-stagger > * {
+  opacity: 0;
+  animation: ob-rise 0.4s var(--spring) forwards;
+}
+.ob-stagger > *:nth-child(1) {
+  animation-delay: 0.03s;
+}
+.ob-stagger > *:nth-child(2) {
+  animation-delay: 0.1s;
+}
+.ob-stagger > *:nth-child(3) {
+  animation-delay: 0.17s;
+}
+.ob-stagger > *:nth-child(4) {
+  animation-delay: 0.24s;
+}
+.ob-stagger > *:nth-child(5) {
+  animation-delay: 0.31s;
+}
+.ob-stagger > *:nth-child(6) {
+  animation-delay: 0.38s;
+}
+@keyframes ob-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ob-stagger > * {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* ---- Tour: hairline ring + popover --------------------------------------- */
+.tour-ring {
+  position: fixed;
+  z-index: 150;
+  border: 1px solid var(--red); /* the active anchor — red's second job */
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+  transition:
+    top 0.16s var(--spring),
+    left 0.16s var(--spring),
+    width 0.16s var(--spring),
+    height 0.16s var(--spring);
+}
+.tour-pop {
+  position: fixed;
+  z-index: 151;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--elev-3);
+  padding: 12px 14px 13px;
+  animation: ob-rise 0.18s var(--spring);
+}
+.tour-count {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.4px;
+  color: var(--text-dim);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.tour-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.tour-body {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+.tour-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 11px;
+}

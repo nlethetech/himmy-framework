@@ -1,0 +1,129 @@
+/* Models — "pick your brain" ledger. Sections come from .home-sec / .run-line
+   (index.css); this file only adds the inline key editor, the pull progress
+   hairline, and routing annotations. No boxes, no fills, no glow. */
+
+.mdl-col {
+  padding-top: 12px;
+}
+
+/* right-aligned mono annotations on a ledger row */
+.mdl-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.mdl-meta.err {
+  color: var(--red); /* red's third job: errors */
+}
+
+/* the "set key / edit key" affordance — mono text, not a button */
+.mdl-keybtn {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.mdl-keybtn:hover {
+  color: var(--text);
+}
+.mdl-keybtn.active {
+  color: var(--red); /* red's second job: the active state */
+}
+
+/* inline key editor under a provider row */
+.mdl-editor {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.mdl-editor .input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* validation verdict / inline errors — a quiet mono line, red only on failure */
+.mdl-verdict {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 6px 2px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.mdl-verdict.err {
+  color: var(--red);
+}
+
+/* ollama pull: input + action, then a hairline progress bar fed by the stream */
+.mdl-pullrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 2px 0;
+}
+.mdl-pullrow .input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.mdl-progress {
+  padding: 10px 2px 0;
+}
+.mdl-progress-track {
+  height: 2px;
+  background: var(--border);
+}
+.mdl-progress-fill {
+  height: 100%;
+  background: var(--red); /* an active pull — red's second job */
+  transition: width 0.25s ease;
+}
+.mdl-progress-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  padding-top: 6px;
+}
+
+/* routing: ordered ledger rows + a one-line explanation */
+.mdl-note {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.55;
+  padding: 12px 2px 4px;
+}
+.mdl-route-idx {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  width: 20px;
+  flex: none;
+}
+.run-line.mdl-skipped {
+  color: var(--text-dim);
+}
+
+/* quiet inline retry for a failed fetch */
+.mdl-retry {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.mdl-retry:hover {
+  color: var(--text);
+}

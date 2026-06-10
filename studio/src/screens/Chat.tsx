@@ -28,6 +28,13 @@ import {
 import { SendIcon, RefreshIcon, PlusIcon } from "../components/icons";
 import { highlightAll } from "../lib/highlight";
 import { PickMenu } from "../components/ui/PickMenu";
+import { ApprovalCard, type ApprovalState } from "../components/ApprovalCard";
+import { ArtifactCard } from "../components/ArtifactCard";
+import {
+  artifactsFromSteps,
+  resolveApprovalStream,
+} from "../lib/artifactsApi";
+import "../styles/chatsurfaces.css";
 
 // Domain-agnostic starter prompts for the empty state (fill the input, don't send).
 const EXAMPLES = [
@@ -53,6 +60,7 @@ interface Msg {
   usage?: LiveUsage;
   streaming?: boolean;
   runId?: string;
+  approvals?: ApprovalState[]; // inline HITL pauses raised during this turn
 }
 
 type Pick =
@@ -194,48 +202,48 @@ export default function Chat() {
   const isTeam = picked?.kind === "team";
   const hasAny = agents.length + teams.length > 0;
 
-  const send = async () => {
-    const prompt = input.trim();
-    if (!prompt || !path || busy) return;
-    setInput("");
+  // Patch one message by index — resumes can land on a message that is no
+  // longer the last one (the user may have sent more turns while paused).
+  const patchAt = (idx: number, fn: (m: Msg) => Msg) =>
+    setMessages((ms) => {
+      if (!ms[idx]) return ms;
+      const copy = ms.slice();
+      copy[idx] = fn(copy[idx]);
+      return copy;
+    });
 
-    const history = messages.map((m) => ({
-      role: m.role === "agent" ? ("assistant" as const) : ("user" as const),
-      content: m.text,
+  const setApprovalAt = (
+    idx: number,
+    checkpointId: string,
+    patch: Partial<ApprovalState>,
+  ) =>
+    patchAt(idx, (m) => ({
+      ...m,
+      approvals: (m.approvals ?? []).map((a) =>
+        a.checkpointId === checkpointId ? { ...a, ...patch } : a,
+      ),
     }));
 
-    setMessages((m) => [
-      ...m,
-      { role: "user", text: prompt },
-      {
-        role: "agent",
-        text: "",
-        streaming: true,
-        steps: [],
-        team: isTeam,
-        usage: emptyUsage(),
-      },
-    ]);
-    setBusy(true);
-
-    const ac = new AbortController();
-    abortRef.current = ac;
-    const patchLast = (fn: (m: Msg) => Msg) =>
-      setMessages((ms) => {
-        const copy = ms.slice();
-        copy[copy.length - 1] = fn(copy[copy.length - 1]);
-        return copy;
-      });
+  // One SSE-frame applier for both the initial run and an approval resume.
+  // A resume's message/done frames carry only the CONTINUATION text, so they
+  // are appended to the text captured when the pause happened, never replace it.
+  const makeEventHandler = (idx: number, resume?: { base: string }) => {
+    let failed = false;
+    let firstToken = true;
+    const sep = resume && resume.base ? "\n\n" : "";
     const addStep = (s: CogStep) =>
-      patchLast((m) => ({ ...m, steps: [...(m.steps ?? []), s] }));
+      patchAt(idx, (m) => ({ ...m, steps: [...(m.steps ?? []), s] }));
 
-    const onEvent = (e: RunEvent) => {
+    const handler = (e: RunEvent) => {
       switch (e.type) {
-        case "token":
-          patchLast((m) => ({ ...m, text: m.text + e.delta }));
+        case "token": {
+          const lead = resume && firstToken ? sep : "";
+          firstToken = false;
+          patchAt(idx, (m) => ({ ...m, text: m.text + lead + e.delta }));
           break;
+        }
         case "agent":
-          patchLast((m) => ({ ...m, active: e.name }));
+          patchAt(idx, (m) => ({ ...m, active: e.name }));
           addStep({ kind: "agent", agent: e.name, model: e.model });
           break;
         case "reason":
@@ -254,11 +262,11 @@ export default function Chat() {
           });
           break;
         case "delegate":
-          patchLast((m) => ({ ...m, active: e.worker }));
+          patchAt(idx, (m) => ({ ...m, active: e.worker }));
           addStep({ kind: "delegate", worker: e.worker, task: e.task, agent: e.from });
           break;
         case "handoff":
-          patchLast((m) => ({ ...m, active: e.to }));
+          patchAt(idx, (m) => ({ ...m, active: e.to }));
           addStep({ kind: "handoff", to: e.to, agent: e.from });
           break;
         case "grounding":
@@ -282,45 +290,126 @@ export default function Chat() {
           });
           break;
         case "usage":
-          patchLast((m) => ({
+          patchAt(idx, (m) => ({
             ...m,
             usage: foldUsage(m.usage ?? emptyUsage(), e),
           }));
           break;
         case "approval_required":
-          patchLast((m) => ({
-            ...m,
-            text:
-              (m.text ? m.text + "\n\n" : "") +
-              `⏸ Paused — needs your approval to run **${e.tools.join(", ")}**. ` +
-              `Review it in the **Approvals** tab.`,
-          }));
+          // Inline card in this ledger entry (a resume can pause again).
+          patchAt(idx, (m) =>
+            (m.approvals ?? []).some((a) => a.checkpointId === e.checkpoint_id)
+              ? m
+              : {
+                  ...m,
+                  approvals: [
+                    ...(m.approvals ?? []),
+                    {
+                      checkpointId: e.checkpoint_id,
+                      tools: e.tools,
+                      status: "pending",
+                    },
+                  ],
+                },
+          );
           break;
         case "paused":
-          patchLast((m) => ({ ...m, streaming: false, active: null }));
+          patchAt(idx, (m) => ({ ...m, streaming: false, active: null }));
           break;
         case "message":
-          patchLast((m) => ({ ...m, text: e.text }));
+          patchAt(idx, (m) => ({
+            ...m,
+            text: resume ? resume.base + sep + e.text : e.text,
+          }));
           break;
         case "done":
-          patchLast((m) => ({
+          patchAt(idx, (m) => ({
             ...m,
-            text: e.output_text || m.text,
+            text: resume
+              ? e.output_text
+                ? resume.base + sep + e.output_text
+                : m.text
+              : e.output_text || m.text,
             streaming: false,
             active: null,
             runId: e.run_id,
           }));
           break;
         case "error":
-          patchLast((m) => ({
+          failed = true;
+          patchAt(idx, (m) => ({
             ...m,
             text: (m.text ? m.text + "\n\n" : "") + "⚠ " + e.message,
             streaming: false,
-            runId: e.run_id,
+            runId: e.run_id ?? m.runId,
           }));
           break;
       }
     };
+    return { handler, failed: () => failed };
+  };
+
+  // Approve/Deny from an inline card: resolve the checkpoint and render the
+  // resumed run's stream back into the same ledger entry.
+  const resolveInline = async (
+    idx: number,
+    checkpointId: string,
+    approve: boolean,
+  ) => {
+    if (busy) return;
+    setApprovalAt(idx, checkpointId, { status: "working" });
+    setBusy(true);
+    const base = messagesRef.current[idx]?.text ?? "";
+    patchAt(idx, (m) => ({ ...m, streaming: true }));
+    const { handler, failed } = makeEventHandler(idx, { base });
+    try {
+      await resolveApprovalStream(checkpointId, approve, handler);
+      setApprovalAt(
+        idx,
+        checkpointId,
+        failed()
+          ? { status: "error", note: "the resumed run reported an error" }
+          : { status: approve ? "approved" : "denied" },
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setApprovalAt(idx, checkpointId, { status: "error", note: msg });
+    } finally {
+      patchAt(idx, (m) => ({ ...m, streaming: false }));
+      setBusy(false);
+    }
+  };
+
+  const send = async () => {
+    const prompt = input.trim();
+    if (!prompt || !path || busy) return;
+    setInput("");
+
+    const history = messages.map((m) => ({
+      role: m.role === "agent" ? ("assistant" as const) : ("user" as const),
+      content: m.text,
+    }));
+
+    // The agent reply lands right after the user turn we are about to append.
+    const agentIdx = messages.length + 1;
+    setMessages((m) => [
+      ...m,
+      { role: "user", text: prompt },
+      {
+        role: "agent",
+        text: "",
+        streaming: true,
+        steps: [],
+        team: isTeam,
+        usage: emptyUsage(),
+      },
+    ]);
+    setBusy(true);
+
+    const ac = new AbortController();
+    abortRef.current = ac;
+    const { handler: onEvent } = makeEventHandler(agentIdx);
+    const patchLast = (fn: (m: Msg) => Msg) => patchAt(agentIdx, fn);
 
     try {
       if (isTeam) {
@@ -460,6 +549,19 @@ export default function Chat() {
                     ) : (
                       m.text
                     ))}
+                  {m.role === "agent" &&
+                    (m.approvals ?? []).map((a) => (
+                      <ApprovalCard
+                        key={a.checkpointId}
+                        approval={a}
+                        onResolve={(approve) =>
+                          resolveInline(i, a.checkpointId, approve)
+                        }
+                      />
+                    ))}
+                  {m.role === "agent" && !m.streaming && (
+                    <ArtifactCard artifacts={artifactsFromSteps(m.steps)} />
+                  )}
                   {m.streaming &&
                     (m.text ? (
                       <span className="caret" />

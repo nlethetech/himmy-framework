@@ -25,11 +25,23 @@ himmy = "himmy.cli.__main__:main"
 # FileResponse Range-header DoS / Host-header URL issues that Studio's StaticFiles +
 # FileResponse path would otherwise be exposed to). FastAPI >=0.116 supports Starlette
 # 1.x, so the two resolve to a current, audited pair.
-api = ["fastapi>=0.116", "uvicorn>=0.29", "starlette>=0.49.1"]
+api = [
+    "fastapi>=0.116",
+    "uvicorn>=0.29",
+    "starlette>=0.49.1",
+    # multipart form parsing (Studio KB file upload); without it the upload
+    # endpoint degrades to a clear 400 rather than failing at import time.
+    "python-multipart>=0.0.9",
+]
 # Himmy Studio — the local web GUI (chat, agent builder, run/trace browser). Served
 # by the same FastAPI BFF; the built frontend ships as package data under
 # himmy/api/_studio_static. Same runtime deps as `api`.
-studio = ["fastapi>=0.116", "uvicorn>=0.29", "starlette>=0.49.1"]
+studio = [
+    "fastapi>=0.116",
+    "uvicorn>=0.29",
+    "starlette>=0.49.1",
+    "python-multipart>=0.0.9",
+]
 # Enterprise auth: OIDC/JWT bearer verification for the BFF (RSA/EC via cryptography).
 auth = ["pyjwt[crypto]>=2.8"]
 # ML-based DLP/PII detection (beyond the built-in regex rules).
@@ -81,6 +93,7 @@ all = [
     "fastapi>=0.116",
     "uvicorn>=0.29",
     "starlette>=0.49.1",
+    "python-multipart>=0.0.9",
     "pydantic-ai>=0.0.1",
     "anthropic>=0.28",
     "asyncpg>=0.29",

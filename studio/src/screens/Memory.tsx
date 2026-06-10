@@ -3,159 +3,334 @@ import {
   listMemorySubjects,
   listMemories,
   addMemory,
+  updateMemory,
   forgetMemory,
   recallMemory,
+  MEMORY_TEXT_MAX,
   type MemoryItem,
   type MemoryHit,
-} from "../lib/api";
-import { Topbar, Page } from "../components/Page";
+} from "../lib/memoryApi";
+import { Topbar } from "../components/Page";
 import { EmptyState } from "../components/ui/EmptyState";
-import { MemoryIcon, PlusIcon, XIcon } from "../components/icons";
+import { Modal } from "../components/ui/Modal";
+import { PickMenu } from "../components/ui/PickMenu";
+import { MemoryIcon } from "../components/icons";
 import { relativeTime } from "../lib/format";
 import { useToast } from "../components/ui/Toast";
+import "../styles/memory.css";
+
+/* Memory as a single centered ledger: one column, one section. The section
+   header flips between MEMORIES (browsing a subject) and RECALL (a semantic
+   query is active). Rows are run-lines — text flex-left, subject + date mono
+   right, quiet ✎ / ✕ actions on hover. Editing happens inline; deletion is an
+   erasure right and says so before it happens. */
+
+const errMsg = (e: unknown) =>
+  e instanceof Error ? e.message : "Something went wrong";
 
 export default function Memory() {
   const [subjects, setSubjects] = useState<string[]>([]);
   const [subject, setSubject] = useState("default");
-  const [items, setItems] = useState<MemoryItem[]>([]);
+  const [items, setItems] = useState<MemoryItem[] | null>(null);
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<MemoryHit[] | null>(null);
+  const [recalling, setRecalling] = useState(false);
+
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const [toDelete, setToDelete] = useState<MemoryItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
   const toast = useToast();
 
   const loadSubjects = () =>
-    listMemorySubjects().then((s) => {
-      setSubjects(s);
-      setSubject((cur) => (s.includes(cur) ? cur : s[0] ?? "default"));
-    });
-  const loadItems = (s: string) => listMemories(s).then(setItems).catch(() => setItems([]));
+    listMemorySubjects()
+      .then((s) => {
+        setSubjects(s);
+        setSubject((cur) => (s.includes(cur) ? cur : (s[0] ?? "default")));
+      })
+      .catch(() => setSubjects(["default"]));
+  const loadItems = (s: string) =>
+    listMemories(s)
+      .then(setItems)
+      .catch((e) => {
+        setItems([]);
+        toast.show(errMsg(e), "err");
+      });
 
   useEffect(() => {
     loadSubjects();
   }, []);
   useEffect(() => {
-    loadItems(subject);
+    setItems(null);
     setHits(null);
+    setQuery("");
+    setEditId(null);
+    loadItems(subject);
   }, [subject]);
 
   const add = async () => {
-    if (!draft.trim()) return;
-    await addMemory(draft.trim(), subject);
-    setDraft("");
-    toast.show("Remembered", "ok");
-    loadItems(subject);
-    loadSubjects();
+    const text = draft.trim();
+    if (!text) return;
+    try {
+      await addMemory(text, subject);
+      setDraft("");
+      toast.show("Remembered", "ok");
+      loadItems(subject);
+      loadSubjects();
+    } catch (e) {
+      toast.show(errMsg(e), "err");
+    }
   };
-  const remove = async (id: string) => {
-    await forgetMemory(id);
-    loadItems(subject);
-  };
+
   const runRecall = async () => {
-    if (!query.trim()) return;
-    setHits(await recallMemory(query.trim(), subject));
+    const q = query.trim();
+    if (!q) return;
+    setRecalling(true);
+    try {
+      setHits(await recallMemory(q, subject));
+    } catch (e) {
+      toast.show(errMsg(e), "err");
+    } finally {
+      setRecalling(false);
+    }
   };
+
+  const beginEdit = (m: MemoryItem) => {
+    setEditId(m.memory_id);
+    setEditText(m.text);
+  };
+  const saveEdit = async () => {
+    const text = editText.trim();
+    if (!editId || !text || saving) return;
+    setSaving(true);
+    try {
+      const updated = await updateMemory(editId, text);
+      setItems(
+        (cur) =>
+          cur?.map((m) => (m.memory_id === updated.memory_id ? updated : m)) ??
+          cur,
+      );
+      setEditId(null);
+      toast.show("Saved", "ok");
+    } catch (e) {
+      toast.show(errMsg(e), "err");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!toDelete || deleting) return;
+    setDeleting(true);
+    try {
+      const r = await forgetMemory(toDelete.memory_id);
+      if (!r.ok) toast.show("Already gone", "info");
+      else toast.show("Erased", "ok");
+      setToDelete(null);
+      loadItems(subject);
+      loadSubjects();
+    } catch (e) {
+      toast.show(errMsg(e), "err");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const showRecall = hits !== null;
+  const loaded = items !== null;
 
   return (
     <>
       <Topbar title="Memory" sub="What your agents remember" />
-      <Page>
-        <div className="mem-bar">
-          <label className="field" style={{ margin: 0 }}>
-            <span className="field-label">Subject</span>
-            <select
-              className="input"
-              value={subject}
-              onChange={(e) => setSubject(e.target.value)}
-            >
-              {subjects.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </select>
-          </label>
+      <div className="home-col">
+        <div className="mm-controls">
+          <PickMenu
+            value={subject}
+            groups={[
+              {
+                label: "Subject",
+                options: (subjects.length ? subjects : [subject]).map((s) => ({
+                  value: s,
+                  label: s,
+                })),
+              },
+            ]}
+            onChange={setSubject}
+            title="Filter memories by subject"
+          />
+          <input
+            className="input"
+            placeholder="Recall — ask what this subject remembers…"
+            value={query}
+            maxLength={2000}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              if (!e.target.value.trim()) setHits(null);
+            }}
+            onKeyDown={(e) => e.key === "Enter" && runRecall()}
+          />
         </div>
 
-        <div className="mem-cols">
-          <div className="card card-pad">
-            <span className="section-title">Add a memory</span>
-            <div className="row gap6">
-              <input
-                className="input"
-                placeholder="A fact this subject should remember…"
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && add()}
-              />
-              <button className="btn btn-primary" onClick={add}>
-                <PlusIcon /> Add
+        <section className="home-sec">
+          <div className="home-sec-head">
+            <span>
+              {showRecall
+                ? `Recall · ${hits.length} hit${hits.length === 1 ? "" : "s"}`
+                : recalling
+                  ? "Recalling…"
+                  : `Memories${loaded ? ` · ${items.length}` : ""}`}
+            </span>
+            {showRecall ? (
+              <button
+                className="mm-clear"
+                onClick={() => {
+                  setHits(null);
+                  setQuery("");
+                }}
+              >
+                clear →
               </button>
-            </div>
-
-            <div className="mem-list">
-              {items.length === 0 ? (
-                <div className="dim" style={{ padding: 8 }}>
-                  No memories for <b>{subject}</b> yet.
-                </div>
-              ) : (
-                items.map((m) => (
-                  <div className="mem-row" key={m.memory_id}>
-                    <span className="mem-text">{m.text}</span>
-                    <span className="mem-meta">{relativeTime(m.created_at)}</span>
-                    <button
-                      className="mem-del"
-                      onClick={() => remove(m.memory_id)}
-                      title="Forget"
-                    >
-                      <XIcon />
-                    </button>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-
-          <div className="card card-pad">
-            <span className="section-title">Recall (semantic search)</span>
-            <div className="row gap6">
-              <input
-                className="input"
-                placeholder="Ask what this subject remembers…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && runRecall()}
-              />
-              <button className="btn" onClick={runRecall}>
-                Recall
-              </button>
-            </div>
-            {hits === null ? (
-              <EmptyState icon={<MemoryIcon />} title="Test recall">
-                Run a query to see what the agent would pull from memory, ranked by
-                similarity.
-              </EmptyState>
-            ) : hits.length === 0 ? (
-              <div className="dim" style={{ padding: 8 }}>
-                Nothing relevant found.
-              </div>
             ) : (
-              <div className="mem-hits">
-                {hits.map((h, i) => (
-                  <div className="mem-hit" key={i}>
-                    <span className="cite-sim">
-                      <span
-                        className="cite-sim-fill"
-                        style={{ width: Math.round(h.similarity * 100) + "%" }}
-                      />
-                    </span>
-                    <span>{h.text}</span>
-                  </div>
-                ))}
-              </div>
+              <span>{subject}</span>
             )}
           </div>
-        </div>
-      </Page>
+
+          {showRecall ? (
+            hits.length === 0 ? (
+              <div className="mm-quiet">
+                Nothing relevant found for “{query.trim()}”.
+              </div>
+            ) : (
+              hits.map((h) => (
+                <div className="run-line" key={h.memory_id}>
+                  <span className="run-line-prompt">{h.text}</span>
+                  <span className="mm-sim" title="Similarity to your query">
+                    {h.similarity.toFixed(2)}
+                  </span>
+                </div>
+              ))
+            )
+          ) : !loaded ? (
+            <div className="mm-quiet">Loading…</div>
+          ) : items.length === 0 ? (
+            <EmptyState icon={<MemoryIcon />} title="Nothing remembered yet">
+              Facts you add here are what your agents recall when they act for{" "}
+              <b>{subject}</b>. Remember the first one below.
+            </EmptyState>
+          ) : (
+            items.map((m) =>
+              editId === m.memory_id ? (
+                <div className="mm-edit" key={m.memory_id}>
+                  <textarea
+                    className="input"
+                    value={editText}
+                    maxLength={MEMORY_TEXT_MAX}
+                    autoFocus
+                    onChange={(e) => setEditText(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setEditId(null);
+                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey))
+                        saveEdit();
+                    }}
+                  />
+                  <div className="mm-edit-foot">
+                    <span className="mm-edit-hint">
+                      {m.subject_id} · {relativeTime(m.created_at)}
+                    </span>
+                    <button className="btn" onClick={() => setEditId(null)}>
+                      Cancel
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      disabled={saving || !editText.trim()}
+                      onClick={saveEdit}
+                    >
+                      {saving ? "Saving…" : "Save"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="run-line mm-row" key={m.memory_id}>
+                  <span className="run-line-prompt" title={m.text}>
+                    {m.text}
+                  </span>
+                  <span className="run-line-meta mono">
+                    {m.subject_id} · {relativeTime(m.created_at)}
+                  </span>
+                  <span className="mm-acts">
+                    <button
+                      className="mm-act"
+                      title="Edit"
+                      aria-label="Edit memory"
+                      onClick={() => beginEdit(m)}
+                    >
+                      ✎
+                    </button>
+                    <button
+                      className="mm-act danger"
+                      title="Erase"
+                      aria-label="Erase memory"
+                      onClick={() => setToDelete(m)}
+                    >
+                      ✕
+                    </button>
+                  </span>
+                </div>
+              ),
+            )
+          )}
+
+          <div className="mm-add">
+            <input
+              className="input"
+              placeholder={`Remember something for ${subject}…`}
+              value={draft}
+              maxLength={MEMORY_TEXT_MAX}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && add()}
+            />
+            <button
+              className="btn btn-primary"
+              disabled={!draft.trim()}
+              onClick={add}
+            >
+              Add
+            </button>
+          </div>
+        </section>
+      </div>
+
+      {toDelete && (
+        <Modal
+          title="Erase this memory"
+          onClose={() => (deleting ? undefined : setToDelete(null))}
+          footer={
+            <>
+              <button className="btn" onClick={() => setToDelete(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={deleting}
+                onClick={confirmDelete}
+              >
+                {deleting ? "Erasing…" : "Erase forever"}
+              </button>
+            </>
+          }
+        >
+          <blockquote className="mm-quote">{toDelete.text}</blockquote>
+          <p className="mm-erasure">
+            Deleting is an erasure: this record is permanently removed from{" "}
+            <b>{toDelete.subject_id}</b>’s memory. Your agents will never
+            recall it again, and it cannot be recovered.
+          </p>
+        </Modal>
+      )}
     </>
   );
 }

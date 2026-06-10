@@ -1,0 +1,137 @@
+/* Memory — a single centered ledger of remembered facts.
+   No cards: rows ride the global .run-line pattern; everything here is the
+   quiet furniture around them (controls line, inline editor, add row, the
+   erasure modal's quote). Hover changes color/border only — no motion. */
+
+.mm-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px 0 26px;
+}
+.mm-controls .input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* quiet inline notes (loading, no recall hits) */
+.mm-quiet {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  padding: 14px 2px;
+}
+
+/* row actions — invisible until the row is hovered; mono glyphs, no fills */
+.mm-acts {
+  display: inline-flex;
+  gap: 2px;
+  white-space: nowrap;
+}
+.mm-act {
+  background: none;
+  border: none;
+  padding: 0 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-dim);
+  cursor: pointer;
+  opacity: 0;
+}
+.mm-row:hover .mm-act,
+.mm-act:focus-visible {
+  opacity: 1;
+}
+.mm-act:hover {
+  color: var(--text);
+}
+.mm-act.danger:hover {
+  color: var(--red); /* an erasure — red's third job */
+}
+@media (hover: none) {
+  .mm-act {
+    opacity: 0.55;
+  }
+}
+
+/* recall hits: similarity as a bare mono number, right-aligned */
+.mm-sim {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* section-head "clear →" — styled like the head's links, but a button */
+.mm-clear {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.mm-clear:hover {
+  color: var(--text-muted);
+}
+
+/* inline editor: a row unfolded — textarea over a save/cancel foot, still
+   bounded by the same hairline the closed row had */
+.mm-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 2px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.mm-edit textarea.input {
+  width: 100%;
+  height: auto;
+  min-height: 64px;
+  resize: vertical;
+  font-family: var(--sans, inherit);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.mm-edit-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.mm-edit-hint {
+  margin-right: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+/* add row — the ledger's open last line */
+.mm-add {
+  display: flex;
+  gap: 8px;
+  padding-top: 14px;
+}
+.mm-add .input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* erasure modal: the memory quoted plainly, then the consequence */
+.mm-quote {
+  margin: 0 0 12px;
+  padding: 2px 0 2px 12px;
+  border-left: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text);
+  max-height: 160px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.mm-erasure {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}

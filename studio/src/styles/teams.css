@@ -1,0 +1,289 @@
+/* Team builder + workflow runner — ledger forms, no boxes.
+   Sections come from .home-sec / .home-sec-head (index.css); everything here
+   is the row grammar those screens add: labelled form rows, removable mono
+   tokens, node-status rows, and the final output block. */
+
+/* The centered column inherits .home-col; these screens want a touch less
+   masthead air than Home. */
+.teams-col {
+  padding-top: 12px;
+}
+
+/* a section-head action ("+ member", "new team") — reads like the head links */
+.tb-head-act {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.tb-head-act:hover {
+  color: var(--text-muted);
+}
+
+/* ---- ledger form rows: micro-label left, control right ------------------ */
+
+.tb-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.tb-row-label {
+  width: 86px;
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+}
+.tb-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* quiet inputs: hairline-under only, so a row of fields stays a ledger row */
+.tb-input {
+  flex: 1;
+  min-width: 80px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid transparent;
+  border-radius: 0;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  padding: 2px 0;
+}
+.tb-input.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.tb-input::placeholder {
+  color: var(--text-dim);
+}
+.tb-input:hover {
+  border-bottom-color: var(--border);
+}
+.tb-input:focus {
+  outline: none;
+  border-bottom-color: var(--red); /* focus — red's active-state job */
+}
+.tb-input.short {
+  flex: 0 1 140px;
+}
+
+/* ---- members ------------------------------------------------------------ */
+
+.tb-member {
+  margin: 0 0 6px;
+}
+.tb-member-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 10px 2px 4px;
+}
+.tb-member-head .tb-input {
+  font-weight: 600;
+}
+.tb-member-entry {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--red); /* the active/entry member */
+}
+.tb-remove {
+  flex: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.tb-remove:hover {
+  color: var(--red);
+}
+.tb-member .tb-row {
+  padding-left: 14px; /* member fields sit one step in from the name */
+}
+
+/* removable mono tokens (packs / handoffs / delegates) */
+.tb-token {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.tb-token:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+.tb-token .x {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+.tb-token:hover .x {
+  color: var(--red);
+}
+
+/* compact PickMenu trigger inside a ledger row */
+.tb-row .pick {
+  flex: none;
+}
+
+/* ---- topology preview ---------------------------------------------------- */
+
+.tb-graph-empty {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  padding: 14px 2px;
+}
+
+/* ---- validation + actions ------------------------------------------------ */
+
+.tb-errors {
+  margin: 0;
+  padding: 10px 2px 0;
+  list-style: none;
+}
+.tb-errors li {
+  color: var(--red);
+  font-size: 12.5px;
+  padding: 3px 0;
+}
+.tb-errors li::before {
+  content: "× ";
+  font-family: var(--mono);
+}
+.tb-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 2px 0;
+}
+.tb-actions .note,
+.tb-note {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+/* ---- existing-team rows --------------------------------------------------- */
+
+.team-line {
+  width: 100%;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+.team-line.on .run-line-prompt {
+  color: var(--red); /* the team currently loaded in the builder */
+}
+
+/* ---- workflow runner ------------------------------------------------------ */
+
+.wfl-line {
+  width: 100%;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+.wfl-line.on .run-line-prompt {
+  color: var(--red); /* selected workflow */
+}
+
+.wfl-step-idx {
+  flex: none;
+  width: 18px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+/* a row whose detail line below carries the hairline instead */
+.run-line.no-rule {
+  border-bottom: none;
+  padding-bottom: 3px;
+}
+.wfl-step-task {
+  display: block;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 0 2px 9px 30px;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* node status rows during a run */
+.wfl-node-state {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+.wfl-node-state.failed {
+  color: var(--red);
+}
+.wfl-node-err {
+  display: block;
+  color: var(--red);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 0 2px 9px 30px;
+  border-bottom: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* the final output block — quiet pre, hairline-framed by the section rule */
+.wfl-out {
+  margin: 0;
+  padding: 12px 2px;
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.wfl-out.failed {
+  color: var(--red);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.wfl-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  padding: 8px 2px 0;
+}

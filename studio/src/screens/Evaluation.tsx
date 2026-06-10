@@ -1,158 +1,280 @@
-import { useEffect, useState } from "react";
-import {
-  api,
-  listEvalSuites,
-  runEval,
-  type EvalSuiteInfo,
-  type AgentSummary,
-  type EvalRun,
-} from "../lib/api";
-import { Topbar, Page } from "../components/Page";
+import { useEffect, useRef, useState } from "react";
+import { Topbar } from "../components/Page";
 import { EmptyState } from "../components/ui/EmptyState";
-import { GlobeIcon } from "../components/icons";
+import { PickMenu } from "../components/ui/PickMenu";
 import { useToast } from "../components/ui/Toast";
+import { GlobeIcon } from "../components/icons";
+import {
+  getBaseline,
+  listRunnableSuites,
+  streamEvalRun,
+  type BaselineRow,
+  type BaselineView,
+  type EvalCaseEvent,
+  type EvalSummaryEvent,
+  type RunnableSuite,
+} from "../lib/evalApi";
+import "../styles/eval.css";
+
+/* Evaluation as a single centered ledger column: SUITES (what's runnable),
+   RUN (per-case rows streaming in), BASELINE (the gate table, with a delta
+   column against the just-finished bench run). Offline stub by default —
+   a live provider only when explicitly picked. */
+
+const PROVIDERS = [
+  {
+    options: [
+      { value: "stub", label: "offline · stub", meta: "deterministic" },
+      { value: "claude-cli", label: "claude-cli", meta: "live" },
+      { value: "ollama", label: "ollama", meta: "live" },
+    ],
+  },
+];
+
+const pct = (n: number) => Math.round(n * 100) + "%";
 
 export default function Evaluation() {
-  const [suites, setSuites] = useState<EvalSuiteInfo[] | null>(null);
-  const [agents, setAgents] = useState<AgentSummary[]>([]);
-  const [suite, setSuite] = useState("");
-  const [agent, setAgent] = useState("");
+  const [suites, setSuites] = useState<RunnableSuite[] | null>(null);
+  const [suitesError, setSuitesError] = useState("");
+  const [baseline, setBaseline] = useState<BaselineView | null>(null);
+  const [provider, setProvider] = useState("stub");
+
   const [running, setRunning] = useState(false);
-  const [run, setRun] = useState<EvalRun | null>(null);
+  const [runLabel, setRunLabel] = useState("");
+  const [cases, setCases] = useState<EvalCaseEvent[]>([]);
+  const [summary, setSummary] = useState<EvalSummaryEvent | null>(null);
+  const [runError, setRunError] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
   const toast = useToast();
 
   useEffect(() => {
-    listEvalSuites().then((s) => {
-      setSuites(s);
-      setSuite((c) => c || s[0]?.path || "");
-    });
-    api.get<AgentSummary[]>("/agents").then((a) => {
-      setAgents(a);
-      setAgent((c) => c || a[0]?.path || "");
-    });
+    listRunnableSuites()
+      .then((r) => setSuites(r.suites))
+      .catch((e) => {
+        setSuites([]);
+        setSuitesError((e as Error).message);
+      });
+    getBaseline().catch(() => null).then((b) => setBaseline(b ?? null));
+    return () => abortRef.current?.abort();
   }, []);
 
-  const go = async () => {
-    if (!suite || !agent) return;
+  const startRun = async (s: RunnableSuite) => {
+    if (running) return;
+    abortRef.current?.abort();
+    const ctl = new AbortController();
+    abortRef.current = ctl;
     setRunning(true);
-    setRun(null);
+    setRunLabel(s.name);
+    setCases([]);
+    setSummary(null);
+    setRunError("");
     try {
-      setRun(await runEval(suite, agent));
+      await streamEvalRun(
+        { suite: s.id, provider: provider === "stub" ? null : provider },
+        (e) => {
+          if (e.type === "case") setCases((c) => [...c, e]);
+          else if (e.type === "summary") setSummary(e);
+          else if (e.type === "error") setRunError(e.message);
+        },
+        ctl.signal,
+      );
     } catch (e) {
-      toast.show((e as Error).message, "err");
+      if (!ctl.signal.aborted) {
+        setRunError((e as Error).message);
+        toast.show((e as Error).message, "err");
+      }
     } finally {
-      setRunning(false);
+      if (abortRef.current === ctl) setRunning(false);
     }
   };
 
-  const pct = (n: number) => Math.round(n * 100) + "%";
+  // Delta vs the baseline only makes sense for a finished bench-gate run.
+  const runMetric = (metric: string): number | null => {
+    if (summary?.kind !== "bench" || !summary.metrics) return null;
+    if (metric === "accuracy") return summary.metrics.accuracy;
+    if (metric === "tool_call_accuracy") return summary.metrics.tool_call_accuracy;
+    if (metric === "error_rate") return summary.metrics.error_rate;
+    return null;
+  };
+
+  const caseMeta = (c: EvalCaseEvent) => {
+    const failing = c.metrics.filter((m) => !m.passed).map((m) => m.metric);
+    return pct(c.score) + (failing.length ? " · " + failing.join(", ") : "");
+  };
+  const caseTitle = (c: EvalCaseEvent) =>
+    c.metrics
+      .map((m) => `${m.metric} ${pct(m.score)} ${m.passed ? "pass" : "fail"}`)
+      .join("\n");
+
+  const nothingToShow =
+    suites !== null && suites.length === 0 && baseline !== null && !baseline.exists;
 
   return (
     <>
-      <Topbar title="Evaluation" sub="Score an agent against a test suite" />
-      <Page>
-        {suites === null ? null : suites.length === 0 ? (
-          <EmptyState icon={<GlobeIcon />} title="No eval suites found">
-            Add a <code>*.eval.yaml</code> with a <code>name</code> and a list of{" "}
-            <code>cases</code> (each an <code>input</code> + <code>expected_output</code>{" "}
-            + <code>metric_weights</code>) to your project, then run it here.
-          </EmptyState>
-        ) : (
-          <>
-            <div className="card card-pad eval-bar">
-              <label className="field" style={{ margin: 0, flex: 1 }}>
-                <span className="field-label">Suite</span>
-                <select className="input" value={suite} onChange={(e) => setSuite(e.target.value)}>
-                  {suites.map((s) => (
-                    <option key={s.path} value={s.path}>
-                      {s.name} · {s.cases} case{s.cases === 1 ? "" : "s"}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="field" style={{ margin: 0, flex: 1 }}>
-                <span className="field-label">Agent</span>
-                <select className="input" value={agent} onChange={(e) => setAgent(e.target.value)}>
-                  {agents.map((a) => (
-                    <option key={a.path} value={a.path}>
-                      {a.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button className="btn btn-primary" onClick={go} disabled={running}>
-                {running ? <span className="spinner" /> : "Run eval"}
-              </button>
+      <Topbar title="Evaluation" sub="Run suites, compare to baseline" />
+      {nothingToShow ? (
+        <EmptyState icon={<GlobeIcon />} title="Nothing to evaluate">
+          Add a <code>*.eval.yaml</code> suite (a <code>name</code> plus{" "}
+          <code>cases</code> of <code>input</code> / <code>expected_output</code> /{" "}
+          <code>metric_weights</code>) to the project, or check in a{" "}
+          <code>benchmarks/baseline.json</code> to run the bench gate.
+          {suitesError ? <> — {suitesError}</> : null}
+        </EmptyState>
+      ) : (
+        <div className="home-col">
+          {/* ---- SUITES ---- */}
+          <section className="home-sec">
+            <div className="home-sec-head">
+              <span>Suites</span>
+              <span className="eval-pick">
+                <PickMenu
+                  value={provider}
+                  groups={PROVIDERS}
+                  onChange={setProvider}
+                  title="Provider for runs — offline stub completes in seconds"
+                />
+              </span>
             </div>
-
-            {running && (
-              <div className="dim" style={{ padding: 16 }}>
-                Running the agent over each case…
+            {suites === null ? (
+              <div className="home-empty">Loading suites…</div>
+            ) : suites.length === 0 ? (
+              <div className="home-empty">
+                {suitesError ||
+                  "No suites found — add a *.eval.yaml to the project root."}
               </div>
-            )}
-
-            {run && (
-              <div className="card">
-                <div className="card-head">
-                  <h2>{run.suite_name}</h2>
-                  <span
-                    className={
-                      "pill " +
-                      (run.aggregate_score >= 0.8
-                        ? "ok"
-                        : run.aggregate_score >= 0.5
-                          ? "warn"
-                          : "err")
-                    }
-                  >
-                    {pct(run.aggregate_score)} overall
+            ) : (
+              suites.map((s) => (
+                <div className="run-line" key={s.id}>
+                  <span className="run-line-prompt" title={s.source}>
+                    {s.name}
                   </span>
+                  <span className="run-line-meta mono">
+                    {s.cases} case{s.cases === 1 ? "" : "s"} ·{" "}
+                    {s.kind === "bench" ? "gate" : "eval"}
+                  </span>
+                  <button
+                    className="eval-run-act"
+                    onClick={() => startRun(s)}
+                    disabled={running}
+                  >
+                    run →
+                  </button>
                 </div>
-                <div className="card-pad">
-                  <div className="eval-cases">
-                    {run.case_results.map((c) => (
-                      <div className="eval-case" key={c.case_id}>
-                        <div className="row spread">
-                          <span className="mono dim" style={{ fontSize: 12 }}>
-                            case {c.case_id.slice(0, 8)}
-                          </span>
-                          <span className={"pill " + (c.passed ? "ok" : "err")}>
-                            {c.passed ? "pass" : "fail"} · {pct(c.aggregate)}
-                          </span>
-                        </div>
-                        <div className="eval-metrics">
-                          {c.metric_scores.map((m) => (
-                            <div className="eval-metric" key={m.metric}>
-                              <span className="eval-metric-name">{m.metric}</span>
-                              <span className="eval-bar-track">
-                                <span
-                                  className="eval-bar-fill"
-                                  style={{
-                                    width: pct(m.score),
-                                    background: m.passed
-                                      ? "var(--ok)"
-                                      : "var(--warn)",
-                                  }}
-                                />
-                              </span>
-                              <span className="mono eval-metric-score">
-                                {pct(m.score)}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                        {c.actual_output && (
-                          <div className="eval-output">{c.actual_output}</div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
+              ))
             )}
-          </>
-        )}
-      </Page>
+          </section>
+
+          {/* ---- RUN ---- */}
+          <section className="home-sec">
+            <div className="home-sec-head">
+              <span>Run</span>
+              {runLabel && (
+                <span className="mono">
+                  {runLabel}
+                  {running ? " · running…" : ""}
+                </span>
+              )}
+            </div>
+            {!runLabel ? (
+              <div className="home-empty">
+                No run yet — pick a suite above. The default provider is the
+                offline stub, so a run finishes in seconds.
+              </div>
+            ) : (
+              <>
+                {cases.map((c) => (
+                  <div
+                    className={"run-line" + (c.passed ? "" : " eval-row-fail")}
+                    key={c.id + c.index}
+                    title={caseTitle(c)}
+                  >
+                    <span className="run-line-prompt">{c.case}</span>
+                    <span className="run-line-meta mono">{caseMeta(c)}</span>
+                    <span className={"mono eval-verdict" + (c.passed ? "" : " fail")}>
+                      {c.passed ? "pass" : "fail"}
+                    </span>
+                  </div>
+                ))}
+                {running && (
+                  <div className="home-empty mono">
+                    running case {cases.length + 1}…
+                  </div>
+                )}
+                {runError && <div className="eval-error">{runError}</div>}
+                {summary && (
+                  <div className="eval-summary">
+                    {summary.passed}/{summary.cases} passed · aggregate{" "}
+                    {pct(summary.aggregate_score)} ·{" "}
+                    {summary.duration_s.toFixed(1)}s
+                    {summary.model ? ` · ${summary.model}` : ""}
+                    {summary.note ? ` · ${summary.note}` : ""}
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+
+          {/* ---- BASELINE ---- */}
+          <section className="home-sec">
+            <div className="home-sec-head">
+              <span>Baseline</span>
+              {baseline?.exists && (
+                <span className="mono">
+                  {baseline.sha.slice(0, 12)} · {baseline.date} · {baseline.trials}{" "}
+                  trials
+                </span>
+              )}
+            </div>
+            {baseline === null ? (
+              <div className="home-empty">Loading baseline…</div>
+            ) : !baseline.exists ? (
+              <div className="home-empty">{baseline.reason}</div>
+            ) : (
+              baseline.models.map((m) => (
+                <div key={m.name}>
+                  <div className="eval-bl-model">{m.name}</div>
+                  <div className="eval-bl-hrow">
+                    <span>metric</span>
+                    <span>floor</span>
+                    <span>measured</span>
+                    <span>delta</span>
+                  </div>
+                  {m.rows.map((r) => (
+                    <BaselineRowLine key={r.metric} row={r} run={runMetric(r.metric)} />
+                  ))}
+                </div>
+              ))
+            )}
+          </section>
+        </div>
+      )}
     </>
+  );
+}
+
+function BaselineRowLine({ row, run }: { row: BaselineRow; run: number | null }) {
+  const delta = run != null && row.measured != null ? run - row.measured : null;
+  // a fresh run breaching the gate bound is a hit — red's third job
+  const breach =
+    run != null &&
+    row.limit != null &&
+    (row.bound === "floor" ? run < row.limit : run > row.limit);
+  return (
+    <div className="eval-bl-row">
+      <span className="eval-bl-name" title={row.bound}>
+        {row.metric}
+      </span>
+      <span className="eval-bl-num">
+        {row.limit == null ? "—" : pct(row.limit) + (row.bound === "ceiling" ? " max" : "")}
+      </span>
+      <span className="eval-bl-num">
+        {row.measured == null ? "—" : pct(row.measured)}
+      </span>
+      <span className={"eval-bl-num" + (breach ? " fail" : "")}>
+        {delta == null
+          ? "—"
+          : (delta >= 0 ? "+" : "−") + Math.abs(Math.round(delta * 100)) + "pt"}
+      </span>
+    </div>
   );
 }

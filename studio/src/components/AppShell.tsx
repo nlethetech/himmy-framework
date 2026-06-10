@@ -15,6 +15,7 @@ import {
   PlusIcon,
   CheckIcon,
   MailIcon,
+  FilesIcon,
 } from "./icons";
 import { useTheme } from "./ui/useTheme";
 import { APP_DEFS, APPS_CHANGED, enabledApps } from "../lib/apps";
@@ -52,6 +53,7 @@ const APP_ICONS: Record<string, NavItem["Icon"]> = {
   tasks: CheckIcon,
   notes: BookIcon,
   research: SearchIcon,
+  files: FilesIcon,
   brain: MemoryIcon,
 };
 

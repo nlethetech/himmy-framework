@@ -15,6 +15,7 @@ export const APP_DEFS: AppDef[] = [
   { key: "tasks", to: "/tasks", label: "Tasks" },
   { key: "notes", to: "/notes", label: "Notes" },
   { key: "research", to: "/research", label: "Research" },
+  { key: "files", to: "/files", label: "Files" },
   { key: "brain", to: "/brain", label: "Brain" },
 ];
 

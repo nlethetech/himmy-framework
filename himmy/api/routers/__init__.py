@@ -9,6 +9,14 @@ from himmy.api.routers import (
     recommendations,
     runs,
     studio,
+    studio_eval,
+    studio_files,
+    studio_knowledge_upload,
+    studio_lineage,
+    studio_memory,
+    studio_models,
+    studio_privacy,
+    studio_teams,
 )
 
 __all__ = [
@@ -18,4 +26,12 @@ __all__ = [
     "dashboard",
     "evaluation",
     "studio",
+    "studio_eval",
+    "studio_files",
+    "studio_knowledge_upload",
+    "studio_lineage",
+    "studio_memory",
+    "studio_models",
+    "studio_privacy",
+    "studio_teams",
 ]

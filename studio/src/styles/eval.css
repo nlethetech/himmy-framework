@@ -1,0 +1,116 @@
+/* Evaluation — ledger styles. No cards: sections are a micro-label over a
+   hairline; rows follow the .run-line pattern. var(--red) appears only on
+   failures and the primary run affordance's hover. */
+
+/* the per-row run action — a mono annotation, not a button chrome */
+.eval-run-act {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.eval-run-act:hover {
+  color: var(--red);
+}
+.eval-run-act:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* provider pick lives in a section head near the top of the page — open the
+   menu downward (the shared .pick-menu opens upward for the composer) */
+.eval-pick .pick-menu {
+  bottom: auto;
+  top: calc(100% + 6px);
+  left: auto;
+  right: 0;
+}
+.eval-pick .pick-chev {
+  transform: rotate(90deg);
+}
+.eval-pick .pick-trigger.open .pick-chev {
+  transform: rotate(-90deg);
+}
+
+/* run rows: verdict column + failure color */
+.eval-verdict {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.eval-verdict.fail {
+  color: var(--red);
+}
+.run-line.eval-row-fail .run-line-prompt {
+  color: var(--red);
+}
+
+/* quiet trailing lines under the run ledger */
+.eval-summary {
+  padding: 11px 2px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+.eval-error {
+  padding: 11px 2px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--red);
+  border-bottom: 1px solid var(--border);
+}
+
+/* baseline gate table — a ledger grid, hairlines only */
+.eval-bl-model {
+  padding: 12px 2px 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+}
+.eval-bl-hrow,
+.eval-bl-row {
+  display: grid;
+  grid-template-columns: 1fr 84px 84px 84px;
+  gap: 12px;
+  align-items: baseline;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.eval-bl-hrow {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  padding: 8px 2px 5px;
+}
+.eval-bl-hrow span:not(:first-child) {
+  text-align: right;
+}
+.eval-bl-row .eval-bl-name {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.eval-bl-row .eval-bl-num {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+  white-space: nowrap;
+}
+.eval-bl-row .eval-bl-num.fail {
+  color: var(--red);
+}

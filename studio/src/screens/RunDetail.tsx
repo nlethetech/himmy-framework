@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, Link } from "react-router-dom";
 import { api, type RunDetailT, type IoCapture } from "../lib/api";
 import { Topbar, Loading, ErrorState } from "../components/Page";
 import { Markdown } from "../components/Markdown";
@@ -126,6 +126,20 @@ export default function RunDetail() {
                     {run.agent_path}
                   </div>
                 )}
+                <div className="mt8">
+                  <Link
+                    className="dim mono"
+                    style={{ fontSize: 12 }}
+                    title="How the agent reached this conclusion"
+                    to={
+                      run.thread_id
+                        ? `/advanced/lineage?entity=${encodeURIComponent(run.thread_id)}&run=${encodeURIComponent(run.id)}`
+                        : `/advanced/lineage?run=${encodeURIComponent(run.id)}`
+                    }
+                  >
+                    lineage →
+                  </Link>
+                </div>
               </div>
 
               <div className="card">
