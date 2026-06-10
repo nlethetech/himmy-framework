@@ -48,6 +48,9 @@ const PROVIDERS = [
   { value: "stub", label: "Stub (offline)" },
   { value: "ollama", label: "Ollama (local)" },
   { value: "claude-cli", label: "Claude CLI" },
+  { value: "openrouter", label: "OpenRouter" },
+  { value: "anthropic", label: "Anthropic API" },
+  { value: "openai", label: "OpenAI API" },
   { value: "pydantic-ai", label: "Cloud (key)" },
 ];
 

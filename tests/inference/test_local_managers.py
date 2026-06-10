@@ -213,3 +213,40 @@ def test_ollama_timeout_env_knob(monkeypatch) -> None:
     assert OllamaClientManager()._timeout == 120.0
     monkeypatch.setenv("HIMMY_OLLAMA_TIMEOUT", "-5")
     assert OllamaClientManager()._timeout == 120.0
+
+
+def test_default_ollama_model_resolution(monkeypatch) -> None:
+    """build_manager_for('ollama') picks an INSTALLED chat model, not llama3.2.
+
+    HIMMY_OLLAMA_MODEL overrides; embedding models are skipped; a down server
+    falls back to the historical default so offline behavior is unchanged.
+    """
+    import httpx
+
+    from himmy.cli.provider import _default_ollama_model
+
+    monkeypatch.setenv("HIMMY_OLLAMA_MODEL", "custom:7b")
+    assert _default_ollama_model() == "custom:7b"
+    monkeypatch.delenv("HIMMY_OLLAMA_MODEL", raising=False)
+
+    def fake_get(url, timeout):  # noqa: ANN001, ANN202
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {"name": "qwen3-embedding:latest"},
+                    {"name": "qwen2.5:3b-instruct"},
+                ]
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    assert _default_ollama_model() == "qwen2.5:3b-instruct"
+
+    def down_get(url, timeout):  # noqa: ANN001, ANN202
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(httpx, "get", down_get)
+    assert _default_ollama_model() == "llama3.2"

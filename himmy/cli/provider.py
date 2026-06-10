@@ -34,6 +34,36 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_DEFAULT_MODEL = "mistralai/mistral-small-3.2-24b-instruct"
 
 
+def _default_ollama_model() -> str:
+    """Pick a sensible default Ollama model: an INSTALLED chat model, not a tag
+    the user may never have pulled.
+
+    ``HIMMY_OLLAMA_MODEL`` overrides; otherwise probe the local server's tags
+    (sub-second timeout) and take the first non-embedding model. Falls back to
+    ``llama3.2`` when the server is down — the historical default, so offline
+    behavior is unchanged.
+    """
+    import os
+
+    override = os.environ.get("HIMMY_OLLAMA_MODEL", "").strip()
+    if override:
+        return override
+    try:
+        import httpx
+
+        base = os.environ.get("HIMMY_OLLAMA_URL", "http://localhost:11434")
+        resp = httpx.get(f"{base.rstrip('/')}/api/tags", timeout=0.8)
+        resp.raise_for_status()
+        models = resp.json().get("models", [])
+        for m in models:
+            name = str(m.get("name", ""))
+            if name and "embed" not in name.lower():
+                return name
+    except Exception:  # noqa: BLE001 - probing is best-effort; offline keeps the old default
+        pass
+    return "llama3.2"
+
+
 class ProviderError(HimmyError):
     """Raised when a requested provider cannot be constructed (e.g. missing extra)."""
 
@@ -64,7 +94,7 @@ def build_manager_for(
     if provider == "ollama":
         from himmy.services.inference.local import OllamaClientManager
 
-        return OllamaClientManager(model=model) if model else OllamaClientManager()
+        return OllamaClientManager(model=model or _default_ollama_model())
 
     if provider == "pydantic-ai":
         try:

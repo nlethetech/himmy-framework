@@ -674,6 +674,15 @@ async def stream_agent_run(
                 # message/done — the user resumes it later from Approvals.
                 status = "awaiting_approval"
                 checkpoint_id = loop.checkpoint_id
+            elif not loop.final.succeeded:
+                # The loop's last turn failed at the inference layer (provider
+                # down, model missing...). Don't guess — show the real error.
+                status = "error"
+                error_msg = (
+                    f"{loop.final.status}: the model call failed — check the "
+                    "provider under Settings → Build → Models (is the model "
+                    "pulled / the key set?)"
+                )
             else:
                 output_text = loop.final.output_text or ""
                 if not output_text.strip():
@@ -699,6 +708,17 @@ async def stream_agent_run(
                     yield {"type": "token", "delta": delta.delta}
                 if delta.done and delta.response is not None:
                     output_text = delta.response.output_text or output_text
+                    # A FAILED inference never raises (INF-1) — it comes back as
+                    # a typed error on the terminal delta. Surface it; a silent
+                    # empty answer is the one unacceptable outcome.
+                    resp = delta.response
+                    if resp.status.value != "SUCCESS":
+                        status = "error"
+                        error_msg = (
+                            resp.error.message
+                            if resp.error is not None
+                            else f"inference failed ({resp.status.value})"
+                        )
             # Streaming can't interleave cognition mid-token, so fold the events it
             # emitted (usage, guardrails, grounding) in afterwards — both to surface
             # them in the GUI and to record cog.steps for persistence. Reasoning is
