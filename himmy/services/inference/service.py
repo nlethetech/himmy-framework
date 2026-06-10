@@ -187,6 +187,12 @@ class InferenceService:
                 return hit
 
         timeout = request.timeout_seconds or self._default_timeout_seconds
+        # Slow local providers (Ollama/CLI on CPU hosts) declare a minimum
+        # budget; the per-request default must not undercut physical reality.
+        manager_floor = float(
+            getattr(self._client_manager, "min_timeout_seconds", 0.0) or 0.0
+        )
+        timeout = max(timeout, manager_floor)
         ceiling = self._ceiling(timeout)
         last_response: InferenceResponse | None = None
 

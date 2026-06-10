@@ -248,6 +248,10 @@ class OllamaClientManager:
         self._registry = dict(model_registry or {})
         self._transport = transport
         self._timeout = timeout if timeout is not None else _default_ollama_timeout()
+        #: Slow-local-provider floor (INF): the framework's 30s default request
+        #: timeout kills legitimate CPU generations; the service's proportional
+        #: ceiling honors this declared minimum (see InferenceService.run).
+        self.min_timeout_seconds = self._timeout
         self.provider_name = provider_name
 
     def resolve(self, model_key: str) -> str:
@@ -282,8 +286,11 @@ class OllamaClientManager:
         if structured_requested:
             # Ollama's native structured-output: constrain the reply to the schema.
             payload["format"] = request.output_json_schema
+        # Floor the per-call budget like the CLI manager does: a CPU host can
+        # legitimately need minutes; request defaults must not kill valid calls.
+        effective_timeout = max(request.timeout_seconds or 0.0, self._timeout)
         try:
-            data = await self._post("/api/chat", payload, request.timeout_seconds)
+            data = await self._post("/api/chat", payload, effective_timeout)
         except Exception as exc:  # noqa: BLE001 - normalize to FAILED
             return _failed(
                 request,
@@ -411,6 +418,8 @@ class ClaudeCliClientManager:
         self._extra_args = list(extra_args or [])
         self._runner = runner
         self._timeout = timeout
+        #: Slow-local-provider floor: mirrors the effective_timeout floor below.
+        self.min_timeout_seconds = _CLI_MIN_TIMEOUT
         self.provider_name = provider_name
 
     def resolve(self, model_key: str) -> str:

@@ -250,3 +250,61 @@ def test_default_ollama_model_resolution(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "get", down_get)
     assert _default_ollama_model() == "llama3.2"
+
+
+def test_slow_local_floor_beats_the_30s_request_default() -> None:
+    """The service's proportional ceiling honors a manager's declared
+    min_timeout_seconds — the framework's 30s request default must not kill
+    legitimate slow-CPU generations (the cause of the 2026-06-10 nightly reds:
+    every Ollama call died at ~32s on the shared runner)."""
+    import asyncio
+
+    class _SlowManager:
+        provider_name = "slow"
+        min_timeout_seconds = 120.0
+
+        def resolve(self, model_key: str) -> str:
+            return "slow:model"
+
+        async def generate(self, request):  # noqa: ANN001, ANN202
+            # Longer than the 30s-derived ceiling (~31.5s scaled down by the
+            # test's tiny grace factors), shorter than the declared floor.
+            await asyncio.sleep(0.05)
+            return InferenceResponse(
+                request_id=request.request_id,
+                status=InferenceStatus.SUCCESS,
+                output_text="made it",
+            )
+
+    # Shrink the proportionality: un-floored ceiling = 0.001*0.001 = 1µs (the
+    # call dies); floored ceiling = 120*0.001 = 0.12s (the 0.05s call survives).
+    # The sleep only outlives the ceiling if the 120s floor was honored.
+    service = InferenceService(
+        _SlowManager(),
+        timeout_grace_seconds=0.0,
+        timeout_grace_factor=0.001,
+    )
+    request = _req()
+    request.timeout_seconds = 0.001
+    resp = run_async(service.run(request))
+    assert resp.status == InferenceStatus.SUCCESS
+    assert resp.output_text == "made it"
+
+
+def test_ollama_effective_timeout_floors_the_request_value(monkeypatch) -> None:
+    """OllamaClientManager passes max(request timeout, manager budget) to the
+    HTTP layer, mirroring the CLI manager's floor."""
+    from himmy.services.inference.local import OllamaClientManager
+
+    seen: dict[str, float] = {}
+
+    async def fake_post(self, path, payload, timeout):  # noqa: ANN001, ANN202
+        seen["timeout"] = timeout
+        return {"message": {"role": "assistant", "content": "ok"}, "done": True}
+
+    monkeypatch.setattr(OllamaClientManager, "_post", fake_post)
+    mgr = OllamaClientManager(timeout=200.0)
+    request = _req()
+    request.timeout_seconds = 30.0
+    run_async(mgr.generate(request))
+    assert seen["timeout"] == 200.0
