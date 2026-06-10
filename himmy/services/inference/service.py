@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
@@ -324,7 +324,7 @@ class InferenceService:
 
     async def run_stream(
         self, request: InferenceRequest, *, chunk_size: int = 24
-    ) -> AsyncIterator[StreamDelta]:
+    ) -> AsyncGenerator[StreamDelta, None]:
         """Stream an inference response as incremental text deltas (INF-7).
 
         If the client manager exposes ``generate_stream`` (the pydantic-ai path
