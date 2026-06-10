@@ -168,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_studio.set_defaults(func=commands.cmd_studio)
 
     p_doctor = sub.add_parser("doctor", help="report extras, providers, and keys")
+    p_doctor.add_argument(
+        "--storage",
+        action="store_true",
+        help="also report the storage backend, migrations, and SQLite stores",
+    )
     p_doctor.set_defaults(func=commands.cmd_doctor)
 
     p_tools = sub.add_parser("tools", help="list built-in tool packs and their tools")

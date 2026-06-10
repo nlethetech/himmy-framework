@@ -1,0 +1,174 @@
+# =============================================================================
+# Himmy Studio — full-stack deployment compose
+# =============================================================================
+#
+# A self-contained Studio + Postgres (+ optional Ollama) topology for running a
+# real, durable deployment. Distinct from the dev-only stack in
+# docker/docker-compose.yml — see "Relationship to the dev stack" below.
+#
+# Usage
+# -----
+#   1. cp deploy/compose/.env.example deploy/compose/.env  and edit it.
+#   2. Put the SAME Postgres password into deploy/compose/secrets/postgres_password
+#      that you set for POSTGRES_PASSWORD in .env  (see "Password duplication").
+#   3. Bring it up (run from the repo root so the relative paths resolve):
+#
+#        docker compose -f deploy/compose/docker-compose.yml up -d
+#
+#      With a bundled Ollama (pulls models on first start, several GB):
+#
+#        docker compose -f deploy/compose/docker-compose.yml --profile ollama up -d
+#
+#      Then: open http://localhost:8765  (Host=localhost passes the Studio guard).
+#
+# Relationship to the dev stack (docker/docker-compose.yml)
+# ---------------------------------------------------------
+# The dev stack publishes a bare Postgres on host port 5433 for tests/CI. THIS
+# stack uses entirely distinct volume names (himmy_pgdata_full vs himmy_pgdata)
+# and publishes no Postgres host port, so the two can run concurrently without
+# colliding on data or ports. The only shared host port is 8765 (Studio); the
+# dev stack does not publish it.
+#
+# Password duplication (read this)
+# --------------------------------
+# The Postgres password is needed in TWO places that cannot share one source:
+#   * studio's HIMMY_DATABASE_URL — an env-interpolated DSN string, so it reads
+#     ${POSTGRES_PASSWORD} from .env.
+#   * the postgres server — receives the password via a Docker *secret* file
+#     (./secrets/postgres_password) so it never lands in `docker inspect`.
+# You MUST set the SAME value in both: POSTGRES_PASSWORD in .env AND the contents
+# of ./secrets/postgres_password. If they diverge, Studio cannot authenticate.
+#
+# Security posture
+# ----------------
+#   * NEVER set HIMMY_STUDIO_GUARD=0. The loopback guard already passes for the
+#     localhost-mapped 8765 port. To reach Studio over a domain or through a
+#     reverse proxy, add that host to HIMMY_STUDIO_ALLOW_HOSTS — do NOT disable
+#     the guard.
+#   * Secrets are delivered as files (compose `secrets:` for Postgres; a RO bind
+#     mount at /run/himmy-secrets for app-managed secrets), keeping them out of
+#     image layers and `docker inspect` output.
+# =============================================================================
+
+# Explicit project name: without it, compose derives the project from the
+# directory basename ("compose"), yielding volumes like compose_himmy_state.
+name: himmy-full
+
+services:
+  studio:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: himmy-studio:${HIMMY_VERSION:-0.1.0}
+    container_name: himmy_studio
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      # Durable Postgres-backed storage. Password comes from ${POSTGRES_PASSWORD}
+      # in .env (see "Password duplication" in the header).
+      HIMMY_DATABASE_URL: "postgresql://himmy:${POSTGRES_PASSWORD}@postgres:5432/himmy"
+      # In-cluster Ollama (only reachable when the `ollama` profile is up).
+      HIMMY_OLLAMA_URL: "http://ollama:11434"
+      # Hosts allowed past the Studio loopback guard (e.g. a proxy/domain).
+      # Empty by default — only localhost:8765 is reachable. Never set GUARD=0.
+      HIMMY_STUDIO_ALLOW_HOSTS: "${HIMMY_STUDIO_ALLOW_HOSTS:-}"
+      # App-managed secrets (e.g. HIMMY_ENCRYPTION_KEY) read from files in the
+      # RO-mounted directory below.
+      HIMMY_SECRETS: "file"
+      HIMMY_SECRETS_DIR: "/run/himmy-secrets"
+      # Optional hardening passthroughs (set in .env to enable).
+      HIMMY_AUTH_MODE: "${HIMMY_AUTH_MODE:-}"
+      HIMMY_INTERNAL_API_KEY: "${HIMMY_INTERNAL_API_KEY:-}"
+      HIMMY_CORS_ORIGINS: "${HIMMY_CORS_ORIGINS:-}"
+      HIMMY_RATE_LIMIT: "${HIMMY_RATE_LIMIT:-}"
+      # Inject the ratelimit.py defaults explicitly: those os.environ.get defaults
+      # only apply to ABSENT vars, but compose injects empty strings for unset
+      # vars unless we supply a default — float("") would crash startup. Window
+      # defaults to 1s; burst defaults to RATE_LIMIT (nested defaults work in v2).
+      HIMMY_RATE_WINDOW: "${HIMMY_RATE_WINDOW:-1}"
+      HIMMY_RATE_BURST: "${HIMMY_RATE_BURST:-${HIMMY_RATE_LIMIT:-}}"
+    volumes:
+      # SQLite-backed sidecar stores (traces/run store/sessions) live in
+      # /app/.himmy. Named volume (not a bind mount) so uid 10001 owns it.
+      - himmy_state:/app/.himmy
+      # App-managed secrets, read-only. Operator-provided files; never written.
+      - ./secrets:/run/himmy-secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: himmy_postgres_full
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: himmy
+      POSTGRES_USER: himmy
+      # Password delivered via a file secret so it stays out of `docker inspect`.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    # No host port published: avoids colliding with the dev stack's 5433 and
+    # keeps Postgres off the host network. Uncomment to expose for debugging
+    # (5434 chosen to dodge the dev stack's 5433):
+    # ports:
+    #   - "5434:5432"
+    volumes:
+      # Distinct from the dev stack's himmy_pgdata so both can coexist.
+      - himmy_pgdata_full:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U himmy -d himmy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    # Pinned to match the CI Ollama pin (0.13.5). No digest — tag is sufficient
+    # for a self-hosted deployment and keeps the file portable across registries.
+    image: ollama/ollama:0.13.5
+    container_name: himmy_ollama
+    restart: unless-stopped
+    profiles: ["ollama"]
+    volumes:
+      - himmy_ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  ollama-init:
+    # One-shot model puller. Idempotent: `ollama pull` is a no-op if the model
+    # is already present, so re-running `up` is safe. Exits after pulling.
+    image: ollama/ollama:0.13.5
+    container_name: himmy_ollama_init
+    profiles: ["ollama"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        ollama pull qwen2.5:3b-instruct &&
+        ollama pull nomic-embed-text &&
+        ollama pull qwen3-embedding
+    restart: "no"
+
+volumes:
+  himmy_state:
+  himmy_pgdata_full:
+  himmy_ollama:
+    # Explicit, unprefixed name (air-gap installer contract): the offline
+    # installer restores pulled models into a volume literally named
+    # "himmy_ollama". Without this `name:`, compose would create
+    # "<project>_himmy_ollama" and never mount the restored models — an
+    # air-gapped deploy would boot with zero models.
+    name: himmy_ollama
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password

@@ -1,0 +1,56 @@
+himmy Studio has been deployed.
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+Chart: {{ include "himmy-studio.chart" . }}  (appVersion {{ .Chart.AppVersion }})
+
+1. Reach the Studio:
+
+{{- if .Values.ingress.enabled }}
+   Ingress is enabled. Try one of:
+{{- range .Values.ingress.hosts }}
+{{- $host := .host }}
+{{- range .paths }}
+     http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host }}{{ .path }}
+{{- end }}
+{{- end }}
+{{- else }}
+   No ingress is enabled. Port-forward to reach it locally:
+
+     kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "himmy-studio.fullname" . }} 8765:{{ .Values.service.port }}
+
+   then open http://localhost:8765 and check health:
+
+     curl -s http://localhost:8765/health      # -> {"status":"ok"}
+{{- end }}
+
+2. Loopback-guard reminder:
+
+   The /api/studio paths are guarded. Requests are allowed only when the Host
+   header is loopback (localhost / 127.0.0.1 / ::1 / testserver — always
+   allowed) OR is listed in HIMMY_STUDIO_ALLOW_HOSTS. /health is UNGUARDED.
+
+{{- if .Values.ingress.enabled }}
+   This chart automatically adds every ingress host to the allow-list, so the
+   ingress above will not 403 itself. Current allow-list value:
+
+     HIMMY_STUDIO_ALLOW_HOSTS={{ include "himmy-studio.allowHosts" . }}
+
+   If you front the Studio with an additional proxy/CDN, add that hostname to
+   .Values.studio.allowHosts and ensure the proxy forwards the original Host
+   header (e.g. nginx: proxy_set_header Host $host;).
+{{- else }}
+   Port-forwarding uses a localhost Host header, which is always allowed.
+   If you later add an ingress or external proxy, put its hostname in
+   .Values.studio.allowHosts (ingress hosts are added automatically).
+{{- end }}
+
+3. Verify storage / migrations from inside the pod:
+
+     kubectl --namespace {{ .Release.Namespace }} exec deploy/{{ include "himmy-studio.fullname" . }} -- himmy doctor --storage
+
+{{- if .Values.persistence.enabled }}
+
+NOTE: This deployment is single-replica by design. The /app/.himmy SQLite
+stores live on an RWO PVC and are single-writer — do NOT raise replicaCount.
+{{- end }}

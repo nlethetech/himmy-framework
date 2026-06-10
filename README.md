@@ -539,6 +539,24 @@ this repo the SPA is already built and committed under `himmy/api/_studio_static
 > 8000, `himmy studio` to 8765, the Vite dev server to 5173 — don't conflate the three.
 > `starlette` is pinned `>=0.49.1` for a CVE fix.
 
+## Deploying
+
+Past `pip install` + `himmy studio` on one machine, there are durable, multi-user shapes —
+all offline-capable, secrets file-delivered, single-writer-honest:
+
+- **Docker Compose** — [`deploy/compose/docker-compose.yml`](deploy/compose/docker-compose.yml):
+  studio + Postgres (+ an optional bundled Ollama behind the `ollama` profile). `make
+  compose-up` (or `make compose-up-ollama`).
+- **Kubernetes** — the minimal [`deploy/helm/himmy-studio/`](deploy/helm/himmy-studio/) chart
+  (single-replica by design — the `.himmy` SQLite stores are single-writer; external Postgres
+  only). `make helm-lint` to validate.
+- **Air-gapped** — `scripts/airgap_bundle.py` builds a no-network install bundle (images +
+  wheelhouse + Ollama models); see [`docs/enterprise/airgap.md`](docs/enterprise/airgap.md).
+
+The full runbook — configuration reference, reverse-proxy/TLS and the loopback-guard
+interplay, WAL-safe backup/restore, and the upgrade procedure — is in
+[`docs/enterprise/deployment.md`](docs/enterprise/deployment.md).
+
 ---
 
 # Install & extras

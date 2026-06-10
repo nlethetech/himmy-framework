@@ -1,0 +1,15 @@
+apiVersion: v2
+name: himmy-studio
+description: |
+  A minimal Helm chart for himmy Studio — an offline-first, local-first agent
+  framework. Single-replica by design (SQLite sidecar stores are single-writer);
+  external Postgres only (no bundled database subchart).
+type: application
+# Chart version — bump on every chart change.
+version: 0.1.0
+# Application version — tracks the himmy release this chart targets.
+appVersion: "0.1.0"
+keywords:
+  - himmy
+  - studio
+  - agent-framework

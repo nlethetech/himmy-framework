@@ -1068,7 +1068,140 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if report.next_step is not None:
         print("\nnext step:")
         print(f"  → {report.next_step.message}")
+
+    if getattr(args, "storage", False):
+        _doctor_storage_section()
     return 0
+
+
+def _redact_dsn(dsn: str) -> str:
+    """Return ``dsn`` with any password component replaced by ``***``.
+
+    Parses with :func:`urllib.parse.urlsplit` and rebuilds the netloc so a raw
+    password is never echoed to the console. If the DSN cannot be parsed we fall
+    back to a fully-masked placeholder rather than risk leaking it.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(dsn)
+        if parts.password is None:
+            return dsn
+        userinfo = parts.username or ""
+        if userinfo:
+            userinfo = f"{userinfo}:***"
+        host = parts.hostname or ""
+        # ``urlsplit`` strips the brackets from an IPv6 host (``[::1]`` → ``::1``);
+        # re-bracket it so the rebuilt netloc stays a valid URL (and the trailing
+        # ``:port`` isn't ambiguous with the address's own colons).
+        if ":" in host:
+            host = f"[{host}]"
+        if parts.port is not None:
+            host = f"{host}:{parts.port}"
+        netloc = f"{userinfo}@{host}" if userinfo else host
+        return urlunsplit(
+            (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+        )
+    except Exception:  # noqa: BLE001 - never risk echoing the raw DSN
+        return "<redacted>"
+
+
+def _doctor_postgres_report(dsn: str) -> None:
+    """Print the Postgres backend report; degrade to one warning line on any error.
+
+    Compares the ``schema_migrations`` versions applied in the live database against
+    ``max(STORAGE_MIGRATIONS)`` in the shipped code, so an operator can see whether
+    pending migrations exist (they are auto-applied at server startup). Any failure
+    — asyncpg missing, connection refused, query error — collapses to a single
+    ``warning:`` line; this command must never crash.
+    """
+    import asyncio
+
+    from himmy.services.storage.postgres import STORAGE_MIGRATIONS
+
+    print(f"  dsn: {_redact_dsn(dsn)}")
+    code_max = max(version for version, _, _ in STORAGE_MIGRATIONS)
+
+    async def _query() -> list[int]:
+        import asyncpg  # noqa: PLC0415 - lazy: optional dependency
+
+        conn = await asyncio.wait_for(asyncpg.connect(dsn), timeout=5.0)
+        try:
+            rows = await conn.fetch("SELECT version FROM schema_migrations")
+        finally:
+            await conn.close()
+        return sorted(int(row["version"]) for row in rows)
+
+    try:
+        applied = asyncio.run(_query())
+    except Exception as exc:  # noqa: BLE001 - offline-first: degrade, never crash
+        print(f"  warning: could not query schema_migrations ({exc})")
+        return
+
+    print(f"  applied: {applied}")
+    print(f"  code max: {code_max}")
+    pending = sorted(
+        version for version, _, _ in STORAGE_MIGRATIONS if version not in applied
+    )
+    if pending:
+        print(f"  PENDING: {pending} (auto-applied at server startup)")
+    else:
+        print("  up to date")
+
+
+def _doctor_sqlite_report(base_dir: Path) -> None:
+    """Print one line per ``*.db`` store under ``base_dir`` (size + journal mode)."""
+    import sqlite3
+
+    if not base_dir.is_dir():
+        print(f"  (no {base_dir}/ stores yet)")
+        return
+    dbs = sorted(base_dir.glob("*.db"))
+    if not dbs:
+        print(f"  (no {base_dir}/ stores yet)")
+        return
+    for db in dbs:
+        try:
+            size = db.stat().st_size
+        except OSError as exc:
+            print(f"  {db.name}: (unreadable: {exc})")
+            continue
+        try:
+            conn = sqlite3.connect(db)
+            try:
+                row = conn.execute("PRAGMA journal_mode").fetchone()
+                mode = str(row[0]) if row else "?"
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            print(f"  {db.name}: {size} bytes (unreadable: {exc})")
+            continue
+        print(f"  {db.name}: {size} bytes, journal_mode={mode}")
+
+
+def _doctor_storage_section() -> None:
+    """Report the durable storage backend (Postgres vs SQLite) and its state.
+
+    Mirrors :mod:`himmy.services.storage.factory` backend selection so the report
+    matches what a server entrypoint would actually use: a ``postgres://`` DSN in
+    ``HIMMY_DATABASE_URL`` selects Postgres (migration report), otherwise the
+    file-backed SQLite stores under the configured store path's directory.
+    """
+    from himmy.config.secrets import get_secret
+    from himmy.services.storage.factory import (  # noqa: PLC2701
+        HIMMY_STORE_PATH,
+        _is_postgres_dsn,
+    )
+
+    print("\nstorage:")
+    dsn = get_secret("HIMMY_DATABASE_URL")
+    if _is_postgres_dsn(dsn):
+        print("  backend: postgresql")
+        _doctor_postgres_report(dsn or "")
+        return
+    print("  backend: sqlite")
+    store_path = get_secret("HIMMY_STORE_PATH") or HIMMY_STORE_PATH
+    _doctor_sqlite_report(Path(store_path).parent)
 
 
 # ----------------------------------------------------------------------- trace

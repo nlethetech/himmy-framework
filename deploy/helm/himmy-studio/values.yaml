@@ -1,0 +1,154 @@
+# Default values for himmy-studio.
+#
+# This is a MINIMAL chart on purpose. The following are intentionally OUT OF
+# SCOPE and are NOT provided by this chart — wire them in yourself if you need
+# them:
+#   - HorizontalPodAutoscaler (HPA)        — single-replica only (see replicaCount)
+#   - PodDisruptionBudget (PDB)
+#   - NetworkPolicy
+#   - ServiceMonitor / Prometheus operator integration
+#   - Bundled Postgres subchart            — external Postgres only (see database)
+#   - Multi-replica / horizontal scaling   — SQLite sidecar stores are single-writer
+#
+# himmy keeps a cwd-relative state dir at /app/.himmy containing SQLite stores
+# that are single-writer. Even when an external Postgres is configured, those
+# sidecar SQLite stores remain single-writer, so this chart is hard-pinned to a
+# single replica with a Recreate update strategy and an RWO PVC.
+
+# -- Number of pod replicas. MUST stay 1: the /app/.himmy SQLite stores live on
+# an RWO PVC and are single-writer. Scaling past 1 corrupts state. See header.
+replicaCount: 1
+
+image:
+  # NOTE: there is no published himmy-studio registry image. Build it from the
+  # repo Dockerfile and push it to your own registry, then set repository/tag.
+  repository: himmy-studio
+  pullPolicy: IfNotPresent
+  # Defaults to .Chart.AppVersion when empty.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Use a specific ServiceAccount for the pod. This chart does NOT create a
+# ServiceAccount; leave empty to use the namespace "default" SA. Set this to
+# the name of a SA you manage yourself if you need one (e.g. for IRSA/Workload
+# Identity).
+serviceAccountName: ""
+
+# -- Pod-level annotations.
+podAnnotations: {}
+
+# -- Pod-level securityContext. himmy runs as uid 10001 in the image; fsGroup
+# ensures the mounted PVC is group-writable by that uid.
+podSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  runAsNonRoot: true
+
+# -- Container-level securityContext.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8765
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+  hosts:
+    - host: himmy.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: himmy-tls
+    #   hosts:
+    #     - himmy.example.com
+
+# -- Studio loopback-guard configuration.
+# The /api/studio paths are guarded: requests whose Host is not loopback
+# (localhost / 127.0.0.1 / ::1 / testserver, always allowed) AND not in the
+# allow-list are rejected. /health is UNGUARDED.
+# Every ingress host is automatically unioned into HIMMY_STUDIO_ALLOW_HOSTS by
+# the chart (see templates/_helpers.tpl "himmy-studio.allowHosts") so an
+# enabled ingress can never 403 itself. Add any extra proxy/CDN hostnames here.
+studio:
+  allowHosts: []
+  #   - studio.internal.example.com
+
+# -- External Postgres (optional). himmy resolves HIMMY_DATABASE_URL via
+# get_secret(), so it works from an inline env value OR a mounted file-secret.
+# Provide EITHER an inline url OR an existingSecret+key (existingSecret wins).
+# Leave both empty to fall back to the default SQLite store on the PVC.
+# NOTE: no Postgres is deployed by this chart — bring your own.
+database:
+  # Inline DSN, e.g. postgresql://himmy:pass@my-postgres:5432/himmy
+  url: ""
+  # Reference an existing Secret instead of an inline DSN.
+  existingSecret: ""
+  existingSecretKey: HIMMY_DATABASE_URL
+
+# -- File-based secrets. When secrets.existingSecret is set, the Secret's keys
+# are mounted as one-file-per-key under /run/himmy-secrets and the app is told
+# to read them (HIMMY_SECRETS=file, HIMMY_SECRETS_DIR=/run/himmy-secrets).
+# Each Secret KEY becomes a secret NAME; the file CONTENT is the value.
+secrets:
+  existingSecret: ""
+  mountPath: /run/himmy-secrets
+
+# -- Persistence for the cwd-relative /app/.himmy state dir (SQLite stores).
+# RWO because the stores are single-writer (matches replicaCount: 1).
+persistence:
+  enabled: true
+  # Use an existing PVC instead of creating one.
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 5Gi
+  annotations: {}
+
+# -- Free-form environment passthrough. Every key/value here is set verbatim as
+# a container env var. Use this for HIMMY_OLLAMA_URL, HIMMY_AUTH_MODE,
+# HIMMY_CORS_ORIGINS, rate-limit/encryption vars, etc.
+# Example:
+#   env:
+#     HIMMY_OLLAMA_URL: http://ollama.default.svc:11434
+#     HIMMY_AUTH_MODE: apikey
+env: {}
+
+# -- Liveness/readiness probe tunables. Probes hit the UNGUARDED /health
+# endpoint. A Host: localhost header is sent defensively (see deployment.yaml).
+probes:
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+resources: {}
+  # limits:
+  #   cpu: "1"
+  #   memory: 1Gi
+  # requests:
+  #   cpu: 250m
+  #   memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

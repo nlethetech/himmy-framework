@@ -32,10 +32,18 @@ COPY pyproject.toml README.md ./
 COPY himmy/ himmy/
 # the SPA built in stage 1 (package data served by `himmy studio`)
 COPY --from=web /app/himmy/api/_studio_static/ himmy/api/_studio_static/
-RUN pip install ".[studio,knowledge]"
+# postgres+encryption+auth match the air-gap wheelhouse extras: the compose stack
+# mandates HIMMY_DATABASE_URL (PostgresStorageService._require_asyncpg() raises
+# without [postgres]), and .env.example documents HIMMY_ENCRYPTION_KEY (encryption)
+# and HIMMY_AUTH_MODE=oidc (auth), so those features must actually be installed.
+RUN pip install ".[studio,knowledge,postgres,encryption,auth]"
 
 # run as a non-root user
 RUN useradd --create-home --uid 10001 himmy && chown -R himmy /app
+# `.himmy/` is cwd-relative (/app/.himmy). When a named volume is mounted there
+# it is created root-owned, so every SQLite store fails on first boot for uid
+# 10001. Pre-create + chown the mount point so the volume inherits himmy.
+RUN mkdir -p /app/.himmy && chown himmy /app/.himmy
 USER himmy
 
 EXPOSE 8765

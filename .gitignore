@@ -47,3 +47,10 @@ studio/*.tsbuildinfo
 
 # Playwright MCP browser artifacts (local testing)
 .playwright-mcp/
+
+# Deployment secrets & local env (deploy/compose/) — operator-provided, never
+# committed. Keep the secrets/ dir itself (via .gitkeep) so the RO bind mount and
+# the postgres_password file source have somewhere to land.
+deploy/compose/secrets/*
+!deploy/compose/secrets/.gitkeep
+deploy/compose/.env

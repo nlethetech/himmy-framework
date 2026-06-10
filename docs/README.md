@@ -63,6 +63,9 @@ under `himmy/`.
 | [Governance](./services/governance.md) | Retention, crypto-shredding for right-to-erasure, erasure tombstones. |
 | [Audit](./services/audit.md) | `SecurityEvent` records, signed bundles / SIEM export, tamper-evidence. |
 | [CLI & Studio](./architecture/cli-and-studio.md) | The `himmy` CLI subcommands and the local Studio web GUI. |
+| [Deployment](./enterprise/deployment.md) | The operations runbook: deployment shapes (pip / compose / Helm), the `HIMMY_*` configuration reference, reverse-proxy/TLS + loopback guard, health monitoring, and WAL-safe backup/restore & DR. |
+| [Upgrades](./enterprise/upgrades.md) | Versioned upgrade notes + the forward-only procedure (backup → install → start → `doctor --storage`); migrations are additive/idempotent, no rollback. |
+| [Air-gapped install](./enterprise/airgap.md) | Building and installing the no-network bundle (images + wheelhouse + Ollama models) with `scripts/airgap_bundle.py`, plus model-licensing notes. |
 
 ## Existing design notes
 

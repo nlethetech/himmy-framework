@@ -1,0 +1,16 @@
+# Patterns to ignore when building Helm packages.
+.DS_Store
+.git/
+.gitignore
+.idea/
+*.tmproj
+.vscode/
+# Common backup/editor artifacts
+*.bak
+*.orig
+*.swp
+*~
+# CI / docs that should not ship inside the package
+*.md
+ci/
+tests/

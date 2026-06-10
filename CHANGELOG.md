@@ -8,6 +8,57 @@ providers, Postgres/pgvector, and observability.
 ## [Unreleased]
 
 ### Added
+- **Deployment engineering — ship himmy, don't hand-assemble it.** Closes the gap
+  between the container-ready runtime and the missing artifacts an operator needs to
+  stand it up.
+  - **Full-stack compose** (`deploy/compose/docker-compose.yml`, project `himmy-full`):
+    studio + a durable `pgvector/pgvector:pg16` (no published host port, distinct
+    `himmy_pgdata_full` volume so it coexists with the dev stack), with an optional
+    bundled Ollama + one-shot model puller behind the `ollama` profile. Secrets are
+    file-delivered (compose `secrets:` for Postgres, an RO `/run/himmy-secrets` mount for
+    app secrets) so credentials stay out of `docker inspect`. Template in
+    `deploy/compose/.env.example`. The Dockerfile pre-creates + chowns `/app/.himmy` so a
+    named volume mounted there is owned by uid 10001 (else every SQLite store fails on
+    first boot).
+  - **Operations runbook + upgrade notes + air-gap guide** under `docs/enterprise/`
+    (`deployment.md`, `upgrades.md`, `airgap.md`): three deployment shapes, the full
+    `HIMMY_*` configuration reference, reverse-proxy/TLS with the loopback-guard interplay
+    (forward the original `Host`, list it in `HIMMY_STUDIO_ALLOW_HOSTS`, or eat a 403),
+    WAL-safe backup/restore + DR, the forward-only/no-rollback upgrade procedure, and
+    model-licensing notes for the offline bundle.
+  - **`himmy doctor --storage`** reports the storage backend (redacted DSN), applied vs
+    available migrations (Postgres `schema_migrations` vs `max(STORAGE_MIGRATIONS)`, with
+    the pending list), and the SQLite stores under `.himmy/` (existence, size, journal
+    mode) — so "is this site migrated?" is answerable without a psql session.
+  - **Operations scripts** (`scripts/ops_health.py`, `scripts/ops_backup.py`,
+    `scripts/ops_provision.py`), stdlib-only and ruff/mypy-clean. `ops_health` is a cheap
+    offline probe (HTTP `/health`, disk free, SQLite `quick_check`, Postgres `SELECT 1` +
+    migration version, Ollama `/api/tags`) with `--json` and 0/1/2 exit codes that slots
+    into a HEALTHCHECK or cron. `ops_backup` snapshots each `.himmy/*.db` via the SQLite
+    online-backup API (WAL-safe — never a bare `cp`), bundles secrets + an optional
+    `pg_dump -Fc` into a checksummed `tar.gz`, and `restore` verifies every SHA-256 and
+    refuses to clobber a live WAL db without `--force`. `ops_provision` generates a
+    starter `.env` + secrets.
+  - **Minimal Helm chart** (`deploy/helm/himmy-studio/`): single-replica by design
+    (the `.himmy` SQLite sidecar stores are single-writer — `replicaCount>1` corrupts
+    state), external Postgres only (no bundled subchart), conditional ingress, file-secret
+    mounts, an RWO PVC at `/app/.himmy`, and a helper that unions every ingress host into
+    `HIMMY_STUDIO_ALLOW_HOSTS` so an enabled ingress can never 403 itself. HPA/PDB/
+    NetworkPolicy/ServiceMonitor are intentionally out of scope.
+  - **Air-gap bundle tooling** (`scripts/airgap_bundle.py` + `scripts/airgap_install.sh`):
+    `build` assembles `docker save`d images + a manylinux `pip download` wheelhouse + the
+    Ollama models + the compose files + a checksummed manifest into one tar; the POSIX
+    installer needs only docker + compose on the target. `build --dry-run` prints the plan
+    + a size estimate with zero side effects (what CI exercises). `--models` overrides the
+    multi-GB default set.
+  - **Deploy CI** (`.github/workflows/deploy.yml`): builds the image and polls `/health`,
+    lints + renders the Helm chart in two value permutations, validates the compose file
+    with and without the ollama profile, and runs the air-gap `--dry-run` — never pulling
+    real models or building the real bundle. Triggered only by changes to the deployment
+    surface (`Dockerfile`, `deploy/**`, the deploy scripts, the workflow) + push to main,
+    so `ci.yml` stays fast.
+  - **Makefile** targets `docker-build`, `compose-up`/`compose-up-ollama`/`compose-down`,
+    `ops-health`, `ops-backup`, `helm-lint`, `airgap-bundle`.
 - **RAG quality, measured on real data (not toy queries).** Two complementary evals:
   a fast **regression gate** (`tests/integration/test_rag_eval.py`, `-m integration`) on a
   hand-built confusable corpus with floors derived from live qwen3-embedding numbers; and

@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "himmy-studio.fullname" . }}
+  labels:
+    {{- include "himmy-studio.labels" . | nindent 4 }}
+spec:
+  # Single replica only — see values.yaml header (SQLite stores are
+  # single-writer on an RWO PVC).
+  replicas: {{ .Values.replicaCount }}
+  # Recreate (not RollingUpdate): the RWO PVC can only be attached to one pod,
+  # so the old pod must terminate before the new one can mount it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "himmy-studio.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "himmy-studio.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.serviceAccountName }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: studio
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8765
+              protocol: TCP
+          env:
+            # --- Loopback guard allow-list -----------------------------------
+            # Unioned with ingress hosts (see _helpers.tpl) so ingress can't
+            # 403 itself. Empty string is fine — loopback is always allowed.
+            - name: HIMMY_STUDIO_ALLOW_HOSTS
+              value: {{ include "himmy-studio.allowHosts" . | quote }}
+            {{- if .Values.secrets.existingSecret }}
+            # --- File-based secrets ------------------------------------------
+            - name: HIMMY_SECRETS
+              value: "file"
+            - name: HIMMY_SECRETS_DIR
+              value: {{ .Values.secrets.mountPath | quote }}
+            {{- end }}
+            {{- if .Values.database.existingSecret }}
+            # --- External Postgres via existing Secret -----------------------
+            - name: HIMMY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | quote }}
+                  key: {{ .Values.database.existingSecretKey | quote }}
+            {{- else if .Values.database.url }}
+            # --- External Postgres via inline DSN ----------------------------
+            - name: HIMMY_DATABASE_URL
+              value: {{ .Values.database.url | quote }}
+            {{- end }}
+            {{- range $key, $value := .Values.env }}
+            # --- Free-form passthrough ---------------------------------------
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          # Probes hit the UNGUARDED /health endpoint. The Host: localhost
+          # header is sent defensively in case a future build extends the guard
+          # to /health — localhost is always allowed by the guard.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /app/.himmy
+            {{- if .Values.secrets.existingSecret }}
+            - name: secrets
+              mountPath: {{ .Values.secrets.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: state
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "himmy-studio.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.secrets.existingSecret }}
+        - name: secrets
+          secret:
+            secretName: {{ .Values.secrets.existingSecret }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
