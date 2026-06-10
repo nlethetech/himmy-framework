@@ -74,7 +74,9 @@ async def run_probe(specs: list[Any] | None = None) -> dict[str, Any]:
             "results": [],
         }
     suite = _quick_suite()
-    cards = await BenchmarkRunner(trials=1).run(suite, specs)
+    # The Doctor probe is a freshness check, not a tracked benchmark run — keep it out
+    # of the committed run history.
+    cards = await BenchmarkRunner(trials=1, append_history=False).run(suite, specs)
     when = utc_now_iso()
     try:
         save_scorecards(cards, suite_name=suite.name, when=when)

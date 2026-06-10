@@ -1,0 +1,142 @@
+name: multiagent
+# Multi-agent collaboration benchmark: the framework's core differentiator (handoff
+# routing, supervisor delegation, group-chat selection) graded as a suite. Each task
+# declares a small 2-3 agent `team` instead of running as a single agent; the runner
+# builds the right orchestrator (handoff/delegation via MultiAgentOrchestrator, or a
+# GroupChatOrchestrator). The synthetic collaboration tools (transfer_to_<peer> /
+# ask_<worker>) show up in the trial's ordered tool sequence, so `trajectory` graders
+# assert on the routing itself — not just the final text.
+#
+# These tasks are REPORTED, not part of the baseline gate subset, until real small-model
+# pass rates are measured. They are designed with unambiguous routing cues so a competent
+# small local model can pass them; offline tests drive them with scripted stub providers.
+tasks:
+  # --- (a) handoff routing: front agent must transfer to the RIGHT specialist ----------
+  - id: handoff_routing
+    category: multiagent
+    # Unambiguous cue: a math question must go to the math specialist, never the weather
+    # one. Graded on BOTH the answer (the computed value) and the routing trajectory
+    # (transferred to math, did NOT transfer to weather).
+    prompt: >
+      A user asks: "What is 6 multiplied by 7?" Route this to the correct specialist and
+      report their answer.
+    packs: [utils]
+    grade: { type: numeric, value: 42 }
+    trajectory:
+      type: all_of
+      of:
+        - { type: tool_called, value: transfer_to_math }
+        - { type: tool_not_called, value: transfer_to_weather }
+    team:
+      mode: handoff
+      entry: router
+      members:
+        - name: router
+          persona:
+            description: A front-desk router that dispatches to the right specialist.
+            instructions:
+              - "You do not answer questions yourself."
+              - "For arithmetic / math questions, transfer to the math specialist."
+              - "For weather questions, transfer to the weather specialist."
+          handoffs: [math, weather]
+        - name: math
+          persona:
+            description: A math specialist who answers arithmetic with the calculator.
+            instructions: ["Use the calculator tool, then state the numeric answer."]
+          tools: [calculator]
+        - name: weather
+          persona:
+            description: A weather specialist. (Wrong target for math questions.)
+            instructions: ["Answer weather questions only."]
+
+  # --- (b) delegation + synthesis: manager asks a worker, folds in its result ----------
+  - id: delegation_synthesis
+    category: multiagent
+    # The manager owns no domain tool; it must delegate to the researcher worker and
+    # then incorporate the worker's answer (the code word) into its final response.
+    prompt: >
+      You are coordinating a team. Find out the project code word by asking your
+      researcher, then report the code word in your final answer.
+    packs: [files]
+    files:
+      codeword.txt: "The project code word is FALCON.\n"
+    grade: { type: contains, value: falcon }
+    trajectory:
+      type: tool_called
+      value: ask_researcher
+    team:
+      mode: handoff
+      entry: manager
+      members:
+        - name: manager
+          persona:
+            description: A manager who coordinates by delegating to workers.
+            instructions:
+              - "You have no file access; you must ask the researcher for facts."
+              - "Ask the researcher for the code word, then report it."
+          delegates: [researcher]
+        - name: researcher
+          persona:
+            description: A researcher who reads files to find facts.
+            instructions: ["Read codeword.txt and report the code word it contains."]
+          tools: [read_file]
+
+  # --- (c) no-handoff control: front agent should answer itself, not transfer ----------
+  - id: no_handoff_control
+    category: multiagent
+    # A general-knowledge question the router can answer directly — it must NOT transfer
+    # to either specialist. Catches over-eager routing (a handoff when none is warranted).
+    prompt: >
+      A user asks: "What is the capital of France? Answer in one word." Answer it
+      yourself if you can; only transfer if it needs a specialist.
+    grade: { type: contains, value: paris }
+    trajectory:
+      type: all_of
+      of:
+        - { type: tool_not_called, value: transfer_to_math }
+        - { type: tool_not_called, value: transfer_to_weather }
+    team:
+      mode: handoff
+      entry: router
+      members:
+        - name: router
+          persona:
+            description: A generalist front desk that answers what it can.
+            instructions:
+              - "Answer general-knowledge questions yourself in one word."
+              - "Only transfer to a specialist for math or weather questions."
+          handoffs: [math, weather]
+        - name: math
+          persona:
+            description: A math specialist.
+            instructions: ["Answer arithmetic only."]
+          tools: [calculator]
+        - name: weather
+          persona:
+            description: A weather specialist.
+            instructions: ["Answer weather questions only."]
+
+  # --- (d) group-chat selector: the right next speaker is observable -------------------
+  - id: group_chat_selection
+    category: multiagent
+    # A round-robin group chat over a fixed two-member panel: the analyst opens, the
+    # editor follows. The selection is observable in the speaker order / final answer.
+    # Grades the final synthesized answer; a scripted/real model puts the keyword in.
+    prompt: >
+      Discuss and agree on a one-word slogan for a tea brand, then state the slogan.
+      The agreed slogan is "Brew".
+    grade: { type: contains, value: brew }
+    team:
+      mode: group_chat
+      selector: round_robin
+      max_rounds: 4
+      entry: analyst
+      members:
+        - name: analyst
+          persona:
+            description: An analyst who proposes ideas.
+            instructions: ["Propose a one-word slogan."]
+        - name: editor
+          persona:
+            description: An editor who finalizes the agreed slogan.
+            instructions: ["State the final agreed one-word slogan."]

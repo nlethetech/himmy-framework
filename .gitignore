@@ -48,6 +48,15 @@ studio/*.tsbuildinfo
 # Playwright MCP browser artifacts (local testing)
 .playwright-mcp/
 
+# Ad-hoc live-model verification scripts (drive a real local Ollama/Claude CLI — NOT
+# pytest-collected, not part of the offline suite). Local-only; never committed.
+tests/live/
+
+# Scratch agent specs at the repo root (Studio's agent picker globs *.agent.yaml here).
+# The tracked default.agent.yaml is the only committed one; these are local scratch.
+/ollama-calc.agent.yaml
+/personal-assistant.agent.yaml
+
 # Deployment secrets & local env (deploy/compose/) — operator-provided, never
 # committed. Keep the secrets/ dir itself (via .gitkeep) so the RO bind mount and
 # the postgres_password file source have somewhere to land.

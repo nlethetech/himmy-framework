@@ -130,6 +130,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--extra-packs", help="comma list of distractor tool packs (to test routing)"
     )
     p_bench.add_argument("--temperature", type=float, default=0.0)
+    p_bench.add_argument(
+        "--judge-model",
+        help="judge model for LLM-judge-tier tasks (must differ from each candidate); "
+        "without it, judge-tier trials are recorded ungraded",
+    )
+    p_bench.add_argument(
+        "--judge-provider",
+        help="provider for --judge-model (default: each candidate's own provider)",
+    )
     p_bench.add_argument("--json", help="also write the full results as JSON")
     p_bench.add_argument(
         "--fail-under",

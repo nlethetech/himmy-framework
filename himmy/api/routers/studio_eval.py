@@ -11,6 +11,9 @@ of the Studio family, see :mod:`himmy.api.routers.studio_common`):
     explicitly picks one.
   * ``GET  /baseline`` — ``benchmarks/baseline.json`` parsed into display rows
     (metric · floor/ceiling · last measured, plus the SHA/date it was cut at).
+  * ``GET  /history``  — the ``benchmarks/history.jsonl`` time series, grouped per
+    ``(model, suite)``: recent runs (accuracy/error-rate over time) plus the
+    latest-vs-previous trend deltas and regression flags from the history loader.
 """
 
 from __future__ import annotations
@@ -50,6 +53,10 @@ _LIVE_CASE_TIMEOUT_S = 300.0
 #: The synthetic suite id for "run the bench gate subset".
 _BENCH_GATE_ID = "bench:gate"
 
+#: A history view shows at most this many recent runs per ``(model, suite)``
+#: (newest last) — older points stay on disk but don't bloat the response.
+_MAX_HISTORY_RUNS = 50
+
 #: Display model id per provider when the caller doesn't pick one.
 _DEFAULT_MODELS = {"stub": "stub", "claude-cli": "haiku", "ollama": "llama3.2"}
 
@@ -58,6 +65,17 @@ def _baseline_file() -> Path:
     from himmy.api.studio_service import project_root
 
     return project_root() / "benchmarks" / "baseline.json"
+
+
+def _history_file() -> Path:
+    # Share the runner's resolver so the Studio History panel reads the SAME file the CLI
+    # bench writes — package-anchored (or HIMMY_BENCH_HISTORY_PATH), falling back to the
+    # launch cwd. Resolving cwd-only here meant a History panel that stayed permanently
+    # empty whenever Studio was launched outside the writer's repo root (or pip-installed).
+    from himmy.api.studio_service import project_root
+    from himmy.benchmark.history import resolve_history_path
+
+    return resolve_history_path(project_root())
 
 
 def _cap(text: str, n: int = _DETAIL_CAP) -> str:
@@ -236,6 +254,156 @@ async def baseline() -> BaselineView:
         min_trials=int(gate.get("min_trials") or 0),
         gate_tasks=[str(t) for t in (gate.get("tasks") or [])],
         models=models,
+    )
+
+
+# ---- GET /history -----------------------------------------------------------
+
+
+class HistoryPoint(BaseModel):
+    """One recorded run of a ``(model, suite)`` pair (a point on the trend line)."""
+
+    when: str
+    sha: str | None = None
+    trials: int = 0
+    accuracy: float | None = None
+    tool_call_accuracy: float | None = None
+    error_rate: float | None = None
+    p50_latency_s: float | None = None
+
+
+class HistoryTrendRow(BaseModel):
+    """Latest-vs-previous delta for one metric, with a regression flag."""
+
+    metric: str
+    latest: float | None = None
+    previous: float | None = None
+    delta: float | None = None
+    regressed: bool = False
+
+
+class HistorySeries(BaseModel):
+    """The full history for one ``(model, suite)``: points oldest→newest + trends."""
+
+    model: str
+    suite: str
+    runs: int  # total runs on disk for this pair (may exceed points returned)
+    latest_when: str = ""
+    previous_when: str | None = None
+    regressed: bool = False
+    points: list[HistoryPoint] = []
+    trends: list[HistoryTrendRow] = []
+
+
+class HistoryView(BaseModel):
+    """``benchmarks/history.jsonl`` grouped per pair, newest series first."""
+
+    exists: bool
+    reason: str = ""
+    total_records: int = 0
+    threshold: float = 0.0
+    series: list[HistorySeries] = []
+
+
+def _history_point(record: dict[str, Any]) -> HistoryPoint:
+    metrics: dict[str, Any] = record.get("metrics") or {}
+    sha = record.get("sha")
+    return HistoryPoint(
+        when=str(record.get("when") or ""),
+        sha=str(sha) if isinstance(sha, str) and sha else None,
+        trials=int(record.get("trials") or 0),
+        accuracy=_num(metrics.get("accuracy")),
+        tool_call_accuracy=_num(metrics.get("tool_call_accuracy")),
+        error_rate=_num(metrics.get("error_rate")),
+        p50_latency_s=_num(metrics.get("p50_latency_s")),
+    )
+
+
+@router.get("/history", response_model=HistoryView)
+async def history() -> HistoryView:
+    """Benchmark run history (``benchmarks/history.jsonl``) grouped per model+suite.
+
+    Each series carries the recent run points (oldest→newest, capped at the last
+    ``_MAX_HISTORY_RUNS``) and the latest-vs-previous trend deltas / regression flags
+    computed by :func:`himmy.benchmark.history.compute_trends`. A missing file is a
+    display state (``exists=False``), not an error — the screen shows an empty state.
+    """
+    from himmy.benchmark.history import (
+        DEFAULT_REGRESSION_THRESHOLD,
+        compute_trends,
+        load_history,
+    )
+
+    path = _history_file()
+    if not path.is_file():
+        return HistoryView(
+            exists=False,
+            # Studio runs deliberately don't write history (append_history=False) — only
+            # the CLI bench does — so the hint points at the CLI, not the RUN panel.
+            reason="No benchmarks/history.jsonl yet — run `himmy bench` (or "
+            "`scripts/bench_gate.py`) from the CLI to start collecting history; "
+            "Studio runs are not recorded.",
+            threshold=DEFAULT_REGRESSION_THRESHOLD,
+        )
+    try:
+        records = load_history(path)
+    except Exception as exc:  # noqa: BLE001 - an unreadable file is a display state
+        return HistoryView(
+            exists=False,
+            reason=f"history file could not be read: {exc}",
+            threshold=DEFAULT_REGRESSION_THRESHOLD,
+        )
+    if not records:
+        return HistoryView(
+            exists=True,
+            reason="History file is present but empty — run `himmy bench` from the CLI "
+            "to start collecting history (Studio runs are not recorded).",
+            threshold=DEFAULT_REGRESSION_THRESHOLD,
+        )
+
+    # Group oldest-first records (as appended) per (model, suite); the trend loader
+    # keys on the same pair, so we can attach its result by lookup.
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for rec in records:
+        model = str(rec.get("model") or "")
+        suite = str(rec.get("suite") or "")
+        if not model:
+            continue
+        grouped.setdefault((model, suite), []).append(rec)
+
+    trends_by_key = {(t.model, t.suite): t for t in compute_trends(records)}
+    series: list[HistorySeries] = []
+    for (model, suite), runs in grouped.items():
+        trend = trends_by_key.get((model, suite))
+        points = [_history_point(r) for r in runs[-_MAX_HISTORY_RUNS:]]
+        series.append(
+            HistorySeries(
+                model=model,
+                suite=suite,
+                runs=len(runs),
+                latest_when=trend.latest_when if trend else points[-1].when,
+                previous_when=trend.previous_when if trend else None,
+                regressed=trend.regressed if trend else False,
+                points=points,
+                trends=[
+                    HistoryTrendRow(
+                        metric=mt.metric,
+                        latest=mt.latest,
+                        previous=mt.previous,
+                        delta=mt.delta,
+                        regressed=mt.regressed,
+                    )
+                    for mt in (trend.trends if trend else [])
+                ],
+            )
+        )
+    # Newest activity first, then regressions to the top within equal recency.
+    series.sort(key=lambda s: (s.latest_when, s.regressed), reverse=True)
+    return HistoryView(
+        exists=True,
+        total_records=len(records),
+        threshold=DEFAULT_REGRESSION_THRESHOLD,
+        series=series,
     )
 
 
@@ -431,7 +599,7 @@ async def _bench_events(
     def _factory(_spec: object) -> InferenceService:
         return InferenceService(build_manager_for(provider, model))
 
-    runner = BenchmarkRunner(trials=1, inference_factory=_factory)
+    runner = BenchmarkRunner(trials=1, inference_factory=_factory, append_history=False)
     timeout = _STUB_CASE_TIMEOUT_S if provider == "stub" else _LIVE_CASE_TIMEOUT_S
     started = time.perf_counter()
     yield {

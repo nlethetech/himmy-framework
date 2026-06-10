@@ -26,6 +26,12 @@ from himmy.benchmark.baseline import (
     load_baseline,
     subset_suite,
 )
+from himmy.benchmark.history import (
+    append_run,
+    compute_trends,
+    load_history,
+)
+from himmy.benchmark.judge import JudgeVerdict, SameModelJudgeError
 from himmy.benchmark.models import (
     BenchmarkSuite,
     BenchmarkTask,
@@ -33,14 +39,38 @@ from himmy.benchmark.models import (
     ModelSpec,
     TaskScore,
     TrialResult,
+    compare_scorecards,
 )
 from himmy.benchmark.report import render_markdown, to_json
 from himmy.benchmark.runner import BenchmarkRunner
+from himmy.benchmark.stats import McNemarResult, mcnemar_exact, mcnemar_from_outcomes
 
 
 def default_suite() -> BenchmarkSuite:
     """Load the packaged ``core`` benchmark suite."""
     return BenchmarkSuite.from_yaml(Path(__file__).parent / "suites" / "core.yaml")
+
+
+def nepali_suite() -> BenchmarkSuite:
+    """Load the packaged ``nepali`` language-understanding suite.
+
+    The product's key model-selection question is "which model understands Nepali?".
+    Most tasks are graded deterministically (transliteration round-trip and BS-calendar
+    reasoning use the nepal toolkit's own functions for ground truth); the open-ended
+    summarization task is judge-graded (reported, never gated).
+    """
+    return BenchmarkSuite.from_yaml(Path(__file__).parent / "suites" / "nepali.yaml")
+
+
+def multiagent_suite() -> BenchmarkSuite:
+    """Load the packaged ``multiagent`` collaboration suite (handoff/delegation/chat).
+
+    Reported, not gated: these tasks exercise the multi-agent orchestrators (the
+    framework's differentiator) but are not part of the baseline gate subset.
+    """
+    return BenchmarkSuite.from_yaml(
+        Path(__file__).parent / "suites" / "multiagent.yaml"
+    )
 
 
 __all__ = [
@@ -54,8 +84,19 @@ __all__ = [
     "render_markdown",
     "to_json",
     "default_suite",
+    "nepali_suite",
+    "multiagent_suite",
+    "JudgeVerdict",
+    "SameModelJudgeError",
     "load_baseline",
     "subset_suite",
     "compare_to_baseline",
     "build_baseline",
+    "compare_scorecards",
+    "McNemarResult",
+    "mcnemar_exact",
+    "mcnemar_from_outcomes",
+    "append_run",
+    "load_history",
+    "compute_trends",
 ]

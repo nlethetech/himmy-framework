@@ -831,6 +831,10 @@ def cmd_bench(args: argparse.Namespace) -> int:
                 tool_router=bool(getattr(args, "router", False)),
                 temperature=getattr(args, "temperature", 0.0),
                 extra_packs=extra,
+                # Judge tier (LLM-graded tasks): unset ⇒ judge-tier trials recorded
+                # ungraded; the judge provider defaults to the candidate's own provider.
+                judge_provider=getattr(args, "judge_provider", None) or "",
+                judge_model=getattr(args, "judge_model", None) or "",
             )
         )
     if not specs:

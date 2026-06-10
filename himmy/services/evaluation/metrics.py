@@ -26,6 +26,14 @@ from himmy.services.evaluation.models import EvaluationCase, MetricScore
 # Default threshold above which a metric counts as "passed".
 _PASS_THRESHOLD = 0.5
 
+#: Detail prefix the LLM judge emits when the model returned SUCCESS but its structured
+#: output had no usable numeric ``score`` (missing key, non-numeric, or non-JSON text).
+#: The eval kernel still treats this as a graded 0.0 (a malformed verdict is a fail for
+#: case scoring), but the benchmark judge tier reads this prefix to mark the trial
+#: *ungraded* instead — a judge that never produced a real verdict must not count against
+#: the candidate. Mirrors the ``"judge failed:"`` provider-error prefix.
+JUDGE_UNPARSEABLE_PREFIX = "judge unparseable:"
+
 #: The score() return: a MetricScore now, or an awaitable yielding one (AAEO-10).
 ScoreResult = Union[MetricScore, Awaitable[MetricScore]]
 
@@ -445,14 +453,23 @@ class LLMJudgeMetric:
             )
         structured = response.output_structured or {}
         raw = structured.get("score") if isinstance(structured, dict) else None
+        rationale = (
+            structured.get("rationale", "") if isinstance(structured, dict) else ""
+        )
         try:
             # raw is untyped JSON; None / non-numeric are caught below.
             value = max(0.0, min(1.0, float(raw)))  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            value = 0.0
-        rationale = (
-            structured.get("rationale", "") if isinstance(structured, dict) else ""
-        )
+            # SUCCESS but no usable numeric score: a malformed/unparseable verdict. The
+            # eval kernel scores it 0.0 (a fail), but we tag the detail so a benchmark
+            # judge tier can mark the trial UNGRADED rather than count it as a graded fail.
+            note = f" ({str(rationale)[:120]})" if rationale else ""
+            return MetricScore(
+                metric=self.name,
+                score=0.0,
+                passed=False,
+                detail=f"{JUDGE_UNPARSEABLE_PREFIX} judge returned no numeric score{note}",
+            )
         return MetricScore(
             metric=self.name,
             score=value,
@@ -529,6 +546,7 @@ __all__ = [
     "CalibrationMetric",
     "EmbeddingSimilarityMetric",
     "LLMJudgeMetric",
+    "JUDGE_UNPARSEABLE_PREFIX",
     "EvaluationMetricRegistry",
     "build_registry",
     "bucketed_ece",

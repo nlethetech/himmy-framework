@@ -4,8 +4,17 @@ name: core
 # sqlite fixtures materialized per trial), so the suite is reproducible anywhere — and
 # runs unchanged in CI against a real local model. Several tasks are regression cases for
 # documented small-model failure modes (noted inline).
+#
+# Each capability category carries >=5 tasks so per-category pass rates are a signal, not
+# statistical noise (one model's "files 1/1" vs "files 4/5" is informative). Difficulty is
+# varied inside a category: the majority are passable by a competent 3B-7B local model,
+# with 1-2 stretch tasks (NULL handling, large-file excerpt, counterfactual reasoning, RAG
+# abstention) that separate the strong models. The six baseline-gate tasks (arithmetic,
+# file_read, sql_count, multistep_file_math, rag_grounded, rx_synthesis_after_tool) keep
+# their exact definitions — the pinned-model floor in benchmarks/baseline.json depends on
+# them — and every other task here is additive.
 tasks:
-  # --- single tool use -----------------------------------------------------------------
+  # --- arithmetic ----------------------------------------------------------------------
   - id: arithmetic
     category: arithmetic
     prompt: "What is 17 times 23? Use the calculator tool."
@@ -13,6 +22,45 @@ tasks:
     expect_tools: [calculator]
     grade: { type: numeric, value: 391 }
 
+  - id: arithmetic_division
+    category: arithmetic
+    prompt: "Use the calculator to compute 4096 divided by 16, then report the result."
+    packs: [utils]
+    expect_tools: [calculator]
+    grade: { type: numeric, value: 256 }
+
+  - id: arithmetic_percentage
+    category: arithmetic
+    # A real word problem: the model must turn prose into 15% of 240 = 36.
+    prompt: >
+      A shopkeeper sells 240 eggs in a day and 15% of them crack before delivery.
+      Use the calculator to work out exactly how many eggs crack.
+    packs: [utils]
+    expect_tools: [calculator]
+    grade: { type: numeric, value: 36 }
+
+  - id: arithmetic_unit_conversion
+    category: arithmetic
+    # Unit conversion word problem: 2.5 km = 2500 m. Model must pick the factor (1000).
+    prompt: >
+      A field is 2.5 kilometres along one edge. How many metres is that? Use the
+      calculator and give the answer in metres.
+    packs: [utils]
+    expect_tools: [calculator]
+    grade: { type: numeric, value: 2500 }
+
+  - id: arithmetic_multistep_word
+    category: arithmetic
+    # Stretch: a two-operation word problem (3*45 = 135 chickens, +12 ducks = 147 birds).
+    # Requires composing the arithmetic, not a single literal expression.
+    prompt: >
+      A farm has 3 coops with 45 chickens each, plus 12 ducks. Use the calculator to
+      find the total number of birds on the farm.
+    packs: [utils]
+    expect_tools: [calculator]
+    grade: { type: numeric, value: 147 }
+
+  # --- files ---------------------------------------------------------------------------
   - id: file_read
     category: files
     prompt: "Read notes.txt and tell me exactly how many ducks the farm has."
@@ -22,6 +70,71 @@ tasks:
       notes.txt: "The farm has 12 ducks, 30 chickens, and 4 beehives.\n"
     grade: { type: numeric, value: 12 }
 
+  - id: file_list_then_read
+    category: files
+    # Two files present; the model must pick the right one named in the prompt.
+    prompt: "Read the file inventory.txt and report how many beehives are listed."
+    packs: [files]
+    expect_tools: [read_file]
+    files:
+      inventory.txt: "Beehives: 9\nCompost bins: 3\n"
+      readme.txt: "This directory holds the farm inventory.\n"
+    grade: { type: numeric, value: 9 }
+
+  - id: file_write_then_read
+    category: files
+    # Write-then-read round trip: the model must write a value, then read it back. The
+    # trajectory asserts the write precedes the read (and write_file is exercised because
+    # the fixture sets fs_allow_write=True).
+    prompt: >
+      Write the text 'harvest=88' to a file named result.txt, then read result.txt back
+      and report the harvest number it contains.
+    packs: [files]
+    expect_tools: [write_file]
+    grade: { type: numeric, value: 88 }
+    trajectory:
+      type: tool_sequence
+      value: [write_file, read_file]
+
+  - id: file_large_excerpt
+    category: files
+    # Stretch: a long file where the answer is one line buried among many; the model must
+    # read it and extract the single relevant fact (not summarize the whole thing).
+    prompt: >
+      Read ledger.txt. It lists many transactions. Report the amount (in NPR) of the
+      single transaction whose description is exactly 'tractor repair'.
+    packs: [files]
+    expect_tools: [read_file]
+    files:
+      ledger.txt: |
+        seed purchase,1200
+        fertilizer,3400
+        irrigation pipe,2750
+        labour wages,8800
+        tractor repair,14500
+        veterinary visit,3600
+        feed sacks,5200
+        market stall fee,900
+        packaging,1100
+        fuel,4300
+        rope and twine,650
+        netting,2100
+        water pump service,3900
+        crate hire,1500
+        electricity,2800
+    grade: { type: numeric, value: 14500 }
+
+  - id: file_count_lines
+    category: files
+    # Read a list and count its entries — exercises reading + a small computed answer.
+    prompt: "Read crops.txt and tell me how many distinct crops are listed (one per line)."
+    packs: [files]
+    expect_tools: [read_file]
+    files:
+      crops.txt: "millet\nmaize\nrice\nmustard\npotato\n"
+    grade: { type: numeric, value: 5 }
+
+  # --- sql -----------------------------------------------------------------------------
   - id: sql_count
     category: sql
     prompt: "What is the quantity value recorded for chickens in the animals table?"
@@ -32,26 +145,73 @@ tasks:
       - "CREATE TABLE animals(name TEXT, quantity INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
     grade: { type: numeric, value: 30 }
 
-  - id: reasoning_noTool
-    category: reasoning
-    prompt: "What is the capital of France? Answer in one word."
-    grade: { type: contains, value: paris }
+  - id: sql_aggregate
+    category: sql
+    prompt: "What is the total quantity across ALL rows of the animals table?"
+    packs: [data]
+    expect_tools: [sql_query]
+    instructions: ["The DB has a table animals(name TEXT, quantity INTEGER)."]
+    sqlite:
+      - "CREATE TABLE animals(name TEXT, quantity INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
+    grade: { type: numeric, value: 40042 }
+    trajectory:
+      type: first_tool
+      value: sql_query
 
-  - id: nepal_date
-    category: nepal
-    prompt: "Convert the date 2026-06-05 to Bikram Sambat."
-    packs: [nepal]
-    expect_tools: [nepali_date]
-    grade: { type: contains, value: "2083" }
+  - id: sql_join
+    category: sql
+    # A JOIN across two tables: find the price of the product in the 'fruit' category.
+    # The model must relate categories(id) to products(category_id).
+    prompt: >
+      The database has two tables. Find the price of the product named 'mango' by joining
+      products to categories, and report that price.
+    packs: [data]
+    expect_tools: [sql_query]
+    instructions:
+      - "Tables: categories(id INTEGER, name TEXT) and products(name TEXT, category_id INTEGER, price INTEGER)."
+    sqlite:
+      - >
+        CREATE TABLE categories(id INTEGER, name TEXT);
+        CREATE TABLE products(name TEXT, category_id INTEGER, price INTEGER);
+        INSERT INTO categories VALUES (1,'grain'),(2,'fruit');
+        INSERT INTO products VALUES ('rice',1,55),('mango',2,180),('wheat',1,48);
+    grade: { type: numeric, value: 180 }
 
-  - id: nepal_format
-    category: nepal
-    prompt: "Format the amount 1234567 as Nepali rupees."
-    packs: [nepal]
-    expect_tools: [nepali_format]
-    grade: { type: numeric, value: 1234567 }
+  - id: sql_date_filter
+    category: sql
+    # A date filter: sum sales that occurred in a specific month (a WHERE on a date range).
+    prompt: >
+      The sales table records dated sales. What is the total amount of all sales that
+      happened in March 2026 (dates from 2026-03-01 to 2026-03-31)?
+    packs: [data]
+    expect_tools: [sql_query]
+    instructions: ["Table: sales(day TEXT in YYYY-MM-DD format, amount INTEGER)."]
+    sqlite:
+      - >
+        CREATE TABLE sales(day TEXT, amount INTEGER);
+        INSERT INTO sales VALUES
+          ('2026-02-25',100),('2026-03-03',200),('2026-03-18',150),
+          ('2026-03-30',50),('2026-04-02',999);
+    grade: { type: numeric, value: 400 }
 
-  # --- multi-step (2+ tools in one run) ------------------------------------------------
+  - id: sql_null_handling
+    category: sql
+    # Stretch / real failure mode: a NULL quantity must NOT be counted. COUNT(quantity)
+    # (or a WHERE quantity IS NOT NULL) yields 3, while COUNT(*) wrongly yields 4. SUM also
+    # ignores the NULL. Models that don't reason about NULLs trip here.
+    prompt: >
+      The plots table has some rows with a NULL area. How many plots have a recorded
+      (non-NULL) area? Report just that count.
+    packs: [data]
+    expect_tools: [sql_query]
+    instructions: ["Table: plots(name TEXT, area INTEGER) — area may be NULL."]
+    sqlite:
+      - >
+        CREATE TABLE plots(name TEXT, area INTEGER);
+        INSERT INTO plots VALUES ('north',10),('south',NULL),('east',25),('west',7);
+    grade: { type: numeric, value: 3 }
+
+  # --- multistep (2+ tools in one run) -------------------------------------------------
   - id: multistep_file_math
     category: multistep
     prompt: "Read fruit.txt, then use the calculator to tell me the total number of fruits."
@@ -69,16 +229,55 @@ tasks:
     sqlite:
       - "CREATE TABLE animals(name TEXT, quantity INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
     grade: { type: numeric, value: 40000 }
+    # The task literally asks to discover columns FIRST, then query — so the schema tool
+    # must precede the query tool (ordered subsequence; not in the baseline gate subset).
+    trajectory:
+      type: tool_sequence
+      value: [sql_schema, sql_query]
 
-  - id: sql_aggregate
-    category: sql
-    prompt: "What is the total quantity across ALL rows of the animals table?"
-    packs: [data]
+  - id: multistep_sql_then_math
+    category: multistep
+    # Read a value from SQL, then compute on it: chickens (30) * 2 eggs/day = 60. Forces a
+    # query followed by a calculator step.
+    prompt: >
+      The animals table records how many chickens the farm has. Each chicken lays 2 eggs
+      a day. Find the chicken count from the table, then use the calculator to work out the
+      total eggs laid per day.
+    packs: [data, utils]
     expect_tools: [sql_query]
     instructions: ["The DB has a table animals(name TEXT, quantity INTEGER)."]
     sqlite:
       - "CREATE TABLE animals(name TEXT, quantity INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
-    grade: { type: numeric, value: 40042 }
+    grade: { type: numeric, value: 60 }
+
+  - id: multistep_two_files_sum
+    category: multistep
+    # Read TWO files and combine them: 18 + 24 = 42. Both files must be read.
+    prompt: >
+      Read morning.txt and evening.txt, then use the calculator to report the total
+      number of eggs collected across both.
+    packs: [files, utils]
+    expect_tools: [read_file]
+    files:
+      morning.txt: "Eggs collected this morning: 18\n"
+      evening.txt: "Eggs collected this evening: 24\n"
+    grade: { type: numeric, value: 42 }
+
+  - id: multistep_write_compute_read
+    category: multistep
+    # Stretch: a 3-step round trip — read a value, compute, and write the result, then read
+    # it back. Trajectory asserts read precedes write.
+    prompt: >
+      Read base.txt to get the starting count, use the calculator to double it, write the
+      doubled number to doubled.txt, then read doubled.txt back and report the number.
+    packs: [files, utils]
+    expect_tools: [read_file, write_file]
+    files:
+      base.txt: "count=21\n"
+    grade: { type: numeric, value: 42 }
+    trajectory:
+      type: tool_sequence
+      value: [read_file, write_file]
 
   # --- RAG (ingest + retrieve, offline embedder) ---------------------------------------
   - id: rag_grounded
@@ -90,6 +289,54 @@ tasks:
     expect_tools: [kb_search]
     grade: { type: contains, value: himmy }
 
+  - id: rag_ingest_then_recall
+    category: rag
+    # Ingest a fact and retrieve a different attribute of it (the color, not the name).
+    prompt: >
+      Ingest this note with kb_ingest, then use kb_search to answer: what colour is the
+      prize rooster? Note: "The prize rooster is named Kukhura and its feathers are golden."
+    packs: [knowledge]
+    expect_tools: [kb_ingest]
+    grade: { type: contains, value: golden }
+
+  - id: rag_two_facts
+    category: rag
+    # Ingest two notes, then retrieve the one that answers the question (selective recall).
+    prompt: >
+      Ingest these two notes with kb_ingest, then use kb_search to answer: how many bees
+      are in the apiary? Note 1: "The pond holds 200 fish." Note 2: "The apiary has 60000 bees."
+    packs: [knowledge]
+    expect_tools: [kb_search]
+    grade: { type: numeric, value: 60000 }
+
+  - id: rag_abstain_unknown
+    category: rag
+    # Stretch / hallucination guard: the answer is NOT in the ingested note. A grounded
+    # agent must say it does not know rather than invent a tractor brand. Graded by
+    # not_contains on plausible hallucinated specifics + a "don't know" signal.
+    prompt: >
+      Ingest this note with kb_ingest, then use kb_search to answer ONLY from the note:
+      what brand is the farm's tractor? If the note does not say, reply that you don't
+      know. Note: "The farm grows millet and keeps 12 ducks."
+    packs: [knowledge]
+    expect_tools: [kb_search]
+    grade:
+      type: all_of
+      of:
+        - { type: regex, value: "don'?t know|not (say|stated|mentioned|specified)|no (information|mention)|cannot|can't|unknown|unable" }
+        - { type: not_contains, value: john deere }
+        - { type: not_contains, value: mahindra }
+
+  - id: rag_grounded_quote
+    category: rag
+    # Retrieve an exact stored token (a code) — tests faithful extraction, not paraphrase.
+    prompt: >
+      Ingest this note with kb_ingest, then use kb_search to answer: what is the storeroom
+      access code? Note: "The storeroom access code is BLUEYAK-7."
+    packs: [knowledge]
+    expect_tools: [kb_search]
+    grade: { type: contains, value: "blueyak-7" }
+
   # --- memory recall -------------------------------------------------------------------
   - id: memory_recall
     category: memory
@@ -98,6 +345,155 @@ tasks:
     expect_tools: [remember]
     grade: { type: contains, value: millet }
 
+  - id: memory_store_then_recall_fact
+    category: memory
+    # Store a discrete fact and recall it by a related query.
+    prompt: >
+      Use the remember tool to store that the well was dug in the year 2019, then use
+      recall to tell me what year the well was dug.
+    packs: [memory]
+    expect_tools: [remember]
+    grade: { type: numeric, value: 2019 }
+
+  - id: memory_recall_after_store
+    category: memory
+    # Trajectory: the store must precede the recall (remember then recall).
+    prompt: >
+      Remember that the dog's name is Bhote, then recall the dog's name and report it.
+    packs: [memory]
+    expect_tools: [recall]
+    grade: { type: contains, value: bhote }
+    trajectory:
+      type: tool_sequence
+      value: [remember, recall]
+
+  - id: memory_overwrite_update
+    category: memory
+    # Stretch / update case: store a value, then store a corrected value, then recall. The
+    # correct answer is the UPDATED value (kathmandu), not the original (pokhara). Tests
+    # that the latest fact wins on recall rather than the stale one surfacing.
+    prompt: >
+      Use remember to store that I live in Pokhara. Then use remember again to store the
+      correction that I actually now live in Kathmandu. Then recall where I live and report
+      my current city.
+    packs: [memory]
+    expect_tools: [remember]
+    grade:
+      type: all_of
+      of:
+        - { type: contains, value: kathmandu }
+        - { type: not_contains, value: pokhara }
+
+  - id: memory_two_facts_selective
+    category: memory
+    # Store two facts, recall the one asked for (favorite tool, not favorite crop).
+    prompt: >
+      Use remember to store that my favorite crop is maize. Use remember again to store
+      that my favorite tool is the sickle. Then recall my favorite tool and report it.
+    packs: [memory]
+    expect_tools: [remember]
+    grade: { type: contains, value: sickle }
+
+  # --- reasoning (no tools) ------------------------------------------------------------
+  - id: reasoning_noTool
+    category: reasoning
+    prompt: "What is the capital of France? Answer in one word."
+    grade: { type: contains, value: paris }
+    # A pure-knowledge question — calling a tool here is a process error.
+    trajectory:
+      type: max_tool_calls
+      value: 0
+
+  - id: reasoning_syllogism
+    category: reasoning
+    # Simple deductive chain, no tools needed.
+    prompt: >
+      All farmers in the village own a goat. Hari is a farmer in the village. Does Hari
+      own a goat? Answer yes or no.
+    grade: { type: regex, value: "\\byes\\b" }
+    trajectory:
+      type: max_tool_calls
+      value: 0
+
+  - id: reasoning_counterfactual
+    category: reasoning
+    # Counterfactual: reason about a hypothetical contrary to the stated fact.
+    prompt: >
+      The bucket currently holds 5 litres of water. If it had held 3 litres more than it
+      actually does, how many litres would be in the bucket? Answer with the number.
+    grade: { type: numeric, value: 8 }
+    trajectory:
+      type: max_tool_calls
+      value: 0
+
+  - id: reasoning_instruction_priority
+    category: reasoning
+    # Instruction-priority: when two instructions conflict, the LATER/explicit one wins.
+    # The model must answer ONLY the word, ignoring the earlier "explain in detail".
+    prompt: >
+      Explain in detail what colour the sky is on a clear day. Actually, ignore that —
+      just answer with the single colour word and nothing else.
+    grade: { type: contains, value: blue }
+    trajectory:
+      type: max_tool_calls
+      value: 0
+
+  - id: reasoning_odd_one_out
+    category: reasoning
+    # Stretch: categorical reasoning — pick the item that doesn't belong (the animal among
+    # crops). No tools.
+    prompt: >
+      Which of these does not belong with the others: millet, maize, rice, goat, wheat?
+      Answer with the single odd-one-out word.
+    grade: { type: contains, value: goat }
+    trajectory:
+      type: max_tool_calls
+      value: 0
+
+  # --- nepal ---------------------------------------------------------------------------
+  - id: nepal_date
+    category: nepal
+    prompt: "Convert the date 2026-06-05 to Bikram Sambat."
+    packs: [nepal]
+    expect_tools: [nepali_date]
+    grade: { type: contains, value: "2083" }
+
+  - id: nepal_format
+    category: nepal
+    prompt: "Format the amount 1234567 as Nepali rupees."
+    packs: [nepal]
+    expect_tools: [nepali_format]
+    grade: { type: numeric, value: 1234567 }
+
+  - id: nepal_fiscal_year
+    category: nepal
+    # The nepali_date tool also returns the Nepali fiscal year for the date.
+    prompt: "Use the nepali_date tool to find the Nepali fiscal year for the AD date 2026-06-05."
+    packs: [nepal]
+    expect_tools: [nepali_date]
+    grade: { type: contains, value: "2082/83" }
+
+  - id: nepal_transliterate
+    category: nepal
+    # Transliterate Roman -> normalized Nepali form (Nepal -> nepal).
+    prompt: "Use the nepali_transliterate tool to normalize the word 'Nepal'."
+    packs: [nepal]
+    expect_tools: [nepali_transliterate]
+    grade: { type: contains, value: nepal }
+
+  - id: nepal_date_new_year
+    category: nepal
+    # Stretch: the BS new year (Baishakh 1) falls on AD 2026-04-14 → 2083-01-01. Tests a
+    # boundary date, not just any conversion.
+    prompt: "Convert the AD date 2026-04-14 to Bikram Sambat using the nepali_date tool."
+    packs: [nepal]
+    expect_tools: [nepali_date]
+    grade:
+      type: all_of
+      of:
+        - { type: contains, value: "2083" }
+        - { type: contains, value: baishakh }
+
   # --- agentic working state -----------------------------------------------------------
   - id: agentic_scratchpad
     category: agentic
@@ -105,6 +501,66 @@ tasks:
     packs: [agentic]
     expect_tools: [scratchpad_set]
     grade: { type: contains, value: tractor }
+    # The prompt prescribes write-then-read; the set must precede the get. (agentic task,
+    # not in the baseline gate subset.)
+    trajectory:
+      type: tool_sequence
+      value: [scratchpad_set, scratchpad_get]
+
+  - id: agentic_todo_plan
+    category: agentic
+    # Plan a multi-step task with the todo list.
+    prompt: "Use todo_write to record a 2-step plan for watering the garden, then report the plan."
+    packs: [agentic]
+    expect_tools: [todo_write]
+    grade:
+      type: any_of
+      of:
+        - { type: contains, value: water }
+        - { type: regex, value: "\\bstep\\b" }
+
+  - id: agentic_scratchpad_overwrite
+    category: agentic
+    # Overwrite a scratchpad key, then read — the latest value (red) wins, not green.
+    prompt: >
+      Use scratchpad_set to store 'green' under the key 'color'. Then use scratchpad_set
+      again to store 'red' under the same key 'color'. Then use scratchpad_get to read the
+      key 'color' and report its current value.
+    packs: [agentic]
+    expect_tools: [scratchpad_get]
+    grade:
+      type: all_of
+      of:
+        - { type: contains, value: red }
+        - { type: not_contains, value: green }
+
+  - id: agentic_todo_complete
+    category: agentic
+    # Write a plan, mark a step done, read it back. Exercises write -> complete -> read.
+    prompt: >
+      Use todo_write to record two tasks: 'feed chickens' and 'collect eggs'. Then use
+      todo_complete to mark 'feed chickens' done. Then use todo_read and report how many
+      tasks are completed.
+    packs: [agentic]
+    expect_tools: [todo_complete]
+    grade: { type: numeric, value: 1 }
+    trajectory:
+      type: tool_sequence
+      value: [todo_write, todo_complete]
+
+  - id: agentic_scratchpad_two_keys
+    category: agentic
+    # Stretch: store two distinct keys and read back the correct one (not the other).
+    prompt: >
+      Use scratchpad_set to store 'shovel' under key 'morning' and 'rake' under key
+      'evening'. Then use scratchpad_get to read the key 'evening' and report its value.
+    packs: [agentic]
+    expect_tools: [scratchpad_set]
+    grade:
+      type: all_of
+      of:
+        - { type: contains, value: rake }
+        - { type: not_contains, value: shovel }
 
   # --- regression cases (documented small-model failure modes) -------------------------
   - id: rx_sql_literal_recovery
@@ -142,3 +598,26 @@ tasks:
     files:
       secret.txt: "The code word is MARIGOLD.\n"
     grade: { type: contains, value: marigold }
+
+  - id: rx_no_tool_hallucination
+    category: regression
+    # Small models faced with a no-DB-needed question sometimes hallucinate a SQL/tool
+    # call anyway. With NO packs bound there are no tools to call; the model must answer
+    # from the prompt alone. tool_not_called guards against an invented sql_query call.
+    prompt: "Apples cost 12 rupees each. State the price of one apple in rupees."
+    grade: { type: numeric, value: 12 }
+    trajectory:
+      type: tool_not_called
+      value: sql_query
+
+  - id: rx_numeric_not_prose
+    category: regression
+    # Failure mode: the model reads the value but answers in vague prose ("a few") instead
+    # of the exact number. The fixture forces a precise count; the numeric grader rejects
+    # any answer that doesn't contain the literal 7.
+    prompt: "Read tally.txt and tell me the exact number of goats. Answer with the number."
+    packs: [files]
+    expect_tools: [read_file]
+    files:
+      tally.txt: "Goats counted at dusk: 7\n"
+    grade: { type: numeric, value: 7 }

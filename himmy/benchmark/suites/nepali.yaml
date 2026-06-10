@@ -1,0 +1,77 @@
+name: nepali
+# Nepali-language understanding — the product's key model-selection question: "which
+# model actually understands Nepali (Devanagari + romanized + code-switched), and can it
+# reason over Nepal-specific facts like the Bikram Sambat calendar?". Every task is
+# OFFLINE and self-contained. GROUND TRUTH is computed wherever possible from the nepal
+# toolkit's OWN functions (transliteration round-trip, BS-calendar conversion) so grading
+# is deterministic and run-to-run reproducible; the judge (LLM-graded, reported-not-gated)
+# is reserved for the one genuinely open-ended task (summarization). None of these tasks
+# is in the baseline gate subset — the suite is reported, not gating.
+tasks:
+  # --- 1. Devanagari instruction following (deterministic, verifiable output) -----------
+  - id: devanagari_instruction
+    category: nepali
+    # The instruction is written in Nepali (Devanagari): "Reply with ONLY the English word
+    # for the color रातो — answer in one word." A model that understands Nepali answers
+    # "red". Verifiable: the expected token is fixed.
+    prompt: "निर्देशन: रातो रंगको अंग्रेजी शब्द मात्र लेख्नुहोस्। एउटै शब्दमा उत्तर दिनुहोस्।"
+    instructions:
+      ["Follow the Nepali instruction exactly. Answer with a single English word."]
+    grade: { type: contains, value: red }
+
+  # --- 2. Code-switched (romanized Nepali + English) query (deterministic) --------------
+  - id: code_switched_query
+    category: nepali
+    # Romanized Nepali mixed with English: "Nepal ko capital city kun ho? Answer in one
+    # word in English." Tests code-switch comprehension without any tool.
+    prompt: "Nepal ko capital city kun ho? Answer in one word in English."
+    instructions: ["Answer the code-switched (Romanized Nepali + English) question."]
+    grade: { type: contains, value: kathmandu }
+
+  # --- 3. Transliteration round-trip (DETERMINISTIC — nepal toolkit is ground truth) ----
+  - id: transliteration_roundtrip
+    category: nepali
+    # Ground truth comes from himmy.nepal.language.transliterate("नेपाल") == "nepaala"
+    # (computed, not hand-written) — see tests/benchmark/test_nepali_suite.py, which asserts
+    # the grade value equals the toolkit output so the suite can never drift from the tool.
+    prompt: "Use the nepali_transliterate tool to transliterate the Devanagari word नेपाल into Roman script, then report the 'roman' field exactly."
+    packs: [nepal]
+    expect_tools: [nepali_transliterate]
+    grade: { type: contains, value: nepaala }
+    # The task prescribes calling the transliteration tool — assert it was used.
+    trajectory: { type: tool_called, value: nepali_transliterate }
+
+  # --- 4. BS-calendar reasoning in Nepali (DETERMINISTIC — nepali_date is ground truth) -
+  - id: bs_calendar_reasoning
+    category: nepali
+    # The question is in Nepali: "What is the date 2026-04-14 AD in Bikram Sambat? Use the
+    # nepali_date tool and report the year." Ground truth: ad_to_bs(2026-04-14) -> 2083 BS
+    # (Nepali New Year 2083-01-01), computed by the toolkit in the test, never hand-coded.
+    prompt: "२०२६-०४-१४ ई. लाई विक्रम सम्बत्‌मा कुन वर्ष पर्छ? nepali_date उपकरण प्रयोग गरी वर्ष बताउनुहोस्।"
+    packs: [nepal]
+    expect_tools: [nepali_date]
+    instructions: ["Use the nepali_date tool for the AD date 2026-04-14 and report the BS year."]
+    grade: { type: contains, value: "2083" }
+    trajectory: { type: tool_called, value: nepali_date }
+
+  # --- 5. Nepali summarization (JUDGE-graded — open-ended, reported NOT gated) ----------
+  - id: nepali_summarization
+    category: nepali
+    # Genuinely open-ended: no single correct string, so a deterministic grader would be
+    # dishonest. Graded by a JUDGE model against a STRICT rubric. Reported, never gating;
+    # the judge model must differ from the candidate (enforced by the runner).
+    prompt: >
+      तलको नेपाली अनुच्छेदलाई एक वाक्यमा नेपालीमा संक्षेप गर्नुहोस्:
+      "नेपाल दक्षिण एसियाको एक भूपरिवेष्ठित देश हो। यसको उत्तरमा चीन र दक्षिण, पूर्व तथा
+      पश्चिममा भारत पर्छ। काठमाडौं नेपालको राजधानी हो र सगरमाथा संसारको सबैभन्दा अग्लो
+      हिमाल हो जुन नेपालमा अवस्थित छ।"
+    instructions: ["Summarize the Nepali paragraph in ONE Nepali sentence."]
+    judge:
+      threshold: 0.6
+      rubric: >
+        Score 1.0 only if the answer is a single concise sentence WRITTEN IN NEPALI
+        (Devanagari) that faithfully captures the source: that Nepal is a landlocked
+        South-Asian country bordered by China and India whose capital is Kathmandu and
+        which contains Mount Everest. Penalize: answers in English, multiple sentences,
+        hallucinated facts, or missing the capital/Everest. Score 0.0 for an empty answer,
+        a non-Nepali answer, or a copy of the whole paragraph.

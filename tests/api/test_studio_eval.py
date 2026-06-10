@@ -61,6 +61,43 @@ def _write_baseline(root: Path, data: dict[str, Any] | None = None) -> None:
     (bench / "baseline.json").write_text(json.dumps(data or _BASELINE))
 
 
+def _history_record(
+    *,
+    model: str = "ollama:qwen2.5:3b-instruct",
+    suite: str = "core",
+    when: str,
+    accuracy: float,
+    error_rate: float = 0.0,
+    tool_call_accuracy: float | None = 1.0,
+    sha: str = "abc123",
+    trials: int = 5,
+) -> dict[str, Any]:
+    return {
+        "sha": sha,
+        "when": when,
+        "model": model,
+        "provider": model.split(":", 1)[0],
+        "model_id": model.split(":", 1)[-1],
+        "suite": suite,
+        "trials": trials,
+        "task_outcomes": {"arithmetic": [True] * trials},
+        "metrics": {
+            "accuracy": accuracy,
+            "tool_call_accuracy": tool_call_accuracy,
+            "error_rate": error_rate,
+            "p50_latency_s": 0.5,
+            "p95_latency_s": 0.9,
+            "mean_cost": 0.0,
+        },
+    }
+
+
+def _write_history(root: Path, lines: list[str]) -> None:
+    bench = root / "benchmarks"
+    bench.mkdir(exist_ok=True)
+    (bench / "history.jsonl").write_text("".join(line + "\n" for line in lines))
+
+
 def _client() -> TestClient:
     return TestClient(create_app())
 
@@ -155,6 +192,157 @@ def test_baseline_malformed_reports_reason(project: Path) -> None:
     body = _client().get("/api/studio/eval/baseline").json()
     assert body["exists"] is False
     assert "parsed" in body["reason"]
+
+
+# ---- GET /api/studio/eval/history --------------------------------------------
+
+
+def test_history_missing_is_a_display_state_not_an_error(project: Path) -> None:
+    body = _client().get("/api/studio/eval/history").json()
+    assert body["exists"] is False
+    assert "history" in body["reason"]
+    assert body["series"] == []
+    assert body["threshold"] > 0.0
+
+
+def test_history_empty_file_reports_present_but_empty(project: Path) -> None:
+    _write_history(project, [])
+    body = _client().get("/api/studio/eval/history").json()
+    assert body["exists"] is True
+    assert body["series"] == []
+    assert body["total_records"] == 0
+
+
+def test_history_populated_groups_and_trends(project: Path) -> None:
+    _write_history(
+        project,
+        [
+            json.dumps(
+                _history_record(when="2026-06-01T00:00:00+00:00", accuracy=0.80)
+            ),
+            json.dumps(
+                _history_record(when="2026-06-02T00:00:00+00:00", accuracy=0.82)
+            ),
+            # a second model+suite pair
+            json.dumps(
+                _history_record(
+                    model="ollama:llama3.2",
+                    suite="core",
+                    when="2026-06-02T01:00:00+00:00",
+                    accuracy=0.50,
+                )
+            ),
+        ],
+    )
+    body = _client().get("/api/studio/eval/history").json()
+    assert body["exists"] is True
+    assert body["total_records"] == 3
+    by_model = {s["model"]: s for s in body["series"]}
+    assert set(by_model) == {"ollama:qwen2.5:3b-instruct", "ollama:llama3.2"}
+
+    qwen = by_model["ollama:qwen2.5:3b-instruct"]
+    assert qwen["runs"] == 2
+    assert [p["accuracy"] for p in qwen["points"]] == [0.80, 0.82]  # oldest→newest
+    assert qwen["latest_when"] == "2026-06-02T00:00:00+00:00"
+    assert qwen["previous_when"] == "2026-06-01T00:00:00+00:00"
+    acc = {t["metric"]: t for t in qwen["trends"]}["accuracy"]
+    assert acc["latest"] == 0.82
+    assert acc["previous"] == 0.80
+    assert round(acc["delta"], 4) == 0.02
+    assert acc["regressed"] is False
+
+    llama = by_model["ollama:llama3.2"]
+    assert llama["runs"] == 1
+    assert llama["previous_when"] is None  # single run → no delta
+
+
+def test_history_flags_accuracy_regression(project: Path) -> None:
+    # A large drop at a high trial count clears BOTH the absolute threshold and the
+    # sample-size-aware noise floor (the trend rule is now noise-aware — see
+    # test_history.py), so it flags a real regression.
+    _write_history(
+        project,
+        [
+            json.dumps(
+                _history_record(
+                    when="2026-06-01T00:00:00+00:00", accuracy=0.90, trials=200
+                )
+            ),
+            json.dumps(
+                _history_record(
+                    when="2026-06-02T00:00:00+00:00", accuracy=0.60, trials=200
+                )
+            ),
+        ],
+    )
+    body = _client().get("/api/studio/eval/history").json()
+    (series,) = body["series"]
+    assert series["regressed"] is True
+    acc = {t["metric"]: t for t in series["trends"]}["accuracy"]
+    assert acc["regressed"] is True
+
+
+def test_history_small_suite_swing_not_flagged_as_regression(project: Path) -> None:
+    # A 0.30 swing at the gate run's trial count (single task x 5 trials here) is within
+    # binomial noise, so the noise-aware trend rule must NOT show a spurious regression in
+    # the Studio History panel. Regression test for finding 1 at the API layer.
+    _write_history(
+        project,
+        [
+            json.dumps(
+                _history_record(
+                    when="2026-06-01T00:00:00+00:00", accuracy=0.80, trials=5
+                )
+            ),
+            json.dumps(
+                _history_record(
+                    when="2026-06-02T00:00:00+00:00", accuracy=0.50, trials=5
+                )
+            ),
+        ],
+    )
+    body = _client().get("/api/studio/eval/history").json()
+    (series,) = body["series"]
+    assert series["regressed"] is False
+    acc = {t["metric"]: t for t in series["trends"]}["accuracy"]
+    assert acc["regressed"] is False
+
+
+def test_history_skips_corrupt_lines(project: Path) -> None:
+    _write_history(
+        project,
+        [
+            json.dumps(
+                _history_record(when="2026-06-01T00:00:00+00:00", accuracy=0.80)
+            ),
+            "{not valid json",  # corrupt tail line
+            json.dumps(
+                _history_record(when="2026-06-02T00:00:00+00:00", accuracy=0.82)
+            ),
+        ],
+    )
+    body = _client().get("/api/studio/eval/history").json()
+    assert body["exists"] is True
+    assert body["total_records"] == 2  # corrupt line skipped by the loader
+    (series,) = body["series"]
+    assert series["runs"] == 2
+
+
+def test_history_caps_recent_runs(project: Path) -> None:
+    # 60 runs on disk; the view caps points at the last 50 but reports the true count.
+    lines = [
+        json.dumps(
+            _history_record(
+                when=f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}", accuracy=0.8
+            )
+        )
+        for i in range(60)
+    ]
+    _write_history(project, lines)
+    body = _client().get("/api/studio/eval/history").json()
+    (series,) = body["series"]
+    assert series["runs"] == 60
+    assert len(series["points"]) == 50
 
 
 # ---- POST /api/studio/eval/run — eval suites (offline stub) ------------------

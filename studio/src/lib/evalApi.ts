@@ -42,6 +42,42 @@ export interface BaselineView {
   models: BaselineModel[];
 }
 
+// ---- GET /history -----------------------------------------------------------
+
+export interface HistoryPoint {
+  when: string;
+  sha: string | null;
+  trials: number;
+  accuracy: number | null;
+  tool_call_accuracy: number | null;
+  error_rate: number | null;
+  p50_latency_s: number | null;
+}
+export interface HistoryTrendRow {
+  metric: string;
+  latest: number | null;
+  previous: number | null;
+  delta: number | null;
+  regressed: boolean;
+}
+export interface HistorySeries {
+  model: string;
+  suite: string;
+  runs: number;
+  latest_when: string;
+  previous_when: string | null;
+  regressed: boolean;
+  points: HistoryPoint[];
+  trends: HistoryTrendRow[];
+}
+export interface HistoryView {
+  exists: boolean;
+  reason: string;
+  total_records: number;
+  threshold: number;
+  series: HistorySeries[];
+}
+
 // ---- POST /run (SSE) ---------------------------------------------------------
 
 export interface EvalMetricScore {
@@ -115,6 +151,7 @@ async function getJson<T>(path: string): Promise<T> {
 
 export const listRunnableSuites = () => getJson<SuitesResponse>("/suites");
 export const getBaseline = () => getJson<BaselineView>("/baseline");
+export const getHistory = () => getJson<HistoryView>("/history");
 
 // Stream a suite run over SSE (fetch + ReadableStream; EventSource can't POST).
 // Calls `onEvent` per `data:` frame; resolves when the stream ends.
