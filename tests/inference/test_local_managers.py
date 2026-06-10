@@ -192,3 +192,24 @@ def test_cost_ordered_escalates_to_cloud_on_local_failure() -> None:
     resp = run_async(InferenceService(router).run(_req()))
     assert resp.provider_name == "cloud"
     assert local.calls >= 1 and cloud.calls >= 1
+
+
+def test_ollama_timeout_env_knob(monkeypatch) -> None:
+    """HIMMY_OLLAMA_TIMEOUT sets the default request budget; bad values fall back.
+
+    The knob exists for slow hosts (CPU-only CI runners) where generation
+    legitimately exceeds the 120s default. An explicit ``timeout=`` always wins.
+    """
+    monkeypatch.delenv("HIMMY_OLLAMA_TIMEOUT", raising=False)
+    assert OllamaClientManager()._timeout == 120.0
+
+    monkeypatch.setenv("HIMMY_OLLAMA_TIMEOUT", "300")
+    assert OllamaClientManager()._timeout == 300.0
+    # An explicit constructor timeout overrides the env.
+    assert OllamaClientManager(timeout=42.0)._timeout == 42.0
+
+    # Misconfiguration must not take the offline path down.
+    monkeypatch.setenv("HIMMY_OLLAMA_TIMEOUT", "not-a-number")
+    assert OllamaClientManager()._timeout == 120.0
+    monkeypatch.setenv("HIMMY_OLLAMA_TIMEOUT", "-5")
+    assert OllamaClientManager()._timeout == 120.0

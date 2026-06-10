@@ -31,6 +31,13 @@ jobs:
     timeout-minutes: 30
     env:
       HIMMY_INTEGRATION_MODEL: qwen2.5:3b-instruct
+      # CPU-only runner: generation is ~10x slower than a dev laptop, and the
+      # fan-out test runs 3 workers CONCURRENTLY — without parallel slots Ollama
+      # serializes them and the queue tail blows the default 120s request budget
+      # (observed as every worker returning an empty answer). 3 slots + a 300s
+      # budget sized to the runner, not the laptop the tests were written on.
+      OLLAMA_NUM_PARALLEL: "3"
+      HIMMY_OLLAMA_TIMEOUT: "300"
     steps:
       - uses: actions/checkout@v6
 
@@ -55,6 +62,14 @@ jobs:
 
       - name: Pull the integration model
         run: ollama pull "$HIMMY_INTEGRATION_MODEL"
+
+      - name: Warm the model (load weights before the first timed request)
+        # CPU model load is tens of seconds; without this the FIRST test request
+        # pays it out of its own inference budget.
+        run: |
+          curl -sf http://localhost:11434/api/generate \
+            -d "{\"model\": \"$HIMMY_INTEGRATION_MODEL\", \"prompt\": \"ok\", \"stream\": false}" \
+            >/dev/null
 
       - name: Run the real-provider integration tests
         # Scope collection to tests/integration so pytest doesn't import the api/db
@@ -148,7 +163,15 @@ jobs:
       - name: Pull the benchmark model
         run: ollama pull qwen2.5:3b-instruct
 
+      - name: Warm the model (load weights before the first timed request)
+        run: |
+          curl -sf http://localhost:11434/api/generate \
+            -d '{"model": "qwen2.5:3b-instruct", "prompt": "ok", "stream": false}' \
+            >/dev/null
+
       - name: Run the gate benchmark against the checked-in baseline
+        env:
+          HIMMY_OLLAMA_TIMEOUT: "300"
         run: python scripts/bench_gate.py run --json bench-pr-results.json
 
       - name: Upload gate results
