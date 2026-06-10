@@ -181,9 +181,6 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Section label="Apps" items={appItems} state={apps} />
         )}
 
-        <SidebarItem
-          item={{ to: "/settings", label: "Settings", Icon: GearIcon }}
-        />
 
         <div className="sb-foot">
           <span className="sb-foot-avatar" />
@@ -192,6 +189,16 @@ export function AppShell({ children }: { children: ReactNode }) {
               ? "local"
               : `${connectionsOk} connection${connectionsOk === 1 ? "" : "s"}`}
           </span>
+          <NavLink
+            to="/settings"
+            className={({ isActive }) =>
+              "rail-btn sb-gear" + (isActive ? " active" : "")
+            }
+            title="Settings"
+            style={{ width: 24, height: 24 }}
+          >
+            <GearIcon className="ico" />
+          </NavLink>
           <button
             className="rail-btn theme-toggle"
             onClick={toggleTheme}

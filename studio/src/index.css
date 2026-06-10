@@ -4478,3 +4478,23 @@ mark.hl.hl-first {
 .run-line.set-toggle:hover {
   background: var(--card);
 }
+
+/* footer gear (Settings) — sits with theme + collapse at the rail's foot */
+.sb-gear .ico {
+  width: 14px;
+  height: 14px;
+}
+.sb-foot .theme-toggle {
+  margin-left: 0;
+}
+.sb-foot .sb-gear {
+  margin-left: auto;
+}
+
+.sb-foot-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
