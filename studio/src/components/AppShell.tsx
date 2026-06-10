@@ -79,6 +79,7 @@ function SidebarItem({ item }: { item: NavItem }) {
       to={item.to}
       end={item.to === "/"}
       className={({ isActive }) => "sb-item" + (isActive ? " active" : "")}
+      data-label={item.label}
     >
       <item.Icon className="ico" />
       <span className="sb-item-label">{item.label}</span>
@@ -128,6 +129,14 @@ export function AppShell({ children }: { children: ReactNode }) {
   const apps = useSection("apps", true);
   const build = useSection("build", false);
   const advanced = useSection("advanced", false);
+  const [collapsed, setCollapsed] = useState<boolean>(
+    () => localStorage.getItem("himmy.sb.collapsed") === "1",
+  );
+  const toggleCollapsed = () =>
+    setCollapsed((c) => {
+      localStorage.setItem("himmy.sb.collapsed", c ? "0" : "1");
+      return !c;
+    });
   const [connectionsOk, setConnectionsOk] = useState<number | null>(null);
   const [approvalsCount, setApprovalsCount] = useState(0);
   const { theme, toggleTheme } = useTheme();
@@ -162,29 +171,34 @@ export function AppShell({ children }: { children: ReactNode }) {
   );
 
   return (
-    <div className="shell">
-      {/* Labeled sidebar */}
+    <div className={"shell" + (collapsed ? " sb-collapsed" : "")}>
+      {/* Labeled sidebar — collapses to an icon rail */}
       <aside className="sidebar">
         <div className="sb-brand">
           <span className="sb-logo">⛰</span>
           <span className="sb-title">Himmy</span>
         </div>
 
-        <NavLink to="/chat" className="sb-newchat">
-          <PlusIcon className="ico" /> New Chat
+        <NavLink to="/chat" className="sb-newchat" data-label="New Chat">
+          <PlusIcon className="ico" />
+          <span className="sb-item-label">New Chat</span>
         </NavLink>
 
         {workspace.map((i) => (
           <SidebarItem key={i.to} item={i} />
         ))}
 
-        <Section label="Apps" items={APPS} state={apps} />
-        <Section label="Build" items={BUILD} state={build} />
-        <Section label="Advanced" items={ADVANCED} state={advanced} />
+        {!collapsed && (
+          <>
+            <Section label="Apps" items={APPS} state={apps} />
+            <Section label="Build" items={BUILD} state={build} />
+            <Section label="Advanced" items={ADVANCED} state={advanced} />
+          </>
+        )}
 
         <div className="sb-foot">
           <span className="sb-foot-avatar" />
-          <span>
+          <span className="sb-foot-text">
             {connectionsOk == null
               ? "local"
               : `${connectionsOk} connection${connectionsOk === 1 ? "" : "s"}`}
@@ -196,6 +210,14 @@ export function AppShell({ children }: { children: ReactNode }) {
             style={{ width: 24, height: 24 }}
           >
             {theme === "dark" ? "☾" : "☀"}
+          </button>
+          <button
+            className="rail-btn sb-collapse"
+            onClick={toggleCollapsed}
+            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            style={{ width: 24, height: 24 }}
+          >
+            <ChevronIcon className="chev" />
           </button>
         </div>
       </aside>

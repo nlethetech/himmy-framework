@@ -4249,3 +4249,79 @@ mark.hl.hl-first {
   font-size: 11px;
   color: var(--red);
 }
+
+/* ---- Collapsed sidebar (icon rail) --------------------------------------- */
+.shell {
+  transition: grid-template-columns 0.18s ease;
+}
+.shell.sb-collapsed {
+  grid-template-columns: 56px 1fr;
+}
+.sb-collapse .chev {
+  width: 13px;
+  height: 13px;
+  transform: rotate(180deg); /* points left: "tuck the sidebar away" */
+  transition: transform 0.18s;
+}
+.sb-collapsed .sb-collapse .chev {
+  transform: rotate(0deg); /* points right: "bring it back" */
+}
+.sb-collapsed .sidebar {
+  padding-left: 6px;
+  padding-right: 6px;
+  overflow: visible; /* tooltips must escape the rail */
+}
+.sb-collapsed .sb-title,
+.sb-collapsed .sb-item-label,
+.sb-collapsed .sb-badge,
+.sb-collapsed .sb-foot-text,
+.sb-collapsed .sb-foot-avatar {
+  display: none;
+}
+.sb-collapsed .sb-brand {
+  padding-left: 0;
+  padding-right: 0;
+}
+.sb-collapsed .sb-item,
+.sb-collapsed .sb-newchat {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+  position: relative;
+}
+.sb-collapsed .sb-foot {
+  flex-direction: column;
+  gap: 6px;
+}
+.sb-collapsed .theme-toggle,
+.sb-collapsed .sb-collapse {
+  margin-left: 0;
+}
+/* hover tooltips for the icon rail (same pattern as the old rail buttons) */
+.sb-collapsed .sb-item::after,
+.sb-collapsed .sb-newchat::after {
+  content: attr(data-label);
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%) translateX(-4px);
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  padding: 3px 9px;
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition:
+    opacity 0.1s,
+    transform 0.12s ease;
+  z-index: 40;
+}
+.sb-collapsed .sb-item:hover::after,
+.sb-collapsed .sb-newchat:hover::after {
+  opacity: 1;
+  transform: translateY(-50%);
+}
