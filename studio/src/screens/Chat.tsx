@@ -430,15 +430,30 @@ export default function Chat() {
                   <div className="who">
                     {m.role === "user" ? "You" : picked?.item.name ?? "Agent"}
                   </div>
-                  {m.steps && m.steps.length > 0 && (
+                  {/* While running, the trace IS the feedback. Once the answer
+                      lands it folds to one quiet line — the answer takes the room. */}
+                  {m.streaming && m.steps && m.steps.length > 0 && (
                     <CognitionTrace steps={m.steps} />
                   )}
-                  {m.role === "agent" && m.steps && (
-                    <SafetyPanel steps={m.steps} />
-                  )}
-                  {m.role === "agent" && m.steps && (
-                    <GroundingPanel steps={m.steps} />
-                  )}
+                  {m.role === "agent" &&
+                    !m.streaming &&
+                    m.steps &&
+                    m.steps.length > 0 && (
+                      <details className="trace-fold">
+                        <summary>
+                          <span className="tf-chev">›</span>
+                          activity
+                          <span className="tf-meta">
+                            {m.steps.length} step
+                            {m.steps.length === 1 ? "" : "s"}
+                          </span>
+                        </summary>
+                        <CognitionTrace steps={m.steps} />
+                        <SafetyPanel steps={m.steps} />
+                        <GroundingPanel steps={m.steps} />
+                        <WorldLedger steps={m.steps} />
+                      </details>
+                    )}
                   {m.role === "agent" && m.usage && (
                     <UsageHud usage={m.usage} live={m.streaming} />
                   )}
@@ -448,9 +463,6 @@ export default function Chat() {
                     ) : (
                       m.text
                     ))}
-                  {m.role === "agent" && !m.streaming && m.steps && (
-                    <WorldLedger steps={m.steps} />
-                  )}
                   {m.streaming &&
                     (m.text ? (
                       <span className="caret" />

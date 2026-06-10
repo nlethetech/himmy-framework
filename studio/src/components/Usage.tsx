@@ -98,7 +98,7 @@ export function UsageHud({
   return (
     <div className={"hud" + (live ? " live" : "")}>
       <span className="hud-item" title="tokens in → out">
-        <span className="hud-ico">🪙</span>
+        <span className="hud-ico">tok</span>
         <span className="mono">
           {fmtTokens(usage.input_tokens)}
           <span className="hud-arrow">→</span>
@@ -109,11 +109,11 @@ export function UsageHud({
         className={"hud-item" + (free ? "" : " cost")}
         title={free ? "local model — no API cost" : "estimated API cost"}
       >
-        <span className="hud-ico">{free ? "🟢" : "💲"}</span>
+        <span className="hud-ico">cost</span>
         <span className="mono">{free ? "local" : fmtUsd(usage.cost)}</span>
       </span>
       <span className="hud-item" title="total inference latency">
-        <span className="hud-ico">⚡</span>
+        <span className="hud-ico">time</span>
         <span className="mono">{fmtMs(usage.latency_ms)}</span>
       </span>
       <span className="hud-item" title="model calls">

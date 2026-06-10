@@ -1637,8 +1637,11 @@ mark.hl.hl-first {
   color: var(--warn);
 }
 .hud-ico {
-  font-size: 12px;
-  opacity: 0.9;
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
 }
 .hud-arrow {
   color: var(--text-dim);
@@ -4089,4 +4092,51 @@ mark.hl.hl-first {
 .mem-bar {
   margin-left: auto;
   margin-right: auto;
+}
+
+/* ---- Post-answer activity fold ------------------------------------------ */
+.trace-fold {
+  margin: 2px 0 10px;
+}
+.trace-fold > summary {
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px 9px;
+  user-select: none;
+  transition:
+    color 0.12s,
+    border-color 0.12s;
+}
+.trace-fold > summary::-webkit-details-marker {
+  display: none;
+}
+.trace-fold > summary:hover {
+  color: var(--text-muted);
+  border-color: var(--border-strong);
+}
+.trace-fold .tf-chev {
+  font-size: 12px;
+  line-height: 1;
+  transition: transform 0.15s;
+}
+.trace-fold[open] .tf-chev {
+  transform: rotate(90deg);
+}
+.trace-fold .tf-meta {
+  color: var(--text-dim);
+  letter-spacing: 0.6px;
+  opacity: 0.75;
+}
+.trace-fold[open] > summary {
+  margin-bottom: 10px;
 }
