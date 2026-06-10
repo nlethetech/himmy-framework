@@ -9,12 +9,11 @@ export function Topbar({
   sub?: ReactNode;
   actions?: ReactNode;
 }) {
+  // The sidebar's active state already says where you are — the title is a
+  // whisper for wayfinding, not a header. The sub survives as a tooltip.
   return (
     <div className="topbar">
-      <div className="row gap10">
-        <h1>{title}</h1>
-        {sub && <span className="sub">{sub}</span>}
-      </div>
+      <h1 title={typeof sub === "string" ? sub : undefined}>{title}</h1>
       {actions && <div className="row gap10">{actions}</div>}
     </div>
   );

@@ -567,10 +567,9 @@ select {
   flex-direction: column;
 }
 .topbar {
-  height: 48px;
+  height: 44px;
   flex: none;
-  /* no rule under the header — the opaque bg masks scrolled content; the
-     canvas reads as one immersive surface */
+  /* not a bar: same surface as the canvas, no rule — the title is a whisper */
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -581,16 +580,16 @@ select {
   z-index: 5;
 }
 .topbar h1 {
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 1.6px;
   margin: 0;
-  color: var(--text);
+  color: var(--text-dim);
 }
 .topbar .sub {
-  color: var(--text-dim);
-  font-family: var(--mono);
-  font-size: 11px;
+  display: none; /* folded into the title tooltip */
 }
 
 .page {
