@@ -387,7 +387,6 @@ export default function Chat() {
           <div className="chat-thread grow">
             {!hasAny ? (
               <div className="chat-hero">
-                <div className="hero-avatar">∅</div>
                 <div className="hero-title">Nothing to run yet</div>
                 <div className="hero-sub">
                   Create an agent in the <b>Agents</b> tab, or drop a{" "}
@@ -396,9 +395,6 @@ export default function Chat() {
               </div>
             ) : (
               <div className="chat-hero">
-                <div className="hero-avatar">
-                  {(picked?.item.name ?? "H").charAt(0).toUpperCase()}
-                </div>
                 <div className="hero-title">{picked?.item.name}</div>
                 <div className="hero-sub">
                   {isTeam

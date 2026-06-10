@@ -38,8 +38,9 @@ type NavItem = {
 const WORKSPACE: NavItem[] = [
   { to: "/", label: "Home", Icon: HomeIcon },
   { to: "/chat", label: "Chat", Icon: ChatIcon },
-  { to: "/chats", label: "Chats", Icon: ChatIcon },
-  { to: "/search", label: "Search", Icon: SearchIcon },
+  // Chats and Search are one screen: the history list that searches inside
+  // every transcript as you type — hence the search icon.
+  { to: "/chats", label: "Chats", Icon: SearchIcon },
   { to: "/approvals", label: "Approvals", Icon: BellIcon },
   { to: "/activity", label: "Activity", Icon: RunsIcon },
 ];
