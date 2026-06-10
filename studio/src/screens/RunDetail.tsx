@@ -13,6 +13,9 @@ import { RunUsage, fmtTokens, fmtUsd } from "../components/Usage";
 import { BackIcon } from "../components/icons";
 import { relativeTime, duration, statusClass } from "../lib/format";
 
+/* Run detail as a single centered ledger column: a meta line between rules,
+   then TRANSCRIPT / ACTIVITY / TIMELINE sections. No boxes, no dots. */
+
 function IoInspector({ io }: { io: IoCapture }) {
   const [open, setOpen] = useState(false);
   return (
@@ -66,25 +69,31 @@ export default function RunDetail() {
       .finally(() => setLoading(false));
   }, [runId]);
 
+  const meta = run
+    ? [
+        run.provider ?? "auto",
+        run.model,
+        duration(run.duration_ms),
+        run.tool_count > 0 ? `${run.tool_count} tools` : null,
+        (run.input_tokens || 0) + (run.output_tokens || 0) > 0
+          ? `${fmtTokens((run.input_tokens || 0) + (run.output_tokens || 0))} tok`
+          : null,
+        (run.cost || 0) > 0 ? fmtUsd(run.cost) : null,
+        relativeTime(run.created_at),
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
+
   return (
     <>
       <Topbar
-        title={run ? run.agent_name ?? "Run" : "Run"}
+        title={run ? (run.agent_name ?? "Run") : "Run"}
         sub={run ? relativeTime(run.created_at) : "trace timeline"}
         actions={
-          <div className="row gap6">
-            {run && (
-              <button
-                className="btn"
-                onClick={() => nav(`/advanced/lineage?run=${run.id}`)}
-              >
-                Lineage
-              </button>
-            )}
-            <button className="btn" onClick={() => nav("/activity")}>
-              <BackIcon /> Back
-            </button>
-          </div>
+          <button className="btn" onClick={() => nav("/activity")}>
+            <BackIcon /> Back
+          </button>
         }
       />
       {loading ? (
@@ -96,155 +105,138 @@ export default function RunDetail() {
           <ErrorState message={error} />
         </div>
       ) : run ? (
-        <div className="run-detail">
-          {/* Left: transcript + meta (scrolls independently) */}
-          <div className="run-col">
-              <div className="card card-pad">
-                <div className="row wrap gap6">
-                  <span className={"pill " + statusClass(run.status)}>
-                    <span className="dot" />
-                    {run.status}
-                  </span>
-                  <span className="pill dim">{run.provider ?? "auto"}</span>
-                  {run.model && <span className="pill dim">{run.model}</span>}
-                  <span className="pill dim">{duration(run.duration_ms)}</span>
-                  {run.tool_count > 0 && (
-                    <span className="pill dim">⚙ {run.tool_count} tools</span>
-                  )}
-                  {(run.input_tokens || 0) + (run.output_tokens || 0) > 0 && (
-                    <span className="pill dim">
-                      {fmtTokens((run.input_tokens || 0) + (run.output_tokens || 0))}{" "}
-                      tok
-                    </span>
-                  )}
-                  {(run.cost || 0) > 0 && (
-                    <span className="pill dim">{fmtUsd(run.cost)}</span>
-                  )}
-                </div>
-                {run.agent_path && (
-                  <div className="dim mono mt8" style={{ fontSize: 12 }}>
-                    {run.agent_path}
-                  </div>
-                )}
-                <div className="mt8">
-                  <Link
-                    className="dim mono"
-                    style={{ fontSize: 12 }}
-                    title="How the agent reached this conclusion"
-                    to={
-                      run.thread_id
-                        ? `/advanced/lineage?entity=${encodeURIComponent(run.thread_id)}&run=${encodeURIComponent(run.id)}`
-                        : `/advanced/lineage?run=${encodeURIComponent(run.id)}`
-                    }
-                  >
-                    lineage →
-                  </Link>
-                </div>
-              </div>
-
-              <div className="card">
-                <div className="card-head">
-                  <h2>Transcript</h2>
-                </div>
-                <div className="card-pad stack gap16">
-                  {(run.messages || []).map((m, i) => (
-                    <div className={"msg " + (m.role === "user" ? "user" : "agent")} key={i}>
-                      <div className="avatar">
-                        {m.role === "user" ? "you" : "H"}
-                      </div>
-                      <div className="body">
-                        <div className="who">{m.role}</div>
-                        {m.role === "user" ? (
-                          m.content
-                        ) : (
-                          <Markdown>{m.content}</Markdown>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {run.steps && run.steps.length > 0 && (
-                <div className="card">
-                  <div className="card-head">
-                    <h2>Cognition</h2>
-                    <span className="dim" style={{ fontSize: 12 }}>
-                      think → act → observe
-                    </span>
-                  </div>
-                  <div className="card-pad">
-                    <CognitionTrace steps={run.steps} />
-                    <WorldLedger steps={run.steps} />
-                  </div>
-                </div>
-              )}
-
-              {run.steps && run.steps.some((s) => s.kind === "safety") && (
-                <div className="card card-pad">
-                  <span className="section-title">Guardrails</span>
-                  <SafetyPanel steps={run.steps} />
-                </div>
-              )}
-
-              {run.steps && run.steps.some((s) => s.kind === "grounding") && (
-                <div className="card card-pad">
-                  <span className="section-title">Grounding</span>
-                  <GroundingPanel steps={run.steps} />
-                </div>
-              )}
-
-              <RunUsage
-                inputTokens={run.input_tokens}
-                outputTokens={run.output_tokens}
-                cost={run.cost}
-                byModel={run.usage_by_model}
-              />
-
-              {(run.tools || []).length > 0 && (
-                <div className="card card-pad">
-                  <span className="section-title">Tools used</span>
-                  <div className="row wrap gap6">
-                    {(run.tools || []).map((t) => (
-                      <span className="chip on" key={t}>
-                        ⚙ {t}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-
-          {/* Right: timeline (scrolls independently) */}
-          <div className="run-col">
-            <div className="card">
-              <div className="card-head">
-                <h2>Timeline</h2>
-                <span className="dim" style={{ fontSize: 12 }}>
-                  {(run.timeline || []).length} steps
+        <div className="run-page">
+          {/* meta line between rules — the run's key facts */}
+          <div className="run-meta">
+            <div className="run-meta-line">
+              {statusClass(run.status) !== "ok" && (
+                <span className={"pill " + statusClass(run.status)}>
+                  {run.status}
                 </span>
-              </div>
-              <div className="card-pad">
-                <div className="timeline">
-                  {(run.timeline || []).map((s) => (
-                    <div className="tl-item" key={s.seq}>
-                      <div className="tl-dot" />
-                      <div className="tl-body">
-                        <div className="row spread">
-                          <span className="tl-label">{s.label}</span>
-                          {s.ts && (
-                            <span className="tl-time">{relativeTime(s.ts)}</span>
-                          )}
-                        </div>
-                        {s.detail && <div className="tl-detail">{s.detail}</div>}
-                        {s.io && <IoInspector io={s.io} />}
-                      </div>
-                    </div>
-                  ))}
+              )}
+              <span className="mono run-meta-facts">{meta}</span>
+              <Link
+                className="mono run-meta-link"
+                title="How the agent reached this conclusion"
+                to={
+                  run.thread_id
+                    ? `/advanced/lineage?entity=${encodeURIComponent(run.thread_id)}&run=${encodeURIComponent(run.id)}`
+                    : `/advanced/lineage?run=${encodeURIComponent(run.id)}`
+                }
+              >
+                lineage →
+              </Link>
+            </div>
+            {run.agent_path && (
+              <div className="run-meta-path mono">{run.agent_path}</div>
+            )}
+          </div>
+
+          <section className="home-sec">
+            <div className="home-sec-head">
+              <span>Transcript</span>
+            </div>
+            {(run.messages || []).map((m, i) => (
+              <div
+                className={"msg " + (m.role === "user" ? "user" : "agent")}
+                key={i}
+              >
+                <div className="body">
+                  <div className="who">{m.role === "user" ? "You" : m.role}</div>
+                  {m.role === "user" ? m.content : <Markdown>{m.content}</Markdown>}
                 </div>
               </div>
+            ))}
+          </section>
+
+          {run.steps && run.steps.length > 0 && (
+            <section className="home-sec">
+              <div className="home-sec-head">
+                <span>Activity</span>
+                <span>think → act → observe</span>
+              </div>
+              <div className="run-sec-body">
+                <CognitionTrace steps={run.steps} />
+                <WorldLedger steps={run.steps} />
+              </div>
+            </section>
+          )}
+
+          {run.steps && run.steps.some((s) => s.kind === "safety") && (
+            <section className="home-sec">
+              <div className="home-sec-head">
+                <span>Guardrails</span>
+              </div>
+              <div className="run-sec-body">
+                <SafetyPanel steps={run.steps} />
+              </div>
+            </section>
+          )}
+
+          {run.steps && run.steps.some((s) => s.kind === "grounding") && (
+            <section className="home-sec">
+              <div className="home-sec-head">
+                <span>Grounding</span>
+              </div>
+              <div className="run-sec-body">
+                <GroundingPanel steps={run.steps} />
+              </div>
+            </section>
+          )}
+
+          <section className="home-sec">
+            <div className="home-sec-head">
+              <span>Timeline</span>
+              <span>{(run.timeline || []).length} steps</span>
             </div>
-          </div>
+            {(run.timeline || []).map((s, i) => (
+              <div className="tl-row" key={s.seq}>
+                <span className="tl-idx mono">
+                  {String(i + 1).padStart(2, "0")}
+                </span>
+                <div className="tl-main">
+                  <div className="tl-head">
+                    <span className="tl-label">{s.label}</span>
+                    {s.ts && <span className="tl-time mono">{relativeTime(s.ts)}</span>}
+                  </div>
+                  {s.detail && <div className="tl-detail">{s.detail}</div>}
+                  {s.io && <IoInspector io={s.io} />}
+                </div>
+              </div>
+            ))}
+          </section>
+
+          {((run.usage_by_model && run.usage_by_model.length > 0) ||
+            (run.input_tokens || 0) + (run.output_tokens || 0) > 0) && (
+            <section className="home-sec">
+              <div className="home-sec-head">
+                <span>Usage</span>
+              </div>
+              <div className="run-sec-body">
+                <RunUsage
+                  inputTokens={run.input_tokens}
+                  outputTokens={run.output_tokens}
+                  cost={run.cost}
+                  byModel={run.usage_by_model}
+                />
+              </div>
+            </section>
+          )}
+
+          {(run.tools || []).length > 0 && (
+            <section className="home-sec">
+              <div className="home-sec-head">
+                <span>Tools used</span>
+              </div>
+              <div className="run-tools">
+                {(run.tools || []).map((t) => (
+                  <span className="chip mono" key={t}>
+                    {t}
+                  </span>
+                ))}
+              </div>
+            </section>
+          )}
         </div>
       ) : null}
     </>

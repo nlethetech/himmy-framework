@@ -4527,3 +4527,93 @@ mark.hl.hl-first {
 .sb-foot .rail-btn:hover {
   border-color: var(--border-strong);
 }
+
+/* ---- Run detail (single ledger column) ----------------------------------- */
+.run-page {
+  max-width: 800px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 20px 32px 64px;
+}
+.run-meta {
+  padding: 12px 2px 14px;
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 30px;
+}
+.run-meta-line {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.run-meta-facts {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.run-meta-link {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.run-meta-link:hover {
+  color: var(--red);
+}
+.run-meta-path {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  margin-top: 5px;
+}
+.run-sec-body {
+  padding-top: 12px;
+}
+.run-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 12px;
+}
+.run-tools .chip {
+  font-size: 11px;
+  cursor: default;
+}
+/* timeline: numbered ledger rows — no dots, no spine */
+.tl-row {
+  display: flex;
+  gap: 14px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.tl-row:last-child {
+  border-bottom: none;
+}
+.tl-idx {
+  font-size: 10px;
+  color: var(--text-dim);
+  padding-top: 2px;
+  flex: none;
+}
+.tl-main {
+  flex: 1;
+  min-width: 0;
+}
+.tl-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.tl-label {
+  font-size: 13px;
+  color: var(--text);
+}
+.tl-time {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.tl-detail {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin-top: 3px;
+  line-height: 1.55;
+}
