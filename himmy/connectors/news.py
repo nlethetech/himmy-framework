@@ -124,6 +124,25 @@ class NewsFetcher:
                 result.failures.append(FeedFailure(source=name, error=str(exc)))
         return result
 
+    #: Generic query words that carry no signal against headlines — a query like
+    #: "recent political news of Nepal" must not demand the literal words
+    #: "recent" and "news" in a title (the old ALL-words match returned zero
+    #: results for exactly that query).
+    _STOPWORDS = frozenset(
+        "a an and are for from in into is it latest more most news of on or over "
+        "recent regarding some that the their this to today todays update updates "
+        "what whats with about current breaking headline headlines stories story "
+        "give me show tell find search".split()
+    )
+
+    def query_tokens(self, query: str) -> list[str]:
+        """The meaningful (non-stopword) tokens of a search query."""
+        return [
+            t
+            for t in query.lower().split()
+            if t and t not in self._STOPWORDS and len(t) > 1
+        ]
+
     def search(
         self,
         query: str,
@@ -134,17 +153,42 @@ class NewsFetcher:
     ) -> list[NewsItem]:
         """Keyword search across sources (case-insensitive over title + summary).
 
-        Matches an article when ALL query words appear in its title or summary (not the
-        whole query as a single phrase) — so "trade India" finds an article titled
-        "…visit India next week for trade talks".
+        Robust matching, not literal: stopwords are stripped from the query, then
+        items matching ANY remaining token are ranked by (tokens matched,
+        recency). Results are de-duplicated across feeds by link/title. When the
+        query is all stopwords — or nothing matches — the LATEST headlines are
+        returned instead, so the tool never hands an agent a dead end.
         """
-        tokens = [t for t in query.lower().split() if t]
-        hits = [
-            item
-            for item in self.fetch_all(per_source=per_source, sources=sources)
-            if all(t in f"{item.title} {item.summary}".lower() for t in tokens)
-        ]
-        return hits[:limit]
+        items = self._dedupe(self.fetch_all(per_source=per_source, sources=sources))
+        tokens = self.query_tokens(query)
+        if not tokens:
+            return items[:limit]
+
+        scored: list[tuple[int, NewsItem]] = []
+        for item in items:
+            haystack = f"{item.title} {item.summary}".lower()
+            matched = sum(1 for t in tokens if t in haystack)
+            if matched:
+                scored.append((matched, item))
+        if not scored:
+            # Zero keyword hits: the latest headlines are more useful than [].
+            return items[:limit]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [item for _matched, item in scored[:limit]]
+
+    @staticmethod
+    def _dedupe(items: list[NewsItem]) -> list[NewsItem]:
+        """Drop cross-feed duplicates by link, then by normalized title."""
+        seen: set[str] = set()
+        unique: list[NewsItem] = []
+        for item in items:
+            key = item.link.strip() or item.title.strip().lower()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            unique.append(item)
+        return unique
 
     @staticmethod
     def _parse(raw: bytes, source: NewsSource, limit: int) -> list[NewsItem]:

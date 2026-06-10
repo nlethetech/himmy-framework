@@ -185,6 +185,33 @@ def test_news_pack_fetches_real_headlines(client: TestClient, project: Path) -> 
     assert "[News Article" not in done["output_text"]
 
 
+def test_news_search_never_dead_ends_on_natural_phrasing(
+    client: TestClient, project: Path
+) -> None:
+    """The exact reported failure: 'use news tool to search about recent
+    political news of Nepal' returned count=0 (the old ALL-words match) and the
+    agent floundered. The tool must now return material for natural phrasing."""
+    path = _agent(project, ["news"])
+    frames, done = _run(
+        client,
+        path,
+        "use the news_search tool to search about recent political news of "
+        "Nepal, then summarize what you find.",
+    )
+    _assert_grounded(done, frames, {"news_search", "news_fetch", "news_sources"})
+    tool = next(
+        (
+            f
+            for f in frames
+            if f.get("type") == "tool" and f.get("name") == "news_search"
+        ),
+        None,
+    )
+    if tool is not None and isinstance(tool.get("result"), str):
+        # the search result must not be a dead end
+        assert '"count": 0' not in tool["result"], tool["result"][:200]
+
+
 # ----------------------------------------------------------------------- web
 def test_web_pack_searches_the_open_web(client: TestClient, project: Path) -> None:
     path = _agent(project, ["web"])

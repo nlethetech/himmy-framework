@@ -39,11 +39,28 @@ def register_news_tools(
         items = await asyncio.to_thread(
             lambda: news.search(query, limit=limit, sources=srcs)
         )
-        return {
+        payload: dict[str, Any] = {
             "query": query,
             "count": len(items),
             "items": [i.model_dump() for i in items],
         }
+        # Honesty about fallback: when none of the meaningful query words match
+        # the returned items, the connector served the latest headlines instead
+        # of an empty dead end — tell the agent so it can frame the answer.
+        tokens = news.query_tokens(query)
+        if items and tokens:
+            any_match = any(
+                any(t in f"{i.title} {i.summary}".lower() for t in tokens)
+                for i in items
+            )
+            if not any_match:
+                payload["note"] = (
+                    "no headlines matched the keywords — returning the latest "
+                    "headlines instead"
+                )
+        elif items and not tokens:
+            payload["note"] = "generic query — returning the latest headlines"
+        return payload
 
     async def _fetch(args: dict[str, Any]) -> dict[str, Any]:
         source = str(args["source"])

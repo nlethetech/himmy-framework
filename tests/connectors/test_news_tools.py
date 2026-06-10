@@ -56,8 +56,33 @@ def test_news_search_filters_by_keyword() -> None:
     assert all("india" in f"{i['title']} {i['summary']}".lower() for i in out["items"])
 
 
-def test_news_search_unknown_keyword_is_empty() -> None:
+def test_news_search_unknown_keyword_falls_back_to_latest() -> None:
+    """An unmatched keyword must NOT hand the agent an empty dead end: the tool
+    returns the latest headlines and says so honestly in ``note`` (found live:
+    'recent political news Nepal' returned count=0 and the agent floundered)."""
     out = run_async(
         _registry().handler_for("news_search")({"query": "zzz-no-such-topic"})
     )
-    assert out["count"] == 0
+    assert out["count"] > 0
+    assert "latest" in out.get("note", "")
+
+
+def test_news_search_stopword_query_returns_latest() -> None:
+    """A query of pure stopwords ('latest news today') is a browse, not a
+    filter — it returns the latest headlines."""
+    out = run_async(
+        _registry().handler_for("news_search")({"query": "latest news today"})
+    )
+    assert out["count"] > 0
+
+
+def test_news_search_stopwords_do_not_starve_real_keywords() -> None:
+    """THE regression: 'recent political news of Nepal' must match articles
+    about Nepal even though no headline contains the words 'recent' or 'news'."""
+    out = run_async(
+        _registry().handler_for("news_search")(
+            {"query": "recent political news of Nepal"}
+        )
+    )
+    assert out["count"] > 0
+    assert "note" not in out or "latest" not in out["note"]
