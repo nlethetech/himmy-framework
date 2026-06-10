@@ -28,6 +28,7 @@ import {
   type LiveUsage,
 } from "../components/Usage";
 import { SendIcon, RefreshIcon, PlusIcon } from "../components/icons";
+import { highlightAll } from "../lib/highlight";
 
 // Domain-agnostic starter prompts for the empty state (fill the input, don't send).
 const EXAMPLES = [
@@ -73,6 +74,10 @@ export default function Chat() {
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [params, setParams] = useSearchParams();
+  // Search deep link (?hl=): highlight every hit once the session has rendered.
+  const [pendingHl, setPendingHl] = useState<string | null>(null);
+  const pendingHlRef = useRef<string | null>(null);
+  pendingHlRef.current = pendingHl;
 
   // A Cookbook recipe (or any deep link) can prefill the agent + prompt via
   // ?agent=<path>&q=<prompt>. The Chats screen resumes a saved conversation via
@@ -81,6 +86,8 @@ export default function Chat() {
     const a = params.get("agent");
     const q = params.get("q");
     const s = params.get("session");
+    const hl = params.get("hl");
+    if (hl) setPendingHl(hl);
     if (s) {
       getChat(s)
         .then((sess) => {
@@ -95,7 +102,7 @@ export default function Chat() {
     }
     if (a) setPath(a);
     if (q) setInput(q);
-    if (a || q || s) setParams({}, { replace: true });
+    if (a || q || s || hl) setParams({}, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -125,11 +132,29 @@ export default function Chat() {
   const messagesRef = useRef<Msg[]>([]);
   useEffect(() => {
     messagesRef.current = messages;
+    if (pendingHlRef.current) return; // a search jump owns the scroll position
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
   }, [messages]);
+
+  // Honor the ?hl= deep link: after the resumed session renders, wrap every
+  // occurrence in <mark class="hl">, pulse the first one, and center it.
+  useEffect(() => {
+    if (!pendingHl || messages.length === 0) return;
+    const root = scrollRef.current;
+    if (!root) return;
+    const raf = requestAnimationFrame(() => {
+      const marks = highlightAll(root, pendingHl);
+      if (marks.length > 0) {
+        marks[0].classList.add("hl-first");
+        marks[0].scrollIntoView({ block: "center" });
+      }
+      setPendingHl(null);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [messages, pendingHl]);
 
   // Persist the current transcript so it shows up under Chats and can be resumed.
   const persist = async () => {

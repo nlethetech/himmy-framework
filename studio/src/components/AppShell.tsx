@@ -133,7 +133,10 @@ export function AppShell({ children }: { children: ReactNode }) {
           <SidebarItem key={i.to} item={i} />
         ))}
 
-        <NavLink to="/chat" className="sb-item">
+        <NavLink
+          to="/search"
+          className={({ isActive }) => "sb-item" + (isActive ? " active" : "")}
+        >
           <SearchIcon className="ico" />
           <span className="sb-item-label">Search</span>
         </NavLink>
