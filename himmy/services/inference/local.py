@@ -35,7 +35,10 @@ from himmy.services.inference.models import (
     ToolExecutor,
     ToolReturnRecord,
 )
-from himmy.services.inference.tool_protocol import parse_text_tool_calls
+from himmy.services.inference.tool_protocol import (
+    _iter_json_objects,
+    parse_text_tool_calls,
+)
 from himmy.services.tools.access import describe_for_model
 from himmy.services.tools.repair import resolve_tool_name, unknown_tool_message
 
@@ -453,6 +456,18 @@ class ClaudeCliClientManager:
         if request.bound_tools:
             # Text-only CLI: a best-effort ReAct protocol the runtime loop drives.
             prompt = f"{prompt}\n\n{_react_tool_manifest(request.bound_tools)}"
+        structured_requested = (
+            request.response_format == ResponseFormat.STRUCTURED_OUTPUT
+            and request.output_json_schema is not None
+        )
+        if structured_requested:
+            # Text-only CLI: no provider-native schema constraint (unlike Ollama's
+            # `format` field), so nudge via the prompt and parse the reply below.
+            prompt = (
+                f"{prompt}\n\nReply with ONLY a single JSON object that matches this "
+                "JSON Schema — no prose, no code fences:\n"
+                f"{json.dumps(request.output_json_schema)}"
+            )
         # Floor the per-call timeout: the local CLI is slow, and a 30s framework
         # default would kill valid ~20-30s responses (then retry, wasting minutes).
         effective_timeout = max(request.timeout_seconds or 0.0, _CLI_MIN_TIMEOUT)
@@ -475,10 +490,18 @@ class ClaudeCliClientManager:
         tool_returns = await _execute_tool_calls(
             request.bound_tools, tool_calls, request.tool_executor
         )
+        output_structured = None
+        if structured_requested and text and not tool_calls:
+            # The CLI replies in prose-capable text: take the first JSON object
+            # embedded in it (tolerates fences/preamble a nudge can't fully prevent).
+            output_structured = next(
+                (o for o in _iter_json_objects(text) if isinstance(o, dict)), None
+            )
         return InferenceResponse(
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,
             output_text="" if tool_calls else text,
+            output_structured=output_structured,
             tool_calls=tool_calls,
             tool_returns=tool_returns,
             model_path=f"claude-cli:{model}",

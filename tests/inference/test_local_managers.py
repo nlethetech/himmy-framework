@@ -117,6 +117,54 @@ def test_claude_cli_parses_json_usage_and_cost() -> None:
     assert "--output-format" in captured["argv"]
 
 
+def test_claude_cli_structured_output_is_nudged_and_parsed() -> None:
+    """STRUCTURED_OUTPUT requests put the schema in the prompt and parse the reply.
+
+    The text-only CLI has no provider-native schema constraint (unlike Ollama's
+    ``format`` field), so the manager must nudge via the prompt and extract the JSON
+    object from the reply — this is what the benchmark judge tier relies on.
+    """
+    from himmy.services.inference.models import ResponseFormat
+
+    captured: dict[str, Any] = {}
+    schema = {
+        "type": "object",
+        "properties": {"score": {"type": "number"}},
+        "required": ["score"],
+    }
+
+    def runner(argv: list[str], stdin: str) -> str:
+        captured["stdin"] = stdin
+        return 'Here is the verdict:\n{"score": 0.9, "rationale": "good"}'
+
+    req = InferenceRequest(
+        messages=[InferenceMessage(role="user", content="grade this")],
+        response_format=ResponseFormat.STRUCTURED_OUTPUT,
+        output_json_schema=schema,
+    )
+    resp = run_async(ClaudeCliClientManager(model="haiku", runner=runner).generate(req))
+    assert resp.status == InferenceStatus.SUCCESS
+    assert resp.output_structured == {"score": 0.9, "rationale": "good"}
+    assert '"score"' in captured["stdin"]  # the schema was put in the prompt
+
+
+def test_claude_cli_structured_output_unparseable_reply_is_none() -> None:
+    """A prose reply with no JSON object yields output_structured=None (not a crash)."""
+    from himmy.services.inference.models import ResponseFormat
+
+    def runner(argv: list[str], stdin: str) -> str:
+        return "I cannot produce JSON right now."
+
+    req = InferenceRequest(
+        messages=[InferenceMessage(role="user", content="grade this")],
+        response_format=ResponseFormat.STRUCTURED_OUTPUT,
+        output_json_schema={"type": "object"},
+    )
+    resp = run_async(ClaudeCliClientManager(model="haiku", runner=runner).generate(req))
+    assert resp.status == InferenceStatus.SUCCESS
+    assert resp.output_structured is None
+
+
 def test_claude_cli_failure_is_normalized() -> None:
     """A runner error becomes a FAILED response."""
 
