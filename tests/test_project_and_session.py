@@ -59,6 +59,40 @@ def test_session_store_roundtrip(tmp_path: Path) -> None:
     store.close()
 
 
+def test_list_sessions_orders_newest_first_with_counts(tmp_path: Path) -> None:
+    """list_sessions returns id + timestamp + message count, newest first."""
+    store = SqliteSessionStore(str(tmp_path / "s.db"))
+    one = ChatThread()
+    one.append_message(Message(role=MessageRole.USER, content="a"))
+    store.save("first", one)
+    two = ChatThread()
+    two.append_message(Message(role=MessageRole.USER, content="b"))
+    two.append_message(Message(role=MessageRole.USER, content="c"))
+    store.save("second", two)  # saved later → newer updated_at
+    infos = store.list_sessions()
+    assert [i.session_id for i in infos] == ["second", "first"]
+    by_id = {i.session_id: i for i in infos}
+    assert by_id["first"].message_count == 1
+    assert by_id["second"].message_count == 2
+    assert all(i.updated_at for i in infos)
+    store.close()
+
+
+def test_list_sessions_respects_limit(tmp_path: Path) -> None:
+    store = SqliteSessionStore(str(tmp_path / "s.db"))
+    for i in range(5):
+        store.save(f"s{i}", ChatThread())
+    assert len(store.list_sessions(limit=2)) == 2
+    assert len(store.list_sessions()) == 5
+    store.close()
+
+
+def test_list_sessions_empty(tmp_path: Path) -> None:
+    store = SqliteSessionStore(str(tmp_path / "s.db"))
+    assert store.list_sessions() == []
+    store.close()
+
+
 def test_session_durable_across_reopen(tmp_path: Path) -> None:
     db = str(tmp_path / "s.db")
     a = SqliteSessionStore(db)

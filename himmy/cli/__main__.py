@@ -118,6 +118,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument(
         "--session", help="persist/resume this conversation by id (.himmy/sessions.db)"
     )
+    p_chat.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_last",
+        action="store_true",
+        help="continue the most recent session (the auto-saved 'last' thread)",
+    )
     p_chat.set_defaults(func=commands.cmd_chat)
 
     p_tg = sub.add_parser("telegram", help="run an agent as a live Telegram bot")
@@ -337,6 +344,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ``himmy "what's the weather in Kathmandu?"`` just answers.
     """
     args_list = list(argv) if argv is not None else sys.argv[1:]
+    # Top-level `himmy -c` / `himmy --continue`: open the REPL continuing the
+    # most recent ('last') session, exactly like `himmy chat -c`. Handled before
+    # subcommand parsing so the bare flag works (and -c can't collide with a
+    # subcommand's own -c, since a subcommand name would precede it).
+    if args_list and args_list[0] in ("-c", "--continue"):
+        args_list = ["chat", *args_list]
     if not args_list:
         # Bare `himmy` is a first contact, not a mistake: splash, then converse.
         from himmy.cli.banner import print_banner
@@ -351,6 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=None,
                 message=None,
                 session=None,
+                continue_last=False,
                 yolo=False,
                 safe=False,
             )

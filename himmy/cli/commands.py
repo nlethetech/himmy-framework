@@ -123,6 +123,45 @@ def _discover_spec_file() -> Path | None:
     return None
 
 
+#: Cap on the HIMMY.md project-context block folded into agent instructions (~20 KB).
+_HIMMY_MD_CAP = 20 * 1024
+
+
+def _discover_himmy_md() -> Path | None:
+    """git-style upward search from cwd for the nearest ``HIMMY.md`` project note."""
+    cwd = Path.cwd().resolve()
+    for directory in (cwd, *cwd.parents):
+        candidate = directory / "HIMMY.md"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _apply_himmy_md(spec: AgentSpec) -> AgentSpec:
+    """Fold a discovered ``HIMMY.md`` into ``spec``'s instructions as project context.
+
+    Walks upward from cwd for ``HIMMY.md`` (same pattern as :func:`_discover_spec_file`);
+    when found, appends its contents (capped at :data:`_HIMMY_MD_CAP`) to the agent's
+    instructions, framed as project notes — for BOTH discovered-spec and house agents.
+    A dim ``using <path>`` line is printed to stderr only on an interactive terminal
+    (it's context, not decoration, so it still applies under pipes/CI — just silently).
+    Returns ``spec`` unchanged when no ``HIMMY.md`` exists.
+    """
+    path = _discover_himmy_md()
+    if path is None:
+        return spec
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return spec
+    if len(raw) > _HIMMY_MD_CAP:
+        raw = raw[:_HIMMY_MD_CAP] + "\n… (truncated)"
+    note = f"Project notes (HIMMY.md):\n{raw.strip()}"
+    if sys.stderr.isatty():
+        _eprint(f"using {path}")
+    return spec.model_copy(update={"instructions": [*spec.instructions, note]})
+
+
 def _house_spec() -> AgentSpec:
     """The capable default agent for a bare ask (`himmy "what's the weather"`).
 
@@ -155,7 +194,16 @@ def _house_spec() -> AgentSpec:
 def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
     """Build the AgentSpec from ``-f file``, the nearest ``agent.yaml`` (searched
     upward from cwd, git-style), or ad-hoc ``--name``/``--instruction`` flags.
-    With none of those, the capable house agent answers (see :func:`_house_spec`)."""
+    With none of those, the capable house agent answers (see :func:`_house_spec`).
+
+    A discovered ``HIMMY.md`` (upward from cwd) is folded into the agent's
+    instructions as project context for every build path (see :func:`_apply_himmy_md`).
+    """
+    return _apply_himmy_md(_spec_from_args_inner(args))
+
+
+def _spec_from_args_inner(args: argparse.Namespace) -> AgentSpec:
+    """Build the bare AgentSpec (before HIMMY.md project context is folded in)."""
     if getattr(args, "file", None):
         return from_spec.load_spec_file(args.file)
     if not getattr(args, "name", None) and not getattr(args, "instruction", None):
@@ -350,6 +398,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not prompt:
         _eprint("error: give a prompt — positional, -p/--prompt, or piped stdin")
         return 2
+    # @file affordance: inline the contents of any @path token that names a real file.
+    from himmy.cli.input_affordances import expand_at_files
+
+    prompt = expand_at_files(prompt, on_warn=lambda msg: _eprint(msg))
     args.prompt = prompt
     if getattr(args, "record", None) and getattr(args, "replay", None):
         _eprint("error: --record and --replay are mutually exclusive")
@@ -533,8 +585,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
         persona = spec.to_persona()
         llm_config = spec.to_llm_config()
+        # Session: an explicit --session resumes that id; -c/--continue resumes the
+        # implicit "last" session. With neither, this one-shot stays ephemeral.
+        explicit = getattr(args, "session", None)
+        continue_last = bool(getattr(args, "continue_last", False))
+        session_id = str(explicit) if explicit else ("last" if continue_last else None)
         store = None
-        session_id = getattr(args, "session", None)
         if session_id:
             from himmy.runtime.session import SqliteSessionStore
 
@@ -542,14 +598,17 @@ def cmd_chat(args: argparse.Namespace) -> int:
             store = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
         thread = ChatThread(agent_id=persona.agent_id)
         if store is not None and session_id:
-            existing = store.load(str(session_id))
+            existing = store.load(session_id)
             if existing is not None:
                 thread = existing
+        from himmy.cli.input_affordances import expand_at_files
+
+        message = expand_at_files(args.message, on_warn=lambda m: _eprint(m))
         result = _exec_with_mcp(
             lambda: _answer(
                 runtime,
                 persona,
-                spec.make_task(args.message),
+                spec.make_task(message),
                 thread=thread,
                 llm_config=llm_config,
                 has_tools=registry is not None,
@@ -559,7 +618,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             spec.mcp_servers,
         )
         if store is not None and session_id:
-            store.save(str(session_id), result.thread)
+            store.save(session_id, result.thread)
         live.finish()
         print(render_markdown_lite(result.output_text or "", stream=sys.stdout))
         return 0 if result.succeeded else 1

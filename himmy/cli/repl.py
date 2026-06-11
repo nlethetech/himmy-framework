@@ -92,7 +92,19 @@ class ChatRepl:
         self.interactive = bool(sys.stdin.isatty() and sys.stderr.isatty())
         self.yolo = bool(getattr(args, "yolo", False))
         self.safe = bool(getattr(args, "safe", False))
+        # Streamed final synthesis for tool turns is OPT-IN (/stream on): it costs
+        # one extra model call per tool turn and records the synthesis exchange in
+        # the thread, so it must be a deliberate choice, not a silent default.
+        self.stream_final = False
         self._c = styles(sys.stdout)
+        # Session continuity. An explicit --session <id> keeps the historical
+        # behavior (persist + auto-load that id). Otherwise the REPL auto-persists
+        # to the implicit "last" session after every turn — but a fresh REPL does
+        # NOT auto-load it (a fresh `himmy` feels fresh) unless `-c`/`--continue`.
+        explicit = getattr(args, "session", None)
+        self._explicit_session = bool(explicit)
+        self._session_id = str(explicit) if explicit else "last"
+        self._continue_last = bool(getattr(args, "continue_last", False))
 
     # ------------------------------------------------------------------ wiring
 
@@ -235,6 +247,48 @@ class ChatRepl:
 
         print(*args, file=sys.stderr)
 
+    # ------------------------------------------------------ input affordances
+
+    def _expand_at_files(self, text: str) -> str:
+        """Inline ``@path`` tokens that name a real file (warning on a miss)."""
+        from himmy.cli.input_affordances import expand_at_files
+
+        c = self._c
+
+        def _warn(msg: str) -> None:
+            self._eprint(f"{c['dim']}{msg}{c['reset']}")
+
+        return expand_at_files(text, on_warn=_warn)
+
+    def _handle_bang(self, line: str) -> str | None:
+        """Run a ``!cmd`` / ``!!cmd`` shell escape the user typed.
+
+        Returns ``None`` for ``!cmd`` (output shown locally, agent NOT involved) and
+        the framed command+output string for ``!!cmd`` (to be sent to the agent). A
+        bare ``!`` with no command is a no-op (returns ``None``). This is a local
+        shell escape the human typed verbatim — never agent-initiated — so it carries
+        no approval gate.
+        """
+        from himmy.cli.input_affordances import (
+            classify_bang,
+            frame_for_agent,
+            run_shell,
+        )
+
+        c = self._c
+        parsed = classify_bang(line)
+        if parsed is None:
+            self._eprint(f"{c['dim']}usage: !<cmd>  or  !!<cmd>{c['reset']}")
+            return None
+        result = run_shell(parsed.command)
+        body = result.output or "(no output)"
+        self._eprint(f"{c['dim']}{body}{c['reset']}")
+        if result.exit_code != 0 and not result.timed_out:
+            self._eprint(f"{c['dim']}(exit {result.exit_code}){c['reset']}")
+        if parsed.send_to_agent:
+            return frame_for_agent(result)
+        return None
+
     def _print_reply(self, text: str) -> None:
         import sys
 
@@ -251,13 +305,30 @@ class ChatRepl:
 
         Returns the (possibly new) thread. A tool-using agent runs the act→observe
         loop under hitl (interactive only) with the approval prompt loop; a no-tool
-        agent streams token-by-token exactly as before.
+        agent streams token-by-token exactly as before. When a tool-using turn
+        finishes WITHOUT a pending approval, the final answer is re-issued as a
+        streamed synthesis turn (see :meth:`_stream_final_answer`) so the user sees
+        it arrive token-by-token instead of all at once.
         """
         import sys
 
         if self.rt["registry"] is not None:
+            tools_before = self._count_tool_messages(thread)
             loop_result = await self._drive_turn_with_approvals(thread, text)
             self.rt["live"].finish()
+            # Stream the final answer only when this turn actually exercised tools
+            # AND all approvals are resolved (no pending checkpoint). We detect tool
+            # use by the TOOL messages the turn added to the thread — which also
+            # catches a tool executed across an approval/resume (where the tool call
+            # is in the pre-checkpoint segment, not in the final result's turns).
+            used_tools = self._count_tool_messages(loop_result.thread) > tools_before
+            if (
+                self.stream_final
+                and used_tools
+                and getattr(loop_result, "checkpoint_id", None) is None
+            ):
+                await self._stream_final_answer(loop_result.thread)
+                return loop_result.thread
             self._print_reply(loop_result.final.output_text or "")
             return loop_result.thread
         # No tools: stream the reply token-by-token (the original behavior).
@@ -274,6 +345,54 @@ class ChatRepl:
                 sys.stdout.flush()
         sys.stdout.write("\n\n" if self.tty else "\n")
         return thread
+
+    @staticmethod
+    def _count_tool_messages(thread: Any) -> int:
+        """How many TOOL-role messages a thread holds (tool-use detector)."""
+        from himmy.agents.base_agent.thread import MessageRole
+
+        return sum(
+            1 for m in getattr(thread, "messages", []) if m.role == MessageRole.TOOL
+        )
+
+    #: The synthesis prompt for the streamed final-answer turn (tools unbound).
+    _STREAM_SYNTHESIS_PROMPT = (
+        "Using only the tool results above, answer the user's question directly and "
+        "completely. Do not call any tools."
+    )
+
+    async def _stream_final_answer(self, thread: Any) -> None:
+        """Stream a final synthesis turn over a thread whose tool loop already ran.
+
+        The act→observe loop buffers its whole answer ("can't stream mid-loop"). Once
+        the loop has finished and every approval is resolved, the thread carries the
+        full tool history, so we re-issue ONE final no-tool turn through
+        :meth:`SingleAgentRuntime.stream_task` (tools unbound via ``tool_names: []``)
+        and write its tokens live. This is an additional, real, streamed synthesis
+        turn — it does not touch ``run_agent_loop`` — so the loop's bounding and the
+        approval flow are unchanged; streaming only kicks in after all of that.
+        """
+        import sys
+
+        from himmy.agents.base_agent.task import Task
+
+        task = Task(
+            title=f"{self.spec.name}-synthesis",
+            prompt=self._STREAM_SYNTHESIS_PROMPT,
+            context={"tool_names": []},  # unbind tools: force a streamed text answer
+        )
+        prefix = "" if self.tty else "bot> "
+        sys.stdout.write(prefix)
+        async for delta in self.rt["runtime"].stream_task(
+            self.persona,
+            task,
+            thread=thread,
+            llm_config=self.llm_config,
+        ):
+            if delta.delta:
+                sys.stdout.write(delta.delta)
+                sys.stdout.flush()
+        sys.stdout.write("\n\n" if self.tty else "\n")
 
     # --------------------------------------------------------------- slash cmds
 
@@ -299,6 +418,8 @@ class ChatRepl:
                 self._eprint(f"{c['dim']}usage: /plan <task>{c['reset']}")
                 return thread
             return self._run_turn_coro(self._plan_and_maybe_run(thread, goal), thread)
+        if cmd == "/resume":
+            return self._resume_picker(thread)
         if cmd == "/reset":
             thread = ChatThread(agent_id=self.persona.agent_id)
             self._persist(thread)
@@ -323,6 +444,15 @@ class ChatRepl:
             from himmy.cli.agents import cmd_agents
 
             cmd_agents(argparse.Namespace(directory=".", json=False))
+        elif cmd == "/stream":
+            if rest and rest[0] in ("on", "off"):
+                self.stream_final = rest[0] == "on"
+            state = "on" if self.stream_final else "off"
+            self._eprint(
+                f"{c['dim']}streamed final answers: {state} — when on, tool turns "
+                f"re-issue the final synthesis as a live stream (one extra model "
+                f"call per turn){c['reset']}"
+            )
         elif cmd == "/cost":
             live = self.rt["live"]
             self._eprint(
@@ -333,17 +463,79 @@ class ChatRepl:
             self._eprint(
                 f"{c['dim']}/model [name [provider]]  switch the model\n"
                 f"/plan <task>              plan a task, then run it on approval\n"
+                f"/resume                   pick a recent session to continue\n"
                 f"/tools                    what this agent can call\n"
                 f"/agents                   specs in this directory\n"
+                f"/stream on|off            stream tool-turn answers (extra call)\n"
                 f"/cost                     session events + spend\n"
                 f"/reset                    start a fresh thread\n"
-                f"/exit                     leave{c['reset']}"
+                f"/exit                     leave\n"
+                f"\n"
+                f"@path                     inline a file's contents into your message\n"
+                f"!cmd                      run a shell command, show its output\n"
+                f"!!cmd                     run a shell command, send it to the agent"
+                f"{c['reset']}"
             )
         else:
             self._eprint(
                 f"{c['dim']}unknown command {cmd} — /help lists them{c['reset']}"
             )
         return thread
+
+    # ------------------------------------------------------------------ resume
+
+    def _resume_picker(self, thread: Any) -> Any:
+        """``/resume``: list recent sessions and swap the live thread to a chosen one.
+
+        Renders a numbered picker (id · last-active · message count) from the session
+        store, reads a choice, and on a valid pick swaps the live thread to that
+        session AND repoints the active session id so subsequent turns persist there.
+        An empty/invalid choice leaves the current thread untouched.
+        """
+        c = self._c
+        store = self.rt.get("session_store")
+        if store is None or not hasattr(store, "list_sessions"):
+            self._eprint(f"{c['dim']}(no session store){c['reset']}")
+            return thread
+        sessions = store.list_sessions(limit=10)
+        if not sessions:
+            self._eprint(f"{c['dim']}(no saved sessions yet){c['reset']}")
+            return thread
+        self._eprint(f"{c['snow']}recent sessions:{c['reset']}")
+        for i, info in enumerate(sessions, start=1):
+            self._eprint(
+                f"  {c['snow']}{i}.{c['reset']} {c['ink']}{info.session_id}{c['reset']}"
+                f"{c['faint']}  {info.updated_at}  "
+                f"{info.message_count} message(s){c['reset']}"
+            )
+        try:
+            answer = self._input("resume which? [number, or blank to cancel] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if not answer:
+            self._eprint(f"{c['dim']}— cancelled{c['reset']}")
+            return thread
+        try:
+            choice = int(answer)
+        except ValueError:
+            self._eprint(f"{c['dim']}— not a number, cancelled{c['reset']}")
+            return thread
+        if not 1 <= choice <= len(sessions):
+            self._eprint(f"{c['dim']}— out of range, cancelled{c['reset']}")
+            return thread
+        picked = sessions[choice - 1]
+        loaded = store.load(picked.session_id)
+        if loaded is None:
+            self._eprint(f"{c['dim']}— could not load that session{c['reset']}")
+            return thread
+        self._session_id = picked.session_id
+        self._explicit_session = True
+        count = len(getattr(loaded, "messages", []))
+        self._eprint(
+            f"{c['dim']}continuing session '{picked.session_id}' "
+            f"({count} messages){c['reset']}"
+        )
+        return loaded
 
     # ----------------------------------------------------------- loop + persist
 
@@ -368,35 +560,47 @@ class ChatRepl:
             return thread
 
     def _new_thread(self) -> Any:
+        """The thread the REPL opens with.
+
+        Loads the active session's saved thread ONLY when the user asked to
+        continue it — an explicit ``--session <id>`` (resume that id) or
+        ``-c``/``--continue`` (continue the implicit ``last`` session). A bare
+        ``himmy chat`` starts fresh even though it auto-persists to ``last``.
+        """
         from himmy.agents.base_agent.thread import ChatThread
 
         store = self.rt.get("session_store")
-        session_id = getattr(self.args, "session", None)
-        if store is not None and session_id:
-            existing = store.load(str(session_id))
+        should_load = self._explicit_session or self._continue_last
+        if store is not None and should_load:
+            existing = store.load(self._session_id)
             if existing is not None:
+                count = len(getattr(existing, "messages", []))
+                self._eprint(
+                    f"{self._c['dim']}continuing session '{self._session_id}' "
+                    f"({count} messages){self._c['reset']}"
+                )
                 return existing
         return ChatThread(agent_id=self.persona.agent_id)
 
     def _persist(self, thread: Any) -> None:
+        """Auto-persist ``thread`` to the active session id (``last`` by default)."""
         store = self.rt.get("session_store")
-        session_id = getattr(self.args, "session", None)
-        if store is not None and session_id:
-            store.save(str(session_id), thread)
+        if store is not None:
+            store.save(self._session_id, thread)
 
     def run(self) -> int:
         """Run the interactive REPL until the user exits. Returns a process code."""
 
         self.rebuild()
-        # Optional durable session.
-        session_id = getattr(self.args, "session", None)
-        if session_id:
-            from himmy.runtime.session import SqliteSessionStore
+        # Durable session continuity. Always wire the store: a bare REPL still
+        # auto-persists to the implicit "last" session after every turn (only an
+        # explicit --session or -c/--continue LOADS a prior thread at startup).
+        from himmy.runtime.session import SqliteSessionStore
 
-            Path(".himmy").mkdir(exist_ok=True)
-            self.rt["session_store"] = SqliteSessionStore(
-                str(Path(".himmy") / "sessions.db")
-            )
+        Path(".himmy").mkdir(exist_ok=True)
+        self.rt["session_store"] = SqliteSessionStore(
+            str(Path(".himmy") / "sessions.db")
+        )
 
         # Connect MCP servers ONCE on the persistent loop (reused across turns).
         mcp_clients: list[Any] = []
@@ -420,8 +624,8 @@ class ChatRepl:
                 f"this session{c['reset']}"
             )
         self._eprint(f"{c['dim']}{self._status()} — /help for commands{c['reset']}")
-        if session_id:
-            self._eprint(f"{c['faint']}session: {session_id}{c['reset']}")
+        if self._explicit_session:
+            self._eprint(f"{c['faint']}session: {self._session_id}{c['reset']}")
         self._eprint("")
 
         thread = self._new_thread()
@@ -440,6 +644,13 @@ class ChatRepl:
                         break
                     thread = handled
                     continue
+                if line.startswith("!"):
+                    sent = self._handle_bang(line)
+                    if sent is None:
+                        continue  # `!cmd`: shown locally, agent not involved
+                    line = sent  # `!!cmd`: framed command+output goes to the agent
+                else:
+                    line = self._expand_at_files(line)
                 thread = self._run_turn_coro(self._chat_turn(thread, line), thread)
                 self._persist(thread)
         finally:

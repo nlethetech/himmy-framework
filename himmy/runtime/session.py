@@ -9,6 +9,7 @@ a :class:`ChatThread` round-trips cleanly via ``model_dump_json``/``model_valida
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 
 from himmy.agents.base_agent.thread import ChatThread
 from himmy.core.ids import utc_now_iso
@@ -20,6 +21,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at TEXT NOT NULL
 );
 """
+
+
+@dataclass(frozen=True)
+class SessionInfo:
+    """A lightweight summary of one stored session for the ``/resume`` picker."""
+
+    session_id: str
+    updated_at: str
+    message_count: int
 
 
 class SqliteSessionStore:
@@ -47,9 +57,36 @@ class SqliteSessionStore:
         ).fetchone()
         return ChatThread.model_validate_json(row[0]) if row else None
 
+    def list_sessions(self, *, limit: int | None = None) -> list[SessionInfo]:
+        """Recent sessions, newest first, with each thread's message count.
+
+        Powers the ``/resume`` picker: returns a :class:`SessionInfo` per stored
+        session (id, last-active timestamp, and how many messages its thread holds).
+        A thread that fails to deserialize is reported with ``message_count=0``
+        rather than breaking the whole listing.
+        """
+        sql = "SELECT session_id, thread, updated_at FROM sessions ORDER BY updated_at DESC"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        rows = self._conn.execute(sql).fetchall()
+        out: list[SessionInfo] = []
+        for session_id, thread_json, updated_at in rows:
+            try:
+                count = len(ChatThread.model_validate_json(thread_json).messages)
+            except Exception:  # noqa: BLE001 - a corrupt row must not break the list
+                count = 0
+            out.append(
+                SessionInfo(
+                    session_id=session_id,
+                    updated_at=updated_at,
+                    message_count=count,
+                )
+            )
+        return out
+
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
         self._conn.close()
 
 
-__all__ = ["SqliteSessionStore"]
+__all__ = ["SessionInfo", "SqliteSessionStore"]
