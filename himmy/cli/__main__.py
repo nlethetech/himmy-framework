@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="run a single prompt and print the answer")
     _add_agent_flags(p_run)
+    p_run.add_argument(
+        "words",
+        nargs="*",
+        metavar="prompt",
+        help="the prompt, as plain words (alternative to -p; stdin can be piped too)",
+    )
     p_run.add_argument("-p", "--prompt", help="the prompt to run")
     p_run.add_argument("--json", action="store_true", help="print full result as JSON")
     p_run.add_argument(
@@ -285,7 +291,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except HimmyError as exc:
-        print(f"error: {exc}", flush=True)
+        # stderr, so a piped stdout never swallows the failure
+        print(f"error: {exc}", file=sys.stderr, flush=True)
         return 1
 
 

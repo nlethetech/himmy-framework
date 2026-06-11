@@ -34,6 +34,7 @@ from himmy.agents.base_agent.task import Task
 from himmy.agents.personas.persona import Persona
 from himmy.config.http_tool_spec import HttpToolSpec
 from himmy.config.mcp_spec import MCPServerConfig
+from himmy.core.errors import HimmyError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.models import LLMConfig
@@ -212,6 +213,10 @@ def load_agent_spec(path: str | Path) -> AgentSpec:
     relative to the YAML file's directory, and inlined into the returned spec.
     """
     spec_path = Path(path).expanduser()
+    if not spec_path.is_file():
+        raise HimmyError(
+            f"agent spec not found: {spec_path} (create one with `himmy init`)"
+        )
     raw = yaml.safe_load(spec_path.read_text()) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"agent spec {spec_path} must be a YAML mapping")

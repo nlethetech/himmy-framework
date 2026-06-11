@@ -95,10 +95,36 @@ _project = from_spec.load_project
 _apply_defaults = from_spec.apply_project_defaults
 
 
+def _read_piped_stdin() -> str:
+    """Piped stdin content, or "" on a TTY / when stdin is unreadable (pytest, cron)."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return ""
+        return sys.stdin.read()
+    except Exception:  # noqa: BLE001 - no stdin is never an error, just no input
+        return ""
+
+
+def _discover_spec_file() -> Path | None:
+    """git-style upward search from cwd for the nearest ``agent.yaml``."""
+    cwd = Path.cwd().resolve()
+    for directory in (cwd, *cwd.parents):
+        candidate = directory / "agent.yaml"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
-    """Build the AgentSpec from ``-f file`` or ad-hoc ``--name``/``--instruction``."""
+    """Build the AgentSpec from ``-f file``, the nearest ``agent.yaml`` (searched
+    upward from cwd, git-style), or ad-hoc ``--name``/``--instruction`` flags."""
     if getattr(args, "file", None):
         return from_spec.load_spec_file(args.file)
+    if not getattr(args, "name", None) and not getattr(args, "instruction", None):
+        discovered = _discover_spec_file()
+        if discovered is not None:
+            _eprint(f"using {discovered}")
+            return from_spec.load_spec_file(str(discovered))
     spec = AgentSpec(
         name=getattr(args, "name", None) or "himmy-agent",
         description="Ad-hoc agent created from CLI flags.",
@@ -229,10 +255,20 @@ def _record_replay_inference(
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """One-shot: run a single prompt through the agent and print the answer."""
-    if not args.prompt:
-        _eprint("error: --prompt/-p is required for `himmy run`")
+    """One-shot: run a single prompt through the agent and print the answer.
+
+    The prompt can arrive three ways, composable: positional words, ``-p``, and
+    piped stdin (appended as input, or used as the whole prompt when alone) —
+    so ``git diff | himmy run "review this"`` does what it reads like it does.
+    """
+    prompt = (args.prompt or " ".join(getattr(args, "words", None) or [])).strip()
+    piped = _read_piped_stdin().strip()
+    if piped:
+        prompt = f"{prompt}\n\n--- piped input ---\n{piped}" if prompt else piped
+    if not prompt:
+        _eprint("error: give a prompt — positional, -p/--prompt, or piped stdin")
         return 2
+    args.prompt = prompt
     if getattr(args, "record", None) and getattr(args, "replay", None):
         _eprint("error: --record and --replay are mutually exclusive")
         return 2
