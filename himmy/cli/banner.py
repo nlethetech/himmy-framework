@@ -58,7 +58,9 @@ _COLORS_256 = {
     "reset": "\x1b[0m",
 }
 
-_SCRAMBLE = "█▓▒░║═╔╗╚╝╣╠"
+# Only glyphs the ANSI Shadow font itself uses: a mid-decode pause then looks
+# like shifting letterforms, never like corruption (▓▒░ read as a broken screen).
+_SCRAMBLE = "█║═╔╗╚╝"
 
 
 def supports_color(stream: object = None) -> bool:
@@ -110,8 +112,13 @@ def _scramble_line(art: str, rng: random.Random) -> str:
     return "".join(ch if ch == " " else rng.choice(_SCRAMBLE) for ch in art)
 
 
-def _animate_lockup(c: dict[str, str], *, step_s: float = 0.04, lead: int = 5) -> None:
-    """Decode the lockup in place: scrambled rows resolve top-to-bottom."""
+def _animate_lockup(c: dict[str, str], *, step_s: float = 0.03, lead: int = 3) -> None:
+    """Decode the lockup in place: scrambled rows resolve top-to-bottom.
+
+    Ends with one unconditional clean repaint of every row — if a renderer
+    drops or batches intermediate frames (xterm.js under a recorder, a slow
+    ssh hop), the settled state is still guaranteed to be the real art.
+    """
     rng = random.Random()
     out = sys.stdout
     n = len(_LOCKUP)
@@ -121,17 +128,27 @@ def _animate_lockup(c: dict[str, str], *, step_s: float = 0.04, lead: int = 5) -
             f"{c['dim']}{_scramble_line(art, rng)}{c['reset']}\n" if art else "\n"
         )
     out.flush()
-    for step in range(n + lead):
+    try:
+        for step in range(n + lead):
+            out.write(f"\x1b[{n}A")
+            for i, (art, role) in enumerate(_LOCKUP):
+                if not art:
+                    out.write("\x1b[2K\n")
+                elif i < step - lead + 1:
+                    out.write(f"\x1b[2K{c[role]}{art}{c['reset']}\n")
+                else:
+                    out.write(
+                        f"\x1b[2K{c['dim']}{_scramble_line(art, rng)}{c['reset']}\n"
+                    )
+            out.flush()
+            time.sleep(step_s)
+    finally:
+        # Settle pass: repaint everything resolved no matter what came before —
+        # a Ctrl-C mid-cascade or a renderer that dropped frames still ends clean.
         out.write(f"\x1b[{n}A")
-        for i, (art, role) in enumerate(_LOCKUP):
-            if not art:
-                out.write("\x1b[2K\n")
-            elif i < step - lead + 1:
-                out.write(f"\x1b[2K{c[role]}{art}{c['reset']}\n")
-            else:
-                out.write(f"\x1b[2K{c['dim']}{_scramble_line(art, rng)}{c['reset']}\n")
+        for art, role in _LOCKUP:
+            out.write(f"\x1b[2K{c[role]}{art}{c['reset']}\n" if art else "\x1b[2K\n")
         out.flush()
-        time.sleep(step_s)
 
 
 def print_banner() -> int:
@@ -140,8 +157,15 @@ def print_banner() -> int:
     Animated decode on an interactive TTY; static text when piped, when
     ``NO_COLOR`` is set, or when ``HIMMY_NO_ANIM`` asks for stillness.
     """
+    import shutil
+
     color = supports_color()
-    animate = color and os.environ.get("HIMMY_NO_ANIM") is None
+    # The in-place decode rewrites rows with cursor-up; a terminal narrower than
+    # the art wraps lines and breaks that math into garbage. Static splash then.
+    wide_enough = shutil.get_terminal_size().columns >= max(
+        len(art) for art, _ in _LOCKUP
+    )
+    animate = color and wide_enough and os.environ.get("HIMMY_NO_ANIM") is None
     if animate:
         c = palette(color=True)
         _animate_lockup(c)
