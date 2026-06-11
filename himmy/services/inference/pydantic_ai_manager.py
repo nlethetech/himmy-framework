@@ -450,12 +450,23 @@ class PydanticAIClientManager:
     @staticmethod
     def _extract_usage(result: Any) -> tuple[int, int]:
         """Read token usage from ``result.usage()`` (request/response tokens)."""
-        usage_fn = getattr(result, "usage", None)
-        if usage_fn is None:
-            return 0, 0
         try:
-            usage = usage_fn()
+            # ``AgentRunResult.usage`` was a method, then (pydantic-ai 1.10x) a
+            # property. Access it as a property and only call it if it's still
+            # callable (older versions) — all under blanket warning suppression so
+            # neither the stdlib DeprecationWarning nor pydantic-ai's own
+            # PydanticAIDeprecationWarning ever dumps onto the user's terminal
+            # mid-conversation. The returned numbers are unchanged either way.
+            import warnings
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                usage = getattr(result, "usage", None)
+                if callable(usage):
+                    usage = usage()
         except Exception:  # noqa: BLE001
+            return 0, 0
+        if usage is None:
             return 0, 0
         # pydantic-ai exposes request_tokens/response_tokens (newer: input/output).
         input_tokens = (
