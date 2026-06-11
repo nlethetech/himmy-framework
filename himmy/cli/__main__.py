@@ -31,6 +31,18 @@ def _cmd_new(args: argparse.Namespace) -> int:
     return cmd_new(args)
 
 
+def _cmd_agents(args: argparse.Namespace) -> int:
+    from himmy.cli.agents import cmd_agents
+
+    return cmd_agents(args)
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    from himmy.cli.agents import cmd_validate
+
+    return cmd_validate(args)
+
+
 def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
     """Shared flags for commands that build/run an agent (run, chat)."""
     parser.add_argument("-f", "--file", help="path to an agent.yaml spec")
@@ -187,6 +199,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_new.add_argument("--model", help="model to draft with")
     p_new.set_defaults(func=_cmd_new)
+
+    p_agents = sub.add_parser(
+        "agents", help="list the agent/team specs in a directory (default: here)"
+    )
+    p_agents.add_argument("directory", nargs="?", default=".", help="directory to scan")
+    p_agents.add_argument(
+        "--json", action="store_true", help="print the listing as JSON"
+    )
+    p_agents.set_defaults(func=_cmd_agents)
+
+    p_validate = sub.add_parser(
+        "validate", help="lint an agent.yaml before running it (did-you-mean hints)"
+    )
+    p_validate.add_argument(
+        "file", nargs="?", help="spec to check (default: the nearest agent.yaml)"
+    )
+    p_validate.set_defaults(func=_cmd_validate)
 
     p_init = sub.add_parser("init", help="scaffold an agent.yaml + tools.py")
     p_init.add_argument("directory", nargs="?", default=".", help="target directory")
