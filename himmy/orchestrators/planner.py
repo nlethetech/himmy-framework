@@ -75,21 +75,25 @@ class PlannerOrchestrator:
         self._max_steps = max_steps
         self._temperature = default_temperature
 
-    async def run(
+    async def plan_only(
         self,
         goal: str,
         persona: Persona | None = None,
         *,
-        tool_names: list[str] | None = None,
         model_key: str = "default",
-    ) -> PlanResult:
-        """Plan ``goal``, execute the steps, and return the synthesized answer."""
+        thread: ChatThread | None = None,
+    ) -> list[str]:
+        """Ask the model for an ordered plan and return its steps (no execution).
+
+        The plan-generation half of :meth:`run`, exposed so a caller (the chat
+        REPL's ``/plan``) can show the plan and gate execution on human approval.
+        The steps are the model's own — structured output when the provider honors
+        it, parsed numbered/bulleted lines otherwise. Capped at ``max_steps``.
+        """
         persona = persona or Persona(
             name="planner", description="You plan, then execute, then summarize."
         )
-        thread = ChatThread(agent_id=persona.agent_id)
-
-        # 1. Plan: ask for an ordered list of steps (structured output).
+        thread = thread or ChatThread(agent_id=persona.agent_id)
         plan_result = await self._runtime.run_task_detailed(
             persona,
             Task(
@@ -110,7 +114,24 @@ class PlannerOrchestrator:
         if not plan:
             # Providers without structured-output support (e.g. Ollama) plan in text.
             plan = _steps_from_text(plan_result.output_text)
-        plan = plan[: self._max_steps]
+        return plan[: self._max_steps]
+
+    async def run(
+        self,
+        goal: str,
+        persona: Persona | None = None,
+        *,
+        tool_names: list[str] | None = None,
+        model_key: str = "default",
+    ) -> PlanResult:
+        """Plan ``goal``, execute the steps, and return the synthesized answer."""
+        persona = persona or Persona(
+            name="planner", description="You plan, then execute, then summarize."
+        )
+        thread = ChatThread(agent_id=persona.agent_id)
+
+        # 1. Plan: ask for an ordered list of steps (structured output).
+        plan = await self.plan_only(goal, persona, model_key=model_key, thread=thread)
 
         # 2. Execute each step over the shared thread (later steps see earlier results).
         step_results: list[RunResult] = []
@@ -145,7 +166,7 @@ class PlannerOrchestrator:
             llm_config=LLMConfig(model_key=model_key, temperature=self._temperature),
         )
 
-        all_results = [plan_result, *step_results, final]
+        all_results = [*step_results, final]
         return PlanResult(
             thread=thread,
             goal=goal,

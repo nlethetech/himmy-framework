@@ -58,6 +58,19 @@ def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
         help="inference provider (default: auto pydantic-ai→stub)",
     )
     parser.add_argument("--model", help="model key/name for the provider")
+    # Permission profile (mutually exclusive): --yolo auto-approves every gated
+    # tool; --safe ignores the himmy.toml allowlist so everything gated prompts.
+    perms = parser.add_mutually_exclusive_group()
+    perms.add_argument(
+        "--yolo",
+        action="store_true",
+        help="auto-approve every approval-gated tool this run (no prompts)",
+    )
+    perms.add_argument(
+        "--safe",
+        action="store_true",
+        help="ignore [permissions] auto_approve — prompt for every gated tool",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -338,6 +351,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=None,
                 message=None,
                 session=None,
+                yolo=False,
+                safe=False,
             )
             return commands.cmd_chat(repl_args)
         return code

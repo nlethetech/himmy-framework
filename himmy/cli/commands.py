@@ -235,6 +235,42 @@ async def _answer(
     return await runtime.run_task_detailed(persona, task, thread, llm_config=llm_config)
 
 
+async def _run_with_in_run_approvals(
+    runtime: Any,
+    checkpoint_store: Any,
+    spec: AgentSpec,
+    args: argparse.Namespace,
+    live: Any,
+) -> Any:
+    """Run one prompt under hitl, servicing approval pauses, and return the RunResult.
+
+    Mirrors the chat REPL's approval loop for one-shot ``himmy run``: run the agent
+    loop with ``hitl=True``; while it pauses (``checkpoint_id`` set), stop the live
+    spinner, prompt approve? [y/N/always], resume with the decision, and loop until
+    the run finishes. Returns ``AgentLoopResult.final`` so the caller's existing
+    RunResult-shaped printing/JSON path is unchanged.
+    """
+    from himmy.cli.repl import prompt_approval
+
+    llm_config = spec.to_llm_config()
+    loop_result = await runtime.run_agent_loop(
+        spec.to_persona(),
+        spec.make_task(args.prompt),
+        llm_config=llm_config,
+        max_turns=8,
+        route_tools=spec.tool_router,
+        hitl=True,
+    )
+    while getattr(loop_result, "checkpoint_id", None):
+        if live is not None:
+            live.finish()
+        approved = prompt_approval(checkpoint_store, loop_result.checkpoint_id)
+        loop_result = await runtime.resume_agent_loop(
+            loop_result.checkpoint_id, approved=approved, llm_config=llm_config
+        )
+    return loop_result.final
+
+
 # Knowledge ingestion lives in himmy.runtime.from_spec (shared with the Studio API).
 _ingest_knowledge = from_spec.ingest_knowledge_sources
 
@@ -245,11 +281,14 @@ def _build_runtime_for(
     *,
     on_event: Any = None,
     inference: Any = None,
+    checkpoint_store: Any = None,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring CLI provider/model overrides + tools.
 
     Thin CLI adapter over :func:`himmy.runtime.from_spec.build_runtime_for_spec`
     (the shared wiring used by Himmy Studio too). Returns ``(runtime, registry)``.
+    ``checkpoint_store`` (optional) wires durable HITL pause/resume — passed when
+    a run/chat may pause at an approval-gated tool.
     """
     return from_spec.build_runtime_for_spec(
         spec,
@@ -258,6 +297,7 @@ def _build_runtime_for(
         on_event=on_event,
         inference=inference,
         on_log=_eprint,
+        checkpoint_store=checkpoint_store,
     )
 
 
@@ -314,6 +354,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "record", None) and getattr(args, "replay", None):
         _eprint("error: --record and --replay are mutually exclusive")
         return 2
+    if getattr(args, "yolo", False) and getattr(args, "safe", False):
+        _eprint("error: --yolo and --safe are mutually exclusive")
+        return 2
     spec = _spec_from_args(args)
     tracer = _TraceCollector() if getattr(args, "trace", False) else None
     inference, recorder = _record_replay_inference(spec, args)
@@ -321,13 +364,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         _maybe_hint_stub(spec, args)
     # Live desk-style rendering (spinner + tool lines on stderr, TTY only).
     # Streaming runs own the terminal with their token flow, so no overlay there.
-    from himmy.cli.ui import LiveRunUI, compose_event_handlers
+    from himmy.cli.ui import LiveRunUI, compose_event_handlers, styles
 
     live = (
         LiveRunUI(model_label=_model_label(spec, args))
         if not getattr(args, "stream", False)
         else None
     )
+    # In-run approvals only when stdin AND stderr are real TTYs (a human can answer
+    # the prompt); scripts/CI stay non-interactive so gated tools fail closed.
+    interactive = bool(sys.stdin.isatty() and sys.stderr.isatty())
+    checkpoint_store = None
+    if interactive:
+        from himmy.cli.repl import _cli_checkpoint_db
+        from himmy.runtime.checkpoint import SqliteCheckpointStore
+
+        checkpoint_store = SqliteCheckpointStore(_cli_checkpoint_db())
     runtime, registry = _build_runtime_for(
         spec,
         args,
@@ -336,7 +388,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             live.handle if live is not None and live.enabled else None,
         ),
         inference=inference,
+        checkpoint_store=checkpoint_store,
     )
+    # Permission profile: --yolo grants everything, --safe ignores the allowlist,
+    # otherwise the himmy.toml [permissions] auto_approve list ungates its tools.
+    from himmy.cli import permissions
+
+    if getattr(args, "yolo", False):
+        c = styles(sys.stderr)
+        _eprint(f"{c['crimson']}⚠ --yolo: every tool runs without approval{c['reset']}")
+        permissions.grant_all_approvals(registry)
+    elif getattr(args, "safe", False):
+        pass  # ignore the allowlist: everything gated prompts
+    else:
+        permissions.apply_allowlist(registry, permissions.load_auto_approve())
 
     def _print_trace() -> None:
         if tracer is not None:
@@ -378,15 +443,29 @@ def cmd_run(args: argparse.Namespace) -> int:
         _print_trace()
         return 0
 
-    async def _go() -> Any:
-        return await _answer(
-            runtime,
-            spec.to_persona(),
-            spec.make_task(args.prompt),
-            llm_config=spec.to_llm_config(),
-            has_tools=registry is not None,
-            route_tools=spec.tool_router,
-        )
+    # Interactive + tool-using: run under hitl and service approval pauses in-run
+    # (render the pending call, prompt approve? [y/N/always], resume, loop).
+    if interactive and registry is not None and checkpoint_store is not None:
+
+        async def _go() -> Any:
+            return await _run_with_in_run_approvals(
+                runtime,
+                checkpoint_store,
+                spec,
+                args,
+                live,
+            )
+    else:
+
+        async def _go() -> Any:
+            return await _answer(
+                runtime,
+                spec.to_persona(),
+                spec.make_task(args.prompt),
+                llm_config=spec.to_llm_config(),
+                has_tools=registry is not None,
+                route_tools=spec.tool_router,
+            )
 
     result = _exec_with_mcp(_go, registry, spec.mcp_servers)
     if live is not None:
@@ -429,197 +508,65 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
-    """Interactive REPL keeping one thread; `--message` runs a single turn."""
+    """Interactive REPL keeping one thread; `--message` runs a single turn.
+
+    The interactive path lives in :class:`himmy.cli.repl.ChatRepl` (which adds
+    in-REPL approvals, interrupt-safe turns, and plan mode); this stays the thin
+    entry that handles the non-interactive ``--message`` one-shot and otherwise
+    delegates to the REPL.
+    """
     spec = _spec_from_args(args)
     _maybe_hint_stub(spec, args)
-    from himmy.cli.ui import LiveRunUI, render_markdown_lite, styles
 
-    # Mutable so /model can swap the backend mid-conversation (thread survives).
-    rt: dict[str, Any] = {}
+    if getattr(args, "yolo", False) and getattr(args, "safe", False):
+        _eprint("error: --yolo and --safe are mutually exclusive")
+        return 2
 
-    def _rebuild() -> None:
-        rt["live"] = LiveRunUI(model_label=_model_label(spec, args))
-        rt["runtime"], rt["registry"] = _build_runtime_for(
-            spec, args, on_event=rt["live"].handle if rt["live"].enabled else None
+    if getattr(args, "message", None):
+        from himmy.cli.ui import LiveRunUI, render_markdown_lite
+
+        live = LiveRunUI(model_label=_model_label(spec, args))
+        runtime, registry = _build_runtime_for(
+            spec, args, on_event=live.handle if live.enabled else None
         )
+        from himmy.agents.base_agent.thread import ChatThread
 
-    _rebuild()
-    persona = spec.to_persona()
-    llm_config = spec.to_llm_config()
+        persona = spec.to_persona()
+        llm_config = spec.to_llm_config()
+        store = None
+        session_id = getattr(args, "session", None)
+        if session_id:
+            from himmy.runtime.session import SqliteSessionStore
 
-    async def _turn(thread: Any, text: str) -> Any:
-        return await _answer(
-            rt["runtime"],
-            persona,
-            spec.make_task(text),
-            thread=thread,
-            llm_config=llm_config,
-            has_tools=rt["registry"] is not None,
-            route_tools=spec.tool_router,
-        )
-
-    from himmy.agents.base_agent.thread import ChatThread
-
-    # Optional durable session: load the thread + persist after every turn.
-    session_id = getattr(args, "session", None)
-    store = None
-    if session_id:
-        from himmy.runtime.session import SqliteSessionStore
-
-        Path(".himmy").mkdir(exist_ok=True)
-        store = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
-
-    def _new_thread() -> Any:
-        if store is not None:
+            Path(".himmy").mkdir(exist_ok=True)
+            store = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
+        thread = ChatThread(agent_id=persona.agent_id)
+        if store is not None and session_id:
             existing = store.load(str(session_id))
             if existing is not None:
-                return existing
-        return ChatThread(agent_id=persona.agent_id)
-
-    def _persist(thread: Any) -> None:
-        if store is not None:
-            store.save(str(session_id), thread)
-
-    tty = sys.stdout.isatty()
-    reply_prefix = "" if tty else "bot> "
-
-    async def _stream(thread: Any, text: str) -> None:
-        """Reply to stdout (appends to ``thread``).
-
-        Streams token-by-token for a no-tool agent; a tool-using agent runs the full
-        act→observe→answer loop (which can't stream mid-loop) and prints the answer.
-        """
-        if rt["registry"] is not None:
-            result = await _turn(thread, text)
-            rt["live"].finish()
-            sys.stdout.write(
-                reply_prefix
-                + render_markdown_lite(result.output_text or "", stream=sys.stdout)
-                + "\n"
-            )
-            if tty:
-                sys.stdout.write("\n")
-            _persist(result.thread)
-            return
-        sys.stdout.write(reply_prefix)
-        async for delta in rt["runtime"].stream_task(
-            persona, spec.make_task(text), thread=thread, llm_config=llm_config
-        ):
-            if delta.delta:
-                sys.stdout.write(delta.delta)
-                sys.stdout.flush()
-        sys.stdout.write("\n\n" if tty else "\n")
-        _persist(thread)
-
-    if args.message:
-        thread = _new_thread()
+                thread = existing
         result = _exec_with_mcp(
-            lambda: _turn(thread, args.message), rt["registry"], spec.mcp_servers
+            lambda: _answer(
+                runtime,
+                persona,
+                spec.make_task(args.message),
+                thread=thread,
+                llm_config=llm_config,
+                has_tools=registry is not None,
+                route_tools=spec.tool_router,
+            ),
+            registry,
+            spec.mcp_servers,
         )
-        _persist(result.thread)
-        rt["live"].finish()
+        if store is not None and session_id:
+            store.save(str(session_id), result.thread)
+        live.finish()
         print(render_markdown_lite(result.output_text or "", stream=sys.stdout))
         return 0 if result.succeeded else 1
 
-    # Interactive REPL. When the agent has MCP servers, connect them ONCE on a
-    # persistent loop and reuse it across turns (re-spawning per turn would be slow
-    # and the clients' reader tasks are loop-bound).
-    loop = asyncio.new_event_loop()
-    mcp_clients: list[Any] = []
-    if spec.mcp_servers:
-        from himmy.config.mcp_spec import attach_mcp_servers
+    from himmy.cli.repl import ChatRepl
 
-        mcp_clients = loop.run_until_complete(
-            attach_mcp_servers(rt["registry"], list(spec.mcp_servers))
-        )
-
-    try:  # arrow-key history + line editing, when the platform has it
-        import readline  # noqa: F401
-    except ImportError:
-        pass
-
-    c = styles(sys.stdout)
-    prompt = f"{c['crimson']}›{c['reset']} " if tty else "you> "
-
-    def _status() -> str:
-        label = _model_label(spec, args) or "auto"
-        packs = ", ".join(spec.tool_packs) or "no tools"
-        return f"{persona.name} · {label} · {packs}"
-
-    _eprint(f"{c['dim']}{_status()} — /help for commands{c['reset']}")
-    if session_id:
-        _eprint(f"{c['faint']}session: {session_id}{c['reset']}")
-    _eprint("")
-
-    def _slash(line: str, thread: Any) -> Any | None:
-        """Handle a /command; returns the (possibly new) thread, or None to exit."""
-        cmd, *rest = line.split()
-        if cmd in ("/exit", "/quit"):
-            return None
-        if cmd == "/reset":
-            thread = ChatThread(agent_id=persona.agent_id)
-            _persist(thread)
-            _eprint(f"{c['dim']}(thread reset){c['reset']}")
-        elif cmd == "/model":
-            if rest:
-                args.model = rest[0]
-                if len(rest) > 1:
-                    args.provider = rest[1]
-                _rebuild()
-            _eprint(
-                f"{c['dim']}model: {_model_label(spec, args) or 'auto'}{c['reset']}"
-            )
-        elif cmd == "/tools":
-            reg = rt["registry"]
-            names = sorted(d.name for d in reg.list()) if reg is not None else []
-            _eprint(f"{c['dim']}{', '.join(names) or '(no tools bound)'}{c['reset']}")
-        elif cmd == "/agents":
-            from himmy.cli.agents import cmd_agents
-
-            cmd_agents(argparse.Namespace(directory=".", json=False))
-        elif cmd == "/cost":
-            live = rt["live"]
-            _eprint(
-                f"{c['dim']}this session: {live.events} events · "
-                f"{live.tool_calls} tool call(s) · ${live.cost:.4f}{c['reset']}"
-            )
-        elif cmd == "/help":
-            _eprint(
-                f"{c['dim']}/model [name [provider]]  switch the model\n"
-                f"/tools                    what this agent can call\n"
-                f"/agents                   specs in this directory\n"
-                f"/cost                     session events + spend\n"
-                f"/reset                    start a fresh thread\n"
-                f"/exit                     leave{c['reset']}"
-            )
-        else:
-            _eprint(f"{c['dim']}unknown command {cmd} — /help lists them{c['reset']}")
-        return thread
-
-    thread = _new_thread()
-    try:
-        while True:
-            try:
-                line = input(prompt).strip()
-            except (EOFError, KeyboardInterrupt):
-                _eprint("")
-                break
-            if not line:
-                continue
-            if line.startswith("/"):
-                handled = _slash(line, thread)
-                if handled is None:
-                    break
-                thread = handled
-                continue
-            loop.run_until_complete(_stream(thread, line))
-    finally:
-        if mcp_clients:
-            from himmy.config.mcp_spec import close_mcp_clients
-
-            loop.run_until_complete(close_mcp_clients(mcp_clients))
-        loop.close()
-    return 0
+    return ChatRepl(spec, args).run()
 
 
 # -------------------------------------------------------------------- telegram
