@@ -174,12 +174,27 @@ def cmd_new(args: argparse.Namespace) -> int:
         )
         return 1
 
-    _eprint(f"drafting with {provider}{f' ({model})' if model else ''} …")
+    import time
+
+    from himmy.cli.ui import Spinner, styles, wants_live_ui
+
+    tag = f"{provider}{f' · {model}' if model else ''}"
+    if not wants_live_ui(sys.stderr):
+        _eprint(f"drafting with {provider}{f' ({model})' if model else ''} …")
+    spin = Spinner(f"drafting agent.yaml · {tag}", indent="  ")
+    spin.start()
     try:
         data = draft_agent_dict(description, provider, model)
     except HimmyError as exc:
+        spin.stop()
         _eprint(f"error: {exc}")
         return 1
+    ms = (time.monotonic() - spin.started_at) * 1000
+    c = styles(sys.stderr)
+    spin.stop(
+        f"  {c['green']}✓{c['reset']}{c['faint']} drafted  ({ms:.0f}ms · {tag})"
+        f"{c['reset']}"
+    )
 
     yaml_text = _spec_to_yaml(data, created_by="himmy new")
     if getattr(args, "dry_run", False):

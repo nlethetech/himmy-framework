@@ -115,9 +115,18 @@ def cmd_agents(args: argparse.Namespace) -> int:
         _eprint('\ncreate one:  himmy init   ·   himmy new "what it should do"')
         return 0
 
+    from himmy.cli.ui import styles
+
+    c = styles(sys.stdout)
+    badge_style = {"agent": c["green"], "team": c["gold"], "broken": c["crimson"]}
     for e in entries:
         flag = {"agent": "agent", "team": "team ", "broken": "BROKEN"}[e["kind"]]
-        print(f"  [{flag}] {e['name']:<24} {e['detail']}  ({e['file']})")
+        print(
+            f"  {badge_style[e['kind']]}[{flag}]{c['reset']} "
+            f"{c['bold']}{c['snow']}{e['name']:<24}{c['reset']} "
+            f"{c['dim']}{e['detail']}{c['reset']}"
+        )
+        print(f"          {c['faint']}{e['file']}{c['reset']}")
     return 0
 
 
@@ -194,12 +203,15 @@ def cmd_validate(args: argparse.Namespace) -> int:
             return 2
         target = str(discovered)
 
+    from himmy.cli.ui import styles
+
+    c = styles(sys.stdout)
     path = Path(target).expanduser()
     findings = _findings_for(path)
     if not findings:
-        print(f"OK: {path} is a valid agent spec")
+        print(f"{c['green']}OK:{c['reset']} {path} is a valid agent spec")
         return 0
-    print(f"{path}: {len(findings)} problem(s)")
+    print(f"{c['snow']}{path}{c['reset']}: {len(findings)} problem(s)")
     for f in findings:
-        print(f"  - {f}")
+        print(f"  {c['crimson']}-{c['reset']} {f}")
     return 1

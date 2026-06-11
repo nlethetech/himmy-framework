@@ -95,6 +95,14 @@ _project = from_spec.load_project
 _apply_defaults = from_spec.apply_project_defaults
 
 
+def _model_label(spec: AgentSpec, args: argparse.Namespace) -> str:
+    """``sonnet · claude-cli``-style tag for the live spinner/✓ lines."""
+    model = getattr(args, "model", None) or spec.model
+    provider = getattr(args, "provider", None) or spec.provider
+    parts = [p for p in (None if model == "default" else model, provider) if p]
+    return " · ".join(parts)
+
+
 def _read_piped_stdin() -> str:
     """Piped stdin content, or "" on a TTY / when stdin is unreadable (pytest, cron)."""
     try:
@@ -277,8 +285,23 @@ def cmd_run(args: argparse.Namespace) -> int:
     inference, recorder = _record_replay_inference(spec, args)
     if inference is None:  # record/replay supplies its own (non-stub) manager
         _maybe_hint_stub(spec, args)
+    # Live desk-style rendering (spinner + tool lines on stderr, TTY only).
+    # Streaming runs own the terminal with their token flow, so no overlay there.
+    from himmy.cli.ui import LiveRunUI, compose_event_handlers
+
+    live = (
+        LiveRunUI(model_label=_model_label(spec, args))
+        if not getattr(args, "stream", False)
+        else None
+    )
     runtime, registry = _build_runtime_for(
-        spec, args, on_event=tracer.handle if tracer else None, inference=inference
+        spec,
+        args,
+        on_event=compose_event_handlers(
+            tracer.handle if tracer else None,
+            live.handle if live is not None and live.enabled else None,
+        ),
+        inference=inference,
     )
 
     def _print_trace() -> None:
@@ -332,6 +355,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     result = _exec_with_mcp(_go, registry, spec.mcp_servers)
+    if live is not None:
+        live.finish()
 
     if args.json:
         print(
@@ -355,7 +380,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     elif spec.output_schema is not None and result.output_structured is not None:
         print(json.dumps(result.output_structured, indent=2, ensure_ascii=False))
     else:
-        print(result.output_text or "")
+        from himmy.cli.ui import render_markdown_lite
+
+        print(render_markdown_lite(result.output_text or "", stream=sys.stdout))
+    if live is not None:
+        live.footer()
     _print_trace()
     if recorder is not None:
         path = recorder.dump(args.record)
@@ -369,7 +398,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
     """Interactive REPL keeping one thread; `--message` runs a single turn."""
     spec = _spec_from_args(args)
     _maybe_hint_stub(spec, args)
-    runtime, registry = _build_runtime_for(spec, args)
+    from himmy.cli.ui import LiveRunUI, render_markdown_lite
+
+    live = LiveRunUI(model_label=_model_label(spec, args))
+    runtime, registry = _build_runtime_for(
+        spec, args, on_event=live.handle if live.enabled else None
+    )
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
 
@@ -416,9 +450,15 @@ def cmd_chat(args: argparse.Namespace) -> int:
         """
         if has_tools:
             result = await _turn(thread, text)
-            sys.stdout.write((result.output_text or "") + "\n")
+            live.finish()
+            sys.stdout.write(
+                "bot> "
+                + render_markdown_lite(result.output_text or "", stream=sys.stdout)
+                + "\n"
+            )
             _persist(result.thread)
             return
+        sys.stdout.write("bot> ")
         async for delta in runtime.stream_task(
             persona, spec.make_task(text), thread=thread, llm_config=llm_config
         ):
@@ -434,7 +474,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
             lambda: _turn(thread, args.message), registry, spec.mcp_servers
         )
         _persist(result.thread)
-        print(result.output_text or "")
+        live.finish()
+        print(render_markdown_lite(result.output_text or "", stream=sys.stdout))
         return 0 if result.succeeded else 1
 
     # Interactive REPL. When the agent has MCP servers, connect them ONCE on a
@@ -472,7 +513,6 @@ def cmd_chat(args: argparse.Namespace) -> int:
             if line == "/help":
                 _eprint("commands: /exit  /reset  /help")
                 continue
-            sys.stdout.write("bot> ")
             loop.run_until_complete(_stream(thread, line))
     finally:
         if mcp_clients:
