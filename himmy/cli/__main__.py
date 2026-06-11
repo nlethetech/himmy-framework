@@ -21,6 +21,7 @@ from himmy.cli import commands
 from himmy.cli.audit import add_audit_parser
 from himmy.cli.consent import add_consent_parser
 from himmy.cli.provider import PROVIDERS
+from himmy.cli.security_audit_cmd import add_seclog_parser
 from himmy.core import HimmyError
 
 
@@ -43,6 +44,48 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return cmd_validate(args)
 
 
+def _cmd_workflow(args: argparse.Namespace) -> int:
+    from himmy.cli.workflow_cmd import cmd_workflow
+
+    return cmd_workflow(args)
+
+
+def _cmd_orchestrate(args: argparse.Namespace) -> int:
+    from himmy.cli.orchestrate import cmd_orchestrate
+
+    return cmd_orchestrate(args)
+
+
+def _cmd_guardrails(args: argparse.Namespace) -> int:
+    from himmy.cli.guardrails_view import cmd_guardrails
+
+    return cmd_guardrails(args)
+
+
+def _cmd_lineage(args: argparse.Namespace) -> int:
+    from himmy.cli.lineage_cmd import cmd_lineage
+
+    return cmd_lineage(args)
+
+
+def _cmd_whoami(args: argparse.Namespace) -> int:
+    from himmy.cli.rbac_cmd import cmd_whoami
+
+    return cmd_whoami(args)
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    from himmy.cli.mcp_cmd import cmd_mcp
+
+    return cmd_mcp(args)
+
+
+def _cmd_skill(args: argparse.Namespace) -> int:
+    from himmy.cli.skill_dispatch import cmd_skill
+
+    return cmd_skill(args)
+
+
 def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
     """Shared flags for commands that build/run an agent (run, chat)."""
     parser.add_argument("-f", "--file", help="path to an agent.yaml spec")
@@ -58,6 +101,11 @@ def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
         help="inference provider (default: auto pydantic-ai→stub)",
     )
     parser.add_argument("--model", help="model key/name for the provider")
+    parser.add_argument(
+        "--role",
+        help="RBAC role for this session; restricts gated-tool execution "
+        "(else HIMMY_ROLE env / himmy.toml [rbac] role / admin)",
+    )
     # Permission profile (mutually exclusive): --yolo auto-approves every gated
     # tool; --safe ignores the himmy.toml allowlist so everything gated prompts.
     perms = parser.add_mutually_exclusive_group()
@@ -331,8 +379,182 @@ def build_parser() -> argparse.ArgumentParser:
     p_trace.add_argument("--limit", type=int, default=10, help="recent runs to list")
     p_trace.set_defaults(func=commands.cmd_trace)
 
+    # workflow — run a declarative workflow.yaml through the orchestrator.
+    p_workflow = sub.add_parser(
+        "workflow", help="run a declarative workflow.yaml through the orchestrator"
+    )
+    wf_sub = p_workflow.add_subparsers(dest="action")
+    p_wf_run = wf_sub.add_parser("run", help="run a workflow.yaml")
+    p_wf_run.add_argument("-f", "--file", help="path to a workflow.yaml")
+    p_wf_run.add_argument(
+        "--state",
+        action="append",
+        metavar="KEY=VALUE",
+        help="seed initial state (repeatable; value JSON-decoded if possible)",
+    )
+    p_wf_run.add_argument("--timeout", type=float, help="overall run timeout (seconds)")
+    p_wf_run.add_argument(
+        "--provider", choices=PROVIDERS, help="inference provider (default: auto)"
+    )
+    p_wf_run.add_argument("--model", help="model key/name for the provider")
+    p_wf_run.add_argument(
+        "--role",
+        help="RBAC role for this run; restricts gated-tool execution "
+        "(else HIMMY_ROLE env / himmy.toml [rbac] role / admin)",
+    )
+    p_wf_run.add_argument(
+        "--json", action="store_true", help="print the full result as JSON"
+    )
+    p_wf_run.set_defaults(func=_cmd_workflow)
+    p_wf_init = wf_sub.add_parser("init", help="scaffold a minimal workflow.yaml")
+    p_wf_init.add_argument(
+        "directory", nargs="?", default=".", help="where to write workflow.yaml"
+    )
+    p_wf_init.add_argument(
+        "--force", action="store_true", help="overwrite an existing file"
+    )
+    p_wf_init.set_defaults(func=_cmd_workflow)
+    # also allow bare `himmy workflow -f ...` (no subcommand) to run:
+    p_workflow.add_argument("-f", "--file", dest="file", help=argparse.SUPPRESS)
+    p_workflow.add_argument("--scaffold", action="store_true", help=argparse.SUPPRESS)
+    p_workflow.add_argument("--role", dest="role", help=argparse.SUPPRESS)
+    p_workflow.set_defaults(func=_cmd_workflow, action=None)
+
+    # orchestrate — run a team.yaml through a selectable real orchestrator.
+    p_orch = sub.add_parser(
+        "orchestrate",
+        help="run a team.yaml through a multi-agent mode "
+        "(hierarchical/group_chat/reflection/graph)",
+    )
+    p_orch.add_argument(
+        "--mode",
+        choices=("hierarchical", "group_chat", "reflection", "graph"),
+        default="hierarchical",
+        help="orchestration mode (default: hierarchical)",
+    )
+    p_orch.add_argument("-f", "--file", required=True, help="path to a team.yaml")
+    p_orch.add_argument("-p", "--prompt", help="the prompt to route through the team")
+    p_orch.add_argument(
+        "--provider", choices=PROVIDERS, help="inference provider (default: auto)"
+    )
+    p_orch.add_argument("--model", help="model key/name for the provider")
+    p_orch.add_argument(
+        "--role",
+        help="RBAC role for this run; restricts gated-tool execution "
+        "(else HIMMY_ROLE env / himmy.toml [rbac] role / admin)",
+    )
+    p_orch.add_argument(
+        "--max-rounds",
+        dest="max_rounds",
+        type=int,
+        default=None,
+        help="group_chat: rounds to run (default: one per member)",
+    )
+    p_orch.add_argument("--json", action="store_true", help="print the full record")
+    p_orch.set_defaults(func=_cmd_orchestrate)
+
+    # guardrails — list the built-in guardrails.
+    p_guardrails = sub.add_parser(
+        "guardrails",
+        help="list the built-in guardrails (pii, injection, nepal_pii, grounding, dlp)",
+    )
+    p_guardrails.add_argument(
+        "--json", action="store_true", help="machine-readable output"
+    )
+    p_guardrails.set_defaults(func=_cmd_guardrails)
+
+    # lineage — trace a run back to its inferences/tool calls/results.
+    p_lineage = sub.add_parser(
+        "lineage",
+        help="show a run's provenance tree (run -> inferences -> tools -> results)",
+    )
+    p_lineage.add_argument(
+        "run_id",
+        nargs="?",
+        help="run id (thread id) to trace; defaults to the most recent traced run",
+    )
+    p_lineage.add_argument(
+        "--dot",
+        action="store_true",
+        help="emit Graphviz DOT instead of the indented tree",
+    )
+    p_lineage.set_defaults(func=_cmd_lineage)
+
+    # whoami — show the active CLI role and the permissions it grants.
+    p_whoami = sub.add_parser(
+        "whoami", help="show the active CLI role and the permissions it grants"
+    )
+    p_whoami.add_argument(
+        "--role",
+        help="override the active role (else HIMMY_ROLE env / himmy.toml [rbac] role "
+        "/ admin)",
+    )
+    p_whoami.set_defaults(func=_cmd_whoami)
+
+    # mcp — manage the stdio MCP servers wired into an agent.yaml.
+    p_mcp = sub.add_parser(
+        "mcp", help="manage the stdio MCP servers wired into an agent.yaml"
+    )
+    p_mcp.add_argument(
+        "action",
+        nargs="?",
+        choices=["list", "add", "test", "remove"],
+        help="default: list",
+    )
+    p_mcp.add_argument("name", nargs="?", help="friendly server name (add/test/remove)")
+    p_mcp.add_argument("-f", "--file", help="path to an agent.yaml (default: nearest)")
+    p_mcp.add_argument("--command", help="executable to launch (add)")
+    p_mcp.add_argument(
+        "--arg", action="append", help="one command arg; repeat for several (add)"
+    )
+    p_mcp.add_argument(
+        "--env",
+        action="append",
+        metavar="KEY=VALUE",
+        help="env var for the server (add)",
+    )
+    p_mcp.add_argument("--cwd", help="working directory for the server (add)")
+    p_mcp.add_argument("--prefix", help="namespace tool names, e.g. github_ (add)")
+    p_mcp.add_argument(
+        "--tool", action="append", help="bind only this tool; repeat for several (add)"
+    )
+    p_mcp.add_argument(
+        "--requires-approval",
+        action="store_true",
+        help="gate this server's tools behind approval (add)",
+    )
+    p_mcp.set_defaults(func=_cmd_mcp)
+
+    # skill — run a single named skill as a focused sub-agent.
+    p_skill = sub.add_parser(
+        "skill", help="run a named skill as a focused sub-agent on a prompt"
+    )
+    p_skill.add_argument(
+        "name", help="the skill (capability) to run; see `himmy skills`"
+    )
+    p_skill.add_argument(
+        "words",
+        nargs="*",
+        metavar="prompt",
+        help="the prompt for the skill, as plain words (alternative to -p)",
+    )
+    p_skill.add_argument("-p", "--prompt", help="the prompt to run the skill on")
+    p_skill.add_argument(
+        "--provider",
+        choices=PROVIDERS,
+        help="inference provider (default: auto pydantic-ai→stub)",
+    )
+    p_skill.add_argument("--model", help="model key/name for the provider")
+    p_skill.add_argument(
+        "--role",
+        help="RBAC role for this run; restricts gated-tool execution "
+        "(else HIMMY_ROLE env / himmy.toml [rbac] role / admin)",
+    )
+    p_skill.set_defaults(func=_cmd_skill)
+
     add_consent_parser(sub)
     add_audit_parser(sub)
+    add_seclog_parser(sub)
 
     return parser
 
@@ -372,6 +594,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 instruction=None,
                 provider=None,
                 model=None,
+                role=None,
                 message=None,
                 session=None,
                 continue_last=False,

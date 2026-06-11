@@ -212,6 +212,27 @@ def test_yolo_via_repl_grants_everything() -> None:
     assert reg.get("wire_money").requires_approval is False
 
 
+def test_apply_permissions_viewer_regate_is_not_silent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding 6: the chat re-gating passes on_line (self._eprint), so a viewer that
+    loses a gated tool sees a deny line — re-gating is no longer silent."""
+    monkeypatch.delenv("HIMMY_ROLE", raising=False)
+    monkeypatch.delenv("HIMMY_RBAC_FILE", raising=False)
+    from himmy.config.agent_spec import AgentSpec
+
+    repl = ChatRepl(
+        AgentSpec(name="t", description="d", provider="stub"),
+        _args(role="viewer"),
+        input_fn=lambda _p: "n",
+    )
+    reg = _gated_registry()
+    repl._apply_permissions(reg)
+    assert reg.get("wire_money").requires_approval is True
+    err = capsys.readouterr().err
+    assert "may not run wire_money" in err
+
+
 def test_yolo_and_safe_mutually_exclusive() -> None:
     """argparse rejects --yolo --safe together."""
     from himmy.cli.__main__ import build_parser

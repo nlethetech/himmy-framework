@@ -186,15 +186,32 @@ class ChatRepl:
         self._apply_permissions(registry)
 
     def _apply_permissions(self, registry: Any) -> None:
-        """Resolve the permission profile onto ``registry`` (allowlist / yolo / safe)."""
+        """Resolve the permission profile onto ``registry`` (allowlist / yolo / safe).
+
+        After the profile, a restricted RBAC role re-gates any gated tool it may not
+        run (fail closed); the default ``admin`` role is a no-op so existing sessions
+        are unaffected.
+        """
         if registry is None:
             return
+        from himmy.cli.rbac_cmd import born_gated_names, enforce_role_on_registry
+
+        # Snapshot born-gated tools BEFORE the profile ungates any, so RBAC can tell
+        # a born-gated tool (tool_gated:execute) from a plain util/read (tool:execute).
+        born_gated = born_gated_names(registry)
         if self.yolo:
             permissions.grant_all_approvals(registry)
-            return
-        if self.safe:
-            return  # ignore the allowlist: everything gated prompts
-        permissions.apply_allowlist(registry, permissions.load_auto_approve())
+        elif self.safe:
+            pass  # ignore the allowlist: everything gated prompts
+        else:
+            permissions.apply_allowlist(registry, permissions.load_auto_approve())
+
+        enforce_role_on_registry(
+            registry,
+            role=getattr(self.args, "role", None),
+            on_line=self._eprint,
+            born_gated=born_gated,
+        )
 
     def _model_label(self) -> str:
         from himmy.cli.commands import _model_label
@@ -248,6 +265,7 @@ class ChatRepl:
             checkpoint_id,
             input_fn=self._input,
             on_line=self._eprint,
+            role=getattr(self.args, "role", None),
         )
 
     # ----------------------------------------------------------------- plan mode
@@ -479,16 +497,13 @@ class ChatRepl:
                     + (f"{c['crimson']} {ev.error}{c['reset']}" if ev.error else "")
                 )
                 if "tool_args" in p:
-                    self._eprint(
-                        f"    {c['faint']}args: "
-                        f"{_render_args(p.get('tool_args'))}{c['reset']}"
-                    )
+                    for ln in _render_forensic_block(p.get("tool_args")):
+                        self._eprint(f"    {c['faint']}args: {ln}{c['reset']}")
                 for key in ("tool_result", "result", "output"):
                     if key in p:
-                        self._eprint(
-                            f"    {c['faint']}{key}: "
-                            f"{_render_args(p.get(key))}{c['reset']}"
-                        )
+                        block = _render_forensic_block(p.get(key))
+                        for ln in block:
+                            self._eprint(f"    {c['faint']}{key}: {ln}{c['reset']}")
             elif kind in ("INFERENCE_SUCCEEDED", "INFERENCE_FAILED"):
                 ms = f"{ev.latency_ms:.0f}ms" if ev.latency_ms else "?ms"
                 cost = f"${ev.cost:.4f}" if ev.cost else "$0"
@@ -505,6 +520,37 @@ class ChatRepl:
                 f"{c['faint']}(deeper history: .himmy/trace.db — "
                 f"`himmy trace`){c['reset']}"
             )
+
+    # --------------------------------------------------------------- /lineage
+
+    def _lineage(self, thread: Any, *, as_dot: bool = False) -> None:
+        """/lineage: provenance tree of the current thread's run (--dot for Graphviz)."""
+        import sys
+
+        from himmy.cli.lineage_cmd import render_run_lineage
+        from himmy.services.observability.trace import SqliteEventStore
+
+        c = self._c
+        db = Path(".himmy/trace.db")
+        if not db.is_file():
+            self._eprint(
+                f"{c['dim']}no persisted trace yet (run with --trace, or this "
+                f"session hasn't written one){c['reset']}"
+            )
+            return
+        store = SqliteEventStore(str(db))
+        try:
+            events = store.list_events(thread_id=thread.thread_id)
+        finally:
+            store.close()
+        if not events:
+            self._eprint(f"{c['dim']}no lineage for this turn yet{c['reset']}")
+            return
+        self._eprint(
+            render_run_lineage(
+                events, thread.thread_id, as_dot=as_dot, c=styles(sys.stderr)
+            )
+        )
 
     # --------------------------------------------------------------- /compact
 
@@ -772,6 +818,64 @@ class ChatRepl:
         if cmd == "/jobs":
             self._jobs(rest)
             return thread
+        if cmd == "/workflow":
+            from himmy.cli.workflow_cmd import slash_workflow
+
+            parts = line.split(None, 1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            slash_workflow(self, arg)
+            return thread
+        if cmd == "/orchestrate":
+            from himmy.cli.orchestrate import slash_orchestrate
+
+            slash_orchestrate(self, rest)
+            return thread
+        if cmd == "/guardrails":
+            from himmy.cli.guardrails_view import slash_guardrails
+
+            slash_guardrails(self)
+            return thread
+        if cmd == "/lineage":
+            self._lineage(thread, as_dot=bool(rest and rest[0] == "--dot"))
+            return thread
+        if cmd == "/seclog":
+            from himmy.cli.security_audit_cmd import cli_security_log, render_seclog
+
+            # Read the SAME durable spine the deny/approval sites write to, so a
+            # denial recorded this session shows up here (and across processes).
+            want_json = bool(rest) and rest[0] == "--json"
+            render_seclog(cli_security_log(), limit=20, as_json=want_json)
+            return thread
+        if cmd == "/whoami":
+            from himmy.cli.rbac_cmd import cmd_whoami as _whoami
+
+            _whoami(argparse.Namespace(role=getattr(self.args, "role", None)))
+            return thread
+        if cmd == "/mcp":
+            from himmy.cli.mcp_cmd import cmd_mcp
+
+            action = rest[0] if rest else "list"
+            name = rest[1] if len(rest) > 1 else None
+            cmd_mcp(
+                argparse.Namespace(
+                    action=action,
+                    name=name,
+                    file=getattr(self.args, "file", None),
+                    command=None,
+                    arg=None,
+                    env=None,
+                    cwd=None,
+                    prefix=None,
+                    requires_approval=False,
+                    tool=None,
+                )
+            )
+            return thread
+        if cmd == "/skill":
+            from himmy.cli.skill_dispatch import slash_skill
+
+            slash_skill(self, rest)
+            return thread
         if cmd == "/compact":
             self._compact(thread)
             return thread
@@ -827,9 +931,20 @@ class ChatRepl:
                 f"/stream on|off            stream tool-turn answers (extra call)\n"
                 f"/cost                     session events + spend (vs budget)\n"
                 f"/why                      full forensics on the last turn\n"
+                f"/lineage [--dot]          provenance tree of this turn "
+                f"(run -> tools -> results)\n"
                 f"/spawn <task>             run a task in the background (can't "
                 f"approve gated tools)\n"
                 f"/jobs [id]                list background jobs, or read one\n"
+                f"/workflow <file>          run a workflow.yaml on the live model\n"
+                f"/orchestrate <mode> <p>   run team.yaml through a multi-agent mode\n"
+                f"/skill <name> <task>      run a named skill as a focused sub-agent\n"
+                f"/mcp [list|test] [name]   inspect the agent's MCP servers\n"
+                f"/guardrails               active guardrails + how many fired "
+                f"this turn\n"
+                f"/seclog [--json]          recent security events "
+                f"(denied/approved/blocked)\n"
+                f"/whoami                   your RBAC role and what it grants\n"
                 f"/compact                  summarize old history to free up context\n"
                 f"/reset                    start a fresh thread\n"
                 f"/exit                     leave\n"
@@ -1057,12 +1172,56 @@ def _render_args(args: Any) -> str:
         return str(args)
 
 
+#: How many lines a single /why forensic block (args/result) may show before truncating.
+_WHY_BLOCK_LINES = 6
+
+
+def _render_forensic_block(
+    value: Any, *, max_lines: int = _WHY_BLOCK_LINES
+) -> list[str]:
+    """Render one /why args/result value as readable, line-bounded text.
+
+    The fix for the /why double-escape bug: tool results often arrive as an *already
+    serialized* JSON string. The old path re-``json.dumps``ed it with
+    ``ensure_ascii=True``, double-escaping non-ASCII into ``\\uXXXX`` sprawl (e.g.
+    काठमाडौं → ``\\u0915\\u093e…``). Here a string that parses as JSON is decoded and
+    re-rendered with ``ensure_ascii=False, indent=2`` so Devanagari (and any unicode)
+    renders as itself; non-JSON strings pass through verbatim; other values pretty-print.
+    The block is truncated to ``max_lines`` with a ``… +N more lines`` marker so a huge
+    result never floods the forensics view. Returns a list of lines (never raises).
+    """
+    import json
+
+    text: str
+    try:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped[0] in "{[":
+                try:
+                    parsed = json.loads(stripped)
+                    text = json.dumps(parsed, ensure_ascii=False, indent=2)
+                except (ValueError, TypeError):
+                    text = value
+            else:
+                text = value
+        else:
+            text = json.dumps(value or {}, ensure_ascii=False, indent=2, default=str)
+    except Exception:  # noqa: BLE001 - forensics must never raise
+        text = str(value)
+    lines = text.splitlines() or [""]
+    if len(lines) <= max_lines:
+        return lines
+    hidden = len(lines) - max_lines
+    return [*lines[:max_lines], f"… +{hidden} more line{'s' if hidden != 1 else ''}"]
+
+
 def prompt_approval(
     checkpoint_store: Any,
     checkpoint_id: str,
     *,
     input_fn: Callable[[str], str] = input,
     on_line: Callable[[str], None] | None = None,
+    role: str | None = None,
 ) -> bool:
     """Render a checkpoint's pending tool call(s) and ask approve? [y/N/always].
 
@@ -1070,8 +1229,25 @@ def prompt_approval(
     rendered (already-styled) diagnostic line — defaults to printing to stderr.
     ``always`` approves AND persists every pending tool name to ``himmy.toml``
     ``[permissions] auto_approve``. Returns the approve/deny decision.
+
+    RBAC enforcement runs FIRST and only ever RESTRICTS: the caller's ``role``
+    (resolved once into a :class:`Principal` against the active
+    :class:`AccessPolicy`) gates every pending gated tool. If any is DENIED for the
+    role (a viewer hitting a gated tool), the denial is emitted and the call fails
+    closed (returns ``False``) with no prompt. Otherwise the normal HITL approve?
+    prompt is shown unchanged — RBAC never auto-approves away the human approval
+    gate. The default role is ``admin`` (unrestricted, nothing denied), so
+    unconfigured sessions behave exactly as before.
     """
     import sys
+
+    from himmy.cli.rbac_cmd import (
+        cli_access_policy,
+        cli_principal,
+        deny_message,
+        gate_tool_for_role,
+    )
+    from himmy.cli.security_audit_cmd import record_security_event
 
     def _emit(text: str) -> None:
         if on_line is not None:
@@ -1080,8 +1256,32 @@ def prompt_approval(
             print(text, file=sys.stderr)
 
     c = styles(sys.stderr)
+    role_label = next(iter(sorted(cli_principal(argparse.Namespace(role=role)).roles)))
+
+    def _seclog(outcome: str, tool: str, detail: str) -> None:
+        record_security_event(
+            event_type="authz_denied" if outcome == "deny" else "access",
+            outcome=outcome,
+            actor={"subject": role_label, "auth_method": "cli"},
+            action="tool_call",
+            resource=tool,
+            detail=detail,
+        )
+
     checkpoint = checkpoint_store.load(checkpoint_id)
     pending = list(checkpoint.pending_tool_calls) if checkpoint else []
+    # RBAC gate: resolve the principal/policy once, then decide every pending call.
+    principal = cli_principal(argparse.Namespace(role=role))
+    policy = cli_access_policy()
+    decisions = [
+        gate_tool_for_role(principal, policy, call.tool_name, True) for call in pending
+    ]
+    if any(d == "deny" for d in decisions):
+        for call, decision in zip(pending, decisions, strict=False):
+            if decision == "deny":
+                _emit(deny_message(principal, call.tool_name, stream=sys.stderr))
+                _seclog("deny", call.tool_name, "rbac: role may not run gated tool")
+        return False  # fail closed: a restricted role may not run a gated tool
     for call in pending:
         args_text = _truncate(_render_args(call.args))
         _emit(
@@ -1093,6 +1293,8 @@ def prompt_approval(
         answer = input_fn("approve? [y/N/always] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         _emit(f"{c['dim']}— denied{c['reset']}")
+        for call in pending:
+            _seclog("deny", call.tool_name, "approval rejected at prompt")
         return False
     if answer in ("a", "always"):
         for call in pending:
@@ -1101,8 +1303,16 @@ def prompt_approval(
                     f"{c['dim']}(added {call.tool_name} to "
                     f"himmy.toml auto_approve){c['reset']}"
                 )
+            _seclog("allow", call.tool_name, "approval granted (always)")
         return True
-    return answer in ("y", "yes")
+    approved = answer in ("y", "yes")
+    for call in pending:
+        _seclog(
+            "allow" if approved else "deny",
+            call.tool_name,
+            "approval granted" if approved else "approval rejected at prompt",
+        )
+    return approved
 
 
 def _cli_checkpoint_db() -> str:

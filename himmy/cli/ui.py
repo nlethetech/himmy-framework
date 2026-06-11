@@ -53,6 +53,22 @@ _PLAIN = {k: "" for k in _STYLES_TRUE}
 
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧")
 
+#: ASCII spinner frames for font-limited renderers (the braille glyphs tofu-box in
+#: agg/GIF and other minimal fonts). Used when HIMMY_ASCII_SPINNER=1 or NO_UNICODE.
+SPINNER_FRAMES_ASCII = ("|", "/", "-", "\\")
+
+
+def spinner_frames() -> tuple[str, ...]:
+    """Pick the spinner frame set: ASCII fallback when the env opts out of unicode.
+
+    Set ``HIMMY_ASCII_SPINNER=1`` (or ``NO_UNICODE``) to render a simple ``|/-\\``
+    spinner instead of the braille one — for terminals / video renderers whose font
+    can't draw the braille glyphs (they show as tofu boxes). Default is unchanged.
+    """
+    if os.environ.get("HIMMY_ASCII_SPINNER") or os.environ.get("NO_UNICODE"):
+        return SPINNER_FRAMES_ASCII
+    return SPINNER_FRAMES
+
 
 def wants_live_ui(stream: Any = None) -> bool:
     """True when the stream is a TTY and color/animation is not opted out."""
@@ -122,9 +138,10 @@ class Spinner:
 
         def _spin() -> None:
             c = styles(self._stream)
+            frames = spinner_frames()
             i = 0
             while not self._stop.wait(0.08):
-                frame = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+                frame = frames[i % len(frames)]
                 self._stream.write(
                     f"\r{self._indent}{c['gold']}{frame}{c['reset']}"
                     f"{c['faint']} {self._label}{c['reset']}\x1b[K"
@@ -252,6 +269,10 @@ class LiveRunUI:
             )
         elif kind == "AGENT_DELEGATED":
             self._line(f"    {c['dim']}⇲ delegated {p.get('worker', '')}{c['reset']}")
+        elif kind == "GUARDRAIL_APPLIED":
+            from himmy.cli.guardrails_view import render_guardrail_event
+
+            self._line(render_guardrail_event(event, c))
 
     # -- lifecycle ---------------------------------------------------------
 

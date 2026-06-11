@@ -337,7 +337,11 @@ async def _run_with_in_run_approvals(
     while getattr(loop_result, "checkpoint_id", None):
         if live is not None:
             live.finish()
-        approved = prompt_approval(checkpoint_store, loop_result.checkpoint_id)
+        approved = prompt_approval(
+            checkpoint_store,
+            loop_result.checkpoint_id,
+            role=getattr(args, "role", None),
+        )
         loop_result = await runtime.resume_agent_loop(
             loop_result.checkpoint_id, approved=approved, llm_config=llm_config
         )
@@ -478,7 +482,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Permission profile: --yolo grants everything, --safe ignores the allowlist,
     # otherwise the himmy.toml [permissions] auto_approve list ungates its tools.
     from himmy.cli import permissions
+    from himmy.cli.rbac_cmd import born_gated_names
 
+    # Snapshot which tools are approval-gated AS BUILT, before the profile ungates
+    # any — RBAC enforcement needs this to gate plain tools vs. born-gated ones.
+    born_gated = born_gated_names(registry)
     if getattr(args, "yolo", False):
         c = styles(sys.stderr)
         _eprint(f"{c['crimson']}⚠ --yolo: every tool runs without approval{c['reset']}")
@@ -487,6 +495,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         pass  # ignore the allowlist: everything gated prompts
     else:
         permissions.apply_allowlist(registry, permissions.load_auto_approve())
+    # RBAC: hard-deny a restricted role's gated tools (re-gate so they fail closed),
+    # so a viewer in CI / non-TTY can't slip a gated tool past the allowlist or --yolo.
+    from himmy.cli.rbac_cmd import enforce_role_on_registry
+
+    enforce_role_on_registry(
+        registry,
+        role=getattr(args, "role", None),
+        on_line=_eprint,
+        born_gated=born_gated,
+    )
 
     def _print_trace() -> None:
         if tracer is not None:

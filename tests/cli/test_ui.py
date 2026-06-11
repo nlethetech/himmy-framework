@@ -116,6 +116,42 @@ def test_live_run_ui_never_raises(truecolor: None) -> None:
     asyncio.run(live.handle(object()))  # no event_type at all
 
 
+def test_spinner_frames_default_is_braille(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HIMMY_ASCII_SPINNER", raising=False)
+    monkeypatch.delenv("NO_UNICODE", raising=False)
+    assert ui.spinner_frames() == ui.SPINNER_FRAMES
+
+
+@pytest.mark.parametrize("var", ["HIMMY_ASCII_SPINNER", "NO_UNICODE"])
+def test_spinner_frames_ascii_fallback(
+    var: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BUG FIX B: HIMMY_ASCII_SPINNER / NO_UNICODE swaps in plain |/-\\ frames."""
+    monkeypatch.delenv("HIMMY_ASCII_SPINNER", raising=False)
+    monkeypatch.delenv("NO_UNICODE", raising=False)
+    monkeypatch.setenv(var, "1")
+    assert ui.spinner_frames() == ui.SPINNER_FRAMES_ASCII
+    # And the ASCII frames carry no braille glyphs (the tofu-box offenders).
+    assert all(f in "|/-\\" for f in ui.SPINNER_FRAMES_ASCII)
+
+
+def test_spinner_animates_with_ascii_frames(
+    truecolor: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live spinner draws the ASCII frames (no braille) when opted in."""
+    monkeypatch.setenv("HIMMY_ASCII_SPINNER", "1")
+    stream = _Tty()
+    sp = ui.Spinner("thinking", stream=stream)
+    sp.start()
+    import time
+
+    time.sleep(0.25)  # let a few frames draw
+    sp.stop()
+    out = stream.getvalue()
+    assert any(f in out for f in ui.SPINNER_FRAMES_ASCII)
+    assert not any(f in out for f in ui.SPINNER_FRAMES)  # no braille leaked
+
+
 def test_compose_event_handlers() -> None:
     seen: list[str] = []
 

@@ -107,6 +107,40 @@ def test_why_after_a_turn_shows_timeline_and_args() -> None:
     assert "42ms" in blob and "$0.0123" in blob  # inference latency + cost
 
 
+def test_why_decodes_unicode_result_and_truncates() -> None:
+    """BUG FIX A: a JSON-string tool result renders decoded unicode, truncated.
+
+    A tool result is commonly an ALREADY-serialized JSON string. The old /why path
+    re-json.dumps'd it with ensure_ascii=True, double-escaping Devanagari into
+    \\uXXXX sprawl over many lines. The fix decodes it (ensure_ascii=False) and caps
+    the block at ~6 lines with a '… +N more lines' marker.
+    """
+    import json
+
+    repl, lines = _stub_repl()
+    # A serialized JSON string with Devanagari + enough keys to overflow 6 lines.
+    payload_obj = {
+        "city": "काठमाडौं",
+        **{f"k{i}": f"v{i}" for i in range(12)},
+    }
+    serialized = json.dumps(payload_obj)  # ensure_ascii=True by default → \uXXXX
+    assert "\\u0915" in serialized  # the raw string IS escaped going in
+    repl.recorder.start_turn()
+    run_async(
+        repl.recorder.handle(
+            _event(
+                "TOOL_COMPLETED",
+                payload={"tool_name": "geocode", "result": serialized},
+            )
+        )
+    )
+    repl._why()
+    blob = "\n".join(lines)
+    assert "काठमाडौं" in blob  # decoded, not क
+    assert "\\u0915" not in blob  # no double-escaped escapes leaked through
+    assert "more line" in blob  # truncated with the marker
+
+
 # -------------------------------------------------------------- budgets
 
 
