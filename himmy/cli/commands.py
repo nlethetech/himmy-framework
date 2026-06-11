@@ -892,11 +892,21 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Scaffold an agent: a default one, a ``--template`` starter, or a ``--team``."""
+    """Scaffold an agent: a default one, a ``--template`` starter, or a ``--team``.
+
+    On a real terminal the default form goes interactive (see
+    :mod:`himmy.cli.wizard`); pipes/CI and ``--classic`` keep the example scaffold.
+    """
     target = Path(args.directory).expanduser()
-    target.mkdir(parents=True, exist_ok=True)
 
     template = getattr(args, "template", None)
+    if not template and not args.team and not getattr(args, "classic", False):
+        from himmy.cli.wizard import run_wizard, wizard_available
+
+        if wizard_available():
+            return run_wizard(target, force=args.force)
+
+    target.mkdir(parents=True, exist_ok=True)
     next_msg = ""
     if template:
         tmpl = _TEMPLATES[template]
