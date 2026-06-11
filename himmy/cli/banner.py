@@ -91,9 +91,9 @@ def _tail_lines(c: dict[str, str]) -> list[str]:
         f"  {c['dim']}offline by default · zero API keys · every action audited{c['reset']}",
         "",
         "  get started:",
-        f"    himmy init my-agent              {c['dim']}scaffold an agent{c['reset']}",
-        f'    himmy run -f agent.yaml -p "…"   {c["dim"]}one-shot run{c["reset"]}',
-        f"    himmy chat -f agent.yaml         {c['dim']}interactive thread{c['reset']}",
+        f'    himmy "what\'s the weather in Kathmandu?"   {c["dim"]}just ask{c["reset"]}',
+        f"    himmy                            {c['dim']}chat — opens right here{c['reset']}",
+        f'    himmy new "describe an agent"    {c["dim"]}AI-draft an agent.yaml{c["reset"]}',
         f"    himmy --help                     {c['dim']}all commands{c['reset']}",
         "",
     ]

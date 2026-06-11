@@ -123,9 +123,39 @@ def _discover_spec_file() -> Path | None:
     return None
 
 
+def _house_spec() -> AgentSpec:
+    """The capable default agent for a bare ask (`himmy "what's the weather"`).
+
+    No spec file anywhere, no flags: instead of a toothless echo agent, build
+    one on the best backend detected on this machine (same probe as the init
+    wizard) with the keyless core packs, so a fresh install can just be asked
+    things. With only the stub available it stays minimal — but still answers.
+    """
+    from himmy.cli.wizard import detect_provider_choices
+
+    choice = detect_provider_choices()[0]
+    real = choice.key != "stub"
+    return AgentSpec(
+        name="himmy",
+        description="Your terminal assistant.",
+        instructions=[
+            "Be concise; answer in a few short lines.",
+            "Use your tools rather than guessing.",
+        ],
+        provider=choice.key if real else None,
+        model=choice.model or "default",
+        tool_packs=["web", "utils", "data-sources", "news", "memory"]
+        if real
+        else ["utils"],
+        memory=real,
+        tool_router=True,
+    )
+
+
 def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
     """Build the AgentSpec from ``-f file``, the nearest ``agent.yaml`` (searched
-    upward from cwd, git-style), or ad-hoc ``--name``/``--instruction`` flags."""
+    upward from cwd, git-style), or ad-hoc ``--name``/``--instruction`` flags.
+    With none of those, the capable house agent answers (see :func:`_house_spec`)."""
     if getattr(args, "file", None):
         return from_spec.load_spec_file(args.file)
     if not getattr(args, "name", None) and not getattr(args, "instruction", None):
@@ -133,6 +163,10 @@ def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
         if discovered is not None:
             _eprint(f"using {discovered}")
             return from_spec.load_spec_file(str(discovered))
+        if not getattr(args, "provider", None):
+            spec = _house_spec()
+            spec = from_spec.apply_project_defaults(spec)
+            return spec
     spec = AgentSpec(
         name=getattr(args, "name", None) or "himmy-agent",
         description="Ad-hoc agent created from CLI flags.",
@@ -398,25 +432,29 @@ def cmd_chat(args: argparse.Namespace) -> int:
     """Interactive REPL keeping one thread; `--message` runs a single turn."""
     spec = _spec_from_args(args)
     _maybe_hint_stub(spec, args)
-    from himmy.cli.ui import LiveRunUI, render_markdown_lite
+    from himmy.cli.ui import LiveRunUI, render_markdown_lite, styles
 
-    live = LiveRunUI(model_label=_model_label(spec, args))
-    runtime, registry = _build_runtime_for(
-        spec, args, on_event=live.handle if live.enabled else None
-    )
+    # Mutable so /model can swap the backend mid-conversation (thread survives).
+    rt: dict[str, Any] = {}
+
+    def _rebuild() -> None:
+        rt["live"] = LiveRunUI(model_label=_model_label(spec, args))
+        rt["runtime"], rt["registry"] = _build_runtime_for(
+            spec, args, on_event=rt["live"].handle if rt["live"].enabled else None
+        )
+
+    _rebuild()
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
 
-    has_tools = registry is not None
-
     async def _turn(thread: Any, text: str) -> Any:
         return await _answer(
-            runtime,
+            rt["runtime"],
             persona,
             spec.make_task(text),
             thread=thread,
             llm_config=llm_config,
-            has_tools=has_tools,
+            has_tools=rt["registry"] is not None,
             route_tools=spec.tool_router,
         )
 
@@ -442,39 +480,44 @@ def cmd_chat(args: argparse.Namespace) -> int:
         if store is not None:
             store.save(str(session_id), thread)
 
+    tty = sys.stdout.isatty()
+    reply_prefix = "" if tty else "bot> "
+
     async def _stream(thread: Any, text: str) -> None:
         """Reply to stdout (appends to ``thread``).
 
         Streams token-by-token for a no-tool agent; a tool-using agent runs the full
         act→observe→answer loop (which can't stream mid-loop) and prints the answer.
         """
-        if has_tools:
+        if rt["registry"] is not None:
             result = await _turn(thread, text)
-            live.finish()
+            rt["live"].finish()
             sys.stdout.write(
-                "bot> "
+                reply_prefix
                 + render_markdown_lite(result.output_text or "", stream=sys.stdout)
                 + "\n"
             )
+            if tty:
+                sys.stdout.write("\n")
             _persist(result.thread)
             return
-        sys.stdout.write("bot> ")
-        async for delta in runtime.stream_task(
+        sys.stdout.write(reply_prefix)
+        async for delta in rt["runtime"].stream_task(
             persona, spec.make_task(text), thread=thread, llm_config=llm_config
         ):
             if delta.delta:
                 sys.stdout.write(delta.delta)
                 sys.stdout.flush()
-        sys.stdout.write("\n")
+        sys.stdout.write("\n\n" if tty else "\n")
         _persist(thread)
 
     if args.message:
         thread = _new_thread()
         result = _exec_with_mcp(
-            lambda: _turn(thread, args.message), registry, spec.mcp_servers
+            lambda: _turn(thread, args.message), rt["registry"], spec.mcp_servers
         )
         _persist(result.thread)
-        live.finish()
+        rt["live"].finish()
         print(render_markdown_lite(result.output_text or "", stream=sys.stdout))
         return 0 if result.succeeded else 1
 
@@ -487,31 +530,87 @@ def cmd_chat(args: argparse.Namespace) -> int:
         from himmy.config.mcp_spec import attach_mcp_servers
 
         mcp_clients = loop.run_until_complete(
-            attach_mcp_servers(registry, list(spec.mcp_servers))
+            attach_mcp_servers(rt["registry"], list(spec.mcp_servers))
         )
 
-    _eprint(f"himmy chat — {persona.name} ({persona.role}). /exit, /reset, /help.")
+    try:  # arrow-key history + line editing, when the platform has it
+        import readline  # noqa: F401
+    except ImportError:
+        pass
+
+    c = styles(sys.stdout)
+    prompt = f"{c['crimson']}›{c['reset']} " if tty else "you> "
+
+    def _status() -> str:
+        label = _model_label(spec, args) or "auto"
+        packs = ", ".join(spec.tool_packs) or "no tools"
+        return f"{persona.name} · {label} · {packs}"
+
+    _eprint(f"{c['dim']}{_status()} — /help for commands{c['reset']}")
     if session_id:
-        _eprint(f"(session: {session_id})")
+        _eprint(f"{c['faint']}session: {session_id}{c['reset']}")
+    _eprint("")
+
+    def _slash(line: str, thread: Any) -> Any | None:
+        """Handle a /command; returns the (possibly new) thread, or None to exit."""
+        cmd, *rest = line.split()
+        if cmd in ("/exit", "/quit"):
+            return None
+        if cmd == "/reset":
+            thread = ChatThread(agent_id=persona.agent_id)
+            _persist(thread)
+            _eprint(f"{c['dim']}(thread reset){c['reset']}")
+        elif cmd == "/model":
+            if rest:
+                args.model = rest[0]
+                if len(rest) > 1:
+                    args.provider = rest[1]
+                _rebuild()
+            _eprint(
+                f"{c['dim']}model: {_model_label(spec, args) or 'auto'}{c['reset']}"
+            )
+        elif cmd == "/tools":
+            reg = rt["registry"]
+            names = sorted(d.name for d in reg.list()) if reg is not None else []
+            _eprint(f"{c['dim']}{', '.join(names) or '(no tools bound)'}{c['reset']}")
+        elif cmd == "/agents":
+            from himmy.cli.agents import cmd_agents
+
+            cmd_agents(argparse.Namespace(directory=".", json=False))
+        elif cmd == "/cost":
+            live = rt["live"]
+            _eprint(
+                f"{c['dim']}this session: {live.events} events · "
+                f"{live.tool_calls} tool call(s) · ${live.cost:.4f}{c['reset']}"
+            )
+        elif cmd == "/help":
+            _eprint(
+                f"{c['dim']}/model [name [provider]]  switch the model\n"
+                f"/tools                    what this agent can call\n"
+                f"/agents                   specs in this directory\n"
+                f"/cost                     session events + spend\n"
+                f"/reset                    start a fresh thread\n"
+                f"/exit                     leave{c['reset']}"
+            )
+        else:
+            _eprint(f"{c['dim']}unknown command {cmd} — /help lists them{c['reset']}")
+        return thread
+
     thread = _new_thread()
     try:
         while True:
             try:
-                line = input("you> ").strip()
+                line = input(prompt).strip()
             except (EOFError, KeyboardInterrupt):
                 _eprint("")
                 break
             if not line:
                 continue
-            if line in {"/exit", "/quit"}:
-                break
-            if line == "/reset":
-                thread = ChatThread(agent_id=persona.agent_id)
-                _persist(thread)
-                _eprint("(thread reset)")
-                continue
-            if line == "/help":
-                _eprint("commands: /exit  /reset  /help")
+            if line.startswith("/"):
+                handled = _slash(line, thread)
+                if handled is None:
+                    break
+                thread = handled
                 continue
             loop.run_until_complete(_stream(thread, line))
     finally:

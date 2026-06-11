@@ -307,15 +307,56 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _command_names(parser: argparse.ArgumentParser) -> set[str]:
+    """All registered subcommand names (introspected, so it can't drift)."""
+    for action in parser._actions:  # noqa: SLF001 - argparse keeps these stable
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            return set(action.choices)
+    return set()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Parse arguments and dispatch to the selected command handler."""
+    """Parse arguments and dispatch to the selected command handler.
+
+    Two frontier-CLI affordances on top of plain argparse: bare ``himmy`` on a
+    real terminal opens the splash and drops into the chat REPL, and anything
+    that isn't a known subcommand is treated as a question for the agent —
+    ``himmy "what's the weather in Kathmandu?"`` just answers.
+    """
     args_list = list(argv) if argv is not None else sys.argv[1:]
     if not args_list:
-        # Bare `himmy` is a first contact, not a mistake: show the splash, not an error.
+        # Bare `himmy` is a first contact, not a mistake: splash, then converse.
         from himmy.cli.banner import print_banner
 
-        return print_banner()
+        code = print_banner()
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            repl_args = argparse.Namespace(
+                file=None,
+                name=None,
+                instruction=None,
+                provider=None,
+                model=None,
+                message=None,
+                session=None,
+            )
+            return commands.cmd_chat(repl_args)
+        return code
     parser = build_parser()
+    known = _command_names(parser)
+    first = args_list[0]
+    if not first.startswith("-") and first not in known:
+        import difflib
+
+        close = difflib.get_close_matches(first, known, n=1, cutoff=0.8)
+        if close and len(args_list) <= 2:
+            print(
+                f"error: unknown command {first!r} — did you mean {close[0]!r}? "
+                f'(quote your text to ask the agent: himmy "{first} …")',
+                file=sys.stderr,
+            )
+            return 2
+        # Not a command — it's a question. `himmy yo what's the weather` answers.
+        args_list = ["run", *args_list]
     args = parser.parse_args(args_list)
     try:
         return int(args.func(args))
