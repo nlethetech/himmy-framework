@@ -176,13 +176,13 @@ def _ask_tool_packs(*, input_fn: Callable[[str], str]) -> list[str]:
 # ------------------------------------------------------------------ the wizard
 
 
-def _spec_to_yaml(data: dict[str, Any]) -> str:
+def _spec_to_yaml(data: dict[str, Any], *, created_by: str = "himmy init") -> str:
     """Render the answers as a clean agent.yaml with a short orienting header."""
     import yaml
 
     body = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=88)
     return (
-        "# Agent spec created by `himmy init`.\n"
+        f"# Agent spec created by `{created_by}`.\n"
         "# Reference: run `himmy tools` / `himmy skills` for capabilities, or see\n"
         "# the full annotated example via `himmy init --classic` in an empty dir.\n"
         + body

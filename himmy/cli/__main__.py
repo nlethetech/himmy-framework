@@ -24,6 +24,13 @@ from himmy.cli.provider import PROVIDERS
 from himmy.core import HimmyError
 
 
+def _cmd_new(args: argparse.Namespace) -> int:
+    """Lazy dispatcher: `himmy new` pulls in inference machinery only when used."""
+    from himmy.cli.new import cmd_new
+
+    return cmd_new(args)
+
+
 def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
     """Shared flags for commands that build/run an agent (run, chat)."""
     parser.add_argument("-f", "--file", help="path to an agent.yaml spec")
@@ -148,6 +155,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit non-zero if any model's accuracy is below this floor (0-1), for CI",
     )
     p_bench.set_defaults(func=commands.cmd_bench)
+
+    p_new = sub.add_parser(
+        "new",
+        help='draft an agent.yaml from a description, e.g. himmy new "tracks my rss feeds"',
+    )
+    p_new.add_argument(
+        "description", nargs="+", help="what the agent should do, in plain English"
+    )
+    p_new.add_argument(
+        "-o", "--output", default="agent.yaml", help="where to write the spec"
+    )
+    p_new.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the drafted YAML to stdout without writing",
+    )
+    p_new.add_argument(
+        "--yes", action="store_true", help="write without asking (and overwrite)"
+    )
+    p_new.add_argument(
+        "--provider",
+        choices=PROVIDERS,
+        help="backend to draft with (default: best one detected on this machine)",
+    )
+    p_new.add_argument("--model", help="model to draft with")
+    p_new.set_defaults(func=_cmd_new)
 
     p_init = sub.add_parser("init", help="scaffold an agent.yaml + tools.py")
     p_init.add_argument("directory", nargs="?", default=".", help="target directory")
