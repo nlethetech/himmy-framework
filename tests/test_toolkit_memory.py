@@ -17,7 +17,8 @@ def _registry(config: ToolkitConfig) -> ToolRegistry:
 
 
 def test_remember_and_recall_tools() -> None:
-    reg = _registry(ToolkitConfig())
+    # ':memory:' keeps behavior tests off the durable default store (cwd .himmy/).
+    reg = _registry(ToolkitConfig(memory_path=":memory:"))
     out = reg.handler_for("remember")({"text": "the duck pond feeds the orchard"})
     assert out["memory_id"]
     found = run_async(
@@ -47,7 +48,9 @@ def test_consolidate_tool_is_opt_in() -> None:
 
 def test_consolidate_tool_reconciles_facts() -> None:
     """The consolidate tool reconciles a changed fact into an UPDATE."""
-    cfg = ToolkitConfig(memory_consolidate=True, memory_subject="s")
+    cfg = ToolkitConfig(
+        memory_consolidate=True, memory_subject="s", memory_path=":memory:"
+    )
     reg = _registry(cfg)
     consolidate = reg.handler_for("consolidate")
     assert consolidate is not None
@@ -59,9 +62,48 @@ def test_consolidate_tool_reconciles_facts() -> None:
 
 def test_recall_tool_active_only_arg() -> None:
     """The recall tool accepts the new active_only / as_of bi-temporal args."""
-    reg = _registry(ToolkitConfig())
+    reg = _registry(ToolkitConfig(memory_path=":memory:"))
     reg.handler_for("remember")({"text": "a recallable fact about ducks"})
     found = run_async(
         reg.handler_for("recall")({"query": "ducks", "active_only": True, "top_k": 2})
     )
     assert found["results"]
+
+
+def test_default_memory_path_is_durable(tmp_path: Path, monkeypatch) -> None:
+    """No explicit memory_path → the durable .himmy/memory.db under cwd.
+
+    `remember` tells the user the fact survives the run; an in-process default
+    silently broke that promise on the CLI (himmy-demo-film shoot, 2026-06-11).
+    """
+    from himmy.toolkit.memory import effective_memory_path
+
+    monkeypatch.chdir(tmp_path)
+    path = effective_memory_path(ToolkitConfig())
+    assert path == str(Path(".himmy") / "memory.db")
+    # the server flag no longer changes the default
+    assert effective_memory_path(ToolkitConfig(), server=False) == path
+
+
+def test_memory_path_colon_memory_opts_out(tmp_path: Path, monkeypatch) -> None:
+    """memory_path=':memory:' forces the ephemeral in-process store."""
+    from himmy.toolkit.memory import effective_memory_path
+
+    monkeypatch.chdir(tmp_path)
+    assert effective_memory_path(ToolkitConfig(memory_path=":memory:")) is None
+    assert not (tmp_path / ".himmy").exists()
+
+
+def test_remember_survives_a_fresh_pack_by_default(tmp_path: Path, monkeypatch) -> None:
+    """End-to-end durability: a fact remembered with DEFAULT config is recallable
+    from a brand-new registry (a 'fresh process')."""
+    monkeypatch.chdir(tmp_path)
+    first = _registry(ToolkitConfig())
+    first.handler_for("remember")({"text": "broker is Naasa Securities, number 58"})
+
+    fresh = _registry(ToolkitConfig())  # new pack, new store object, same default path
+    found = run_async(
+        fresh.handler_for("recall")({"query": "broker Naasa Securities", "top_k": 3})
+    )
+    assert found["results"]
+    assert "Naasa" in found["results"][0]["text"]

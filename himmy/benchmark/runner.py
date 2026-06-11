@@ -466,6 +466,10 @@ class BenchmarkRunner:
         from himmy.toolkit import ToolkitConfig
 
         config = ToolkitConfig.from_env()
+        if not config.memory_path:
+            # Benchmark tasks exercise remember/recall with synthetic facts; they
+            # must never land in the user's durable default store (.himmy/memory.db).
+            config = config.model_copy(update={"memory_path": ":memory:"})
         if not task.files and not task.sqlite:
             yield config
             return

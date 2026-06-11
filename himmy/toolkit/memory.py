@@ -76,20 +76,19 @@ def effective_memory_path(
 ) -> str | None:
     """The memory store path agents should actually use.
 
-    Explicit config (``HIMMY_MEMORY_PATH`` / project toolkit config) always wins.
-    Otherwise, inside a SERVER entrypoint (Studio/BFF) memories default to the
-    SAME durable store the Memory API reads — ``.himmy/memory.db`` under the
-    project root — so an agent's ``remember`` survives the run and shows up in
-    the GUI. On the one-shot CLI path the default stays in-memory (zero setup),
-    unchanged. (Found live: agents remembered into an ephemeral store while the
-    Brain/Memory screens read the durable one — memories silently vanished.)
+    Explicit config (``HIMMY_MEMORY_PATH`` / project toolkit config) always wins,
+    with the special value ``:memory:`` forcing the ephemeral in-process store.
+    Otherwise the default is the durable ``.himmy/memory.db`` under the working
+    directory — on the server (Studio/BFF) AND on the one-shot CLI. An agent only
+    gets a memory store at all when its spec opted into memory, and ``remember``
+    tells the user the fact will survive: an ephemeral default silently broke
+    that promise (found live: ``remember`` reported success, a fresh ``himmy
+    run`` recalled nothing). ``server`` is kept for callers but no longer
+    changes the default.
     """
     if config.memory_path:
-        return config.memory_path
-    from himmy.services.storage.factory import in_server_context
-
-    if not (server if server is not None else in_server_context()):
-        return None
+        return None if config.memory_path == ":memory:" else config.memory_path
+    del server  # both entrypoints share the durable default now
     from pathlib import Path
 
     d = Path(".himmy")
