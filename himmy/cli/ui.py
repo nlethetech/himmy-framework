@@ -276,6 +276,38 @@ class LiveRunUI:
         )
 
 
+class TurnRecorder:
+    """An in-memory ``on_event`` sink that remembers the LAST turn's events.
+
+    Composed alongside :class:`LiveRunUI` (which only counts events on a TTY), this
+    captures the full :class:`~himmy.core.events.RunEvent` list for ``/why`` AND a
+    running cumulative cost so budget accounting works even when the live UI is
+    disabled (pipes/CI). A new turn (``start_turn``) clears the per-turn buffer but
+    keeps the cumulative cost; events that arrive after ``start_turn`` accrue into
+    both ``events`` (this turn) and ``total_cost`` (the session).
+    """
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+        self.total_cost: float = 0.0
+        self.total_events: int = 0
+        self.total_tool_calls: int = 0
+
+    def start_turn(self) -> None:
+        """Begin recording a new turn (clears the per-turn event buffer)."""
+        self.events = []
+
+    async def handle(self, event: Any) -> None:
+        self.events.append(event)
+        self.total_events += 1
+        try:
+            if getattr(event.event_type, "value", "") == "TOOL_CALLED":
+                self.total_tool_calls += 1
+            self.total_cost += event.cost or 0.0
+        except Exception:  # noqa: BLE001 - accounting must never break a run
+            pass
+
+
 def compose_event_handlers(*handlers: Any) -> Any:
     """Fan one runtime ``on_event`` out to several handlers (Nones skipped)."""
     active = [h for h in handlers if h is not None]

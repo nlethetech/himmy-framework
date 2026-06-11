@@ -44,6 +44,30 @@ def load_auto_approve(start: str | Path | None = None) -> list[str]:
     return [str(n) for n in names if isinstance(n, str)]
 
 
+def load_session_budget(start: str | Path | None = None) -> float | None:
+    """The ``[limits] session_budget`` dollar cap from ``himmy.toml`` (cwd), or None.
+
+    Same per-project read as :func:`load_auto_approve`: reads only the local
+    ``himmy.toml``. Returns ``None`` when the file/table/key is absent or the value
+    is not a positive number, so a missing/odd config simply means "no budget".
+    """
+    path = Path(start or Path.cwd()) / "himmy.toml"
+    if not path.is_file():
+        return None
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    limits = data.get("limits")
+    if not isinstance(limits, dict):
+        return None
+    value = limits.get("session_budget")
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    return float(value)
+
+
 def apply_allowlist(registry: Any, allow: list[str]) -> None:
     """Flip ``requires_approval`` off for every allowlisted tool in ``registry``.
 
@@ -155,6 +179,7 @@ def persist_auto_approve(tool_name: str, *, start: str | Path | None = None) -> 
 
 __all__ = [
     "load_auto_approve",
+    "load_session_budget",
     "apply_allowlist",
     "grant_all_approvals",
     "persist_auto_approve",

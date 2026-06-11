@@ -71,6 +71,16 @@ def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="ignore [permissions] auto_approve — prompt for every gated tool",
     )
+    parser.add_argument(
+        "--budget",
+        type=float,
+        metavar="USD",
+        help=(
+            "session/run cost cap in dollars (overrides himmy.toml [limits] "
+            "session_budget). run: stops the agent loop once spend reaches the cap; "
+            "chat: warns at 80%% and prompts before a turn once the cap is spent"
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -262,6 +262,8 @@ async def _answer(
     has_tools: bool = False,
     max_turns: int = 8,
     route_tools: bool | None = None,
+    cost_budget: float | None = None,
+    on_stop: Any = None,
 ) -> Any:
     """Produce a final answer, driving the tool loop when the agent has tools.
 
@@ -269,6 +271,8 @@ async def _answer(
     but for a tool-using one the model's first turn is the tool *call*; the answer
     only comes after the runtime feeds the tool result back. So when tools are wired
     we use ``run_agent_loop`` (act → observe → answer) and return its final turn.
+    ``cost_budget`` (when set) bounds the loop; ``on_stop`` is called with the loop's
+    ``stopped_reason`` so the caller can report a budget-stopped run.
     """
     if has_tools:
         loop = await runtime.run_agent_loop(
@@ -278,7 +282,10 @@ async def _answer(
             llm_config=llm_config,
             max_turns=max_turns,
             route_tools=route_tools,
+            cost_budget=cost_budget,
         )
+        if on_stop is not None:
+            on_stop(loop.stopped_reason)
         return loop.final
     return await runtime.run_task_detailed(persona, task, thread, llm_config=llm_config)
 
@@ -289,6 +296,8 @@ async def _run_with_in_run_approvals(
     spec: AgentSpec,
     args: argparse.Namespace,
     live: Any,
+    cost_budget: float | None = None,
+    on_stop: Any = None,
 ) -> Any:
     """Run one prompt under hitl, servicing approval pauses, and return the RunResult.
 
@@ -308,6 +317,7 @@ async def _run_with_in_run_approvals(
         max_turns=8,
         route_tools=spec.tool_router,
         hitl=True,
+        cost_budget=cost_budget,
     )
     while getattr(loop_result, "checkpoint_id", None):
         if live is not None:
@@ -316,6 +326,8 @@ async def _run_with_in_run_approvals(
         loop_result = await runtime.resume_agent_loop(
             loop_result.checkpoint_id, approved=approved, llm_config=llm_config
         )
+    if on_stop is not None:
+        on_stop(loop_result.stopped_reason)
     return loop_result.final
 
 
@@ -410,6 +422,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         _eprint("error: --yolo and --safe are mutually exclusive")
         return 2
     spec = _spec_from_args(args)
+    from himmy.cli import permissions as _perms
+
+    flag_budget = getattr(args, "budget", None)
+    cost_budget = (
+        float(flag_budget) if flag_budget is not None else _perms.load_session_budget()
+    )
     tracer = _TraceCollector() if getattr(args, "trace", False) else None
     inference, recorder = _record_replay_inference(spec, args)
     if inference is None:  # record/replay supplies its own (non-stub) manager
@@ -497,6 +515,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Interactive + tool-using: run under hitl and service approval pauses in-run
     # (render the pending call, prompt approve? [y/N/always], resume, loop).
+    stop_reason: list[str] = []
     if interactive and registry is not None and checkpoint_store is not None:
 
         async def _go() -> Any:
@@ -506,6 +525,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 spec,
                 args,
                 live,
+                cost_budget=cost_budget,
+                on_stop=stop_reason.append,
             )
     else:
 
@@ -517,11 +538,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                 llm_config=spec.to_llm_config(),
                 has_tools=registry is not None,
                 route_tools=spec.tool_router,
+                cost_budget=cost_budget,
+                on_stop=stop_reason.append,
             )
 
     result = _exec_with_mcp(_go, registry, spec.mcp_servers)
     if live is not None:
         live.finish()
+    if cost_budget is not None and stop_reason and stop_reason[0] == "budget":
+        _eprint(
+            f"⚠ stopped: cost budget ${cost_budget:.2f} reached "
+            f"(spent ${result.cost or 0.0:.4f}) — answer may be incomplete"
+        )
 
     if args.json:
         print(
@@ -604,6 +632,14 @@ def cmd_chat(args: argparse.Namespace) -> int:
         from himmy.cli.input_affordances import expand_at_files
 
         message = expand_at_files(args.message, on_warn=lambda m: _eprint(m))
+        from himmy.cli import permissions as _perms
+
+        _flag_budget = getattr(args, "budget", None)
+        _cost_budget = (
+            float(_flag_budget)
+            if _flag_budget is not None
+            else _perms.load_session_budget()
+        )
         result = _exec_with_mcp(
             lambda: _answer(
                 runtime,
@@ -613,6 +649,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 llm_config=llm_config,
                 has_tools=registry is not None,
                 route_tools=spec.tool_router,
+                cost_budget=_cost_budget,
             ),
             registry,
             spec.mcp_servers,

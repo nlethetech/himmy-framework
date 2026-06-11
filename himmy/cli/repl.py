@@ -22,12 +22,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import threading
+import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from himmy.cli import permissions
-from himmy.cli.ui import LiveRunUI, render_markdown_lite, styles
+from himmy.cli.ui import (
+    LiveRunUI,
+    TurnRecorder,
+    compose_event_handlers,
+    render_markdown_lite,
+    styles,
+)
 from himmy.config.agent_spec import AgentSpec
 
 #: ~200-char cap on the faint args echoed beside a pending tool name.
@@ -37,6 +46,11 @@ _ARG_PREVIEW_CAP = 200
 def _truncate(text: str, cap: int = _ARG_PREVIEW_CAP) -> str:
     text = text or ""
     return text if len(text) <= cap else text[: cap - 1] + "…"
+
+
+def _kfmt(tokens: int) -> str:
+    """Compact token count: ``980`` → ``0.9k``, ``3210`` → ``3.2k``."""
+    return f"{tokens / 1000:.1f}k"
 
 
 async def cancel_inflight_task(task: asyncio.Task[Any]) -> None:
@@ -56,6 +70,19 @@ async def cancel_inflight_task(task: asyncio.Task[Any]) -> None:
         return
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+@dataclass
+class _Job:
+    """One backgrounded ``/spawn`` sub-agent turn and its (eventual) result."""
+
+    job_id: str
+    task: str
+    status: str = "running"  # running | done | failed
+    started_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    result: str = ""
+    notified: bool = False  # has the "✓ done" line been shown yet?
 
 
 class ChatRepl:
@@ -105,6 +132,22 @@ class ChatRepl:
         self._explicit_session = bool(explicit)
         self._session_id = str(explicit) if explicit else "last"
         self._continue_last = bool(getattr(args, "continue_last", False))
+        # Forensics + off-TTY cost accounting: a TurnRecorder keeps the last turn's
+        # raw events (for /why) AND a cumulative session cost (for budgets) even when
+        # LiveRunUI is silent (pipes/CI). Wired in rebuild() alongside LiveRunUI.
+        self.recorder = TurnRecorder()
+        # Budget guardrail: --budget flag wins over himmy.toml [limits] session_budget.
+        flag_budget = getattr(args, "budget", None)
+        self.budget: float | None = (
+            float(flag_budget)
+            if flag_budget is not None
+            else permissions.load_session_budget()
+        )
+        self._budget_warned = False  # the one-time 80% warning fired?
+        # Background /spawn jobs, oldest first; guarded for the daemon threads.
+        self.jobs: list[_Job] = []
+        self._jobs_lock = threading.Lock()
+        self._job_seq = 0
 
     # ------------------------------------------------------------------ wiring
 
@@ -121,10 +164,15 @@ class ChatRepl:
 
         self.rt["live"] = LiveRunUI(model_label=self._model_label())
         store = SqliteCheckpointStore(_cli_checkpoint_db())
+        # Always record events (TurnRecorder) for /why + budget accounting; the live
+        # overlay is only added when it has a TTY to draw on.
         runtime, registry = _build_runtime_for(
             self.spec,
             self.args,
-            on_event=self.rt["live"].handle if self.rt["live"].enabled else None,
+            on_event=compose_event_handlers(
+                self.recorder.handle,
+                self.rt["live"].handle if self.rt["live"].enabled else None,
+            ),
             checkpoint_store=store,
         )
         self.rt["runtime"] = runtime
@@ -233,6 +281,7 @@ class ChatRepl:
             return thread
         plan_block = "\n".join(f"{i}. {s}" for i, s in enumerate(plan, start=1))
         prompt = f"{goal}\n\nFollow this approved plan, step by step:\n{plan_block}"
+        self.recorder.start_turn()
         loop_result = await self._drive_turn_with_approvals(thread, prompt)
         self.rt["live"].finish()
         self._print_reply(loop_result.final.output_text or "")
@@ -312,6 +361,7 @@ class ChatRepl:
         """
         import sys
 
+        self.recorder.start_turn()
         if self.rt["registry"] is not None:
             tools_before = self._count_tool_messages(thread)
             loop_result = await self._drive_turn_with_approvals(thread, text)
@@ -394,6 +444,290 @@ class ChatRepl:
                 sys.stdout.flush()
         sys.stdout.write("\n\n" if self.tty else "\n")
 
+    # ------------------------------------------------------------------ /why
+
+    def _why(self) -> None:
+        """``/why``: full forensic detail of the LAST turn's recorded events.
+
+        Renders :func:`format_timeline` over the recorder's last-turn events, then —
+        per tool/inference event — the UNtruncated args/results and per-inference
+        latency/cost/tokens. When a persistent ``.himmy/trace.db`` exists, points the
+        user at it for cross-turn digging. Nothing recorded yet → a dim placeholder.
+        """
+        from himmy.services.observability.trace import format_timeline
+
+        c = self._c
+        events = list(self.recorder.events)
+        if not events:
+            self._eprint(f"{c['dim']}nothing to explain yet{c['reset']}")
+            return
+        self._eprint(f"{c['snow']}why — last turn ({len(events)} events):{c['reset']}")
+        for raw_line in format_timeline(events).splitlines():
+            self._eprint(f"{c['faint']}{raw_line}{c['reset']}")
+        for ev in sorted(events, key=lambda e: e.timestamp):
+            kind = getattr(ev.event_type, "value", str(ev.event_type))
+            p = ev.payload or {}
+            if kind in ("TOOL_CALLED", "TOOL_COMPLETED", "TOOL_FAILED"):
+                name = p.get("tool_name", "")
+                self._eprint(
+                    f"  {c['gold']}{kind} {name}{c['reset']}"
+                    + (f"{c['crimson']} {ev.error}{c['reset']}" if ev.error else "")
+                )
+                if "tool_args" in p:
+                    self._eprint(
+                        f"    {c['faint']}args: "
+                        f"{_render_args(p.get('tool_args'))}{c['reset']}"
+                    )
+                for key in ("tool_result", "result", "output"):
+                    if key in p:
+                        self._eprint(
+                            f"    {c['faint']}{key}: "
+                            f"{_render_args(p.get(key))}{c['reset']}"
+                        )
+            elif kind in ("INFERENCE_SUCCEEDED", "INFERENCE_FAILED"):
+                ms = f"{ev.latency_ms:.0f}ms" if ev.latency_ms else "?ms"
+                cost = f"${ev.cost:.4f}" if ev.cost else "$0"
+                toks = ""
+                it, ot = p.get("input_tokens"), p.get("output_tokens")
+                if it is not None or ot is not None:
+                    toks = f" · {it or 0}→{ot or 0} tok"
+                self._eprint(
+                    f"  {c['faint']}inference: {ms} · {cost}{toks}{c['reset']}"
+                    + (f"{c['crimson']} {ev.error}{c['reset']}" if ev.error else "")
+                )
+        if Path(".himmy/trace.db").is_file():
+            self._eprint(
+                f"{c['faint']}(deeper history: .himmy/trace.db — "
+                f"`himmy trace`){c['reset']}"
+            )
+
+    # --------------------------------------------------------------- /compact
+
+    def _compact(self, thread: Any) -> None:
+        """``/compact``: run the runtime's summarize-compaction against this thread NOW.
+
+        Invokes the SAME machinery the runtime uses mid-loop
+        (:meth:`SingleAgentRuntime._maybe_compact`) on-demand, with a one-shot
+        ``compaction_spec`` ctx — so the live thread is summarized in place and the
+        real ``CONTEXT_COMPACTED`` event fires. Prints measured before/after counts
+        (never fabricated). A no-op (honest line) when the thread is already small.
+        """
+        from himmy.runtime.compaction import estimate_tokens
+
+        c = self._c
+        runtime = self.rt.get("runtime")
+        if runtime is None:
+            self._eprint(f"{c['dim']}(no runtime to compact with){c['reset']}")
+            return
+        msgs = getattr(thread, "messages", [])
+        before_msgs = len(msgs)
+        before_tokens = sum(estimate_tokens(m.content) for m in msgs)
+        # Force a low threshold so an on-demand /compact actually compacts (the user
+        # asked for it explicitly), keeping the spec's keep_recent.
+        ctx = {
+            "compaction_spec": {
+                "max_tokens": min(before_tokens, self.spec.compact_after_tokens),
+                "keep_recent": self.spec.compact_keep_recent,
+            },
+            "model_key": str(
+                self.llm_config.model_key if self.llm_config else "default"
+            ),
+        }
+
+        async def _run() -> None:
+            await runtime._maybe_compact(
+                self.persona, thread, ctx, "compact-on-demand", self.llm_config
+            )
+
+        try:
+            self.loop.run_until_complete(_run())
+        except Exception as exc:  # noqa: BLE001 - on-demand compaction is best-effort
+            self._eprint(f"{c['dim']}(compaction failed: {exc}){c['reset']}")
+            return
+        after_msgs = len(getattr(thread, "messages", []))
+        after_tokens = sum(
+            estimate_tokens(m.content) for m in getattr(thread, "messages", [])
+        )
+        if after_msgs >= before_msgs:
+            self._eprint(
+                f"{c['dim']}nothing to compact "
+                f"(~{before_tokens // 1000}.{(before_tokens % 1000) // 100}k tokens, "
+                f"{before_msgs} messages){c['reset']}"
+            )
+            return
+        self._persist(thread)
+        self._eprint(
+            f"{c['gold']}compacted: {before_msgs} → {after_msgs} messages "
+            f"(~{_kfmt(before_tokens)} → ~{_kfmt(after_tokens)} tokens){c['reset']}"
+        )
+
+    def _context_meter(self, thread: Any) -> str:
+        """A faint context gauge string: ``~3.2k tokens`` (vs budget if known)."""
+        from himmy.runtime.compaction import estimate_tokens
+
+        tokens = sum(
+            estimate_tokens(m.content) for m in getattr(thread, "messages", [])
+        )
+        maximum = self.spec.compact_after_tokens if self.spec.compact_context else None
+        if maximum:
+            pct = min(100, int(tokens * 100 / maximum)) if maximum else 0
+            return f"~{_kfmt(tokens)} / ~{_kfmt(maximum)} tokens ({pct}%)"
+        return f"~{_kfmt(tokens)} tokens"
+
+    def _footer(self, thread: Any) -> None:
+        """The faint post-turn footer: context gauge + budget spend if a budget is set."""
+        c = self._c
+        gauge = self._context_meter(thread)
+        spent = self.recorder.total_cost
+        budget = ""
+        if self.budget:
+            budget = f" · ${spent:.4f} / ${self.budget:.2f}"
+        elif spent:
+            budget = f" · ${spent:.4f}"
+        self._eprint(f"{c['faint']}  {gauge}{budget}{c['reset']}")
+        self._maybe_warn_budget()
+
+    # -------------------------------------------------------------- budgets
+
+    def _maybe_warn_budget(self) -> None:
+        """Print ONE gold warning when cumulative spend first crosses 80% of budget."""
+        if not self.budget or self._budget_warned:
+            return
+        if self.recorder.total_cost >= 0.8 * self.budget:
+            self._budget_warned = True
+            c = self._c
+            self._eprint(
+                f"{c['gold']}⚠ budget: ${self.recorder.total_cost:.4f} of "
+                f"${self.budget:.2f} spent (≥80%){c['reset']}"
+            )
+
+    def _budget_blocks_turn(self) -> bool:
+        """At/over budget before a turn starts → prompt continue? [y/N]; True = block."""
+        if not self.budget or self.recorder.total_cost < self.budget:
+            return False
+        c = self._c
+        try:
+            answer = (
+                self._input(
+                    f"budget reached (${self.recorder.total_cost:.4f} spent of "
+                    f"${self.budget:.2f}) — continue? [y/N] "
+                )
+                .strip()
+                .lower()
+            )
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer in ("y", "yes"):
+            return False
+        self._eprint(f"{c['dim']}— skipped (budget){c['reset']}")
+        return True
+
+    # ----------------------------------------------------------- spawn / jobs
+
+    def _spawn(self, task_text: str) -> None:
+        """``/spawn <task>``: run ONE sub-agent turn on a daemon thread, silently.
+
+        Builds a FRESH runtime/registry + thread (never shares the live runtime
+        across threads) with NO hitl — so any approval-gated tool in a background
+        job fails closed (background jobs cannot prompt for approval). The job's
+        events are silent (``on_event=None``), so nothing interleaves with the REPL.
+        """
+        c = self._c
+        with self._jobs_lock:
+            self._job_seq += 1
+            job = _Job(job_id=f"j{self._job_seq}", task=task_text)
+            self.jobs.append(job)
+        self._eprint(f"{c['dim']}↗ {job.job_id} spawned — /jobs to check{c['reset']}")
+
+        def _worker() -> None:
+            try:
+                output = self._run_job(task_text)
+                with self._jobs_lock:
+                    job.result = output
+                    job.status = "done"
+                    job.finished_at = time.time()
+            except Exception as exc:  # noqa: BLE001 - surface failure, don't crash REPL
+                with self._jobs_lock:
+                    job.result = f"{type(exc).__name__}: {exc}"
+                    job.status = "failed"
+                    job.finished_at = time.time()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _run_job(self, task_text: str) -> str:
+        """Run one isolated sub-agent turn to completion; return its final text."""
+        from himmy.agents.base_agent.thread import ChatThread
+
+        # Fresh runtime/registry on a fresh loop in THIS thread (no shared state, no
+        # checkpoint store → gated tools fail closed; no live UI → no stderr writes).
+        from himmy.cli.commands import _build_runtime_for
+
+        runtime, registry = _build_runtime_for(self.spec, self.args, on_event=None)
+        self._apply_permissions(registry)
+        thread = ChatThread(agent_id=self.persona.agent_id)
+
+        async def _go() -> Any:
+            return await runtime.run_agent_loop(
+                self.persona,
+                self.spec.make_task(task_text),
+                thread,
+                llm_config=self.llm_config,
+                max_turns=8,
+                route_tools=self.spec.tool_router,
+                hitl=False,
+            )
+
+        result = asyncio.run(_go())
+        return result.final.output_text or ""
+
+    def _notify_finished_jobs(self) -> None:
+        """Before a prompt: one dim line per job that finished since the last check."""
+        c = self._c
+        with self._jobs_lock:
+            newly = [j for j in self.jobs if j.status != "running" and not j.notified]
+            for j in newly:
+                j.notified = True
+        for j in newly:
+            mark = "✓" if j.status == "done" else "✗"
+            self._eprint(
+                f"{c['dim']}{mark} {j.job_id} {j.status} — "
+                f"/jobs {j.job_id} to read{c['reset']}"
+            )
+
+    def _jobs(self, rest: list[str]) -> None:
+        """``/jobs`` lists jobs; ``/jobs <id>`` prints that job's full answer."""
+        c = self._c
+        with self._jobs_lock:
+            jobs = list(self.jobs)
+        if rest:
+            target = rest[0]
+            match = next((j for j in jobs if j.job_id == target), None)
+            if match is None:
+                self._eprint(f"{c['dim']}no such job {target}{c['reset']}")
+                return
+            if match.status == "running":
+                self._eprint(f"{c['dim']}{target} still running…{c['reset']}")
+                return
+            self._eprint(
+                f"{c['snow']}{target} ({match.status}) — {match.task}{c['reset']}"
+            )
+            import sys
+
+            sys.stdout.write(
+                render_markdown_lite(match.result, stream=sys.stdout) + "\n"
+            )
+            sys.stdout.flush()
+            return
+        if not jobs:
+            self._eprint(f"{c['dim']}(no background jobs){c['reset']}")
+            return
+        self._eprint(f"{c['snow']}background jobs:{c['reset']}")
+        for j in jobs:
+            self._eprint(
+                f"  {c['dim']}{j.job_id}  {j.status:<8}{c['reset']}"
+                f"{c['faint']}{_truncate(j.task, 60)}{c['reset']}"
+            )
+
     # --------------------------------------------------------------- slash cmds
 
     def _slash(self, line: str, thread: Any) -> Any | None:
@@ -418,6 +752,24 @@ class ChatRepl:
                 self._eprint(f"{c['dim']}usage: /plan <task>{c['reset']}")
                 return thread
             return self._run_turn_coro(self._plan_and_maybe_run(thread, goal), thread)
+        if cmd == "/why":
+            self._why()
+            return thread
+        if cmd == "/spawn":
+            task_text = (
+                line.split(None, 1)[1].strip() if len(line.split(None, 1)) > 1 else ""
+            )
+            if not task_text:
+                self._eprint(f"{c['dim']}usage: /spawn <task>{c['reset']}")
+                return thread
+            self._spawn(task_text)
+            return thread
+        if cmd == "/jobs":
+            self._jobs(rest)
+            return thread
+        if cmd == "/compact":
+            self._compact(thread)
+            return thread
         if cmd == "/resume":
             return self._resume_picker(thread)
         if cmd == "/reset":
@@ -454,10 +806,11 @@ class ChatRepl:
                 f"call per turn){c['reset']}"
             )
         elif cmd == "/cost":
-            live = self.rt["live"]
+            budget = f" / ${self.budget:.2f} budget" if self.budget else ""
             self._eprint(
-                f"{c['dim']}this session: {live.events} events · "
-                f"{live.tool_calls} tool call(s) · ${live.cost:.4f}{c['reset']}"
+                f"{c['dim']}this session: {self.recorder.total_events} events · "
+                f"{self.recorder.total_tool_calls} tool call(s) · "
+                f"${self.recorder.total_cost:.4f}{budget}{c['reset']}"
             )
         elif cmd == "/help":
             self._eprint(
@@ -467,7 +820,12 @@ class ChatRepl:
                 f"/tools                    what this agent can call\n"
                 f"/agents                   specs in this directory\n"
                 f"/stream on|off            stream tool-turn answers (extra call)\n"
-                f"/cost                     session events + spend\n"
+                f"/cost                     session events + spend (vs budget)\n"
+                f"/why                      full forensics on the last turn\n"
+                f"/spawn <task>             run a task in the background (can't "
+                f"approve gated tools)\n"
+                f"/jobs [id]                list background jobs, or read one\n"
+                f"/compact                  summarize old history to free up context\n"
                 f"/reset                    start a fresh thread\n"
                 f"/exit                     leave\n"
                 f"\n"
@@ -628,9 +986,15 @@ class ChatRepl:
             self._eprint(f"{c['faint']}session: {self._session_id}{c['reset']}")
         self._eprint("")
 
+        if self.budget:
+            self._eprint(
+                f"{c['faint']}budget: ${self.budget:.2f} this session{c['reset']}"
+            )
+
         thread = self._new_thread()
         try:
             while True:
+                self._notify_finished_jobs()
                 try:
                     line = self._input(prompt).strip()
                 except (EOFError, KeyboardInterrupt):
@@ -651,9 +1015,19 @@ class ChatRepl:
                     line = sent  # `!!cmd`: framed command+output goes to the agent
                 else:
                     line = self._expand_at_files(line)
+                if self._budget_blocks_turn():
+                    continue  # at/over budget and the user declined to continue
                 thread = self._run_turn_coro(self._chat_turn(thread, line), thread)
                 self._persist(thread)
+                self._footer(thread)
         finally:
+            with self._jobs_lock:
+                running = sum(1 for j in self.jobs if j.status == "running")
+            if running:
+                self._eprint(
+                    f"{c['dim']}⚠ {running} background job(s) still running — "
+                    f"abandoned on exit{c['reset']}"
+                )
             if mcp_clients:
                 from himmy.config.mcp_spec import close_mcp_clients
 
@@ -668,8 +1042,8 @@ class ChatRepl:
         return f"{self.persona.name} · {label} · {packs}"
 
 
-def _render_args(args: dict[str, Any]) -> str:
-    """Compact JSON of tool args for the faint approval preview."""
+def _render_args(args: Any) -> str:
+    """Compact JSON of tool args/results for the faint approval/forensics preview."""
     import json
 
     try:
