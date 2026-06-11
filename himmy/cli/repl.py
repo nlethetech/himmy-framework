@@ -159,9 +159,14 @@ class ChatRepl:
         under ``--yolo`` — grants every gated tool. ``/model`` calls this to swap the
         backend mid-conversation.
         """
-        from himmy.cli.commands import _build_runtime_for
+        from himmy.cli.commands import _apply_cli_overrides, _build_runtime_for
         from himmy.runtime.checkpoint import SqliteCheckpointStore
 
+        # /model mutates args; fold the override into the spec AND re-derive the
+        # llm_config so the per-request model_key matches the rebuilt manager
+        # (a stale model_key sends the old model string to the new provider).
+        self.spec = _apply_cli_overrides(self.spec, self.args)
+        self.llm_config = self.spec.to_llm_config()
         self.rt["live"] = LiveRunUI(model_label=self._model_label())
         store = SqliteCheckpointStore(_cli_checkpoint_db())
         # Always record events (TurnRecorder) for /why + budget accounting; the live

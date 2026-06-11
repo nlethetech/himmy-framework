@@ -197,9 +197,24 @@ def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
     With none of those, the capable house agent answers (see :func:`_house_spec`).
 
     A discovered ``HIMMY.md`` (upward from cwd) is folded into the agent's
-    instructions as project context for every build path (see :func:`_apply_himmy_md`).
+    instructions as project context for every build path (see :func:`_apply_himmy_md`),
+    and ``--provider``/``--model`` flags are folded INTO the spec so the per-request
+    ``model_key`` (from ``spec.to_llm_config()``) matches the manager the flags
+    built — otherwise an override sends the spec's old model string to the new
+    provider every request (found live: OpenRouter 400 on a leaked ollama tag).
     """
-    return _apply_himmy_md(_spec_from_args_inner(args))
+    return _apply_cli_overrides(_apply_himmy_md(_spec_from_args_inner(args)), args)
+
+
+def _apply_cli_overrides(spec: AgentSpec, args: argparse.Namespace) -> AgentSpec:
+    """Fold ``--provider``/``--model`` into the spec itself (see _spec_from_args)."""
+    provider = getattr(args, "provider", None)
+    model = getattr(args, "model", None)
+    if provider:
+        spec.provider = provider
+    if model and model != "default":
+        spec.model = model
+    return spec
 
 
 def _spec_from_args_inner(args: argparse.Namespace) -> AgentSpec:

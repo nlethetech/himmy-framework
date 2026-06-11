@@ -95,3 +95,50 @@ def test_explicit_provider_keeps_adhoc_agent(
     monkeypatch.setattr(commands, "_house_spec", lambda: called.append(True) or real())
     assert main(["run", "--provider", "stub", "hello"]) == 0
     assert not called
+
+
+def test_cli_overrides_fold_into_spec(tmp_path: Path) -> None:
+    """--provider/--model override the spec itself, so the per-request model_key
+    matches the manager the flags built (OpenRouter 400 regression, 2026-06-11)."""
+    spec_file = tmp_path / "a.yaml"
+    spec_file.write_text("name: x\nprovider: ollama\nmodel: qwen2.5:7b-instruct\n")
+    args = __import__("argparse").Namespace(
+        file=str(spec_file),
+        name=None,
+        instruction=None,
+        provider="openrouter",
+        model="google/gemini-2.5-flash",
+    )
+    spec = commands._spec_from_args(args)
+    assert spec.provider == "openrouter"
+    assert spec.model == "google/gemini-2.5-flash"
+    assert spec.to_llm_config().model_key == "google/gemini-2.5-flash"
+
+
+def test_repl_model_swap_refreshes_llm_config(tmp_path: Path, monkeypatch) -> None:
+    """/model rebuild re-derives llm_config so requests carry the new model_key."""
+    monkeypatch.chdir(tmp_path)
+    from himmy.cli.repl import ChatRepl
+    from himmy.config.agent_spec import AgentSpec
+
+    spec = AgentSpec(name="t", description="d", provider="stub", model="alpha")
+    args = __import__("argparse").Namespace(
+        file=None,
+        name="t",
+        instruction=None,
+        provider="stub",
+        model=None,
+        message=None,
+        session=None,
+        continue_last=False,
+        yolo=False,
+        safe=False,
+        budget=None,
+    )
+    repl = ChatRepl(spec, args, input_fn=lambda _p: "/exit")
+    repl.rebuild()
+    assert repl.llm_config.model_key == "alpha"
+    args.model = "beta"
+    repl.rebuild()
+    assert repl.spec.model == "beta"
+    assert repl.llm_config.model_key == "beta"
