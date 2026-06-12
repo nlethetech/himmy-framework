@@ -22,6 +22,7 @@ import inspect
 import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 from himmy.config.secrets import get_secret
 from himmy.core.events import EventType, RunEvent
@@ -139,6 +140,36 @@ def _next_link(link_header: str) -> str | None:
             if key.strip().lower() == "rel" and value.strip().strip('"') == "next":
                 return target
     return None
+
+
+def _link_target_allowed(
+    link: str, origin_url: str, allow_hosts: tuple[str, ...]
+) -> bool:
+    """Default-deny gate for a pagination ``Link`` rel="next" target.
+
+    A cross-host ``Link`` is a credential-exfiltration vector: the bearer/auth header
+    is reused on every page, so a hostile upstream returning
+    ``Link: <https://evil.example/x>; rel="next"`` would otherwise pull the secret
+    off-host. We follow the target ONLY when it is same-origin with the original
+    request (identical scheme + host + port) or — when an explicit egress allow-list
+    is configured — its host matches that list. With the default empty allow-list this
+    collapses to same-origin only, so the secret never leaves the API it was minted for.
+    The downstream SSRF guard still runs on whatever we allow through here.
+    """
+    target = urlsplit(link)
+    if not target.scheme or not target.netloc:
+        return False  # relative / malformed → not a host we can vet; refuse
+    if allow_hosts:
+        from himmy.toolkit._net import _host_allowed
+
+        host = target.hostname
+        return host is not None and _host_allowed(host, allow_hosts)
+    origin = urlsplit(origin_url)
+    return (
+        target.scheme.lower() == origin.scheme.lower()
+        and (target.hostname or "").lower() == (origin.hostname or "").lower()
+        and target.port == origin.port
+    )
 
 
 def _coerce_lenient_args(
@@ -457,7 +488,7 @@ class ToolService:
                 last_error is not None
                 and last_error.code in RETRYABLE_TOOL_CODES
                 and attempt < retry.max_attempts - 1
-                and self._is_retry_safe(definition, last_error.code)
+                and self._is_retry_safe(definition, last_error.code, args)
             ):
                 await asyncio.sleep(retry.delay_for(attempt))
                 continue
@@ -529,20 +560,29 @@ class ToolService:
         return self._default_timeout_seconds
 
     @staticmethod
-    def _is_retry_safe(definition: ToolDefinition, code: ToolErrorCode) -> bool:
-        """Whether a transient ``code`` may be retried for this tool.
+    def _is_retry_safe(
+        definition: ToolDefinition, code: ToolErrorCode, args: dict[str, Any]
+    ) -> bool:
+        """Whether a transient ``code`` may be retried for THIS invocation.
 
         LOCAL tools and read-only / idempotent HTTP calls are always safe to repeat. A
         side-effecting HTTP method (POST/PUT/PATCH/DELETE) with NO idempotency key may
         already have landed when a TIMEOUT or PROVIDER_UNAVAILABLE fires, so those are
         not retried — only RATE_LIMITED (429, rejected before any work) is.
+
+        The idempotency exemption is keyed off whether the key was actually supplied
+        for *this* call — not merely whether ``idempotency_arg`` is configured. The
+        ``Idempotency-Key`` header is only attached when ``args`` carry that key (see
+        :meth:`_dispatch_http`), so a configured-but-omitted key means the upstream
+        gets NO dedup header and a blind resend could double-act. Treating such a call
+        as retry-safe (the old behavior) silently re-fires the mutation; we don't.
         """
         cfg = definition.http_config
         if cfg is None:
             return True
         if cfg.method.upper() in _SAFE_HTTP_METHODS:
             return True
-        if cfg.idempotency_arg:
+        if cfg.idempotency_arg and args.get(cfg.idempotency_arg):
             return True  # the Idempotency-Key lets the upstream dedupe a resend
         return code is ToolErrorCode.RATE_LIMITED
 
@@ -778,13 +818,19 @@ class ToolService:
 
         Each next page is re-guarded the same way (the pinned client re-checks the IP),
         so a ``Link``/cursor that points off-host or at an internal address is refused.
+        A ``Link`` rel="next" is additionally gated to be SAME-ORIGIN with the original
+        request (or on the configured egress allow-list), so the connector's reused auth
+        header can't be exfiltrated to a host the operator never authorized. ``page_count``
+        counts the pages actually fetched in EVERY mode (not just PAGE).
         """
         page_cfg = cfg.pagination
         max_pages = max(1, page_cfg.max_pages)
+        allow_hosts = tuple(cfg.egress_allow_hosts)
         collected: list[Any] = []
         params = dict(base_params)
         next_url = url
-        page_num = 1
+        page_num = 1  # 1-based page counter for PAGE-mode query params
+        pages_fetched = 0  # the value reported back, counted in every mode
 
         for _ in range(max_pages):
             if page_cfg.mode is HttpPaginationMode.PAGE:
@@ -792,6 +838,7 @@ class ToolService:
             response = await self._http_request(
                 client, method, next_url, params, body, headers, timeout
             )
+            pages_fetched += 1
             try:
                 payload = response.json()
             except Exception:
@@ -819,11 +866,20 @@ class ToolService:
 
                 link = _next_link(response.headers.get("link", ""))
                 if link:
+                    # Default-deny: the Link target must be same-origin with the original
+                    # request (or on the egress allow-list) BEFORE we reuse the auth
+                    # header on it — a cross-host rel="next" would leak the bearer secret.
+                    if not _link_target_allowed(link, next_url, allow_hosts):
+                        raise _ToolDispatchError(
+                            ToolErrorCode.INVALID_REQUEST,
+                            "pagination Link target refused: cross-host rel=\"next\" "
+                            "is not same-origin and not on the egress allow-list",
+                        )
                     try:
                         guard_url(
                             link,
                             allow_private=cfg.allow_private_hosts,
-                            allow_hosts=tuple(cfg.egress_allow_hosts) or None,
+                            allow_hosts=allow_hosts or None,
                             resolve=False,
                         )
                     except ToolSecurityError as exc:
@@ -836,7 +892,7 @@ class ToolService:
             if not advanced:
                 break
 
-        return {"items": collected, "page_count": page_num}
+        return {"items": collected, "page_count": pages_fetched}
 
     @staticmethod
     def _build_auth(auth: Any) -> tuple[dict[str, str], dict[str, str]]:
