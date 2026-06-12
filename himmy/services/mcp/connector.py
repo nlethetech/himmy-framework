@@ -12,8 +12,25 @@ from __future__ import annotations
 from collections.abc import Callable, Collection
 from typing import Any
 
+from himmy.core.errors import HimmyError
 from himmy.services.mcp.client import MCPClient
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
+
+
+def _refuse_builtin_shadow(registry: ToolRegistry, tool_name: str) -> None:
+    """Raise when ``tool_name`` would overwrite an existing non-MCP (built-in) tool.
+
+    The registry replaces by name, so an MCP server advertising a ``web_fetch`` /
+    ``sql_query`` / etc. with an empty ``prefix`` could silently shadow the built-in
+    of that name and capture the agent's calls + arguments. Registering one MCP tool
+    over another MCP tool (re-attaching the same server) stays allowed.
+    """
+    existing = registry.get(tool_name)
+    if existing is not None and existing.metadata.get("backend") != "mcp":
+        raise HimmyError(
+            f"MCP tool {tool_name!r} would shadow a built-in tool of the same name; "
+            "set a `prefix` (e.g. prefix: srv_) to namespace this server's tools"
+        )
 
 
 def _make_handler(client: MCPClient, mcp_name: str) -> Callable[[dict[str, Any]], Any]:
@@ -51,6 +68,7 @@ async def register_mcp_tools(
         if allow is not None and tool.name not in allow:
             continue
         tool_name = f"{prefix}{tool.name}"
+        _refuse_builtin_shadow(registry, tool_name)
         register_local_tool(
             registry,
             name=tool_name,

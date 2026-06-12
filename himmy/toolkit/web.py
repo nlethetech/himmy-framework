@@ -4,8 +4,9 @@ These give an agent the single most-requested capability it otherwise lacks —
 reaching the open web — while staying offline-testable and SSRF-safe:
 
 * every model-supplied URL passes :func:`himmy.toolkit._net.guard_url` (no private
-  hosts, http/https only, no embedded creds), redirects are not followed, and bodies
-  are size- and time-bounded;
+  hosts, http/https only, no embedded creds), and that same guard re-runs on every
+  redirect hop so a 302 to an internal address can't slip past — ``http_request``
+  refuses redirects outright; bodies are size- and time-bounded;
 * network I/O goes through injectable seams (:class:`~himmy.connectors.fetcher.Fetcher`
   for GET, an ``HttpCaller`` for full requests) so tests pass fakes and never hit the
   network;
@@ -24,10 +25,15 @@ from http.client import responses as _HTTP_REASONS
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import parse_qs, quote_plus, urlsplit
 
-from himmy.connectors.fetcher import Fetcher, HttpxFetcher
+from himmy.connectors.fetcher import (
+    DEFAULT_MAX_BYTES,
+    Fetcher,
+    HttpxFetcher,
+    ResponseTooLarge,
+)
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
 from himmy.services.tools.security import ToolSecurityError, redact_mapping
-from himmy.toolkit._net import guard_url
+from himmy.toolkit._net import build_pinned_transport, guard_url
 from himmy.toolkit.config import ToolkitConfig
 
 # DuckDuckGo's HTML endpoint challenges non-browser agents, so search requests
@@ -51,7 +57,13 @@ class HttpResponse:
 
 @runtime_checkable
 class HttpCaller(Protocol):
-    """Performs a single HTTP request and returns an :class:`HttpResponse`."""
+    """Performs a single HTTP request and returns an :class:`HttpResponse`.
+
+    The body is read incrementally and capped at ``max_bytes`` *during* download —
+    a body that crosses the cap raises :class:`~himmy.connectors.fetcher.ResponseTooLarge`
+    rather than landing whole in memory first, so a multi-GB / chunked-forever
+    response cannot exhaust memory before any post-hoc slice.
+    """
 
     def __call__(
         self,
@@ -61,6 +73,7 @@ class HttpCaller(Protocol):
         headers: dict[str, str] | None,
         json_body: Any | None,
         timeout: float,
+        max_bytes: int = DEFAULT_MAX_BYTES,
     ) -> HttpResponse: ...
 
 
@@ -105,6 +118,24 @@ def _check_status(resp: HttpResponse, url: str) -> HttpResponse:
     )
 
 
+def _read_capped(response: Any, url: str, max_bytes: int) -> bytes:
+    """Stream ``response`` into memory, refusing a body over ``max_bytes``.
+
+    Reading incrementally means a multi-GB / never-ending body is rejected as soon
+    as it crosses the cap, not after the whole thing has landed in memory — the same
+    streamed-cap discipline :class:`~himmy.connectors.fetcher.HttpxFetcher` applies.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            response.close()
+            raise ResponseTooLarge(url, max_bytes)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _httpx_caller(
     method: str,
     url: str,
@@ -112,17 +143,35 @@ def _httpx_caller(
     headers: dict[str, str] | None,
     json_body: Any | None,
     timeout: float,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    transport: Any | None = None,
 ) -> HttpResponse:
-    """Default :class:`HttpCaller` backed by ``httpx`` (redirects disabled)."""
+    """Default :class:`HttpCaller` backed by ``httpx`` (redirects disabled).
+
+    The body is streamed and capped at ``max_bytes`` mid-download (via
+    :func:`_read_capped`) so an unbounded response can't exhaust memory before the
+    caller ever slices it. ``transport`` (when given) pins the DNS-vetted IP at
+    connect time — :func:`register_web_pack` passes the same pinned transport here
+    that it gives the fetcher, closing the DNS-rebinding (TOCTOU) window; when None a
+    deny-private pinned transport is built so direct callers stay protected too.
+    """
     import httpx
 
-    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-        resp = client.request(method, url, headers=headers, json=json_body)
-        return HttpResponse(
-            status_code=resp.status_code,
-            headers={k: v for k, v in resp.headers.items()},
-            text=resp.text,
-        )
+    if transport is None:
+        transport = build_pinned_transport()
+    with httpx.Client(
+        timeout=timeout, follow_redirects=False, transport=transport
+    ) as client:
+        with client.stream(
+            method, url, headers=headers, json=json_body
+        ) as resp:
+            body = _read_capped(resp, url, max_bytes)
+            text = body.decode(resp.encoding or "utf-8", "replace")
+            return HttpResponse(
+                status_code=resp.status_code,
+                headers={k: v for k, v in resp.headers.items()},
+                text=text,
+            )
 
 
 # ------------------------------------------------------------------ HTML helpers
@@ -294,10 +343,17 @@ class DuckDuckGoBackend:
 class TavilyBackend:
     """Web search via the Tavily API (requires an API key)."""
 
-    def __init__(self, api_key: str, caller: HttpCaller, timeout: float) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        caller: HttpCaller,
+        timeout: float,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> None:
         self._key = api_key
         self._caller = caller
         self._timeout = timeout
+        self._max_bytes = max_bytes
 
     def search(self, query: str, max_results: int) -> list[dict[str, str]]:
         url = "https://api.tavily.com/search"
@@ -312,6 +368,7 @@ class TavilyBackend:
                     "max_results": max_results,
                 },
                 timeout=self._timeout,
+                max_bytes=self._max_bytes,
             ),
             url,
         )
@@ -331,10 +388,17 @@ class TavilyBackend:
 class BraveBackend:
     """Web search via the Brave Search API (requires an API key)."""
 
-    def __init__(self, api_key: str, caller: HttpCaller, timeout: float) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        caller: HttpCaller,
+        timeout: float,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> None:
         self._key = api_key
         self._caller = caller
         self._timeout = timeout
+        self._max_bytes = max_bytes
 
     def search(self, query: str, max_results: int) -> list[dict[str, str]]:
         url = f"https://api.search.brave.com/res/v1/web/search?q={quote_plus(query)}"
@@ -348,6 +412,7 @@ class BraveBackend:
                 },
                 json_body=None,
                 timeout=self._timeout,
+                max_bytes=self._max_bytes,
             ),
             url,
         )
@@ -375,11 +440,15 @@ def build_search_backend(
     if backend == "tavily":
         if not config.search_api_key:
             raise ToolSecurityError("tavily backend needs HIMMY_SEARCH_API_KEY")
-        return TavilyBackend(config.search_api_key, caller, config.http_timeout)
+        return TavilyBackend(
+            config.search_api_key, caller, config.http_timeout, config.http_max_bytes
+        )
     if backend == "brave":
         if not config.search_api_key:
             raise ToolSecurityError("brave backend needs HIMMY_SEARCH_API_KEY")
-        return BraveBackend(config.search_api_key, caller, config.http_timeout)
+        return BraveBackend(
+            config.search_api_key, caller, config.http_timeout, config.http_max_bytes
+        )
     raise ToolSecurityError(f"unknown search backend {backend!r}")
 
 
@@ -427,8 +496,52 @@ def register_web_pack(
     ddg_post: DdgPost | None = None,
 ) -> None:
     """Register ``web_search``, ``web_fetch``, and ``http_request`` onto ``registry``."""
-    fetcher = fetcher or HttpxFetcher(timeout=config.http_timeout)
-    caller = http_caller or _httpx_caller
+
+    allow_hosts = set(config.egress_allow_hosts) or None
+
+    # The default fetcher re-runs this guard on EVERY redirect hop — not just the
+    # model-supplied URL — so a 302 to 169.254.169.254 / loopback / an RFC1918 host
+    # is refused before the hop is followed (closing the SSRF-via-redirect gap).
+    def _guard(target: str) -> str:
+        return guard_url(
+            target,
+            allow_private=config.allow_private_hosts,
+            allow_hosts=allow_hosts,
+        )
+
+    # One transport, shared by the fetcher and the http_request/search caller, that
+    # pins the DNS-vetted IP at connect time so a low-TTL name can't rebind between
+    # the guard's resolution and httpx's own (the DNS-rebinding TOCTOU bypass).
+    pinned_transport = build_pinned_transport(
+        allow_private=config.allow_private_hosts, allow_hosts=allow_hosts
+    )
+    fetcher = fetcher or HttpxFetcher(
+        timeout=config.http_timeout,
+        guard=_guard,
+        max_bytes=config.http_max_bytes,
+        transport=pinned_transport,
+    )
+
+    def _pinned_caller(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None,
+        json_body: Any | None,
+        timeout: float,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> HttpResponse:
+        return _httpx_caller(
+            method,
+            url,
+            headers=headers,
+            json_body=json_body,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            transport=pinned_transport,
+        )
+
+    caller = http_caller or _pinned_caller
     post = ddg_post or (lambda q: ddg_post_html(q, config.http_timeout))
     backend = build_search_backend(config, caller, post)
 
@@ -440,11 +553,7 @@ def register_web_pack(
     def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
         url = str(args["url"])
         max_chars = int(args.get("max_chars", 8000))
-        guard_url(
-            url,
-            allow_private=config.allow_private_hosts,
-            allow_hosts=set(config.egress_allow_hosts) or None,
-        )
+        _guard(url)
         html = fetcher.get_text(url)
         title, text = html_to_text(html)
         return {
@@ -464,6 +573,10 @@ def register_web_pack(
             allow_private=config.allow_private_hosts,
             allow_hosts=set(config.egress_allow_hosts) or None,
         )
+        # The caller streams the body and caps it at http_max_bytes DURING the
+        # download (raising ResponseTooLarge if it crosses the cap), so a multi-GB
+        # GET can't exhaust memory before we ever slice it. The body we get back is
+        # therefore already bounded — no post-hoc truncation is possible.
         resp = _check_status(
             caller(
                 method,
@@ -471,15 +584,15 @@ def register_web_pack(
                 headers=headers,
                 json_body=json_body,
                 timeout=config.http_timeout,
+                max_bytes=config.http_max_bytes,
             ),
             url,
         )
-        body = resp.text[: config.http_max_bytes]
         return {
             "status_code": resp.status_code,
             "headers": redact_mapping(resp.headers),
-            "text": body,
-            "truncated": len(resp.text) > len(body),
+            "text": resp.text,
+            "truncated": False,
         }
 
     register_local_tool(

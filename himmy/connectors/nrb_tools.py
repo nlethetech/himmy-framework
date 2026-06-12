@@ -13,6 +13,7 @@ from typing import Any
 
 from himmy.connectors.nrb import NRBClient
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
+from himmy.toolkit._net import guard_url
 
 
 def _json_safe(cell: Any) -> Any:
@@ -51,6 +52,10 @@ def register_nrb_tools(
     async def _workbook(args: dict[str, Any]) -> dict[str, Any]:
         report_url = args.get("report_url")
         if report_url:
+            # The URL is model-supplied, so SSRF-guard it before fetching (the
+            # connector itself follows it directly + scans the page for linked
+            # spreadsheets). Raises ToolSecurityError → the kernel reports a failure.
+            guard_url(str(report_url))
             workbook = await asyncio.to_thread(
                 nrb.fetch_macro_workbook, str(report_url)
             )
