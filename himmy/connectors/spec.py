@@ -284,12 +284,15 @@ class SpecToolConnector(OutboundToolConnector):
         """Perform the actual HTTP call through the guarded fetcher / pinned transport.
 
         GET/HEAD go through the connector's :class:`Fetcher` (which already guards every
-        redirect hop). A body-bearing method (POST/PUT/PATCH) uses a pinned httpx client
-        — same DNS-pinning transport as the comms webhook tool — with redirects OFF so a
-        3xx can't bounce the request to an internal host.
+        redirect hop) carrying the auth ``headers`` — so a declarative GET tool under
+        ``auth:`` is actually authenticated. The fetcher drops the ``Authorization``
+        header before any redirect that crosses to a different origin, so the credential
+        is never replayed to a third-party host. A body-bearing method (POST/PUT/PATCH)
+        uses a pinned httpx client — same DNS-pinning transport as the comms webhook tool
+        — with redirects OFF so a 3xx can't bounce the request to an internal host.
         """
         if method in _SAFE_METHODS:
-            return get_json(self.fetcher, url)
+            return get_json(self.fetcher, url, headers=headers or None)
         import httpx
 
         payload = {k: args[k] for k in tool.body if k in args}

@@ -13,10 +13,10 @@ from __future__ import annotations
 import json
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (httpx stays a lazy import)
     import httpx
@@ -47,6 +47,29 @@ DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 #: address is rejected before the hop is followed.
 UrlGuard = Callable[[str], object]
 
+#: Request headers that carry a credential and so MUST NOT be replayed onto a redirect
+#: target on a *different* origin (scheme/host/port). A guarded redirect can still send
+#: the request to another host (it just has to be a public one); forwarding the
+#: ``Authorization`` header there would leak the credential to a third party — the same
+#: rule browsers and httpx apply on a cross-origin redirect.
+_SENSITIVE_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
+
+
+def _same_origin(a: str, b: str) -> bool:
+    """Whether two URLs share scheme + host + (explicit-or-default) port."""
+    pa, pb = urlsplit(a), urlsplit(b)
+    default = {"http": 80, "https": 443}
+    return (
+        pa.scheme == pb.scheme
+        and (pa.hostname or "").lower() == (pb.hostname or "").lower()
+        and (pa.port or default.get(pa.scheme)) == (pb.port or default.get(pb.scheme))
+    )
+
+
+def _strip_sensitive_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Drop credential-bearing headers (used when a redirect crosses origins)."""
+    return {k: v for k, v in headers.items() if k.lower() not in _SENSITIVE_HEADERS}
+
 
 class ResponseTooLarge(Exception):
     """A fetched body exceeded the fetcher's ``max_bytes`` ceiling."""
@@ -76,7 +99,13 @@ def _parse_retry_after(value: str | None) -> float | None:
 
 @runtime_checkable
 class Fetcher(Protocol):
-    """Fetches a URL's body as text or bytes (the only network dependency)."""
+    """Fetches a URL's body as text or bytes (the only network dependency).
+
+    An implementation MAY accept an optional ``headers`` keyword to carry per-request
+    headers (an authenticated GET needs this — see :class:`HttpxFetcher`). It is kept
+    optional so a minimal fetcher (a test double, a fixture) can implement just
+    ``get_text(url)``; :func:`get_json` probes for header support and degrades cleanly.
+    """
 
     def get_text(self, url: str) -> str:
         """Return the response body as decoded text."""
@@ -155,25 +184,36 @@ class HttpxFetcher:
             chunks.append(chunk)
         return b"".join(chunks)
 
-    def _request_once(self, client: Any, url: str) -> Any:
+    def _request_once(
+        self, client: Any, url: str, headers: dict[str, str] | None = None
+    ) -> Any:
         """Issue one GET (no auto-redirect) and read its capped body into memory.
 
         Each redirect hop's ``Location`` is re-validated through ``guard`` before
         it is followed, so the SSRF check applies to the WHOLE chain, not just the
-        model-supplied URL. Returns an httpx ``Response`` with ``_himmy_body`` set.
+        model-supplied URL. ``headers`` (per-request, e.g. an ``Authorization`` from a
+        connector's auth spec) ride on the request, but any credential-bearing header
+        is DROPPED before a redirect that crosses to a different origin — so a guarded
+        3xx to another public host can't exfiltrate the token. Returns an httpx
+        ``Response`` with ``_himmy_body`` set.
         """
         import httpx
 
         current = url
+        hop_headers = dict(headers or {})
         for _ in range(_MAX_REDIRECTS + 1):
             if self._guard is not None:
                 self._guard(current)
-            with client.stream("GET", current) as response:
+            with client.stream("GET", current, headers=hop_headers) as response:
                 if (
                     response.status_code in _REDIRECT_STATUSES
                     and "location" in response.headers
                 ):
-                    current = urljoin(current, response.headers["location"])
+                    target = urljoin(current, response.headers["location"])
+                    if not _same_origin(current, target):
+                        # Cross-origin hop: never replay the credential to a new host.
+                        hop_headers = _strip_sensitive_headers(hop_headers)
+                    current = target
                     continue
                 response._himmy_body = self._read_capped(response, current)
                 return response
@@ -182,10 +222,17 @@ class HttpxFetcher:
             request=httpx.Request("GET", url),
         )
 
-    def _get(self, url: str, *, timeout: float | None = None) -> Any:
+    def _get(
+        self,
+        url: str,
+        *,
+        timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
         import httpx
 
         effective_timeout = self._timeout if timeout is None else timeout
+        request_headers = dict(headers) if headers else None
         for attempt in range(self._retries + 1):
             try:
                 with httpx.Client(
@@ -194,7 +241,7 @@ class HttpxFetcher:
                     follow_redirects=False,
                     transport=self._transport,
                 ) as client:
-                    response = self._request_once(client, url)
+                    response = self._request_once(client, url, request_headers)
             except httpx.TransportError:
                 if attempt >= self._retries:
                     raise
@@ -209,25 +256,57 @@ class HttpxFetcher:
             return response
         raise AssertionError("unreachable: the retry loop returns or raises")
 
-    def get_text(self, url: str, *, timeout: float | None = None) -> str:
+    def get_text(
+        self,
+        url: str,
+        *,
+        timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> str:
         """Fetch ``url`` and return its decoded text body.
 
-        ``timeout`` overrides the fetcher's default per-request timeout.
+        ``timeout`` overrides the fetcher's default per-request timeout. ``headers``
+        are per-request headers (e.g. an ``Authorization`` from a connector's auth
+        spec); credential-bearing ones are dropped on a cross-origin redirect.
         """
-        response = self._get(url, timeout=timeout)
+        response = self._get(url, timeout=timeout, headers=headers)
         body: bytes = response._himmy_body
         return body.decode(response.encoding or "utf-8", "replace")
 
-    def get_bytes(self, url: str, *, timeout: float | None = None) -> bytes:
+    def get_bytes(
+        self,
+        url: str,
+        *,
+        timeout: float | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> bytes:
         """Fetch ``url`` and return its raw byte body.
 
-        ``timeout`` overrides the fetcher's default per-request timeout.
+        ``timeout`` overrides the fetcher's default per-request timeout. ``headers``
+        are per-request headers, dropped on a cross-origin redirect when sensitive.
         """
-        return bytes(self._get(url, timeout=timeout)._himmy_body)
+        return bytes(self._get(url, timeout=timeout, headers=headers)._himmy_body)
 
 
-def get_json(fetcher: Fetcher, url: str) -> Any:
-    """Fetch ``url`` via ``fetcher`` and parse the body as JSON."""
+def get_json(
+    fetcher: Fetcher, url: str, *, headers: Mapping[str, str] | None = None
+) -> Any:
+    """Fetch ``url`` via ``fetcher`` and parse the body as JSON.
+
+    ``headers`` (e.g. a connector's ``Authorization``) are forwarded when the
+    ``fetcher`` accepts them — :class:`HttpxFetcher` does, carrying them on the GET and
+    dropping any credential-bearing header on a cross-origin redirect. A minimal
+    :class:`Fetcher` whose ``get_text`` takes only the URL is still supported (the
+    headers are simply not applied) so existing fixtures keep working; an
+    *authenticated* GET must therefore go through a header-aware fetcher.
+    """
+    if headers:
+        try:
+            return json.loads(fetcher.get_text(url, headers=headers))  # type: ignore[call-arg]
+        except TypeError:
+            # A header-unaware Fetcher (e.g. a test double) — fall back to the URL-only
+            # call rather than crash; callers needing auth use HttpxFetcher.
+            pass
     return json.loads(fetcher.get_text(url))
 
 

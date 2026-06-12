@@ -32,7 +32,37 @@ class _MemSecrets:
 
 
 class _RecordingFetcher:
-    """A Fetcher that records GET URLs and returns canned JSON text."""
+    """A Fetcher that records GET URLs + per-request headers and returns canned JSON.
+
+    Header-aware on purpose: the prior version took only ``get_text(url)``, which
+    structurally COULD NOT observe the ``Authorization`` header — exactly what masked
+    the bug where authenticated declarative GET tools were sent unauthenticated. The
+    contract tests assert ``headers`` here so a regression is caught offline.
+    """
+
+    def __init__(self, text: str = "{}") -> None:
+        self.urls: list[str] = []
+        self.headers: list[dict[str, str]] = []
+        self._text = text
+
+    def get_text(self, url: str, *, headers: dict[str, str] | None = None) -> str:
+        self.urls.append(url)
+        self.headers.append(dict(headers or {}))
+        return self._text
+
+    def get_bytes(self, url: str, *, headers: dict[str, str] | None = None) -> bytes:
+        self.urls.append(url)
+        self.headers.append(dict(headers or {}))
+        return self._text.encode()
+
+
+class _HeaderBlindFetcher:
+    """A minimal Fetcher whose get_text takes only the URL (a header-unaware double).
+
+    Proves :func:`get_json` degrades cleanly: an authenticated GET through a fetcher
+    that cannot carry headers still fetches (the headers are simply not applied) rather
+    than crashing on an unexpected ``headers`` kwarg.
+    """
 
     def __init__(self, text: str = "{}") -> None:
         self.urls: list[str] = []
@@ -91,6 +121,45 @@ def test_spec_get_tool_builds_guarded_url_and_calls_fetcher() -> None:
         assert fetcher.urls == [
             "https://api.github.com/repos/nlethetech/himmy/issues/7"
         ]
+        # The GET path MUST carry the auth header from the secrets layer — a read tool
+        # under auth:{bearer} that is sent unauthenticated breaks every API that
+        # authenticates reads (Slack, private GitHub, search). This is the regression
+        # the old header-blind fetcher could not see.
+        assert fetcher.headers == [{"Authorization": "Bearer ghp_x"}]
+    finally:
+        configure_secrets(None)
+
+
+def test_spec_get_tool_without_auth_sends_no_auth_header() -> None:
+    """A connector with no auth sends a bare GET — no spurious Authorization header."""
+    fetcher = _RecordingFetcher('{"ok": true}')
+    spec = ConnectorSpec(
+        name="public",
+        base_url="https://api.github.com",
+        egress_allow_hosts=["api.github.com"],
+        tools=[{"name": "ping", "method": "GET", "path": "/zen"}],
+    )
+    registry = ToolRegistry()
+    spec.build(fetcher=fetcher).register_tools(registry)
+    run_async(registry.handler_for("ping")({}))
+    assert fetcher.headers == [{}]
+
+
+def test_spec_get_tool_with_header_blind_fetcher_still_fetches() -> None:
+    """An authenticated GET through a header-unaware fetcher degrades, doesn't crash."""
+    configure_secrets(_MemSecrets({"GITHUB_TOKEN": "ghp_x"}))
+    try:
+        fetcher = _HeaderBlindFetcher('{"number": 1}')
+        connector = _github_like_spec().build(fetcher=fetcher)
+        registry = ToolRegistry()
+        connector.register_tools(registry)
+        out = run_async(
+            registry.handler_for("github_get_issue")(
+                {"owner": "o", "repo": "r", "number": "1"}
+            )
+        )
+        assert out["ok"] is True
+        assert fetcher.urls == ["https://api.github.com/repos/o/r/issues/1"]
     finally:
         configure_secrets(None)
 
@@ -150,6 +219,46 @@ def test_spec_post_sends_auth_header_and_body_via_mock_transport() -> None:
         assert seen["auth"] == "Bearer ghp_secret"  # from the secrets layer
         assert '"title":"New issue"' in seen["body"]
         assert '"body":"details"' in seen["body"]
+    finally:
+        configure_secrets(None)
+
+
+def test_spec_get_sends_auth_header_on_the_wire_via_mock_transport() -> None:
+    """End-to-end contract: a GET tool's request actually carries Authorization.
+
+    Uses a real :class:`HttpxFetcher` over an ``httpx.MockTransport`` (the same setup
+    that empirically confirmed the bug) so the assertion is on the request that hits the
+    wire — not on a recording double. Before the fix this header was absent because the
+    GET path discarded the connector's auth headers.
+    """
+    import httpx
+
+    from himmy.connectors.fetcher import HttpxFetcher
+
+    configure_secrets(_MemSecrets({"GITHUB_TOKEN": "ghp_wire"}))
+    seen: dict[str, Any] = {}
+
+    def app(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("Authorization")
+        return httpx.Response(200, json={"number": 7})
+
+    try:
+        # allow_private so the fetcher's guard/pinning is a passthrough for the mock.
+        fetcher = HttpxFetcher(transport=httpx.MockTransport(app), retries=0)
+        connector = _github_like_spec().build(fetcher=fetcher)
+        registry = ToolRegistry()
+        connector.register_tools(registry)
+        out = run_async(
+            registry.handler_for("github_get_issue")(
+                {"owner": "nlethetech", "repo": "himmy", "number": "7"}
+            )
+        )
+        assert out["ok"] is True
+        assert seen["method"] == "GET"
+        assert seen["url"] == "https://api.github.com/repos/nlethetech/himmy/issues/7"
+        assert seen["auth"] == "Bearer ghp_wire"  # the fix: auth reaches the wire
     finally:
         configure_secrets(None)
 
