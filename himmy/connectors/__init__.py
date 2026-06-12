@@ -96,6 +96,19 @@ from himmy.connectors.spec import (
     SpecToolConnector,
     register_connector_specs,
 )
+from himmy.connectors.webhook import (
+    DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_TIMESTAMP_SKEW,
+    DEFAULT_SIGNATURE_HEADER,
+    DEFAULT_SIGNATURE_PREFIX,
+    DEFAULT_TIMESTAMP_HEADER,
+    WEBHOOK_SIGNING_SECRET,
+    GuardedCallbackPoster,
+    WebhookInboundConnector,
+    build_webhook_router,
+    make_webhook_connector,
+    sign_webhook_body,
+)
 from himmy.connectors.websearch import (
     BRAVE_API_HOST,
     BRAVE_API_KEY_SECRET,
@@ -197,4 +210,16 @@ __all__ = [
     "BRAVE_API_HOST",
     "BRAVE_API_KEY_SECRET",
     "WEBSEARCH_BACKEND_ENV",
+    # Generic inbound webhook connector
+    "WebhookInboundConnector",
+    "GuardedCallbackPoster",
+    "build_webhook_router",
+    "make_webhook_connector",
+    "sign_webhook_body",
+    "WEBHOOK_SIGNING_SECRET",
+    "DEFAULT_SIGNATURE_HEADER",
+    "DEFAULT_SIGNATURE_PREFIX",
+    "DEFAULT_TIMESTAMP_HEADER",
+    "DEFAULT_MAX_TIMESTAMP_SKEW",
+    "DEFAULT_MAX_BODY_BYTES",
 ]
