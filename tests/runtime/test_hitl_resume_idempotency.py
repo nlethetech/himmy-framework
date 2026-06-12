@@ -136,10 +136,13 @@ def test_resume_retry_after_crash_does_not_re_execute_the_tool() -> None:
         run_async(rt.resume_agent_loop(paused.checkpoint_id, approved=True))
     assert len(executions) == 1
 
-    # The execution was recorded durably BEFORE the crash window.
+    # The execution was recorded durably BEFORE the crash window. The atomic claim
+    # flipped the checkpoint to ``resolving`` before executing, so a mid-resume crash
+    # leaves it there (re-claimable by a retry) — never ``approved`` (it never
+    # resolved).
     checkpoint = store.load(paused.checkpoint_id)
     assert checkpoint is not None
-    assert checkpoint.status == "awaiting_approval"  # never resolved
+    assert checkpoint.status == "resolving"  # claimed, executed, but not resolved
     pending_id = checkpoint.pending_tool_calls[0].tool_call_id
     assert pending_id in checkpoint.executed_tool_results
 

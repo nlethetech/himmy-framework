@@ -41,6 +41,14 @@ class GuardrailVerdict:
     flags: list[str] = field(default_factory=list)
     #: Per-guardrail attribution for every block/redaction/flag (who fired, on what).
     triggers: list[GuardrailTrigger] = field(default_factory=list)
+    #: Set by :meth:`GuardrailPipeline.inspect` when a BLOCKING guardrail supplied its
+    #: own safe replacement text (it returned ``allowed=False`` with ``text`` changed
+    #: from its own input — e.g. GroundingGuardrail's tailored refusal). The enforcing
+    #: caller honors that replacement; when this is False on a block it means the
+    #: blocking guardrail left the offending text in place (DLP ``…:block`` / blocklist /
+    #: injection all return their input unchanged), so the caller MUST substitute a safe
+    #: placeholder rather than let ``text`` through. Meaningless when ``allowed`` is True.
+    block_replacement: bool = False
 
 
 @runtime_checkable
@@ -64,6 +72,24 @@ class GuardrailPipeline:
         """The names of the guardrails in this pipeline."""
         return [g.name for g in self._guardrails]
 
+    def suppresses_output_content(self) -> bool:
+        """True when any guardrail in this pipeline WITHHOLDS blocked output content.
+
+        A guardrail declares this (via an optional ``suppresses_output_content``
+        method) when a block drops the offending text rather than redacting it in
+        place — e.g. a DLP ``…:block`` policy, a blocklist, or a blocking injection
+        guard. A streaming caller uses this to decide it must BUFFER the full answer
+        and guard it before emitting any token (an already-streamed secret/banned
+        phrase cannot be recalled). Guards without the method (pure redactors,
+        grounding) contribute False, so a redact-only / grounding-only output
+        pipeline stays on the cheaper guard-after-streaming path.
+        """
+        for guardrail in self._guardrails:
+            probe = getattr(guardrail, "suppresses_output_content", None)
+            if callable(probe) and probe():
+                return True
+        return False
+
     def inspect(
         self, text: str, *, context: dict[str, Any] | None = None
     ) -> GuardrailVerdict:
@@ -78,12 +104,24 @@ class GuardrailPipeline:
         ctx = context or {}
         current = text
         allowed = True
+        block_replacement = False
         reasons: list[str] = []
         flags: list[str] = []
         triggers: list[GuardrailTrigger] = []
         for guardrail in self._guardrails:
             verdict = guardrail.inspect(current, context=ctx)
             changed = verdict.text != current
+            if not verdict.allowed:
+                allowed = False
+                # A blocking guardrail that rewrote ITS OWN input supplied a safe
+                # replacement (Grounding's refusal); one that returned its input
+                # unchanged (DLP …:block / blocklist / injection) did not — even if
+                # an UPSTREAM redactor already changed ``current``. Tracking this per
+                # blocking guardrail (not by comparing the aggregate text to the
+                # original) is what closes the mixed redact+block fail-open: the
+                # enforcing caller must substitute a placeholder when no blocking
+                # guardrail supplied its own replacement.
+                block_replacement = changed
             current = verdict.text
             reasons.extend(verdict.reasons)
             flags.extend(verdict.flags)
@@ -91,14 +129,13 @@ class GuardrailPipeline:
                 verdict.triggers
                 or _synthesize_triggers(guardrail.name, verdict, changed=changed)
             )
-            if not verdict.allowed:
-                allowed = False
         return GuardrailVerdict(
             allowed=allowed,
             text=current,
             reasons=reasons,
             flags=flags,
             triggers=triggers,
+            block_replacement=block_replacement,
         )
 
 

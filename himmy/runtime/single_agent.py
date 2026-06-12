@@ -34,7 +34,6 @@ from himmy.core.events import EventType, RunEvent
 from himmy.core.metadata import AssistantMessageMetadata
 from himmy.runtime.checkpoint import (
     APPROVED,
-    AWAITING_APPROVAL,
     REJECTED,
     AgentCheckpoint,
     CheckpointStore,
@@ -118,6 +117,21 @@ def _validate_max_turns(max_turns: int, entry_point: str) -> None:
 DEFAULT_TOOL_RETRY_ATTEMPTS = 2
 DEFAULT_TOOL_RETRY_BACKOFF_SECONDS = 0.2
 
+#: What a BLOCKED user prompt is replaced with before it reaches the model. A
+#: blocking input guardrail (DLP ``…:block``, blocklist, injection) must NOT let the
+#: offending text through — the model never sees the blocked prompt; it sees this.
+_INPUT_BLOCK_PLACEHOLDER = (
+    "[blocked: this message was withheld by an input guardrail and not delivered]"
+)
+#: What a BLOCKED assistant answer is replaced with before it reaches the user / the
+#: persisted thread. Used when the firing guardrail did not already substitute its own
+#: safe text (e.g. GroundingGuardrail supplies a tailored refusal; a DLP ``…:block`` /
+#: blocklist returns the original, so the runtime substitutes this).
+_OUTPUT_BLOCK_PLACEHOLDER = (
+    "I can't share that response: it was withheld by an output guardrail because it "
+    "contained blocked content."
+)
+
 
 def _transient_tool_codes() -> frozenset[str]:
     """The tool error codes the runtime treats as transient (turn-level retry).
@@ -130,6 +144,19 @@ def _transient_tool_codes() -> frozenset[str]:
     from himmy.services.tools.service import RETRYABLE_TOOL_CODES
 
     return frozenset(code.value for code in RETRYABLE_TOOL_CODES)
+
+
+def _tool_timeout_code() -> str:
+    """The tools kernel's TIMEOUT error-code value (the side-effect-unsafe retry).
+
+    Unlike rate-limit / provider-unavailable (the call never reached the tool), a
+    TIMEOUT means the tool MAY have run and committed a side effect, so retrying it
+    is only safe for read-only tools. Imported lazily — the tools kernel is not on
+    this kernel's import path.
+    """
+    from himmy.services.tools.models import ToolErrorCode
+
+    return ToolErrorCode.TIMEOUT.value
 
 
 class TaskContext(BaseModel):
@@ -294,17 +321,42 @@ class _CheckpointToolIdempotencyStore:
         self._store = store
 
     def get(self, key: str) -> ToolExecutionResult | None:
-        """Return the recorded result for ``key``, or None if never executed."""
-        raw = self._checkpoint.executed_tool_results.get(key)
+        """Return the recorded result for ``key``, or None if never executed.
+
+        Reads the DURABLE ledger (re-loading the checkpoint from the store), not
+        just this call's in-memory copy: a resume that re-enters after a crash —
+        or that loses the atomic claim race to a sibling that already executed and
+        recorded this key — sees the persisted result and replays it instead of
+        running a side-effecting tool a second time. Falls back to the in-memory
+        copy when the row is gone (e.g. an in-test store that drops it).
+        """
+        latest = self._store.load(self._checkpoint.checkpoint_id)
+        ledger = (
+            latest.executed_tool_results
+            if latest is not None
+            else self._checkpoint.executed_tool_results
+        )
+        raw = ledger.get(key) or self._checkpoint.executed_tool_results.get(key)
         if raw is None:
             return None
         # Imported lazily: the tools kernel is not on this kernel's import path.
         from himmy.services.tools.models import ToolExecutionResult
 
+        # Keep the working copy consistent so the durable record survives the
+        # checkpoint's later status-flip save (which writes this in-memory copy).
+        self._checkpoint.executed_tool_results.setdefault(key, raw)
         return ToolExecutionResult.model_validate(raw)
 
     def put(self, key: str, result: ToolExecutionResult) -> None:
-        """Record ``result`` on the checkpoint and persist it durably, NOW."""
+        """Record ``result`` on the checkpoint and persist it durably, NOW.
+
+        Merges any concurrently-recorded keys from the durable ledger first so a
+        sibling resume's record is not clobbered by this copy's status-flip save.
+        """
+        latest = self._store.load(self._checkpoint.checkpoint_id)
+        if latest is not None:
+            for k, v in latest.executed_tool_results.items():
+                self._checkpoint.executed_tool_results.setdefault(k, v)
         self._checkpoint.executed_tool_results[key] = result.model_dump(mode="json")
         self._store.save(self._checkpoint)
 
@@ -530,6 +582,13 @@ class SingleAgentRuntime:
         self.default_deadline_seconds = default_deadline_seconds
         self.strict_snapshot = strict_snapshot
         self._checkpoint_store = checkpoint_store
+        # Per-checkpoint resume serialization (HITL exactly-once). The store-level
+        # atomic claim is the cross-process gate; this in-process lock keeps two
+        # concurrent resumes of the SAME checkpoint on one event loop (a
+        # double-clicked Approve, two tabs, an automation retry) from interleaving
+        # between the claim and the gated tool's execution — so the approved action
+        # runs exactly once. Keyed by checkpoint_id, created on demand.
+        self._resume_locks: dict[str, asyncio.Lock] = {}
         self._input_guardrail = input_guardrail
         self._output_guardrail = output_guardrail
         # Opt-in raw-I/O capture for the trace inspector (off unless asked, or the
@@ -952,7 +1011,9 @@ class SingleAgentRuntime:
         snapshot, _snapshot_id, _err = await self._resolve_snapshot(
             persona, task, ctx, None
         )
-        system_prompt, _task_prompt, _missing = self._render_prompts(
+        # Guard injected context (recalled memory / KB docs projected into the system
+        # block) before it lands in the persona-switch SYSTEM message.
+        system_prompt, _task_prompt, _missing = await self._render_guarded_prompts(
             persona, task, ctx, snapshot
         )
 
@@ -999,6 +1060,7 @@ class SingleAgentRuntime:
         loop's lazy async-generator finalizer.
         """
         from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
+        from himmy.services.inference.service import StreamDelta
 
         if thread is None:
             thread = ChatThread(agent_id=persona.agent_id)
@@ -1010,7 +1072,10 @@ class SingleAgentRuntime:
             snapshot, _snapshot_id, _err = await self._resolve_snapshot(
                 persona, task, ctx, None
             )
-            system_prompt, task_prompt, _missing = self._render_prompts(
+            # Injected context (recalled memory / retrieved KB docs) is guarded here
+            # so a poisoned memory/KB chunk is redacted/blocked before it reaches the
+            # model (indirect prompt-injection seam) — parity with run_task_detailed.
+            system_prompt, task_prompt, _missing = await self._render_guarded_prompts(
                 persona, task, ctx, snapshot
             )
             if not any(m.role == MessageRole.SYSTEM for m in thread.messages):
@@ -1046,6 +1111,22 @@ class SingleAgentRuntime:
             request, _tool_names = self._build_request(
                 thread, ctx, llm_config, trace_id=trace_id
             )
+            # The output guardrail must be enforced on a streamed answer too (audit
+            # parity with the non-streaming paths). Two regimes:
+            #  * BUFFER: the output guard can WITHHOLD blocked content (DLP ``…:block``
+            #    / blocklist / blocking injection). An already-streamed secret can't be
+            #    recalled, so we must NOT stream — we drain the provider stream silently,
+            #    guard the full answer, then emit it as one ``done`` delta.
+            #  * GUARD-AFTER: a redact-only / grounding-only output guard. Stream the
+            #    tokens, then guard the final text; if it changed, the PERSISTED message
+            #    and the ``done`` payload carry the guarded text (the already-streamed
+            #    deltas can't be recalled, but the durable copy must be clean) and a
+            #    correction delta is emitted so a consumer that materializes from
+            #    ``delta`` rather than ``response`` also lands on the guarded text.
+            buffer_output = (
+                self._output_guardrail is not None
+                and self._output_guardrail.suppresses_output_content()
+            )
             # ``run_stream`` is an async generator; own the reference so an early
             # close/cancellation of THIS generator can close it in the finally.
             stream = self.inference_service.run_stream(request)
@@ -1053,12 +1134,21 @@ class SingleAgentRuntime:
             try:
                 async for delta in stream:
                     if delta.done and delta.response is not None:
+                        raw_text = delta.response.output_text or ""
+                        guarded_text = (
+                            await self._guard_output(
+                                raw_text, agent_id=persona.agent_id
+                            )
+                            or ""
+                        )
+                        corrected = guarded_text != raw_text
                         assistant = Message(
                             role=MessageRole.ASSISTANT,
-                            content=delta.response.output_text or "",
+                            content=guarded_text,
                             metadata={
                                 "request_id": request.request_id,
                                 "streamed": True,
+                                **({"guarded": True} if corrected else {}),
                             },
                         )
                         thread.append_message(assistant)
@@ -1085,6 +1175,37 @@ class SingleAgentRuntime:
                             )
                         )
                         run_finished = True
+                        # The ``done`` delta must never carry the pre-guard text. Rewrite
+                        # its response (and the textual ``delta``) to the guarded answer.
+                        guarded_response = delta.response.model_copy(
+                            update={"output_text": guarded_text}
+                        )
+                        if buffer_output:
+                            # Nothing was streamed; deliver the whole guarded answer now.
+                            yield StreamDelta(
+                                request_id=request.request_id,
+                                delta=guarded_text,
+                                index=delta.index,
+                                done=True,
+                                response=guarded_response,
+                            )
+                        else:
+                            if corrected:
+                                # The already-streamed tokens were the raw answer; emit a
+                                # correction so a delta-materializing consumer ends clean.
+                                yield StreamDelta(
+                                    request_id=request.request_id,
+                                    delta="",
+                                    index=delta.index,
+                                    event_type="guarded_output",
+                                    event_payload={"output_text": guarded_text},
+                                )
+                            yield delta.model_copy(update={"response": guarded_response})
+                        continue
+                    if buffer_output and not delta.done:
+                        # Suppress intermediate text in BUFFER mode — the answer is only
+                        # safe to surface after the guard runs on the ``done`` delta.
+                        continue
                     yield delta
             except (GeneratorExit, asyncio.CancelledError):
                 # Early termination at a yield point: record the terminal event
@@ -1480,6 +1601,20 @@ class SingleAgentRuntime:
                 },
             )
 
+    def _resume_lock_for(self, checkpoint_id: str) -> asyncio.Lock:
+        """The per-checkpoint resume lock (created on first use), serializing resumes.
+
+        Two concurrent resumes of the SAME checkpoint on one event loop must not
+        interleave between the atomic claim and the gated tool's execution, or both
+        could run the approved action. Different checkpoints get different locks, so
+        unrelated resumes still proceed in parallel.
+        """
+        lock = self._resume_locks.get(checkpoint_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._resume_locks[checkpoint_id] = lock
+        return lock
+
     async def resume_agent_loop(
         self,
         checkpoint_id: str,
@@ -1493,22 +1628,63 @@ class SingleAgentRuntime:
         Rehydrates the checkpoint, applies the decision to each pending tool call
         — executing it (``approved=True``) and recording the real result, or
         recording a rejection — then drives one more model turn (so the model sees
-        the outcome) and continues the loop. Idempotency is enforced twice over: a
-        checkpoint already ``approved``/``rejected`` cannot be resumed again, and
-        each approved execution is recorded on the checkpoint the moment it
-        completes (``executed_tool_results``), so a resume retried after a partial
-        failure replays recorded results instead of re-executing state-mutating
-        tools.
+        the outcome) and continues the loop. Exactly-once is enforced at three
+        layers: a per-checkpoint in-process lock serializes concurrent resumes on one
+        event loop; an ATOMIC store claim (``awaiting_approval``/``resolving`` ->
+        ``resolving``) gates cross-process resumes and the loser is refused; and each
+        approved execution is recorded on the checkpoint the moment it completes
+        (``executed_tool_results``, read from the DURABLE ledger), so a resume retried
+        after a crash replays recorded results instead of re-executing a
+        state-mutating tool.
         """
         if self._checkpoint_store is None:
             raise HimmyError("resume_agent_loop requires a checkpoint_store.")
-        checkpoint = self._checkpoint_store.load(checkpoint_id)
-        if checkpoint is None:
+        if self._checkpoint_store.load(checkpoint_id) is None:
             raise HimmyError(f"unknown checkpoint {checkpoint_id!r}.")
-        if checkpoint.status != AWAITING_APPROVAL:
-            raise HimmyError(
-                f"checkpoint {checkpoint_id!r} already resolved ({checkpoint.status})."
+        # Serialize concurrent in-process resumes of this checkpoint end-to-end: the
+        # claim, the gated tool's execution, and the status flip all happen under the
+        # lock, so a second concurrent resume only enters AFTER the first has resolved
+        # (and is then refused or replays via the ledger). The cross-process gate is
+        # the store-level atomic claim below; the lock closes the much more common
+        # single-process race (double-clicked Approve, two browser tabs, an
+        # automation retry hitting one server).
+        async with self._resume_lock_for(checkpoint_id):
+            return await self._resume_agent_loop_locked(
+                checkpoint_id,
+                approved=approved,
+                llm_config=llm_config,
+                hitl=hitl,
             )
+
+    async def _resume_agent_loop_locked(
+        self,
+        checkpoint_id: str,
+        *,
+        approved: bool,
+        llm_config: LLMConfig | None,
+        hitl: bool,
+    ) -> AgentLoopResult:
+        """The resume body, run under the per-checkpoint lock (see resume_agent_loop)."""
+        assert self._checkpoint_store is not None  # guaranteed by the caller
+        # Atomic claim: compare-and-set the status to ``resolving`` as a single store
+        # operation. Concurrent resumes of the same checkpoint (two tabs, an
+        # automation retry, two workers on the shared SQLite file) race here, and only
+        # the winner proceeds to execute the approval-gated tool — the loser's claim
+        # returns False and it is refused outright, so the gated action runs EXACTLY
+        # once. (The old plain status check was a TOCTOU: both callers read
+        # awaiting_approval, both executed, then both flipped the status.) An
+        # already-resolved (approved/rejected) checkpoint also loses here.
+        if not self._checkpoint_store.claim(checkpoint_id):
+            current = self._checkpoint_store.load(checkpoint_id)
+            status = current.status if current is not None else "unknown"
+            raise HimmyError(
+                f"checkpoint {checkpoint_id!r} already resolved ({status})."
+            )
+        # We hold the claim: re-load so the executed_tool_results ledger (and status)
+        # reflect the just-claimed row rather than the pre-claim snapshot.
+        checkpoint = self._checkpoint_store.load(checkpoint_id)
+        if checkpoint is None:  # pragma: no cover - the claim just observed it
+            raise HimmyError(f"unknown checkpoint {checkpoint_id!r}.")
         # Checkpoints written by the validated entry points always pass; this guards
         # the resumed drive loop against a hand-crafted/tampered checkpoint row.
         _validate_max_turns(checkpoint.max_turns, "resume_agent_loop")
@@ -2161,7 +2337,10 @@ class SingleAgentRuntime:
         )
 
         # --- 2. render prompts (+ project snapshot keys) -------------------
-        system_prompt, task_prompt, _missing = self._render_prompts(
+        # Injected context (recalled memory / retrieved KB docs) is routed through
+        # the guardrail here so a poisoned memory or KB chunk is redacted/blocked
+        # before it reaches the model (indirect prompt-injection seam).
+        system_prompt, task_prompt, _missing = await self._render_guarded_prompts(
             persona, task, ctx, snapshot
         )
 
@@ -2413,11 +2592,43 @@ class SingleAgentRuntime:
         A clean pass (no flags, no block, text unchanged) emits nothing, so the
         event stream only carries the safety layer when it actually did something —
         which is exactly what the audit panel surfaces.
+
+        Enforcement is real, not advisory: when a guardrail BLOCKS (``allowed`` is
+        False) the offending text NEVER propagates. Blocking guardrails (DLP
+        ``…:block``, blocklist, injection) return the original text on a block, so
+        the runtime substitutes a safe placeholder here instead of letting it
+        through — on the INPUT stage the model never sees the blocked prompt, and on
+        the OUTPUT stage the user and the persisted thread never see the blocked
+        answer. A guardrail that already supplied its own safe replacement (e.g.
+        GroundingGuardrail's tailored refusal) is honored; otherwise the stage's
+        generic placeholder is used. The GUARDRAIL_APPLIED event always reflects
+        reality (``blocked``/``redacted`` describe the text actually returned).
+
+        Whether a safe replacement was supplied is read from the verdict's
+        ``block_replacement`` flag (set by :meth:`GuardrailPipeline.inspect` per
+        blocking guardrail), NOT by comparing ``verdict.text`` to the original. In a
+        MIXED pipeline an upstream redactor changes the text before a downstream
+        blocker returns its (already-redacted) input unchanged, so ``verdict.text``
+        no longer equals the original even though the blocker supplied nothing — the
+        old equality check fell open and leaked the offending content through.
         """
         if guardrail is None:
             return text
         verdict = guardrail.inspect(text, context={"stage": stage})
-        redacted = verdict.text != text
+        result = cast(str, verdict.text)
+        if not verdict.allowed:
+            # The block is enforced: never return the offending text. Honor a safe
+            # replacement the BLOCKING guardrail itself produced; otherwise fall back
+            # to the stage's generic placeholder. ``block_replacement`` is authoritative
+            # — a bare ``result != text`` would be fooled by an upstream redaction in a
+            # mixed redact+block pipeline (finding #3's fail-open).
+            if not getattr(verdict, "block_replacement", False):
+                result = (
+                    _INPUT_BLOCK_PLACEHOLDER
+                    if stage == "input"
+                    else _OUTPUT_BLOCK_PLACEHOLDER
+                )
+        redacted = result != text
         if verdict.flags or verdict.reasons or not verdict.allowed or redacted:
             await self._emit(
                 RunEvent(
@@ -2432,7 +2643,7 @@ class SingleAgentRuntime:
                     },
                 )
             )
-        return cast(str, verdict.text)
+        return result
 
     async def _resolve_snapshot(
         self,
@@ -2540,14 +2751,53 @@ class SingleAgentRuntime:
         return snapshot, resolved_id, snapshot_error
 
     # --------------------------------------------------------------- prompts
-    def _render_prompts(
+    async def _render_guarded_prompts(
         self,
         persona: Persona,
         task: Task,
         ctx: dict[str, Any],
         snapshot: Any,
     ) -> tuple[str, str, list[str]]:
-        """Render system + task prompts and append projected snapshot blocks."""
+        """Render prompts, routing INJECTED context through the guardrail first.
+
+        Recalled long-term memory (``MemoryContextAdapter``) and retrieved KB docs
+        reach the model as projected snapshot blocks — content the agent did NOT
+        author and that an attacker may have planted in a remembered fact or an
+        ingested document (indirect prompt injection / data exfiltration). The
+        base persona/task prompts are the operator's own text and are left alone;
+        only the injected blocks are passed through :meth:`_guard_input` (the
+        configured injection/DLP/blocklist guards), so a poisoned memory or KB chunk
+        is redacted/blocked/flagged BEFORE it enters the model. No guardrail
+        configured ⇒ ``_guard_input`` is a passthrough, so the merged prompts are
+        byte-identical to the unguarded render.
+        """
+        system_prompt, task_prompt, missing, sys_block, task_block = (
+            self._render_prompt_parts(persona, task, ctx, snapshot)
+        )
+        if sys_block:
+            guarded_sys = await self._guard_input(sys_block, agent_id=persona.agent_id)
+            system_prompt = f"{system_prompt}\n\n{guarded_sys}".strip()
+        if task_block:
+            guarded_task = await self._guard_input(
+                task_block, agent_id=persona.agent_id
+            )
+            task_prompt = f"{task_prompt}\n\n{guarded_task}".strip()
+        return system_prompt, task_prompt, missing
+
+    def _render_prompt_parts(
+        self,
+        persona: Persona,
+        task: Task,
+        ctx: dict[str, Any],
+        snapshot: Any,
+    ) -> tuple[str, str, list[str], str, str]:
+        """Render the base prompts and the projected snapshot blocks SEPARATELY.
+
+        Returns ``(system_prompt, task_prompt, missing, sys_block, task_block)`` where
+        the two prompts are the operator-authored text (persona/task/system_prefix)
+        and ``sys_block``/``task_block`` are the projected snapshot content kept apart
+        so a caller can guard the injected context independently of the base prompt.
+        """
         system_prompt = ""
         task_prompt = task.prompt
         missing: list[str] = []
@@ -2594,7 +2844,11 @@ class SingleAgentRuntime:
         if prefix:
             system_prompt = f"{prefix}\n\n{system_prompt}".strip()
 
-        # Project snapshot keys into system/task blocks.
+        # Project snapshot keys into system/task blocks (kept SEPARATE from the base
+        # prompts so the injected context can be guarded independently — see
+        # _render_guarded_prompts).
+        sys_block = ""
+        task_block = ""
         map_spec = ctx.get("context_prompt_map_spec")
         if (
             self.context_prompt_mapper is not None
@@ -2605,13 +2859,11 @@ class SingleAgentRuntime:
                 sys_block, task_block, missing = self.context_prompt_mapper.project(
                     snapshot, map_spec
                 )
-                if sys_block:
-                    system_prompt = f"{system_prompt}\n\n{sys_block}".strip()
-                if task_block:
-                    task_prompt = f"{task_prompt}\n\n{task_block}".strip()
             except Exception:  # pragma: no cover - defensive
                 missing = []
-        return system_prompt, task_prompt, missing
+                sys_block = ""
+                task_block = ""
+        return system_prompt, task_prompt, missing, sys_block, task_block
 
     # ----------------------------------------------------------- inference
     def _effective_model_key(
@@ -2751,6 +3003,31 @@ class SingleAgentRuntime:
             request.timeout_seconds = timeout_seconds
         return request, tool_names_override or tool_names
 
+    def _tool_is_read_only(self, tool_name: str) -> bool:
+        """True only when ``tool_name`` is provably read-only (no side effect).
+
+        Used to decide whether a TIMEOUT may be retried: a read-only tool has no
+        side effect, so re-running it after a timeout is safe; anything else (a write
+        tool, or an ambiguously-named one whose intent can't be inferred) is treated
+        as side-effecting and NOT retried on timeout. Resolution: the definition's
+        explicit ``read_only`` flag wins; otherwise the name is classified
+        (``classify_read_only`` — ``None``/ambiguous ⇒ not read-only); an unknown
+        tool (no definition) is conservatively treated as side-effecting.
+        """
+        if self.tool_service is None:
+            return False
+        registry = getattr(self.tool_service, "registry", None)
+        if registry is None:
+            return False
+        definition = registry.get(tool_name)
+        if definition is None:
+            return False
+        if definition.read_only is not None:
+            return bool(definition.read_only)
+        from himmy.services.tools.access import classify_read_only
+
+        return classify_read_only(tool_name) is True
+
     def _wrap_executor_with_retry(
         self,
         executor: ToolExecutor,
@@ -2776,6 +3053,15 @@ class SingleAgentRuntime:
         ``TOOL_CALLED`` event tagged ``transient_retry`` so the trace shows it.
         Non-transient failures (and exhausted retries) keep the current
         behavior exactly: the last failed record flows into the turn.
+
+        SIDE-EFFECT SAFETY: a ``TIMEOUT`` does NOT mean the tool didn't run — an
+        HTTP POST / write may have committed server-side after the client gave up,
+        so re-firing it would duplicate the write/send/charge. The retry therefore
+        skips ``TIMEOUT`` for any tool that is not provably read-only (a write or an
+        ambiguously-named tool); read-only tools (no side effect) still retry on
+        timeout. The other transient codes (``RATE_LIMITED`` /
+        ``PROVIDER_UNAVAILABLE``) mean the call never reached the tool, so they stay
+        retryable for every tool.
         """
         raw_attempts = ctx.get("tool_retry_attempts")
         retries = (
@@ -2792,12 +3078,17 @@ class SingleAgentRuntime:
             else max(0.0, float(raw_backoff))
         )
         transient = _transient_tool_codes()
+        timeout_code = _tool_timeout_code()
 
         async def _execute(tool_name: str, args: dict[str, Any]) -> ToolReturnRecord:
             record = await executor(tool_name, args)
             for attempt in range(1, retries + 1):
                 code = (record.metadata or {}).get("error_code")
                 if record.outcome != "failed" or code not in transient:
+                    return record
+                # A timed-out non-read-only tool may already have committed its
+                # side effect — do not re-fire it (idempotency would be violated).
+                if code == timeout_code and not self._tool_is_read_only(tool_name):
                     return record
                 await self._emit(
                     RunEvent(

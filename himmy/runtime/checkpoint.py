@@ -24,6 +24,11 @@ from himmy.core.ids import new_uuid, utc_now_iso
 
 #: Checkpoint lifecycle states.
 AWAITING_APPROVAL = "awaiting_approval"
+#: Transient claim state: a resume that won the atomic compare-and-set flips
+#: ``awaiting_approval`` -> ``resolving`` BEFORE executing any pending tool, so a
+#: second concurrent resume (a double-clicked Approve, two tabs, two workers on the
+#: shared SQLite file) loses the claim and is a no-op — the gated tool runs once.
+RESOLVING = "resolving"
 APPROVED = "approved"
 REJECTED = "rejected"
 
@@ -128,6 +133,19 @@ class CheckpointStore(Protocol):
         """Return a checkpoint by id, or None."""
         ...
 
+    def claim(self, checkpoint_id: str) -> bool:
+        """Atomically take the resume claim; True iff we won.
+
+        The atomic compare-and-set behind HITL exactly-once: a checkpoint in
+        ``awaiting_approval`` (a fresh resume) or ``resolving`` (a crash-retry
+        re-entering after a prior resume died mid-flight) is claimable and flips to
+        :data:`RESOLVING`; an ``approved``/``rejected`` (or unknown) checkpoint is
+        not, returning ``False``. Concurrent callers serialize on this CAS so the
+        gated tool's execution stays exactly-once (the per-tool idempotency ledger
+        replays an already-executed call for the crash-retry case).
+        """
+        ...
+
 
 class InMemoryCheckpointStore:
     """A volatile, process-local :class:`CheckpointStore` (the default)."""
@@ -143,6 +161,20 @@ class InMemoryCheckpointStore:
         """Return a deep copy of the stored checkpoint, or None."""
         found = self._store.get(checkpoint_id)
         return found.model_copy(deep=True) if found is not None else None
+
+    def claim(self, checkpoint_id: str) -> bool:
+        """Compare-and-set a claimable checkpoint -> ``resolving`` (True iff we won).
+
+        Synchronous and process-local: the check-and-set runs to completion without
+        an ``await`` in between, so concurrent resume coroutines on one event loop
+        cannot interleave inside it — exactly one wins. Claimable means
+        ``awaiting_approval`` (fresh) or ``resolving`` (crash-retry re-entry).
+        """
+        found = self._store.get(checkpoint_id)
+        if found is None or found.status not in (AWAITING_APPROVAL, RESOLVING):
+            return False
+        self._store[checkpoint_id] = found.model_copy(update={"status": RESOLVING})
+        return True
 
 
 _SCHEMA = """
@@ -372,6 +404,43 @@ class SqliteCheckpointStore:
             return None
         return AgentCheckpoint.model_validate(_migrate_checkpoint(json.loads(row[0])))
 
+    def claim(self, checkpoint_id: str) -> bool:
+        """Atomically take the resume claim -> ``resolving`` (True iff we won).
+
+        A single conditional UPDATE under ``BEGIN IMMEDIATE`` (which takes the write
+        lock up front) so two concurrent resumes — even across processes sharing this
+        file — serialize: the first matches a claimable status and flips it (rowcount
+        1, the claim); a concurrent caller's UPDATE runs after the commit and, for a
+        fresh resume that had been ``awaiting_approval``, now sees ``resolving`` —
+        still claimable, so the cross-process loser is gated by the in-process
+        per-checkpoint lock and, failing that, by the durable idempotency ledger
+        (an already-executed tool is replayed, never re-run). Claimable =
+        ``awaiting_approval`` (fresh) or ``resolving`` (crash-retry). The persisted
+        ``data`` JSON's ``status`` is rewritten too so a later ``load`` is consistent
+        with the ``status`` column.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE agent_checkpoints "
+                "SET status = ?, "
+                "    data = json_set(data, '$.status', ?) "
+                "WHERE checkpoint_id = ? AND status IN (?, ?)",
+                (
+                    RESOLVING,
+                    RESOLVING,
+                    checkpoint_id,
+                    AWAITING_APPROVAL,
+                    RESOLVING,
+                ),
+            )
+            won = cur.rowcount == 1
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return won
+
     def list_by_status(self, status: str) -> list[AgentCheckpoint]:
         """All checkpoints with the given status, newest first (for an approvals UI)."""
         rows = self._conn.execute(
@@ -391,6 +460,7 @@ class SqliteCheckpointStore:
 
 __all__ = [
     "AWAITING_APPROVAL",
+    "RESOLVING",
     "APPROVED",
     "REJECTED",
     "CHECKPOINT_SCHEMA_VERSION",
