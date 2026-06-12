@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, cast
 from himmy.core.events import RunEvent
 from himmy.core.ids import utc_now_iso
 from himmy.core.sqlite_util import connect_hardened
+from himmy.services.storage.at_rest import StorePayloadCipher, build_store_cipher
 from himmy.services.storage.models import (
     ActionRecord,
     AgentStateRecord,
@@ -188,6 +189,17 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
 """
 
 
+class _Unset:
+    """Sentinel: ``cipher`` was not passed, so source it from the environment.
+
+    Distinct from an explicit ``cipher=None`` (which forces plaintext regardless of
+    ``HIMMY_ENCRYPTION_KEY``) so a caller can opt out even when a key is configured.
+    """
+
+
+_UNSET = _Unset()
+
+
 class SqliteStorageService:
     """A durable, file-backed SQLite storage backend mirroring ``StorageService`` 1:1.
 
@@ -199,7 +211,12 @@ class SqliteStorageService:
     :func:`asyncio.to_thread`, so the async surface never blocks the event loop.
     """
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        cipher: StorePayloadCipher | None | _Unset = _UNSET,
+    ) -> None:
         """Open (or create) the SQLite database at ``path`` and apply the schema.
 
         ``path``'s parent directory is created when it does not exist, so a default
@@ -207,6 +224,12 @@ class SqliteStorageService:
         ephemeral use (the connection is shared, so the in-memory DB persists for the
         lifetime of the instance). A process-wide lock serializes writes so concurrent
         ``asyncio.to_thread`` workers can share the single connection safely.
+
+        ``cipher`` controls field encryption at rest for the sensitive payloads (message
+        content + run-event payloads). It defaults to :func:`build_store_cipher`, which is
+        ``None`` (plaintext, offline path unchanged) unless ``HIMMY_ENCRYPTION_KEY`` /
+        ``HIMMY_KEK_PROVIDER`` is configured; pass an explicit cipher (or ``None``) to
+        override.
         """
         self._path = str(path)
         if self._path != ":memory:":
@@ -218,6 +241,7 @@ class SqliteStorageService:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._lock = threading.Lock()
+        self._cipher = build_store_cipher() if isinstance(cipher, _Unset) else cipher
 
     @property
     def path(self) -> str:
@@ -283,18 +307,23 @@ class SqliteStorageService:
 
     # ------------------------------------------------------------------ threads
     async def save_thread(self, thread: ChatThread) -> ChatThread:
-        """Upsert a chat thread keyed by ``thread_id``."""
+        """Upsert a chat thread keyed by ``thread_id`` (message content encrypted)."""
+        payload = thread.model_dump(mode="json")
+        if self._cipher is not None:
+            payload = self._cipher.encrypt_thread_payload(
+                payload, thread_id=thread.thread_id
+            )
         await asyncio.to_thread(
             self._write,
             "INSERT INTO chat_threads (thread_id, payload, updated_at) "
             "VALUES (?, ?, ?) ON CONFLICT (thread_id) DO UPDATE SET "
             "payload = excluded.payload, updated_at = excluded.updated_at",
-            (thread.thread_id, self._dump(thread), utc_now_iso()),
+            (thread.thread_id, json.dumps(payload), utc_now_iso()),
         )
         return thread
 
     async def load_thread(self, thread_id: str) -> ChatThread | None:
-        """Return a stored chat thread by id, or None."""
+        """Return a stored chat thread by id, or None (message content decrypted)."""
         from himmy.agents.base_agent.thread import ChatThread
 
         row = await asyncio.to_thread(
@@ -302,7 +331,12 @@ class SqliteStorageService:
             "SELECT payload FROM chat_threads WHERE thread_id = ?",
             (thread_id,),
         )
-        return ChatThread.model_validate(json.loads(row["payload"])) if row else None
+        if row is None:
+            return None
+        payload = json.loads(row["payload"])
+        if self._cipher is not None:
+            payload = self._cipher.decrypt_thread_payload(payload, thread_id=thread_id)
+        return ChatThread.model_validate(payload)
 
     # ------------------------------------------------------------------- events
     async def append_event(self, event: RunEvent) -> None:
@@ -312,6 +346,11 @@ class SqliteStorageService:
         Postgres ``ON CONFLICT (event_id) DO NOTHING``. Insertion order is preserved
         by the autoincrement ``seq`` column.
         """
+        record = event.model_dump(mode="json")
+        if self._cipher is not None:
+            record["payload"] = self._cipher.encrypt_event_payload(
+                record.get("payload") or {}, event_id=event.event_id
+            )
         await asyncio.to_thread(
             self._write,
             "INSERT INTO run_events (event_id, thread_id, trace_id, payload) "
@@ -320,7 +359,7 @@ class SqliteStorageService:
                 event.event_id,
                 event.thread_id,
                 event.trace_id,
-                json.dumps(event.model_dump(mode="json")),
+                json.dumps(record),
             ),
         )
 
@@ -342,7 +381,16 @@ class SqliteStorageService:
             f"SELECT payload FROM run_events{where} ORDER BY seq ASC",  # noqa: S608
             tuple(params),
         )
-        return [RunEvent.model_validate(json.loads(r["payload"])) for r in rows]
+        return [self._row_to_event(json.loads(r["payload"])) for r in rows]
+
+    def _row_to_event(self, record: dict[str, Any]) -> RunEvent:
+        """Reconstruct a ``RunEvent``, decrypting its payload envelope when present."""
+        if self._cipher is not None:
+            record = dict(record)
+            record["payload"] = self._cipher.decrypt_event_payload(
+                record.get("payload") or {}, event_id=str(record.get("event_id", ""))
+            )
+        return RunEvent.model_validate(record)
 
     # ------------------------------------------------------------------ context
     async def save_context_field(self, field: ContextField) -> ContextField:

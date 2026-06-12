@@ -36,6 +36,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     SubjectExtractor = Callable[[EntityRecord], str | None]
     FieldsForKind = Callable[[str], Sequence[str]]
 
+#: Pseudo-field marker the wiring layer lists for ``chat_thread`` (whose sensitive content
+#: is nested in ``messages[*].content``, not a top-level payload field). When the encrypted
+#: field spec contains it, ``_encrypt`` walks every message's ``content`` through the
+#: subject's cipher so right-to-erasure renders the *conversation body* unrecoverable too —
+#: otherwise the immutable spine would keep a plaintext copy that crypto-shred can't reach.
+MESSAGES_CONTENT_FIELD = "messages[].content"
+
 
 class ConsentAwareRegistry:
     """Gate subject-bearing ``register()`` writes to the spine; delegate the rest."""
@@ -77,17 +84,30 @@ class ConsentAwareRegistry:
     def _encrypt(self, record: EntityRecord, subject: str) -> EntityRecord:
         """Encrypt the kind's subject-bearing fields under the subject's key (if wired).
 
-        ``record_id`` is derived from ``(kind, stable_id, version)`` only, so encrypting
-        the payload leaves the content-addressed id (and thus lineage) unchanged while the
-        signed-bundle hash now covers ciphertext.
+        Top-level string fields are encrypted directly; the
+        :data:`MESSAGES_CONTENT_FIELD` marker triggers a nested walk of every
+        ``messages[*].content`` so a ``chat_thread`` aggregate carries no plaintext
+        conversation body onto the immutable spine (otherwise crypto-shred could never make
+        it unrecoverable). ``record_id`` is derived from ``(kind, stable_id, version)``
+        only, so encrypting the payload leaves the content-addressed id (and thus lineage)
+        unchanged while the signed-bundle hash now covers ciphertext.
         """
         fields = tuple(self._fields_for(record.kind))
         if not fields or self._vault is None:
             return record
         from himmy.services.storage.encryption import RecordCipher
 
-        cipher = RecordCipher(self._vault.encryptor_for(subject))
-        payload = cipher.encrypt_fields(record.payload, fields, aad=subject.encode())
+        encryptor = self._vault.encryptor_for(subject)
+        top_level = tuple(f for f in fields if f != MESSAGES_CONTENT_FIELD)
+        payload = RecordCipher(encryptor).encrypt_fields(
+            record.payload, top_level, aad=subject.encode()
+        )
+        if MESSAGES_CONTENT_FIELD in fields:
+            from himmy.services.storage.at_rest import StorePayloadCipher
+
+            payload = StorePayloadCipher(encryptor).encrypt_thread_payload(
+                payload, thread_id=subject
+            )
         return EntityRecord.create(
             stable_id=record.stable_id,
             version=record.version,
@@ -118,4 +138,4 @@ class ConsentAwareRegistry:
         return getattr(self._inner, name)
 
 
-__all__ = ["ConsentAwareRegistry"]
+__all__ = ["ConsentAwareRegistry", "MESSAGES_CONTENT_FIELD"]

@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from himmy.services.governance.consent_registry import MESSAGES_CONTENT_FIELD
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.entities.records import EntityRecord
     from himmy.entities.registry import EntityRegistry
@@ -46,13 +48,16 @@ _GATED_SPINE_KINDS = frozenset(
     }
 )
 
-#: Per-kind subject-bearing string fields encrypted under the subject's shreddable key on
-#: an ALLOW write (so ``RetentionService.erase_subject`` renders them unrecoverable). Kinds
-#: whose sensitive content is nested (chat_thread.messages) or already stripped by the A2
-#: TRAIN gate (run_event payload) list no top-level field; for a denied subject the record
-#: is skipped entirely so nothing is persisted regardless.
+#: Per-kind subject-bearing fields encrypted under the subject's shreddable key on an ALLOW
+#: write (so ``RetentionService.erase_subject`` renders them unrecoverable). ``chat_thread``
+#: lists the :data:`MESSAGES_CONTENT_FIELD` marker so its *nested* ``messages[*].content``
+#: is walked through the subject cipher — otherwise the immutable spine would keep a full
+#: plaintext conversation that crypto-shred can never reach. ``run_event`` payload is already
+#: stripped by the A2 TRAIN gate, so it lists no field; for a denied subject the record is
+#: skipped entirely so nothing is persisted regardless.
 _SPINE_ENCRYPTED_FIELDS: dict[str, tuple[str, ...]] = {
     "message": ("content",),
+    "chat_thread": (MESSAGES_CONTENT_FIELD,),
     "recommendation": ("title", "summary", "rationale"),
 }
 

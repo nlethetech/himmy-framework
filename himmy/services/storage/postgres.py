@@ -32,6 +32,7 @@ from typing import Any, cast
 
 from himmy.core.errors import HimmyError
 from himmy.core.events import RunEvent
+from himmy.services.storage.at_rest import StorePayloadCipher, build_store_cipher
 from himmy.services.storage.models import (
     ActionRecord,
     AgentStateRecord,
@@ -43,6 +44,17 @@ from himmy.services.storage.models import (
     RunRecord,
     RunStatus,
 )
+
+
+class _Unset:
+    """Sentinel: ``cipher`` was not passed, so source it from the environment.
+
+    Distinct from an explicit ``cipher=None`` (which forces plaintext regardless of
+    ``HIMMY_ENCRYPTION_KEY``) so a caller can opt out even when a key is configured.
+    """
+
+
+_UNSET = _Unset()
 
 #: Idempotent schema for the full storage surface. 14 tables + the ai_call_log view.
 #: Timestamps that drive analytics are TIMESTAMPTZ with indexes; the model boundary
@@ -383,11 +395,20 @@ def _iso(value: Any) -> str | None:
 
 
 # ----------------------------------------------------------------- row mappers
-def _row_to_event(row: Any) -> RunEvent:
-    """Map a run_events row to a RunEvent (payload is native via the codec)."""
+def _row_to_event(row: Any, *, cipher: StorePayloadCipher | None = None) -> RunEvent:
+    """Map a run_events row to a RunEvent (payload is native via the codec).
+
+    When a payload cipher is configured the at-rest payload envelope is decrypted back to
+    the cleartext dict, bound to the row's ``event_id`` as AAD.
+    """
     data = dict(row)
     data["timestamp"] = _iso(data.get("timestamp"))
-    data["payload"] = data.get("payload") or {}
+    payload = data.get("payload") or {}
+    if cipher is not None and isinstance(payload, dict):
+        payload = cipher.decrypt_event_payload(
+            payload, event_id=str(data.get("event_id", ""))
+        )
+    data["payload"] = payload
     return RunEvent.model_validate(data)
 
 
@@ -422,8 +443,14 @@ class _PgStoreBase:
     ``pool = self._require_pool()`` exactly as the original facade methods did.
     """
 
-    def __init__(self, require_pool: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        require_pool: Callable[[], Any],
+        *,
+        cipher: StorePayloadCipher | None = None,
+    ) -> None:
         self._require_pool = require_pool
+        self._cipher = cipher
 
     # ------------------------------------------------------------- generic helpers
     async def _save_keyed(
@@ -501,11 +528,19 @@ class PostgresThreadStore(_PgStoreBase):
     """Postgres-backed chat-thread persistence keyed by ``thread_id``."""
 
     async def save_thread(self, thread: Any) -> Any:
-        """Upsert a chat thread keyed by ``thread_id`` (refreshes ``updated_at``)."""
+        """Upsert a chat thread keyed by ``thread_id`` (refreshes ``updated_at``).
+
+        When a payload cipher is configured each message's ``content`` is encrypted at
+        rest (bound to the ``thread_id``); the indexed columns stay clear.
+        """
         pool = self._require_pool()
         from himmy.core.ids import utc_now_iso
 
         payload = thread.model_dump(mode="json")
+        if self._cipher is not None:
+            payload = self._cipher.encrypt_thread_payload(
+                payload, thread_id=thread.thread_id
+            )
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -529,7 +564,7 @@ class PostgresThreadStore(_PgStoreBase):
         return thread
 
     async def load_thread(self, thread_id: str) -> Any | None:
-        """Load a chat thread by id, or None."""
+        """Load a chat thread by id, or None (message content decrypted at rest)."""
         from himmy.agents.base_agent.thread import ChatThread
 
         pool = self._require_pool()
@@ -539,15 +574,23 @@ class PostgresThreadStore(_PgStoreBase):
             )
         if row is None:
             return None
-        return ChatThread.model_validate(row["payload"])
+        payload = row["payload"]
+        if self._cipher is not None and isinstance(payload, dict):
+            payload = self._cipher.decrypt_thread_payload(payload, thread_id=thread_id)
+        return ChatThread.model_validate(payload)
 
 
 class PostgresEventLog(_PgStoreBase):
     """Postgres-backed append-only run-event stream (EventSink surface)."""
 
     async def append_event(self, event: RunEvent) -> None:
-        """Append a run event (EventSink role)."""
+        """Append a run event (EventSink role); the payload is encrypted at rest."""
         pool = self._require_pool()
+        payload = dict(event.payload or {})
+        if self._cipher is not None:
+            payload = self._cipher.encrypt_event_payload(
+                payload, event_id=event.event_id
+            )
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -567,7 +610,7 @@ class PostgresEventLog(_PgStoreBase):
                 event.tool_call_id,
                 event.latency_ms,
                 event.cost,
-                dict(event.payload or {}),
+                payload,
                 event.error,
                 event.timestamp,
             )
@@ -590,7 +633,7 @@ class PostgresEventLog(_PgStoreBase):
             rows = await conn.fetch(
                 f"SELECT * FROM run_events{where} ORDER BY timestamp ASC", *params
             )
-        return [_row_to_event(r) for r in rows]
+        return [_row_to_event(r, cipher=self._cipher) for r in rows]
 
 
 class PostgresContextStore(_PgStoreBase):
@@ -1225,12 +1268,24 @@ class PostgresStorageService:
             ...
     """
 
-    def __init__(self, pool: Any | None = None) -> None:
+    def __init__(
+        self,
+        pool: Any | None = None,
+        *,
+        cipher: StorePayloadCipher | None | _Unset = _UNSET,
+    ) -> None:
         self._pool = pool
+        # Field encryption at rest for the sensitive payloads (message content +
+        # run-event payloads). Defaults to the env-configured cipher (``None`` ⇒ plaintext,
+        # offline path unchanged); pass an explicit cipher (or ``None``) to override.
+        self._cipher = build_store_cipher() if isinstance(cipher, _Unset) else cipher
         # Compose the focused per-concern stores behind this facade, injecting the
-        # bound ``_require_pool`` so each store reads the live pool lazily.
-        self._thread_store = PostgresThreadStore(self._require_pool)
-        self._event_log = PostgresEventLog(self._require_pool)
+        # bound ``_require_pool`` so each store reads the live pool lazily. Only the
+        # stores that persist sensitive payloads receive the cipher.
+        self._thread_store = PostgresThreadStore(
+            self._require_pool, cipher=self._cipher
+        )
+        self._event_log = PostgresEventLog(self._require_pool, cipher=self._cipher)
         self._context_store = PostgresContextStore(self._require_pool)
         self._run_store = PostgresRunStore(self._require_pool)
         self._recommendation_store = PostgresRecommendationStore(self._require_pool)

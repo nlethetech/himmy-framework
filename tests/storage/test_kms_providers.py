@@ -34,8 +34,11 @@ from himmy.services.storage.kms_providers import (  # noqa: E402
 class FakeAwsKmsClient:
     """Offline stand-in for a boto3 KMS client (reversible XOR + a per-key tag).
 
-    ``Encrypt`` prefixes the blob with a key-id tag so ``Decrypt`` can recover the DEK
-    without being told the key (mirroring real KMS, which records the producing CMK).
+    botocore exposes operation methods in snake_case (``encrypt`` / ``decrypt``), so the
+    fake mirrors that surface — a PascalCase ``Encrypt`` would not match the real client
+    and would let the provider's method names silently drift. ``encrypt`` prefixes the
+    blob with a key-id tag so ``decrypt`` can recover the DEK without being told the key
+    (mirroring real KMS, which records the producing CMK).
     """
 
     def __init__(self) -> None:
@@ -46,13 +49,13 @@ class FakeAwsKmsClient:
     def _mask(blob: bytes) -> bytes:
         return bytes(b ^ 0x5A for b in blob)
 
-    def Encrypt(self, *, KeyId: str, Plaintext: bytes) -> dict[str, bytes]:  # noqa: N803
+    def encrypt(self, *, KeyId: str, Plaintext: bytes) -> dict[str, bytes]:  # noqa: N803
         self.encrypt_calls.append({"KeyId": KeyId, "Plaintext": Plaintext})
         tag = KeyId.encode("utf-8")
         framed = bytes([len(tag)]) + tag + self._mask(Plaintext)
         return {"CiphertextBlob": framed}
 
-    def Decrypt(self, *, CiphertextBlob: bytes) -> dict[str, bytes]:  # noqa: N803
+    def decrypt(self, *, CiphertextBlob: bytes) -> dict[str, bytes]:  # noqa: N803
         self.decrypt_calls.append({"CiphertextBlob": CiphertextBlob})
         tag_len = CiphertextBlob[0]
         key_id = CiphertextBlob[1 : 1 + tag_len].decode("utf-8")
@@ -96,6 +99,41 @@ def test_aws_kms_wrap_unwrap_via_fake_client() -> None:
 
     assert provider.unwrap_dek(wrapped, version) == dek
     assert client.decrypt_calls  # Decrypt was actually exercised
+
+
+def test_aws_kms_calls_botocore_snake_case_methods() -> None:
+    """Regression: the provider must call ``client.encrypt`` / ``client.decrypt``.
+
+    botocore KMS clients expose snake_case operation methods; the historical PascalCase
+    ``Encrypt`` / ``Decrypt`` raise ``AttributeError`` against a real boto3 client. A
+    recording client that ONLY implements the snake_case surface (and explodes on the
+    PascalCase names) pins the wire so signature drift is caught offline.
+    """
+
+    class SnakeCaseOnlyClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def encrypt(self, *, KeyId: str, Plaintext: bytes) -> dict[str, bytes]:  # noqa: N803
+            self.calls.append("encrypt")
+            return {"CiphertextBlob": b"wrapped:" + Plaintext}
+
+        def decrypt(self, *, CiphertextBlob: bytes) -> dict[str, bytes]:  # noqa: N803
+            self.calls.append("decrypt")
+            return {"Plaintext": CiphertextBlob[len(b"wrapped:") :]}
+
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(
+                f"provider called non-botocore method {name!r}; real KMS clients only "
+                "expose snake_case operations (encrypt/decrypt)"
+            )
+
+    client = SnakeCaseOnlyClient()
+    provider = AwsKmsKekProvider(key_id="key-1", client=client)
+    dek = os.urandom(32)
+    wrapped, _version = provider.wrap_dek(dek)
+    assert provider.unwrap_dek(wrapped, _version) == dek
+    assert client.calls == ["encrypt", "decrypt"]
 
 
 def test_aws_kms_version_is_stable_non_secret_fingerprint() -> None:

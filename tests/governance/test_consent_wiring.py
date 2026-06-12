@@ -431,3 +431,59 @@ async def test_governed_withdraw_crypto_shreds_consented_message(
     assert spine.list_by_kind("erasure_tombstone")
     # Fresh decision is now DENY.
     assert not ledger.decision("teacher_a", Purpose.RETAIN).allowed
+
+
+@pytest.mark.asyncio
+async def test_governed_chat_thread_carries_no_plaintext_conversation_on_spine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the chat_thread aggregate's nested message content is encrypted too.
+
+    The richest record kind registers a full conversation per turn; before the fix it
+    landed in plaintext on the immutable spine (mapped to ``()``), so crypto-shred could
+    never make it unrecoverable. Now its ``messages[*].content`` is walked through the
+    subject cipher, so erasing the subject renders the whole conversation body lost.
+    """
+    pytest.importorskip("cryptography")
+    import json
+
+    from himmy.services.storage.encryption import ENC_PREFIX
+
+    container = _governed_container(monkeypatch)
+    ledger = container.consent_ledger
+    ledger.grant("teacher_a", Purpose.RETAIN)
+    ledger.grant("teacher_a", Purpose.TRAIN)
+    task = Task(
+        title="lesson",
+        prompt=_SECRET,
+        context={"context_subject_id": "teacher_a"},
+    )
+    await container.runtime.run_task(Persona(name="Tutor"), task)
+
+    spine = container.entity_registry
+    threads = [
+        r
+        for r in spine.list_by_kind("chat_thread")
+        if r.metadata.get("subject_id") == "teacher_a"
+    ]
+    assert threads, "the consented subject's chat_thread reached the spine"
+    # No plaintext conversation body survives on the spine chat_thread record.
+    blob = "".join(json.dumps(r.payload) for r in threads)
+    assert _SECRET not in blob
+    # At least one message's content is a ciphertext envelope.
+    enc_contents = [
+        m["content"]
+        for r in threads
+        for m in r.payload.get("messages", [])
+        if isinstance(m, dict) and isinstance(m.get("content"), str) and m["content"]
+    ]
+    assert enc_contents and all(c.startswith(ENC_PREFIX) for c in enc_contents)
+
+    # Erase the subject: the nested thread ciphertext is now permanently unrecoverable.
+    vault = container.retention_service._keys
+    token = enc_contents[0]
+    ledger.withdraw("teacher_a")
+    from cryptography.exceptions import InvalidTag
+
+    with pytest.raises(InvalidTag):
+        vault.encryptor_for("teacher_a").decrypt(token, aad=b"teacher_a")
