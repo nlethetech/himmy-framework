@@ -58,6 +58,15 @@ def _ipv4_ok(text: str) -> bool:
     return len(parts) == 4 and all(p.isdigit() and int(p) <= 255 for p in parts)
 
 
+def _phone_ok(text: str) -> bool:
+    """False only for a bare decimal number — a lat/long coordinate, price, or version
+    like ``27.7172453`` — which the broad phone pattern would otherwise redact as
+    ``[REDACTED-PHONE]``. Everything else (real phones, long digit runs the phone rule
+    catches as a safety net) is left for redaction.
+    """
+    return re.fullmatch(r"\d+\.\d+", text.strip()) is None
+
+
 def _redact(text: str, rules: list[PIIRule]) -> tuple[str, list[str]]:
     """Apply each rule (validated) in order; return redacted text + per-label flags."""
     redacted = text
@@ -125,6 +134,7 @@ _PII_RULES: list[PIIRule] = [
         "phone",
         "[REDACTED-PHONE]",
         re.compile(r"(?<![\d.])\+?\d[\d().\-\s]{7,}\d(?![\d.])"),
+        _phone_ok,
     ),
 ]
 
