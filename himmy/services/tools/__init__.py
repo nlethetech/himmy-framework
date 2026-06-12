@@ -5,6 +5,8 @@ from __future__ import annotations
 from himmy.services.tools.models import (
     HttpAuthConfig,
     HttpAuthMode,
+    HttpPaginationConfig,
+    HttpPaginationMode,
     HttpToolConfig,
     ToolBackendKind,
     ToolDefinition,
@@ -35,6 +37,8 @@ __all__ = [
     "HttpToolConfig",
     "HttpAuthConfig",
     "HttpAuthMode",
+    "HttpPaginationConfig",
+    "HttpPaginationMode",
     "register_local_tool",
     "register_http_tool",
     "validate_against_schema",

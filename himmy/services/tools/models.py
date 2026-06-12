@@ -23,28 +23,68 @@ class ToolBackendKind(str, Enum):
 class HttpAuthMode(str, Enum):
     """How an HTTP connector authenticates against its upstream.
 
-    ``BASIC`` reads the env var as raw ``user:pass`` and base64-encodes it here;
-    ``PREENCODED_BASIC`` treats the env var as an already-base64-encoded credential
-    and passes it through verbatim (for secrets stored pre-encoded).
+    ``BEARER`` sends ``Authorization: Bearer <secret>``. ``HEADER`` writes the secret
+    verbatim to ``header_name`` (a custom API-key header). ``API_KEY_QUERY`` appends
+    the secret as a query parameter named by ``query_param`` (some APIs key off the
+    URL, e.g. ``?api_key=...``). ``BASIC`` reads the secret as the password and pairs
+    it with ``username`` (or reads the secret as raw ``user:pass`` when no username is
+    set) and base64-encodes it here; ``PREENCODED_BASIC`` treats the secret as an
+    already-base64-encoded credential and passes it through verbatim.
     """
 
     NONE = "NONE"
     BEARER = "BEARER"
     HEADER = "HEADER"
+    API_KEY_QUERY = "API_KEY_QUERY"
     BASIC = "BASIC"
     PREENCODED_BASIC = "PREENCODED_BASIC"
 
 
 class HttpAuthConfig(BaseModel):
-    """Declarative, env-backed auth for an HTTP tool.
+    """Declarative, secrets-backed auth for an HTTP tool.
 
-    The secret value is never stored on the model; ``env_var`` names the
-    environment variable read at execution time.
+    The secret value is never stored on the model; ``env_var`` names the credential,
+    resolved at execution time through the secrets layer (``get_secret``) — so it can
+    live in a vault / cloud secret manager / file, not just an environment variable.
     """
 
     mode: HttpAuthMode = HttpAuthMode.NONE
-    env_var: str | None = None
-    header_name: str | None = None
+    env_var: str | None = None  # secret NAME resolved via get_secret (never a literal)
+    header_name: str | None = None  # for HEADER mode
+    query_param: str | None = None  # for API_KEY_QUERY mode
+    username: str | None = None  # for BASIC mode (the password is the secret)
+
+
+class HttpPaginationMode(str, Enum):
+    """How the connector follows pagination across multiple upstream pages.
+
+    ``NONE`` returns one page. ``CURSOR`` reads a next-page token from the JSON body
+    (``cursor_path``) and re-sends it as a query param (``cursor_param``). ``PAGE``
+    increments a 1-based page number (``page_param``) until a page comes back empty or
+    short. ``LINK_HEADER`` follows the RFC 5988 ``Link: <…>; rel="next"`` header. In
+    every mode the records under ``items_path`` are concatenated, capped at
+    ``max_pages`` so a buggy/hostile upstream can't loop forever.
+    """
+
+    NONE = "NONE"
+    CURSOR = "CURSOR"
+    PAGE = "PAGE"
+    LINK_HEADER = "LINK_HEADER"
+
+
+class HttpPaginationConfig(BaseModel):
+    """Declarative pagination for an HTTP REST connector (bounded, opt-in)."""
+
+    mode: HttpPaginationMode = HttpPaginationMode.NONE
+    #: JSON path (dotted) to the list of records on each page (e.g. ``data.items``).
+    items_path: str = ""
+    #: CURSOR: dotted path to the next-page token in the body; the query param to send.
+    cursor_path: str = ""
+    cursor_param: str = "cursor"
+    #: PAGE: the query param carrying the 1-based page number.
+    page_param: str = "page"
+    #: Hard ceiling on pages followed — a DoS / infinite-loop guard.
+    max_pages: int = 20
 
 
 class HttpToolConfig(BaseModel):
@@ -54,9 +94,9 @@ class HttpToolConfig(BaseModel):
     all resolved from the invocation's ``args`` at execution time.
     """
 
-    # The base URL comes from ``base_url_env_var`` (an env var, preferred for
-    # secrets/config) when set; otherwise the literal ``base_url`` (handy for simple,
-    # public endpoints). At least one must resolve at call time.
+    # The base URL comes from ``base_url_env_var`` (a secret/config NAME, preferred)
+    # when set; otherwise the literal ``base_url`` (handy for simple public endpoints).
+    # At least one must resolve at call time.
     base_url_env_var: str = ""
     base_url: str = ""
     method: str = "GET"
@@ -66,6 +106,18 @@ class HttpToolConfig(BaseModel):
     body_arg_names: list[str] = []
     header_arg_names: list[str] = []
     timeout_seconds: float = 15.0
+    #: Egress allow-list (host names). Empty ⇒ any PUBLIC host (the SSRF guard still
+    #: blocks private/loopback/reserved). Pin this to the API's host for defence-in-depth.
+    egress_allow_hosts: list[str] = []
+    #: Only for a trusted INTERNAL API: skip the public-IP SSRF check (still requires the
+    #: host be reachable). Leave False for anything reachable from untrusted prompts.
+    allow_private_hosts: bool = False
+    #: Static query params always sent (e.g. an API version) — merged under model args.
+    static_query: dict[str, str] = {}
+    pagination: HttpPaginationConfig = HttpPaginationConfig()
+    #: Arg whose value is an idempotency key for a side-effecting (non-GET) call. When
+    #: set it is sent as the ``Idempotency-Key`` header so a safe retry can't double-act.
+    idempotency_arg: str | None = None
 
 
 class ToolDefinition(BaseModel):

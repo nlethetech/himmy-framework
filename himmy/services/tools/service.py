@@ -19,14 +19,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
-import os
 import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from himmy.config.secrets import get_secret
 from himmy.core.events import EventType, RunEvent
 from himmy.services.tools.models import (
     HttpAuthMode,
+    HttpPaginationMode,
+    HttpToolConfig,
     ToolBackendKind,
     ToolDefinition,
     ToolErrorCode,
@@ -43,6 +45,11 @@ from himmy.services.tools.security import (
     redact_mapping,
 )
 from himmy.services.tools.validation import validate_against_schema
+
+#: Methods that are safe to repeat (read-only): a blind retry of these can't mutate
+#: state. Anything else is non-idempotent — never retried unless an idempotency key is
+#: supplied so the upstream can dedupe it.
+_SAFE_HTTP_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from himmy.core.events import EventSink
@@ -96,6 +103,42 @@ def _validate_against_schema(value: Any, schema: dict[str, Any]) -> str | None:
     :func:`himmy.services.tools.validation.validate_against_schema`.
     """
     return validate_against_schema(value, schema)
+
+
+def _dig(payload: Any, dotted_path: str) -> Any:
+    """Walk a dotted path into a nested JSON ``payload`` (empty path → payload itself).
+
+    Used by HTTP pagination to pull the records list / next-cursor out of a page body.
+    Returns ``None`` when any segment is missing or the shape doesn't match, so a
+    malformed/hostile page can't crash the connector — it simply yields no records.
+    """
+    if not dotted_path:
+        return payload
+    current = payload
+    for segment in dotted_path.split("."):
+        if isinstance(current, dict) and segment in current:
+            current = current[segment]
+        else:
+            return None
+    return current
+
+
+def _next_link(link_header: str) -> str | None:
+    """Parse an RFC 5988 ``Link`` header and return the ``rel="next"`` URL, if any."""
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        segments = part.split(";")
+        if len(segments) < 2:
+            continue
+        target = segments[0].strip().strip("<>").strip()
+        if not target:
+            continue
+        for attr in segments[1:]:
+            key, _, value = attr.strip().partition("=")
+            if key.strip().lower() == "rel" and value.strip().strip('"') == "next":
+                return target
+    return None
 
 
 def _coerce_lenient_args(
@@ -176,11 +219,16 @@ class ToolService:
         # validation. Keeps required/typed checks strict; off → strict pass-through.
         self._lenient_args = lenient_args
         # Shared httpx client, built lazily on first HTTP call (or injected for tests).
+        # When a client is injected (tests pass a MockTransport-backed one) it is used
+        # for EVERY HTTP tool. Otherwise a per-egress-policy pinned client is built and
+        # cached, so each tool's SSRF allow-list / private-host policy is enforced at the
+        # transport (DNS-pinned) layer, not just at URL-guard time.
         self._http_client = http_client
         self._http_client_owned = http_client is None
         self._http_max_connections = http_max_connections
         self._http_max_keepalive = http_max_keepalive_connections
         self._http_lock = asyncio.Lock()
+        self._pinned_clients: dict[tuple[bool, tuple[str, ...]], Any] = {}
 
     @property
     def registry(self) -> ToolRegistry:
@@ -196,29 +244,59 @@ class ToolService:
         except Exception:  # pragma: no cover - defensive
             pass
 
-    async def _get_http_client(self) -> Any:
-        """Return the shared httpx client, building it lazily (thread-safe)."""
+    async def _get_http_client(
+        self,
+        *,
+        allow_private: bool = False,
+        allow_hosts: tuple[str, ...] = (),
+    ) -> Any:
+        """Return an httpx client for the given egress policy, building it lazily.
+
+        An *injected* client (the test seam) is used verbatim for every tool. Otherwise
+        a DNS-pinned ``AsyncClient`` is built per ``(allow_private, allow_hosts)`` policy
+        and cached — so the SSRF allow-list and the private-host opt-out are enforced at
+        the transport layer (closing the DNS-rebinding window), not only at URL-guard
+        time. ``follow_redirects`` is always off so a 3xx can't bounce to an internal
+        host.
+        """
         if self._http_client is not None:
             return self._http_client
+        key = (allow_private, allow_hosts)
+        cached = self._pinned_clients.get(key)
+        if cached is not None:
+            return cached
         async with self._http_lock:
-            if self._http_client is None:  # re-check under the lock
+            cached = self._pinned_clients.get(key)  # re-check under the lock
+            if cached is None:
                 import httpx
+
+                from himmy.toolkit._net import build_async_pinned_transport
 
                 limits = httpx.Limits(
                     max_connections=self._http_max_connections,
                     max_keepalive_connections=self._http_max_keepalive,
                 )
-                self._http_client = httpx.AsyncClient(
-                    follow_redirects=False, limits=limits
+                cached = httpx.AsyncClient(
+                    follow_redirects=False,
+                    limits=limits,
+                    transport=build_async_pinned_transport(
+                        allow_private=allow_private,
+                        allow_hosts=allow_hosts or None,
+                    ),
                 )
                 self._http_client_owned = True
-        return self._http_client
+                self._pinned_clients[key] = cached
+        return cached
 
     async def aclose(self) -> None:
-        """Close the shared httpx client if this service owns it (idempotent)."""
-        client = self._http_client
-        if client is not None and self._http_client_owned:
+        """Close every owned httpx client (shared + per-egress pinned); idempotent."""
+        clients: list[Any] = []
+        if self._http_client is not None and self._http_client_owned:
+            clients.append(self._http_client)
             self._http_client = None
+        clients.extend(self._pinned_clients.values())
+        self._pinned_clients = {}
+        for client in clients:
             try:
                 await client.aclose()
             except Exception:  # pragma: no cover - defensive
@@ -369,11 +447,17 @@ class ToolService:
                 last_error = exc
             except Exception as exc:  # pragma: no cover - defensive
                 last_error = _ToolDispatchError(ToolErrorCode.EXECUTION_ERROR, str(exc))
-            # Retry only on transient codes with attempts remaining.
+            # Retry only on transient codes with attempts remaining — and only when the
+            # failure is safe to repeat. A non-idempotent HTTP mutation (a POST/PUT/etc.
+            # with no idempotency key) is NOT retried on TIMEOUT / PROVIDER_UNAVAILABLE,
+            # since the request may already have landed and a blind resend would
+            # double-act; a 429 (RATE_LIMITED) is always safe — the upstream rejected it
+            # before doing any work.
             if (
                 last_error is not None
                 and last_error.code in RETRYABLE_TOOL_CODES
                 and attempt < retry.max_attempts - 1
+                and self._is_retry_safe(definition, last_error.code)
             ):
                 await asyncio.sleep(retry.delay_for(attempt))
                 continue
@@ -444,6 +528,24 @@ class ToolService:
             return definition.http_config.timeout_seconds
         return self._default_timeout_seconds
 
+    @staticmethod
+    def _is_retry_safe(definition: ToolDefinition, code: ToolErrorCode) -> bool:
+        """Whether a transient ``code`` may be retried for this tool.
+
+        LOCAL tools and read-only / idempotent HTTP calls are always safe to repeat. A
+        side-effecting HTTP method (POST/PUT/PATCH/DELETE) with NO idempotency key may
+        already have landed when a TIMEOUT or PROVIDER_UNAVAILABLE fires, so those are
+        not retried — only RATE_LIMITED (429, rejected before any work) is.
+        """
+        cfg = definition.http_config
+        if cfg is None:
+            return True
+        if cfg.method.upper() in _SAFE_HTTP_METHODS:
+            return True
+        if cfg.idempotency_arg:
+            return True  # the Idempotency-Key lets the upstream dedupe a resend
+        return code is ToolErrorCode.RATE_LIMITED
+
     async def _dispatch(self, definition: ToolDefinition, args: dict[str, Any]) -> Any:
         """Route to the LOCAL or HTTP backend."""
         if definition.kind is ToolBackendKind.LOCAL:
@@ -480,7 +582,17 @@ class ToolService:
     async def _dispatch_http(
         self, definition: ToolDefinition, args: dict[str, Any]
     ) -> Any:
-        """Execute a declarative HTTP connector via the shared httpx client."""
+        """Execute a declarative HTTP/REST connector, guarded end-to-end.
+
+        Hardening on every call: the method must be on the allow-list; the base URL is
+        resolved through the secrets layer; path args are percent-encoded and re-checked
+        against the base host (no host pivot, no traversal); the final URL is SSRF-guarded
+        (public-only, plus an optional egress allow-list) and dialed through a DNS-pinned
+        transport (no rebinding); auth is read from the secrets layer (never logged);
+        redirects are refused; a non-GET is NOT blind-retried here (it carries an
+        ``Idempotency-Key`` when configured); and, when pagination is on, pages are
+        followed up to a hard ``max_pages`` cap and the records are concatenated.
+        """
         cfg = definition.http_config
         if cfg is None:
             raise _ToolDispatchError(
@@ -495,27 +607,19 @@ class ToolService:
                 f"HTTP method {method!r} is not allowed",
             )
 
-        try:
-            import httpx
-        except ImportError as exc:  # pragma: no cover - httpx is a core dep
-            raise _ToolDispatchError(
-                ToolErrorCode.PROVIDER_UNAVAILABLE,
-                f"httpx is required for HTTP tools: {exc}",
-            ) from exc
-
         base_url = ""
         if cfg.base_url_env_var:
-            base_url = os.environ.get(cfg.base_url_env_var) or ""
+            base_url = get_secret(cfg.base_url_env_var) or ""
         if not base_url:
             base_url = cfg.base_url
         if not base_url:
             raise _ToolDispatchError(
                 ToolErrorCode.INVALID_REQUEST,
                 f"no base URL for HTTP tool: set `base_url` or the "
-                f"{cfg.base_url_env_var!r} env var",
+                f"{cfg.base_url_env_var!r} secret",
             )
 
-        # Resolve & encode path placeholders, then pin the final host.
+        # Resolve & encode path placeholders, then re-pin to the base host.
         try:
             path = build_safe_path(cfg.path_template, args)
         except KeyError as exc:
@@ -531,13 +635,84 @@ class ToolService:
         except ToolSecurityError as exc:
             raise _ToolDispatchError(ToolErrorCode.INVALID_REQUEST, str(exc)) from exc
 
-        params = {k: args[k] for k in cfg.query_arg_names if k in args}
+        # SSRF guard the resolved URL: scheme / no-embedded-creds / host-allow-list are
+        # checked eagerly here; the DNS→public-IP check is done at CONNECT time by the
+        # pinned transport (so the same name is resolved once, and the IP that is vetted
+        # is the IP that is dialed — closing the rebinding window). When the operator
+        # injects their own client (the test seam), we run the cheap checks and trust
+        # their transport. ``resolve=False`` avoids a redundant/offline DNS lookup here.
+        from himmy.toolkit._net import guard_url
+
+        allow_hosts = tuple(cfg.egress_allow_hosts) or None
+        try:
+            guard_url(
+                url,
+                allow_private=cfg.allow_private_hosts,
+                allow_hosts=allow_hosts,
+                resolve=False,
+            )
+        except ToolSecurityError as exc:
+            raise _ToolDispatchError(ToolErrorCode.INVALID_REQUEST, str(exc)) from exc
+
         body = {k: args[k] for k in cfg.body_arg_names if k in args}
         headers = {k: str(args[k]) for k in cfg.header_arg_names if k in args}
-        headers.update(self._build_auth_headers(cfg.auth))
+        auth_headers, auth_params = self._build_auth(cfg.auth)
+        headers.update(auth_headers)
+
+        # An idempotency key turns a side-effecting retry into a safe no-op upstream.
+        if cfg.idempotency_arg and args.get(cfg.idempotency_arg):
+            headers["Idempotency-Key"] = str(args[cfg.idempotency_arg])
+
+        base_params: dict[str, Any] = dict(cfg.static_query)
+        base_params.update({k: args[k] for k in cfg.query_arg_names if k in args})
+        base_params.update(auth_params)
 
         timeout = self._resolve_timeout(definition)
-        client = await self._get_http_client()
+        client = await self._get_http_client(
+            allow_private=cfg.allow_private_hosts,
+            allow_hosts=tuple(cfg.egress_allow_hosts),
+        )
+
+        if cfg.pagination.mode is HttpPaginationMode.NONE:
+            return await self._http_single(
+                client, method, url, base_params, body, headers, timeout
+            )
+        return await self._http_paginated(
+            client, cfg, method, url, base_params, body, headers, timeout
+        )
+
+    async def _http_single(
+        self,
+        client: Any,
+        method: str,
+        url: str,
+        params: dict[str, Any],
+        body: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> Any:
+        """Issue ONE request, normalize transport/HTTP errors, return parsed JSON."""
+        response = await self._http_request(
+            client, method, url, params, body, headers, timeout
+        )
+        try:
+            return response.json()
+        except Exception:
+            return {"text": response.text}
+
+    async def _http_request(
+        self,
+        client: Any,
+        method: str,
+        url: str,
+        params: dict[str, Any],
+        body: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> Any:
+        """One guarded request → an httpx ``Response`` (status mapped to tool errors)."""
+        import httpx
+
         try:
             response = await client.request(
                 method,
@@ -548,8 +723,11 @@ class ToolService:
                 timeout=timeout,
                 follow_redirects=False,
             )
+        except ToolSecurityError as exc:
+            # The pinned transport refused the connect (rebinding / off-allow-list host).
+            raise _ToolDispatchError(ToolErrorCode.INVALID_REQUEST, str(exc)) from exc
         except httpx.TimeoutException as exc:
-            # Never echo header/secret values; report the URL path only.
+            # Never echo header/secret values; report the exception type only.
             raise _ToolDispatchError(
                 ToolErrorCode.TIMEOUT, f"request timed out: {type(exc).__name__}"
             ) from exc
@@ -583,34 +761,114 @@ class ToolService:
                 ToolErrorCode.INVALID_REQUEST,
                 f"upstream returned {response.status_code}",
             )
-        try:
-            return response.json()
-        except Exception:
-            return {"text": response.text}
+        return response
+
+    async def _http_paginated(
+        self,
+        client: Any,
+        cfg: HttpToolConfig,
+        method: str,
+        url: str,
+        base_params: dict[str, Any],
+        body: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> Any:
+        """Follow pagination up to ``max_pages``; return ``{"items": [...all records]}``.
+
+        Each next page is re-guarded the same way (the pinned client re-checks the IP),
+        so a ``Link``/cursor that points off-host or at an internal address is refused.
+        """
+        page_cfg = cfg.pagination
+        max_pages = max(1, page_cfg.max_pages)
+        collected: list[Any] = []
+        params = dict(base_params)
+        next_url = url
+        page_num = 1
+
+        for _ in range(max_pages):
+            if page_cfg.mode is HttpPaginationMode.PAGE:
+                params[page_cfg.page_param] = page_num
+            response = await self._http_request(
+                client, method, next_url, params, body, headers, timeout
+            )
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {"text": response.text}
+
+            page_items = _dig(payload, page_cfg.items_path)
+            if isinstance(page_items, list):
+                collected.extend(page_items)
+            elif page_items is not None:
+                collected.append(page_items)
+
+            advanced = False
+            if page_cfg.mode is HttpPaginationMode.CURSOR:
+                cursor = _dig(payload, page_cfg.cursor_path)
+                if cursor:
+                    params = {**params, page_cfg.cursor_param: cursor}
+                    advanced = True
+            elif page_cfg.mode is HttpPaginationMode.PAGE:
+                # Stop once a page comes back empty (no more records).
+                if isinstance(page_items, list) and page_items:
+                    page_num += 1
+                    advanced = True
+            elif page_cfg.mode is HttpPaginationMode.LINK_HEADER:
+                from himmy.toolkit._net import guard_url
+
+                link = _next_link(response.headers.get("link", ""))
+                if link:
+                    try:
+                        guard_url(
+                            link,
+                            allow_private=cfg.allow_private_hosts,
+                            allow_hosts=tuple(cfg.egress_allow_hosts) or None,
+                            resolve=False,
+                        )
+                    except ToolSecurityError as exc:
+                        raise _ToolDispatchError(
+                            ToolErrorCode.INVALID_REQUEST,
+                            f"pagination Link target refused: {exc}",
+                        ) from exc
+                    next_url, params = link, {}
+                    advanced = True
+            if not advanced:
+                break
+
+        return {"items": collected, "page_count": page_num}
 
     @staticmethod
-    def _build_auth_headers(auth: Any) -> dict[str, str]:
-        """Resolve env-backed auth into request headers (empty when NONE/unset).
+    def _build_auth(auth: Any) -> tuple[dict[str, str], dict[str, str]]:
+        """Resolve secrets-backed auth into (headers, query-params); both empty if unset.
 
-        ``BASIC`` reads ``user:pass`` from the env var and base64-encodes it here;
-        ``PREENCODED_BASIC`` passes an already-encoded credential through verbatim.
+        The credential is read through the SECRETS LAYER (``get_secret``) — env var,
+        vault, cloud secret manager, or file, per deployment config — and never echoed.
+        ``BASIC`` pairs ``username`` with the secret (or treats the secret as raw
+        ``user:pass`` when no username is set) and base64-encodes here;
+        ``PREENCODED_BASIC`` passes an already-encoded credential through verbatim;
+        ``API_KEY_QUERY`` returns the secret as a query param instead of a header.
         """
         if auth.mode is HttpAuthMode.NONE or not auth.env_var:
-            return {}
-        secret = os.environ.get(auth.env_var)
+            return {}, {}
+        secret = get_secret(auth.env_var)
         if not secret:
-            return {}
+            return {}, {}
         if auth.mode is HttpAuthMode.BEARER:
-            return {"Authorization": f"Bearer {secret}"}
+            return {"Authorization": f"Bearer {secret}"}, {}
         if auth.mode is HttpAuthMode.BASIC:
-            encoded = base64.b64encode(secret.encode("utf-8")).decode("ascii")
-            return {"Authorization": f"Basic {encoded}"}
+            raw = f"{auth.username}:{secret}" if auth.username else secret
+            encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+            return {"Authorization": f"Basic {encoded}"}, {}
         if auth.mode is HttpAuthMode.PREENCODED_BASIC:
-            return {"Authorization": f"Basic {secret}"}
+            return {"Authorization": f"Basic {secret}"}, {}
         if auth.mode is HttpAuthMode.HEADER:
             header_name = auth.header_name or "Authorization"
-            return {header_name: secret}
-        return {}
+            return {header_name: secret}, {}
+        if auth.mode is HttpAuthMode.API_KEY_QUERY:
+            param = auth.query_param or "api_key"
+            return {}, {param: secret}
+        return {}, {}
 
     async def _fail(
         self,
