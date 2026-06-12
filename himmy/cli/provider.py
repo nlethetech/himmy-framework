@@ -5,8 +5,11 @@ The default (``provider is None``) delegates to the package's
 :func:`~himmy.runtime.builder.build_inference`, preserving its auto behavior: a real
 pydantic-ai manager when a provider key + the ``providers`` extra + a model are present,
 otherwise the offline deterministic stub. Explicit providers let a user opt into the
-local ``claude`` CLI (Claude Max), a local Ollama server, or force the stub. Heavier
-managers are imported lazily so the common paths stay light and offline.
+local ``claude`` CLI (Claude Max), a local Ollama server, the direct Anthropic/OpenAI
+SDKs, or any OpenAI-compatible endpoint — ``openrouter`` and the generic
+``openai-compatible`` (configurable ``base_url`` + secrets-layer key) cover OpenRouter,
+Sarvam, Groq, Together, and friends through one code path. Heavier managers are imported
+lazily so the common paths stay light and offline.
 """
 
 from __future__ import annotations
@@ -25,11 +28,13 @@ PROVIDERS = (
     "ollama",
     "pydantic-ai",
     "openrouter",
+    "openai-compatible",
     "anthropic",
     "openai",
 )
 
-#: OpenRouter is an OpenAI-compatible aggregator; route through the pydantic-ai path.
+#: OpenRouter is an OpenAI-compatible aggregator; talk to it through the direct
+#: OpenAI-compatible manager (one code path serves OpenRouter / Sarvam / Groq / Together).
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_DEFAULT_MODEL = "mistralai/mistral-small-3.2-24b-instruct"
 
@@ -137,35 +142,119 @@ def build_manager_for(
         return OpenAIClientManager(model=model or DEFAULT_OPENAI_MODEL)
 
     if provider == "openrouter":
+        chosen = model if model and model != "default" else OPENROUTER_DEFAULT_MODEL
+        return _build_openai_compatible(
+            provider_name="openrouter",
+            model=chosen,
+            base_url=OPENROUTER_BASE_URL,
+            key_names=("OPENROUTER_API_KEY",),
+            default_headers=_openrouter_headers(),
+            missing_key_hint=(
+                "provider 'openrouter' needs OPENROUTER_API_KEY "
+                "(get a key at https://openrouter.ai/keys)."
+            ),
+        )
+
+    if provider == "openai-compatible":
         import os
 
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        if not api_key:
+        base_url = (
+            os.environ.get("HIMMY_OPENAI_COMPAT_BASE_URL")
+            or os.environ.get("OPENAI_COMPAT_BASE_URL")
+            or ""
+        ).strip()
+        if not base_url:
             raise ProviderError(
-                "provider 'openrouter' needs OPENROUTER_API_KEY in the environment "
-                "(get a key at https://openrouter.ai/keys)."
+                "provider 'openai-compatible' needs a base_url: set "
+                "HIMMY_OPENAI_COMPAT_BASE_URL to your endpoint "
+                "(e.g. https://api.groq.com/openai/v1, https://api.sarvam.ai/v1, "
+                "https://api.together.xyz/v1)."
             )
-        try:
-            from himmy.services.inference.pydantic_ai_manager import (
-                PydanticAIClientManager,
-            )
-        except Exception as exc:  # pragma: no cover - optional extra missing
+        if not model or model == "default":
             raise ProviderError(
-                "provider 'openrouter' needs the 'providers' extra: "
-                "pip install 'himmy[providers]'"
-            ) from exc
-        chosen = model if model and model != "default" else OPENROUTER_DEFAULT_MODEL
-        model_string = f"openai:{chosen}"
-        return PydanticAIClientManager(
-            {"default": model_string},
-            default_model=model_string,
-            base_url=OPENROUTER_BASE_URL,
-            api_key=api_key,
-            provider_name="openrouter",
+                "provider 'openai-compatible' needs an explicit --model "
+                "(the upstream model id, passed through verbatim)."
+            )
+        return _build_openai_compatible(
+            provider_name="openai-compatible",
+            model=model,
+            base_url=base_url,
+            key_names=(
+                "HIMMY_OPENAI_COMPAT_API_KEY",
+                "OPENAI_COMPAT_API_KEY",
+                "OPENAI_API_KEY",
+            ),
+            default_headers=None,
+            missing_key_hint=(
+                "provider 'openai-compatible' needs an API key: set "
+                "HIMMY_OPENAI_COMPAT_API_KEY (or OPENAI_API_KEY) to the endpoint's key."
+            ),
         )
 
     raise ProviderError(
         f"unknown provider {provider!r}; choose one of {', '.join(PROVIDERS)}"
+    )
+
+
+def _openrouter_headers() -> dict[str, str]:
+    """OpenRouter's OPTIONAL attribution headers, read from env (never required).
+
+    OpenRouter uses ``HTTP-Referer`` / ``X-Title`` to attribute traffic on its
+    dashboard. We forward them only when the operator sets them — an unset env var
+    sends no header (blank values are dropped by the manager).
+    """
+    import os
+
+    headers: dict[str, str] = {}
+    referer = os.environ.get("OPENROUTER_HTTP_REFERER", "").strip()
+    title = os.environ.get("OPENROUTER_X_TITLE", "").strip()
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if title:
+        headers["X-Title"] = title
+    return headers
+
+
+def _build_openai_compatible(
+    *,
+    provider_name: str,
+    model: str,
+    base_url: str,
+    key_names: tuple[str, ...],
+    default_headers: dict[str, str] | None,
+    missing_key_hint: str,
+) -> ClientManager:
+    """Build a direct :class:`OpenAIClientManager` against an OpenAI-compatible endpoint.
+
+    The API key is resolved through the SECRETS layer (env/file/vault/cloud), trying
+    ``key_names`` in order — never read straight from ``os.environ`` and never logged.
+    ``model`` passes through verbatim (e.g. ``anthropic/claude-3.5-sonnet`` or a Sarvam
+    model id). Raises a clear, key-redacting :class:`ProviderError` when no key is set.
+    """
+    from himmy.config.secrets import get_secret
+
+    api_key: str | None = None
+    for name in key_names:
+        api_key = get_secret(name)
+        if api_key:
+            break
+    if not api_key:
+        raise ProviderError(missing_key_hint)
+
+    try:
+        from himmy.services.inference.openai_manager import OpenAIClientManager
+    except Exception as exc:  # pragma: no cover - optional extra missing
+        raise ProviderError(
+            f"provider {provider_name!r} needs the 'openai' extra: "
+            "pip install 'himmy[openai]'"
+        ) from exc
+
+    return OpenAIClientManager(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        default_headers=default_headers,
+        provider_name=provider_name,
     )
 
 

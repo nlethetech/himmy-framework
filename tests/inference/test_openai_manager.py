@@ -182,7 +182,7 @@ def test_tool_calls_are_extracted_and_executed() -> None:
 def test_base_url_override_reaches_async_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """base_url + api_key are forwarded to AsyncOpenAI (OpenRouter-style endpoints)."""
+    """base_url + api_key + bounded timeout/retries reach AsyncOpenAI (compat endpoints)."""
     captured: dict[str, Any] = {}
 
     class _SpyClient:
@@ -204,6 +204,85 @@ def test_base_url_override_reaches_async_client(
     assert resp.output_text == "routed"
     assert captured["base_url"] == "https://openrouter.ai/api/v1"
     assert captured["api_key"] == "sk-or-unit"
+    # Bounded transport: a finite timeout and a conservative retry budget are always set.
+    assert captured["timeout"] > 0
+    assert captured["max_retries"] >= 0
+
+
+def test_model_passes_through_verbatim_to_create() -> None:
+    """An OpenAI-compatible model id (with a '/') is sent to the API verbatim."""
+    client = _FakeClient(_completion(content="ok"))
+    mgr = OpenAIClientManager(
+        model="anthropic/claude-3.5-sonnet",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-unit",
+        client=client,
+        provider_name="openrouter",
+    )
+    resp = run_async(mgr.generate(_req(model_key="anthropic/claude-3.5-sonnet")))
+
+    assert resp.status == InferenceStatus.SUCCESS
+    # No prefix rewriting: the upstream model id is passed through unchanged.
+    assert client.chat.completions.seen["model"] == "anthropic/claude-3.5-sonnet"
+    assert resp.model_path == "openai:anthropic/claude-3.5-sonnet"
+    assert resp.provider_name == "openrouter"
+
+
+def test_default_headers_reach_client_and_each_request() -> None:
+    """OpenRouter attribution headers reach the SDK client AND ride each create() call."""
+    client = _FakeClient(_completion(content="hi"))
+    mgr = OpenAIClientManager(
+        model="x/y",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-unit",
+        default_headers={"HTTP-Referer": "https://himmy.example", "X-Title": "Himmy"},
+        client=client,
+    )
+    run_async(mgr.generate(_req(model_key="x/y")))
+
+    # Per-request extra_headers carry the attribution headers (works with any transport).
+    assert client.chat.completions.seen["extra_headers"] == {
+        "HTTP-Referer": "https://himmy.example",
+        "X-Title": "Himmy",
+    }
+
+
+def test_default_headers_forwarded_to_async_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the real client is built, default_headers are handed to AsyncOpenAI."""
+    captured: dict[str, Any] = {}
+
+    class _SpyClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            self.chat = _FakeChat(_completion(content="ok"))
+
+    import openai
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _SpyClient)
+
+    mgr = OpenAIClientManager(
+        model="x/y",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-unit",
+        default_headers={"X-Title": "Himmy"},
+    )
+    run_async(mgr.generate(_req(model_key="x/y")))
+    assert captured["default_headers"] == {"X-Title": "Himmy"}
+
+
+def test_blank_default_headers_are_dropped() -> None:
+    """Blank header values (unset attribution env) are not sent at all."""
+    client = _FakeClient(_completion(content="ok"))
+    mgr = OpenAIClientManager(
+        model="x/y",
+        default_headers={"HTTP-Referer": "", "X-Title": "  "[:0] or ""},
+        client=client,
+    )
+    run_async(mgr.generate(_req(model_key="x/y")))
+    # No extra_headers key emitted when every header was blank.
+    assert "extra_headers" not in client.chat.completions.seen
 
 
 # ------------------------------------------------------------------ stream
