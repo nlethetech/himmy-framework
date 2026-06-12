@@ -21,6 +21,18 @@ See ``docs/connectors/authoring.md`` to write your own.
 
 from __future__ import annotations
 
+from himmy.connectors.discord import (
+    DISCORD_API_HOST,
+    DISCORD_API_ROOT,
+    DISCORD_BOT_TOKEN_SECRET,
+    DISCORD_PUBLIC_KEY_SECRET,
+    DiscordClient,
+    DiscordGatewayListener,
+    DiscordInteractionsConnector,
+    DiscordOutboundConnector,
+    register_discord_connectors,
+    verify_ed25519_signature,
+)
 from himmy.connectors.fetcher import DEFAULT_USER_AGENT, Fetcher, HttpxFetcher
 from himmy.connectors.models import (
     FeedFailure,
@@ -103,4 +115,15 @@ __all__ = [
     "register_nrb_tools",
     "register_news_tools",
     "NEWS_TOOL_NAMES",
+    # Discord connector
+    "DiscordClient",
+    "DiscordOutboundConnector",
+    "DiscordInteractionsConnector",
+    "DiscordGatewayListener",
+    "verify_ed25519_signature",
+    "register_discord_connectors",
+    "DISCORD_API_ROOT",
+    "DISCORD_API_HOST",
+    "DISCORD_BOT_TOKEN_SECRET",
+    "DISCORD_PUBLIC_KEY_SECRET",
 ]

@@ -356,6 +356,47 @@ Connectors are built around injectable seams, so they test fully offline.
 
 ---
 
+## Worked example: the built-in Discord connector
+
+`himmy/connectors/discord.py` is a full, security-complete connector you can copy from.
+It has both shapes:
+
+- **Inbound — `DiscordInteractionsConnector`.** We deliberately use Discord's HTTP
+  **Interactions** endpoint (a signed webhook) over a persistent **gateway** WebSocket:
+  it is stateless, needs no always-on socket, and Discord signs every delivery, so it is
+  the cleaner fit for both a command bot and the SDK's webhook gate. Discord signs each
+  interaction with **Ed25519** over `timestamp + raw_body`, so the connector *overrides*
+  `verify_webhook` (the SDK default is HMAC) to verify the Ed25519 signature on the raw
+  body first; then a **guild/channel/user allowlist (default-deny)** gates the sender; a
+  `PING` is answered with a `PONG` without touching the agent; and a slash command runs
+  the agent and replies inline (`CHANNEL_MESSAGE_WITH_SOURCE`). Receiving *arbitrary*
+  (non-command) channel messages is a separate capability that needs the gateway +
+  Message Content intent — provided by the optional, capability-gated
+  `DiscordGatewayListener` (the `[discord]` extra) and marked live-pending.
+- **Outbound — `DiscordOutboundConnector`.** Registers `discord_post_message`: the bot
+  token comes from the secrets layer, the post goes through the SSRF-guarded pinned
+  transport (egress-pinned to `discord.com`), the target channel must be on a
+  **channel allowlist** (default-deny), and the post is idempotent (deduped per
+  `(channel, content)`, also passed to Discord as a `nonce`).
+
+Wire the outbound connector with `register_discord_connectors()`; the inbound connector
+is constructed explicitly with your agent handler (a FastAPI route calls
+`handle_webhook(raw_body, request.headers)` and returns its `response`).
+
+Configuration (all via the secrets layer / env, never the model):
+
+| Var | Purpose |
+| --- | --- |
+| `HIMMY_DISCORD_BOT_TOKEN` | Bot token for `discord_post_message` (and the gateway). |
+| `HIMMY_DISCORD_PUBLIC_KEY` | Application Ed25519 public key (hex) to verify interactions. |
+| `HIMMY_DISCORD_ALLOWED_CHANNELS` | Comma-separated channel allowlist for posting. |
+| `HIMMY_DISCORD_DEFAULT_CHANNEL` | Default post channel when the tool's `channel_id` is omitted. |
+
+The slash-command webhook and the post tool need **no extra** (Ed25519 uses
+`cryptography`, HTTP uses the core `httpx`); only the gateway listener needs `[discord]`.
+
+---
+
 ## Checklist before you ship
 
 - [ ] Credentials read via `self.secret(...)` / `get_secret(...)` — never `os.environ`,

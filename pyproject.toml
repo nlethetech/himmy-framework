@@ -65,6 +65,11 @@ knowledge = ["pgvector>=0.2", "openai>=1.0", "pypdf>=4.0"]
 observability = ["logfire>=0.30"]
 # Nepal data connectors: Nepali-news RSS aggregation + NRB forex/macro (Excel).
 connectors = ["feedparser>=6", "openpyxl>=3"]
+# Discord GATEWAY listener only (receiving arbitrary channel messages over a WebSocket
+# with the Message Content intent). The slash-command interactions webhook + the
+# post-message tool need NO extra: Ed25519 verification uses `cryptography` (already in
+# the `auth`/`encryption` extras) and HTTP uses the core `httpx`.
+discord = ["discord.py>=2.3"]
 # Nepal domain primitives: the Bikram Sambat calendar.
 nepal = ["nepali-datetime>=1.0"]
 # Optional full-fidelity JSON Schema validation for tool args/output. Without it,
