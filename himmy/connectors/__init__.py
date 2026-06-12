@@ -67,6 +67,19 @@ from himmy.connectors.sdk import (
     safe_error,
     verify_hmac_signature,
 )
+from himmy.connectors.slack import (
+    SLACK_API_HOST,
+    SLACK_API_ROOT,
+    SLACK_APP_TOKEN_SECRET,
+    SLACK_BOT_TOKEN_SECRET,
+    SLACK_SIGNING_SECRET,
+    SlackClient,
+    SlackEventsConnector,
+    SlackOutboundConnector,
+    SlackSocketModeListener,
+    register_slack_connectors,
+    verify_slack_signature,
+)
 from himmy.connectors.spec import (
     ConnectorSpec,
     SpecToolConnector,
@@ -126,4 +139,16 @@ __all__ = [
     "DISCORD_API_HOST",
     "DISCORD_BOT_TOKEN_SECRET",
     "DISCORD_PUBLIC_KEY_SECRET",
+    # Slack connector
+    "SlackClient",
+    "SlackOutboundConnector",
+    "SlackEventsConnector",
+    "SlackSocketModeListener",
+    "verify_slack_signature",
+    "register_slack_connectors",
+    "SLACK_API_ROOT",
+    "SLACK_API_HOST",
+    "SLACK_BOT_TOKEN_SECRET",
+    "SLACK_SIGNING_SECRET",
+    "SLACK_APP_TOKEN_SECRET",
 ]
