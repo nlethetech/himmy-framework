@@ -1235,7 +1235,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         return 1
 
-    app = create_app()
+    # Pass the bind host so create_app can fail closed when an unauthenticated
+    # build would be exposed off-loopback (see _enforce_auth_posture).
+    app = create_app(bind_host=args.host)
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
@@ -1297,7 +1299,9 @@ def cmd_studio(args: argparse.Namespace) -> int:
 
         threading.Thread(target=_open, daemon=True).start()
 
-    uvicorn.run(create_app(), host=args.host, port=args.port)
+    # Pass the bind host so create_app can fail closed when an unauthenticated
+    # build would be exposed off-loopback (see _enforce_auth_posture).
+    uvicorn.run(create_app(bind_host=args.host), host=args.host, port=args.port)
     return 0
 
 

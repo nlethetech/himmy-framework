@@ -33,6 +33,7 @@ def audit_event(
     log = getattr(state, "security_audit", None)
     if log is None:  # pragma: no cover - always wired alongside the authenticator
         return
+    from himmy.api.auth.base import peer_ip
     from himmy.api.auth.context import get_principal
 
     log.record(
@@ -45,6 +46,7 @@ def audit_event(
             workspace_id=workspace_id,
             method=request.method,
             path=str(request.url.path),
+            peer_ip=peer_ip(request),
             detail=detail,
         )
     )

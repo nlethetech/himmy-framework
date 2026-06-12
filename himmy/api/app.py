@@ -83,10 +83,113 @@ async def _rate_limit_dependency(request: Request) -> None:
         limiter(request)
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True when a uvicorn bind ``host`` is loopback / unspecified-loopback only.
+
+    ``127.0.0.1`` / ``::1`` / ``localhost`` are loopback. The empty string and the
+    unspecified binds (``0.0.0.0`` / ``::``) reach the network, so they are NOT
+    loopback. An unparseable value is treated as non-loopback (fail safe).
+    """
+    import ipaddress
+
+    value = (host or "").strip().lower()
+    if not value:
+        return False
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _enforce_auth_posture(authenticator: object | None, bind_host: str) -> None:
+    """Refuse to start an unauthenticated admin surface on a non-loopback bind.
+
+    The zero-config default is a fully-unrestricted (all-tenants/admin) ANONYMOUS
+    principal — safe only because the default bind is loopback. Binding off-loopback
+    with no authenticator would expose that admin surface to the network. We fail
+    closed: such a combination raises unless the operator explicitly opts in via
+    ``HIMMY_ALLOW_UNAUTHENTICATED=1`` (e.g. auth is terminated at a trusted proxy).
+    """
+    import os
+
+    if authenticator is not None or _is_loopback_host(bind_host):
+        return
+    opt_in = os.environ.get("HIMMY_ALLOW_UNAUTHENTICATED", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if opt_in:
+        logger.warning(
+            "binding to non-loopback host %r with NO authenticator configured: the "
+            "BFF is exposed unauthenticated (admin/all-tenants) — HIMMY_ALLOW_"
+            "UNAUTHENTICATED is set, so starting anyway",
+            bind_host,
+        )
+        return
+    raise HimmyError(
+        f"refusing to start: bound to non-loopback host {bind_host!r} with no "
+        "authenticator configured — this would expose an unauthenticated admin "
+        "surface to the network. Configure auth (HIMMY_INTERNAL_API_KEY / "
+        "HIMMY_API_KEYS_FILE / HIMMY_AUTH_MODE=oidc), bind to 127.0.0.1, or set "
+        "HIMMY_ALLOW_UNAUTHENTICATED=1 to override (e.g. auth at a trusted proxy)."
+    )
+
+
+def _wants_durable_store() -> bool:
+    """True when the server should wire the durable store instead of in-memory.
+
+    Opt-in so ``create_app()`` stays offline-green by default: a durable backend is
+    selected when a database DSN is configured (``HIMMY_DATABASE_URL``) or when the
+    operator explicitly asks for it (``HIMMY_DURABLE_STORAGE=1``). Either way the
+    backend is resolved by :class:`StoreFactory` (Postgres for a ``postgres://`` DSN,
+    file-backed SQLite otherwise) — this entrypoint only decides *whether* to use it.
+    """
+    import os
+
+    from himmy.config.secrets import get_secret
+
+    if (get_secret("HIMMY_DATABASE_URL") or "").strip():
+        return True
+    return os.environ.get("HIMMY_DURABLE_STORAGE", "").lower() in ("1", "true", "yes")
+
+
+def _rebind_container(app: FastAPI, container: ApiContainer) -> None:
+    """Point ``app.state`` at a (re)built container's services.
+
+    Mirrors the wiring ``create_app`` does after building the default container, so a
+    durable container constructed in the lifespan replaces the in-memory one for every
+    request-time reader (routers read ``app.state.container``; ``audit_event`` reads
+    ``app.state.security_audit``).
+    """
+    app.state.container = container
+    app.state.security_audit = SecurityAuditLog(container.entity_registry)
+    app.state.consent_ledger = getattr(container, "consent_ledger", None)
+    app.state.consent_policy = getattr(container, "consent_policy", None)
+    app.state.retention_service = getattr(container, "retention_service", None)
+
+
 def _build_lifespan(
     container: ApiContainer,
+    *,
+    upgrade_to_durable: bool = True,
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
-    """Build a FastAPI lifespan that sweeps stuck runs + drains on shutdown (AAEO-1)."""
+    """Build a FastAPI lifespan that sweeps stuck runs + drains on shutdown (AAEO-1).
+
+    When a durable store is requested (item #7), the lifespan upgrades the in-memory
+    default container to a durable one (Postgres/SQLite via
+    :meth:`ApiContainer.build_default_async`) *before* serving any request, so
+    background runs and the tamper-evident security-audit log survive restarts.
+
+    ``upgrade_to_durable`` gates that upgrade: it is only ever attempted when
+    ``create_app`` built the default in-memory container itself. A caller who injects
+    a container via ``create_app(container=...)`` has already chosen its backends (the
+    documented production recipe is to ``build_default_async`` and pass the result in),
+    so we must NOT discard it and stand up a second, duplicate Postgres pool — the
+    injected container is served as-is even when ``HIMMY_DATABASE_URL`` is set.
+    """
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -100,9 +203,30 @@ def _build_lifespan(
         )
 
         server_ctx_token = set_server_context(True)
+
+        # Item #7: wire the durable store at startup (the sync default container is
+        # in-memory). Build it asynchronously so a Postgres pool can be created +
+        # migrated, then rebind app.state so every request-time reader uses it. If the
+        # durable build fails we keep the in-memory container running (degraded but up).
+        active = container
+        built_durable = False
+        if upgrade_to_durable and _wants_durable_store():
+            try:
+                active = await ApiContainer.build_default_async()
+                _rebind_container(app, active)
+                built_durable = True
+                logger.info("durable storage wired for the server entrypoint")
+            except Exception:  # pragma: no cover - defensive: stay up on store failure
+                logger.warning(
+                    "durable storage requested but could not be wired; "
+                    "falling back to in-memory storage",
+                    exc_info=True,
+                )
+                active = container
+
         # Startup: sweep runs left non-terminal by a previous process so they
         # reach a terminal state instead of hanging in QUEUED/RUNNING forever.
-        run_app = getattr(container, "run_app", None)
+        run_app = getattr(active, "run_app", None)
         if run_app is not None:
             try:
                 swept = await run_app.sweep_stuck_runs()
@@ -132,9 +256,15 @@ def _build_lifespan(
                 except Exception:  # pragma: no cover - shutdown best-effort
                     logger.warning("run drain failed on shutdown", exc_info=True)
             try:
-                await container.aclose()
+                await active.aclose()
             except Exception:  # pragma: no cover - shutdown best-effort
                 pass
+            # Also close the original in-memory container if we swapped it out.
+            if built_durable and active is not container:
+                try:
+                    await container.aclose()
+                except Exception:  # pragma: no cover - shutdown best-effort
+                    pass
             # Clear the server-context flag so a subsequent in-process CLI/test run
             # reverts to the in-memory one-shot default.
             try:
@@ -145,14 +275,24 @@ def _build_lifespan(
     return _lifespan
 
 
-def create_app(container: ApiContainer | None = None) -> FastAPI:
+def create_app(
+    container: ApiContainer | None = None, *, bind_host: str | None = None
+) -> FastAPI:
     """Create and configure the Himmy FastAPI app.
 
     Pass a custom :class:`ApiContainer` to inject production backends; omit it to
     get the offline-first default (in-memory storage + stub inference). The app
     installs a startup run-sweep + shutdown drain (AAEO-1) and a global exception
     handler mapping :class:`HimmyError` to a structured 400 (AAEO-9).
+
+    ``bind_host`` is the host uvicorn will bind to (the server entrypoints pass it).
+    It gates the fail-closed posture check: starting an unauthenticated build on a
+    non-loopback host is refused unless explicitly overridden. When ``None`` it is
+    read from ``HIMMY_BIND_HOST`` and defaults to loopback, so a bare ``create_app()``
+    (the in-process/test path) is always treated as a safe loopback bind.
     """
+    import os
+
     from himmy.services.observability import (
         configure_observability,
         instrument_fastapi,
@@ -160,12 +300,24 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
 
     configure_observability()
 
+    # Track whether we built the container ourselves: only an implicitly-built
+    # in-memory default may be upgraded to the durable store in the lifespan. An
+    # injected container has already chosen its backends and must be served as-is
+    # (see ``_build_lifespan``'s ``upgrade_to_durable``).
+    container_was_none = container is None
     if container is None:
         container = ApiContainer.build_default()
 
     # Identity: authenticate every request → Principal (WS1); None ⇒ offline/no-auth
     # default where requests are ANONYMOUS (all tenants). Rate limiting runs either way.
     authenticator = build_authenticator()
+    # Fail closed: never silently expose an unauthenticated admin surface off-loopback.
+    effective_host = (
+        bind_host
+        if bind_host is not None
+        else os.environ.get("HIMMY_BIND_HOST", "127.0.0.1")
+    )
+    _enforce_auth_posture(authenticator, effective_host)
     app = FastAPI(
         title="Himmy API",
         version="0.1.0",
@@ -175,7 +327,7 @@ def create_app(container: ApiContainer | None = None) -> FastAPI:
             Depends(principal_dependency),
             Depends(_rate_limit_dependency),
         ],
-        lifespan=_build_lifespan(container),
+        lifespan=_build_lifespan(container, upgrade_to_durable=container_was_none),
     )
     app.state.container = container
     app.state.authenticator = authenticator
@@ -366,15 +518,27 @@ def _origin_host(value: str) -> str:
         return ""
 
 
-def _install_studio_guard(app: FastAPI) -> None:
-    """Block DNS-rebinding + cross-site access to the loopback Studio API (WS3.5).
+# Path prefixes the rebinding/cross-site guard protects. Every router that runs
+# agents, reads runs/threads/context, or holds credentials lives under one of these:
+# the Studio surface AND the unauthenticated tenant ``/v1/*`` surface (whose
+# ``POST /v1/runs`` background-executes an agent). Liveness (``/health``), the SPA
+# shell, hashed assets, and the OpenAPI docs are deliberately left open so probes and
+# the browser app keep working. This is the default boundary for the whole loopback
+# BFF, not just one prefix.
+_GUARDED_PREFIXES = ("/api/studio", "/v1")
 
-    Studio runs agents that take real actions (send email/Telegram) and stores
-    credentials, so its ``/api/studio`` surface must only answer requests whose
-    ``Host`` is loopback and whose ``Origin``/``Referer`` (when present) is same-site.
-    This defeats a malicious web page (or DNS rebinding) reaching the local API.
-    Disable with ``HIMMY_STUDIO_GUARD=0``; allow extra hosts (e.g. a reverse proxy)
-    via ``HIMMY_STUDIO_ALLOW_HOSTS=host1,host2``.
+
+def _install_studio_guard(app: FastAPI) -> None:
+    """Block DNS-rebinding + cross-site access to the loopback BFF (WS3.5).
+
+    The BFF runs agents that take real actions (send email/Telegram), stores
+    credentials, and exposes run/thread/context reads — so every sensitive surface
+    (``/api/studio`` **and** the unauthenticated ``/v1/*`` tenant API, incl.
+    ``POST /v1/runs`` which background-executes an agent) must only answer requests
+    whose ``Host`` is loopback and whose ``Origin``/``Referer`` (when present) is
+    same-site. This defeats a malicious web page (or DNS rebinding) reaching the local
+    API for *any* guarded route, not just Studio. Disable with ``HIMMY_STUDIO_GUARD=0``;
+    allow extra hosts (e.g. a reverse proxy) via ``HIMMY_STUDIO_ALLOW_HOSTS=host1,host2``.
     """
     import os
 
@@ -393,7 +557,7 @@ def _install_studio_guard(app: FastAPI) -> None:
     async def _guard(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        if request.url.path.startswith("/api/studio"):
+        if request.url.path.startswith(_GUARDED_PREFIXES):
             host = _studio_host(request.headers.get("host", ""))
             if host and host not in allowed:
                 return JSONResponse(

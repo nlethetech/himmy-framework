@@ -15,7 +15,9 @@ class SecurityEvent(BaseModel):
     Recorded as a tamper-evident ``EntityRecord`` (kind ``security_event``) so the
     audit trail inherits immutability, lineage, and the signed-bundle integrity check.
     ``actor`` is the compact principal descriptor (subject/auth_method/roles/ip);
-    ``outcome`` is ``allow`` or ``deny``.
+    ``outcome`` is ``allow`` or ``deny``. ``peer_ip`` is the real transport peer —
+    recorded alongside the (possibly proxy-forwarded) actor source IP so a spoofed
+    ``X-Forwarded-For`` cannot fully launder forensic attribution.
     """
 
     event_id: str = Field(default_factory=new_uuid)
@@ -28,6 +30,7 @@ class SecurityEvent(BaseModel):
     workspace_id: str | None = None
     method: str | None = None
     path: str | None = None
+    peer_ip: str | None = None
     detail: str = ""
 
 
