@@ -453,14 +453,26 @@ class ToolService:
     async def _dispatch_local(
         self, definition: ToolDefinition, args: dict[str, Any]
     ) -> Any:
-        """Invoke a local handler, awaiting it when it is a coroutine function."""
+        """Invoke a local handler off the event loop when it is synchronous.
+
+        A coroutine handler is awaited directly. A plain sync handler — which may do
+        blocking network/file/SQLite IO (the web/file/data packs are sync) — is run
+        in a worker thread via :func:`asyncio.to_thread`, so one slow tool can't
+        freeze the single event loop shared by every concurrent run, stream, and the
+        scheduler. Offloading also lets the surrounding ``wait_for`` timeout actually
+        fire: the loop stays responsive and abandons the worker thread on timeout.
+        """
         handler = self._registry.handler_for(definition.name)
         if handler is None:
             raise _ToolDispatchError(
                 ToolErrorCode.EXECUTION_ERROR,
                 f"no local handler registered for {definition.name!r}",
             )
-        outcome = handler(args)
+        if inspect.iscoroutinefunction(handler):
+            return await handler(args)
+        outcome = await asyncio.to_thread(handler, args)
+        # A sync handler may still return an awaitable (e.g. a callable that returns
+        # a coroutine); preserve the original await-the-result contract.
         if inspect.isawaitable(outcome):
             outcome = await outcome
         return outcome

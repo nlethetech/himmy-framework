@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import re
+import zipfile
 from datetime import date
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -28,9 +29,17 @@ from himmy.connectors._feeds import entry_cap, parse_feed
 from himmy.connectors.fetcher import Fetcher, HttpxFetcher, get_json
 from himmy.connectors.models import ForexRate, MacroReport, Workbook
 from himmy.core.errors import HimmyError
+from himmy.toolkit._net import build_pinned_transport, guard_url
 
 NRB_FOREX_API = "https://www.nrb.org.np/api/forex/v1/rates"
 NRB_MACRO_FEED = "https://www.nrb.org.np/category/current-macroeconomic-situation/feed/"
+
+# Ceiling on a workbook's TOTAL decompressed size. The download is already capped
+# (HttpxFetcher.max_bytes, ~8MB), but an .xlsx is a zip: a small compressed file can
+# carry a huge shared-strings table / sheet that openpyxl would inflate into memory
+# (a "zip bomb"). We reject before openpyxl ever sees it. Live NRB Tables workbooks
+# (~93 sheets of CPI/WPI/GDP data) decompress well under this bound.
+_MAX_WORKBOOK_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 
 # A link to a downloadable spreadsheet on the NRB site.
 _XLS_RE = re.compile(r'https?://[^\s"\'<>]+?\.(?:xlsx|xls)', re.IGNORECASE)
@@ -74,6 +83,42 @@ def _find_workbook_link(html: str) -> str | None:
 def _looks_like_workbook(data: bytes) -> bool:
     """True when ``data`` is a spreadsheet by magic bytes (xlsx zip / legacy xls)."""
     return data[:4] == b"PK\x03\x04" or data[:4] == b"\xd0\xcf\x11\xe0"
+
+
+def _guard_decompressed_size(data: bytes, limit: int | None = None) -> None:
+    """Reject a zip-bomb ``.xlsx`` before openpyxl inflates it into memory.
+
+    An ``.xlsx`` is a zip container, so its compressed size (already capped on
+    download) says nothing about how much memory parsing it will cost: a tiny file
+    can declare a multi-GB shared-strings table or sheet. The central directory
+    records each member's uncompressed ``file_size``; we sum those (and check each
+    member) WITHOUT decompressing anything, and raise if the total — or any single
+    member — would exceed ``limit`` (defaulting to the module cap, read at call time
+    so it stays configurable/patchable). Non-zip inputs (legacy ``.xls``) are left
+    for openpyxl/the caller to handle.
+    """
+    if limit is None:
+        limit = _MAX_WORKBOOK_UNCOMPRESSED_BYTES
+    if data[:4] != b"PK\x03\x04":  # only the zip-backed format can be a zip bomb
+        return
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            total = 0
+            for info in archive.infolist():
+                if info.file_size > limit:
+                    raise HimmyError(
+                        f"workbook member {info.filename!r} declares "
+                        f"{info.file_size} uncompressed bytes, over the "
+                        f"{limit}-byte safety cap (possible zip bomb)"
+                    )
+                total += info.file_size
+                if total > limit:
+                    raise HimmyError(
+                        f"workbook decompresses to over {limit} bytes "
+                        f"(possible zip bomb); refusing to parse"
+                    )
+    except zipfile.BadZipFile:
+        return  # not a real zip — let the parser surface the real error
 
 
 # ----------------------------------------------------------- forex payload schema
@@ -142,8 +187,17 @@ class NRBClient:
     """A direct client for NRB forex + macroeconomic-situation reports."""
 
     def __init__(self, fetcher: Fetcher | None = None) -> None:
-        """Wire the HTTP fetcher (defaults to the live ``HttpxFetcher``)."""
-        self._fetcher = fetcher or HttpxFetcher()
+        """Wire the HTTP fetcher (defaults to the live ``HttpxFetcher``).
+
+        The default fetcher carries the SSRF guard so redirect hops AND the
+        spreadsheet links discovered on a (possibly model-supplied) report page
+        must resolve to public addresses — never loopback / RFC1918 / IMDS. Its
+        transport pins the vetted IP at connect time so a low-TTL name can't rebind
+        between the guard's DNS lookup and httpx's own (the rebinding TOCTOU gap).
+        """
+        self._fetcher = fetcher or HttpxFetcher(
+            guard=guard_url, transport=build_pinned_transport()
+        )
 
     # ------------------------------------------------------------------- forex
     def forex(
@@ -259,6 +313,11 @@ class NRBClient:
                 "(pip install 'himmy[connectors]')."
             ) from exc
         import warnings
+
+        # Bound the DECOMPRESSED size before openpyxl inflates the (model/attacker-
+        # influenced) bytes — the download cap only bounds the compressed download,
+        # so a small zip-bomb .xlsx could otherwise exhaust memory at parse time.
+        _guard_decompressed_size(data)
 
         with warnings.catch_warnings():
             # NRB workbooks use extensions openpyxl warns (harmlessly) about.

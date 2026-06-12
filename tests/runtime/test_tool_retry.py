@@ -39,6 +39,7 @@ def _runtime_with_tool(
         handler=handler,
         args_json_schema={"type": "object", "properties": {}},
         timeout_seconds=0.05,  # a sleeping handler trips a genuine TIMEOUT
+        read_only=True,  # a read-only probe is safe to re-run after a TIMEOUT
     )
     events: list[RunEvent] = []
 

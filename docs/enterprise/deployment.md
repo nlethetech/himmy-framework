@@ -322,12 +322,23 @@ page):** free disk below ~1 GiB, pending Postgres migrations after a deploy.
 python scripts/ops_backup.py backup --out /backups      # `make ops-backup` writes to the repo root
 ```
 
-Produces `himmy-backup-<utc>.tar.gz` containing a WAL-safe snapshot of every
-`.himmy/*.db`, the non-db store files, the `secrets/` directory, and a
-checksummed `manifest.json`. If `HIMMY_DATABASE_URL` is set and `pg_dump` is on
-PATH, a `pg_dump -Fc` of Postgres is included automatically; if `pg_dump` is
-absent the SQLite-only backup still succeeds and the manifest records that the
-dump was skipped.
+Produces `himmy-backup-<utc>.tar.gz` (created `0600`) containing a WAL-safe
+snapshot of every `.himmy/*.db`, the non-db store files, and a checksummed
+`manifest.json`. If `HIMMY_DATABASE_URL` is set and `pg_dump` is on PATH, a
+`pg_dump -Fc` of Postgres is included automatically; if `pg_dump` is absent the
+SQLite-only backup still succeeds and the manifest records that the dump was
+skipped.
+
+> **The `secrets/` directory (encryption KEK + Postgres password) is EXCLUDED by
+> default.** Bundling the KEK next to the data would let anyone who reads the
+> backup decrypt every encrypted-at-rest field — backups routinely travel to
+> lower-trust storage, so that one `tar.gz` would undo encryption-at-rest
+> entirely. **Back up the KEK separately** (a secrets manager, an offline copy,
+> or your existing secret-distribution channel) — without it the data archive is
+> deliberately un-decryptable. Pass `--include-secrets` ONLY for an air-gapped,
+> separately-encrypted archive whose access you fully control; the archive is then
+> as sensitive as the KEK itself and must be stored encrypted with restricted
+> access.
 
 For Postgres specifically, you can also dump it directly:
 
@@ -356,12 +367,55 @@ bundled Postgres dump is restored via `pg_restore --clean --if-exists` when
    (and let it `pg_restore` the Postgres dump, or restore Postgres from your own
    `pg_dump`). For compose, restore into the `himmy_state` volume; for an
    air-gapped Ollama, restore models into the `himmy_ollama` volume.
-3. **Restore secrets** — the `secrets/` subtree from the archive (Postgres
-   password, `HIMMY_ENCRYPTION_KEY`). Encrypted fields are unreadable without the
-   original KEK, so this step is mandatory.
+3. **Restore secrets** — from your SEPARATE secrets backup (Postgres password,
+   `HIMMY_ENCRYPTION_KEY`), since the data archive excludes them by default.
+   Encrypted fields are unreadable without the original KEK, so this step is
+   mandatory. (If you used `--include-secrets`, restore also writes the `secrets/`
+   subtree from the archive.)
 4. **Start** the deployment.
 5. **Verify** — `himmy doctor --storage` and `python scripts/ops_health.py`
    (expect exit 0).
+
+## Retention / pruning
+
+himmy **never deletes durable history automatically** — there is no background
+GC. The durable SQLite stores grow monotonically with usage:
+
+| Store | Default path | Grows per | Eligible for prune |
+|---|---|---|---|
+| Run events | `.himmy/storage.db` | several rows per agent turn (the audit stream) | events older than the cutoff, and/or all but the most recent N |
+| Approval checkpoints | `.himmy/approvals.db` | one full thread+persona+ctx snapshot per HITL pause | only `approved`/`rejected` rows older than the cutoff (live `awaiting_approval`/`resolving` are always kept) |
+| Sessions | `.himmy/sessions.db` | the whole thread re-upserted every REPL turn | sessions not touched since the cutoff, and/or all but the most recent N |
+| Graph checkpoints | (caller-chosen) | one snapshot per interrupted graph | only `completed`/`failed` rows older than the cutoff (resumable `running`/`interrupted` always kept) |
+
+On a busy server `.himmy/storage.db` is the dominant grower — every agent turn
+appends multiple events, and `list_events`/timeline reads get linearly slower as
+the stream lengthens — followed by `approvals.db` (each pause is a full snapshot).
+
+Run **`scripts/ops_prune.py`** from cron / a scheduled job to bound this. The
+recommended starting policy for a long-lived deployment is **`--older-than-days
+90`** (90 days of audit/approval/session history retained, everything older
+reclaimed); live and unresolved work is preserved at any age.
+
+```bash
+# 90-day retention across run store, approvals, and sessions (recommended baseline)
+python scripts/ops_prune.py --older-than-days 90
+
+# also cap the event stream and session count regardless of age
+python scripts/ops_prune.py --older-than-days 90 \
+    --keep-last-events 1000000 --keep-last-sessions 500
+
+# include a graph checkpoint DB (no default path — pass it explicitly)
+python scripts/ops_prune.py --older-than-days 30 --graph-path .himmy/graphs.db
+```
+
+It prunes in place through the same WAL-aware connection the server uses, so it is
+safe to run while the server is up (writes serialize on the SQLite write lock).
+Pruning deletes rows but does **not** shrink the file; follow a large first prune
+with `VACUUM` (against a quiescent database) to actually return the space to the
+filesystem. The `prune_events` / `prune_resolved` / `prune_terminal` / session
+`prune` methods chunk their deletes, so a first-ever prune of a multi-hundred-
+thousand-row store does not trip SQLite's bound-parameter limit.
 
 ## Kubernetes
 
@@ -372,6 +426,15 @@ Key constraints:
 - **Single replica, hard-pinned.** `replicaCount: 1` with a `Recreate` strategy
   and an RWO PVC for `/app/.himmy`. The SQLite sidecar stores are single-writer —
   **raising the replica count corrupts state**, even with external Postgres.
+- **State PVC is retained by default.** The chart-managed PVC carries
+  `helm.sh/resource-policy: keep` (`persistence.retain: true`), so a routine
+  `helm uninstall` or a failed `helm upgrade --install` will **not** delete the only
+  copy of your chats/runs/traces. Delete it explicitly (`kubectl delete pvc …`) after
+  a backup, or set `persistence.retain=false` to let Helm GC it with the release.
+- **Default resource requests/limits.** The pod ships `requests cpu 250m / mem 512Mi`
+  and `limits cpu 1 / mem 1Gi` (Burstable, not BestEffort) so it isn't first-evicted
+  under node memory pressure and has an OOM ceiling. Override `resources` for heavier
+  in-pod local models, or set it to `{}` to opt out.
 - **External Postgres only.** No Postgres subchart. Set `database.url` inline or
   reference `database.existingSecret` (the latter wins). Leave both empty to fall
   back to the PVC SQLite store.

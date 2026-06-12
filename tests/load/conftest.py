@@ -58,8 +58,11 @@ def client_factory(
     running server, no lifespan side effects — so it is deterministic and offline.
     """
 
+    # "testserver" is the canonical test Host that the loopback BFF's DNS-rebinding
+    # guard allows (browsers cannot forge a Host header, so it opens no hole). Using
+    # it keeps the guarded ``/v1/*`` surface reachable from the in-process client.
     @asynccontextmanager
-    async def _make(base_url: str = "http://loadtest") -> AsyncIterator[AsyncClient]:
+    async def _make(base_url: str = "http://testserver") -> AsyncIterator[AsyncClient]:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url=base_url) as client:
             yield client

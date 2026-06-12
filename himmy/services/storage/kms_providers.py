@@ -4,8 +4,8 @@ These implement the :class:`~himmy.services.storage.encryption.KekProvider` prot
 delegating DEK wrap/unwrap to a managed Key Management Service, so the master key (KEK)
 never leaves the cloud HSM — only the wrapped DEK and ciphertext are stored locally.
 
-* :class:`AwsKmsKekProvider` — the reference implementation (AWS KMS ``Encrypt`` /
-  ``Decrypt``). boto3 is lazily imported (the ``kms-aws`` extra) and the client is
+* :class:`AwsKmsKekProvider` — the reference implementation (AWS KMS ``encrypt`` /
+  ``decrypt``). boto3 is lazily imported (the ``kms-aws`` extra) and the client is
   injectable so tests never touch AWS.
 * :class:`GcpKmsKekProvider` / :class:`AzureKeyVaultKekProvider` — documented seams that
   raise :class:`NotImplementedError`; the docstrings point at the SDK call to wire in.
@@ -23,10 +23,11 @@ from typing import Any, cast
 class AwsKmsKekProvider:
     """Wrap/unwrap a DEK with AWS KMS (the reference cloud KEK provider).
 
-    Wrapping calls KMS ``Encrypt`` on the plaintext DEK; unwrapping calls KMS ``Decrypt``
+    Wrapping calls KMS ``encrypt`` on the plaintext DEK; unwrapping calls KMS ``decrypt``
     on the returned blob (KMS records which CMK produced a blob, so ``KeyId`` is not
     required to decrypt). boto3 is imported lazily so the dependency stays optional, and
-    ``client`` may be injected for offline tests.
+    ``client`` may be injected for offline tests. (botocore exposes snake_case operation
+    methods — ``client.encrypt`` / ``client.decrypt`` — not the PascalCase API names.)
 
     ``key_version`` is ``"aws-kms.<fp>"`` where ``<fp>`` is the first 16 hex chars of the
     SHA-256 of the key id — a stable, non-secret fingerprint that ties a token to its CMK
@@ -67,13 +68,13 @@ class AwsKmsKekProvider:
         return f"aws-kms.{fingerprint}"
 
     def wrap_dek(self, plaintext_dek: bytes) -> tuple[bytes, str]:
-        """Wrap the DEK via KMS ``Encrypt``; return ``(ciphertext_blob, key_version)``."""
-        resp = self._ensure().Encrypt(KeyId=self._key_id, Plaintext=plaintext_dek)
+        """Wrap the DEK via KMS ``encrypt``; return ``(ciphertext_blob, key_version)``."""
+        resp = self._ensure().encrypt(KeyId=self._key_id, Plaintext=plaintext_dek)
         return cast(bytes, resp["CiphertextBlob"]), self.key_version
 
     def unwrap_dek(self, wrapped_dek: bytes, key_version: str) -> bytes:
-        """Unwrap the DEK via KMS ``Decrypt`` (``key_version`` is informational)."""
-        resp = self._ensure().Decrypt(CiphertextBlob=wrapped_dek)
+        """Unwrap the DEK via KMS ``decrypt`` (``key_version`` is informational)."""
+        resp = self._ensure().decrypt(CiphertextBlob=wrapped_dek)
         return cast(bytes, resp["Plaintext"])
 
 

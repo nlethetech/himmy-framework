@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from himmy.services.tools.security import ToolSecurityError
+
+if TYPE_CHECKING:  # pragma: no cover - typing only (httpx/httpcore stay lazy)
+    import httpx
 
 
 def _host_allowed(host: str, allow_hosts: Collection[str]) -> bool:
@@ -74,12 +78,23 @@ def guard_url(
 
     # A literal IP host is checked directly; a name is resolved and every
     # returned address must be public.
+    _validate_resolved_ips(host, parts.port)
+    return url
+
+
+def _validate_resolved_ips(host: str, port: int | None) -> list[str]:
+    """Resolve ``host`` and require every address be public; return the addresses.
+
+    A literal-IP host is checked directly (no DNS); a name is resolved via
+    ``getaddrinfo`` and EVERY returned address must pass :func:`_is_blocked_ip`.
+    Raises :class:`ToolSecurityError` on an unresolvable host or a non-public hit.
+    """
     try:
         ipaddress.ip_address(host)
         candidates = [host]
     except ValueError:
         try:
-            infos = socket.getaddrinfo(host, parts.port or None)
+            infos = socket.getaddrinfo(host, port or None)
         except OSError as exc:
             raise ToolSecurityError(f"could not resolve host {host!r}") from exc
         candidates = [str(info[4][0]) for info in infos]
@@ -89,7 +104,76 @@ def guard_url(
             raise ToolSecurityError(
                 f"host {host!r} resolves to a non-public address ({ip})"
             )
-    return url
+    return candidates
 
 
-__all__ = ["guard_url"]
+def build_pinned_transport(
+    *,
+    allow_private: bool = False,
+    allow_hosts: Collection[str] | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> httpx.BaseTransport:
+    """An httpx transport that re-validates + PINS the resolved IP at connect time.
+
+    :func:`guard_url` resolves DNS and vets the IPs, but a brand-new ``httpx.Client``
+    re-resolves at connect time — a DNS-rebinding (check-to-use / TOCTOU) window where
+    an attacker who controls a low-TTL name answers the guard lookup with a public IP
+    and the connect lookup with ``169.254.169.254`` / loopback / RFC1918. This wraps
+    the connection layer so the host is resolved ONCE, every candidate address is
+    re-checked with the same :func:`_is_blocked_ip` rule, and the socket is dialed at
+    the validated literal IP (the original Host header + TLS SNI are preserved by
+    httpcore, which derives them from the request, not the connect target). Check and
+    connect therefore share one resolution: the IP that is vetted is the IP that is
+    dialed. With ``allow_private`` the wrapper is a passthrough (no pinning needed).
+
+    ``transport`` is a test seam: when given, it is returned as-is so suites can inject
+    a mock transport instead of opening real sockets.
+    """
+    import httpx
+
+    if transport is not None:
+        return transport
+    http_transport = httpx.HTTPTransport()
+    if allow_private:
+        return http_transport
+
+    from httpcore._backends.sync import SyncBackend
+
+    base_backend = SyncBackend()
+
+    class _PinningBackend(SyncBackend):  # type: ignore[misc]
+        def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,
+            local_address: str | None = None,
+            socket_options: Iterable[Any] | None = None,
+        ) -> Any:
+            # Resolve + vet here, at connect time, and dial the literal IP we just
+            # validated — closing the gap where httpx would re-resolve independently.
+            try:
+                ipaddress.ip_address(host)
+                pinned = host  # already a literal IP (e.g. a fetcher-rewritten URL)
+            except ValueError:
+                if allow_hosts is not None and not _host_allowed(host, allow_hosts):
+                    raise ToolSecurityError(
+                        f"host {host!r} is not in the egress allow-list"
+                    ) from None
+                pinned = _validate_resolved_ips(host, port)[0]
+            return base_backend.connect_tcp(
+                pinned,
+                port,
+                timeout=timeout,
+                local_address=local_address,
+                socket_options=socket_options,
+            )
+
+    # Swap the pool's network backend (httpcore's documented custom-backend hook)
+    # so the actual TCP connect dials the IP we vetted, leaving httpx's TLS/proxy
+    # config — and the Host header + SNI derived from the request — intact.
+    http_transport._pool._network_backend = _PinningBackend()
+    return http_transport
+
+
+__all__ = ["guard_url", "build_pinned_transport"]

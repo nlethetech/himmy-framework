@@ -117,6 +117,10 @@ persistence:
     - ReadWriteOnce
   size: 5Gi
   annotations: {}
+  # Keep the chart-managed PVC on `helm uninstall` (helm.sh/resource-policy: keep),
+  # so a routine uninstall or a failed upgrade --install does NOT delete the only copy
+  # of the /app/.himmy state. Set to false to let Helm GC it with the release.
+  retain: true
 
 # -- Free-form environment passthrough. Every key/value here is set verbatim as
 # a container env var. Use this for HIMMY_OLLAMA_URL, HIMMY_AUTH_MODE,
@@ -141,13 +145,17 @@ probes:
     timeoutSeconds: 3
     failureThreshold: 3
 
-resources: {}
-  # limits:
-  #   cpu: "1"
-  #   memory: 1Gi
-  # requests:
-  #   cpu: 250m
-  #   memory: 512Mi
+# -- Pod resource requests/limits. Sane defaults so the pod is Burstable (not
+# BestEffort): an empty block leaves the pod first-to-be-evicted under node memory
+# pressure with no OOM ceiling while running local-model/agent workloads. Raise the
+# memory limit if you run heavier local models in-pod; set to {} to opt out entirely.
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
 
 nodeSelector: {}
 tolerations: []

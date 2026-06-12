@@ -18,7 +18,20 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from himmy.runtime.checkpoint import AWAITING_APPROVAL, SqliteCheckpointStore
+from himmy.runtime.checkpoint import (
+    AWAITING_APPROVAL,
+    RESOLVING,
+    SqliteCheckpointStore,
+)
+
+#: The checkpoint statuses a human can still act on from the inbox: a fresh
+#: ``awaiting_approval`` AND a ``resolving`` row left stranded by a resume that
+#: crashed mid-flight. ``claim()`` (the real concurrency gate in
+#: ``resume_agent_loop``) re-claims both, so the crash-retry the new RESOLVING design
+#: explicitly supports stays reachable from the only shipped human surface — without
+#: it a crashed resume would be permanently stuck (hidden by ``list_pending`` and
+#: refused by ``resolve``).
+_RESUMABLE = (AWAITING_APPROVAL, RESOLVING)
 
 _SECRETY = ("token", "password", "secret", "key", "authorization", "auth")
 
@@ -106,10 +119,17 @@ def _summary(cp: Any) -> ApprovalSummary:
 
 
 def list_pending() -> list[ApprovalSummary]:
-    """All checkpoints awaiting a human decision (newest first)."""
-    return [
-        _summary(cp) for cp in get_checkpoint_store().list_by_status(AWAITING_APPROVAL)
-    ]
+    """All checkpoints a human can still act on (newest first).
+
+    Includes fresh ``awaiting_approval`` checkpoints AND any ``resolving`` row left
+    stranded by a resume that crashed mid-flight — those are still re-claimable by
+    ``resume_agent_loop`` (so retryable via :func:`resolve`), and hiding them would
+    strand the run with no human surface to recover it.
+    """
+    store = get_checkpoint_store()
+    pending = [cp for status in _RESUMABLE for cp in store.list_by_status(status)]
+    pending.sort(key=lambda cp: cp.created_at, reverse=True)
+    return [_summary(cp) for cp in pending]
 
 
 def get_detail(checkpoint_id: str) -> ApprovalDetail | None:
@@ -155,7 +175,12 @@ async def resolve(
     if cp is None:
         yield {"type": "error", "message": "unknown approval"}
         return
-    if cp.status != AWAITING_APPROVAL:
+    # Accept ``resolving`` here too: a resume that crashed mid-flight leaves the row
+    # at ``resolving``, and ``resume_agent_loop``'s atomic ``claim()`` re-claims it —
+    # that claim, not this pre-check, is the real concurrency gate. Refusing it here
+    # would make the crash-retry the RESOLVING design supports unreachable from the
+    # only shipped human surface. An already-``approved``/``rejected`` row is terminal.
+    if cp.status not in _RESUMABLE:
         yield {"type": "error", "message": f"already {cp.status}"}
         return
 

@@ -9,6 +9,7 @@ stack only ever sees a Principal.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from himmy.core.errors import HimmyError
@@ -36,13 +37,39 @@ class Authenticator(Protocol):
         ...
 
 
-def client_ip(request: Request) -> str | None:
-    """Best-effort source IP for audit (honors a single proxy ``X-Forwarded-For``)."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+def _trusted_proxies() -> frozenset[str]:
+    """The peer IPs allowed to set ``X-Forwarded-For`` (from ``HIMMY_TRUSTED_PROXIES``)."""
+    return frozenset(
+        p.strip()
+        for p in (os.environ.get("HIMMY_TRUSTED_PROXIES") or "").split(",")
+        if p.strip()
+    )
+
+
+def peer_ip(request: Request) -> str | None:
+    """The real transport peer IP (``request.client.host``), ignoring any header."""
     client = getattr(request, "client", None)
     return getattr(client, "host", None) if client else None
 
 
-__all__ = ["Authenticator", "AuthError", "client_ip"]
+def client_ip(request: Request) -> str | None:
+    """Source IP for audit + rate-limit keying.
+
+    Honors ``X-Forwarded-For`` **only** when the immediate peer is a configured
+    trusted proxy (``HIMMY_TRUSTED_PROXIES``); otherwise the header is attacker-
+    controllable and is ignored in favour of the real ``request.client.host``. This
+    closes the rate-limit-bypass / audit-IP-spoofing hole where any client could
+    forge a fresh source by rotating the header.
+    """
+    peer = peer_ip(request)
+    trusted = _trusted_proxies()
+    if peer in trusted and trusted:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first
+    return peer
+
+
+__all__ = ["Authenticator", "AuthError", "client_ip", "peer_ip"]

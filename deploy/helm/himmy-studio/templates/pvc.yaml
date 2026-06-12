@@ -5,10 +5,17 @@ metadata:
   name: {{ include "himmy-studio.pvcName" . }}
   labels:
     {{- include "himmy-studio.labels" . | nindent 4 }}
-  {{- with .Values.persistence.annotations }}
   annotations:
+    {{- if .Values.persistence.retain }}
+    # Survive `helm uninstall` / a failed `helm upgrade --install`: this PVC holds
+    # the ONLY copy of the /app/.himmy SQLite stores, so Helm must NOT garbage-collect
+    # it with the release. Set persistence.retain=false to opt out (the PVC is then
+    # deleted on uninstall — all chats/runs/traces are lost with no undo).
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    {{- with .Values.persistence.annotations }}
     {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- end }}
 spec:
   accessModes:
     {{- toYaml .Values.persistence.accessModes | nindent 4 }}

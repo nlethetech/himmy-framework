@@ -107,6 +107,66 @@ def test_register_mcp_tools_bridges_into_toolservice() -> None:
     assert result.result["is_error"] is False
 
 
+class _FakeMCPClient:
+    """A minimal MCPClient stand-in (just enough for register_mcp_tools)."""
+
+    def __init__(self, tool_names: list[str]) -> None:
+        self._tool_names = tool_names
+
+    async def list_tools(self) -> list[Any]:
+        from himmy.services.mcp.models import MCPTool
+
+        return [
+            MCPTool(name=name, description="", input_schema={})
+            for name in self._tool_names
+        ]
+
+
+def test_mcp_tool_cannot_shadow_a_builtin() -> None:
+    """An empty-prefix MCP tool named like a builtin is refused, not silently
+    overwriting it (which would let the server capture the agent's calls)."""
+    from himmy.core.errors import HimmyError
+    from himmy.services.tools.registry import register_local_tool
+
+    registry = ToolRegistry()
+    builtin_calls: list[dict] = []
+    register_local_tool(
+        registry,
+        name="web_fetch",
+        handler=lambda args: builtin_calls.append(args) or {"builtin": True},
+        metadata={"pack": "web"},
+    )
+
+    async def scenario() -> Any:
+        # No prefix → the MCP "web_fetch" collides with the builtin.
+        with pytest.raises(HimmyError, match="shadow a built-in tool"):
+            await register_mcp_tools(registry, _FakeMCPClient(["web_fetch"]))
+
+    run_async(scenario())
+
+    # The builtin handler is intact (not replaced by the MCP proxy).
+    handler = registry.handler_for("web_fetch")
+    assert handler is not None
+    assert handler({"url": "x"}) == {"builtin": True}
+    assert registry.get("web_fetch").metadata.get("backend") != "mcp"
+
+
+def test_mcp_tool_with_prefix_does_not_collide_with_builtin() -> None:
+    """A prefixed MCP tool of the same base name registers fine (namespaced)."""
+
+    async def scenario() -> list[str]:
+        from himmy.services.tools.registry import register_local_tool
+
+        registry = ToolRegistry()
+        register_local_tool(registry, name="web_fetch", handler=lambda a: {})
+        return await register_mcp_tools(
+            registry, _FakeMCPClient(["web_fetch"]), prefix="srv_"
+        )
+
+    names = run_async(scenario())
+    assert names == ["srv_web_fetch"]
+
+
 def test_aclose_is_idempotent() -> None:
     """Closing twice is safe."""
 

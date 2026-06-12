@@ -333,6 +333,19 @@ class DlpGuardrail:
             )
         return GuardrailVerdict(allowed=True, text=result, flags=flags)
 
+    def suppresses_output_content(self) -> bool:
+        """True when this DLP guard can BLOCK matched content (a ``…:block`` action).
+
+        A block means the offending text is withheld, never redacted-in-place — so a
+        streaming caller must NOT emit tokens before this guard runs (already-streamed
+        secrets cannot be recalled). The default action counts: ``*:block`` blocks
+        every class. Redact/tokenize-only policies (no block) return False, so they
+        stay on the cheaper guard-after-streaming path.
+        """
+        if self._policy.default is DlpAction.BLOCK:
+            return True
+        return any(action is DlpAction.BLOCK for action in self._policy.actions.values())
+
     def _apply(self, rule: PIIRule, text: str, action: DlpAction) -> str:
         """Redact or tokenize every validated match of ``rule`` in ``text``."""
 

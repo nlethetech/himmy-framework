@@ -62,10 +62,21 @@ def smtp_login_check(config: ToolkitConfig) -> None:
 def _httpx_webhook(
     url: str, payload: Any, headers: dict[str, str] | None, timeout: float
 ) -> int:
-    """Default :data:`WebhookCaller`: POST ``payload`` as JSON, return the status."""
+    """Default :data:`WebhookCaller`: POST ``payload`` as JSON, return the status.
+
+    The transport pins the DNS-vetted IP at connect time so the name ``send_webhook``
+    already passed through :func:`guard_url` can't rebind to an internal address
+    between that check and httpx's own resolution (the rebinding TOCTOU gap).
+    """
     import httpx
 
-    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+    from himmy.toolkit._net import build_pinned_transport
+
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=False,
+        transport=build_pinned_transport(),
+    ) as client:
         resp = client.post(url, json=payload, headers=headers)
         return resp.status_code
 

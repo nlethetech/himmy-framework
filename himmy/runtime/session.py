@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from himmy.agents.base_agent.thread import ChatThread
 from himmy.core.ids import utc_now_iso
@@ -21,6 +22,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at TEXT NOT NULL
 );
 """
+
+#: Max bound parameters per ``DELETE ... WHERE session_id IN (?, …)`` when pruning. SQLite
+#: caps a statement's host parameters at ``SQLITE_MAX_VARIABLE_NUMBER`` (999 on libsqlite
+#: < 3.32) and raises ``sqlite3.OperationalError: too many SQL variables`` past it, so a
+#: large doomed set is deleted in batches of this size rather than one oversized IN-list.
+_PRUNE_DELETE_CHUNK = 900
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,55 @@ class SqliteSessionStore:
                 )
             )
         return out
+
+    def prune(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete stale sessions, bounding the session store's unbounded growth.
+
+        Every REPL turn upserts the whole thread, so a session store grows without
+        bound across a long-lived deployment. This explicit, operator-invoked call
+        reclaims that space; nothing prunes automatically — callers must drive it from
+        their own ops job (the bundled ``scripts/ops_prune.py`` does so for the default
+        ``.himmy`` stores). Pass ``older_than_days`` to drop sessions not touched since the
+        cutoff (by ``updated_at``) and/or ``keep_last`` to keep only the N most recently
+        updated sessions. At least one bound must be given; a session is removed if it
+        fails EITHER bound. Returns the number of sessions deleted.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError("prune needs at least one of older_than_days / keep_last")
+        doomed: set[str] = set()
+        if older_than_days is not None:
+            cutoff = (
+                datetime.now(UTC) - timedelta(days=older_than_days)
+            ).isoformat()
+            rows = self._conn.execute(
+                "SELECT session_id FROM sessions WHERE updated_at < ?", (cutoff,)
+            ).fetchall()
+            doomed.update(r[0] for r in rows)
+        if keep_last is not None:
+            keep = max(int(keep_last), 0)
+            rows = self._conn.execute(
+                "SELECT session_id FROM sessions ORDER BY updated_at DESC "
+                "LIMIT -1 OFFSET ?",
+                (keep,),
+            ).fetchall()
+            doomed.update(r[0] for r in rows)
+        if not doomed:
+            return 0
+        # Delete in chunks so the IN-list never exceeds SQLITE_MAX_VARIABLE_NUMBER
+        # ("too many SQL variables"); all chunks commit together so a mid-prune failure
+        # leaves the store untouched rather than half-pruned.
+        ordered = sorted(doomed)
+        for start in range(0, len(ordered), _PRUNE_DELETE_CHUNK):
+            batch = ordered[start : start + _PRUNE_DELETE_CHUNK]
+            placeholders = ",".join("?" for _ in batch)
+            self._conn.execute(
+                f"DELETE FROM sessions WHERE session_id IN ({placeholders})",  # noqa: S608
+                tuple(batch),
+            )
+        self._conn.commit()
+        return len(doomed)
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""

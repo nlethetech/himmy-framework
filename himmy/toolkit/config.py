@@ -61,6 +61,11 @@ class ToolkitConfig(BaseModel):
     # telegram pack ---------------------------------------------------------
     telegram_bot_token: str | None = None
     telegram_default_chat_id: str | None = None
+    #: Sender/chat allowlist for the inbound bot loop (``HIMMY_TELEGRAM_ALLOWED_CHATS``,
+    #: comma-separated chat ids). Empty ⇒ the bot answers EVERY chat that messages it,
+    #: so set this for any bot reachable beyond a single trusted chat. Compared as
+    #: strings, so it matches both user chat ids and group ids.
+    telegram_allowed_chat_ids: list[str] = Field(default_factory=list)
 
     # code pack -------------------------------------------------------------
     sandbox_limits: SandboxLimits = Field(default_factory=SandboxLimits)
@@ -163,6 +168,11 @@ class ToolkitConfig(BaseModel):
             smtp_use_tls=_env_bool(env.get("HIMMY_SMTP_USE_TLS"), default=True),
             telegram_bot_token=get_secret("HIMMY_TELEGRAM_BOT_TOKEN"),
             telegram_default_chat_id=env.get("HIMMY_TELEGRAM_CHAT_ID"),
+            telegram_allowed_chat_ids=[
+                c.strip()
+                for c in (env.get("HIMMY_TELEGRAM_ALLOWED_CHATS") or "").split(",")
+                if c.strip()
+            ],
             code_exec=env.get("HIMMY_CODE_EXEC", "subprocess"),
             sandbox_image=env.get("HIMMY_SANDBOX_IMAGE", "python:3.12-slim"),
             sandbox_engine=env.get("HIMMY_SANDBOX_ENGINE", "docker"),

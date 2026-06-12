@@ -23,12 +23,14 @@ import asyncio
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from himmy.core.events import RunEvent
 from himmy.core.ids import utc_now_iso
 from himmy.core.sqlite_util import connect_hardened
+from himmy.services.storage.at_rest import StorePayloadCipher, build_store_cipher
 from himmy.services.storage.models import (
     ActionRecord,
     AgentStateRecord,
@@ -187,6 +189,52 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
     ON environment_states (environment_name, round);
 """
 
+#: Schema version of the base :data:`_SCHEMA` above (PRAGMA user_version after it is
+#: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
+#: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
+#: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
+SQLITE_SCHEMA_VERSION = 1
+
+#: Ordered forward migrations applied after the base DDL, mirroring the Postgres
+#: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
+#: ``(version, [statements...])`` and is applied exactly once, gated by
+#: ``PRAGMA user_version``: a database steps through every migration whose version
+#: exceeds its current ``user_version`` and is then stamped at the highest version.
+#: The convention is **frozen base + forward migrations** — :data:`_SCHEMA` is the
+#: version-1 shape and is NEVER edited in place, so a fresh database (``user_version``
+#: 0) lays down that frozen base and then runs *every* migration (version 2, 3, …)
+#: just like a legacy file would, converging to the exact same schema by either path.
+#: (Editing :data:`_SCHEMA` to add a column AND re-adding it via a migration would
+#: double-apply the ALTER and break fresh installs.) Append new entries here — never
+#: edit a shipped one — and bump :data:`SQLITE_SCHEMA_VERSION` to match the highest.
+_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ()
+
+#: Max bound parameters per ``DELETE ... WHERE seq IN (?, …)`` when pruning. SQLite caps
+#: a statement at ``SQLITE_MAX_VARIABLE_NUMBER`` host parameters (999 on libsqlite < 3.32,
+#: 32,766 after) and raises ``sqlite3.OperationalError: too many SQL variables`` past it —
+#: the first prune of a long-lived database can easily exceed that. The doomed seqs are
+#: deleted in batches of this size so the IN-list never overruns the lower historical
+#: limit, regardless of the linked SQLite version.
+_PRUNE_DELETE_CHUNK = 900
+
+
+def _chunked(items: list[int], size: int) -> Iterator[list[int]]:
+    """Yield ``items`` in contiguous slices of at most ``size`` (size >= 1)."""
+    step = max(int(size), 1)
+    for start in range(0, len(items), step):
+        yield items[start : start + step]
+
+
+class _Unset:
+    """Sentinel: ``cipher`` was not passed, so source it from the environment.
+
+    Distinct from an explicit ``cipher=None`` (which forces plaintext regardless of
+    ``HIMMY_ENCRYPTION_KEY``) so a caller can opt out even when a key is configured.
+    """
+
+
+_UNSET = _Unset()
+
 
 class SqliteStorageService:
     """A durable, file-backed SQLite storage backend mirroring ``StorageService`` 1:1.
@@ -199,7 +247,12 @@ class SqliteStorageService:
     :func:`asyncio.to_thread`, so the async surface never blocks the event loop.
     """
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        cipher: StorePayloadCipher | None | _Unset = _UNSET,
+    ) -> None:
         """Open (or create) the SQLite database at ``path`` and apply the schema.
 
         ``path``'s parent directory is created when it does not exist, so a default
@@ -207,6 +260,12 @@ class SqliteStorageService:
         ephemeral use (the connection is shared, so the in-memory DB persists for the
         lifetime of the instance). A process-wide lock serializes writes so concurrent
         ``asyncio.to_thread`` workers can share the single connection safely.
+
+        ``cipher`` controls field encryption at rest for the sensitive payloads (message
+        content + run-event payloads). It defaults to :func:`build_store_cipher`, which is
+        ``None`` (plaintext, offline path unchanged) unless ``HIMMY_ENCRYPTION_KEY`` /
+        ``HIMMY_KEK_PROVIDER`` is configured; pass an explicit cipher (or ``None``) to
+        override.
         """
         self._path = str(path)
         if self._path != ":memory:":
@@ -215,9 +274,50 @@ class SqliteStorageService:
             )
         self._conn = connect_hardened(self._path)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
         self._lock = threading.Lock()
+        self._apply_schema()
+        self._cipher = build_store_cipher() if isinstance(cipher, _Unset) else cipher
+
+    def _apply_schema(self) -> None:
+        """Create/upgrade the schema and stamp ``PRAGMA user_version`` (idempotent).
+
+        The base :data:`_SCHEMA` is ``CREATE ... IF NOT EXISTS`` so it is a no-op on an
+        already-provisioned database — but that means a new column added in a later
+        release would *never* reach an existing file, and the first INSERT naming it
+        would raise. To evolve safely, a ``PRAGMA user_version`` records the applied
+        schema version: a fresh database (version 0, no tables) gets the frozen base DDL
+        and an existing database does not, but BOTH then step through every entry in
+        :data:`_MIGRATIONS` whose version exceeds the stored ``user_version`` (so a fresh
+        db at version 0 runs every migration, converging to the same schema a legacy file
+        reaches) and the highest known version is stamped at the end. The whole upgrade
+        runs under the write lock so concurrent workers/processes sharing the file can't
+        double-apply a step.
+        """
+        with self._lock:
+            current = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            try:
+                if current == 0:
+                    # Either a brand-new database, OR a legacy file written before
+                    # versioning existed (user_version defaults to 0). Re-running the
+                    # idempotent base DDL is safe in both cases.
+                    self._conn.executescript(_SCHEMA)
+                for version, statements in sorted(_MIGRATIONS):
+                    if version > current:
+                        for statement in statements:
+                            self._conn.execute(statement)  # noqa: S608 - constant DDL
+                # Stamp the highest known version (PRAGMA cannot be parameterised).
+                target = max(SQLITE_SCHEMA_VERSION, current)
+                self._conn.execute(f"PRAGMA user_version = {int(target)}")
+                self._conn.commit()
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    @property
+    def schema_version(self) -> int:
+        """The applied schema version (``PRAGMA user_version``) of the backing file."""
+        with self._lock:
+            return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
 
     @property
     def path(self) -> str:
@@ -283,18 +383,23 @@ class SqliteStorageService:
 
     # ------------------------------------------------------------------ threads
     async def save_thread(self, thread: ChatThread) -> ChatThread:
-        """Upsert a chat thread keyed by ``thread_id``."""
+        """Upsert a chat thread keyed by ``thread_id`` (message content encrypted)."""
+        payload = thread.model_dump(mode="json")
+        if self._cipher is not None:
+            payload = self._cipher.encrypt_thread_payload(
+                payload, thread_id=thread.thread_id
+            )
         await asyncio.to_thread(
             self._write,
             "INSERT INTO chat_threads (thread_id, payload, updated_at) "
             "VALUES (?, ?, ?) ON CONFLICT (thread_id) DO UPDATE SET "
             "payload = excluded.payload, updated_at = excluded.updated_at",
-            (thread.thread_id, self._dump(thread), utc_now_iso()),
+            (thread.thread_id, json.dumps(payload), utc_now_iso()),
         )
         return thread
 
     async def load_thread(self, thread_id: str) -> ChatThread | None:
-        """Return a stored chat thread by id, or None."""
+        """Return a stored chat thread by id, or None (message content decrypted)."""
         from himmy.agents.base_agent.thread import ChatThread
 
         row = await asyncio.to_thread(
@@ -302,7 +407,12 @@ class SqliteStorageService:
             "SELECT payload FROM chat_threads WHERE thread_id = ?",
             (thread_id,),
         )
-        return ChatThread.model_validate(json.loads(row["payload"])) if row else None
+        if row is None:
+            return None
+        payload = json.loads(row["payload"])
+        if self._cipher is not None:
+            payload = self._cipher.decrypt_thread_payload(payload, thread_id=thread_id)
+        return ChatThread.model_validate(payload)
 
     # ------------------------------------------------------------------- events
     async def append_event(self, event: RunEvent) -> None:
@@ -312,6 +422,11 @@ class SqliteStorageService:
         Postgres ``ON CONFLICT (event_id) DO NOTHING``. Insertion order is preserved
         by the autoincrement ``seq`` column.
         """
+        record = event.model_dump(mode="json")
+        if self._cipher is not None:
+            record["payload"] = self._cipher.encrypt_event_payload(
+                record.get("payload") or {}, event_id=event.event_id
+            )
         await asyncio.to_thread(
             self._write,
             "INSERT INTO run_events (event_id, thread_id, trace_id, payload) "
@@ -320,7 +435,7 @@ class SqliteStorageService:
                 event.event_id,
                 event.thread_id,
                 event.trace_id,
-                json.dumps(event.model_dump(mode="json")),
+                json.dumps(record),
             ),
         )
 
@@ -342,7 +457,99 @@ class SqliteStorageService:
             f"SELECT payload FROM run_events{where} ORDER BY seq ASC",  # noqa: S608
             tuple(params),
         )
-        return [RunEvent.model_validate(json.loads(r["payload"])) for r in rows]
+        return [self._row_to_event(json.loads(r["payload"])) for r in rows]
+
+    async def prune_events(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old run events, bounding the audit stream's unbounded growth.
+
+        Returns the number of rows deleted. This is an explicit, operator-invoked
+        retention call — nothing deletes automatically. Callers must drive it from
+        their own ops job; the bundled ``scripts/ops_prune.py`` does exactly this for
+        the default ``.himmy`` stores. The default policy is conservative: pass
+        ``older_than_days`` to drop events whose recorded ``timestamp`` is older than the
+        cutoff, and/or ``keep_last`` to additionally cap the stream to the N most recent
+        events by insertion order (``seq``). At least one bound must be given; both may
+        be combined (a row is pruned if it fails EITHER bound). The recommended starting
+        policy for a long-lived Studio server is ``older_than_days=90`` run periodically.
+
+        ``older_than_days`` reads each candidate row's ISO ``timestamp`` from the stored
+        payload (decrypting first when at-rest encryption is on), so it is correct
+        regardless of clock skew between writers; ``keep_last`` is a pure ``seq`` cap and
+        never decrypts. The delete runs under the write lock as a single statement set.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_events needs at least one of older_than_days / keep_last"
+            )
+        return await asyncio.to_thread(self._prune_events_sync, older_than_days, keep_last)
+
+    def _prune_events_sync(
+        self, older_than_days: float | None, keep_last: int | None
+    ) -> int:
+        """The locked delete for :meth:`prune_events` (returns rows removed)."""
+        from datetime import datetime, timedelta
+
+        doomed: set[int] = set()
+        with self._lock:
+            try:
+                if older_than_days is not None:
+                    cutoff = datetime.now().astimezone() - timedelta(days=older_than_days)
+                    rows = self._conn.execute(
+                        "SELECT seq, payload FROM run_events ORDER BY seq ASC"
+                    ).fetchall()
+                    for row in rows:
+                        ts = self._event_timestamp(json.loads(row["payload"]))
+                        if ts is not None and ts < cutoff:
+                            doomed.add(int(row["seq"]))
+                if keep_last is not None:
+                    keep = max(int(keep_last), 0)
+                    over = self._conn.execute(
+                        "SELECT seq FROM run_events ORDER BY seq DESC LIMIT -1 OFFSET ?",
+                        (keep,),
+                    ).fetchall()
+                    doomed.update(int(r["seq"]) for r in over)
+                if not doomed:
+                    return 0
+                # Delete in chunks so the bound-parameter IN-list never exceeds
+                # SQLITE_MAX_VARIABLE_NUMBER (which raises "too many SQL variables").
+                # The whole prune is one transaction: all chunks commit together, so a
+                # failure midway leaves the stream untouched rather than half-pruned.
+                ordered = sorted(doomed)
+                for batch in _chunked(ordered, _PRUNE_DELETE_CHUNK):
+                    placeholders = ",".join("?" for _ in batch)
+                    self._conn.execute(
+                        f"DELETE FROM run_events WHERE seq IN ({placeholders})",  # noqa: S608
+                        tuple(batch),
+                    )
+                self._conn.commit()
+                return len(doomed)
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    def _event_timestamp(self, record: dict[str, Any]) -> Any:
+        """Parse a stored event's ISO ``timestamp`` to an aware datetime, or None."""
+        from datetime import datetime
+
+        raw = record.get("timestamp")
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:  # pragma: no cover - malformed legacy timestamp
+            return None
+        return parsed if parsed.tzinfo else parsed.astimezone()
+
+    def _row_to_event(self, record: dict[str, Any]) -> RunEvent:
+        """Reconstruct a ``RunEvent``, decrypting its payload envelope when present."""
+        if self._cipher is not None:
+            record = dict(record)
+            record["payload"] = self._cipher.decrypt_event_payload(
+                record.get("payload") or {}, event_id=str(record.get("event_id", ""))
+            )
+        return RunEvent.model_validate(record)
 
     # ------------------------------------------------------------------ context
     async def save_context_field(self, field: ContextField) -> ContextField:
@@ -944,4 +1151,4 @@ def _row_to_recommendation(row: sqlite3.Row) -> RecommendationItem:
     return RecommendationItem.model_validate(json.loads(row["payload"]))
 
 
-__all__ = ["SqliteStorageService"]
+__all__ = ["SqliteStorageService", "SQLITE_SCHEMA_VERSION"]

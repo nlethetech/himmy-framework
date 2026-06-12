@@ -158,3 +158,53 @@ def test_fetch_latest_macro_workbook_auto_discovers() -> None:
     workbook = NRBClient(fetcher=fetcher).fetch_latest_macro_workbook()
     assert workbook is not None
     assert workbook.sheet_names()
+
+
+# --------------------------------------------------------- zip-bomb (DoS) guard
+
+
+def _zip_bomb(declared_uncompressed: int) -> bytes:
+    """A tiny zip (PK magic) whose member DECLARES a huge uncompressed size.
+
+    Highly compressible (all-zero) content makes the stored bytes tiny while the
+    central-directory ``file_size`` is large — exactly the shape of a zip bomb, so
+    the guard must reject it on the declared size without inflating anything.
+    """
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("xl/sharedStrings.xml", b"\x00" * declared_uncompressed)
+    payload = buffer.getvalue()
+    assert payload[:4] == b"PK\x03\x04"
+    return payload
+
+
+def test_parse_workbook_rejects_zip_bomb() -> None:
+    """A small .xlsx declaring a huge decompressed member is refused before parsing."""
+    from himmy.connectors import nrb
+
+    bomb = _zip_bomb(64 * 1024)  # stays tiny compressed; 64KB uncompressed
+    assert len(bomb) < 4096  # the compressed download cap would NOT have caught it
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(nrb, "_MAX_WORKBOOK_UNCOMPRESSED_BYTES", 1024)
+        with pytest.raises(HimmyError, match="zip bomb"):
+            NRBClient.parse_workbook(bomb)
+
+
+def test_parse_workbook_zip_bomb_member_guard_independent_of_total() -> None:
+    """A single oversize member trips the guard even on its own (per-member bound)."""
+    from himmy.connectors import nrb
+
+    bomb = _zip_bomb(8 * 1024)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(nrb, "_MAX_WORKBOOK_UNCOMPRESSED_BYTES", 2048)
+        with pytest.raises(HimmyError, match="zip bomb"):
+            nrb._guard_decompressed_size(bomb)
+
+
+def test_parse_workbook_allows_normal_workbook_under_cap() -> None:
+    """A legitimate (small) workbook still parses — the guard is a ceiling, not a floor."""
+    data = _xlsx([["Indicator", "Value"], ["CPI", 105.2]])
+    workbook = NRBClient.parse_workbook(data)  # default cap is generous
+    assert workbook.sheets["Macro"][1][0] == "CPI"

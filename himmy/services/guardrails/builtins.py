@@ -177,6 +177,15 @@ class InjectionGuardrail:
             flags=["injection"],
         )
 
+    def suppresses_output_content(self) -> bool:
+        """True when a detection BLOCKS (``block=True``): the text is withheld.
+
+        A blocking injection guard on the output stage must run before any token is
+        streamed — guard-after cannot recall an already-streamed answer. A flag-only
+        guard (``block=False``) leaves the text intact, so it is safe to apply after.
+        """
+        return self._block
+
 
 class BlocklistGuardrail:
     """Blocks text matching any configured (case-insensitive) substring/pattern."""
@@ -199,6 +208,14 @@ class BlocklistGuardrail:
                     flags=[self.name],
                 )
         return GuardrailVerdict(allowed=True, text=text)
+
+    def suppresses_output_content(self) -> bool:
+        """Always True: a blocklist withholds matched content, never redacts it.
+
+        On the output stage that means tokens must NOT be streamed before the
+        blocklist runs — an already-streamed banned phrase cannot be recalled.
+        """
+        return True
 
 
 _NEPAL_PII_RULES: list[PIIRule] = [
