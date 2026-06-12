@@ -60,10 +60,51 @@ else
 fi
 
 # --- 4. drop compose files in place ------------------------------------------
+# Idempotent upgrade-in-place: NEVER blow away an existing deploy/compose, because
+# the operator's provisioned secrets live there (deploy/compose/.env and
+# deploy/compose/secrets/ — see next-steps below). A naive `rm -rf deploy/compose`
+# on a re-run would delete the live Postgres password and HIMMY_ENCRYPTION_KEY; if
+# the KEK had no other copy, every encrypted-at-rest field becomes permanently
+# unreadable — on exactly the air-gapped sites with the fewest recovery options.
+# Instead we copy the bundled compose files item-by-item and preserve .env/secrets/.
 log "==> installing compose files"
-mkdir -p deploy
-rm -rf deploy/compose
-cp -R compose deploy/compose
+mkdir -p deploy/compose
+
+# Back up an existing install (excluding the operator's secrets, which we keep in
+# place) so a botched copy is recoverable, then refresh the bundled files.
+if [ -e deploy/compose/docker-compose.yml ]; then
+    backup="deploy/compose.bak-$(date +%Y%m%dT%H%M%SZ)"
+    log "    existing install found — backing up to $backup (secrets preserved in place)"
+    cp -R deploy/compose "$backup"
+fi
+
+# Copy every bundled file EXCEPT a top-level .env or the secrets/ dir, so an existing
+# provisioned .env / secrets/ is never clobbered. New/changed compose files are
+# refreshed; operator-owned files are left untouched.
+for src in compose/*; do
+    [ -e "$src" ] || continue   # empty glob guard
+    base=$(basename "$src")
+    case "$base" in
+        .env|secrets)
+            # Only seed these from the bundle if the operator has NOT provisioned
+            # them yet; never overwrite an existing one.
+            if [ ! -e "deploy/compose/$base" ]; then
+                cp -R "$src" "deploy/compose/$base"
+                log "    seeded deploy/compose/$base (was absent)"
+            else
+                log "    kept existing deploy/compose/$base (not overwritten)"
+            fi
+            ;;
+        *)
+            rm -rf "deploy/compose/$base"
+            cp -R "$src" "deploy/compose/$base"
+            ;;
+    esac
+done
+# Also copy any bundled dotfiles like .env.example that the glob above skips.
+for hidden in compose/.env.example; do
+    [ -e "$hidden" ] && cp "$hidden" "deploy/compose/$(basename "$hidden")"
+done
 log "    compose files at ./deploy/compose"
 
 # --- 5. next steps -----------------------------------------------------------

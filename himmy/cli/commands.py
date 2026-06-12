@@ -740,7 +740,21 @@ def cmd_telegram(args: argparse.Namespace) -> int:
         threads[chat_id] = result.thread
         return result.output_text or ""
 
-    bot = TelegramBot(TelegramClient(token, timeout=cfg.http_timeout + 30), _handle)
+    # Sender allowlist: --allow-chat flags win over HIMMY_TELEGRAM_ALLOWED_CHATS; an
+    # empty allowlist keeps the answer-everyone behaviour for a private single-chat bot.
+    allowed_chat_ids = getattr(args, "allow_chat", None) or cfg.telegram_allowed_chat_ids
+    bot = TelegramBot(
+        TelegramClient(token, timeout=cfg.http_timeout + 30),
+        _handle,
+        allowed_chat_ids=allowed_chat_ids,
+    )
+    if allowed_chat_ids:
+        _eprint(f"  (restricted to chat ids: {', '.join(allowed_chat_ids)})")
+    else:
+        _eprint(
+            "  (no chat allowlist — set HIMMY_TELEGRAM_ALLOWED_CHATS or --allow-chat "
+            "to restrict who can drive the bot)"
+        )
     _eprint(f"himmy telegram — {persona.name} is live. Ctrl-C to stop.")
 
     async def _serve() -> None:

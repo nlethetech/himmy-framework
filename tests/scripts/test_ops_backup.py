@@ -48,12 +48,15 @@ def _count(path: Path) -> int:
         conn.close()
 
 
-def _backup_args(store: Path, secrets: Path, out: Path) -> argparse.Namespace:
+def _backup_args(
+    store: Path, secrets: Path, out: Path, *, include_secrets: bool = False
+) -> argparse.Namespace:
     return argparse.Namespace(
         store_path=str(store / "storage.db"),
         secrets_dir=str(secrets),
         out=str(out),
         dsn=None,
+        include_secrets=include_secrets,
         func=ops.cmd_backup,
     )
 
@@ -80,17 +83,18 @@ def test_backup_restore_round_trip(tmp_path: Path) -> None:
     secrets.mkdir(parents=True)
     (secrets / "postgres_password").write_text("hunter2\n", encoding="utf-8")
 
-    assert ops.cmd_backup(_backup_args(store, secrets, out)) == 0
+    assert ops.cmd_backup(_backup_args(store, secrets, out, include_secrets=True)) == 0
     archives = list(out.glob("himmy-backup-*.tar.gz"))
     assert len(archives) == 1
     archive = archives[0]
 
-    # manifest is present + checksums recorded for every db + secret
+    # manifest is present + checksums recorded for every db + secret (opted in)
     with tarfile.open(archive) as tar:
         manifest = json.loads(tar.extractfile("manifest.json").read())  # type: ignore[union-attr]
     names = {f["name"] for f in manifest["files"]}
     assert {"storage.db", "memory.db", "secrets/postgres_password"} <= names
     assert manifest["schema_version"] == 1
+    assert manifest["secrets_included"] is True
 
     # wipe and restore into a fresh store dir
     restore_store = tmp_path / "restored"
@@ -226,6 +230,45 @@ def test_restore_rejects_unsafe_manifest_paths(tmp_path: Path) -> None:
     assert "unsafe manifest path" in str(exc.value)
     # Nothing should have been written outside the target.
     assert not (tmp_path / "escape.db").exists()
+
+
+def test_backup_excludes_secrets_by_default(tmp_path: Path) -> None:
+    """The KEK / DB password are NOT bundled unless --include-secrets is passed."""
+    store = tmp_path / ".himmy"
+    secrets = store / "secrets"
+    out = tmp_path / "out"
+    _make_db(store / "storage.db", wal=False, rows=2)
+    secrets.mkdir(parents=True)
+    (secrets / "HIMMY_ENCRYPTION_KEY").write_text("kek\n", encoding="utf-8")
+    (secrets / "postgres_password").write_text("pw\n", encoding="utf-8")
+
+    assert ops.cmd_backup(_backup_args(store, secrets, out)) == 0
+    archive = next(out.glob("himmy-backup-*.tar.gz"))
+    with tarfile.open(archive) as tar:
+        members = set(tar.getnames())
+        manifest = json.loads(tar.extractfile("manifest.json").read())  # type: ignore[union-attr]
+    # No secret bytes anywhere in the archive (members or manifest), and the data IS.
+    assert not any(n.startswith("secrets/") for n in members), members
+    names = {f["name"] for f in manifest["files"]}
+    assert not any(n.startswith("secrets/") for n in names), names
+    assert "storage.db" in names
+    assert manifest["secrets_included"] is False
+
+
+def test_backup_archive_is_owner_only(tmp_path: Path) -> None:
+    """The archive is created 0600 so it isn't world-readable on a shared host."""
+    import stat
+
+    store = tmp_path / ".himmy"
+    secrets = store / "secrets"
+    out = tmp_path / "out"
+    _make_db(store / "storage.db", wal=False, rows=1)
+    secrets.mkdir(parents=True)
+
+    assert ops.cmd_backup(_backup_args(store, secrets, out)) == 0
+    archive = next(out.glob("himmy-backup-*.tar.gz"))
+    mode = stat.S_IMODE(archive.stat().st_mode)
+    assert mode == 0o600, oct(mode)
 
 
 def test_restore_rejects_checksum_tamper(tmp_path: Path) -> None:

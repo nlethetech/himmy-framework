@@ -23,6 +23,7 @@ import asyncio
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -188,6 +189,41 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
     ON environment_states (environment_name, round);
 """
 
+#: Schema version of the base :data:`_SCHEMA` above (PRAGMA user_version after it is
+#: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
+#: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
+#: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
+SQLITE_SCHEMA_VERSION = 1
+
+#: Ordered forward migrations applied after the base DDL, mirroring the Postgres
+#: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
+#: ``(version, [statements...])`` and is applied exactly once, gated by
+#: ``PRAGMA user_version``: a database steps through every migration whose version
+#: exceeds its current ``user_version`` and is then stamped at the highest version.
+#: The convention is **frozen base + forward migrations** — :data:`_SCHEMA` is the
+#: version-1 shape and is NEVER edited in place, so a fresh database (``user_version``
+#: 0) lays down that frozen base and then runs *every* migration (version 2, 3, …)
+#: just like a legacy file would, converging to the exact same schema by either path.
+#: (Editing :data:`_SCHEMA` to add a column AND re-adding it via a migration would
+#: double-apply the ALTER and break fresh installs.) Append new entries here — never
+#: edit a shipped one — and bump :data:`SQLITE_SCHEMA_VERSION` to match the highest.
+_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ()
+
+#: Max bound parameters per ``DELETE ... WHERE seq IN (?, …)`` when pruning. SQLite caps
+#: a statement at ``SQLITE_MAX_VARIABLE_NUMBER`` host parameters (999 on libsqlite < 3.32,
+#: 32,766 after) and raises ``sqlite3.OperationalError: too many SQL variables`` past it —
+#: the first prune of a long-lived database can easily exceed that. The doomed seqs are
+#: deleted in batches of this size so the IN-list never overruns the lower historical
+#: limit, regardless of the linked SQLite version.
+_PRUNE_DELETE_CHUNK = 900
+
+
+def _chunked(items: list[int], size: int) -> Iterator[list[int]]:
+    """Yield ``items`` in contiguous slices of at most ``size`` (size >= 1)."""
+    step = max(int(size), 1)
+    for start in range(0, len(items), step):
+        yield items[start : start + step]
+
 
 class _Unset:
     """Sentinel: ``cipher`` was not passed, so source it from the environment.
@@ -238,10 +274,50 @@ class SqliteStorageService:
             )
         self._conn = connect_hardened(self._path)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
         self._lock = threading.Lock()
+        self._apply_schema()
         self._cipher = build_store_cipher() if isinstance(cipher, _Unset) else cipher
+
+    def _apply_schema(self) -> None:
+        """Create/upgrade the schema and stamp ``PRAGMA user_version`` (idempotent).
+
+        The base :data:`_SCHEMA` is ``CREATE ... IF NOT EXISTS`` so it is a no-op on an
+        already-provisioned database — but that means a new column added in a later
+        release would *never* reach an existing file, and the first INSERT naming it
+        would raise. To evolve safely, a ``PRAGMA user_version`` records the applied
+        schema version: a fresh database (version 0, no tables) gets the frozen base DDL
+        and an existing database does not, but BOTH then step through every entry in
+        :data:`_MIGRATIONS` whose version exceeds the stored ``user_version`` (so a fresh
+        db at version 0 runs every migration, converging to the same schema a legacy file
+        reaches) and the highest known version is stamped at the end. The whole upgrade
+        runs under the write lock so concurrent workers/processes sharing the file can't
+        double-apply a step.
+        """
+        with self._lock:
+            current = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            try:
+                if current == 0:
+                    # Either a brand-new database, OR a legacy file written before
+                    # versioning existed (user_version defaults to 0). Re-running the
+                    # idempotent base DDL is safe in both cases.
+                    self._conn.executescript(_SCHEMA)
+                for version, statements in sorted(_MIGRATIONS):
+                    if version > current:
+                        for statement in statements:
+                            self._conn.execute(statement)  # noqa: S608 - constant DDL
+                # Stamp the highest known version (PRAGMA cannot be parameterised).
+                target = max(SQLITE_SCHEMA_VERSION, current)
+                self._conn.execute(f"PRAGMA user_version = {int(target)}")
+                self._conn.commit()
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    @property
+    def schema_version(self) -> int:
+        """The applied schema version (``PRAGMA user_version``) of the backing file."""
+        with self._lock:
+            return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
 
     @property
     def path(self) -> str:
@@ -382,6 +458,89 @@ class SqliteStorageService:
             tuple(params),
         )
         return [self._row_to_event(json.loads(r["payload"])) for r in rows]
+
+    async def prune_events(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old run events, bounding the audit stream's unbounded growth.
+
+        Returns the number of rows deleted. This is an explicit, operator-invoked
+        retention call — nothing deletes automatically. Callers must drive it from
+        their own ops job; the bundled ``scripts/ops_prune.py`` does exactly this for
+        the default ``.himmy`` stores. The default policy is conservative: pass
+        ``older_than_days`` to drop events whose recorded ``timestamp`` is older than the
+        cutoff, and/or ``keep_last`` to additionally cap the stream to the N most recent
+        events by insertion order (``seq``). At least one bound must be given; both may
+        be combined (a row is pruned if it fails EITHER bound). The recommended starting
+        policy for a long-lived Studio server is ``older_than_days=90`` run periodically.
+
+        ``older_than_days`` reads each candidate row's ISO ``timestamp`` from the stored
+        payload (decrypting first when at-rest encryption is on), so it is correct
+        regardless of clock skew between writers; ``keep_last`` is a pure ``seq`` cap and
+        never decrypts. The delete runs under the write lock as a single statement set.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_events needs at least one of older_than_days / keep_last"
+            )
+        return await asyncio.to_thread(self._prune_events_sync, older_than_days, keep_last)
+
+    def _prune_events_sync(
+        self, older_than_days: float | None, keep_last: int | None
+    ) -> int:
+        """The locked delete for :meth:`prune_events` (returns rows removed)."""
+        from datetime import datetime, timedelta
+
+        doomed: set[int] = set()
+        with self._lock:
+            try:
+                if older_than_days is not None:
+                    cutoff = datetime.now().astimezone() - timedelta(days=older_than_days)
+                    rows = self._conn.execute(
+                        "SELECT seq, payload FROM run_events ORDER BY seq ASC"
+                    ).fetchall()
+                    for row in rows:
+                        ts = self._event_timestamp(json.loads(row["payload"]))
+                        if ts is not None and ts < cutoff:
+                            doomed.add(int(row["seq"]))
+                if keep_last is not None:
+                    keep = max(int(keep_last), 0)
+                    over = self._conn.execute(
+                        "SELECT seq FROM run_events ORDER BY seq DESC LIMIT -1 OFFSET ?",
+                        (keep,),
+                    ).fetchall()
+                    doomed.update(int(r["seq"]) for r in over)
+                if not doomed:
+                    return 0
+                # Delete in chunks so the bound-parameter IN-list never exceeds
+                # SQLITE_MAX_VARIABLE_NUMBER (which raises "too many SQL variables").
+                # The whole prune is one transaction: all chunks commit together, so a
+                # failure midway leaves the stream untouched rather than half-pruned.
+                ordered = sorted(doomed)
+                for batch in _chunked(ordered, _PRUNE_DELETE_CHUNK):
+                    placeholders = ",".join("?" for _ in batch)
+                    self._conn.execute(
+                        f"DELETE FROM run_events WHERE seq IN ({placeholders})",  # noqa: S608
+                        tuple(batch),
+                    )
+                self._conn.commit()
+                return len(doomed)
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    def _event_timestamp(self, record: dict[str, Any]) -> Any:
+        """Parse a stored event's ISO ``timestamp`` to an aware datetime, or None."""
+        from datetime import datetime
+
+        raw = record.get("timestamp")
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:  # pragma: no cover - malformed legacy timestamp
+            return None
+        return parsed if parsed.tzinfo else parsed.astimezone()
 
     def _row_to_event(self, record: dict[str, Any]) -> RunEvent:
         """Reconstruct a ``RunEvent``, decrypting its payload envelope when present."""
@@ -992,4 +1151,4 @@ def _row_to_recommendation(row: sqlite3.Row) -> RecommendationItem:
     return RecommendationItem.model_validate(json.loads(row["payload"]))
 
 
-__all__ = ["SqliteStorageService"]
+__all__ = ["SqliteStorageService", "SQLITE_SCHEMA_VERSION"]

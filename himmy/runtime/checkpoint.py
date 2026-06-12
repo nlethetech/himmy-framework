@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -364,6 +365,29 @@ class SqliteGraphCheckpointStore:
             for r in rows
         ]
 
+    def prune_terminal(self, *, older_than_days: float = 30.0) -> int:
+        """Delete terminal (completed/failed) graph checkpoints older than the cutoff.
+
+        Like :meth:`SqliteCheckpointStore.prune_resolved`, this is an explicit
+        operator-invoked retention call. ONLY ``completed``/``failed`` rows are eligible;
+        a ``running``/``interrupted`` checkpoint is resumable work and is never deleted.
+        Returns the number of rows removed.
+        """
+        cutoff = (
+            datetime.now(UTC) - timedelta(days=older_than_days)
+        ).isoformat()
+        try:
+            cur = self._conn.execute(
+                "DELETE FROM graph_checkpoints "
+                "WHERE status IN (?, ?) AND updated_at < ?",
+                (GRAPH_COMPLETED, GRAPH_FAILED, cutoff),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return cur.rowcount
+
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
         self._conn.close()
@@ -452,6 +476,33 @@ class SqliteCheckpointStore:
             AgentCheckpoint.model_validate(_migrate_checkpoint(json.loads(r[0])))
             for r in rows
         ]
+
+    def prune_resolved(self, *, older_than_days: float = 30.0) -> int:
+        """Delete resolved (approved/rejected) checkpoints older than the cutoff.
+
+        Resolved checkpoints carry the full serialized persona/task/thread/ctx per row
+        and accumulate forever, so a long-lived approvals DB grows without bound. This
+        explicit, operator-invoked call reclaims that space; nothing prunes
+        automatically — callers must drive it from their own ops job (the bundled
+        ``scripts/ops_prune.py`` does so for the default ``.himmy`` stores). ONLY terminal
+        ``approved``/``rejected`` rows are eligible — an ``awaiting_approval``/
+        ``resolving`` checkpoint is live work and is never deleted regardless of age.
+        Returns the number of rows removed.
+        """
+        cutoff = (
+            datetime.now(UTC) - timedelta(days=older_than_days)
+        ).isoformat()
+        try:
+            cur = self._conn.execute(
+                "DELETE FROM agent_checkpoints "
+                "WHERE status IN (?, ?) AND created_at < ?",
+                (APPROVED, REJECTED, cutoff),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return cur.rowcount
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""

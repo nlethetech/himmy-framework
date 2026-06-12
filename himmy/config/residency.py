@@ -46,13 +46,33 @@ def region_allowed(region: str | None) -> bool:
     return region in allowed_regions()
 
 
-def enforce_region(region: str | None) -> None:
-    """Raise :class:`ResidencyError` when ``region`` violates the residency policy."""
+def enforce_region(region: str | None, *, context: str | None = None) -> None:
+    """Raise :class:`ResidencyError` when ``region`` violates the residency policy.
+
+    ``context`` names the boundary being checked (e.g. ``"storage"``/``"inference"``)
+    so the error points the operator at the offending knob; it is otherwise inert when
+    residency is not pinned.
+    """
     if not region_allowed(region):
+        where = f"{context}: " if context else ""
         raise ResidencyError(
-            f"data residency: region {region!r} is not allowed "
+            f"data residency: {where}region {region!r} is not allowed "
             f"(home={current_region()!r}, allowed={sorted(allowed_regions())})"
         )
+
+
+def storage_region() -> str | None:
+    """The region the durable store is pinned to (``HIMMY_STORE_REGION``), or None.
+
+    Defaults to the home region (``HIMMY_REGION``) when unset, so a single
+    ``HIMMY_REGION=eu`` keeps storage in-region without a second variable; set
+    ``HIMMY_STORE_REGION`` explicitly when the database lives in a different region than
+    the deployment home (it must still be inside ``HIMMY_ALLOWED_REGIONS``).
+    """
+    explicit = os.environ.get("HIMMY_STORE_REGION")
+    if explicit and explicit.strip():
+        return explicit.strip()
+    return current_region()
 
 
 __all__ = [
@@ -61,4 +81,5 @@ __all__ = [
     "allowed_regions",
     "region_allowed",
     "enforce_region",
+    "storage_region",
 ]

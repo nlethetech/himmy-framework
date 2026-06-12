@@ -6,7 +6,13 @@ the secrets files that decrypt/authenticate them. Copying a live ``.db`` with th
 filesystem is unsafe — a WAL-mode database has uncommitted pages in a side file —
 so this tool uses the SQLite online-backup API (``src.backup(dst)``) to snapshot
 each database consistently while the server keeps running, then bundles the
-snapshots + secrets + a checksummed ``manifest.json`` into one ``tar.gz``.
+snapshots + a checksummed ``manifest.json`` into one ``tar.gz`` (mode 0600).
+
+The secrets directory (the encryption KEK + Postgres password) is EXCLUDED by
+default: bundling it next to the data would let anyone who reads the archive decrypt
+every encrypted-at-rest field, so the KEK must be backed up SEPARATELY (store it in a
+secrets manager / offline, not on the same /backups mount). ``--include-secrets`` opts
+back in for an air-gapped, separately-encrypted archive only.
 
 ``restore`` is deliberately paranoid: it verifies every file's SHA-256 against the
 manifest before writing anything, and REFUSES to overwrite a store directory that
@@ -162,7 +168,13 @@ def cmd_backup(args: argparse.Namespace) -> int:
                 )
 
         # 3. Secrets directory (preserve under a secrets/ subtree).
-        if secrets_dir.is_dir():
+        #    EXCLUDED BY DEFAULT: this dir holds the encryption KEK and the Postgres
+        #    password. Bundling them next to the data means anyone who reads the backup
+        #    (a shared /backups mount, a backup server operator) gets the key that
+        #    decrypts every encrypted-at-rest field — encryption-at-rest is undone by
+        #    possession of one tar.gz. Store the KEK separately and only opt in with
+        #    --include-secrets for an air-gapped, separately-protected archive.
+        if args.include_secrets and secrets_dir.is_dir():
             for secret in sorted(secrets_dir.iterdir()):
                 if secret.is_file():
                     rel = Path("secrets") / secret.name
@@ -176,6 +188,17 @@ def cmd_backup(args: argparse.Namespace) -> int:
                             "bytes": dst.stat().st_size,
                         }
                     )
+            _eprint(
+                "  WARNING: --include-secrets bundled the KEK/DB password into the "
+                "archive — store it encrypted with restricted access (it is as "
+                "sensitive as the KEK itself)."
+            )
+        elif secrets_dir.is_dir():
+            _eprint(
+                "  secrets EXCLUDED (default) — back up .himmy/secrets separately; "
+                "the data archive is useless without the KEK, which is the point. "
+                "Pass --include-secrets to bundle them anyway."
+            )
 
         # 4. Optional Postgres dump.
         pg: dict[str, Any] = {"included": False, "reason": "no DSN configured"}
@@ -200,6 +223,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
             "schema_version": _schema_version(),
             "files": files_meta,
             "postgres": pg,
+            "secrets_included": bool(args.include_secrets),
         }
         (staging / _MANIFEST_NAME).write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
@@ -210,6 +234,9 @@ def cmd_backup(args: argparse.Namespace) -> int:
             for item in sorted(staging.rglob("*")):
                 if item.is_file():
                     tar.add(item, arcname=str(item.relative_to(staging)))
+        # The archive can hold the entire database (and, with --include-secrets, the
+        # KEK). Restrict it to the owner so it isn't world-readable on a shared host.
+        os.chmod(archive, 0o600)
         print(str(archive))
         _eprint(f"backup complete: {len(files_meta)} file(s) -> {archive}")
         return 0
@@ -334,6 +361,13 @@ def main(argv: list[str] | None = None) -> int:
     p_backup = sub.add_parser("backup", help="snapshot the durable state to a tar.gz")
     p_backup.add_argument("--store-path", default=_DEFAULT_STORE_PATH)
     p_backup.add_argument("--secrets-dir", default=_DEFAULT_SECRETS_DIR)
+    p_backup.add_argument(
+        "--include-secrets",
+        action="store_true",
+        help="bundle .himmy/secrets (KEK + DB password) into the archive. OFF by "
+        "default — the KEK must be backed up separately so the data archive alone "
+        "cannot decrypt the data. Only use for a separately-protected, encrypted archive.",
+    )
     p_backup.add_argument("--out", default=".", help="output directory for the archive")
     p_backup.add_argument(
         "--dsn",

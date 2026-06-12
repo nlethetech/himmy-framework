@@ -53,4 +53,16 @@ Chart: {{ include "himmy-studio.chart" . }}  (appVersion {{ .Chart.AppVersion }}
 
 NOTE: This deployment is single-replica by design. The /app/.himmy SQLite
 stores live on an RWO PVC and are single-writer — do NOT raise replicaCount.
+
+{{- if .Values.persistence.retain }}
+The state PVC ({{ include "himmy-studio.pvcName" . }}) is annotated
+helm.sh/resource-policy: keep, so `helm uninstall` and a failed
+`helm upgrade --install` will NOT delete it (your chats/runs/traces survive).
+Delete it deliberately with `kubectl delete pvc {{ include "himmy-studio.pvcName" . }}`
+once you have a backup. Set persistence.retain=false to let Helm GC it instead.
+{{- else }}
+WARNING: persistence.retain is false — `helm uninstall` will DELETE the state PVC
+and every chat/run/trace with it (no undo). Take a backup first
+(scripts/ops_backup.py), or set persistence.retain=true.
+{{- end }}
 {{- end }}

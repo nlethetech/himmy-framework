@@ -188,6 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_tg = sub.add_parser("telegram", help="run an agent as a live Telegram bot")
     _add_agent_flags(p_tg)
     p_tg.add_argument("--token", help="bot token (default: HIMMY_TELEGRAM_BOT_TOKEN)")
+    p_tg.add_argument(
+        "--allow-chat",
+        action="append",
+        metavar="CHAT_ID",
+        help="restrict the bot to these chat ids (repeatable; default: "
+        "HIMMY_TELEGRAM_ALLOWED_CHATS). Without an allowlist the bot answers everyone.",
+    )
     p_tg.set_defaults(func=commands.cmd_telegram)
 
     p_team = sub.add_parser("team", help="run a multi-agent team from a team.yaml")

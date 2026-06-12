@@ -65,6 +65,18 @@ docker compose --profile ollama up -d ollama studio postgres
 curl -fsS http://localhost:8765/health
 ```
 
+### Upgrade in place (re-running the installer)
+
+The installer is **idempotent**: re-running it (unpack a newer bundle in the same
+directory and run `./airgap_install.sh`) refreshes the bundled compose files but
+**preserves your provisioned `deploy/compose/.env` and `deploy/compose/secrets/`** —
+it never overwrites an existing `.env`/`secrets/`, and it copies an existing
+`deploy/compose` to `deploy/compose.bak-<utc>` first. This protects the Postgres
+password and `HIMMY_ENCRYPTION_KEY`: losing the KEK would make every
+encrypted-at-rest field permanently unreadable. Even so, **keep an independent copy
+of the KEK** off-host (see the backup section in [deployment.md](deployment.md)) —
+the data is unrecoverable without it.
+
 ### Air-gapped startup — skip the `ollama-init` puller
 
 The compose stack ships an `ollama-init` one-shot whose only job is

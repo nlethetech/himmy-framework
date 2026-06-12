@@ -158,14 +158,28 @@ class TelegramBot:
         handler: MessageHandler,
         *,
         poll_timeout: int = 25,
+        allowed_chat_ids: list[str] | None = None,
     ) -> None:
-        """Drive ``client`` with ``handler``; ``poll_timeout`` is the long-poll wait."""
+        """Drive ``client`` with ``handler``; ``poll_timeout`` is the long-poll wait.
+
+        ``allowed_chat_ids`` is a sender/chat allowlist: when non-empty, the loop runs
+        the handler ONLY for messages whose chat id is listed (compared as strings) and
+        silently drops every other sender, so a bot whose token leaks can't be driven by
+        an arbitrary stranger who finds it. An empty/``None`` list keeps the previous
+        answer-everyone behaviour (a single-user/private bot), so existing wiring is
+        unchanged.
+        """
         self._client = client
         self._handler = handler
         self._poll_timeout = poll_timeout
+        self._allowed_chat_ids = {str(c) for c in (allowed_chat_ids or [])}
+
+    def _is_allowed(self, chat_id: str) -> bool:
+        """Whether ``chat_id`` may drive the agent (always True when no allowlist set)."""
+        return not self._allowed_chat_ids or chat_id in self._allowed_chat_ids
 
     async def poll_once(self, offset: int | None) -> int | None:
-        """Fetch one batch of updates, reply to each message, return the next offset."""
+        """Fetch one batch of updates, reply to each ALLOWED message, return next offset."""
         updates = await self._client.get_updates(
             offset=offset, timeout=self._poll_timeout
         )
@@ -176,6 +190,8 @@ class TelegramBot:
             chat_id = (message.get("chat") or {}).get("id")
             if not text or chat_id is None:
                 continue  # non-text update (sticker, join, …) — nothing to answer
+            if not self._is_allowed(str(chat_id)):
+                continue  # sender is not allow-listed — never reaches the agent handler
             reply = await self._handler(str(chat_id), str(text))
             if reply:
                 await self._client.send_message(chat_id, reply)

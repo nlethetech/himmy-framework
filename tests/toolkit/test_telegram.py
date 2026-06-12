@@ -154,3 +154,62 @@ def test_bot_run_stops_on_predicate() -> None:
 def test_client_builds_expected_url() -> None:
     client = TelegramClient("abc", base_url="https://example.test")
     assert client._base == "https://example.test/botabc"
+
+
+# ----------------------------------------------------------- inbound allowlist
+
+
+def _allowlist_batch() -> list[list[dict[str, Any]]]:
+    """One batch with an allowed (5) and a stranger (7) chat messaging the bot."""
+    return [
+        [
+            {"update_id": 1, "message": {"chat": {"id": 5}, "text": "trusted"}},
+            {"update_id": 2, "message": {"chat": {"id": 7}, "text": "stranger"}},
+        ]
+    ]
+
+
+def test_bot_allowlist_drops_non_allowlisted_senders() -> None:
+    client = _FakeClient(batches=_allowlist_batch())
+    handled: list[str] = []
+
+    async def handler(chat_id: str, text: str) -> str:
+        handled.append(chat_id)
+        return f"echo:{text}"
+
+    bot = TelegramBot(client, handler, allowed_chat_ids=["5"])  # type: ignore[arg-type]
+    next_offset = run_async(bot.poll_once(None))
+    # Offset still advances past BOTH updates (we consumed them), but only the
+    # allow-listed chat reached the handler and got a reply.
+    assert next_offset == 3
+    assert handled == ["5"]
+    assert client.sent == [(5, "echo:trusted")]
+
+
+def test_bot_allowlist_matches_int_chat_ids_as_strings() -> None:
+    client = _FakeClient(batches=_allowlist_batch())
+
+    async def handler(chat_id: str, text: str) -> str:
+        return "ok"
+
+    # Allowlist given as ints still matches the string-coerced chat id.
+    bot = TelegramBot(client, handler, allowed_chat_ids=[5])  # type: ignore[arg-type,list-item]
+    run_async(bot.poll_once(None))
+    assert client.sent == [(5, "ok")]
+
+
+def test_bot_empty_allowlist_answers_everyone() -> None:
+    client = _FakeClient(batches=_allowlist_batch())
+
+    async def handler(chat_id: str, text: str) -> str:
+        return "ok"
+
+    bot = TelegramBot(client, handler, allowed_chat_ids=[])  # type: ignore[arg-type]
+    run_async(bot.poll_once(None))
+    assert client.sent == [(5, "ok"), (7, "ok")]
+
+
+def test_config_parses_allowed_chats_env(monkeypatch: Any) -> None:
+    monkeypatch.setenv("HIMMY_TELEGRAM_ALLOWED_CHATS", " 5 , 7 ,")
+    cfg = ToolkitConfig.from_env()
+    assert cfg.telegram_allowed_chat_ids == ["5", "7"]

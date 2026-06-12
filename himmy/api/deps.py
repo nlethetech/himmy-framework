@@ -365,6 +365,7 @@ class ApiContainer:
     @staticmethod
     def _build_inference() -> InferenceService:
         """Build the inference service: gateway when keyed, else the offline stub."""
+        from himmy.config.residency import enforce_region
         from himmy.config.secrets import get_secret
         from himmy.services.inference.client_manager import (
             GatewayClientManager,
@@ -375,6 +376,10 @@ class ApiContainer:
 
         if get_secret("PYDANTIC_AI_GATEWAY_API_KEY"):
             region = os.environ.get("HIMMY_GATEWAY_REGION", "us")
+            # Residency boundary (WS4.3): the inference gateway region must be inside
+            # the residency policy, so regulated prompts/completions cannot leave the
+            # jurisdiction. A no-op unless HIMMY_REGION is pinned.
+            enforce_region(region, context="inference gateway")
             manager: Any = GatewayClientManager(GatewayRuntimeConfig(region=region))
         else:
             manager = StubClientManager()

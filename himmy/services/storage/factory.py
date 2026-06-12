@@ -99,6 +99,7 @@ class StoreFactory:
         :data:`HIMMY_STORE_PATH` (override with ``HIMMY_STORE_PATH``). Returns a backend
         that mirrors the in-memory ``StorageService`` API 1:1, so callers are agnostic.
         """
+        cls._enforce_residency()
         dsn = get_secret("HIMMY_DATABASE_URL")
         if _is_postgres_dsn(dsn):
             from himmy.services.storage.postgres import PostgresStorageService
@@ -123,8 +124,22 @@ class StoreFactory:
         :meth:`for_server` is used by the API container where an event loop is available.
         """
         if server if server is not None else in_server_context():
+            cls._enforce_residency()
             return cls._sqlite_store()
         return cls.for_cli()
+
+    @staticmethod
+    def _enforce_residency() -> None:
+        """Refuse to build a durable store outside the residency policy (WS4.3).
+
+        A no-op unless ``HIMMY_REGION`` is set. When pinned, the store's region
+        (``HIMMY_STORE_REGION``, defaulting to the home region) must be inside
+        ``HIMMY_ALLOWED_REGIONS`` or this raises :class:`ResidencyError` — so durable
+        data physically cannot be written to a database in a disallowed region.
+        """
+        from himmy.config.residency import enforce_region, storage_region
+
+        enforce_region(storage_region(), context="storage")
 
     @classmethod
     def _sqlite_store(cls) -> object:
