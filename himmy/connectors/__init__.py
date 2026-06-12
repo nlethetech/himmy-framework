@@ -96,6 +96,19 @@ from himmy.connectors.spec import (
     SpecToolConnector,
     register_connector_specs,
 )
+from himmy.connectors.websearch import (
+    BRAVE_API_HOST,
+    BRAVE_API_KEY_SECRET,
+    BRAVE_SEARCH_URL,
+    TAVILY_API_HOST,
+    TAVILY_API_KEY_SECRET,
+    TAVILY_SEARCH_URL,
+    WEBSEARCH_BACKEND_ENV,
+    WebSearchClient,
+    WebSearchConnector,
+    WebSearchError,
+    register_websearch_connectors,
+)
 
 __all__ = [
     "Fetcher",
@@ -172,4 +185,16 @@ __all__ = [
     "GITHUB_API_HOST",
     "GITHUB_API_VERSION",
     "GITHUB_TOKEN_SECRET",
+    # Web search connector
+    "WebSearchClient",
+    "WebSearchConnector",
+    "WebSearchError",
+    "register_websearch_connectors",
+    "TAVILY_SEARCH_URL",
+    "TAVILY_API_HOST",
+    "TAVILY_API_KEY_SECRET",
+    "BRAVE_SEARCH_URL",
+    "BRAVE_API_HOST",
+    "BRAVE_API_KEY_SECRET",
+    "WEBSEARCH_BACKEND_ENV",
 ]
