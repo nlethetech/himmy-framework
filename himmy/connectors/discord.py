@@ -40,6 +40,7 @@ run on this machine.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Collection, Mapping
 from typing import TYPE_CHECKING, Any
@@ -192,16 +193,23 @@ class DiscordClient:
     ) -> dict[str, Any]:
         """POST ``content`` to ``channel_id`` (``POST /channels/{id}/messages``).
 
-        ``nonce`` is Discord's own de-duplication token: passing a stable value makes a
-        repeated send idempotent on Discord's side too (belt-and-braces with the
-        connector's idempotency store). Returns the created Message object. Raises a
-        secret-safe :class:`ConnectorError` on a non-2xx so the token can never ride out
-        in an error string.
+        ``nonce`` is Discord's own de-duplication token: passing a stable value AND
+        ``enforce_nonce: true`` makes a repeated send idempotent on Discord's side too
+        (belt-and-braces with the connector's idempotency store) — Discord only checks the
+        nonce for uniqueness when ``enforce_nonce`` is set, returning the existing message
+        on a duplicate. The nonce must be <=25 chars (Discord rejects a longer one with a
+        50035 Invalid Form Body), so the caller passes a clipped value. Returns the created
+        Message object. Raises a secret-safe :class:`ConnectorError` on a non-2xx so the
+        token can never ride out in an error string.
         """
         url = f"{self._base}/channels/{channel_id}/messages"
         payload: dict[str, Any] = {"content": _truncate(content)}
         if nonce:
-            payload["nonce"] = nonce
+            # Discord caps the nonce at 25 chars; clip defensively so an over-long value
+            # degrades instead of 400-ing. ``enforce_nonce`` makes Discord honour it for
+            # de-dupe (without it the nonce is ignored for uniqueness).
+            payload["nonce"] = nonce[:25]
+            payload["enforce_nonce"] = True
         with self._client() as client:
             resp = client.post(url, json=payload, headers=self._auth_headers())
             if resp.status_code >= 400:
@@ -338,16 +346,19 @@ class DiscordOutboundConnector(OutboundToolConnector):
                 )
             self._throttle()
             client = self._build_client()
-            # Idempotency key over the (channel, content): a retry / re-issued call posts
-            # once. The same value is sent to Discord as `nonce` for upstream de-dupe too.
-            key = f"{channel_id}:{hash(content) & 0xFFFFFFFF:08x}"
+            # Idempotency over the (channel, content). A SHA-256 digest is the local store
+            # key: it is collision-resistant (unlike PYTHONHASHSEED-salted, 32-bit-truncated
+            # hash(), which could silently drop a distinct message as a duplicate). Discord's
+            # `nonce` is capped at 25 chars, so the client sends a clipped slice of this same
+            # digest for upstream de-dupe; the FULL digest is what we dedupe on locally.
+            digest = hashlib.sha256(f"{channel_id}:{content}".encode()).hexdigest()
 
             def _send() -> dict[str, Any]:
-                return client.post_message(channel_id, content, nonce=key)
+                return client.post_message(channel_id, content, nonce=digest)
 
             try:
                 message = await asyncio.to_thread(
-                    self.call_idempotent, f"post:{key}", _send
+                    self.call_idempotent, f"post:{digest}", _send
                 )
             except Exception as exc:  # noqa: BLE001 - normalize to a secret-safe error
                 token = self.secret(DISCORD_BOT_TOKEN_SECRET, required=False) or ""

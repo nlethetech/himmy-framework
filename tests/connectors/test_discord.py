@@ -346,8 +346,60 @@ def test_post_message_sends_bot_auth_and_body_via_mock_transport() -> None:
         assert seen["auth"] == "Bot bot.secret.token"
         assert seen["body"]["content"] == "hi from himmy"
         assert "nonce" in seen["body"]  # idempotency token rides to Discord too
+        # Discord only honours the nonce for de-dupe when enforce_nonce is set.
+        assert seen["body"]["enforce_nonce"] is True
     finally:
         configure_secrets(None)
+
+
+def test_post_message_nonce_within_discord_25char_cap_realistic_snowflake() -> None:
+    """Live-contract: with a REAL 17-20-digit snowflake channel id the nonce stays <=25.
+
+    Discord rejects a nonce >25 chars with 50035 Invalid Form Body, so a too-long nonce
+    would 400 every live post. The earlier tests used 2-char fake ids ('C1') which hid
+    this — here we use realistic snowflakes (and even a 20-digit one) and assert the cap
+    holds, plus that enforce_nonce is sent so the nonce is actually honoured upstream.
+    """
+    import httpx
+
+    captured: list[dict[str, Any]] = []
+
+    def app(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.read().decode()))
+        return httpx.Response(200, json={"id": "111111111111111111"})
+
+    # A spread of realistic ids: 17, 18, 19 and a worst-case 20-digit snowflake.
+    snowflakes = [
+        "175928847299117063",  # 18 digits (Discord's own docs example)
+        "12345678901234567",  # 17 digits
+        "1234567890123456789",  # 19 digits
+        "99999999999999999999",  # 20 digits (upper bound)
+    ]
+    for chan in snowflakes:
+        configure_secrets(_MemSecrets({DISCORD_BOT_TOKEN_SECRET: "tok"}))
+        try:
+            conn = DiscordOutboundConnector(
+                allowed_channel_ids=[chan],
+                requires_approval=False,
+                client_factory=lambda t: DiscordClient(
+                    t, transport=_mock_transport(app)
+                ),
+            )
+            registry = ToolRegistry()
+            conn.register_tools(registry)
+            run_async(
+                registry.handler_for("discord_post_message")(
+                    {"content": "a longer message body here", "channel_id": chan}
+                )
+            )
+        finally:
+            configure_secrets(None)
+
+    assert len(captured) == len(snowflakes)
+    for body in captured:
+        nonce = body["nonce"]
+        assert len(nonce) <= 25, f"nonce {nonce!r} exceeds Discord's 25-char cap"
+        assert body["enforce_nonce"] is True
 
 
 def test_post_message_denies_unlisted_channel_default_deny() -> None:
