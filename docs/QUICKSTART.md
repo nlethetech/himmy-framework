@@ -180,10 +180,11 @@ Type your messages; type `/exit` (or `/quit`) to leave, `/reset` to start the th
 
 ## 4. Your first agent in 60 seconds
 
-An "agent" is just a tiny text file describing a role. Let Himmy scaffold one:
+An "agent" is just a tiny text file describing a role. Let Himmy scaffold one. The
+`--classic` flag writes a complete, fully-commented example you can read and edit:
 
 ```bash
-himmy init my-agent
+himmy init my-agent --classic
 ```
 
 Expected output:
@@ -196,6 +197,14 @@ wrote my-agent/skills/my_skill.yaml
 
 Next: himmy run -f my-agent/agent.yaml -p "hello"
 ```
+
+> **On a real terminal, plain `himmy init my-agent` (without `--classic`) is
+> interactive.** It asks a few short questions — name, what it should do, which model,
+> tool packs, memory — and you can just **press Enter to accept each default**. That path
+> writes a single minimal `my-agent/agent.yaml` (no `tools.py`/`himmy.toml`/skills) and
+> prints `wrote my-agent/agent.yaml`. Use `--classic` when you want the full annotated
+> scaffold shown above, or run plain `himmy init my-agent` for the guided setup. (Piped
+> or CI runs always get the classic scaffold automatically.)
 
 Now run a prompt through it.
 
