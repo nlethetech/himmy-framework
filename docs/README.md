@@ -61,7 +61,8 @@ under `himmy/`.
 
 | Doc | What it covers |
 | --- | --- |
-| [Sandbox](./services/sandbox.md) | `off`/`subprocess`/`container` code execution, container hardening, gVisor/Kata seam. |
+| [Sandbox (service)](./services/sandbox.md) | `off`/`subprocess`/`container` code execution, container hardening, gVisor/Firecracker seam. |
+| [Sandbox backends (operator guide)](./enterprise/sandbox.md) | The five backends, the security ladder, which to use per tier, and how to deploy/verify gVisor & Firecracker on a Linux+KVM host. |
 | [Guardrails](./services/guardrails.md) | Guardrail pipeline, PII/injection/blocklist built-ins, DLP + reversible tokenization. |
 | [Governance](./services/governance.md) | Retention, crypto-shredding for right-to-erasure, erasure tombstones. |
 | [Audit](./services/audit.md) | `SecurityEvent` records, signed bundles / SIEM export, tamper-evidence. |
