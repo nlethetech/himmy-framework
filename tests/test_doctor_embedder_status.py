@@ -75,6 +75,26 @@ def test_report_to_dict_includes_embedder_fields(
     assert {"name", "available", "reason"} <= set(data["embedder_statuses"][0])
 
 
+def test_install_model_next_step_points_to_quickstart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A brand-new user (no model, no agent) is pointed at the 5-minute quickstart.
+
+    The ``install_model`` next-step is the first onboarding hook a fresh install
+    hits (surfaced by ``himmy doctor`` and Studio's Doctor screen), so it carries
+    the quickstart path for a non-technical user.
+    """
+    # No local CLI provider on PATH and no provider keys → the install_model branch.
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda _binary: None)
+    for key in diagnostics._KEYS:
+        monkeypatch.delenv(key, raising=False)
+    report = diagnostics.collect_doctor_report()
+    assert report.has_real_model is False
+    assert report.next_step is not None
+    assert report.next_step.kind == "install_model"
+    assert "docs/QUICKSTART.md" in report.next_step.message
+
+
 def test_cmd_doctor_renders_embedder_section(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

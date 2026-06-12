@@ -11,6 +11,9 @@ under `himmy/`.
 
 ## Start here
 
+- **[Quickstart — deploy in 5 minutes](./QUICKSTART.md)** — the fastest path for a brand-new
+  user: install, bring a model (free offline Ollama **or** an API key), run Studio and/or the
+  CLI, and talk to your first agent. Start here if you've never run Himmy.
 - **[Architecture overview](./architecture/overview.md)** — the layered package map, the
   offline-first philosophy, and the end-to-end shape of a single agent run. Read this first.
 - **[Local-first & hardening](./architecture/local-first.md)** — what runs with zero config,
