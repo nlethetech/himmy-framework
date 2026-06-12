@@ -34,6 +34,17 @@ from himmy.connectors.discord import (
     verify_ed25519_signature,
 )
 from himmy.connectors.fetcher import DEFAULT_USER_AGENT, Fetcher, HttpxFetcher
+from himmy.connectors.github import (
+    GITHUB_API_HOST,
+    GITHUB_API_ROOT,
+    GITHUB_API_VERSION,
+    GITHUB_TOKEN_SECRET,
+    GitHubClient,
+    GitHubError,
+    GitHubOutboundConnector,
+    GitHubRateLimitError,
+    register_github_connectors,
+)
 from himmy.connectors.models import (
     FeedFailure,
     ForexRate,
@@ -151,4 +162,14 @@ __all__ = [
     "SLACK_BOT_TOKEN_SECRET",
     "SLACK_SIGNING_SECRET",
     "SLACK_APP_TOKEN_SECRET",
+    # GitHub connector
+    "GitHubClient",
+    "GitHubError",
+    "GitHubRateLimitError",
+    "GitHubOutboundConnector",
+    "register_github_connectors",
+    "GITHUB_API_ROOT",
+    "GITHUB_API_HOST",
+    "GITHUB_API_VERSION",
+    "GITHUB_TOKEN_SECRET",
 ]
