@@ -491,6 +491,29 @@ class RecommendationAppService:
         )
         return len(items)
 
+    async def get(
+        self,
+        recommendation_id: str,
+        *,
+        workspace_id: str | None = None,
+    ) -> RecommendationItem | None:
+        """Return one recommendation by id, tenant-scoped (AAEO-4).
+
+        The app-service getter the read surfaces (``himmy recommendations show`` and
+        the /v1 GET-by-id path) need: a recommendation belonging to another workspace
+        is treated as not found (returns None) instead of being read cross-tenant.
+        Until now the service exposed only ``list``/``count``/``update_status`` plus
+        ``get_recommendation_lineage`` — a single-item read had no app-layer entry, so
+        a caller had to reach into ``storage.get_recommendation`` and re-implement the
+        scope check. This closes that gap (reviewer must_fix for T2h).
+        """
+        item = await self._storage.get_recommendation(recommendation_id)
+        if item is None:
+            return None
+        if workspace_id is not None and item.workspace_id != workspace_id:
+            return None
+        return item
+
     async def update_status(
         self,
         recommendation_id: str,

@@ -20,7 +20,11 @@ from himmy import __version__
 from himmy.cli import commands
 from himmy.cli.audit import add_audit_parser
 from himmy.cli.consent import add_consent_parser
+from himmy.cli.context_cmd import add_context_parser
+from himmy.cli.dashboard_cmd import add_dashboard_parser
 from himmy.cli.provider import PROVIDERS
+from himmy.cli.recommendations_cmd import add_recommendations_parser
+from himmy.cli.runs_cmd import add_runs_parser
 from himmy.cli.security_audit_cmd import add_seclog_parser
 from himmy.core import HimmyError
 
@@ -174,6 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="re-run deterministically from a recorded cassette (no provider/network)",
     )
+    p_run.add_argument(
+        "--persist",
+        action="store_true",
+        help="record this run in the canonical store (visible in `himmy runs` + /v1 + "
+        "Studio); default off keeps the run in-RAM",
+    )
     p_run.set_defaults(func=commands.cmd_run)
 
     p_chat = sub.add_parser("chat", help="interactive chat keeping one thread")
@@ -189,6 +199,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="continue_last",
         action="store_true",
         help="continue the most recent session (the auto-saved 'last' thread)",
+    )
+    p_chat.add_argument(
+        "--persist",
+        action="store_true",
+        help="record a --message turn in the canonical store (visible in `himmy runs` + "
+        "/v1 + Studio); default off keeps the turn in-RAM",
     )
     p_chat.set_defaults(func=commands.cmd_chat)
 
@@ -598,6 +614,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_skill.set_defaults(func=_cmd_skill)
 
+    add_runs_parser(sub)
+    add_recommendations_parser(sub)
+    add_context_parser(sub)
+    add_dashboard_parser(sub)
     add_consent_parser(sub)
     add_audit_parser(sub)
     add_seclog_parser(sub)

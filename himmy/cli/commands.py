@@ -380,6 +380,75 @@ def _build_runtime_for(
     )
 
 
+def _persist_run_result(
+    result: Any,
+    spec: AgentSpec,
+    args: argparse.Namespace,
+    *,
+    prompt: str,
+) -> str | None:
+    """Persist a SYNCHRONOUSLY-completed RunResult to the canonical run store (T2b).
+
+    ``--persist`` is OPT-IN: a plain one-shot ``himmy run``/``himmy chat`` never reaches
+    here and stays in-RAM (the zero-config default). When set, we capture the run that
+    ALREADY completed at the call site and write it via ``store.save_run`` — deliberately
+    NOT through :meth:`RunAppService.create_run` (reviewer must_fix): ``create_run`` is
+    fire-and-forget background execution, and a one-shot ``asyncio.run`` tears the event
+    loop down the moment this returns, so a background task would be killed mid-flight. The
+    run is finished; we only need to RECORD it, in the SAME ``.himmy/storage.db`` the
+    server reads, so it lands in ``himmy runs list`` AND ``GET /v1/runs`` AND the Studio
+    runs screen (the connectedness payoff). Stamped with the reserved ``__local__``
+    workspace/subject so it is browsable locally but excluded from cross-tenant admin lists.
+
+    Best-effort: returns the persisted ``run_id`` on success, or ``None`` (with a stderr
+    note) on failure — persistence never changes the run's own exit code.
+    """
+    from himmy.cli.app_services import build_app_container
+    from himmy.services.inference.models import InferenceStatus
+    from himmy.services.storage.models import (
+        LOCAL_SUBJECT,
+        LOCAL_WORKSPACE,
+        RunRecord,
+        RunStatus,
+    )
+
+    succeeded = getattr(result, "status", None) == InferenceStatus.SUCCESS.value
+    thread = getattr(result, "thread", None)
+    thread_id = getattr(thread, "thread_id", None)
+    persona = spec.to_persona()
+    record = RunRecord(
+        workspace_id=LOCAL_WORKSPACE,
+        subject_id=LOCAL_SUBJECT,
+        thread_id=thread_id,
+        trace_id=getattr(result, "trace_id", None) or thread_id,
+        persona_name=getattr(persona, "agent_id", None) or spec.name,
+        model_key=getattr(result, "model_path", None) or None,
+        status=RunStatus.SUCCEEDED if succeeded else RunStatus.FAILED,
+        output_text=getattr(result, "output_text", None) or None,
+        output_structured=getattr(result, "output_structured", None),
+        error=getattr(result, "error", None),
+        metadata={
+            "source": "cli",
+            "prompt": prompt,
+            "provider_name": getattr(result, "provider_name", "") or "",
+            "cost": getattr(result, "cost", 0.0) or 0.0,
+            "input_tokens": getattr(result, "input_tokens", 0) or 0,
+            "output_tokens": getattr(result, "output_tokens", 0) or 0,
+            "latency_ms": getattr(result, "latency_ms", 0.0) or 0.0,
+        },
+    )
+    container = build_app_container()
+    try:
+        saved = asyncio.run(container.storage.save_run(record))
+    except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+        _eprint(f"⚠ --persist failed to save run: {exc}")
+        return None
+    finally:
+        container.close()
+    _eprint(f"persisted run {saved.run_id} → himmy runs show {saved.run_id}")
+    return saved.run_id
+
+
 # --------------------------------------------------------------------- run/chat
 
 
@@ -584,6 +653,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"(spent ${result.cost or 0.0:.4f}) — answer may be incomplete"
         )
 
+    # --persist (opt-in, T2b): record the now-completed run in the canonical store so it
+    # appears in `himmy runs` / `GET /v1/runs` / the Studio runs screen. Default-off keeps
+    # the one-shot path in-RAM and byte-identical to before.
+    if getattr(args, "persist", False):
+        _persist_run_result(result, spec, args, prompt=args.prompt)
+
     if args.json:
         print(
             json.dumps(
@@ -690,6 +765,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
         )
         if store is not None and session_id:
             store.save(session_id, result.thread)
+        # --persist (opt-in, T2b): record this completed turn in the canonical run store.
+        if getattr(args, "persist", False):
+            _persist_run_result(result, spec, args, prompt=message)
         live.finish()
         print(render_markdown_lite(result.output_text or "", stream=sys.stdout))
         return 0 if result.succeeded else 1
