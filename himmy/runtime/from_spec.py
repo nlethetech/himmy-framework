@@ -89,6 +89,66 @@ async def ingest_knowledge_sources(registry: Any, sources: list[str]) -> int:
     return count
 
 
+def _register_outbound_connectors(
+    registry: Any, names: list[str], *, audit: Any = None
+) -> list[str]:
+    """Bind each named OUTBOUND connector's tools into ``registry`` (enabled + ready only).
+
+    For every connector the spec names, this:
+
+    * ensures the built-in connectors are registered on the process-wide registry;
+    * SKIPS the connector cleanly when it is not enabled for the ``outbound`` surface
+      (the operator did not turn it on) — a disabled name is a no-op, never an error;
+    * SKIPS it cleanly when its capability probe fails (missing dependency/credential),
+      so a shared ``agent.yaml`` runs in an environment that lacks one connector's key;
+    * otherwise builds the live connector wired to the RUN'S audit spine (so a tool call
+      it makes lands on the same EntityRecord registry as the run's lineage) and calls
+      :meth:`OutboundToolConnector.register_tools` — which itself re-checks capability and
+      audits the registration. Unknown connector names are skipped (logged via audit by
+      the service, never crashing the wire). Returns the registered tool names.
+
+    Defensive by construction: a per-connector failure is contained so one bad name can
+    never blank out the whole agent's toolset.
+    """
+    from himmy.connectors.manage import (
+        ConnectorService,
+        ensure_builtin_connectors_registered,
+    )
+    from himmy.connectors.sdk import (
+        AuditSink,
+        ConnectorContext,
+        ConnectorError,
+    )
+
+    ensure_builtin_connectors_registered()
+    context = (
+        ConnectorContext(audit=AuditSink.from_registry(audit))
+        if audit is not None
+        else None
+    )
+    service = ConnectorService(context=context)
+    registered: list[str] = []
+    for name in dict.fromkeys(names):  # de-dupe, order-stable
+        try:
+            descriptor = service.descriptor(name)
+        except KeyError:
+            continue  # unknown connector name — skip cleanly
+        if descriptor.kind.value != "outbound":
+            continue  # inbound connectors are mounted by the BFF, not bound as tools
+        if not service.is_enabled(name, "outbound"):
+            continue  # operator has not enabled this connector for outbound
+        if not service.status(name).available:
+            continue  # missing dependency/credential — skip cleanly (no crash)
+        try:
+            connector = service.build_outbound(name)
+        except ConnectorError:
+            continue  # raced to unconfigured between the check and the build
+        # register_tools re-checks capability and audits the registration onto the
+        # run's spine via the connector's ConnectorContext.
+        registered.extend(connector.register_tools(registry))
+    return registered
+
+
 def load_spec_file(
     path: str,
     *,
@@ -245,6 +305,7 @@ def build_runtime_for_spec(
         or spec.mcp_servers
         or spec.allow_spawn
         or spec.allow_skill_dispatch
+        or spec.connectors
     ):
         # Share the run's audit spine so co-registered packs (memory) project their
         # writes onto the same registry the runtime/tool lineage uses (P0-C).
@@ -255,6 +316,10 @@ def build_runtime_for_spec(
             tk_config = ToolkitConfig.from_sources(load_project().get("toolkit"))
             tk_config.server_context = server
             register_packs(registry, spec.tool_packs, tk_config)
+        if spec.connectors:
+            _register_outbound_connectors(
+                registry, spec.connectors, audit=entity_registry
+            )
         if spec.knowledge:
             # Auto-ingest the declared docs into a local knowledge base and give the
             # agent kb_search — a grounded doc agent with no driver code.
@@ -336,4 +401,5 @@ __all__ = [
     "ingest_knowledge_sources",
     "load_spec_file",
     "build_runtime_for_spec",
+    "_register_outbound_connectors",
 ]

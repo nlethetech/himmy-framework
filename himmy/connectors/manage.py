@@ -670,7 +670,7 @@ class ConnectorService:
         directly (a third-party/custom connector the catalog has no descriptor for).
         """
         if name in _DIRECT_OUTBOUND_NAMES:
-            connector: Connector = _direct_outbound(name)
+            connector: Connector = _direct_outbound(name, context=self._context)
         else:
             registered = self._registry.get(name)
             connector = registered if registered is not None else _direct_outbound(name)
@@ -741,26 +741,69 @@ def _split_env(name: str) -> list[str]:
 #: composes with :meth:`ConnectorService.build_outbound`.
 _DIRECT_OUTBOUND_NAMES = frozenset({"slack", "discord", "github", "websearch"})
 
+#: Each direct-built outbound connector's per-connector self-throttle (tokens/sec). These
+#: MIRROR the defaults each connector applies when it is built with no context — so when
+#: the runtime supplies a context (to wire the run's audit spine), the rate limiter is
+#: preserved, not dropped. Keep in sync with the connectors' ``__init__`` defaults.
+_OUTBOUND_RATE: dict[str, float] = {
+    "slack": 1.0,
+    "discord": 5.0,
+    "github": 10.0,
+    "websearch": 5.0,
+}
 
-def _direct_outbound(name: str) -> Connector:
-    """Build an outbound connector directly (secrets-aware, registry-independent)."""
+
+def _outbound_context(
+    name: str, context: ConnectorContext | None
+) -> ConnectorContext | None:
+    """Merge the run's audit/retry context with this connector's own rate-limit default.
+
+    A connector applies its standard :class:`RateLimiter` only when built with NO context;
+    passing one (to carry the run's audit sink) would otherwise silence the self-throttle.
+    This returns a context that keeps the caller's ``audit``/``retry`` AND restores the
+    connector's default rate limiter when the caller did not set one.
+    """
+    if context is None:
+        return None
+    if context.rate_limiter is not None:
+        return context
+    from himmy.connectors.sdk import RateLimiter
+
+    rate = _OUTBOUND_RATE.get(name)
+    limiter = RateLimiter(rate=rate, window=1.0) if rate else None
+    return ConnectorContext(
+        audit=context.audit, rate_limiter=limiter, retry=context.retry
+    )
+
+
+def _direct_outbound(name: str, *, context: ConnectorContext | None = None) -> Connector:
+    """Build an outbound connector directly (secrets-aware, registry-independent).
+
+    ``context`` (when given) carries the run's audit sink so a tool call the connector
+    makes lands on the run's spine; the connector's standard rate-limit default is
+    preserved via :func:`_outbound_context`.
+    """
+    ctx = _outbound_context(name, context)
     if name == "slack":
         return SlackOutboundConnector(
             allowed_channel_ids=_split_env("HIMMY_SLACK_ALLOWED_CHANNELS") or None,
             default_channel_id=get_secret(SLACK_DEFAULT_CHANNEL_SECRET),
+            context=ctx,
         )
     if name == "discord":
         return DiscordOutboundConnector(
             allowed_channel_ids=_split_env("HIMMY_DISCORD_ALLOWED_CHANNELS") or None,
             default_channel_id=get_secret(DISCORD_DEFAULT_CHANNEL_SECRET),
+            context=ctx,
         )
     if name == "github":
         return GitHubOutboundConnector(
             allowed_repos=_split_env("HIMMY_GITHUB_ALLOWED_REPOS") or None,
             default_repo=get_secret(GITHUB_DEFAULT_REPO_SECRET),
+            context=ctx,
         )
     if name == "websearch":
-        return WebSearchConnector()
+        return WebSearchConnector(context=ctx)
     raise ConnectorError(f"no outbound connector registered under {name!r}")
 
 

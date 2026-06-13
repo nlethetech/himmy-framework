@@ -382,6 +382,12 @@ def create_app(
     app.include_router(studio_projects.router)
     app.include_router(studio_notify.router)
 
+    # Mount enabled + capability-OK inbound connectors (webhook/Slack/Discord intake),
+    # each wired to a configured agent.yaml. No-op unless an inbound agent is configured
+    # AND a connector is enabled with its signing secret present — so the default offline
+    # surface is unchanged and an unsigned public trigger is never exposed.
+    _mount_inbound_connectors(app)
+
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
         """Liveness probe."""
@@ -394,6 +400,25 @@ def create_app(
     # Mount the built Studio SPA last so its catch-all never shadows an API route.
     _mount_studio(app)
     return app
+
+
+def _mount_inbound_connectors(app: FastAPI) -> None:
+    """Mount enabled inbound connectors (best-effort; never abort app creation).
+
+    Delegates to :func:`himmy.api.connector_inbound.mount_inbound_connectors`, which
+    mounts a router only for a connector that is enabled for ``inbound`` AND whose signing
+    secret is present (capability OK), wired to the configured inbound ``agent.yaml``. A
+    failure to build any connector is logged and skipped so a misconfiguration cannot stop
+    the BFF coming up.
+    """
+    try:
+        from himmy.api.connector_inbound import mount_inbound_connectors
+
+        mounted = mount_inbound_connectors(app)
+        if mounted:
+            logger.info("mounted inbound connector(s): %s", ", ".join(mounted))
+    except Exception:  # pragma: no cover - defensive: inbound mount is best-effort
+        logger.warning("mounting inbound connectors failed", exc_info=True)
 
 
 # Built Studio frontend (emitted by `npm run build` in studio/). Absent in a source

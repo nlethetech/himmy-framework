@@ -3,6 +3,8 @@ import {
   setConnection,
   testConnection,
   deleteConnection,
+  enableConnection,
+  disableConnection,
   type ConnectionStatus,
 } from "../lib/api";
 import { Modal } from "./ui/Modal";
@@ -13,6 +15,10 @@ const ICONS: Record<string, (p: { className?: string }) => JSX.Element> = {
   email: MailIcon,
   telegram: TelegramIcon,
   web_search: GlobeIcon,
+  discord: TelegramIcon,
+  webhook: GlobeIcon,
+  slack: PlugIcon,
+  github: PlugIcon,
 };
 
 export function ConnectionCard({
@@ -24,9 +30,32 @@ export function ConnectionCard({
 }) {
   const [editing, setEditing] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [toggling, setToggling] = useState(false);
   const [testOk, setTestOk] = useState<boolean | null>(null);
   const toast = useToast();
   const Icon = ICONS[conn.type] ?? PlugIcon;
+
+  const allowlist = conn.allowlist_field
+    ? conn.fields.find((f) => f.name === conn.allowlist_field)
+    : undefined;
+
+  const toggleEnabled = async () => {
+    setToggling(true);
+    try {
+      const next = conn.enabled
+        ? await disableConnection(conn.type)
+        : await enableConnection(conn.type);
+      toast.show(
+        `${conn.title} ${next.enabled ? "enabled" : "disabled"}`,
+        next.enabled ? "ok" : "info",
+      );
+      onChange();
+    } catch (e) {
+      toast.show((e as Error).message, "err");
+    } finally {
+      setToggling(false);
+    }
+  };
 
   const runTest = async () => {
     setTesting(true);
@@ -94,6 +123,46 @@ export function ConnectionCard({
           <span className="conn-off">Not connected</span>
         )}
       </div>
+
+      {/* Enable toggle: a connector-managed connection is wired into the runtime only
+          when it is enabled (default-deny). Configured-but-OFF means "ready, not live". */}
+      {conn.enableable && (
+        <div className="conn-toggle-row">
+          <label className="conn-toggle" title="Wire this connector into agent runs">
+            <input
+              type="checkbox"
+              checked={conn.enabled}
+              disabled={!conn.configured || !conn.writable || toggling}
+              onChange={toggleEnabled}
+            />
+            <span>
+              {conn.kind === "inbound" ? "Mounted" : "Enabled"}
+              {conn.enabled ? " · on" : " · off"}
+            </span>
+          </label>
+        </div>
+      )}
+
+      {/* Allow-list summary (default-deny). A configured-but-empty allow-list answers /
+          posts to no one until the operator names a channel/repo/source. */}
+      {allowlist && (
+        <div className="conn-allowlist">
+          <span className="conn-allowlist-label">{allowlist.label}</span>
+          <span className="conn-allowlist-value mono">
+            {allowlist.masked_hint || (
+              <em className="conn-off">none (default-deny)</em>
+            )}
+          </span>
+        </div>
+      )}
+
+      {/* Inbound mount URL: where a signed delivery is POSTed to trigger the agent. */}
+      {conn.kind === "inbound" && conn.mount_path && (
+        <div className="conn-mount">
+          <span className="conn-mount-label">Mount URL</span>
+          <code className="conn-mount-url">{conn.mount_path}</code>
+        </div>
+      )}
 
       <div className="conn-actions">
         {conn.configured ? (

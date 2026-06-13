@@ -63,6 +63,12 @@ class AgentSpec(BaseModel):
     tools_module: str | None = None
     http_tools: list[HttpToolSpec] = []  # declarative REST tools (no Python)
     mcp_servers: list[MCPServerConfig] = []  # stdio MCP servers → agent tools
+    # Built-in OUTBOUND connectors to bind as agent tools (e.g. ["slack", "github"]).
+    # A named connector is wired only when it is ENABLED for outbound AND configured
+    # (its capability probe passes) — an unconfigured/disabled name is skipped cleanly,
+    # not an error, so a shared spec degrades gracefully across environments. Inbound
+    # connectors (webhook/slack/discord intake) are mounted by the BFF, not bound here.
+    connectors: list[str] = []
     # Give the agent a spawn_agent tool (one-level recursive sub-agents):
     allow_spawn: bool = False
     # Give the agent a dispatch_skill tool (run a named capability as a sub-agent):

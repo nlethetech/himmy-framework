@@ -416,6 +416,37 @@ async def delete_connection(ctype: str) -> ConnectionStatus:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.put("/connections/{ctype}/enable", response_model=ConnectionStatus)
+async def enable_connection(ctype: str) -> ConnectionStatus:
+    """Enable a connector-managed connection for its surface (outbound tool / inbound mount).
+
+    Delegates to the connector-management service so the flag the runtime + CLI honor is the
+    SAME store key. 404 for an unknown or non-enableable connection (email/telegram/web_search
+    are always-on once configured); 409 on a read-only secrets backend.
+    """
+    try:
+        return studio_connections.set_enabled(ctype, True)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="unknown or non-enableable connection"
+        ) from exc
+    except ReadOnlyBackendError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.put("/connections/{ctype}/disable", response_model=ConnectionStatus)
+async def disable_connection(ctype: str) -> ConnectionStatus:
+    """Disable a connector-managed connection (its tool/mount stops being wired)."""
+    try:
+        return studio_connections.set_enabled(ctype, False)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="unknown or non-enableable connection"
+        ) from exc
+    except ReadOnlyBackendError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.post("/connections/{ctype}/test", response_model=ConnectionTestResult)
 async def test_connection(ctype: str) -> ConnectionTestResult:
     """Live-validate a connection (SMTP login / Telegram getMe / search ping)."""

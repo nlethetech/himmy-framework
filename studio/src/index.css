@@ -2370,6 +2370,52 @@ mark.hl.hl-first {
 .conn-off {
   color: var(--text-dim);
 }
+.conn-toggle-row {
+  display: flex;
+  align-items: center;
+}
+.conn-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.conn-toggle input {
+  accent-color: var(--accent, var(--text));
+  cursor: pointer;
+}
+.conn-toggle input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.conn-allowlist,
+.conn-mount {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+}
+.conn-allowlist-label,
+.conn-mount-label {
+  color: var(--text-dim);
+  flex: none;
+}
+.conn-allowlist-value {
+  color: var(--text-muted);
+  text-align: right;
+  word-break: break-all;
+}
+.conn-mount-url {
+  color: var(--text-muted);
+  background: var(--surface, var(--card));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+  font-size: var(--fs-xs, 11px);
+}
 .conn-actions {
   display: flex;
   gap: var(--sp-2);

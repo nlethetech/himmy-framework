@@ -411,6 +411,11 @@ export interface ConnectionStatus {
   configured: boolean;
   writable: boolean;
   fields: ConnectionFieldStatus[];
+  kind: string; // outbound | inbound
+  enableable: boolean; // has an on/off flag the runtime honors
+  enabled: boolean; // currently enabled for its surface
+  allowlist_field: string | null; // field id holding the default-deny allow-list
+  mount_path: string | null; // (inbound) the BFF path this connector mounts at
 }
 
 export interface ConnectionTestResult {
@@ -427,6 +432,10 @@ export const setConnection = (type: string, fields: Record<string, unknown>) =>
   api.put<ConnectionStatus>(`/connections/${type}`, { fields });
 export const deleteConnection = (type: string) =>
   api.del<ConnectionStatus>(`/connections/${type}`);
+export const enableConnection = (type: string) =>
+  api.put<ConnectionStatus>(`/connections/${type}/enable`, {});
+export const disableConnection = (type: string) =>
+  api.put<ConnectionStatus>(`/connections/${type}/disable`, {});
 export const testConnection = (type: string) =>
   api.post<ConnectionTestResult>(`/connections/${type}/test`, {});
 export const sendViaConnection = (type: string, payload: Record<string, unknown>) =>
