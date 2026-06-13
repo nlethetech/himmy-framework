@@ -59,6 +59,21 @@ def test_pii_keeps_iso_dates_and_coordinates() -> None:
     assert "[REDACTED-PHONE]" in g.inspect("call +9779812345678", context={}).text
 
 
+def test_pii_keeps_numbers_inside_urls() -> None:
+    """A number inside an http(s) URL — a tweet status id, a /news/<id> path — is NOT PII
+    and must survive (redacting it breaks the citation link). Bare PII outside URLs and
+    credentials embedded in a URL still redact."""
+    g = PIIGuardrail()
+    v = g.inspect(
+        "Tweet https://twitter.com/OpenAI/status/2065225374737543376 — call 9841234567",
+        context={},
+    )
+    assert "2065225374737543376" in v.text  # tweet id preserved, link intact
+    assert "[REDACTED-PHONE]" in v.text  # the bare phone outside the URL still redacts
+    # An embedded user:pass@ in a URL is still caught (url_credentials runs over URLs).
+    assert "[REDACTED-URL]" in g.inspect("login https://user:pass@host.com/x", context={}).text
+
+
 def test_pii_detects_keys_jwt_url_mac() -> None:
     g = PIIGuardrail()
     assert (

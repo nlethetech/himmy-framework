@@ -78,15 +78,40 @@ def _phone_ok(text: str) -> bool:
     return True
 
 
+#: A whole http(s) URL. Its path/query — a tweet status id, a ``/news/195751`` id — is NOT
+#: PII, and scrubbing digits out of it breaks the link, so the numeric/structured rules must
+#: not redact inside it. (``url_credentials`` is the exception: it targets an embedded
+#: ``user:pass@`` and still applies to URLs.)
+_URL_RE = re.compile(r"""https?://[^\s<>"')\]]+""")
+
+
 def _redact(text: str, rules: list[PIIRule]) -> tuple[str, list[str]]:
-    """Apply each rule (validated) in order; return redacted text + per-label flags."""
+    """Apply each rule (validated) in order; return redacted text + per-label flags.
+
+    A match that falls inside an http(s) URL is left intact for every rule EXCEPT
+    ``url_credentials`` — a tweet/news id in a URL path is not PII and redacting it would
+    break the citation link. URL spans are recomputed per rule (the text mutates as rules
+    redact), so the in-URL test stays aligned with the string being substituted.
+    """
     redacted = text
     flags: list[str] = []
     for rule in rules:
+        protect_urls = rule.label != "url_credentials"
+        spans = (
+            [(m.start(), m.end()) for m in _URL_RE.finditer(redacted)]
+            if protect_urls
+            else []
+        )
         hit = False
 
-        def _replace(match: re.Match[str], r: PIIRule = rule) -> str:
+        def _replace(
+            match: re.Match[str],
+            r: PIIRule = rule,
+            spans: list[tuple[int, int]] = spans,
+        ) -> str:
             nonlocal hit
+            if any(s <= match.start() and match.end() <= e for s, e in spans):
+                return match.group(0)  # inside a URL — keep the link intact, not PII
             if r.validator is not None and not r.validator(match.group(0)):
                 return match.group(0)
             hit = True
