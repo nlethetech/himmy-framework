@@ -163,7 +163,9 @@ def test_repl_turn_autopersists_to_last(
     repl = _scripted_repl(["hello", "/exit"])
     code = repl.run()
     assert code == 0
-    store = SqliteSessionStore(str(tmp_path / ".himmy" / "sessions.db"))
+    from himmy.config.project import conversations_db_path
+
+    store = SqliteSessionStore(conversations_db_path())
     assert store.load("last") is not None
     store.close()
 
@@ -177,10 +179,11 @@ def test_fresh_repl_does_not_autoload_last(
     # A new bare REPL: _new_thread must NOT load 'last'.
     repl = _scripted_repl(["/exit"])
     repl.rebuild()
+    from himmy.config.project import conversations_db_path
     from himmy.runtime.session import SqliteSessionStore
 
     Path(".himmy").mkdir(exist_ok=True)
-    repl.rt["session_store"] = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
+    repl.rt["session_store"] = SqliteSessionStore(conversations_db_path())
     thread = repl._new_thread()
     assert thread.messages == []  # fresh, not the seeded 'last'
 
@@ -193,9 +196,10 @@ def test_continue_last_loads_prior_thread(
     _scripted_repl(["remember this", "/exit"]).run()
     repl = _scripted_repl(["/exit"], continue_last=True)
     repl.rebuild()
+    from himmy.config.project import conversations_db_path
     from himmy.runtime.session import SqliteSessionStore
 
-    repl.rt["session_store"] = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
+    repl.rt["session_store"] = SqliteSessionStore(conversations_db_path())
     thread = repl._new_thread()
     assert any("remember this" in (m.content or "") for m in thread.messages)
 
@@ -217,9 +221,10 @@ def test_explicit_session_unaffected_by_default_continuity(
     monkeypatch.chdir(tmp_path)
     repl = _scripted_repl(["into session", "/exit"], session="work")
     repl.run()
+    from himmy.config.project import conversations_db_path
     from himmy.runtime.session import SqliteSessionStore
 
-    store = SqliteSessionStore(str(tmp_path / ".himmy" / "sessions.db"))
+    store = SqliteSessionStore(conversations_db_path())
     assert store.load("work") is not None
     # A bare REPL persists to 'last', so 'work' must be distinct.
     assert any(i.session_id == "work" for i in store.list_sessions())
@@ -236,9 +241,10 @@ def test_resume_picker_swaps_thread(
 
     repl = _scripted_repl(["1"])  # picker reads "1"
     repl.rebuild()
+    from himmy.config.project import conversations_db_path
     from himmy.runtime.session import SqliteSessionStore
 
-    repl.rt["session_store"] = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
+    repl.rt["session_store"] = SqliteSessionStore(conversations_db_path())
     lines: list[str] = []
     repl._eprint = staticmethod(  # type: ignore[method-assign,assignment]
         lambda *a: lines.append(" ".join(str(x) for x in a))
@@ -260,9 +266,10 @@ def test_resume_picker_cancel_keeps_thread(
     _scripted_repl(["seed", "/exit"]).run()
     repl = _scripted_repl([""])  # blank → cancel
     repl.rebuild()
+    from himmy.config.project import conversations_db_path
     from himmy.runtime.session import SqliteSessionStore
 
-    repl.rt["session_store"] = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
+    repl.rt["session_store"] = SqliteSessionStore(conversations_db_path())
     repl._eprint = staticmethod(lambda *a: None)  # type: ignore[method-assign,assignment]
     from himmy.agents.base_agent.thread import ChatThread
 

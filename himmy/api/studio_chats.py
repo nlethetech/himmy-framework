@@ -1,66 +1,44 @@
-"""Studio Chats: durable, resumable chat sessions — and the Projects that group them.
+"""Studio Chats — now a thin adapter over the ONE unified conversation store (T2.3).
 
-The Chat screen keeps its live transcript in React state; this store persists a session
-so it can be reopened later. A ``ChatSession`` holds metadata (title, agent path,
-provider) and an ordered list of ``ChatMessage`` rows. SQLite at ``.himmy/chats.db``
-(cwd-keyed singleton), mirroring the Tasks/Notes/Calendar stores.
+The Chat screen keeps its live transcript in React state; this store persists a session so
+it can be reopened later. Historically that lived in a standalone ``.himmy/chats.db`` (a
+FLAT ``user``/``agent`` transcript) disconnected from the CLI's rich ``.himmy/sessions.db``.
+As of T2.3 both collapse into ONE durable ``.himmy/conversations.db``
+(:mod:`himmy.services.storage.conversations`): the authoritative store keeps a rich
+:class:`~himmy.agents.base_agent.thread.ChatThread` JSON and regenerates the flat projection
+this screen reads, so a conversation started in ``himmy chat`` shows up in the Studio Chats
+list and vice versa.
 
-Projects give sustained work a home: a named group of chats with an optional
-default knowledge base and default agent. They live in the same database
-(``projects`` table) and sessions carry a nullable ``project_id`` — added via
-the same additive ``PRAGMA table_info`` + ``ALTER TABLE`` migration the runs
-store uses, so pre-existing databases upgrade in place without touching rows.
+:class:`ChatsStore` is kept as a BACK-COMPATIBLE FACADE: the same ``list``/``get``/``save``/
+``rename``/``delete`` chat surface and the same Projects surface, returning the same
+:class:`ChatSession`/:class:`ChatSessionDetail`/:class:`Project` models, with a live ``_conn``
+exposing the unified database (a ``chat_sessions`` compatibility view keeps the legacy
+direct-SQL inspection working). Studio's flat save is mapped to the authoritative thread via
+:func:`~himmy.services.storage.conversations.thread_from_flat`.
+
+Security: the co-mounted ``POST /api/studio/chats`` write path is single-user-gated — every
+``/api/studio`` route carries the ``studio:use`` permission guard (see
+:func:`himmy.api.routers.studio._studio_permission`), which is a no-op only in the zero-config
+loopback default and otherwise requires the ``studio:use`` role. There is no per-tenant
+workspace on a Studio conversation by design (Studio is single-user-local); the guard is the
+isolation boundary.
 """
 
 from __future__ import annotations
 
 import builtins
-import sqlite3
+import os
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from himmy.core.ids import new_uuid, utc_now_iso
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS chat_sessions (
-    id          TEXT PRIMARY KEY,
-    title       TEXT NOT NULL,
-    agent_path  TEXT,
-    provider    TEXT,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
-    project_id  TEXT
-);
-CREATE TABLE IF NOT EXISTS chat_messages (
-    id          TEXT PRIMARY KEY,
-    session_id  TEXT NOT NULL,
-    role        TEXT NOT NULL,
-    text        TEXT NOT NULL,
-    seq         INTEGER NOT NULL,
-    created_at  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_chat_messages_session
-    ON chat_messages (session_id, seq);
-CREATE TABLE IF NOT EXISTS projects (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    kb_id       TEXT,
-    agent_path  TEXT,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
-);
-"""
-
-#: Columns added to ``chat_sessions`` after the original schema shipped, with the
-#: ``ALTER TABLE`` declaration that backfills a pre-existing database. Mirrors
-#: the migration pattern in :mod:`himmy.api.studio_runs`. Additive + nullable
-#: only — existing rows are never rewritten.
-_LATER_SESSION_COLUMNS: dict[str, str] = {
-    "project_id": "TEXT",
-}
+from himmy.services.storage.conversations import (
+    ORIGIN_STUDIO,
+    ConversationStore,
+    get_conversation_store,
+    reset_conversation_store,
+)
 
 
 class ChatMessage(BaseModel):
@@ -100,54 +78,53 @@ class Project(BaseModel):
 _PROJECT_FIELDS = frozenset({"name", "description", "kb_id", "agent_path"})
 
 
+def _derive_title(messages: Sequence[ChatMessage]) -> str:
+    """Use the first user message as the session title (trimmed)."""
+    for m in messages:
+        if m.role == "user" and m.text.strip():
+            t = m.text.strip().splitlines()[0]
+            return t[:60] + ("…" if len(t) > 60 else "")
+    return "New chat"
+
+
 class ChatsStore:
-    def __init__(self, path: str = ":memory:") -> None:
-        from himmy.core.sqlite_util import connect_hardened
+    """Facade over :class:`~himmy.services.storage.conversations.ConversationStore`.
 
-        self._conn = connect_hardened(path)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
-        self._migrate()
-        self._conn.commit()
+    Translates the Studio chat/project surface to the unified store. A Studio chat id is
+    used directly as the unified ``conversation_id`` (so a chat saved here is the same row
+    the CLI ``/resume`` picker lists). When constructed with an explicit ``path`` (e.g. by a
+    test pointing ``HIMMY_CHATS_PATH`` at a tmp file) it owns its own store; the singleton
+    accessor reuses the process-wide one.
+    """
 
-    def _migrate(self) -> None:
-        """Add columns introduced after a DB was first created (project_id)."""
-        cols = {
-            r["name"]
-            for r in self._conn.execute("PRAGMA table_info(chat_sessions)").fetchall()
-        }
-        for name, decl in _LATER_SESSION_COLUMNS.items():
-            if name not in cols:
-                self._conn.execute(
-                    f"ALTER TABLE chat_sessions ADD COLUMN {name} {decl}"
-                )
+    def __init__(self, path: str = ":memory:", *, store: ConversationStore | None = None) -> None:
+        self._store = store if store is not None else ConversationStore(path)
 
-    def list(self) -> list[ChatSession]:
-        rows = self._conn.execute(
-            """
-            SELECT s.*, COUNT(m.id) AS n
-            FROM chat_sessions s
-            LEFT JOIN chat_messages m ON m.session_id = s.id
-            GROUP BY s.id
-            ORDER BY s.updated_at DESC
-            """
-        ).fetchall()
-        return [self._session(r, r["n"]) for r in rows]
+    @property
+    def _conn(self):  # type: ignore[no-untyped-def]
+        """The unified store's live SQLite connection (back-compat for direct-SQL tests)."""
+        return self._store._conn
+
+    # ---- chats ------------------------------------------------------------
+
+    def list(self) -> builtins.list[ChatSession]:
+        return [self._to_session(s) for s in self._store.list_summaries()]
 
     def get(self, session_id: str) -> ChatSessionDetail | None:
-        row = self._conn.execute(
-            "SELECT * FROM chat_sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        if row is None:
+        summary = self._store.get_summary(session_id)
+        if summary is None:
             return None
-        msgs = self._conn.execute(
-            "SELECT role, text FROM chat_messages WHERE session_id = ? ORDER BY seq",
-            (session_id,),
-        ).fetchall()
-        base = self._session(row, len(msgs))
+        msgs = self._store.flat_messages(session_id)
         return ChatSessionDetail(
-            **base.model_dump(),
-            messages=[ChatMessage(role=m["role"], text=m["text"]) for m in msgs],
+            id=summary.conversation_id,
+            title=summary.title,
+            agent_path=summary.agent_path,
+            provider=summary.provider,
+            created_at=summary.created_at,
+            updated_at=summary.updated_at,
+            message_count=summary.message_count,
+            project_id=summary.project_id,
+            messages=[ChatMessage(role=m.role, text=m.text) for m in msgs],
         )
 
     def save(
@@ -162,105 +139,38 @@ class ChatsStore:
     ) -> ChatSession:
         """Create or replace a session and its messages (upsert by id).
 
-        ``project_id=None`` means "leave the assignment alone" — a resave from
-        the Chat screen must never silently pull a chat out of its project.
-        Clearing an assignment goes through :meth:`unassign_chat`.
+        ``project_id=None`` means "leave the assignment alone" (the unified store honours
+        the same contract). The flat ``messages`` are lifted to the authoritative ChatThread
+        by the store.
         """
-        now = utc_now_iso()
-        sid = session_id or new_uuid()
         resolved_title = (title or "").strip() or _derive_title(messages)
-        existing = self._conn.execute(
-            "SELECT created_at, project_id FROM chat_sessions WHERE id = ?", (sid,)
-        ).fetchone()
-        created = existing["created_at"] if existing else now
-        effective_project = project_id or (existing["project_id"] if existing else None)
-        self._conn.execute(
-            """
-            INSERT INTO chat_sessions
-                (id, title, agent_path, provider, created_at, updated_at, project_id)
-            VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(id) DO UPDATE SET
-                title=excluded.title,
-                agent_path=excluded.agent_path,
-                provider=excluded.provider,
-                updated_at=excluded.updated_at,
-                project_id=excluded.project_id
-            """,
-            (
-                sid,
-                resolved_title,
-                agent_path,
-                provider,
-                created,
-                now,
-                effective_project,
-            ),
-        )
-        self._conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (sid,))
-        for i, m in enumerate(messages):
-            self._conn.execute(
-                """
-                INSERT INTO chat_messages (id, session_id, role, text, seq, created_at)
-                VALUES (?,?,?,?,?,?)
-                """,
-                (new_uuid(), sid, m.role, m.text, i, now),
-            )
-        self._conn.commit()
-        return ChatSession(
-            id=sid,
+        summary = self._store.save_flat(
+            conversation_id=session_id,
             title=resolved_title,
             agent_path=agent_path,
             provider=provider,
-            created_at=created,
-            updated_at=now,
-            message_count=len(messages),
-            project_id=effective_project,
+            flat_messages=[(m.role, m.text) for m in messages],
+            project_id=project_id,
+            origin=ORIGIN_STUDIO,
         )
+        return self._to_session(summary)
 
     def rename(self, session_id: str, title: str) -> bool:
-        cur = self._conn.execute(
-            "UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?",
-            (title, utc_now_iso(), session_id),
-        )
-        self._conn.commit()
-        return cur.rowcount > 0
+        return self._store.rename(session_id, title)
 
     def delete(self, session_id: str) -> bool:
-        self._conn.execute(
-            "DELETE FROM chat_messages WHERE session_id = ?", (session_id,)
-        )
-        cur = self._conn.execute(
-            "DELETE FROM chat_sessions WHERE id = ?", (session_id,)
-        )
-        self._conn.commit()
-        return cur.rowcount > 0
+        return self._store.delete(session_id)
 
-    # ---- Projects ---------------------------------------------------------
+    # ---- projects ---------------------------------------------------------
 
     def list_projects(self) -> builtins.list[Project]:
-        # (builtins.list: inside this class, bare ``list`` names the method above)
-        rows = self._conn.execute(
-            """
-            SELECT p.*, COUNT(s.id) AS n
-            FROM projects p
-            LEFT JOIN chat_sessions s ON s.project_id = p.id
-            GROUP BY p.id
-            ORDER BY p.updated_at DESC
-            """
-        ).fetchall()
-        return [self._project(r, r["n"]) for r in rows]
+        return [self._to_project(r, n) for r, n in self._store.list_project_rows()]
 
     def get_project(self, project_id: str) -> Project | None:
-        row = self._conn.execute(
-            "SELECT * FROM projects WHERE id = ?", (project_id,)
-        ).fetchone()
+        row = self._store.get_project_row(project_id)
         if row is None:
             return None
-        n = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM chat_sessions WHERE project_id = ?",
-            (project_id,),
-        ).fetchone()["n"]
-        return self._project(row, n)
+        return self._to_project(row, self._store.project_chat_count(project_id))
 
     def create_project(
         self,
@@ -270,118 +180,59 @@ class ChatsStore:
         kb_id: str | None = None,
         agent_path: str | None = None,
     ) -> Project:
-        now = utc_now_iso()
-        pid = new_uuid()
-        self._conn.execute(
-            """
-            INSERT INTO projects
-                (id, name, description, kb_id, agent_path, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?)
-            """,
-            (pid, name, description, kb_id, agent_path, now, now),
+        data = self._store.create_project(
+            name=name, description=description, kb_id=kb_id, agent_path=agent_path
         )
-        self._conn.commit()
-        return Project(
-            id=pid,
-            name=name,
-            description=description,
-            kb_id=kb_id,
-            agent_path=agent_path,
-            created_at=now,
-            updated_at=now,
-            chat_count=0,
-        )
+        return Project(**data)  # type: ignore[arg-type]
 
     def update_project(
         self, project_id: str, changes: Mapping[str, str | None]
     ) -> Project | None:
         """Apply a partial update; unknown keys are ignored, ``None`` clears.
 
-        Only the columns in ``_PROJECT_FIELDS`` are writable (the SQL below is
-        built from that allowlist, never from caller-supplied names).
+        Only the columns in ``_PROJECT_FIELDS`` are writable (the assignment dict is built
+        from that allowlist, never from caller-supplied names).
         """
         sets = {k: changes[k] for k in _PROJECT_FIELDS if k in changes}
         if "name" in sets and not (sets["name"] or "").strip():
             del sets["name"]  # a project always keeps a non-empty name
-        if sets:
-            assignments = ", ".join(f"{k} = ?" for k in sets)
-            cur = self._conn.execute(
-                # column names come from the _PROJECT_FIELDS allowlist above,
-                # never from caller input — only values are interpolated via ?
-                f"UPDATE projects SET {assignments}, updated_at = ? WHERE id = ?",  # noqa: S608
-                (*sets.values(), utc_now_iso(), project_id),
-            )
-            self._conn.commit()
-            if cur.rowcount == 0:
-                return None
+        if self._store.get_project_row(project_id) is None:
+            return None
+        self._store.update_project(project_id, dict(sets))
         return self.get_project(project_id)
 
     def delete_project(self, project_id: str) -> bool:
-        """Delete a project; its chats survive, merely ungrouped."""
-        self._conn.execute(
-            "UPDATE chat_sessions SET project_id = NULL WHERE project_id = ?",
-            (project_id,),
-        )
-        cur = self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-        self._conn.commit()
-        return cur.rowcount > 0
+        return self._store.delete_project(project_id)
 
     def project_chats(self, project_id: str) -> builtins.list[ChatSession]:
-        """The project's sessions, newest activity first."""
-        rows = self._conn.execute(
-            """
-            SELECT s.*, COUNT(m.id) AS n
-            FROM chat_sessions s
-            LEFT JOIN chat_messages m ON m.session_id = s.id
-            WHERE s.project_id = ?
-            GROUP BY s.id
-            ORDER BY s.updated_at DESC
-            """,
-            (project_id,),
-        ).fetchall()
-        return [self._session(r, r["n"]) for r in rows]
+        return [
+            self._to_session(s)
+            for s in self._store.project_conversation_summaries(project_id)
+        ]
 
     def assign_chat(self, project_id: str, chat_id: str) -> bool:
-        """Put a chat into a project. False when either side is unknown."""
-        if self.get_project(project_id) is None:
-            return False
-        cur = self._conn.execute(
-            "UPDATE chat_sessions SET project_id = ? WHERE id = ?",
-            (project_id, chat_id),
-        )
-        if cur.rowcount > 0:
-            self._conn.execute(
-                "UPDATE projects SET updated_at = ? WHERE id = ?",
-                (utc_now_iso(), project_id),
-            )
-        self._conn.commit()
-        return cur.rowcount > 0
+        return self._store.assign_conversation(project_id, chat_id)
 
     def unassign_chat(self, chat_id: str) -> bool:
-        """Pull a chat out of whatever project holds it."""
-        cur = self._conn.execute(
-            "UPDATE chat_sessions SET project_id = NULL "
-            "WHERE id = ? AND project_id IS NOT NULL",
-            (chat_id,),
-        )
-        self._conn.commit()
-        return cur.rowcount > 0
+        return self._store.unassign_conversation(chat_id)
+
+    # ---- mapping ----------------------------------------------------------
 
     @staticmethod
-    def _session(row: sqlite3.Row, n: int) -> ChatSession:
+    def _to_session(summary) -> ChatSession:  # type: ignore[no-untyped-def]
         return ChatSession(
-            id=row["id"],
-            title=row["title"],
-            agent_path=row["agent_path"],
-            provider=row["provider"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            message_count=n,
-            project_id=row["project_id"],
+            id=summary.conversation_id,
+            title=summary.title,
+            agent_path=summary.agent_path,
+            provider=summary.provider,
+            created_at=summary.created_at,
+            updated_at=summary.updated_at,
+            message_count=summary.message_count,
+            project_id=summary.project_id,
         )
 
     @staticmethod
-    def _project(row: sqlite3.Row, n: int) -> Project:
+    def _to_project(row, n: int) -> Project:  # type: ignore[no-untyped-def]
         return Project(
             id=row["id"],
             name=row["name"],
@@ -394,50 +245,56 @@ class ChatsStore:
         )
 
     def close(self) -> None:
-        self._conn.close()
-
-
-def _derive_title(messages: Sequence[ChatMessage]) -> str:
-    """Use the first user message as the session title (trimmed)."""
-    for m in messages:
-        if m.role == "user" and m.text.strip():
-            t = m.text.strip().splitlines()[0]
-            return t[:60] + ("…" if len(t) > 60 else "")
-    return "New chat"
-
-
-_STORE: ChatsStore | None = None
-_PATH: str | None = None
+        self._store.close()
 
 
 def chats_db_path() -> str:
-    import os
+    """The path the Studio chats facade opens.
 
+    Honours the legacy ``HIMMY_CHATS_PATH`` override (kept for test isolation and any
+    operator who pinned it) and otherwise resolves to the canonical unified
+    ``.himmy/conversations.db`` — so by default Studio and the CLI share one database.
+    """
     env = os.environ.get("HIMMY_CHATS_PATH")
     if env:
         return env
-    d = Path(".himmy")
-    d.mkdir(exist_ok=True)
-    return str(d / "chats.db")
+    from himmy.config.project import conversations_db_path
+
+    return conversations_db_path()
 
 
 def get_chats_store() -> ChatsStore:
-    global _STORE, _PATH
-    path = chats_db_path()
-    if _STORE is None or _PATH != path:
-        if _STORE is not None:
-            _STORE.close()
-        _STORE = ChatsStore(path)
-        _PATH = path
-    return _STORE
+    """Return the process-wide Studio chats facade over the unified store.
+
+    When ``HIMMY_CHATS_PATH`` is set the facade opens that explicit path (own connection,
+    used by tests for isolation); otherwise it wraps the shared
+    :func:`~himmy.services.storage.conversations.get_conversation_store` singleton so Studio
+    and the CLI literally share one open store.
+    """
+    env = os.environ.get("HIMMY_CHATS_PATH")
+    if env:
+        global _OVERRIDE_STORE, _OVERRIDE_PATH
+        if _OVERRIDE_STORE is None or _OVERRIDE_PATH != env:
+            if _OVERRIDE_STORE is not None:
+                _OVERRIDE_STORE.close()
+            _OVERRIDE_STORE = ChatsStore(env)
+            _OVERRIDE_PATH = env
+        return _OVERRIDE_STORE
+    return ChatsStore(store=get_conversation_store())
 
 
 def reset_chats_store() -> None:
-    global _STORE, _PATH
-    if _STORE is not None:
-        _STORE.close()
-    _STORE = None
-    _PATH = None
+    """Drop both the override facade and the shared singleton (test hook)."""
+    global _OVERRIDE_STORE, _OVERRIDE_PATH
+    if _OVERRIDE_STORE is not None:
+        _OVERRIDE_STORE.close()
+    _OVERRIDE_STORE = None
+    _OVERRIDE_PATH = None
+    reset_conversation_store()
+
+
+_OVERRIDE_STORE: ChatsStore | None = None
+_OVERRIDE_PATH: str | None = None
 
 
 __all__ = [

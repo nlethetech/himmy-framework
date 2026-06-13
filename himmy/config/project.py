@@ -32,6 +32,10 @@ HIMMY_DIR_NAME = ".himmy"
 #: set it is honoured verbatim — the parent directory is created on first use.
 HIMMY_SPINE_PATH_ENV = "HIMMY_SPINE_PATH"
 
+#: Override for the canonical durable conversation store (``.himmy/conversations.db`` by
+#: default). When set it is honoured verbatim — the parent directory is created on first use.
+HIMMY_CONVERSATIONS_PATH_ENV = "HIMMY_CONVERSATIONS_PATH"
+
 
 def find_project_config(start: str | Path | None = None) -> Path | None:
     """Locate ``himmy.toml`` (cwd) or ``~/.himmy/config.toml``, or ``None``."""
@@ -94,6 +98,24 @@ def spine_db_path(start: str | Path | None = None) -> str:
     return str(himmy_dir(start) / "spine.db")
 
 
+def conversations_db_path(start: str | Path | None = None) -> str:
+    """The ONE canonical durable conversation store the CLI and Studio both share (T2.3).
+
+    Resolution: ``HIMMY_CONVERSATIONS_PATH`` when set (honoured verbatim, its parent dir
+    created), otherwise ``<project-root>/.himmy/conversations.db`` (project root resolved by
+    :func:`find_project_root`). This is the single decision point for WHERE conversations
+    live, so a thread started in ``himmy chat`` is the same on-disk database the Studio Chats
+    list reads — coherence across the interfaces.
+    """
+    override = os.environ.get(HIMMY_CONVERSATIONS_PATH_ENV)
+    if override and override.strip():
+        path = Path(override.strip()).expanduser()
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    return str(himmy_dir(start) / "conversations.db")
+
+
 def load_project_config(start: str | Path | None = None) -> dict[str, Any]:
     """Load the project config as a dict (empty when no file is found)."""
     path = find_project_config(start)
@@ -104,8 +126,10 @@ def load_project_config(start: str | Path | None = None) -> dict[str, Any]:
 
 
 __all__ = [
+    "HIMMY_CONVERSATIONS_PATH_ENV",
     "HIMMY_DIR_NAME",
     "HIMMY_SPINE_PATH_ENV",
+    "conversations_db_path",
     "find_project_config",
     "find_project_root",
     "himmy_dir",

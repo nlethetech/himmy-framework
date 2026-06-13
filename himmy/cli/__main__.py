@@ -180,7 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_agent_flags(p_chat)
     p_chat.add_argument("--message", help="run a single turn non-interactively")
     p_chat.add_argument(
-        "--session", help="persist/resume this conversation by id (.himmy/sessions.db)"
+        "--session",
+        help="persist/resume this conversation by id (.himmy/conversations.db)",
     )
     p_chat.add_argument(
         "-c",

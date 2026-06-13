@@ -1123,12 +1123,11 @@ class ChatRepl:
         # Durable session continuity. Always wire the store: a bare REPL still
         # auto-persists to the implicit "last" session after every turn (only an
         # explicit --session or -c/--continue LOADS a prior thread at startup).
+        from himmy.config.project import conversations_db_path
         from himmy.runtime.session import SqliteSessionStore
 
         Path(".himmy").mkdir(exist_ok=True)
-        self.rt["session_store"] = SqliteSessionStore(
-            str(Path(".himmy") / "sessions.db")
-        )
+        self.rt["session_store"] = SqliteSessionStore(conversations_db_path())
 
         # Connect MCP servers ONCE on the persistent loop (reused across turns).
         mcp_clients: list[Any] = []

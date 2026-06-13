@@ -653,10 +653,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
         session_id = str(explicit) if explicit else ("last" if continue_last else None)
         store = None
         if session_id:
+            from himmy.config.project import conversations_db_path
             from himmy.runtime.session import SqliteSessionStore
 
             Path(".himmy").mkdir(exist_ok=True)
-            store = SqliteSessionStore(str(Path(".himmy") / "sessions.db"))
+            store = SqliteSessionStore(conversations_db_path())
         thread = ChatThread(agent_id=persona.agent_id)
         if store is not None and session_id:
             existing = store.load(session_id)
