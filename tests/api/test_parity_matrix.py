@@ -10,8 +10,13 @@ that the corresponding surface actually EXISTS on that interface:
 * **CLI** — the subcommand is registered in the ``himmy`` argparse parser
   (introspected via :func:`himmy.cli.__main__._command_names`).
 * **Studio (GUI)** — the BFF route is registered in the same app **and**
-  (best-effort) a frontend artifact exists under ``studio/src`` (a route in
-  ``main.tsx`` or a screen/component/lib module that renders the surface).
+  (best-effort) a frontend artifact exists under ``studio/src`` (a *non-empty*
+  feature-named route in ``main.tsx`` or a screen/component/lib module that renders
+  the surface). The always-present "/" home/index route is deliberately NOT a
+  satisfying artifact: a feature-specific cell can never "pass" on the home screen,
+  so a genuinely-absent Studio surface (e.g. Recommendations, Context — which exist
+  on /v1 + CLI but were never built into Studio) is encoded as a documented
+  principled-omit, never as a hollow ``route=""`` cell.
 
 A ``✓``/``=`` cell whose surface is missing FAILS the test. A principled-omit
 (``⊘``) MUST carry a documented footnote reason (encoded inline on the cell), so
@@ -65,14 +70,17 @@ def _studio_route_paths() -> frozenset[str]:
     """Client-side route paths declared in ``studio/src/main.tsx`` (e.g. ``activity``).
 
     Parsed from the ``path: "..."`` entries in the ``createBrowserRouter`` table.
-    The index route (``index: true``) is represented as the empty string ``""``.
+
+    The index route (``index: true`` → the always-present "/" home screen) is
+    deliberately NOT added: it is not a dedicated surface for any feature, and
+    :func:`assert_studio` rejects ``route=""`` so a feature-specific cell can never
+    "pass" on the home screen. Encoding the index here would re-open that loophole.
+    Only non-empty, feature-named client-side routes are returned.
     """
     if not _STUDIO_MAIN.is_file():  # pragma: no cover - studio source always present
         return frozenset()
     text = _STUDIO_MAIN.read_text(encoding="utf-8")
-    paths = set(re.findall(r"""path:\s*["']([^"']*)["']""", text))
-    if re.search(r"\bindex:\s*true\b", text):
-        paths.add("")  # the index route is the "/" home screen
+    paths = {p for p in re.findall(r"""path:\s*["']([^"']*)["']""", text) if p}
     return frozenset(paths)
 
 
@@ -206,6 +214,24 @@ FOOTNOTES: dict[str, str] = {
         "CLI and Studio are single-user-local (one operator, one process), so a "
         "tenant-isolation control plane and retry-idempotency keys do not apply."
     ),
+    "10": (
+        "Recommendations are exposed on /v1 (GET /v1/recommendations) and the CLI "
+        "(`himmy recommendations`); Studio has NO dedicated recommendations surface "
+        "today. The plan's matrix marked the Studio cell '= recs screen' "
+        "aspirationally, but the screen was never built — there is no recommendations "
+        "BFF route, no client-side route, and no recommendations artifact anywhere in "
+        "studio/src. Encoded as a principled Studio omit rather than certifying a "
+        "surface that does not exist; a recs screen is a thin follow-on, not a "
+        "shipped surface."
+    ),
+    "11": (
+        "Context fields/snapshots are exposed on /v1 (GET /v1/context/fields) and the "
+        "CLI (`himmy context`); Studio has NO dedicated context-fields/snapshot "
+        "surface today. The plan's matrix marked the Studio cell '= context UI' "
+        "aspirationally, but no such UI exists in studio/src (the only `context` "
+        "references are React `createContext`/model-context, unrelated). Encoded as a "
+        "principled Studio omit rather than certifying a surface that does not exist."
+    ),
 }
 
 
@@ -302,21 +328,28 @@ MATRIX: tuple[MatrixRow, ...] = (
     MatrixRow(
         feature="Recommendations",
         cli=CliTarget(command="recommendations"),
-        # Studio surfaces recommendations on the Home screen (no dedicated BFF route).
-        studio=StudioTarget(route="", artifact="ecommend"),
+        # No Studio recommendations surface exists today (the plan's "recs screen" was
+        # never built) — documented principled omit, NOT an always-true index route. †10
+        studio=StudioTarget(omit_reason=FOOTNOTES["10"]),
         v1=V1Target(path="/v1/recommendations"),
+        footnotes=("10",),
     ),
     MatrixRow(
         feature="Context fields/snapshots",
         cli=CliTarget(command="context"),
-        # Studio context surfaces inside the Home/dashboard UI (no dedicated BFF route).
-        studio=StudioTarget(route=""),
+        # No Studio context-fields/snapshot surface exists today (the plan's "context
+        # UI" was never built) — documented principled omit. †11
+        studio=StudioTarget(omit_reason=FOOTNOTES["11"]),
         v1=V1Target(path="/v1/context/fields"),
+        footnotes=("11",),
     ),
     MatrixRow(
         feature="Dashboard / operational summary",
         cli=CliTarget(command="dashboard"),
-        studio=StudioTarget(bff_path="/api/studio/runs/analytics", route=""),
+        # The operational summary is the runs-analytics BFF, consumed by the Home
+        # screen; the registered BFF route IS the verifiable surface (no hollow
+        # route="" — the index route certifies nothing on its own).
+        studio=StudioTarget(bff_path="/api/studio/runs/analytics"),
         v1=V1Target(path="/v1/dashboard/summary"),
     ),
     MatrixRow(
@@ -466,13 +499,29 @@ def assert_studio(
             f"Studio BFF route {target.bff_path!r} is required by the parity matrix "
             f"but is not registered in the FastAPI app."
         )
-    # Best-effort frontend artifact: a declared route or a referenced source token.
-    has_route = target.route is not None and target.route in routes
+    # Best-effort frontend artifact: a declared NON-EMPTY client-side route or a
+    # referenced source token. The empty-string index route (``""``) is the always-
+    # present "/" home screen — it is NOT a dedicated surface for any feature, so it
+    # must NEVER satisfy a frontend-artifact assertion (otherwise a feature-specific
+    # Studio cell could "pass" on the home screen and the guard could never go red for
+    # it). A cell that wants frontend coverage must carry a real route or artifact.
+    declares_route = target.route is not None and target.route != ""
+    has_route = declares_route and target.route in routes
     has_artifact = target.artifact is not None and target.artifact in blob
-    if target.route is not None or target.artifact is not None:
+    if declares_route or target.artifact is not None:
         assert has_route or has_artifact, (
             f"Studio frontend artifact for this cell is missing under studio/src "
             f"(route={target.route!r}, artifact={target.artifact!r})."
+        )
+    elif target.route == "" and target.bff_path is None:
+        # ``route=""`` with no BFF route and no artifact is the defective pattern the
+        # capstone reviewer flagged: it asserts nothing (the index always exists). A
+        # cell that genuinely has no dedicated Studio surface must be a documented
+        # principled-omit, not a hollow ``route=""`` cell.
+        raise AssertionError(
+            "a Studio cell may not certify coverage via the empty index route "
+            '(route="") alone — declare a real BFF route / client-side route / '
+            "artifact, or encode the cell as a documented principled-omit."
         )
 
 
@@ -527,14 +576,13 @@ def test_every_cell_is_present_or_documented_omit() -> None:
             ("/v1", row.v1.path is not None or bool(row.v1.omit_reason)),
             (
                 "Studio",
-                any(
-                    v is not None
-                    for v in (
-                        row.studio.bff_path,
-                        row.studio.route,
-                        row.studio.artifact,
-                    )
-                )
+                # A present Studio surface needs a BFF route, a NON-EMPTY client-side
+                # route, or an artifact token — the empty index route (route="") is
+                # hollow and does NOT count (it would re-open the capstone loophole).
+                # Absent any of those, the cell MUST be a documented principled-omit.
+                row.studio.bff_path is not None
+                or (row.studio.route is not None and row.studio.route != "")
+                or row.studio.artifact is not None
                 or bool(row.studio.omit_reason),
             ),
         ):
@@ -600,4 +648,48 @@ def test_a_removed_studio_frontend_artifact_makes_the_guard_fail() -> None:
             registered=_PATHS,
             routes=crippled_routes,
             blob=crippled_blob,
+        )
+
+
+def test_an_artifact_only_studio_cell_goes_red_when_its_token_is_stripped() -> None:
+    """A token-backed Studio cell (no route) must fail once its artifact is gone.
+
+    The Guardrails cell carries a real ``artifact='guardrailsApi'`` and no client-side
+    route of its own (it renders inside the Tools screen). Removing the token from the
+    source blob and the ``tools`` route from the route set must make the cell go red —
+    proving artifact-backed coverage is genuinely verified, not hollow.
+    """
+    guard_row = next(r for r in MATRIX if r.feature.startswith("Guardrails"))
+    assert guard_row.studio.artifact == "guardrailsApi"  # guards the encoding
+    crippled_blob = _STUDIO_BLOB.replace("guardrailsApi", "REMOVED")
+    crippled_routes = frozenset(r for r in _STUDIO_ROUTES if r != "tools")
+    # BFF route stays registered → the failure must come from the missing artifact.
+    with pytest.raises(AssertionError):
+        assert_studio(
+            guard_row.studio,
+            registered=_PATHS,
+            routes=crippled_routes,
+            blob=crippled_blob,
+        )
+
+
+def test_the_empty_index_route_cannot_satisfy_a_studio_cell() -> None:
+    """The capstone loophole the reviewer flagged is closed: ``route=""`` is hollow.
+
+    A Studio cell that declares ONLY the empty index route (the defective pattern the
+    Recommendations/Context cells used) asserts nothing — the "/" home screen always
+    exists. This must now FAIL so such a cell can never silently certify coverage; a
+    genuinely-absent Studio surface must instead be a documented principled-omit.
+    """
+    hollow = StudioTarget(route="")  # no bff_path, no artifact — index only
+    with pytest.raises(AssertionError):
+        assert_studio(hollow, registered=_PATHS, routes=_STUDIO_ROUTES, blob=_STUDIO_BLOB)
+    # Even if the parser were to (re-)introduce "" into the route set, the empty route
+    # must STILL not satisfy the cell.
+    with pytest.raises(AssertionError):
+        assert_studio(
+            hollow,
+            registered=_PATHS,
+            routes=_STUDIO_ROUTES | frozenset({""}),
+            blob=_STUDIO_BLOB,
         )
