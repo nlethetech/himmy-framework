@@ -39,6 +39,7 @@ from himmy.api.routers import (
     models,
     privacy_audit,
     recommendations,
+    routines,
     runs,
     studio,
     studio_eval,
@@ -312,6 +313,13 @@ def _build_lifespan(
                 set_canonical_storage_provider(None)
             except Exception:  # pragma: no cover - shutdown best-effort
                 pass
+            # Clear the routine container provider for the same reason.
+            try:
+                from himmy.api.routines import set_routine_container_provider
+
+                set_routine_container_provider(None)
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
             # Clear the server-context flag so a subsequent in-process CLI/test run
             # reverts to the in-memory one-shot default.
             try:
@@ -393,6 +401,20 @@ def create_app(
     except Exception:  # pragma: no cover - canonical wiring is best-effort
         logger.warning("wiring canonical run store failed", exc_info=True)
 
+    # T3c: point the routine scheduler at the wired app container so a workspace-scoped
+    # (agent_id) routine run dispatches through the SAME RunAppService the request-driven
+    # /v1 surface uses — landing in the tenant's workspace of the canonical store under the
+    # T0.4 quota + the HITL rails. Resolved dynamically so a lifespan rebind to the durable
+    # container is reflected.
+    try:
+        from himmy.api.routines import set_routine_container_provider
+
+        set_routine_container_provider(
+            lambda: getattr(app.state, "container", None)
+        )
+    except Exception:  # pragma: no cover - routine wiring is best-effort
+        logger.warning("wiring routine container failed", exc_info=True)
+
     app.state.authenticator = authenticator
     # Authorization: role → permission policy (data-driven via HIMMY_RBAC_FILE).
     # Enforced per-route via require_permission; bypassed when auth is off.
@@ -440,6 +462,7 @@ def create_app(
     app.include_router(agents.router)
     app.include_router(threads.router)
     app.include_router(knowledge.router)
+    app.include_router(routines.router)
     app.include_router(recommendations.router)
     app.include_router(dashboard.router)
     app.include_router(evaluation.router)

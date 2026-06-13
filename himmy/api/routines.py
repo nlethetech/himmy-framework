@@ -38,8 +38,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from himmy.core.ids import new_uuid, utc_now_iso
+from himmy.services.storage.models import LOCAL_WORKSPACE
 
 logger = logging.getLogger("himmy.api.routines")
+
+#: Builtin ``list`` aliased so annotations on :class:`RoutinesStore` methods that follow
+#: the ``def list`` method (which shadows the builtin name in class scope) still resolve to
+#: the builtin generic for the type checker — e.g. ``find_by_agent_id -> _list[str]``.
+_list = list
 
 # ---- schedule grammar -----------------------------------------------------
 
@@ -87,17 +93,36 @@ class Schedule(BaseModel):
 
 
 class Routine(BaseModel):
-    """One scheduled routine, as stored."""
+    """One scheduled routine, as stored.
+
+    A routine binds to its agent through EXACTLY ONE of two mutually-exclusive seams:
+
+    * ``agent_path`` — a project-relative ``agent.yaml`` on the SERVER filesystem. This
+      is the single-user-local seam the Studio routines screen and ``himmy routines``
+      drive (the local operator owns the filesystem). Runs execute headless through the
+      Studio run pipeline and land in the ``__local__`` workspace of the canonical store.
+    * ``agent_id`` — a stored, workspace-scoped :class:`AgentDefRecord` (T2e). This is
+      the multi-tenant ``/v1/routines`` seam: a tenant references a stored agent by id,
+      NEVER a filesystem path (a path would leak the server FS — reviewer must_fix). Runs
+      execute through ``RunAppService.create_run`` under the routine's ``workspace_id``.
+
+    ``workspace_id`` is the canonical tenant scope. It defaults to ``__local__`` so an
+    existing single-user routine (created before T3c) and the CLI/Studio surfaces all
+    share one scope; ``/v1`` stamps the authenticated tenant's workspace.
+    """
 
     id: str = Field(default_factory=new_uuid)
     name: str
-    agent_path: str
+    workspace_id: str = LOCAL_WORKSPACE
+    agent_path: str | None = None
+    agent_id: str | None = None
     prompt: str
     schedule: Schedule
     provider: str | None = None
     model: str | None = None
     deliver: DeliverKind = "none"
     enabled: bool = True
+    idempotency_key: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
     last_run_at: str | None = None
@@ -105,6 +130,16 @@ class Routine(BaseModel):
     last_preview: str = ""
     last_error: str | None = None
     last_delivery: str | None = None  # delivery failure note; None = ok / not asked
+
+    @model_validator(mode="after")
+    def _check_agent_binding(self) -> Routine:
+        """Exactly one of ``agent_path`` / ``agent_id`` must identify the agent."""
+        if bool(self.agent_path) == bool(self.agent_id):
+            raise ValueError(
+                "a routine needs exactly one of agent_path (single-user-local) or "
+                "agent_id (workspace-scoped stored agent)"
+            )
+        return self
 
 
 def _parse_iso(value: str) -> datetime | None:
@@ -152,11 +187,20 @@ def is_due(routine: Routine, now: datetime) -> bool:
 
 # ---- the store --------------------------------------------------------------
 
+#: The current (T3c) routines-table shape. ``agent_path`` is NULLABLE because a
+#: workspace-scoped ``/v1`` routine binds by ``agent_id`` instead (and vice-versa); the
+#: exactly-one-of invariant is enforced in the :class:`Routine` model, not by a column
+#: constraint. ``workspace_id`` defaults to ``__local__`` so a routine created before
+#: T3c (which had neither column) upgrades into the local scope. A fresh database lays
+#: this down directly; a legacy database is migrated to it by :meth:`RoutinesStore._migrate`.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS routines (
     id             TEXT PRIMARY KEY,
     name           TEXT NOT NULL,
-    agent_path     TEXT NOT NULL,
+    workspace_id   TEXT NOT NULL DEFAULT '__local__',
+    agent_path     TEXT,
+    agent_id       TEXT,
+    idempotency_key TEXT,
     prompt         TEXT NOT NULL,
     schedule_kind  TEXT NOT NULL,
     schedule_at    TEXT,
@@ -177,10 +221,17 @@ CREATE TABLE IF NOT EXISTS routines (
 
 
 def _row_to_routine(r: sqlite3.Row) -> Routine:
+    keys = r.keys()
     return Routine(
         id=r["id"],
         name=r["name"],
+        workspace_id=(r["workspace_id"] if "workspace_id" in keys else None)
+        or LOCAL_WORKSPACE,
         agent_path=r["agent_path"],
+        agent_id=(r["agent_id"] if "agent_id" in keys else None),
+        idempotency_key=(
+            r["idempotency_key"] if "idempotency_key" in keys else None
+        ),
         prompt=r["prompt"],
         schedule=Schedule(
             kind=r["schedule_kind"],
@@ -210,32 +261,123 @@ class RoutinesStore:
         self._conn = connect_hardened(path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
 
-    def list(self) -> list[Routine]:
-        rows = self._conn.execute(
-            "SELECT * FROM routines ORDER BY created_at DESC"
-        ).fetchall()
+    def _migrate(self) -> None:
+        """Forward-migrate a legacy (pre-T3c) routines table to the current shape.
+
+        A database created before T3c lacks the ``workspace_id``/``agent_id``/
+        ``idempotency_key`` columns AND carries a ``NOT NULL`` on ``agent_path`` — which a
+        plain ``ALTER ADD COLUMN`` cannot drop, yet an ``agent_id``-bound ``/v1`` routine
+        legitimately has a NULL ``agent_path``. So when the legacy ``NOT NULL`` is present
+        we REBUILD the table into the nullable shape (copy rows → drop → rename); otherwise
+        we additively add any missing columns. The introspection is idempotent, so the
+        method converges to the current schema on every open regardless of starting point.
+        """
+        info = self._conn.execute("PRAGMA table_info(routines)").fetchall()
+        cols = {row["name"] for row in info}
+        # ``notnull`` is 1 for a NOT NULL column. A legacy table has agent_path NOT NULL;
+        # the current shape has it nullable — that flag distinguishes the two and cannot be
+        # changed by ALTER, so a rebuild is required to relax it.
+        agent_path_notnull = any(
+            row["name"] == "agent_path" and row["notnull"] for row in info
+        )
+        if agent_path_notnull:
+            self._rebuild_legacy_table()
+        else:
+            if "workspace_id" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE routines ADD COLUMN workspace_id TEXT "
+                    "NOT NULL DEFAULT '__local__'"
+                )
+            if "agent_id" not in cols:
+                self._conn.execute("ALTER TABLE routines ADD COLUMN agent_id TEXT")
+            if "idempotency_key" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE routines ADD COLUMN idempotency_key TEXT"
+                )
+        # Create the workspace index AFTER the column is guaranteed to exist (a fresh
+        # database has it from _SCHEMA; a legacy one just got it above). Idempotent.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS routines_workspace_id_idx "
+            "ON routines (workspace_id)"
+        )
+
+    def _rebuild_legacy_table(self) -> None:
+        """Rebuild the legacy routines table into the nullable-``agent_path`` shape.
+
+        Copies every legacy row into a fresh table that matches the current ``_SCHEMA``
+        (stamping ``workspace_id='__local__'`` and leaving ``agent_id``/``idempotency_key``
+        NULL), then atomically swaps it in. Wrapped in a transaction so a failure leaves the
+        original table intact.
+        """
+        create_new = _SCHEMA.replace(
+            "CREATE TABLE IF NOT EXISTS routines", "CREATE TABLE routines_new"
+        )
+        with self._conn:  # one transaction; commits on success, rolls back on error
+            self._conn.execute(create_new)
+            self._conn.execute(
+                "INSERT INTO routines_new ("
+                "id, name, workspace_id, agent_path, agent_id, idempotency_key, prompt, "
+                "schedule_kind, schedule_at, schedule_hours, provider, model, deliver, "
+                "enabled, created_at, updated_at, last_run_at, last_status, last_preview, "
+                "last_error, last_delivery) "
+                "SELECT id, name, '__local__', agent_path, NULL, NULL, prompt, "
+                "schedule_kind, schedule_at, schedule_hours, provider, model, deliver, "
+                "enabled, created_at, updated_at, last_run_at, last_status, last_preview, "
+                "last_error, last_delivery FROM routines"
+            )
+            self._conn.execute("DROP TABLE routines")
+            self._conn.execute("ALTER TABLE routines_new RENAME TO routines")
+
+    def list(self, *, workspace_id: str | None = None) -> list[Routine]:
+        """All routines newest-first; scoped to ``workspace_id`` when given.
+
+        The scheduler tick lists across ALL workspaces (``workspace_id=None``) so one
+        process fires every tenant's due routines; ``/v1`` always passes a concrete
+        workspace so one tenant never sees another's routines.
+        """
+        if workspace_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM routines ORDER BY created_at DESC"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM routines WHERE workspace_id = ? "
+                "ORDER BY created_at DESC",
+                (workspace_id,),
+            ).fetchall()
         return [_row_to_routine(r) for r in rows]
 
-    def get(self, routine_id: str) -> Routine | None:
+    def get(
+        self, routine_id: str, *, workspace_id: str | None = None
+    ) -> Routine | None:
+        """Fetch one routine by id; ``None`` when out-of-workspace (404) when scoped."""
         row = self._conn.execute(
             "SELECT * FROM routines WHERE id = ?", (routine_id,)
         ).fetchone()
-        return _row_to_routine(row) if row else None
+        if row is None:
+            return None
+        routine = _row_to_routine(row)
+        if workspace_id is not None and routine.workspace_id != workspace_id:
+            return None
+        return routine
 
     def upsert(self, routine: Routine) -> Routine:
         routine.updated_at = utc_now_iso()
         self._conn.execute(
             """
             INSERT INTO routines (
-                id, name, agent_path, prompt, schedule_kind, schedule_at,
-                schedule_hours, provider, model, deliver, enabled, created_at,
-                updated_at, last_run_at, last_status, last_preview, last_error,
-                last_delivery
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                id, name, workspace_id, agent_path, agent_id, idempotency_key,
+                prompt, schedule_kind, schedule_at, schedule_hours, provider, model,
+                deliver, enabled, created_at, updated_at, last_run_at, last_status,
+                last_preview, last_error, last_delivery
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
-                name=excluded.name, agent_path=excluded.agent_path,
+                name=excluded.name, workspace_id=excluded.workspace_id,
+                agent_path=excluded.agent_path, agent_id=excluded.agent_id,
+                idempotency_key=excluded.idempotency_key,
                 prompt=excluded.prompt, schedule_kind=excluded.schedule_kind,
                 schedule_at=excluded.schedule_at,
                 schedule_hours=excluded.schedule_hours,
@@ -251,7 +393,10 @@ class RoutinesStore:
             (
                 routine.id,
                 routine.name,
+                routine.workspace_id,
                 routine.agent_path,
+                routine.agent_id,
+                routine.idempotency_key,
                 routine.prompt,
                 routine.schedule.kind,
                 routine.schedule.at,
@@ -272,10 +417,31 @@ class RoutinesStore:
         self._conn.commit()
         return routine
 
-    def delete(self, routine_id: str) -> bool:
-        cur = self._conn.execute("DELETE FROM routines WHERE id = ?", (routine_id,))
+    def delete(self, routine_id: str, *, workspace_id: str | None = None) -> bool:
+        """Delete a routine, tenant-scoped. Returns ``True`` iff a row was removed."""
+        if workspace_id is None:
+            cur = self._conn.execute(
+                "DELETE FROM routines WHERE id = ?", (routine_id,)
+            )
+        else:
+            cur = self._conn.execute(
+                "DELETE FROM routines WHERE id = ? AND workspace_id = ?",
+                (routine_id, workspace_id),
+            )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def find_by_agent_id(self, agent_id: str, *, workspace_id: str) -> _list[str]:
+        """Routine ids in ``workspace_id`` that reference stored ``agent_id`` (T2e ref-finder).
+
+        Used as the :class:`AgentDefAppService` reference finder so deleting a stored
+        agent still referenced by a routine returns HTTP 409 rather than orphaning it.
+        """
+        rows = self._conn.execute(
+            "SELECT id FROM routines WHERE agent_id = ? AND workspace_id = ?",
+            (agent_id, workspace_id),
+        ).fetchall()
+        return [r["id"] for r in rows]
 
     def mark_started(self, routine_id: str, started_at: str) -> None:
         """Stamp the run start — also the due-math anchor, so a slow run can't
@@ -339,6 +505,35 @@ def reset_routines_store() -> None:
     _PATH = None
 
 
+# ---- workspace-scoped (/v1) execution seam -----------------------------------
+
+#: Process-wide provider of the wired :class:`ApiContainer` (T3c). The app factory sets
+#: this to read ``app.state.container`` so a workspace-scoped (``agent_id``) routine run
+#: dispatched by the scheduler executes through the SAME ``RunAppService`` the request-
+#: driven ``/v1`` surface uses — landing the run in the tenant's workspace of the
+#: canonical store, under the T0.4 per-workspace quota, with the HITL/approval rails.
+#: Unset outside a server process (a plain CLI single-user-local routine never needs it).
+_CONTAINER_PROVIDER: Callable[[], Any] | None = None
+
+
+def set_routine_container_provider(provider: Callable[[], Any] | None) -> None:
+    """Install (or clear) the process-wide app-container provider for /v1 routines (T3c)."""
+    global _CONTAINER_PROVIDER
+    _CONTAINER_PROVIDER = provider
+
+
+def resolve_routine_container() -> Any | None:
+    """Resolve the wired app container, or ``None`` when not in a server process."""
+    provider = _CONTAINER_PROVIDER
+    if provider is None:
+        return None
+    try:
+        return provider()
+    except Exception:  # noqa: BLE001 - a bad provider must never break a run
+        logger.debug("routine container provider failed", exc_info=True)
+        return None
+
+
 # ---- headless execution ------------------------------------------------------
 
 
@@ -357,21 +552,33 @@ def run_timeout_s() -> float:
 
 
 async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
-    """Run one routine through the normal Studio run pipeline, unattended.
+    """Run one routine unattended; returns ``(status, output_text, error)``.
 
-    Returns ``(status, output_text, error)``. ``stream_agent_run`` persists the
-    run to the runs store itself; an approval-gated tool pauses the run on a
-    durable checkpoint (status ``awaiting_approval``) — it is NOT executed. The run
-    is mirrored into the canonical run store (T3c) so a scheduled run is visible in
-    ``himmy runs`` and ``/v1`` too, not just the local studio.db.
+    Two execution seams, picked by how the routine binds its agent:
+
+    * ``agent_id`` (workspace-scoped ``/v1`` routine) → :func:`_run_headless_agent_id`,
+      which dispatches through ``RunAppService.create_run`` under the routine's
+      ``workspace_id`` with the HITL/approval rails, landing the run in the TENANT's
+      workspace of the canonical store (the right place for a multi-tenant run).
+    * ``agent_path`` (single-user-local Studio/CLI routine) → the Studio
+      ``stream_agent_run`` pipeline (below), landing in the ``__local__`` workspace.
+
+    In both seams an approval-gated tool PAUSES the run (status ``awaiting_approval``)
+    rather than executing it; the scheduler never auto-approves.
     """
+    if routine.agent_id:
+        return await _run_headless_agent_id(routine)
+
     from himmy.api import studio_service
     from himmy.api.studio_canonical import resolve_canonical_storage
 
+    # The model invariant guarantees exactly one of agent_path/agent_id; the agent_id
+    # branch returned above, so agent_path is set here.
+    agent_path = routine.agent_path or ""
     canonical = resolve_canonical_storage()
     try:
         spec = studio_service.load_studio_spec(
-            routine.agent_path, provider=routine.provider, model=routine.model
+            agent_path, provider=routine.provider, model=routine.model
         )
     except FileNotFoundError as exc:
         return "error", "", str(exc)
@@ -389,7 +596,7 @@ async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
             routine.prompt,
             provider=routine.provider,
             model=routine.model,
-            agent_path=routine.agent_path,
+            agent_path=agent_path,
             canonical_storage=canonical,
         ):
             kind = event.get("type")
@@ -414,6 +621,111 @@ async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
         status = "error"
         error = str(exc)
     return status, output, error
+
+
+#: Canonical statuses that a polled unattended ``/v1`` run has SETTLED on — the scheduler
+#: stops waiting once a dispatched run reaches one (``AWAITING_APPROVAL`` is terminal for an
+#: unattended run: it paused on a gated tool and is NOT auto-approved).
+_SETTLED_RUN_STATUSES = {"SUCCEEDED", "FAILED", "AWAITING_APPROVAL"}
+
+#: Canonical → routine status string, mirroring the Studio mapping so a routine's
+#: ``last_status`` reads the same vocabulary regardless of which seam ran it.
+_RUN_STATUS_TO_ROUTINE = {
+    "SUCCEEDED": "ok",
+    "FAILED": "error",
+    "AWAITING_APPROVAL": "awaiting_approval",
+}
+
+
+async def _run_headless_agent_id(routine: Routine) -> tuple[str, str, str | None]:
+    """Dispatch a workspace-scoped (``agent_id``) routine through ``RunAppService`` (T3c).
+
+    Resolves the wired app container, loads the routine's stored agent in its OWN
+    ``workspace_id`` (404→error when missing/out-of-workspace), then launches the run via
+    ``create_run`` with ``hitl=True`` so an approval-gated tool PAUSES at
+    ``AWAITING_APPROVAL`` instead of firing unattended. ``create_run`` returns a QUEUED
+    record and executes on a background task, so we poll the canonical run until it settles
+    (or the wall-clock budget elapses). The run lands in the tenant's workspace of the ONE
+    canonical store — visible in ``GET /v1/runs`` AND ``himmy runs`` AND Studio.
+    """
+    container = resolve_routine_container()
+    if container is None:
+        return (
+            "error",
+            "",
+            "workspace-scoped routines require a running server (no app container)",
+        )
+    run_app = getattr(container, "run_app", None)
+    agent_app = getattr(container, "agent_app", None)
+    if run_app is None or agent_app is None:
+        return "error", "", "app container is missing the run/agent services"
+
+    from himmy.agents.base_agent.task import Task
+
+    workspace_id = routine.workspace_id
+    try:
+        agent_def = await agent_app.get_agent_def(
+            routine.agent_id, workspace_id=workspace_id
+        )
+        if agent_def is None:
+            return "error", "", f"stored agent {routine.agent_id!r} not found"
+        agent_spec = agent_def.agent_spec()
+        persona = agent_spec.to_persona()
+        llm_config = agent_spec.to_llm_config()
+    except Exception as exc:  # noqa: BLE001 - a bad spec must not kill the loop
+        return "error", "", f"could not resolve stored agent: {exc}"
+
+    task = Task(title=routine.name, prompt=routine.prompt, context={})
+    # HITL only when the stored agent actually builds a tool registry to gate; a tool-less
+    # agent has nothing to pause on, so dispatching it with hitl=True is rejected by
+    # create_run (HitlRequiresAgentError). Run it plainly in that case — it cannot reach a
+    # gated tool anyway, so the unattended-safety contract is preserved.
+    hitl = bool(agent_spec.builds_tool_registry())
+    actor = {"source": "routine", "routine_id": routine.id}
+    try:
+        run = await run_app.create_run(
+            workspace_id=workspace_id,
+            subject_id=workspace_id,
+            persona=persona,
+            task=task,
+            llm_config=llm_config,
+            agent_spec=agent_spec,
+            agent_def=agent_def,
+            hitl=hitl,
+            actor=actor,
+        )
+    except Exception as exc:  # noqa: BLE001 - admission/precondition failures
+        return "error", "", str(exc)
+
+    return await _await_run_settled(run_app, run.run_id, workspace_id)
+
+
+async def _await_run_settled(
+    run_app: Any, run_id: str, workspace_id: str
+) -> tuple[str, str, str | None]:
+    """Poll a dispatched ``/v1`` run until it settles or the wall-clock budget elapses."""
+    deadline = run_timeout_s()
+    poll = 0.1
+    waited = 0.0
+    while True:
+        run = await run_app.get_run(run_id, workspace_id=workspace_id)
+        if run is None:  # vanished (deleted/erased) — treat as an error, never hang
+            return "error", "", "run record disappeared while waiting"
+        status_value = run.status.value
+        if status_value in _SETTLED_RUN_STATUSES:
+            mapped = _RUN_STATUS_TO_ROUTINE.get(status_value, "ok")
+            output = str(run.output_text or "")
+            error = run.error if mapped == "error" else None
+            return mapped, output, error
+        if waited >= deadline:
+            return (
+                "timeout",
+                "",
+                f"run exceeded {deadline:.0f}s and was left running in the background",
+            )
+        await asyncio.sleep(poll)
+        waited += poll
+        poll = min(poll * 1.5, 2.0)
 
 
 async def _deliver(routine: Routine, output: str) -> str | None:
@@ -480,17 +792,48 @@ def _notify(routine: Routine, status: str, preview: str, error: str | None) -> N
         )
 
 
+def routine_lock_name(routine_id: str) -> str:
+    """The cross-process flock name guarding a single routine's execution (T3c)."""
+    return f"routine-{routine_id}"
+
+
 async def execute_routine(
     routine_id: str, *, now: Callable[[], datetime] | None = None
 ) -> Routine | None:
     """Run one routine end-to-end: run → deliver → record → notify.
 
     Returns the refreshed routine, or ``None`` when it no longer exists.
+
+    Cross-process single-flight (T3c reviewer must_fix): the in-process
+    :class:`RoutineScheduler` registry stops same-process overlap, but a ``himmy
+    routines run-now`` runs in a SEPARATE process that cannot see that registry — so
+    without a host-level guard the CLI and the Studio scheduler could fire the SAME
+    routine simultaneously and double-run its gated tools / deliveries. A non-blocking
+    :func:`process_lock` keyed ``routine-<id>`` is held for the whole execution; a
+    concurrent attempt anywhere on the host raises :class:`RoutineBusyError` (mapped to
+    a 409 / a CLI "already running" message) rather than executing twice.
     """
+    from himmy.core.process_lock import ProcessLockBusy, process_lock
+
     store = get_routines_store()
     routine = store.get(routine_id)
     if routine is None:
         return None
+    try:
+        with process_lock(routine_lock_name(routine_id)):
+            return await _execute_locked(routine_id, routine, now=now)
+    except ProcessLockBusy as exc:
+        raise RoutineBusyError(routine_id) from exc
+
+
+async def _execute_locked(
+    routine_id: str,
+    routine: Routine,
+    *,
+    now: Callable[[], datetime] | None = None,
+) -> Routine | None:
+    """The guarded body of :func:`execute_routine` (runs while the flock is held)."""
+    store = get_routines_store()
     now_fn = now or _default_now
     store.mark_started(routine_id, now_fn().isoformat())
     try:
@@ -655,6 +998,7 @@ def reset_scheduler() -> None:
 
 __all__ = [
     "DELIVERY_MAX_CHARS",
+    "LOCAL_WORKSPACE",
     "PREVIEW_MAX_CHARS",
     "Routine",
     "RoutineBusyError",
@@ -667,6 +1011,9 @@ __all__ = [
     "is_due",
     "reset_routines_store",
     "reset_scheduler",
+    "resolve_routine_container",
+    "routine_lock_name",
     "routines_db_path",
     "run_timeout_s",
+    "set_routine_container_provider",
 ]

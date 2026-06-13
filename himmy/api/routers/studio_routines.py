@@ -55,11 +55,15 @@ class RoutineUpdate(BaseModel):
 
 
 class RoutineView(BaseModel):
-    """One routine, including last-run info, as the GUI sees it."""
+    """One routine, including last-run info, as the single-user-local GUI sees it.
+
+    Studio routines are filesystem (``agent_path``) bound; the ``/v1`` workspace/``agent_id``
+    fields the shared store now carries are not part of this single-user-local view.
+    """
 
     id: str
     name: str
-    agent_path: str
+    agent_path: str | None
     prompt: str
     schedule: svc.Schedule
     provider: str | None
@@ -78,7 +82,22 @@ class RoutineView(BaseModel):
 
 def _view(routine: svc.Routine) -> RoutineView:
     return RoutineView(
-        **routine.model_dump(),
+        id=routine.id,
+        name=routine.name,
+        agent_path=routine.agent_path,
+        prompt=routine.prompt,
+        schedule=routine.schedule,
+        provider=routine.provider,
+        model=routine.model,
+        deliver=routine.deliver,
+        enabled=routine.enabled,
+        created_at=routine.created_at,
+        updated_at=routine.updated_at,
+        last_run_at=routine.last_run_at,
+        last_status=routine.last_status,
+        last_preview=routine.last_preview,
+        last_error=routine.last_error,
+        last_delivery=routine.last_delivery,
         running=svc.get_scheduler().is_running(routine.id),
     )
 

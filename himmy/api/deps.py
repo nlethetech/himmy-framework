@@ -263,6 +263,7 @@ class ApiContainer:
         agent_app = AgentDefAppService(
             storage=service_storage,
             entity_registry=service_registry,
+            reference_finder=cls._routine_reference_finder,
         )
         # T2f: /v1's OWN durable HITL checkpoint inbox (distinct from Studio's
         # ``.himmy/approvals.db``). Durable file-backed in a server context (so a paused
@@ -341,6 +342,28 @@ class ApiContainer:
             privacy_audit=privacy_audit,
             checkpoint_store=checkpoint_store,
         )
+
+    @staticmethod
+    async def _routine_reference_finder(
+        agent_id: str, workspace_id: str
+    ) -> list[str]:
+        """Referential check for :class:`AgentDefAppService` (T3c): routines using ``agent_id``.
+
+        Returns the routine ids in ``workspace_id`` that reference the stored agent, so a
+        ``DELETE /v1/agents/{id}`` of an agent still wired to a routine returns HTTP 409
+        instead of orphaning the routine's binding (the reviewer must_fix). Reads the
+        SAME ``.himmy/routines.db`` the ``/v1/routines`` + Studio + CLI surfaces drive.
+        Best-effort: a store error never blocks a delete (the reference set is empty).
+        """
+        try:
+            from himmy.api.routines import get_routines_store
+
+            ids = get_routines_store().find_by_agent_id(
+                agent_id, workspace_id=workspace_id
+            )
+        except Exception:  # pragma: no cover - a store error must not block deletes
+            return []
+        return [f"routine:{rid}" for rid in ids]
 
     @staticmethod
     def _build_v1_checkpoint_store() -> Any:

@@ -25,6 +25,7 @@ from himmy.cli.dashboard_cmd import add_dashboard_parser
 from himmy.cli.models_cmd import cmd_compare, cmd_models
 from himmy.cli.provider import PROVIDERS
 from himmy.cli.recommendations_cmd import add_recommendations_parser
+from himmy.cli.routines_cmd import add_routines_parser
 from himmy.cli.runs_cmd import add_runs_parser
 from himmy.cli.security_audit_cmd import add_seclog_parser
 from himmy.core import HimmyError
@@ -661,6 +662,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_skill.set_defaults(func=_cmd_skill)
 
     add_runs_parser(sub)
+    add_routines_parser(sub)
     add_recommendations_parser(sub)
     add_context_parser(sub)
     add_dashboard_parser(sub)
