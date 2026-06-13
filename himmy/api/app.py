@@ -55,7 +55,9 @@ from himmy.api.routers import (
     studio_projects,
     studio_routines,
     studio_teams,
+    teams,
     threads,
+    workflows,
 )
 from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.core.errors import HimmyError
@@ -463,6 +465,8 @@ def create_app(
     app.include_router(threads.router)
     app.include_router(knowledge.router)
     app.include_router(routines.router)
+    app.include_router(teams.router)
+    app.include_router(workflows.router)
     app.include_router(recommendations.router)
     app.include_router(dashboard.router)
     app.include_router(evaluation.router)

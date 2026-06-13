@@ -1967,6 +1967,187 @@ class RunAppService:
             await asyncio.sleep(0.01)
         return await self._storage.get_run(run_id)
 
+    # ----------------------------------------------- T3b team/workflow runs
+    async def create_orchestration_run(
+        self,
+        *,
+        workspace_id: str,
+        subject_id: str,
+        kind: str,
+        members: list[AgentDefRecord],
+        prompt: str,
+        resource_kind: str,
+        resource_id: str,
+        idempotency_key: str | None = None,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+        graph_checkpoint_store: Any = None,
+        graph_resume_id: str | None = None,
+    ) -> RunRecord:
+        """Launch a team/workflow orchestration on the EXISTING run machinery (T3b).
+
+        A team/workflow run is NOT a second executor: it creates a canonical
+        :class:`RunRecord`, admits it against the SAME T0.4 per-workspace quota, and
+        executes on a tracked background task under the per-workspace concurrency semaphore
+        — exactly like :meth:`create_run`. The difference is the body: instead of one
+        per-run agent runtime it builds a TEAM runtime from the ordered member
+        :class:`AgentDefRecord`s (resolved + sanitized) and drives the matching orchestrator
+        (``multi_agent`` | ``group_chat`` for a team; an ordered pipeline for a workflow).
+
+        ``kind`` selects the orchestrator. ``members`` is the ordered, pre-resolved member
+        list (the router validated each exists in the workspace + drew the same-workspace
+        membership check). ``resource_kind``/``resource_id`` (``team``/``workflow`` + its id)
+        are stamped into the run metadata so a run is traceable to the team/workflow that
+        launched it. ``graph_checkpoint_store``/``graph_resume_id`` (the ``graph`` kind)
+        thread the durable :class:`SqliteGraphCheckpointStore` so a long graph run resumes
+        after a restart.
+
+        Returns the QUEUED :class:`RunRecord` immediately; poll ``get_run`` for the outcome.
+        Raises :class:`WorkspaceRunQuotaExceeded` (429) when the workspace is at its cap.
+        """
+        metadata: dict[str, Any] = {
+            "orchestration": resource_kind,
+            "orchestration_kind": kind,
+            f"{resource_kind}_id": resource_id,
+            "member_agent_ids": [m.agent_id for m in members],
+        }
+        if actor:
+            metadata["actor"] = actor
+        if graph_resume_id:
+            metadata["graph_resume_id"] = graph_resume_id
+        run = RunRecord(
+            workspace_id=workspace_id,
+            subject_id=subject_id,
+            task_id=None,
+            persona_name=members[0].name if members else resource_kind,
+            model_key="default",
+            idempotency_key=idempotency_key,
+            status=RunStatus.QUEUED,
+            metadata=metadata,
+        )
+        stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
+        if not created:
+            return stored
+
+        try:
+            self._admit_workspace_run(workspace_id)
+        except WorkspaceRunQuotaExceeded:
+            stored.status = RunStatus.FAILED
+            stored.error = "rejected: workspace run-concurrency quota exceeded"
+            stored.updated_at = _now()
+            try:
+                await self._storage.save_run(stored)
+            except Exception:  # pragma: no cover - best-effort terminal mark
+                logger.warning("failed to mark quota-rejected run %s", stored.run_id)
+            raise
+
+        bg = asyncio.create_task(
+            self._execute_orchestration_run(
+                stored.run_id,
+                workspace_id=workspace_id,
+                kind=kind,
+                members=members,
+                prompt=prompt,
+                resource_kind=resource_kind,
+                operator_provisioned=operator_provisioned,
+                graph_checkpoint_store=graph_checkpoint_store,
+                graph_resume_id=graph_resume_id,
+            )
+        )
+        self._tasks.add(bg)
+        bg.add_done_callback(self._tasks.discard)
+        return stored
+
+    async def _execute_orchestration_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: str,
+        kind: str,
+        members: list[AgentDefRecord],
+        prompt: str,
+        resource_kind: str,
+        operator_provisioned: bool,
+        graph_checkpoint_store: Any,
+        graph_resume_id: str | None,
+    ) -> None:
+        """Background worker: build the team runtime + drive the orchestrator (T3b).
+
+        Holds the per-workspace concurrency semaphore (T0.4) and releases the outstanding
+        reservation in ``finally`` (mirroring :meth:`_execute_run`), so a team/workflow run
+        is bounded and accounted exactly like a single-agent run.
+        """
+        from himmy.application.orchestration_runner import run_orchestration
+
+        semaphore = self._workspace_semaphore(workspace_id)
+        try:
+            async with semaphore:
+                run = await self._storage.get_run(run_id)
+                if run is None:  # pragma: no cover - defensive
+                    return
+                run.status = RunStatus.RUNNING
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                try:
+                    outcome = await asyncio.wait_for(
+                        run_orchestration(
+                            kind=kind,
+                            members=members,
+                            prompt=prompt,
+                            resource_kind=resource_kind,
+                            storage=self._storage,
+                            shared_inference=getattr(
+                                self._runtime, "inference_service", None
+                            ),
+                            operator_provisioned=operator_provisioned,
+                            graph_checkpoint_store=graph_checkpoint_store,
+                            graph_resume_id=graph_resume_id,
+                        ),
+                        timeout=self._run_timeout_seconds,
+                    )
+                except TimeoutError:
+                    run.status = RunStatus.FAILED
+                    run.error = (
+                        f"run exceeded {self._run_timeout_seconds:.0f}s execution timeout"
+                    )
+                    run.updated_at = _now()
+                    await self._storage.save_run(run)
+                    return
+                except asyncio.CancelledError:
+                    run.status = RunStatus.FAILED
+                    run.error = "run cancelled"
+                    run.updated_at = _now()
+                    try:
+                        await self._storage.save_run(run)
+                    except Exception:  # pragma: no cover - best-effort during cancel
+                        pass
+                    raise
+                except Exception as exc:  # noqa: BLE001 - terminal failure transition
+                    run.status = RunStatus.FAILED
+                    run.error = str(exc)
+                    run.updated_at = _now()
+                    await self._storage.save_run(run)
+                    return
+
+                run.thread_id = outcome.thread_id
+                run.output_text = outcome.output_text or None
+                run.metadata = {
+                    **(run.metadata or {}),
+                    "stopped_reason": outcome.stopped_reason,
+                    "route": outcome.route,
+                }
+                if outcome.graph_checkpoint_id:
+                    run.metadata["graph_checkpoint_id"] = outcome.graph_checkpoint_id
+                run.status = (
+                    RunStatus.FAILED if outcome.failed else RunStatus.SUCCEEDED
+                )
+                if outcome.failed:
+                    run.error = outcome.error or "orchestration failed"
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+        finally:
+            self._release_workspace_run(workspace_id)
+
 
 class AgentDefReferencedError(Exception):
     """A stored agent could not be deleted because it is referenced (T2e must_fix).

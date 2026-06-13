@@ -263,7 +263,7 @@ class ApiContainer:
         agent_app = AgentDefAppService(
             storage=service_storage,
             entity_registry=service_registry,
-            reference_finder=cls._routine_reference_finder,
+            reference_finder=cls._agent_reference_finder,
         )
         # T2f: /v1's OWN durable HITL checkpoint inbox (distinct from Studio's
         # ``.himmy/approvals.db``). Durable file-backed in a server context (so a paused
@@ -344,26 +344,49 @@ class ApiContainer:
         )
 
     @staticmethod
-    async def _routine_reference_finder(
+    async def _agent_reference_finder(
         agent_id: str, workspace_id: str
     ) -> list[str]:
-        """Referential check for :class:`AgentDefAppService` (T3c): routines using ``agent_id``.
+        """Referential check for :class:`AgentDefAppService` (T3b/T3c): who references ``agent_id``.
 
-        Returns the routine ids in ``workspace_id`` that reference the stored agent, so a
-        ``DELETE /v1/agents/{id}`` of an agent still wired to a routine returns HTTP 409
-        instead of orphaning the routine's binding (the reviewer must_fix). Reads the
-        SAME ``.himmy/routines.db`` the ``/v1/routines`` + Studio + CLI surfaces drive.
-        Best-effort: a store error never blocks a delete (the reference set is empty).
+        Returns the routine / team / workflow ids in ``workspace_id`` that reference the
+        stored agent, so a ``DELETE /v1/agents/{id}`` of an agent still wired to ANY of them
+        returns HTTP 409 instead of orphaning the binding (the reviewer must_fix — and the
+        production reference_finder the T3b teams/workflows need). Reads the SAME
+        ``.himmy/routines.db`` / ``.himmy/teams.db`` / ``.himmy/workflows.db`` the
+        ``/v1`` + Studio + CLI surfaces drive. Best-effort per store: a store error never
+        blocks a delete (that store contributes no references).
         """
+        references: list[str] = []
         try:
             from himmy.api.routines import get_routines_store
 
-            ids = get_routines_store().find_by_agent_id(
-                agent_id, workspace_id=workspace_id
-            )
+            references += [
+                f"routine:{rid}"
+                for rid in get_routines_store().find_by_agent_id(
+                    agent_id, workspace_id=workspace_id
+                )
+            ]
         except Exception:  # pragma: no cover - a store error must not block deletes
-            return []
-        return [f"routine:{rid}" for rid in ids]
+            pass
+        try:
+            from himmy.api.teams_store import get_teams_store, get_workflows_store
+
+            references += [
+                f"team:{tid}"
+                for tid in get_teams_store().find_by_agent_id(
+                    agent_id, workspace_id=workspace_id
+                )
+            ]
+            references += [
+                f"workflow:{wid}"
+                for wid in get_workflows_store().find_by_agent_id(
+                    agent_id, workspace_id=workspace_id
+                )
+            ]
+        except Exception:  # pragma: no cover - a store error must not block deletes
+            pass
+        return references
 
     @staticmethod
     def _build_v1_checkpoint_store() -> Any:
