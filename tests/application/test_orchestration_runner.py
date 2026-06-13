@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 from himmy.application.orchestration_runner import run_orchestration
 from himmy.config.agent_spec import AgentSpec
@@ -112,6 +113,68 @@ def test_workflow_pipeline_completes_with_checkpoint(tmp_path: Path) -> None:
         loaded = store.load(outcome.graph_checkpoint_id)
         assert loaded is not None
         assert loaded.status == "completed"
+
+    run_async(_scenario())
+
+
+def test_graph_node_routes_to_pinned_provider_not_stub(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A workflow/graph member that pins a provider must execute on THAT provider's
+    backend — via the ``<provider>:<model>`` dispatch key the team inference manager
+    registers — not silently fall through to the stub default.
+
+    Regression for the bug where ``_run_graph`` passed ``spec.to_llm_config()`` (whose
+    model_key is the plain model name), missing the dispatch key so every graph/workflow
+    run executed on the stub regardless of the pinned provider. multi_agent/group_chat
+    threaded the dispatch key correctly; the graph node did not.
+    """
+    from himmy.services.inference.client_manager import StubClientManager
+    from himmy.services.inference.models import InferenceResponse, InferenceStatus
+
+    class _SpyManager:
+        provider_name = "spy"
+
+        def resolve(self, model_key: str) -> str:
+            return f"spy:{model_key}"
+
+        async def generate(self, request: Any) -> InferenceResponse:
+            return InferenceResponse(
+                request_id=request.request_id,
+                status=InferenceStatus.SUCCESS,
+                output_text="SPY_PROVIDER_RAN",
+                input_tokens=1,
+                output_tokens=1,
+                provider_name="spy",
+            )
+
+    def _fake_build_manager_for(provider: str | None, model: Any = None) -> Any:
+        return _SpyManager() if provider == "spy" else StubClientManager()
+
+    # build_team_inference imports build_manager_for from himmy.cli.provider at call time.
+    monkeypatch.setattr(
+        "himmy.cli.provider.build_manager_for", _fake_build_manager_for
+    )
+
+    async def _scenario() -> None:
+        spec = AgentSpec(
+            name="step1", description="pinned", provider="spy", model="m1"
+        )
+        member = AgentDefRecord.from_spec(spec, workspace_id="acme")
+        outcome = await run_orchestration(
+            kind="graph",
+            members=[member],
+            prompt="go",
+            resource_kind="workflow",
+            storage=StorageService(),
+            shared_inference=None,
+            operator_provisioned=False,
+            graph_checkpoint_store=SqliteGraphCheckpointStore(str(tmp_path / "g.db")),
+        )
+        assert outcome.failed is False
+        # Routed to the pinned provider (NOT the stub default).
+        assert "SPY_PROVIDER_RAN" in (outcome.output_text or "")
+        assert "[stub:" not in (outcome.output_text or "")
 
     run_async(_scenario())
 

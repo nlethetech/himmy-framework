@@ -215,6 +215,7 @@ async def _run_graph(
     interrupted long run resumes from its last completed superstep via ``graph_resume_id``.
     """
     from himmy.agents.base_agent.task import Task
+    from himmy.config.team_spec import dispatch_key_for
     from himmy.orchestrators import END, StateGraph
     from himmy.runtime.checkpoint import InMemoryGraphCheckpointStore
 
@@ -234,8 +235,16 @@ async def _run_graph(
                 f"{base_prompt}\n\nPrevious step output:\n{prior}" if prior else base_prompt
             )
             task = Task(title=f"{node_name}-step", prompt=turn_prompt, context={})
+            # Route this node through the SAME <provider>:<model> dispatch key the
+            # team inference manager registered each backend under (build_team_inference);
+            # spec.to_llm_config() carries only the plain model name, which misses that
+            # key and silently falls through to the stub default — so a graph/workflow
+            # run would execute on the stub regardless of the pinned provider.
+            llm_config = spec.to_llm_config().model_copy(
+                update={"model_key": dispatch_key_for(spec.provider, spec.model)}
+            )
             result = await runtime.run_task_detailed(
-                spec.to_persona(), task, llm_config=spec.to_llm_config()
+                spec.to_persona(), task, llm_config=llm_config
             )
             text = result.output_text or ""
             outputs = dict(state.get("outputs") or {})
