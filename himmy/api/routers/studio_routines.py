@@ -119,8 +119,14 @@ def _validate_agent_path(rel_path: str) -> None:
 
 @router.get("", response_model=list[RoutineView])
 async def list_routines() -> list[RoutineView]:
-    """All routines, newest first, with their last-run info."""
-    return [_view(r) for r in svc.get_routines_store().list()]
+    """Local routines, newest first, with their last-run info.
+
+    Scoped to the ``__local__`` workspace so the single-user Studio GUI shows only its
+    own ``agent_path`` routines and never an ``agent_id``-bound ``/v1`` tenant row (whose
+    ``agent_path`` is null) when both surfaces share ``.himmy/routines.db``.
+    """
+    rows = svc.get_routines_store().list(workspace_id=svc.LOCAL_WORKSPACE)
+    return [_view(r) for r in rows]
 
 
 @router.post("", response_model=RoutineView)

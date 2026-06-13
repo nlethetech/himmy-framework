@@ -950,13 +950,24 @@ class RoutineScheduler:
             launched.append(routine.id)
         return launched
 
-    def _launch(self, routine_id: str) -> asyncio.Task[Any]:
+    def _launch(self, routine_id: str) -> asyncio.Task[Routine | None]:
+        """Fire-and-forget launch for the tick loop — failures are swallowed.
+
+        The tick path never awaits the returned task, so a genuine run failure (or
+        cross-process flock contention) must not escape: :func:`_guarded_execute`
+        funnels everything to a logged ``None``. ``run_now`` does NOT use this path
+        precisely because it must let :class:`RoutineBusyError` surface (a 409).
+        """
         task = asyncio.create_task(
             self._guarded_execute(routine_id), name=f"himmy-routine-{routine_id}"
         )
+        self._track(routine_id, task)
+        return task
+
+    def _track(self, routine_id: str, task: asyncio.Task[Routine | None]) -> None:
+        """Register an in-flight run so same-process :meth:`is_running` sees it."""
         self._running[routine_id] = task
         task.add_done_callback(lambda _t: self._running.pop(routine_id, None))
-        return task
 
     async def _guarded_execute(self, routine_id: str) -> Routine | None:
         try:
@@ -972,12 +983,24 @@ class RoutineScheduler:
     async def run_now(self, routine_id: str) -> Routine | None:
         """Run a routine immediately through the same rails; await the result.
 
-        Raises :class:`RoutineBusyError` if it is already executing.
+        Raises :class:`RoutineBusyError` when the routine is already executing —
+        whether in THIS process (the same-process pre-check) or in another process
+        on the host (the cross-process flock inside :func:`execute_routine`). Unlike
+        the tick path, ``run_now`` is awaited and surfaces a 409, so it must NOT route
+        through :func:`_guarded_execute` (which swallows busy as a logged ``None``).
+        Genuine run failures still settle into the routine's ``last_status`` rather
+        than raising — only contention propagates.
         """
         if self.is_running(routine_id):
             raise RoutineBusyError(routine_id)
-        result: Routine | None = await self._launch(routine_id)
-        return result
+        # Track in _running (so a concurrent same-process run-now/tick sees it) but
+        # await a task that lets RoutineBusyError out instead of eating it.
+        task: asyncio.Task[Routine | None] = asyncio.create_task(
+            execute_routine(routine_id, now=self._now),
+            name=f"himmy-routine-run-now-{routine_id}",
+        )
+        self._track(routine_id, task)
+        return await task
 
 
 _SCHEDULER: RoutineScheduler | None = None

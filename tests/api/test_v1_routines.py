@@ -239,6 +239,33 @@ def test_run_now_unknown_routine_404(client: TestClient) -> None:
     )
 
 
+def test_run_now_is_409_when_routine_flock_held(client: TestClient) -> None:
+    """Holding the routine's cross-process flock makes /v1 run-now a clean 409.
+
+    Reviewer must_fix: the cross-process busy case (another process owns the routine's
+    flock) raised ``RoutineBusyError`` deep in ``execute_routine`` but was being swallowed
+    by ``RoutineScheduler._guarded_execute`` on the ``run_now`` path, so the router mapped
+    ``None`` → 404 and the ``409`` handler was dead code for the exact scenario the flock
+    guards. Stand in for "the Studio scheduler process holds it" by holding the same-named
+    flock here, then assert run-now surfaces 409 (NOT 404) and never executes the body.
+    """
+    from himmy.core.process_lock import process_lock
+
+    agent_id = _store_agent(client)
+    rid = client.post("/v1/routines", json=_routine_body(agent_id)).json()["id"]
+
+    runs_before = client.get("/v1/runs", params={"workspace_id": "acme"}).json()["total"]
+    with process_lock(svc.routine_lock_name(rid)):
+        res = client.post(
+            f"/v1/routines/{rid}/run-now", params={"workspace_id": "acme"}
+        )
+    assert res.status_code == 409, res.text
+    assert "already running" in res.json()["detail"]
+    # The guarded body never ran a second time → no new canonical run was created.
+    runs_after = client.get("/v1/runs", params={"workspace_id": "acme"}).json()["total"]
+    assert runs_after == runs_before
+
+
 # ------------------------------------------ authenticated cross-tenant isolation
 
 
