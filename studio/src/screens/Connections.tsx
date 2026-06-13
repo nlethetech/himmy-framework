@@ -3,6 +3,7 @@ import { listConnections, type ConnectionStatus } from "../lib/api";
 import { Topbar, Page, Loading, ErrorState } from "../components/Page";
 import { ConnectionCard } from "../components/ConnectionCard";
 import { GoogleCard } from "../components/GoogleCard";
+import { TelegramListenerCard } from "../components/TelegramListenerCard";
 import { EmptyState } from "../components/ui/EmptyState";
 import { PlugIcon, RefreshIcon } from "../components/icons";
 
@@ -67,6 +68,11 @@ export default function Connections() {
               {conns.map((c) => (
                 <ConnectionCard key={c.type} conn={c} onChange={load} />
               ))}
+              {/* Inbound Telegram listener (T3g): start/stop the live bot that
+                  replies to messages, using the Telegram connection's token. */}
+              <TelegramListenerCard
+                telegram={conns.find((c) => c.type === "telegram")}
+              />
             </div>
           </>
         )}

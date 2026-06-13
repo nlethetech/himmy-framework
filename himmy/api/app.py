@@ -57,6 +57,7 @@ from himmy.api.routers import (
     studio_routines,
     studio_seclog,
     studio_teams,
+    studio_telegram,
     teams,
     threads,
     workflows,
@@ -491,6 +492,7 @@ def create_app(
     app.include_router(studio_eval.router)
     app.include_router(studio_missions.router)
     app.include_router(studio_routines.router)
+    app.include_router(studio_telegram.router)
     app.include_router(studio_mcp.router)
     app.include_router(studio_projects.router)
     app.include_router(studio_notify.router)

@@ -797,6 +797,24 @@ def cmd_telegram(args: argparse.Namespace) -> int:
         _eprint("error: set HIMMY_TELEGRAM_BOT_TOKEN (or pass --token) to run the bot.")
         return 2
 
+    # Cross-process single-flight (must share the lock the Studio listener uses): the CLI
+    # and the Studio inbound listener must NEVER both long-poll one bot token, or Telegram
+    # returns 409 / drops+duplicates updates across the two competing `getUpdates` loops.
+    # Acquire the SAME per-token flock `studio_telegram.start()` takes (keyed by a digest of
+    # the token, never the token itself) and hold it for the whole serve loop; refuse — do
+    # NOT retry into a poll storm — if it is already held here or by the Studio listener.
+    from himmy.api.studio_telegram import telegram_lock_name
+    from himmy.core.process_lock import ProcessLockBusy, acquire_process_lock
+
+    try:
+        token_lock = acquire_process_lock(telegram_lock_name(token))
+    except ProcessLockBusy:
+        _eprint(
+            "error: this bot token is already being polled (the Studio Telegram listener "
+            "or another `himmy telegram`). Stop the other poller first."
+        )
+        return 2
+
     # One conversation thread per chat, so each user gets continuous context.
     threads: dict[str, Any] = {}
 
@@ -847,6 +865,10 @@ def cmd_telegram(args: argparse.Namespace) -> int:
         _exec_with_mcp(_serve, registry, spec.mcp_servers)
     except KeyboardInterrupt:  # pragma: no cover - interactive
         _eprint("\n(stopped)")
+    finally:
+        # Release the per-token flock so the Studio listener (or a fresh CLI) can poll
+        # this token once we stop; the OS also drops it automatically on process exit.
+        token_lock.release()
     return 0
 
 

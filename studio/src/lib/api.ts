@@ -443,6 +443,32 @@ export const sendViaConnection = (type: string, payload: Record<string, unknown>
     payload,
   });
 
+// ---- Telegram inbound listener (T3g) -------------------------------------
+
+// The Studio control over the inbound Telegram long-poll listener. The bot token
+// and chat allowlist come from the Telegram Connection (above); this only starts/
+// stops the loop. The token is NEVER returned in any of these payloads.
+export interface TelegramListenerStatus {
+  active: boolean;
+  agent_path: string | null;
+  allowed_chat_ids: string[];
+  allow_everyone: boolean;
+  provider: string | null;
+  model: string | null;
+  error: string | null;
+}
+
+export const getTelegramListener = () =>
+  api.get<TelegramListenerStatus>("/telegram/status");
+export const startTelegramListener = (body: {
+  agent_path: string;
+  provider?: string | null;
+  model?: string | null;
+  allow_everyone?: boolean;
+}) => api.post<TelegramListenerStatus>("/telegram/start", body);
+export const stopTelegramListener = () =>
+  api.post<TelegramListenerStatus>("/telegram/stop", {});
+
 // ---- Approvals (HITL inbox) ----------------------------------------------
 
 export interface PendingToolView {

@@ -79,6 +79,66 @@ def _safe_name(name: str) -> str:
     return cleaned or "lock"
 
 
+class ProcessLockHandle:
+    """A held cross-process lock you release explicitly (not scope-bound).
+
+    :func:`process_lock` is the right tool when the guarded work is a single call you
+    can wrap in a ``with`` block. A long-lived listener (T3g: the Studio Telegram
+    long-poll loop) instead acquires the lock when it STARTS and releases it when it
+    STOPS — a span that does not nest cleanly in one stack frame — so it holds a handle
+    across its whole lifetime and calls :meth:`release` on shutdown. The OS still drops
+    the lock automatically if the process dies, so a crashed listener never wedges the
+    token. Idempotent: a second :meth:`release` is a no-op.
+
+    On a non-POSIX host (no ``fcntl``) the handle is inert (``release`` is a no-op) — the
+    in-process manager registry remains the guard there.
+    """
+
+    def __init__(self, name: str, fd: int | None) -> None:
+        self.name = name
+        self._fd = fd
+
+    def release(self) -> None:
+        """Release the lock and close the descriptor (idempotent)."""
+        fd = self._fd
+        if fd is None:
+            return
+        self._fd = None
+        if _HAVE_FCNTL:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def acquire_process_lock(
+    name: str, *, base: str | Path | None = None
+) -> ProcessLockHandle:
+    """Acquire a non-blocking cross-process exclusive lock and return its handle.
+
+    Like :func:`process_lock` but the lock is HELD until the caller calls
+    :meth:`ProcessLockHandle.release` (or the process dies) rather than the end of a
+    ``with`` block — the shape a long-running listener needs. Raises
+    :class:`ProcessLockBusy` immediately if the lock is held anywhere on this host, so a
+    second poller of the same bot token is refused (mapped to a 409) instead of starting
+    a competing long-poll.
+
+    On a non-POSIX host (no ``fcntl``) this always "acquires" an inert handle.
+    """
+    if not _HAVE_FCNTL:  # pragma: no cover - non-POSIX fallback
+        return ProcessLockHandle(name, None)
+    path = _locks_dir(base) / f"{_safe_name(name)}.lock"
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        # EAGAIN/EACCES: the lock is held elsewhere. Refuse rather than block.
+        raise ProcessLockBusy(name) from exc
+    return ProcessLockHandle(name, fd)
+
+
 @contextlib.contextmanager
 def process_lock(
     name: str, *, base: str | Path | None = None
@@ -94,25 +154,16 @@ def process_lock(
     On a non-POSIX host (no ``fcntl``) this is a no-op acquire — the same-process
     registry remains the guard there (see the module docstring).
     """
-    if not _HAVE_FCNTL:  # pragma: no cover - non-POSIX fallback
-        yield
-        return
-    path = _locks_dir(base) / f"{_safe_name(name)}.lock"
-    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    handle = acquire_process_lock(name, base=base)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            # EAGAIN/EACCES: the lock is held elsewhere. Refuse rather than block.
-            raise ProcessLockBusy(name) from exc
-        try:
-            yield
-        finally:
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
+        yield
     finally:
-        with contextlib.suppress(OSError):
-            os.close(fd)
+        handle.release()
 
 
-__all__ = ["ProcessLockBusy", "process_lock"]
+__all__ = [
+    "ProcessLockBusy",
+    "ProcessLockHandle",
+    "acquire_process_lock",
+    "process_lock",
+]
