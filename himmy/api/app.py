@@ -35,6 +35,7 @@ from himmy.api.routers import (
     dashboard,
     diagnostics,
     evaluation,
+    knowledge,
     models,
     privacy_audit,
     recommendations,
@@ -438,6 +439,7 @@ def create_app(
     app.include_router(runs.router)
     app.include_router(agents.router)
     app.include_router(threads.router)
+    app.include_router(knowledge.router)
     app.include_router(recommendations.router)
     app.include_router(dashboard.router)
     app.include_router(evaluation.router)

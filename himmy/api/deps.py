@@ -111,6 +111,7 @@ class ApiContainer:
         agent_app: Any = None,
         thread_app: Any = None,
         conversation_store: Any = None,
+        knowledge_app: Any = None,
         evaluation: Any = None,
         consent_ledger: Any = None,
         consent_policy: Any = None,
@@ -136,6 +137,7 @@ class ApiContainer:
         self.agent_app = agent_app
         self.thread_app = thread_app
         self.conversation_store = conversation_store
+        self.knowledge_app = knowledge_app
         self.recommendation_app = recommendation_app
         self.dashboard = dashboard
         self.evaluation = evaluation
@@ -275,6 +277,11 @@ class ApiContainer:
         # default it is a private in-memory store (no files written). Built before the run
         # service so the thread sink can be wired in.
         conversation_store = cls._build_conversation_store()
+        # T3a: the durable workspace-namespaced knowledge resource (/v1/knowledge). Reuses
+        # the container's service storage handle so the surface is consistent across
+        # interfaces; the namespace boundary it enforces is a property of an AUTHENTICATED
+        # deployment only (inert offline — see KnowledgeAppService's docstring).
+        knowledge_app = cls._build_knowledge(service_storage)
         # The thread service is wired AFTER the run service is built (it needs the run
         # app), so the run service's conversation sink is bound via a late attribute set.
         run_app = RunAppService(
@@ -324,6 +331,7 @@ class ApiContainer:
             agent_app=agent_app,
             thread_app=thread_app,
             conversation_store=conversation_store,
+            knowledge_app=knowledge_app,
             recommendation_app=recommendation_app,
             dashboard=dashboard,
             evaluation=evaluation,
@@ -382,6 +390,25 @@ class ApiContainer:
 
             return get_conversation_store()
         return ConversationStore(":memory:")
+
+    @staticmethod
+    def _build_knowledge(storage: Any) -> Any:
+        """Build the workspace-namespaced knowledge service (T3a) over the wired storage.
+
+        Reuses the container's ``storage`` handle (the durable backend in a server
+        context, the in-memory store offline) and the env-configured embedder so the
+        KB's vector dimension matches the embedder that is actually built. The
+        :class:`KnowledgeAppService` threads every operation through the single
+        :func:`~himmy.services.knowledge.app_service.knowledge_namespace` choke point.
+        Constructing it runs no I/O, so the zero-config offline path is unchanged.
+        """
+        from himmy.services.knowledge.app_service import KnowledgeAppService
+        from himmy.services.knowledge.service import KnowledgeBase
+        from himmy.toolkit.config import ToolkitConfig
+
+        embedder, dim = ToolkitConfig.from_env().build_embedder_and_dim()
+        kb = KnowledgeBase(storage=storage, embedder=embedder)
+        return KnowledgeAppService(kb, vector_dim=dim)
 
     @staticmethod
     def _build_privacy_audit(
