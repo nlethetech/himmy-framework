@@ -728,9 +728,34 @@ export interface RunAnalytics {
   avg_latency_ms: number;
   p50_latency_ms: number;
   p95_latency_ms: number;
+  feedback_up: number;
+  feedback_down: number;
   by_model: ModelAnalytics[];
   by_day: DayAnalytics[];
 }
+
+// ---- Run feedback (P0-A: human thumbs up/down) ---------------------------
+
+export type FeedbackVerdict = "up" | "down";
+
+export interface RunFeedback {
+  run_id: string;
+  verdict: FeedbackVerdict;
+  note: string | null;
+  actor: string;
+  created_at: string;
+  version: number;
+}
+
+export const setRunFeedback = (
+  runId: string,
+  verdict: FeedbackVerdict,
+  note?: string | null,
+) =>
+  api.post<RunFeedback>(`/runs/${runId}/feedback`, { verdict, note: note ?? null });
+
+export const getRunFeedback = (runId: string) =>
+  api.get<RunFeedback | null>(`/runs/${runId}/feedback`);
 
 export interface IoCapture {
   model: string | null;

@@ -154,7 +154,7 @@ def get_detail(checkpoint_id: str) -> ApprovalDetail | None:
 
 
 async def resolve(
-    checkpoint_id: str, *, approved: bool
+    checkpoint_id: str, *, approved: bool, actor: str = "human"
 ) -> AsyncIterator[dict[str, Any]]:
     """Approve/reject a pending checkpoint and stream the resumed run's frames.
 
@@ -223,7 +223,7 @@ async def resolve(
     yield {"type": "start", "agent": spec.name, "streaming": False, "resumed": True}
     try:
         run_task = asyncio.create_task(
-            runtime.resume_agent_loop(checkpoint_id, approved=approved)
+            runtime.resume_agent_loop(checkpoint_id, approved=approved, actor=actor)
         )
         async for frame in ss._drain_cognition(queue, run_task, cog):
             yield frame

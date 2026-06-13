@@ -51,13 +51,25 @@ def get_memory_service() -> MemoryService:
     global _SERVICE, _STORE, _PATH
     path = _db_path()
     if _SERVICE is None or _PATH != path:
+        from typing import cast
+
+        from himmy.api.studio_entities import get_entity_registry
+        from himmy.entities.registry import EntityRegistry
         from himmy.toolkit.config import ToolkitConfig
 
         if _STORE is not None:
             _STORE.close()
         _STORE = SqliteMemoryStore(path)
         embedder, _dim = ToolkitConfig.from_env().build_embedder_and_dim()
-        _SERVICE = MemoryService(_STORE, embedder=embedder)
+        # P0-C: project every memory mutation onto the durable Studio entity spine
+        # (memory_fact records + MEMORY_* audit events) — the dormant audit path,
+        # now on. The registry is the same durable spine run feedback writes to.
+        # SqliteEntityRegistry is API-compatible (cast per the cli/consent pattern).
+        _SERVICE = MemoryService(
+            _STORE,
+            embedder=embedder,
+            registry=cast(EntityRegistry, get_entity_registry()),
+        )
         _PATH = path
     return _SERVICE
 

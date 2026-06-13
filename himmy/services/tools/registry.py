@@ -29,6 +29,15 @@ class ToolRegistry:
         self._handlers: dict[str, Callable[..., Any]] = {}
         self._entity_registry = entity_registry
 
+    @property
+    def entity_registry(self) -> EntityRegistry | None:
+        """The audit spine tool registrations project onto (``None`` when unwired).
+
+        Exposed so co-registered packs (e.g. memory) can share the same registry
+        and route their own writes onto one spine.
+        """
+        return self._entity_registry
+
     def register(
         self,
         definition: ToolDefinition,
