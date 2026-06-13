@@ -18,6 +18,7 @@ from himmy.core.events import RunEvent
 from himmy.core.ids import utc_now_iso
 from himmy.services.storage.models import (
     ActionRecord,
+    AgentDefRecord,
     AgentStateRecord,
     EnvironmentStateRecord,
     EpisodicMemoryObject,
@@ -199,6 +200,91 @@ class InMemoryRunStore:
         if run_id is None:
             return None
         return self._runs.get(run_id)
+
+
+class InMemoryAgentDefStore:
+    """Process-local workspace-scoped stored agent definitions (T2e).
+
+    Keyed by ``agent_id`` with a ``(workspace_id, idempotency_key)`` index mirroring
+    the run store's idempotency primitive, so an idempotent re-POST returns the prior
+    record. All reads are tenant-scoped: a record from another workspace reads as None.
+    """
+
+    def __init__(self) -> None:
+        self._defs: dict[str, AgentDefRecord] = {}
+        # (workspace_id, idempotency_key) -> agent_id
+        self._by_idempotency: dict[tuple[str, str], str] = {}
+
+    async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
+        """Upsert an agent definition keyed by ``agent_id`` (refreshes ``updated_at``)."""
+        record.updated_at = utc_now_iso()
+        self._index_idempotency(record)
+        self._defs[record.agent_id] = record
+        return record
+
+    async def save_agent_def_if_absent(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """Create an agent def unless its ``(workspace, idempotency_key)`` already exists.
+
+        Returns ``(record, created)``. No ``await`` between the read and the write, so
+        two concurrent callers with the same key cannot both create (the in-memory
+        analog of the run store's atomic idempotent insert).
+        """
+        key = record.idempotency_key
+        if key is not None:
+            existing_id = self._by_idempotency.get((record.workspace_id, key))
+            if existing_id is not None:
+                existing = self._defs.get(existing_id)
+                if existing is not None:
+                    return existing, False
+        record.updated_at = utc_now_iso()
+        self._index_idempotency(record)
+        self._defs[record.agent_id] = record
+        return record, True
+
+    def _index_idempotency(self, record: AgentDefRecord) -> None:
+        """Maintain the (workspace_id, idempotency_key) -> agent_id index."""
+        if record.idempotency_key is not None:
+            self._by_idempotency.setdefault(
+                (record.workspace_id, record.idempotency_key), record.agent_id
+            )
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return an agent def by id, tenant-scoped (out-of-workspace reads as None)."""
+        rec = self._defs.get(agent_id)
+        if rec is None:
+            return None
+        if workspace_id is not None and rec.workspace_id != workspace_id:
+            return None
+        return rec
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List agent defs for a workspace (created_at asc)."""
+        items = [
+            r
+            for r in self._defs.values()
+            if workspace_id is None or r.workspace_id == workspace_id
+        ]
+        return sorted(items, key=lambda r: r.created_at)
+
+    async def delete_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> bool:
+        """Delete an agent def, tenant-scoped. Returns True iff a row was removed."""
+        rec = self._defs.get(agent_id)
+        if rec is None:
+            return False
+        if workspace_id is not None and rec.workspace_id != workspace_id:
+            return False
+        self._defs.pop(agent_id, None)
+        if rec.idempotency_key is not None:
+            self._by_idempotency.pop((rec.workspace_id, rec.idempotency_key), None)
+        return True
 
 
 class InMemoryRecommendationStore:
@@ -417,6 +503,7 @@ class InMemoryOrchestrationStore:
 
 
 __all__ = [
+    "InMemoryAgentDefStore",
     "InMemoryContextStore",
     "InMemoryEvaluationStore",
     "InMemoryEventLog",

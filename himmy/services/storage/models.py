@@ -192,6 +192,84 @@ class ContextEvidenceRecord(BaseModel):
     created_at: str = Field(default_factory=utc_now_iso)
 
 
+class AgentDefRecord(BaseModel):
+    """A reusable, workspace-scoped stored agent definition (T2e).
+
+    The durable ``/v1/agents`` resource: a tenant stores a declarative
+    :class:`~himmy.config.agent_spec.AgentSpec` once, then launches runs by
+    ``agent_id`` instead of re-sending an inline persona each time. The spec is the
+    SAME declarative shape the CLI writes to ``agent.yaml``, so the two surfaces
+    interoperate (a stored ``/v1`` spec round-trips to a CLI file and back).
+
+    ``spec`` is stored as the plain JSON projection of an ``AgentSpec`` (not the model
+    instance) so the record stays a pure-data Pydantic type with no import-time
+    dependency on the heavier agent stack; :meth:`agent_spec` rehydrates it on read.
+    A tenant-submitted ``spec`` MUST be run through the T0.3 sanitizer at the write
+    boundary BEFORE it reaches this record (the operator-only ``tools_module`` /
+    ``http_tools`` / ``mcp_servers`` fields are an RCE/SSRF surface) — the storage
+    layer is content-agnostic and does not sanitize.
+    """
+
+    agent_id: str = Field(default_factory=new_uuid)
+    workspace_id: str
+    name: str
+    description: str = ""
+    spec: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+    @classmethod
+    def from_spec(
+        cls,
+        spec: Any,
+        *,
+        workspace_id: str,
+        agent_id: str | None = None,
+        idempotency_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AgentDefRecord:
+        """Build a record from an :class:`AgentSpec` (stores its JSON projection)."""
+        payload = spec.model_dump(mode="json")
+        fields: dict[str, Any] = {
+            "workspace_id": workspace_id,
+            "name": spec.name,
+            "description": spec.description,
+            "spec": payload,
+            "idempotency_key": idempotency_key,
+            "metadata": metadata or {},
+        }
+        if agent_id is not None:
+            fields["agent_id"] = agent_id
+        return cls(**fields)
+
+    def agent_spec(self) -> Any:
+        """Rehydrate the stored JSON projection back into an :class:`AgentSpec`."""
+        from himmy.config.agent_spec import AgentSpec
+
+        return AgentSpec.model_validate(self.spec)
+
+    def to_record(self) -> EntityRecord:
+        """Project this stored agent into its canonical ``agent`` ``EntityRecord``.
+
+        The ``stable_id`` is the workspace-scoped ``agent_id`` so a run launched by
+        this agent can link to the SAME node across re-versions, and so two
+        workspaces' agents with the same ``name`` never collide. The content-addressed
+        record id is derived from the (sanitized) spec payload, so editing the spec
+        creates a new version while the stable id stays put.
+        """
+        from himmy.entities.projection import project
+
+        return project(
+            self,
+            stable_value=f"{self.workspace_id}:{self.agent_id}",
+            namespace="agent",
+            kind="agent",
+            metadata={"workspace_id": self.workspace_id, "name": self.name},
+        )
+
+
 __all__ = [
     "LOCAL_SUBJECT",
     "LOCAL_WORKSPACE",
@@ -206,4 +284,5 @@ __all__ = [
     "ActionRecord",
     "EnvironmentStateRecord",
     "ContextEvidenceRecord",
+    "AgentDefRecord",
 ]

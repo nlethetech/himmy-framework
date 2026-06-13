@@ -27,6 +27,7 @@ from himmy.api.deps import ApiContainer
 from himmy.api.models import ErrorResponse
 from himmy.api.ratelimit import build_rate_limiter
 from himmy.api.routers import (
+    agents,
     audit,
     connectors,
     consent,
@@ -432,6 +433,7 @@ def create_app(
 
     app.include_router(context.router)
     app.include_router(runs.router)
+    app.include_router(agents.router)
     app.include_router(recommendations.router)
     app.include_router(dashboard.router)
     app.include_router(evaluation.router)

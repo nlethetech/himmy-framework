@@ -35,6 +35,7 @@ from himmy.core.events import RunEvent
 from himmy.services.storage.at_rest import StorePayloadCipher, build_store_cipher
 from himmy.services.storage.models import (
     ActionRecord,
+    AgentDefRecord,
     AgentStateRecord,
     EnvironmentStateRecord,
     EpisodicMemoryObject,
@@ -155,6 +156,20 @@ CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status);
 CREATE INDEX IF NOT EXISTS runs_updated_at_idx ON runs (updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS runs_idempotency_idx
     ON runs (workspace_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS agent_defs (
+    agent_id        TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    idempotency_key TEXT,
+    payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS agent_defs_workspace_id_idx ON agent_defs (workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_defs_idempotency_idx
+    ON agent_defs (workspace_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS recommendations (
@@ -320,6 +335,29 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "WHERE workspace_id IS NULL",
         ],
     ),
+    # v3 (T2e): durable workspace-scoped stored agent definitions backing /v1/agents.
+    # The base DDL also declares this table (IF NOT EXISTS), so a fresh database lays it
+    # down with the base; this migration reaches an EXISTING database that provisioned
+    # the base before this table existed. ``IF NOT EXISTS`` makes the double-path safe.
+    (
+        3,
+        "agent_defs",
+        [
+            "CREATE TABLE IF NOT EXISTS agent_defs ("
+            "agent_id TEXT PRIMARY KEY, "
+            "workspace_id TEXT NOT NULL, "
+            "name TEXT NOT NULL, "
+            "idempotency_key TEXT, "
+            "payload JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+            "CREATE INDEX IF NOT EXISTS agent_defs_workspace_id_idx "
+            "ON agent_defs (workspace_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS agent_defs_idempotency_idx "
+            "ON agent_defs (workspace_id, idempotency_key) "
+            "WHERE idempotency_key IS NOT NULL",
+        ],
+    ),
 ]
 
 
@@ -440,6 +478,15 @@ def _row_to_run(row: Any) -> RunRecord:
     if isinstance(structured, dict) and set(structured.keys()) == {"value"}:
         data["output_structured"] = structured["value"]
     return RunRecord.model_validate(data)
+
+
+def _row_to_agent_def(row: Any) -> AgentDefRecord:
+    """Map an agent_defs row's JSONB ``payload`` to an :class:`AgentDefRecord`.
+
+    The pooled jsonb codec decodes ``payload`` to a dict already, so the model is
+    rehydrated straight from it (the full record, incl. the sanitized AgentSpec).
+    """
+    return AgentDefRecord.model_validate(row["payload"])
 
 
 def _row_to_recommendation(row: Any) -> RecommendationItem:
@@ -950,6 +997,144 @@ class PostgresRunStore(_PgStoreBase):
         return _row_to_run(row) if row else None
 
 
+class PostgresAgentDefStore(_PgStoreBase):
+    """Postgres-backed workspace-scoped stored agent definitions (T2e)."""
+
+    async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
+        """Upsert a stored agent definition keyed by ``agent_id``."""
+        from himmy.core.ids import utc_now_iso
+
+        record.updated_at = utc_now_iso()
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(self._UPSERT_BY_ID, *self._params(record))
+        return record
+
+    async def save_agent_def_if_absent(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """Atomically create an agent def unless its idempotency key already exists.
+
+        The partial UNIQUE index ``agent_defs_idempotency_idx`` closes the race via
+        ``INSERT ... ON CONFLICT (workspace_id, idempotency_key) DO NOTHING``: exactly
+        one concurrent writer wins; on conflict the existing row is read back.
+        """
+        from himmy.core.ids import utc_now_iso
+
+        record.updated_at = utc_now_iso()
+        pool = self._require_pool()
+        if record.idempotency_key is None:
+            async with pool.acquire() as conn:
+                await conn.execute(self._UPSERT_BY_ID, *self._params(record))
+            return record, True
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO agent_defs
+                    (agent_id, workspace_id, name, idempotency_key, payload,
+                     created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (workspace_id, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL
+                    DO NOTHING
+                RETURNING agent_id
+                """,
+                *self._params(record),
+            )
+            if row is not None:
+                return record, True
+            existing = await conn.fetchrow(
+                "SELECT payload FROM agent_defs "
+                "WHERE workspace_id = $1 AND idempotency_key = $2",
+                record.workspace_id,
+                record.idempotency_key,
+            )
+        return _row_to_agent_def(existing), False
+
+    _UPSERT_BY_ID = """
+        INSERT INTO agent_defs
+            (agent_id, workspace_id, name, idempotency_key, payload,
+             created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (agent_id) DO UPDATE SET
+            workspace_id = EXCLUDED.workspace_id,
+            name = EXCLUDED.name,
+            idempotency_key = EXCLUDED.idempotency_key,
+            payload = EXCLUDED.payload,
+            updated_at = EXCLUDED.updated_at
+    """
+
+    @staticmethod
+    def _params(record: AgentDefRecord) -> list[Any]:
+        """Positional params for the agent_defs upsert (payload as jsonb)."""
+        return [
+            record.agent_id,
+            record.workspace_id,
+            record.name,
+            record.idempotency_key,
+            record.model_dump(mode="json"),
+            record.created_at,
+            record.updated_at,
+        ]
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return a stored agent def by id, tenant-scoped (out-of-workspace → None)."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            if workspace_id is None:
+                row = await conn.fetchrow(
+                    "SELECT payload FROM agent_defs WHERE agent_id = $1", agent_id
+                )
+            else:
+                row = await conn.fetchrow(
+                    "SELECT payload FROM agent_defs "
+                    "WHERE agent_id = $1 AND workspace_id = $2",
+                    agent_id,
+                    workspace_id,
+                )
+        return _row_to_agent_def(row) if row else None
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List stored agent defs for a workspace (created_at asc)."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            if workspace_id is None:
+                rows = await conn.fetch(
+                    "SELECT payload FROM agent_defs ORDER BY created_at ASC"
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT payload FROM agent_defs WHERE workspace_id = $1 "
+                    "ORDER BY created_at ASC",
+                    workspace_id,
+                )
+        return [_row_to_agent_def(r) for r in rows]
+
+    async def delete_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> bool:
+        """Delete a stored agent def, tenant-scoped. Returns True iff a row was removed."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            if workspace_id is None:
+                result = await conn.execute(
+                    "DELETE FROM agent_defs WHERE agent_id = $1", agent_id
+                )
+            else:
+                result = await conn.execute(
+                    "DELETE FROM agent_defs WHERE agent_id = $1 AND workspace_id = $2",
+                    agent_id,
+                    workspace_id,
+                )
+        # asyncpg returns a command tag e.g. "DELETE 1" / "DELETE 0".
+        return str(result).rsplit(" ", 1)[-1] != "0"
+
+
 class PostgresRecommendationStore(_PgStoreBase):
     """Postgres-backed recommendation items."""
 
@@ -1324,6 +1509,7 @@ class PostgresStorageService:
         self._event_log = PostgresEventLog(self._require_pool, cipher=self._cipher)
         self._context_store = PostgresContextStore(self._require_pool)
         self._run_store = PostgresRunStore(self._require_pool)
+        self._agent_def_store = PostgresAgentDefStore(self._require_pool)
         self._recommendation_store = PostgresRecommendationStore(self._require_pool)
         self._evaluation_store = PostgresEvaluationStore(self._require_pool)
         self._orchestration_store = PostgresOrchestrationStore(self._require_pool)
@@ -1553,6 +1739,39 @@ class PostgresStorageService:
         """Return the existing run for an idempotency key, or None."""
         return await self._run_store.load_run_by_idempotency(
             workspace_id, idempotency_key
+        )
+
+    # ------------------------------------------------------------- agent defs (T2e)
+    async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
+        """Upsert a stored agent definition keyed by ``agent_id``."""
+        return await self._agent_def_store.save_agent_def(record)
+
+    async def save_agent_def_if_absent(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """Atomically create an agent def unless its idempotency key already exists."""
+        return await self._agent_def_store.save_agent_def_if_absent(record)
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return a stored agent def by id, tenant-scoped (out-of-workspace → None)."""
+        return await self._agent_def_store.get_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List stored agent defs for a workspace."""
+        return await self._agent_def_store.list_agent_defs(workspace_id=workspace_id)
+
+    async def delete_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> bool:
+        """Delete a stored agent def, tenant-scoped. Returns True iff removed."""
+        return await self._agent_def_store.delete_agent_def(
+            agent_id, workspace_id=workspace_id
         )
 
     # ---------------------------------------------------------- recommendations

@@ -108,6 +108,7 @@ class ApiContainer:
         run_app: Any,
         recommendation_app: Any,
         dashboard: Any,
+        agent_app: Any = None,
         evaluation: Any = None,
         consent_ledger: Any = None,
         consent_policy: Any = None,
@@ -128,6 +129,7 @@ class ApiContainer:
         self.runtime = runtime
         self.context_app = context_app
         self.run_app = run_app
+        self.agent_app = agent_app
         self.recommendation_app = recommendation_app
         self.dashboard = dashboard
         self.evaluation = evaluation
@@ -192,6 +194,7 @@ class ApiContainer:
         TRAIN gate.
         """
         from himmy.application.services import (
+            AgentDefAppService,
             ContextAppService,
             DashboardQueryService,
             RecommendationAppService,
@@ -249,6 +252,14 @@ class ApiContainer:
             entity_registry=service_registry,
             recommendation_app=recommendation_app,
         )
+        # T2e: the durable workspace-scoped stored-agent (/v1/agents) resource. Shares
+        # the same storage + spine the run service reads, so a stored agent projects an
+        # ``agent`` node into the one canonical spine and a run launched by ``agent_id``
+        # links back to it.
+        agent_app = AgentDefAppService(
+            storage=service_storage,
+            entity_registry=service_registry,
+        )
         dashboard = DashboardQueryService(storage=service_storage)
         # The LLM-judge metric path (AAEO-10) can reach the inference service.
         evaluation = EvaluationService(
@@ -273,6 +284,7 @@ class ApiContainer:
             runtime=runtime,
             context_app=context_app,
             run_app=run_app,
+            agent_app=agent_app,
             recommendation_app=recommendation_app,
             dashboard=dashboard,
             evaluation=evaluation,

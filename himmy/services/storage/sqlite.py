@@ -33,6 +33,7 @@ from himmy.core.sqlite_util import connect_hardened
 from himmy.services.storage.at_rest import StorePayloadCipher, build_store_cipher
 from himmy.services.storage.models import (
     ActionRecord,
+    AgentDefRecord,
     AgentStateRecord,
     EnvironmentStateRecord,
     EpisodicMemoryObject,
@@ -193,7 +194,7 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
 #: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
 #: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
 #: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
-SQLITE_SCHEMA_VERSION = 3
+SQLITE_SCHEMA_VERSION = 4
 
 #: Ordered forward migrations applied after the base DDL, mirroring the Postgres
 #: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
@@ -245,6 +246,29 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "UPDATE evaluation_runs SET workspace_id = "
             "json_extract(payload, '$.workspace_id') "
             "WHERE workspace_id IS NULL AND json_valid(payload)",
+        ),
+    ),
+    # v4 (T2e): durable workspace-scoped stored agent definitions backing the
+    # /v1/agents CRUD resource. ``agent_id`` is the PK; the full AgentDefRecord JSON
+    # (incl. the sanitized AgentSpec) rides in ``payload``; ``workspace_id`` is an
+    # indexed column for tenant-scoped reads and a partial-unique idempotency index
+    # mirrors the runs table so a re-POSTed idempotency key returns the prior row.
+    (
+        4,
+        (
+            "CREATE TABLE IF NOT EXISTS agent_defs ("
+            "agent_id TEXT PRIMARY KEY, "
+            "workspace_id TEXT NOT NULL, "
+            "name TEXT NOT NULL, "
+            "idempotency_key TEXT, "
+            "payload TEXT NOT NULL DEFAULT '{}', "
+            "created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS agent_defs_workspace_id_idx "
+            "ON agent_defs (workspace_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS agent_defs_idempotency_idx "
+            "ON agent_defs (workspace_id, idempotency_key) "
+            "WHERE idempotency_key IS NOT NULL",
         ),
     ),
 )
@@ -812,6 +836,132 @@ class SqliteStorageService:
         )
         return _row_to_run(row) if row else None
 
+    # ------------------------------------------------------------- agent defs (T2e)
+    async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
+        """Upsert a stored agent definition keyed by ``agent_id``."""
+        record.updated_at = utc_now_iso()
+        await asyncio.to_thread(self._write, *self._agent_def_upsert(record))
+        return record
+
+    async def save_agent_def_if_absent(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """Atomically create an agent def unless its idempotency key already exists.
+
+        Mirrors :meth:`save_run_if_absent_by_idempotency`: the write lock +
+        ``agent_defs_idempotency_idx`` partial UNIQUE index make the existence-check
+        and the insert atomic across processes sharing the file.
+        """
+        record.updated_at = utc_now_iso()
+        return await asyncio.to_thread(self._save_agent_def_if_absent_sync, record)
+
+    def _save_agent_def_if_absent_sync(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """The locked read-then-insert for the idempotent agent-def create."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if record.idempotency_key is not None:
+                    existing = self._conn.execute(
+                        "SELECT payload FROM agent_defs WHERE workspace_id = ? AND "
+                        "idempotency_key = ?",
+                        (record.workspace_id, record.idempotency_key),
+                    ).fetchone()
+                    if existing is not None:
+                        self._conn.commit()
+                        return _row_to_agent_def(existing), False
+                sql, params = self._agent_def_upsert(record)
+                self._conn.execute(sql, params)
+                self._conn.commit()
+                return record, True
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    @staticmethod
+    def _agent_def_upsert(record: AgentDefRecord) -> tuple[str, tuple[Any, ...]]:
+        """The upsert-by-agent_id statement + params for a stored agent definition."""
+        sql = (
+            "INSERT INTO agent_defs (agent_id, workspace_id, name, idempotency_key, "
+            "payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (agent_id) DO UPDATE SET "
+            "workspace_id = excluded.workspace_id, name = excluded.name, "
+            "idempotency_key = excluded.idempotency_key, payload = excluded.payload, "
+            "updated_at = excluded.updated_at"
+        )
+        params = (
+            record.agent_id,
+            record.workspace_id,
+            record.name,
+            record.idempotency_key,
+            json.dumps(record.model_dump(mode="json")),
+            record.created_at,
+            record.updated_at,
+        )
+        return sql, params
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return a stored agent def by id, tenant-scoped (out-of-workspace → None)."""
+        row = await asyncio.to_thread(
+            self._fetchone,
+            "SELECT payload FROM agent_defs WHERE agent_id = ?",
+            (agent_id,),
+        )
+        if not row:
+            return None
+        rec = _row_to_agent_def(row)
+        if workspace_id is not None and rec.workspace_id != workspace_id:
+            return None
+        return rec
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List stored agent defs for a workspace (created_at asc)."""
+        if workspace_id is None:
+            sql = "SELECT payload FROM agent_defs ORDER BY created_at ASC"
+            params: tuple[Any, ...] = ()
+        else:
+            sql = (
+                "SELECT payload FROM agent_defs WHERE workspace_id = ? "
+                "ORDER BY created_at ASC"
+            )
+            params = (workspace_id,)
+        rows = await asyncio.to_thread(self._fetchall, sql, params)
+        return [_row_to_agent_def(r) for r in rows]
+
+    async def delete_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> bool:
+        """Delete a stored agent def, tenant-scoped. Returns True iff a row was removed."""
+        return await asyncio.to_thread(
+            self._delete_agent_def_sync, agent_id, workspace_id
+        )
+
+    def _delete_agent_def_sync(
+        self, agent_id: str, workspace_id: str | None
+    ) -> bool:
+        """Locked tenant-scoped delete; returns whether a row was actually removed."""
+        with self._lock:
+            try:
+                if workspace_id is None:
+                    cur = self._conn.execute(
+                        "DELETE FROM agent_defs WHERE agent_id = ?", (agent_id,)
+                    )
+                else:
+                    cur = self._conn.execute(
+                        "DELETE FROM agent_defs WHERE agent_id = ? AND workspace_id = ?",
+                        (agent_id, workspace_id),
+                    )
+                self._conn.commit()
+                return cur.rowcount > 0
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
     # ---------------------------------------------------------- recommendations
     async def save_recommendation(self, item: RecommendationItem) -> RecommendationItem:
         """Upsert a recommendation item keyed by ``recommendation_id``."""
@@ -1211,6 +1361,11 @@ class SqliteStorageService:
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
     """Reconstruct a :class:`RunRecord` from a row's JSON ``payload``."""
     return RunRecord.model_validate(json.loads(row["payload"]))
+
+
+def _row_to_agent_def(row: sqlite3.Row) -> AgentDefRecord:
+    """Reconstruct an :class:`AgentDefRecord` from a row's JSON ``payload``."""
+    return AgentDefRecord.model_validate(json.loads(row["payload"]))
 
 
 def _row_to_recommendation(row: sqlite3.Row) -> RecommendationItem:

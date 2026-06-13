@@ -35,6 +35,7 @@ from himmy.application.models import RecommendationEnvelope
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import (
     LOCAL_WORKSPACE,
+    AgentDefRecord,
     RecommendationItem,
     RecommendationStatus,
     RunRecord,
@@ -576,6 +577,7 @@ class RunAppService:
         llm_config: LLMConfig | None = None,
         actor: dict[str, Any] | None = None,
         agent_spec: AgentSpec | None = None,
+        agent_def: AgentDefRecord | None = None,
         operator_provisioned: bool = False,
         checkpoint_store: Any = None,
     ) -> RunRecord:
@@ -628,6 +630,10 @@ class RunAppService:
             metadata["actor"] = actor
         if agent_spec is not None:
             metadata["agent_name"] = agent_spec.name
+        # T2e: a run launched by a stored agent records its agent_id so the run<->agent
+        # lineage is reconstructable and the Studio/CLI can show "run of agent X".
+        if agent_def is not None:
+            metadata["agent_id"] = agent_def.agent_id
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
@@ -670,6 +676,7 @@ class RunAppService:
                 task=task,
                 llm_config=llm_config,
                 agent_spec=agent_spec,
+                agent_def=agent_def,
                 checkpoint_store=checkpoint_store,
             )
         )
@@ -732,6 +739,7 @@ class RunAppService:
         task: Task,
         llm_config: LLMConfig | None,
         agent_spec: AgentSpec | None = None,
+        agent_def: AgentDefRecord | None = None,
         checkpoint_store: Any = None,
     ) -> None:
         """Background worker: RUNNING -> run_task -> SUCCEEDED/FAILED + extraction.
@@ -763,6 +771,7 @@ class RunAppService:
                     task=task,
                     llm_config=llm_config,
                     agent_spec=agent_spec,
+                    agent_def=agent_def,
                     checkpoint_store=checkpoint_store,
                 )
         finally:
@@ -776,6 +785,7 @@ class RunAppService:
         task: Task,
         llm_config: LLMConfig | None,
         agent_spec: AgentSpec | None,
+        agent_def: AgentDefRecord | None = None,
         checkpoint_store: Any,
     ) -> None:
         """Drive one run to a terminal state on the resolved runtime (T0.2 core)."""
@@ -828,6 +838,12 @@ class RunAppService:
         thread = result.thread
         run.thread_id = thread.thread_id
         run.trace_id = result.trace_id
+
+        # T2e: link the run's chat_thread hub -> the stored agent node so a run launched
+        # by ``agent_id`` carries a durable run<->agent lineage edge (best-effort; the
+        # run never fails because lineage projection did).
+        if agent_def is not None:
+            await self._project_run_agent_link(run, agent_def)
 
         # AAEO-3: honour the FAILED inference path. ``RunResult.succeeded`` is the
         # typed status surface; a failed run records the error and skips extraction.
@@ -908,6 +924,54 @@ class RunAppService:
             checkpoint_store=checkpoint_store,
         )
         return cast("SingleAgentRuntime", runtime)
+
+    async def _project_run_agent_link(
+        self, run: RunRecord, agent_def: AgentDefRecord
+    ) -> None:
+        """Register the stored-agent node + link the run's thread -> agent (T2e).
+
+        Ensures the ``agent`` entity exists in the shared spine (idempotent,
+        content-addressed) and draws a ``run_of_agent`` edge from the run's
+        ``chat_thread`` hub to that agent node, so a run launched by ``agent_id`` joins
+        the agent's lineage graph. Best-effort: a projection failure never fails the run
+        (it is provenance, not the work).
+        """
+        if self._registry is None or not run.thread_id:
+            return
+        try:
+            from himmy.entities.records import stable_id_for
+
+            agent_record = await _maybe_await(
+                self._registry.register(agent_def.to_record())
+            )
+            thread_sid = stable_id_for(run.thread_id, namespace="chat_thread")
+            thread_record = await _maybe_await(self._registry.get_latest(thread_sid))
+            if thread_record is None:
+                return
+            # Dedupe the edge so a re-run of the same thread/agent never doubles it.
+            existing = await _maybe_await(
+                self._registry.links_from(thread_record.record_id)
+            )
+            for link in existing:
+                if (
+                    link.to_record_id == agent_record.record_id
+                    and link.relation == "run_of_agent"
+                ):
+                    return
+            await _maybe_await(
+                self._registry.link(
+                    from_record_id=thread_record.record_id,
+                    to_record_id=agent_record.record_id,
+                    relation="run_of_agent",
+                    metadata={"run_id": run.run_id, "agent_id": agent_def.agent_id},
+                )
+            )
+        except Exception:  # pragma: no cover - lineage projection is best-effort
+            logger.warning(
+                "failed to project run<->agent lineage for run %s agent %s",
+                run.run_id,
+                agent_def.agent_id,
+            )
 
     @staticmethod
     def _parse_structured(content: str | None) -> Any:
@@ -1121,6 +1185,192 @@ class RunAppService:
                 return run
             await asyncio.sleep(0.01)
         return await self._storage.get_run(run_id)
+
+
+class AgentDefReferencedError(Exception):
+    """A stored agent could not be deleted because it is referenced (T2e must_fix).
+
+    Raised by :meth:`AgentDefAppService.delete_agent_def` when a referential check
+    finds the agent is still used by a team/routine (and ``cascade`` is not set), so a
+    DELETE returns HTTP 409 rather than silently orphaning the reference.
+    """
+
+    def __init__(self, agent_id: str, references: list[str]) -> None:
+        """Record the agent and the references that block its deletion."""
+        self.agent_id = agent_id
+        self.references = list(references)
+        joined = ", ".join(self.references) or "another resource"
+        super().__init__(
+            f"agent {agent_id} cannot be deleted: still referenced by {joined}"
+        )
+
+
+class AgentDefAppService:
+    """Owns the stored-agent (``/v1/agents``) resource lifecycle (T2e).
+
+    A workspace-scoped CRUD service over :class:`AgentDefRecord` that, on every
+    tenant write, runs the spec through the T0.3 sanitizer (the operator-only
+    ``tools_module``/``http_tools``/``mcp_servers`` RCE/SSRF surface is rejected/
+    stripped) BEFORE it is persisted, projects each stored agent as an ``agent``
+    entity into the shared spine (so run->agent lineage links resolve), enforces
+    tenant scoping on every read, supports idempotent create, and refuses to delete an
+    agent still referenced by a team/routine (referential integrity).
+    """
+
+    def __init__(
+        self,
+        *,
+        storage: StorageService,
+        entity_registry: EntityRegistryProtocol | None = None,
+        reference_finder: Any = None,
+    ) -> None:
+        """Wire the store, the optional spine, and an optional reference finder.
+
+        ``reference_finder`` is an optional callable
+        ``(agent_id, workspace_id) -> awaitable[list[str]]`` returning the human
+        references (team/routine ids) that block a delete. It is a forward-looking seam
+        for T3b/T3c (which introduce /v1 teams + routines that reference an agent_id);
+        when ``None`` the referential check is a no-op (nothing references agents yet),
+        so the contract is in place without coupling to not-yet-built resources.
+        """
+        self._storage = storage
+        self._registry = entity_registry
+        self._reference_finder = reference_finder
+
+    async def save_agent_def(
+        self,
+        spec: AgentSpec,
+        *,
+        workspace_id: str,
+        agent_id: str | None = None,
+        idempotency_key: str | None = None,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+    ) -> tuple[AgentDefRecord, bool]:
+        """Sanitize, store (idempotent), and project a stored agent. Returns (rec, created).
+
+        The spec is fail-closed sanitized against the tenant attack surface (T0.3)
+        BEFORE persistence — a tenant spec carrying ``tools_module``/``http_tools``/
+        ``mcp_servers`` is rejected (or stripped when the deployment opts into strip
+        mode), unless operator-provisioned AND the operator opted in. ``idempotency_key``
+        makes a re-submit return the prior record (``created=False``) without creating a
+        duplicate. The stored agent is projected as an ``agent`` entity into the spine.
+        """
+        from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+        clean = sanitize_tenant_spec(
+            spec, operator_provisioned=operator_provisioned
+        ).spec
+        metadata: dict[str, Any] = {}
+        if actor:
+            metadata["actor"] = actor
+        record = AgentDefRecord.from_spec(
+            clean,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            idempotency_key=idempotency_key,
+            metadata=metadata,
+        )
+        stored, created = await self._storage.save_agent_def_if_absent(record)
+        # Re-project on every accepted write (create OR explicit update). An idempotent
+        # no-op re-submit (created=False, same record) still re-registers — the spine is
+        # content-addressed so it dedupes; an edit creates a new version.
+        await self._project_agent(stored)
+        return stored, created
+
+    async def update_agent_def(
+        self,
+        agent_id: str,
+        spec: AgentSpec,
+        *,
+        workspace_id: str,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+    ) -> AgentDefRecord | None:
+        """Replace a stored agent's spec in place (tenant-scoped). None when absent.
+
+        The existing record's ``agent_id``/``created_at``/``idempotency_key`` are
+        preserved; only the (re-sanitized) spec + name/description + ``updated_at``
+        change. Returns ``None`` when the agent does not exist in the workspace (404).
+        """
+        existing = await self._storage.get_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+        if existing is None:
+            return None
+        from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+        clean = sanitize_tenant_spec(
+            spec, operator_provisioned=operator_provisioned
+        ).spec
+        metadata = dict(existing.metadata)
+        if actor:
+            metadata["actor"] = actor
+        updated = AgentDefRecord.from_spec(
+            clean,
+            workspace_id=workspace_id,
+            agent_id=existing.agent_id,
+            idempotency_key=existing.idempotency_key,
+            metadata=metadata,
+        )
+        updated.created_at = existing.created_at
+        stored = await self._storage.save_agent_def(updated)
+        await self._project_agent(stored)
+        return stored
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return a stored agent def by id, tenant-scoped (out-of-workspace → None)."""
+        return await self._storage.get_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List stored agent defs for a workspace."""
+        return await self._storage.list_agent_defs(workspace_id=workspace_id)
+
+    async def delete_agent_def(
+        self,
+        agent_id: str,
+        *,
+        workspace_id: str | None = None,
+        cascade: bool = False,
+    ) -> bool:
+        """Delete a stored agent, refusing if referenced (unless ``cascade``).
+
+        Returns ``True`` when a row was removed, ``False`` when the agent did not exist
+        in the workspace (404). Raises :class:`AgentDefReferencedError` (HTTP 409) when
+        a referential check finds the agent is still used by a team/routine and
+        ``cascade`` is not set — the reviewer must_fix against silently orphaning a
+        reference. ``cascade`` is accepted for forward-compat; the caller owns removing
+        the referencing resources first.
+        """
+        existing = await self._storage.get_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+        if existing is None:
+            return False
+        if not cascade and self._reference_finder is not None:
+            references = await _maybe_await(
+                self._reference_finder(agent_id, existing.workspace_id)
+            )
+            if references:
+                raise AgentDefReferencedError(agent_id, list(references))
+        return await self._storage.delete_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+
+    async def _project_agent(self, record: AgentDefRecord) -> None:
+        """Register the stored agent as an ``agent`` entity in the spine (best-effort)."""
+        if self._registry is None:
+            return
+        try:
+            await _maybe_await(self._registry.register(record.to_record()))
+        except Exception:  # pragma: no cover - projection is best-effort
+            logger.warning("failed to project agent entity for %s", record.agent_id)
 
 
 def _resolve_model_key(llm_config: LLMConfig | None, task: Task) -> str | None:

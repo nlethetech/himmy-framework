@@ -52,11 +52,18 @@ class TaskInput(BaseModel):
 
 
 class CreateRunRequest(BaseModel):
-    """The POST /v1/runs body: subject scope + persona + task + idempotency."""
+    """The POST /v1/runs body: subject scope + persona/agent + task + idempotency.
+
+    Exactly one identity source must be supplied: either an inline ``persona`` (the
+    legacy fast path, which runs tool-less on the shared runtime, byte-unchanged) OR an
+    ``agent_id`` referencing a stored :class:`AgentSpec` (T2e) — which runs WITH ITS
+    TOOLS on a per-run tool-bearing runtime (T0.2). They are mutually exclusive.
+    """
 
     workspace_id: str
     subject_id: str
-    persona: PersonaInput
+    persona: PersonaInput | None = None
+    agent_id: str | None = None
     task: TaskInput
     idempotency_key: str | None = None
 
@@ -68,22 +75,60 @@ def _container(request: Request) -> Any:
 
 @router.post("", response_model=RunRecord, dependencies=_WRITE)
 async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
-    """Create a run (idempotent) and execute it in the background; returns the record."""
+    """Create a run (idempotent) and execute it in the background; returns the record.
+
+    Two mutually-exclusive identity sources (T2e): an inline ``persona`` (tool-less,
+    byte-unchanged back-compat) OR an ``agent_id`` that resolves a stored ``AgentSpec``
+    and executes WITH ITS TOOLS on the per-run runtime, recording an agent lineage edge.
+    """
     from himmy.agents.base_agent.task import Task
     from himmy.agents.personas.persona import Persona
 
-    persona = Persona(
-        name=body.persona.name,
-        description=body.persona.description,
-        instructions=body.persona.instructions,
-        metadata=body.persona.metadata,
-    )
+    if (body.persona is None) == (body.agent_id is None):
+        raise HTTPException(
+            status_code=422,
+            detail="exactly one of 'persona' or 'agent_id' is required",
+        )
+
+    workspace_id = require_workspace(request, body.workspace_id)
     task = Task(
         title=body.task.title,
         prompt=body.task.prompt,
         context=body.task.context,
     )
-    workspace_id = require_workspace(request, body.workspace_id)
+
+    persona: Persona
+    agent_spec = None
+    agent_def = None
+    llm_config = None
+    operator_provisioned = False
+
+    if body.agent_id is not None:
+        # T2e: resolve the stored, tenant-scoped agent and run it WITH ITS TOOLS.
+        agent_def = await _container(request).agent_app.get_agent_def(
+            body.agent_id, workspace_id=workspace_id
+        )
+        if agent_def is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        agent_spec = agent_def.agent_spec()
+        persona = agent_spec.to_persona()
+        llm_config = agent_spec.to_llm_config()
+        # The stored spec was already sanitized at WRITE time; the run-time sanitizer
+        # (re-applied inside create_run, defense-in-depth) must honor the same operator
+        # status, else an operator-provisioned spec's tools would be stripped at run.
+        operator_provisioned = bool(
+            getattr(get_principal(request), "all_tenants", False)
+        )
+    else:
+        # The inline-persona fast path: tool-less shared runtime, byte-unchanged.
+        assert body.persona is not None  # guaranteed by the XOR check above
+        persona = Persona(
+            name=body.persona.name,
+            description=body.persona.description,
+            instructions=body.persona.instructions,
+            metadata=body.persona.metadata,
+        )
+
     run: RunRecord = cast(
         RunRecord,
         await _container(request).run_app.create_run(
@@ -92,6 +137,10 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
             persona=persona,
             task=task,
             idempotency_key=body.idempotency_key,
+            llm_config=llm_config,
+            agent_spec=agent_spec,
+            agent_def=agent_def,
+            operator_provisioned=operator_provisioned,
             actor=get_principal(request).actor_metadata(),
         ),
     )
