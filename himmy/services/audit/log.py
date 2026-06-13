@@ -16,7 +16,7 @@ from himmy.entities.records import EntityRecord
 from himmy.services.audit.models import SecurityEvent
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
 
 #: The EntityRecord kind used for audit events.
 SECURITY_EVENT_KIND = "security_event"
@@ -25,7 +25,7 @@ SECURITY_EVENT_KIND = "security_event"
 class SecurityAuditLog:
     """Append-only security audit trail backed by the entity registry."""
 
-    def __init__(self, entity_registry: EntityRegistry) -> None:
+    def __init__(self, entity_registry: EntityRegistryProtocol) -> None:
         """Record events into ``entity_registry`` as ``security_event`` records."""
         self._registry = entity_registry
 

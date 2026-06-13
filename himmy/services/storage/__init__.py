@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from himmy.services.storage.inmemory import (
+    InMemoryAgentDefStore,
     InMemoryContextStore,
     InMemoryEvaluationStore,
     InMemoryEventLog,
@@ -12,7 +13,11 @@ from himmy.services.storage.inmemory import (
     InMemoryThreadStore,
 )
 from himmy.services.storage.models import (
+    LOCAL_SUBJECT,
+    LOCAL_WORKSPACE,
+    STUDIO_METADATA_KEY,
     ActionRecord,
+    AgentDefRecord,
     AgentStateRecord,
     ContextEvidenceRecord,
     EnvironmentStateRecord,
@@ -28,6 +33,7 @@ from himmy.services.storage.postgres import (
     PostgresStorageService,
 )
 from himmy.services.storage.protocols import (
+    AgentDefStore,
     ContextStore,
     EvaluationStore,
     EventLog,
@@ -47,6 +53,7 @@ __all__ = [
     "ThreadEventStore",
     "ContextStore",
     "RunStore",
+    "AgentDefStore",
     "RecommendationStore",
     "EvaluationStore",
     "OrchestrationStore",
@@ -55,14 +62,19 @@ __all__ = [
     "InMemoryEventLog",
     "InMemoryContextStore",
     "InMemoryRunStore",
+    "InMemoryAgentDefStore",
     "InMemoryRecommendationStore",
     "InMemoryEvaluationStore",
     "InMemoryOrchestrationStore",
     # Records.
+    "LOCAL_SUBJECT",
+    "LOCAL_WORKSPACE",
+    "STUDIO_METADATA_KEY",
     "RunRecord",
     "RunStatus",
     "RecommendationItem",
     "RecommendationStatus",
+    "AgentDefRecord",
     "PostgresStorageService",
     "STORAGE_DDL",
     "MemoryObject",

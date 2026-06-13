@@ -32,6 +32,7 @@ from himmy.services.storage.models import (
     MemoryObject,
     RecommendationItem,
     RunRecord,
+    RunStatus,
 )
 from himmy.services.storage.service import StorageService
 from tests.conftest import run_async
@@ -127,6 +128,79 @@ def test_idempotency_index_first_writer_wins(storage: StorageService) -> None:
         await storage.save_run(second)
         resolved = await storage.load_run_by_idempotency("w", "dup")
         assert resolved is not None and resolved.run_id == first.run_id
+
+    run_async(scenario())
+
+
+# ------------------------------ UNIT 1: atomic run-level resume claim (CAS)
+def test_claim_run_for_resume_one_winner_concurrent(storage: StorageService) -> None:
+    """asyncio.gather of N concurrent claims flips AWAITING_APPROVAL -> RESOLVING once."""
+
+    async def scenario() -> None:
+        run = RunRecord(
+            workspace_id="w1", subject_id="s", status=RunStatus.AWAITING_APPROVAL
+        )
+        await storage.save_run(run)
+        results = await asyncio.gather(
+            *(storage.claim_run_for_resume(run.run_id, workspace_id="w1") for _ in range(25))
+        )
+        assert sum(1 for won in results if won) == 1
+        got = await storage.get_run(run.run_id)
+        assert got is not None and got.status is RunStatus.RESOLVING
+
+    run_async(scenario())
+
+
+def test_claim_run_for_resume_rejects_non_awaiting(storage: StorageService) -> None:
+    """A claim only wins from AWAITING_APPROVAL — RESOLVING/RUNNING/terminal all lose."""
+
+    async def scenario() -> None:
+        for status in (
+            RunStatus.RESOLVING,
+            RunStatus.RUNNING,
+            RunStatus.SUCCEEDED,
+            RunStatus.QUEUED,
+        ):
+            run = RunRecord(workspace_id="w1", subject_id="s", status=status)
+            await storage.save_run(run)
+            assert (
+                await storage.claim_run_for_resume(run.run_id, workspace_id="w1")
+                is False
+            )
+
+    run_async(scenario())
+
+
+def test_claim_run_for_resume_workspace_scoped(storage: StorageService) -> None:
+    """A claim from the wrong workspace cannot flip the run (tenant isolation)."""
+
+    async def scenario() -> None:
+        run = RunRecord(
+            workspace_id="w1", subject_id="s", status=RunStatus.AWAITING_APPROVAL
+        )
+        await storage.save_run(run)
+        assert (
+            await storage.claim_run_for_resume(run.run_id, workspace_id="other")
+            is False
+        )
+        still = await storage.get_run(run.run_id)
+        assert still is not None and still.status is RunStatus.AWAITING_APPROVAL
+
+    run_async(scenario())
+
+
+def test_resolving_round_trips_through_storage(storage: StorageService) -> None:
+    """RunStatus.RESOLVING serializes + round-trips + filters in list_runs (enum string)."""
+
+    async def scenario() -> None:
+        run = RunRecord(
+            workspace_id="w1", subject_id="s", status=RunStatus.RESOLVING
+        )
+        await storage.save_run(run)
+        got = await storage.get_run(run.run_id)
+        assert got is not None and got.status is RunStatus.RESOLVING
+        listed = await storage.list_runs(status=RunStatus.RESOLVING)
+        assert [r.run_id for r in listed] == [run.run_id]
 
     run_async(scenario())
 

@@ -411,6 +411,11 @@ export interface ConnectionStatus {
   configured: boolean;
   writable: boolean;
   fields: ConnectionFieldStatus[];
+  kind: string; // outbound | inbound
+  enableable: boolean; // has an on/off flag the runtime honors
+  enabled: boolean; // currently enabled for its surface
+  allowlist_field: string | null; // field id holding the default-deny allow-list
+  mount_path: string | null; // (inbound) the BFF path this connector mounts at
 }
 
 export interface ConnectionTestResult {
@@ -427,12 +432,42 @@ export const setConnection = (type: string, fields: Record<string, unknown>) =>
   api.put<ConnectionStatus>(`/connections/${type}`, { fields });
 export const deleteConnection = (type: string) =>
   api.del<ConnectionStatus>(`/connections/${type}`);
+export const enableConnection = (type: string) =>
+  api.put<ConnectionStatus>(`/connections/${type}/enable`, {});
+export const disableConnection = (type: string) =>
+  api.put<ConnectionStatus>(`/connections/${type}/disable`, {});
 export const testConnection = (type: string) =>
   api.post<ConnectionTestResult>(`/connections/${type}/test`, {});
 export const sendViaConnection = (type: string, payload: Record<string, unknown>) =>
   api.post<{ ok: boolean; detail: string }>(`/connections/${type}/send`, {
     payload,
   });
+
+// ---- Telegram inbound listener (T3g) -------------------------------------
+
+// The Studio control over the inbound Telegram long-poll listener. The bot token
+// and chat allowlist come from the Telegram Connection (above); this only starts/
+// stops the loop. The token is NEVER returned in any of these payloads.
+export interface TelegramListenerStatus {
+  active: boolean;
+  agent_path: string | null;
+  allowed_chat_ids: string[];
+  allow_everyone: boolean;
+  provider: string | null;
+  model: string | null;
+  error: string | null;
+}
+
+export const getTelegramListener = () =>
+  api.get<TelegramListenerStatus>("/telegram/status");
+export const startTelegramListener = (body: {
+  agent_path: string;
+  provider?: string | null;
+  model?: string | null;
+  allow_everyone?: boolean;
+}) => api.post<TelegramListenerStatus>("/telegram/start", body);
+export const stopTelegramListener = () =>
+  api.post<TelegramListenerStatus>("/telegram/stop", {});
 
 // ---- Approvals (HITL inbox) ----------------------------------------------
 
@@ -728,9 +763,34 @@ export interface RunAnalytics {
   avg_latency_ms: number;
   p50_latency_ms: number;
   p95_latency_ms: number;
+  feedback_up: number;
+  feedback_down: number;
   by_model: ModelAnalytics[];
   by_day: DayAnalytics[];
 }
+
+// ---- Run feedback (P0-A: human thumbs up/down) ---------------------------
+
+export type FeedbackVerdict = "up" | "down";
+
+export interface RunFeedback {
+  run_id: string;
+  verdict: FeedbackVerdict;
+  note: string | null;
+  actor: string;
+  created_at: string;
+  version: number;
+}
+
+export const setRunFeedback = (
+  runId: string,
+  verdict: FeedbackVerdict,
+  note?: string | null,
+) =>
+  api.post<RunFeedback>(`/runs/${runId}/feedback`, { verdict, note: note ?? null });
+
+export const getRunFeedback = (runId: string) =>
+  api.get<RunFeedback | null>(`/runs/${runId}/feedback`);
 
 export interface IoCapture {
   model: string | null;

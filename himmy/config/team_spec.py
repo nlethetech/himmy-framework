@@ -54,11 +54,20 @@ class TeamMemberSpec(BaseModel):
     delegates: list[str] = []
 
 
+def dispatch_key_for(provider: str | None, model: str) -> str:
+    """The model_key a member/graph-node routes on: ``<provider>:<model>`` or plain model.
+
+    This is the key :func:`build_team_inference` registers each backend under, so every
+    execution path (multi-agent, group-chat, AND the linear graph runner) must build its
+    per-step ``LLMConfig.model_key`` from here — otherwise a plain model name misses the
+    ``<provider>:<model>`` key and silently falls through to the stub default.
+    """
+    return f"{provider}:{model}" if provider else model
+
+
 def _dispatch_key(member: TeamMemberSpec) -> str:
-    """The model_key a member routes on: ``<provider>:<model>`` or its plain model."""
-    if member.provider:
-        return f"{member.provider}:{member.model}"
-    return member.model
+    """The model_key a member routes on (see :func:`dispatch_key_for`)."""
+    return dispatch_key_for(member.provider, member.model)
 
 
 class TeamSpec(BaseModel):

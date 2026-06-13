@@ -12,7 +12,7 @@ from himmy.services.tools.models import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
 
 
 class ToolRegistry:
@@ -24,10 +24,21 @@ class ToolRegistry:
     supplied, each registration is also projected to a ``tool_definition`` record.
     """
 
-    def __init__(self, *, entity_registry: EntityRegistry | None = None) -> None:
+    def __init__(
+        self, *, entity_registry: EntityRegistryProtocol | None = None
+    ) -> None:
         self._definitions: dict[str, ToolDefinition] = {}
         self._handlers: dict[str, Callable[..., Any]] = {}
         self._entity_registry = entity_registry
+
+    @property
+    def entity_registry(self) -> EntityRegistryProtocol | None:
+        """The audit spine tool registrations project onto (``None`` when unwired).
+
+        Exposed so co-registered packs (e.g. memory) can share the same registry
+        and route their own writes onto one spine.
+        """
+        return self._entity_registry
 
     def register(
         self,

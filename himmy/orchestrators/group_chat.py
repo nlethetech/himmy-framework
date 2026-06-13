@@ -40,7 +40,12 @@ from himmy.agents.base_agent.task import Task
 from himmy.agents.base_agent.thread import ChatThread
 from himmy.core import HimmyError
 from himmy.core.events import EventType, RunEvent
-from himmy.orchestrators.multi_agent import AgentTeam, OnEvent, TeamMember
+from himmy.orchestrators.multi_agent import (
+    AgentTeam,
+    OnEvent,
+    TeamMember,
+    _fail_closed_on_gated_tool,
+)
 from himmy.runtime.single_agent import RunResult, SingleAgentRuntime
 from himmy.runtime.termination import (
     FINAL_ANSWER_TOOL,
@@ -380,6 +385,11 @@ class GroupChatOrchestrator:
             )
 
             result = await self._speak(speaker, thread, prompt if is_first else None)
+            # Fail closed: a speaker calling an approval-gated tool is denied by the
+            # tool gate (the tool never ran); HITL is unsupported for the group_chat
+            # kind, so surface it as a clean FAILED run naming the tool rather than
+            # silently continuing the discussion past the denial.
+            _fail_closed_on_gated_tool(result, kind="group_chat")
             turns.append((speaker_name, result))
             spoken_text = result.output_text or ""
             transcript.append((speaker_name, spoken_text))

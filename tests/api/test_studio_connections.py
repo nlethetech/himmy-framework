@@ -65,8 +65,8 @@ def test_read_only_backend_rejects_writes() -> None:
 
 def test_unknown_type_raises(file_backend: None) -> None:
     with pytest.raises(KeyError):
-        sc.set_connection("slack", {"x": "y"})
-    assert sc.get_connection("slack") is None
+        sc.set_connection("nonexistent-connection", {"x": "y"})
+    assert sc.get_connection("nonexistent-connection") is None
 
 
 def test_apply_connections_to_env(

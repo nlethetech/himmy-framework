@@ -63,6 +63,12 @@ class AgentSpec(BaseModel):
     tools_module: str | None = None
     http_tools: list[HttpToolSpec] = []  # declarative REST tools (no Python)
     mcp_servers: list[MCPServerConfig] = []  # stdio MCP servers → agent tools
+    # Built-in OUTBOUND connectors to bind as agent tools (e.g. ["slack", "github"]).
+    # A named connector is wired only when it is ENABLED for outbound AND configured
+    # (its capability probe passes) — an unconfigured/disabled name is skipped cleanly,
+    # not an error, so a shared spec degrades gracefully across environments. Inbound
+    # connectors (webhook/slack/discord intake) are mounted by the BFF, not bound here.
+    connectors: list[str] = []
     # Give the agent a spawn_agent tool (one-level recursive sub-agents):
     allow_spawn: bool = False
     # Give the agent a dispatch_skill tool (run a named capability as a sub-agent):
@@ -159,6 +165,31 @@ class AgentSpec(BaseModel):
             prompt=prompt,
             context=context,
             metadata=dict(self.metadata),
+        )
+
+    def builds_tool_registry(self) -> bool:
+        """Whether ``build_runtime_for_spec`` will construct a per-run tool registry.
+
+        Mirrors the exact gate in :func:`himmy.runtime.from_spec.build_runtime_for_spec`
+        (which is the single caller that decides this): a spec that declares any
+        tool-bearing surface — packs, a tools module, declarative HTTP/MCP tools,
+        knowledge auto-ingest, recursive spawn, skill dispatch, or outbound connectors —
+        yields a :class:`ToolRegistry`; a bare persona spec (e.g. ``{"name": "x"}``) does
+        NOT. Callers that need a registry to exist (HITL/plan mode, which register a gated
+        tool onto it) gate on this so a tool-less stored agent is rejected up front rather
+        than silently producing a run that can never pause. ``tools`` (bare names) alone
+        does not build a registry — those names resolve against tools a ``tools_module``
+        registers, so they are not counted here.
+        """
+        return bool(
+            self.tool_packs
+            or self.tools_module
+            or self.http_tools
+            or self.knowledge
+            or self.mcp_servers
+            or self.allow_spawn
+            or self.allow_skill_dispatch
+            or self.connectors
         )
 
 

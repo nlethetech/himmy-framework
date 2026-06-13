@@ -41,13 +41,27 @@ class ConnectionField:
 
 @dataclass(frozen=True)
 class ConnectionType:
-    """A connectable account type: its fields + an optional live test."""
+    """A connectable account type: its fields + an optional live test.
+
+    ``kind`` is ``outbound`` (the agent calls it as a tool) or ``inbound`` (it triggers an
+    agent run). ``enableable`` marks a connection wired through the connector-management
+    enable/disable surface (Slack/GitHub/Discord/webhook) — those carry an on/off flag the
+    runtime honors; the legacy toolkit-config connections (email/telegram/web_search) are
+    always-on once configured, so they are not enableable. ``allowlist_field`` names the
+    field that holds the connector's default-deny allow-list (None when it has none).
+    ``inbound_agent`` marks the inbound connectors whose mount runs the configured
+    ``agent.yaml`` (surfaced so the UI can show the mount URL + secret).
+    """
 
     type: str
     title: str
     description: str
     hue: str  # CSS hue token name (email/telegram/web/…)
     fields: tuple[ConnectionField, ...]
+    kind: str = "outbound"  # outbound | inbound
+    enableable: bool = False  # wired through connector-manage enable/disable
+    allowlist_field: str | None = None  # the field id holding the default-deny allow-list
+    mount_path: str | None = None  # (inbound) the BFF path the connector mounts at
 
 
 # ---- the registry -------------------------------------------------------
@@ -146,6 +160,134 @@ CONNECTION_TYPES: dict[str, ConnectionType] = {
             ),
         ),
     ),
+    # ---- connector-managed connections (enable/disable + allow-list) ------
+    # These map onto himmy.connectors.manage's secret names so the Studio screen and the
+    # CLI `himmy connectors` / runtime binding all read/write the SAME store keys. They
+    # carry an on/off flag (enableable) the runtime honors and a default-deny allow-list.
+    "slack": ConnectionType(
+        type="slack",
+        title="Slack",
+        description="Let agents post to allow-listed Slack channels (outbound tool).",
+        hue="web",
+        kind="outbound",
+        enableable=True,
+        allowlist_field="allowed_channels",
+        fields=(
+            ConnectionField(
+                "bot_token",
+                "HIMMY_SLACK_BOT_TOKEN",
+                "Bot token",
+                secret=True,
+                kind="password",
+                placeholder="xoxb-...",
+            ),
+            ConnectionField(
+                "allowed_channels",
+                "HIMMY_SLACK_ALLOWED_CHANNELS",
+                "Allowed channels",
+                required=False,
+                placeholder="C0123ABC,C0456DEF",
+            ),
+            ConnectionField(
+                "default_channel",
+                "HIMMY_SLACK_DEFAULT_CHANNEL",
+                "Default channel",
+                required=False,
+                placeholder="C0123ABC",
+            ),
+        ),
+    ),
+    "github": ConnectionType(
+        type="github",
+        title="GitHub",
+        description="Let agents read/act on allow-listed GitHub repos (outbound tool).",
+        hue="web",
+        kind="outbound",
+        enableable=True,
+        allowlist_field="allowed_repos",
+        fields=(
+            ConnectionField(
+                "token",
+                "HIMMY_GITHUB_TOKEN",
+                "API token",
+                secret=True,
+                kind="password",
+                placeholder="ghp_...",
+            ),
+            ConnectionField(
+                "allowed_repos",
+                "HIMMY_GITHUB_ALLOWED_REPOS",
+                "Allowed repos",
+                required=False,
+                placeholder="owner/repo,owner/other",
+            ),
+            ConnectionField(
+                "default_repo",
+                "HIMMY_GITHUB_DEFAULT_REPO",
+                "Default repo",
+                required=False,
+                placeholder="owner/repo",
+            ),
+        ),
+    ),
+    "discord": ConnectionType(
+        type="discord",
+        title="Discord",
+        description="Let agents post to allow-listed Discord channels (outbound tool).",
+        hue="telegram",
+        kind="outbound",
+        enableable=True,
+        allowlist_field="allowed_channels",
+        fields=(
+            ConnectionField(
+                "bot_token",
+                "HIMMY_DISCORD_BOT_TOKEN",
+                "Bot token",
+                secret=True,
+                kind="password",
+            ),
+            ConnectionField(
+                "allowed_channels",
+                "HIMMY_DISCORD_ALLOWED_CHANNELS",
+                "Allowed channels",
+                required=False,
+                placeholder="123456789,987654321",
+            ),
+            ConnectionField(
+                "default_channel",
+                "HIMMY_DISCORD_DEFAULT_CHANNEL",
+                "Default channel",
+                required=False,
+            ),
+        ),
+    ),
+    "webhook": ConnectionType(
+        type="webhook",
+        title="Inbound webhook",
+        description="Receive HMAC-signed deliveries that trigger your agent (inbound).",
+        hue="web",
+        kind="inbound",
+        enableable=True,
+        allowlist_field="allowed_sources",
+        mount_path="/v1/connectors/webhook",
+        fields=(
+            ConnectionField(
+                "signing_secret",
+                "HIMMY_WEBHOOK_SIGNING_SECRET",
+                "Signing secret",
+                secret=True,
+                kind="password",
+                placeholder="a long random string",
+            ),
+            ConnectionField(
+                "allowed_sources",
+                "HIMMY_WEBHOOK_ALLOWED_SOURCES",
+                "Allowed sources",
+                required=False,
+                placeholder="ci,monitoring",
+            ),
+        ),
+    ),
 }
 
 
@@ -172,6 +314,13 @@ class ConnectionStatus(BaseModel):
     configured: bool
     writable: bool
     fields: list[ConnectionFieldStatus]
+    # connector-managed metadata (defaults keep legacy email/telegram/web_search rows
+    # byte-compatible for any existing client that ignores the new fields):
+    kind: str = "outbound"  # outbound | inbound
+    enableable: bool = False  # has an enable/disable flag the runtime honors
+    enabled: bool = False  # currently enabled for its surface (always False if !enableable)
+    allowlist_field: str | None = None  # the field id holding the default-deny allow-list
+    mount_path: str | None = None  # (inbound) the BFF path this connector mounts at
 
 
 class ConnectionTestResult(BaseModel):
@@ -233,7 +382,29 @@ def _status(ct: ConnectionType) -> ConnectionStatus:
         configured=configured,
         writable=writable,
         fields=fields,
+        kind=ct.kind,
+        enableable=ct.enableable,
+        enabled=_is_enabled(ct),
+        allowlist_field=ct.allowlist_field,
+        mount_path=ct.mount_path,
     )
+
+
+def _surface(ct: ConnectionType) -> str:
+    """The connector-manage surface for ``ct`` (inbound connections enable inbound)."""
+    return "inbound" if ct.kind == "inbound" else "outbound"
+
+
+def _is_enabled(ct: ConnectionType) -> bool:
+    """Whether an enableable connection is currently ON (False for non-enableable rows)."""
+    if not ct.enableable:
+        return False
+    from himmy.connectors.manage import ConnectorService
+
+    try:
+        return ConnectorService().is_enabled(ct.type, _surface(ct))
+    except (KeyError, ValueError):  # not a connector-manage connector
+        return False
 
 
 # ---- service ------------------------------------------------------------
@@ -282,6 +453,44 @@ def delete_connection(ctype: str) -> ConnectionStatus:
     for f in ct.fields:
         writable.delete(f.secret_name)
         os.environ.pop(f.secret_name, None)
+    # Disabling a deleted connector keeps the runtime from trying to wire a now-empty
+    # credential (best-effort: a non-enableable row has nothing to disable).
+    if ct.enableable:
+        from himmy.connectors.manage import ConnectorService
+
+        try:
+            ConnectorService().disable(ct.type, _surface(ct))
+        except Exception:  # noqa: BLE001 - best-effort; the secrets are already gone
+            pass
+    return _status(ct)
+
+
+def set_enabled(ctype: str, enabled: bool) -> ConnectionStatus:
+    """Enable/disable a connector-managed connection (delegates to the manage service).
+
+    Refuses cleanly (:class:`KeyError`) for an unknown or non-enableable connection, and
+    FAILS LOUDLY (:class:`ReadOnlyBackendError`) on a read-only secrets backend — an
+    enable that could not persist would be a silent no-op the next process never sees.
+    """
+    ct = CONNECTION_TYPES.get(ctype)
+    if ct is None or not ct.enableable:
+        raise KeyError(ctype)
+    from himmy.connectors.manage import (
+        ConnectorService,
+    )
+    from himmy.connectors.manage import (
+        ReadOnlyBackendError as ManageReadOnly,
+    )
+
+    service = ConnectorService()
+    surface = _surface(ct)
+    try:
+        if enabled:
+            service.enable(ct.type, surface)
+        else:
+            service.disable(ct.type, surface)
+    except ManageReadOnly as exc:
+        raise ReadOnlyBackendError(str(exc)) from exc
     return _status(ct)
 
 
@@ -349,6 +558,20 @@ async def test_connection(ctype: str) -> ConnectionTestResult:
     from himmy.toolkit.config import ToolkitConfig
 
     apply_connections_to_env()
+
+    # Connector-managed connections (slack/github/discord/webhook) test through the SAME
+    # connector-manage service the CLI uses: a structural capability check plus an optional
+    # read-only live ping. Routed here so the Studio "Test" button works for them too.
+    ct = CONNECTION_TYPES.get(ctype)
+    if ct is not None and ct.enableable:
+        from himmy.connectors.manage import ConnectorService
+
+        try:
+            r = await ConnectorService().test(ctype)
+        except KeyError:
+            raise KeyError(ctype) from None
+        return ConnectionTestResult(ok=r.ok, detail=r.detail, checked=r.checked)
+
     cfg = ToolkitConfig.from_env()
 
     if ctype == "email":
@@ -457,6 +680,7 @@ __all__ = [
     "get_connection",
     "set_connection",
     "delete_connection",
+    "set_enabled",
     "test_connection",
     "send_via_connection",
     "apply_connections_to_env",

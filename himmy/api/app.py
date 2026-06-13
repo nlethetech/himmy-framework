@@ -27,17 +27,24 @@ from himmy.api.deps import ApiContainer
 from himmy.api.models import ErrorResponse
 from himmy.api.ratelimit import build_rate_limiter
 from himmy.api.routers import (
+    agents,
     audit,
+    connectors,
     consent,
     context,
     dashboard,
+    diagnostics,
     evaluation,
+    knowledge,
+    models,
     privacy_audit,
     recommendations,
+    routines,
     runs,
     studio,
     studio_eval,
     studio_files,
+    studio_guardrails,
     studio_knowledge_upload,
     studio_lineage,
     studio_mcp,
@@ -48,8 +55,14 @@ from himmy.api.routers import (
     studio_privacy,
     studio_projects,
     studio_routines,
+    studio_seclog,
     studio_teams,
+    studio_telegram,
+    teams,
+    threads,
+    workflows,
 )
+from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.core.errors import HimmyError
 from himmy.services.audit import SecurityAuditLog
 
@@ -210,6 +223,7 @@ def _build_lifespan(
         # durable build fails we keep the in-memory container running (degraded but up).
         active = container
         built_durable = False
+        rebuilt_for_spine = False
         if upgrade_to_durable and _wants_durable_store():
             try:
                 active = await ApiContainer.build_default_async()
@@ -223,6 +237,35 @@ def _build_lifespan(
                     exc_info=True,
                 )
                 active = container
+        elif upgrade_to_durable:
+            # BUILD-ORDER trap (T2.1 reviewer must_fix): ``build_default`` ran BEFORE the
+            # server-context flag was set above, so the container resolved its spine on the
+            # CLI path. ``SpineFactory.for_cli`` is already durable (the canonical
+            # ``.himmy/spine.db``), so the common zero-DSN case is correct at construction;
+            # but if ``HIMMY_SPINE_DATABASE_URL`` is set the SERVER spine is Postgres, which
+            # is ONLY resolved on the server path — the construction-time spine would be the
+            # wrong (SQLite) backend. So when we are NOT building a durable container, ALWAYS
+            # rebuild the in-memory default container under the now-active server context:
+            # this re-resolves the spine through ``SpineFactory.for_context`` (server) while
+            # keeping the in-memory run store the zero-config server expects. The
+            # construction-time run store is empty (no request served yet), so discarding it
+            # is safe, and a run's lineage now survives a restart on the durable spine.
+            try:
+                rebuilt = ApiContainer.build_default()
+                _rebind_container(app, rebuilt)
+                active = rebuilt
+                rebuilt_for_spine = True
+                logger.info("durable spine wired for the zero-DSN server entrypoint")
+            except Exception:  # pragma: no cover - defensive: stay up on spine failure
+                logger.warning(
+                    "durable spine rebind failed; serving the construction-time spine",
+                    exc_info=True,
+                )
+                active = container
+
+        # The routine canonical-storage provider is wired in ``create_app`` to read
+        # ``app.state.container.storage`` dynamically, so the rebind above (to the
+        # durable store) is automatically reflected — no re-wiring needed here.
 
         # Startup: sweep runs left non-terminal by a previous process so they
         # reach a terminal state instead of hanging in QUEUED/RUNNING forever.
@@ -236,6 +279,17 @@ def _build_lifespan(
                     )
             except Exception:  # pragma: no cover - startup sweep is best-effort
                 logger.warning("startup run sweep failed", exc_info=True)
+            # Re-drive HITL resumes left at RESOLVING by a crash (exactly-once via the
+            # member checkpoint claim + ledger). Done AFTER the sweep, which never reaps a
+            # RESOLVING run.
+            try:
+                redriven = await run_app.reconcile_resolving_runs()
+                if redriven:
+                    logger.info(
+                        "re-drove %d crashed HITL resume(s) on startup", len(redriven)
+                    )
+            except Exception:  # pragma: no cover - startup reconcile is best-effort
+                logger.warning("startup resume reconcile failed", exc_info=True)
         # Materialize Studio "connection" non-secret fields (SMTP host, search
         # backend, …) from the writable secrets backend into the process env so
         # tool config picks them up without a restart.
@@ -259,12 +313,29 @@ def _build_lifespan(
                 await active.aclose()
             except Exception:  # pragma: no cover - shutdown best-effort
                 pass
-            # Also close the original in-memory container if we swapped it out.
-            if built_durable and active is not container:
+            # Also close the original container if we swapped it out (for a durable
+            # store OR a durable-spine rebind) so its construction-time spine/store
+            # handle is released.
+            if (built_durable or rebuilt_for_spine) and active is not container:
                 try:
                     await container.aclose()
                 except Exception:  # pragma: no cover - shutdown best-effort
                     pass
+            # Clear the canonical-storage provider so a later in-process CLI/test run
+            # does not mirror into this (now-closed) container's store.
+            try:
+                from himmy.api.studio_canonical import set_canonical_storage_provider
+
+                set_canonical_storage_provider(None)
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
+            # Clear the routine container provider for the same reason.
+            try:
+                from himmy.api.routines import set_routine_container_provider
+
+                set_routine_container_provider(None)
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
             # Clear the server-context flag so a subsequent in-process CLI/test run
             # reverts to the in-memory one-shot default.
             try:
@@ -330,6 +401,36 @@ def create_app(
         lifespan=_build_lifespan(container, upgrade_to_durable=container_was_none),
     )
     app.state.container = container
+
+    # T2.2/T3c: point the routine scheduler at the SAME canonical run store the Studio
+    # runs reader uses (``app.state.container.storage``), resolved dynamically so a
+    # lifespan rebind to the durable store is reflected without re-wiring. Set in
+    # ``create_app`` (not only the lifespan) so even a bare ``TestClient(create_app())``
+    # — which never enters the lifespan — mirrors a scheduled run into the one store the
+    # GUI reads, keeping "all runs, one store" coherent.
+    try:
+        from himmy.api.studio_canonical import set_canonical_storage_provider
+
+        set_canonical_storage_provider(
+            lambda: getattr(getattr(app.state, "container", None), "storage", None)
+        )
+    except Exception:  # pragma: no cover - canonical wiring is best-effort
+        logger.warning("wiring canonical run store failed", exc_info=True)
+
+    # T3c: point the routine scheduler at the wired app container so a workspace-scoped
+    # (agent_id) routine run dispatches through the SAME RunAppService the request-driven
+    # /v1 surface uses — landing in the tenant's workspace of the canonical store under the
+    # T0.4 quota + the HITL rails. Resolved dynamically so a lifespan rebind to the durable
+    # container is reflected.
+    try:
+        from himmy.api.routines import set_routine_container_provider
+
+        set_routine_container_provider(
+            lambda: getattr(app.state, "container", None)
+        )
+    except Exception:  # pragma: no cover - routine wiring is best-effort
+        logger.warning("wiring routine container failed", exc_info=True)
+
     app.state.authenticator = authenticator
     # Authorization: role → permission policy (data-driven via HIMMY_RBAC_FILE).
     # Enforced per-route via require_permission; bypassed when auth is off.
@@ -357,16 +458,42 @@ def create_app(
             content=ErrorResponse(detail=str(exc), code="himmy_error").model_dump(),
         )
 
+    # T0.4: a workspace at its outstanding-run cap is a backpressure signal, not a
+    # server fault — surface it as a clean 429 (the exception's own contract) instead
+    # of letting it fall through to the generic 500 handler.
+    @app.exception_handler(WorkspaceRunQuotaExceeded)
+    async def _run_quota_handler(
+        request: Request, exc: WorkspaceRunQuotaExceeded
+    ) -> JSONResponse:
+        """Map a per-workspace run-concurrency quota breach to a structured 429."""
+        return JSONResponse(
+            status_code=429,
+            content=ErrorResponse(
+                detail=str(exc), code="run_quota_exceeded"
+            ).model_dump(),
+        )
+
     app.include_router(context.router)
     app.include_router(runs.router)
+    app.include_router(agents.router)
+    app.include_router(threads.router)
+    app.include_router(knowledge.router)
+    app.include_router(routines.router)
+    app.include_router(teams.router)
+    app.include_router(workflows.router)
     app.include_router(recommendations.router)
     app.include_router(dashboard.router)
     app.include_router(evaluation.router)
+    app.include_router(models.router)
+    app.include_router(diagnostics.router)
+    app.include_router(connectors.router)
     app.include_router(privacy_audit.router)
     app.include_router(audit.router)
     app.include_router(consent.router)
     app.include_router(studio.router)
     app.include_router(studio_privacy.router)
+    app.include_router(studio_guardrails.router)
+    app.include_router(studio_seclog.router)
     app.include_router(studio_lineage.router)
     app.include_router(studio_files.router)
     app.include_router(studio_knowledge_upload.router)
@@ -376,9 +503,16 @@ def create_app(
     app.include_router(studio_eval.router)
     app.include_router(studio_missions.router)
     app.include_router(studio_routines.router)
+    app.include_router(studio_telegram.router)
     app.include_router(studio_mcp.router)
     app.include_router(studio_projects.router)
     app.include_router(studio_notify.router)
+
+    # Mount enabled + capability-OK inbound connectors (webhook/Slack/Discord intake),
+    # each wired to a configured agent.yaml. No-op unless an inbound agent is configured
+    # AND a connector is enabled with its signing secret present — so the default offline
+    # surface is unchanged and an unsigned public trigger is never exposed.
+    _mount_inbound_connectors(app)
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
@@ -392,6 +526,25 @@ def create_app(
     # Mount the built Studio SPA last so its catch-all never shadows an API route.
     _mount_studio(app)
     return app
+
+
+def _mount_inbound_connectors(app: FastAPI) -> None:
+    """Mount enabled inbound connectors (best-effort; never abort app creation).
+
+    Delegates to :func:`himmy.api.connector_inbound.mount_inbound_connectors`, which
+    mounts a router only for a connector that is enabled for ``inbound`` AND whose signing
+    secret is present (capability OK), wired to the configured inbound ``agent.yaml``. A
+    failure to build any connector is logged and skipped so a misconfiguration cannot stop
+    the BFF coming up.
+    """
+    try:
+        from himmy.api.connector_inbound import mount_inbound_connectors
+
+        mounted = mount_inbound_connectors(app)
+        if mounted:
+            logger.info("mounted inbound connector(s): %s", ", ".join(mounted))
+    except Exception:  # pragma: no cover - defensive: inbound mount is best-effort
+        logger.warning("mounting inbound connectors failed", exc_info=True)
 
 
 # Built Studio frontend (emitted by `npm run build` in studio/). Absent in a source

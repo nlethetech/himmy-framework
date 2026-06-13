@@ -521,6 +521,49 @@ class ChatRepl:
                 f"`himmy trace`){c['reset']}"
             )
 
+    # ------------------------------------------------------------ /good · /bad
+
+    def _feedback(self, verdict: str, note: str | None) -> None:
+        """``/good`` | ``/bad`` [note]: rate the LAST turn (human feedback → spine).
+
+        The cheapest, least-noisy learning signal there is. Records against the
+        last turn's run id (``trace_id``) on the durable entity spine
+        (``.himmy/entities.db``, shared with Studio) — no Studio run row needed.
+        Re-rating appends a new version, so the audit trail keeps every change.
+        """
+        from himmy.api.studio_feedback import record_feedback
+
+        c = self._c
+        last = next(
+            (e for e in reversed(self.recorder.events) if getattr(e, "trace_id", None)),
+            None,
+        )
+        if last is None:
+            self._eprint(
+                f"{c['dim']}nothing to rate yet — ask something first{c['reset']}"
+            )
+            return
+        extra = {"thread_id": last.thread_id} if last.thread_id else None
+        try:
+            fb = record_feedback(
+                last.trace_id,
+                verdict=verdict,
+                note=note,
+                source="cli",
+                require_studio_run=False,
+                extra_metadata=extra,
+            )
+        except Exception as exc:  # never let feedback crash the REPL
+            self._eprint(f"{c['crimson']}couldn't record feedback: {exc}{c['reset']}")
+            return
+        assert fb is not None  # require_studio_run=False never returns None
+        label = "👍 good" if verdict == "up" else "👎 bad"
+        suffix = f" · “{note}”" if note else ""
+        self._eprint(
+            f"{c['snow']}{label} recorded{c['reset']}"
+            f"{c['faint']}{suffix} (v{fb.version}){c['reset']}"
+        )
+
     # --------------------------------------------------------------- /lineage
 
     def _lineage(self, thread: Any, *, as_dot: bool = False) -> None:
@@ -806,6 +849,11 @@ class ChatRepl:
         if cmd == "/why":
             self._why()
             return thread
+        if cmd in ("/good", "/bad"):
+            parts = line.split(None, 1)
+            note = parts[1].strip() if len(parts) > 1 else None
+            self._feedback("up" if cmd == "/good" else "down", note)
+            return thread
         if cmd == "/spawn":
             task_text = (
                 line.split(None, 1)[1].strip() if len(line.split(None, 1)) > 1 else ""
@@ -931,6 +979,8 @@ class ChatRepl:
                 f"/stream on|off            stream tool-turn answers (extra call)\n"
                 f"/cost                     session events + spend (vs budget)\n"
                 f"/why                      full forensics on the last turn\n"
+                f"/good [note] · /bad [note] rate the last answer (teaches the "
+                f"agent over time)\n"
                 f"/lineage [--dot]          provenance tree of this turn "
                 f"(run -> tools -> results)\n"
                 f"/spawn <task>             run a task in the background (can't "
@@ -1073,12 +1123,11 @@ class ChatRepl:
         # Durable session continuity. Always wire the store: a bare REPL still
         # auto-persists to the implicit "last" session after every turn (only an
         # explicit --session or -c/--continue LOADS a prior thread at startup).
+        from himmy.config.project import conversations_db_path
         from himmy.runtime.session import SqliteSessionStore
 
         Path(".himmy").mkdir(exist_ok=True)
-        self.rt["session_store"] = SqliteSessionStore(
-            str(Path(".himmy") / "sessions.db")
-        )
+        self.rt["session_store"] = SqliteSessionStore(conversations_db_path())
 
         # Connect MCP servers ONCE on the persistent loop (reused across turns).
         mcp_clients: list[Any] = []

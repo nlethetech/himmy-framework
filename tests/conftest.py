@@ -47,6 +47,31 @@ def executor_from(
 
 
 @pytest.fixture(autouse=True)
+def _isolated_spine(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Point the canonical durable spine at a per-test temp file (T2.1 isolation).
+
+    ``SpineFactory`` resolves ONE durable ``.himmy/spine.db`` so the CLI, Studio, and /v1
+    share a spine across processes — the right production behaviour, but it means two
+    tests in the same working directory would otherwise accumulate each other's
+    security/lineage rows in one on-disk file (the spine used to be a fresh in-memory
+    ``EntityRegistry()`` per ``build_default``). Setting ``HIMMY_SPINE_PATH`` to a unique
+    temp file per test restores per-test isolation WITHOUT weakening the durable default:
+    the production resolution is exercised end-to-end (a real on-disk SQLite spine), just
+    scoped to a throwaway path. Tests that want a specific path still override the env
+    after this fixture (their ``setenv`` wins). Skipped for ``integration`` tests, which
+    own their environment.
+    """
+    if request.node.get_closest_marker("integration"):
+        return
+    spine_db = tmp_path_factory.mktemp("spine") / "spine.db"
+    monkeypatch.setenv("HIMMY_SPINE_PATH", str(spine_db))
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_embedder_cascade(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:

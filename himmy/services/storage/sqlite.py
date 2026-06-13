@@ -33,6 +33,7 @@ from himmy.core.sqlite_util import connect_hardened
 from himmy.services.storage.at_rest import StorePayloadCipher, build_store_cipher
 from himmy.services.storage.models import (
     ActionRecord,
+    AgentDefRecord,
     AgentStateRecord,
     EnvironmentStateRecord,
     EpisodicMemoryObject,
@@ -193,7 +194,7 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
 #: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
 #: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
 #: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
-SQLITE_SCHEMA_VERSION = 1
+SQLITE_SCHEMA_VERSION = 4
 
 #: Ordered forward migrations applied after the base DDL, mirroring the Postgres
 #: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
@@ -207,7 +208,70 @@ SQLITE_SCHEMA_VERSION = 1
 #: (Editing :data:`_SCHEMA` to add a column AND re-adding it via a migration would
 #: double-apply the ALTER and break fresh installs.) Append new entries here — never
 #: edit a shipped one — and bump :data:`SQLITE_SCHEMA_VERSION` to match the highest.
-_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ()
+_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    # v2 (P0-B): promote event_type + tool_name to indexed columns on run_events
+    # so learning miners can answer "which tools fail most" / "what gets blocked"
+    # with an index seek instead of a full-table json_extract scan. New writes
+    # populate the columns directly (append_event); existing rows are backfilled
+    # from the stored JSON best-effort (top-level event_type is always plaintext;
+    # the nested tool_name backfills only for unencrypted databases).
+    (
+        2,
+        (
+            "ALTER TABLE run_events ADD COLUMN event_type TEXT",
+            "ALTER TABLE run_events ADD COLUMN tool_name TEXT",
+            "CREATE INDEX IF NOT EXISTS run_events_event_type_idx "
+            "ON run_events (event_type)",
+            "CREATE INDEX IF NOT EXISTS run_events_tool_name_idx "
+            "ON run_events (tool_name)",
+            "UPDATE run_events SET event_type = "
+            "json_extract(payload, '$.event_type') WHERE event_type IS NULL",
+            "UPDATE run_events SET tool_name = "
+            "json_extract(payload, '$.payload.tool_name') "
+            "WHERE tool_name IS NULL AND json_valid(payload)",
+        ),
+    ),
+    # v3 (T1.1): promote workspace_id to an indexed column on evaluation_runs so
+    # GET /v1/evaluation/runs/{id} can be tenant-scoped (close the cross-tenant
+    # IDOR) and lists can filter by workspace with an index seek. New writes
+    # populate the column directly (save_evaluation_run); existing rows are
+    # backfilled best-effort from the stored JSON payload (top-level
+    # workspace_id; only for unencrypted databases where the column is plaintext).
+    (
+        3,
+        (
+            "ALTER TABLE evaluation_runs ADD COLUMN workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS evaluation_runs_workspace_id_idx "
+            "ON evaluation_runs (workspace_id)",
+            "UPDATE evaluation_runs SET workspace_id = "
+            "json_extract(payload, '$.workspace_id') "
+            "WHERE workspace_id IS NULL AND json_valid(payload)",
+        ),
+    ),
+    # v4 (T2e): durable workspace-scoped stored agent definitions backing the
+    # /v1/agents CRUD resource. ``agent_id`` is the PK; the full AgentDefRecord JSON
+    # (incl. the sanitized AgentSpec) rides in ``payload``; ``workspace_id`` is an
+    # indexed column for tenant-scoped reads and a partial-unique idempotency index
+    # mirrors the runs table so a re-POSTed idempotency key returns the prior row.
+    (
+        4,
+        (
+            "CREATE TABLE IF NOT EXISTS agent_defs ("
+            "agent_id TEXT PRIMARY KEY, "
+            "workspace_id TEXT NOT NULL, "
+            "name TEXT NOT NULL, "
+            "idempotency_key TEXT, "
+            "payload TEXT NOT NULL DEFAULT '{}', "
+            "created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS agent_defs_workspace_id_idx "
+            "ON agent_defs (workspace_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS agent_defs_idempotency_idx "
+            "ON agent_defs (workspace_id, idempotency_key) "
+            "WHERE idempotency_key IS NOT NULL",
+        ),
+    ),
+)
 
 #: Max bound parameters per ``DELETE ... WHERE seq IN (?, …)`` when pruning. SQLite caps
 #: a statement at ``SQLITE_MAX_VARIABLE_NUMBER`` host parameters (999 on libsqlite < 3.32,
@@ -427,14 +491,22 @@ class SqliteStorageService:
             record["payload"] = self._cipher.encrypt_event_payload(
                 record.get("payload") or {}, event_id=event.event_id
             )
+        # P0-B: denormalise event_type + tool_name into indexed columns so the
+        # learning miners query by index. Captured from the live event BEFORE
+        # encryption, so tool_name survives even with payload encryption at rest.
+        event_type = getattr(event.event_type, "value", str(event.event_type))
+        tool_name = (event.payload or {}).get("tool_name")
         await asyncio.to_thread(
             self._write,
-            "INSERT INTO run_events (event_id, thread_id, trace_id, payload) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING",
+            "INSERT INTO run_events "
+            "(event_id, thread_id, trace_id, event_type, tool_name, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING",
             (
                 event.event_id,
                 event.thread_id,
                 event.trace_id,
+                event_type,
+                tool_name,
                 json.dumps(record),
             ),
         )
@@ -697,6 +769,55 @@ class SqliteStorageService:
                 self._rollback_quietly()
                 raise
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool:
+        """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won).
+
+        The run-level mirror of :meth:`SqliteCheckpointStore.claim`: a single conditional
+        UPDATE under ``BEGIN IMMEDIATE`` (which takes the write lock up front) flips
+        ``AWAITING_APPROVAL`` -> ``RESOLVING`` for ``(run_id, workspace_id)``, returning
+        ``rowcount == 1`` for the winner. Two concurrent resumes — even across processes
+        sharing this file — serialize on the write lock; the first matches
+        ``AWAITING_APPROVAL`` and flips it, the second now sees ``RESOLVING`` and matches
+        nothing (rowcount 0), so a SECOND concurrent approve loses the CAS and is refused
+        BEFORE any resume launches (closing the orchestration double-advance race). Only
+        ``AWAITING_APPROVAL`` is claimable here; a stale ``RESOLVING`` (a crashed resume)
+        is re-driven by recovery, not re-claimed by a fresh approve. Both the ``status``
+        column and the JSON ``payload``'s ``$.status`` are rewritten (and ``updated_at``)
+        so a later ``get_run`` is consistent with the column.
+        """
+        return await asyncio.to_thread(
+            self._claim_run_for_resume_sync, run_id, workspace_id
+        )
+
+    def _claim_run_for_resume_sync(self, run_id: str, workspace_id: str) -> bool:
+        """The locked conditional UPDATE for the run-level resume claim."""
+        now = utc_now_iso()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cur = self._conn.execute(
+                    "UPDATE runs SET status = ?, updated_at = ?, "
+                    "payload = json_set(payload, '$.status', ?, '$.updated_at', ?) "
+                    "WHERE run_id = ? AND workspace_id = ? AND status = ?",
+                    (
+                        RunStatus.RESOLVING.value,
+                        now,
+                        RunStatus.RESOLVING.value,
+                        now,
+                        run_id,
+                        workspace_id,
+                        RunStatus.AWAITING_APPROVAL.value,
+                    ),
+                )
+                won = cur.rowcount == 1
+                self._conn.commit()
+                return won
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
     @staticmethod
     def _run_upsert(run: RunRecord) -> tuple[str, tuple[Any, ...]]:
         """The upsert-by-run_id statement + params for a run record."""
@@ -763,6 +884,132 @@ class SqliteStorageService:
             (workspace_id, idempotency_key),
         )
         return _row_to_run(row) if row else None
+
+    # ------------------------------------------------------------- agent defs (T2e)
+    async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
+        """Upsert a stored agent definition keyed by ``agent_id``."""
+        record.updated_at = utc_now_iso()
+        await asyncio.to_thread(self._write, *self._agent_def_upsert(record))
+        return record
+
+    async def save_agent_def_if_absent(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """Atomically create an agent def unless its idempotency key already exists.
+
+        Mirrors :meth:`save_run_if_absent_by_idempotency`: the write lock +
+        ``agent_defs_idempotency_idx`` partial UNIQUE index make the existence-check
+        and the insert atomic across processes sharing the file.
+        """
+        record.updated_at = utc_now_iso()
+        return await asyncio.to_thread(self._save_agent_def_if_absent_sync, record)
+
+    def _save_agent_def_if_absent_sync(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """The locked read-then-insert for the idempotent agent-def create."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if record.idempotency_key is not None:
+                    existing = self._conn.execute(
+                        "SELECT payload FROM agent_defs WHERE workspace_id = ? AND "
+                        "idempotency_key = ?",
+                        (record.workspace_id, record.idempotency_key),
+                    ).fetchone()
+                    if existing is not None:
+                        self._conn.commit()
+                        return _row_to_agent_def(existing), False
+                sql, params = self._agent_def_upsert(record)
+                self._conn.execute(sql, params)
+                self._conn.commit()
+                return record, True
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    @staticmethod
+    def _agent_def_upsert(record: AgentDefRecord) -> tuple[str, tuple[Any, ...]]:
+        """The upsert-by-agent_id statement + params for a stored agent definition."""
+        sql = (
+            "INSERT INTO agent_defs (agent_id, workspace_id, name, idempotency_key, "
+            "payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (agent_id) DO UPDATE SET "
+            "workspace_id = excluded.workspace_id, name = excluded.name, "
+            "idempotency_key = excluded.idempotency_key, payload = excluded.payload, "
+            "updated_at = excluded.updated_at"
+        )
+        params = (
+            record.agent_id,
+            record.workspace_id,
+            record.name,
+            record.idempotency_key,
+            json.dumps(record.model_dump(mode="json")),
+            record.created_at,
+            record.updated_at,
+        )
+        return sql, params
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return a stored agent def by id, tenant-scoped (out-of-workspace → None)."""
+        row = await asyncio.to_thread(
+            self._fetchone,
+            "SELECT payload FROM agent_defs WHERE agent_id = ?",
+            (agent_id,),
+        )
+        if not row:
+            return None
+        rec = _row_to_agent_def(row)
+        if workspace_id is not None and rec.workspace_id != workspace_id:
+            return None
+        return rec
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List stored agent defs for a workspace (created_at asc)."""
+        if workspace_id is None:
+            sql = "SELECT payload FROM agent_defs ORDER BY created_at ASC"
+            params: tuple[Any, ...] = ()
+        else:
+            sql = (
+                "SELECT payload FROM agent_defs WHERE workspace_id = ? "
+                "ORDER BY created_at ASC"
+            )
+            params = (workspace_id,)
+        rows = await asyncio.to_thread(self._fetchall, sql, params)
+        return [_row_to_agent_def(r) for r in rows]
+
+    async def delete_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> bool:
+        """Delete a stored agent def, tenant-scoped. Returns True iff a row was removed."""
+        return await asyncio.to_thread(
+            self._delete_agent_def_sync, agent_id, workspace_id
+        )
+
+    def _delete_agent_def_sync(
+        self, agent_id: str, workspace_id: str | None
+    ) -> bool:
+        """Locked tenant-scoped delete; returns whether a row was actually removed."""
+        with self._lock:
+            try:
+                if workspace_id is None:
+                    cur = self._conn.execute(
+                        "DELETE FROM agent_defs WHERE agent_id = ?", (agent_id,)
+                    )
+                else:
+                    cur = self._conn.execute(
+                        "DELETE FROM agent_defs WHERE agent_id = ? AND workspace_id = ?",
+                        (agent_id, workspace_id),
+                    )
+                self._conn.commit()
+                return cur.rowcount > 0
+            except BaseException:
+                self._rollback_quietly()
+                raise
 
     # ---------------------------------------------------------- recommendations
     async def save_recommendation(self, item: RecommendationItem) -> RecommendationItem:
@@ -885,48 +1132,67 @@ class SqliteStorageService:
 
     # --------------------------------------------------------------- evaluation
     async def save_evaluation_run(self, run: EvaluationRun) -> EvaluationRun:
-        """Upsert an evaluation run keyed by ``run_id``."""
+        """Upsert an evaluation run keyed by ``run_id`` (stamping its workspace)."""
         await asyncio.to_thread(
             self._write,
-            "INSERT INTO evaluation_runs (run_id, suite_id, payload, created_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET "
-            "suite_id = excluded.suite_id, payload = excluded.payload",
+            "INSERT INTO evaluation_runs "
+            "(run_id, suite_id, workspace_id, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET "
+            "suite_id = excluded.suite_id, "
+            "workspace_id = excluded.workspace_id, payload = excluded.payload",
             (
                 run.run_id,
                 getattr(run, "suite_id", None),
+                getattr(run, "workspace_id", None),
                 self._dump(run),
                 str(getattr(run, "created_at", None) or utc_now_iso()),
             ),
         )
         return run
 
-    async def get_evaluation_run(self, run_id: str) -> EvaluationRun | None:
-        """Return an evaluation run by id, or None."""
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> EvaluationRun | None:
+        """Return an evaluation run by id, tenant-scoped (AAEO-4).
+
+        When ``workspace_id`` is supplied, a run belonging to another workspace is
+        treated as not found (returns None) — closing the cross-tenant IDOR.
+        """
         from himmy.services.evaluation.models import EvaluationRun
 
-        row = await asyncio.to_thread(
-            self._fetchone,
-            "SELECT payload FROM evaluation_runs WHERE run_id = ?",
-            (run_id,),
-        )
+        if workspace_id is None:
+            sql = "SELECT payload FROM evaluation_runs WHERE run_id = ?"
+            params: tuple[Any, ...] = (run_id,)
+        else:
+            sql = (
+                "SELECT payload FROM evaluation_runs "
+                "WHERE run_id = ? AND workspace_id = ?"
+            )
+            params = (run_id, workspace_id)
+        row = await asyncio.to_thread(self._fetchone, sql, params)
         return EvaluationRun.model_validate(json.loads(row["payload"])) if row else None
 
     async def list_evaluation_runs(
-        self, suite_id: str | None = None
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
     ) -> list[EvaluationRun]:
-        """List evaluation runs, optionally filtered by suite id."""
+        """List evaluation runs, optionally filtered by suite id and workspace (AAEO-4)."""
         from himmy.services.evaluation.models import EvaluationRun
 
-        if suite_id is None:
-            sql = "SELECT payload FROM evaluation_runs ORDER BY created_at ASC"
-            params: tuple[Any, ...] = ()
-        else:
-            sql = (
-                "SELECT payload FROM evaluation_runs WHERE suite_id = ? "
-                "ORDER BY created_at ASC"
-            )
-            params = (suite_id,)
-        rows = await asyncio.to_thread(self._fetchall, sql, params)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if suite_id is not None:
+            clauses.append("suite_id = ?")
+            params.append(suite_id)
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            params.append(workspace_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = await asyncio.to_thread(
+            self._fetchall,
+            # clauses are constant column literals; values are bound params.
+            f"SELECT payload FROM evaluation_runs{where} ORDER BY created_at ASC",  # noqa: S608
+            tuple(params),
+        )
         return [EvaluationRun.model_validate(json.loads(r["payload"])) for r in rows]
 
     # --------------------------------------------- memory + orchestration records
@@ -1144,6 +1410,11 @@ class SqliteStorageService:
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
     """Reconstruct a :class:`RunRecord` from a row's JSON ``payload``."""
     return RunRecord.model_validate(json.loads(row["payload"]))
+
+
+def _row_to_agent_def(row: sqlite3.Row) -> AgentDefRecord:
+    """Reconstruct an :class:`AgentDefRecord` from a row's JSON ``payload``."""
+    return AgentDefRecord.model_validate(json.loads(row["payload"]))
 
 
 def _row_to_recommendation(row: sqlite3.Row) -> RecommendationItem:

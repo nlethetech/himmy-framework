@@ -180,39 +180,67 @@ def test_save_preserves_project_assignment(store: None) -> None:
     assert s.project_chats(project.id)[0].id == saved.id
 
 
-def test_migration_is_idempotent_on_old_store(
+def test_legacy_chats_db_is_imported_into_conversations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Opening a pre-projects DB adds project_id once; old rows are untouched."""
-    db = tmp_path / "old-chats.db"
-    conn = sqlite3.connect(str(db))
+    """A pre-T2.3 ``chats.db`` is folded once into the unified ``conversations.db``.
+
+    Replaces the old in-place ``chat_sessions`` ALTER migration: as of T2.3 the legacy
+    flat Studio DB is a *separate* file imported (best-effort, idempotent) into the unified
+    store on first open. The imported chat is then listable, keeps its title, and fully
+    supports projects (the ``chat_sessions`` compat view always carries ``project_id``).
+    """
+    from himmy.services.storage.conversations import (
+        ConversationStore,
+        reset_conversation_store,
+    )
+
+    legacy = tmp_path / "chats.db"
+    conn = sqlite3.connect(str(legacy))
     conn.executescript(_OLD_SCHEMA)
     conn.execute(
         "INSERT INTO chat_sessions VALUES ('s1', 'Old chat', NULL, NULL, "
         "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
     )
+    conn.execute(
+        "INSERT INTO chat_messages VALUES ('m1', 's1', 'user', 'remember me', 0, "
+        "'2026-01-01T00:00:00+00:00')"
+    )
     conn.commit()
     conn.close()
 
-    monkeypatch.setenv("HIMMY_CHATS_PATH", str(db))
+    # Point the unified store at a sibling of the legacy chats.db so the one-time import
+    # picks it up. The Studio facade resolves through this same singleton when no
+    # HIMMY_CHATS_PATH override is set.
+    monkeypatch.delenv("HIMMY_CHATS_PATH", raising=False)
+    monkeypatch.setenv(
+        "HIMMY_CONVERSATIONS_PATH", str(tmp_path / "conversations.db")
+    )
+    reset_conversation_store()
     sc.reset_chats_store()
     try:
-        for _ in range(2):  # open twice — the ALTER must not re-run
-            store = sc.ChatsStore(str(db))
-            cols = [
-                r[1]
-                for r in store._conn.execute(
-                    "PRAGMA table_info(chat_sessions)"
-                ).fetchall()
-            ]
-            assert cols.count("project_id") == 1
-            store.close()
+        # The compat view always carries project_id, regardless of the legacy shape.
+        store = ConversationStore(str(tmp_path / "conversations.db"))
+        store.import_legacy(chats_db=str(legacy))
+        cols = [
+            r[1]
+            for r in store._conn.execute(
+                "PRAGMA table_info(chat_sessions)"
+            ).fetchall()
+        ]
+        assert cols.count("project_id") == 1
+        # idempotent: a second import does not duplicate the row
+        store.import_legacy(chats_db=str(legacy))
+        store.close()
 
-        s = sc.get_chats_store()
+        s = sc.get_chats_store()  # opens the singleton, runs the one-time import
         sessions = s.list()
         assert [x.id for x in sessions] == ["s1"]
         assert sessions[0].title == "Old chat"
         assert sessions[0].project_id is None
+        detail = s.get("s1")
+        assert detail is not None
+        assert detail.messages[0].text == "remember me"
         # and the upgraded store fully supports projects
         p = s.create_project(name="After upgrade")
         assert s.assign_chat(p.id, "s1") is True

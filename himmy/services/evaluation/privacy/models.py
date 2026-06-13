@@ -37,8 +37,11 @@ from himmy.core.ids import new_uuid, utc_now_iso
 # because :class:`RecordedDataContext` is a pydantic model whose fields reference them,
 # so the annotations must resolve when the model is built. None of these modules import
 # the privacy package, so there is no import cycle (the field types are leaf data/model
-# classes). ``EntityRegistry`` is a plain class, allowed via ``arbitrary_types_allowed``.
-from himmy.entities.registry import EntityRegistry
+# classes). ``EntityRegistryProtocol`` is a ``runtime_checkable`` Protocol, allowed via
+# ``arbitrary_types_allowed`` — and crucially it accepts ANY registry backend (in-memory
+# OR the durable :class:`SqliteEntityRegistry`) structurally, instead of the old nominal
+# ``EntityRegistry`` check that rejected a durable spine at validation time.
+from himmy.entities.protocol import EntityRegistryProtocol
 from himmy.services.audit.models import SecurityEvent
 from himmy.services.governance.retention import RetentionService, SubjectKeyVault
 from himmy.services.storage.models import (
@@ -190,7 +193,7 @@ class RecordedDataContext(BaseModel):
     memory: list[MemoryObject] = Field(default_factory=list)
     episodic: list[EpisodicMemoryObject] = Field(default_factory=list)
     security_events: list[SecurityEvent] = Field(default_factory=list)
-    entity_registry: EntityRegistry | None = None
+    entity_registry: EntityRegistryProtocol | None = None
     consent_service: Any = None
     retention_service: RetentionService | None = None
     key_vault: SubjectKeyVault | None = None

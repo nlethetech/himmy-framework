@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from himmy.core.events import RunEvent
 from himmy.services.storage.models import (
     ActionRecord,
+    AgentDefRecord,
     AgentStateRecord,
     EnvironmentStateRecord,
     EpisodicMemoryObject,
@@ -106,6 +107,10 @@ class RunStore(Protocol):
         self, run: RunRecord
     ) -> tuple[RunRecord, bool]: ...
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool: ...
+
     async def get_run(self, run_id: str) -> RunRecord | None: ...
 
     async def list_runs(
@@ -118,6 +123,35 @@ class RunStore(Protocol):
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str
     ) -> RunRecord | None: ...
+
+
+@runtime_checkable
+class AgentDefStore(Protocol):
+    """Persistence for workspace-scoped stored agent definitions (T2e).
+
+    The durable ``/v1/agents`` resource: reusable :class:`AgentDefRecord` rows keyed
+    by ``agent_id`` and always read tenant-scoped on ``workspace_id`` so one tenant's
+    stored agent is invisible (404) to another. ``save_agent_def_if_absent`` is the
+    non-run idempotent-create analog of ``save_run_if_absent_by_idempotency``.
+    """
+
+    async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord: ...
+
+    async def save_agent_def_if_absent(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]: ...
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None: ...
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]: ...
+
+    async def delete_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> bool: ...
 
 
 @runtime_checkable
@@ -156,10 +190,12 @@ class EvaluationStore(Protocol):
 
     async def save_evaluation_run(self, run: EvaluationRun) -> EvaluationRun: ...
 
-    async def get_evaluation_run(self, run_id: str) -> EvaluationRun | None: ...
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> EvaluationRun | None: ...
 
     async def list_evaluation_runs(
-        self, suite_id: str | None = None
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
     ) -> list[EvaluationRun]: ...
 
 
@@ -221,6 +257,7 @@ class OrchestrationStore(Protocol):
 
 
 __all__ = [
+    "AgentDefStore",
     "ContextStore",
     "EvaluationStore",
     "EventLog",

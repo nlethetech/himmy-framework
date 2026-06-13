@@ -82,3 +82,36 @@ export const exportAuditBundle = () =>
 
 export const verifyAuditBundle = (payload: unknown) =>
   api.post<VerifyResult>("/privacy/audit/verify", payload);
+
+// ---- Security log (seclog) viewer (/api/studio/seclog) -------------------
+//
+// Read-only mirror of `himmy seclog`: recent security events (auth/authz
+// decisions, denied tools, approvals, policy blocks) off the SAME durable
+// .himmy/spine.db the CLI reads — so the rows match the CLI exactly.
+
+export interface SeclogEvent {
+  event_id: string;
+  event_type: string;
+  outcome: string; // allow | deny
+  created_at: string;
+  actor: string; // the principal subject, "-" when unknown
+  resource: string | null;
+  action: string | null;
+  method: string | null;
+  path: string | null;
+  detail: string;
+}
+
+export interface SeclogResponse {
+  items: SeclogEvent[];
+  total: number;
+  types: string[]; // distinct event_types in the window (filter options)
+}
+
+export const getSeclog = (opts?: { limit?: number; type?: string }) => {
+  const params = new URLSearchParams();
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  if (opts?.type) params.set("type", opts.type);
+  const qs = params.toString();
+  return api.get<SeclogResponse>(`/seclog${qs ? `?${qs}` : ""}`);
+};

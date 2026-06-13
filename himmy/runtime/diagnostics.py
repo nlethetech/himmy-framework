@@ -72,6 +72,45 @@ class NextStep:
 
 
 @dataclass
+class StorageHealth:
+    """The durable storage backend in use (secrets redacted)."""
+
+    backend: str  # "postgresql" | "sqlite"
+    dsn: str | None = None  # redacted (password masked) when Postgres, else None
+    code_max_migration: int | None = None  # max migration version in the shipped code
+
+
+@dataclass
+class DbFileHealth:
+    """Presence + size of one canonical ``.himmy/*.db`` store (no contents read)."""
+
+    name: str  # logical name: spine | conversations | run_store | v1_approvals
+    path: str
+    present: bool
+    size_bytes: int | None = None
+
+
+@dataclass
+class DiagnosticsReport:
+    """Global infra/health snapshot for ``GET /v1/diagnostics`` (NOT per-tenant).
+
+    A read-only, secrets-redacted view of what the *server* can do and where its durable
+    state lives — providers/keys/extras/embedders (shared with ``himmy doctor``), the
+    storage backend, the canonical ``.himmy`` SQLite stores, and whether the routine
+    scheduler loop is active. Per-tenant doctor is not meaningful, so this is global.
+    """
+
+    doctor: DoctorReport
+    storage: StorageHealth
+    db_files: list[DbFileHealth] = field(default_factory=list)
+    scheduler_active: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-friendly dict (nested dataclasses flattened)."""
+        return asdict(self)
+
+
+@dataclass
 class DoctorReport:
     python: str
     version: str
@@ -222,6 +261,110 @@ def collect_doctor_report() -> DoctorReport:
     )
 
 
+def _redact_dsn(dsn: str) -> str:
+    """Return ``dsn`` with any password component replaced by ``***`` (never echo a secret).
+
+    Mirrors ``himmy doctor``'s redaction: rebuilds the netloc with the password masked;
+    any parse failure collapses to a fully-masked placeholder rather than risk a leak.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(dsn)
+        if parts.password is None:
+            return dsn
+        userinfo = parts.username or ""
+        if userinfo:
+            userinfo = f"{userinfo}:***"
+        host = parts.hostname or ""
+        if ":" in host:  # re-bracket an IPv6 host that urlsplit stripped
+            host = f"[{host}]"
+        if parts.port is not None:
+            host = f"{host}:{parts.port}"
+        netloc = f"{userinfo}@{host}" if userinfo else host
+        return urlunsplit(
+            (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+        )
+    except Exception:  # noqa: BLE001 - never risk echoing the raw DSN
+        return "<redacted>"
+
+
+def _collect_storage_health() -> StorageHealth:
+    """Resolve the durable storage backend in use (Postgres DSN redacted)."""
+    from himmy.config.secrets import get_secret
+    from himmy.services.storage.factory import _is_postgres_dsn  # noqa: PLC2701
+
+    dsn = get_secret("HIMMY_DATABASE_URL")
+    if _is_postgres_dsn(dsn):
+        from himmy.services.storage.postgres import STORAGE_MIGRATIONS
+
+        code_max = max(version for version, _, _ in STORAGE_MIGRATIONS)
+        return StorageHealth(
+            backend="postgresql",
+            dsn=_redact_dsn(dsn or ""),
+            code_max_migration=code_max,
+        )
+    from himmy.services.storage.sqlite import SQLITE_SCHEMA_VERSION
+
+    return StorageHealth(
+        backend="sqlite", dsn=None, code_max_migration=SQLITE_SCHEMA_VERSION
+    )
+
+
+def _db_file_health(name: str, path: str) -> DbFileHealth:
+    """Presence + size of one canonical SQLite store (never opens or reads contents)."""
+    p = Path(path)
+    try:
+        present = p.is_file()
+        size = p.stat().st_size if present else None
+    except OSError:
+        present, size = False, None
+    return DbFileHealth(name=name, path=path, present=present, size_bytes=size)
+
+
+def _collect_db_files() -> list[DbFileHealth]:
+    """The canonical ``.himmy`` SQLite stores (spine, conversations, run store, approvals).
+
+    Path resolution reuses the single decision points in :mod:`himmy.config.project` and
+    :mod:`himmy.services.storage.factory`, so the report points at the same files the CLI,
+    Studio, and /v1 actually use. Presence/size only — no contents are read.
+    """
+    import os
+
+    from himmy.config.project import (
+        conversations_db_path,
+        spine_db_path,
+        v1_approvals_db_path,
+    )
+    from himmy.services.storage.factory import HIMMY_STORE_PATH
+
+    files = [
+        _db_file_health("spine", spine_db_path()),
+        _db_file_health("conversations", conversations_db_path()),
+        _db_file_health("v1_approvals", v1_approvals_db_path()),
+    ]
+    # The canonical run store (SQLite) — only meaningful when not on Postgres; report the
+    # resolved file path either way so an operator sees where runs would land.
+    store_path = os.environ.get("HIMMY_STORE_PATH") or HIMMY_STORE_PATH
+    files.append(_db_file_health("run_store", store_path))
+    return files
+
+
+def collect_diagnostics_report(*, scheduler_active: bool = False) -> DiagnosticsReport:
+    """Probe the global server health: providers/keys, storage backend, and durable stores.
+
+    ``scheduler_active`` is passed in by the caller (the API reads the live
+    :class:`~himmy.api.routines.RoutineScheduler` off ``app.state``) so this module stays
+    free of an API dependency. Secrets are never included — only presence + redacted DSNs.
+    """
+    return DiagnosticsReport(
+        doctor=collect_doctor_report(),
+        storage=_collect_storage_health(),
+        db_files=_collect_db_files(),
+        scheduler_active=scheduler_active,
+    )
+
+
 __all__ = [
     "DoctorReport",
     "ExtraStatus",
@@ -229,5 +372,9 @@ __all__ = [
     "KeyStatus",
     "EmbedderStatus",
     "NextStep",
+    "StorageHealth",
+    "DbFileHealth",
+    "DiagnosticsReport",
     "collect_doctor_report",
+    "collect_diagnostics_report",
 ]

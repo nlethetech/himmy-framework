@@ -80,6 +80,32 @@ RouterFn = Callable[[GraphState], Any]  # returns a node name or sequence of nam
 Reducer = Callable[[Any, Any], Any]
 
 
+class MemberResumeOutcome(BaseModel):
+    """The result of resuming a paused graph member after a human approve/reject.
+
+    ``delta`` is the state delta the resumed member produced (spliced into shared
+    state exactly as the original node return would have been). When the SAME member
+    pauses AGAIN on a second approval-gated tool, ``paused_again`` is True and
+    ``member_checkpoint_id`` carries the new member checkpoint to re-stamp — the graph
+    re-persists the interrupt at the same node rather than advancing.
+    """
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    delta: GraphState = {}
+    paused_again: bool = False
+    member_checkpoint_id: str = ""
+
+
+#: The orchestration-supplied resume callback. Given the paused node, the member
+#: checkpoint id it suspended on, and the current shared state, it drives the member's
+#: ``resume_agent_loop`` (approve/reject) exactly-once and returns the outcome. The graph
+#: itself is member-agnostic, so this is how the durable-resume splice runs a real agent.
+ResumeMemberFn = Callable[
+    [str, str, GraphState], "Awaitable[MemberResumeOutcome] | MemberResumeOutcome"
+]
+
+
 class GraphError(HimmyError):
     """A static error in a graph definition or invocation."""
 
@@ -90,6 +116,29 @@ class GraphRecursionError(GraphError):
 
 class GraphStateSizeError(GraphError):
     """The merged shared state exceeded ``max_state_bytes`` (an OOM guard tripped)."""
+
+
+class NodeInterrupt(GraphError):
+    """A node paused on an approval-gated tool (HITL), not a failure.
+
+    Raised by a node body when the member it runs suspends to ``awaiting_approval``
+    on a ``requires_approval`` tool. It carries the paused node name and the durable
+    :class:`~himmy.runtime.checkpoint.AgentCheckpoint` id the member suspended on so
+    the run loop can convert it into a durable graph interrupt (state preserved, node
+    left in the frontier) that an orchestration-level approve/reject resumes.
+
+    Critically it must ESCAPE :meth:`CompiledStateGraph._run_node` unchanged — it is
+    re-raised one frame early there (mirroring the ``CancelledError`` re-raise) so the
+    generic ``except Exception`` cannot re-wrap a pause as a node FAILURE.
+    """
+
+    def __init__(self, node: str, member_checkpoint_id: str) -> None:
+        self.node = node
+        self.member_checkpoint_id = member_checkpoint_id
+        super().__init__(
+            f"node {node!r} paused for approval "
+            f"(member checkpoint {member_checkpoint_id!r})"
+        )
 
 
 def add_reducer(existing: Any, incoming: Any) -> Any:
@@ -313,6 +362,7 @@ class CompiledStateGraph:
         timeout_seconds: float | None = None,
         thread_id: str | None = None,
         max_state_bytes: int | None = None,
+        resume_member: ResumeMemberFn | None = None,
     ) -> GraphRunResult:
         """Run the graph to completion (or until a guard/timeout interrupts it).
 
@@ -324,6 +374,13 @@ class CompiledStateGraph:
         ``max_state_bytes`` (default ``None`` = use the compile-time setting,
         itself default unlimited) bounds the merged shared state per run; when
         exceeded the run fails with :class:`GraphStateSizeError`.
+
+        ``resume_member`` (HITL) is the orchestration-supplied callback that drives a
+        paused member's ``resume_agent_loop`` (approve/reject). It is used ONLY when
+        ``resume`` points at a HITL-interrupted checkpoint (``member_checkpoint_id``
+        set); the resumed member's delta is spliced, the paused node completed once,
+        and the loop re-entered. A bare timeout-interrupted checkpoint (member fields
+        empty) ignores this callback and takes the ordinary durable resume.
         """
         if max_state_bytes is not None and max_state_bytes < 1:
             raise GraphError("max_state_bytes must be >= 1")
@@ -346,6 +403,16 @@ class CompiledStateGraph:
             chk = chk.model_copy(update={"checkpoint_id": checkpoint_id})
 
         tid = thread_id or f"graph:{chk.checkpoint_id}"
+
+        # HITL resume splice: a checkpoint that paused on an approval-gated tool carries
+        # a member reference. Drive the member's approve/reject via ``resume_member``,
+        # splice its delta, complete the paused node once, and fall through to the normal
+        # loop. A checkpoint WITHOUT a member reference (a bare timeout interrupt) skips
+        # this and resumes ordinarily, so a pre-existing interrupted row never errors.
+        if resume is not None and chk.member_checkpoint_id and resume_member is not None:
+            interrupted = await self._splice_member_resume(chk, tid, resume_member)
+            if interrupted is not None:
+                return interrupted
 
         if chk.superstep == 0:
             await self._emit(
@@ -412,6 +479,118 @@ class CompiledStateGraph:
         chk.status = GRAPH_RUNNING
         return chk
 
+    async def _splice_member_resume(
+        self,
+        chk: GraphCheckpoint,
+        tid: str,
+        resume_member: ResumeMemberFn,
+    ) -> GraphRunResult | None:
+        """Splice an approved/rejected member resume back into the paused graph node.
+
+        Crash-safe and idempotent: ``resume_member`` drives the member's
+        ``resume_agent_loop`` whose own store-level ``claim()`` + idempotency ledger
+        guarantee the gated tool runs EXACTLY ONCE even across a crash-retry (a member
+        already resolved replays its recorded output). On a normal resume the member's
+        delta is spliced, the paused node is completed ONCE (visit count + superstep each
+        +1), the member fields are cleared, and the next frontier is routed — then the
+        caller falls through to :meth:`_run_loop`. The paused node BODY never re-runs.
+
+        Returns a terminal/interrupted :class:`GraphRunResult` only when the SAME member
+        pauses AGAIN on a second gated tool (re-stamping the interrupt at this node);
+        otherwise returns ``None`` so the loop continues to the next node.
+        """
+        node = chk.paused_node
+        member_cp = chk.member_checkpoint_id
+        if node not in self._nodes:  # pragma: no cover - tampered checkpoint
+            raise GraphError(
+                f"interrupted checkpoint names unknown paused node {node!r}"
+            )
+
+        raw = resume_member(node, member_cp, dict(chk.state))
+        outcome = await raw if inspect.isawaitable(raw) else raw
+
+        if outcome.paused_again:
+            # The member called a second approval-gated tool; re-stamp the interrupt at
+            # the SAME node with the NEW member checkpoint and stay paused (no advance).
+            chk.status = GRAPH_INTERRUPTED
+            chk.member_checkpoint_id = outcome.member_checkpoint_id or member_cp
+            chk.updated_at = utc_now_iso()
+            self._checkpoint_store.save(chk)
+            await self._emit(
+                RunEvent(
+                    event_type=EventType.APPROVAL_REQUIRED,
+                    thread_id=tid,
+                    payload={
+                        "graph_name": self.name,
+                        "checkpoint_id": chk.checkpoint_id,
+                        "member_checkpoint_id": chk.member_checkpoint_id,
+                        "node": node,
+                        "superstep": chk.superstep,
+                    },
+                )
+            )
+            await self._emit_finished(tid, chk)
+            return GraphRunResult(
+                graph_name=self.name,
+                status=GRAPH_INTERRUPTED,
+                final_state=dict(chk.state),
+                supersteps=chk.superstep,
+                node_sequence=list(chk.completed_nodes),
+                checkpoint_id=chk.checkpoint_id,
+            )
+
+        # Splice the resumed member's delta (its final text + per-node outputs) into
+        # shared state, then advance the paused node EXACTLY ONCE.
+        self._merge(chk.state, dict(outcome.delta or {}))
+        await self._emit(
+            RunEvent(
+                event_type=EventType.GRAPH_NODE_COMPLETED,
+                thread_id=tid,
+                payload={
+                    "graph_name": self.name,
+                    "node": node,
+                    "status": "completed",
+                    "resumed": True,
+                },
+            )
+        )
+        next_targets: list[str] = []
+        for target in self._route(node, dict(chk.state)):
+            await self._emit(
+                RunEvent(
+                    event_type=EventType.GRAPH_EDGE_TAKEN,
+                    thread_id=tid,
+                    payload={"graph_name": self.name, "from": node, "to": target},
+                )
+            )
+            if target != END:
+                next_targets.append(target)
+
+        chk.completed_nodes.append(node)
+        chk.visit_counts[node] = chk.visit_counts.get(node, 0) + 1
+        chk.frontier = next_targets
+        chk.superstep += 1
+        # Clear the member reference so a later (timeout) interrupt is never mistaken
+        # for an approval and a crash-retry of THIS splice falls through to the loop.
+        chk.paused_node = ""
+        chk.member_checkpoint_id = ""
+        chk.status = GRAPH_RUNNING
+        chk.updated_at = utc_now_iso()
+        self._checkpoint_store.save(chk)
+        await self._emit(
+            RunEvent(
+                event_type=EventType.GRAPH_CHECKPOINTED,
+                thread_id=tid,
+                payload={
+                    "graph_name": self.name,
+                    "checkpoint_id": chk.checkpoint_id,
+                    "superstep": chk.superstep,
+                    "frontier": chk.frontier,
+                },
+            )
+        )
+        return None
+
     async def _run_loop(
         self, chk: GraphCheckpoint, tid: str, max_state_bytes: int | None = None
     ) -> GraphRunResult:
@@ -431,7 +610,43 @@ class CompiledStateGraph:
             # De-duplicate the frontier preserving order (a join target reached by
             # two predecessors runs once per superstep).
             frontier = list(dict.fromkeys(chk.frontier))
-            deltas, next_targets = await self._run_superstep(frontier, chk, tid)
+            try:
+                deltas, next_targets = await self._run_superstep(frontier, chk, tid)
+            except NodeInterrupt as interrupt:
+                # A member paused on an approval-gated tool. Persist a DURABLE HITL
+                # interrupt: the paused node stays in the frontier (NOT completed, NOT
+                # visit-bumped, NO superstep advance) so an approve re-enters exactly it,
+                # and the member-checkpoint reference makes this distinguishable from a
+                # timeout interrupt (whose fields stay empty). Persist BEFORE the finished
+                # event so a crash after the event still finds the durable pause.
+                chk.status = GRAPH_INTERRUPTED
+                chk.paused_node = interrupt.node
+                chk.member_checkpoint_id = interrupt.member_checkpoint_id
+                chk.error = None
+                chk.updated_at = utc_now_iso()
+                self._checkpoint_store.save(chk)
+                await self._emit(
+                    RunEvent(
+                        event_type=EventType.APPROVAL_REQUIRED,
+                        thread_id=tid,
+                        payload={
+                            "graph_name": self.name,
+                            "checkpoint_id": chk.checkpoint_id,
+                            "member_checkpoint_id": interrupt.member_checkpoint_id,
+                            "node": interrupt.node,
+                            "superstep": chk.superstep,
+                        },
+                    )
+                )
+                await self._emit_finished(tid, chk)
+                return GraphRunResult(
+                    graph_name=self.name,
+                    status=GRAPH_INTERRUPTED,
+                    final_state=dict(chk.state),
+                    supersteps=chk.superstep,
+                    node_sequence=list(chk.completed_nodes),
+                    checkpoint_id=chk.checkpoint_id,
+                )
 
             # Merge every node's delta into shared state (reducers applied).
             for delta in deltas:
@@ -509,6 +724,21 @@ class CompiledStateGraph:
                     for name in frontier
                 ]
         except BaseExceptionGroup as eg:
+            # A HITL pause inside the group surfaces as a NodeInterrupt leaf. The single
+            # member checkpoint slot on the graph checkpoint can represent exactly ONE
+            # paused member, so two nodes pausing in one (parallel) superstep is rejected
+            # with a clear error rather than persisting an ambiguous reference. (The v1
+            # linear workflow runs one node per superstep, so this only guards a future
+            # fan-out gating at two members at once.)
+            interrupts = _collect_interrupts(eg)
+            if len(interrupts) > 1:
+                raise GraphError(
+                    "two or more nodes paused for approval in one superstep "
+                    f"({sorted(i.node for i in interrupts)}); the durable graph "
+                    "checkpoint can hold only one pending member"
+                ) from eg
+            if interrupts:
+                raise interrupts[0] from eg
             # The TaskGroup has already cancelled AND awaited every sibling task
             # (a bare gather would orphan them); surface the first real failure
             # as a plain exception so callers keep seeing GraphError, not a group.
@@ -565,6 +795,14 @@ class CompiledStateGraph:
             if inspect.isawaitable(raw):
                 raw = await raw
         except asyncio.CancelledError:
+            raise
+        except NodeInterrupt:
+            # A HITL pause is NOT a node failure — it must escape the node runner
+            # unchanged so the run loop can convert it into a durable graph interrupt.
+            # Without this re-raise (one frame before the generic except below) the
+            # pause would be re-wrapped as a node-raised GraphError and the run would
+            # go FAILED instead of pausing to awaiting_approval. Mirrors the
+            # CancelledError re-raise directly above.
             raise
         except Exception as exc:  # node failure is a graph error, surfaced cleanly
             await self._emit(
@@ -707,6 +945,24 @@ def _first_failure(eg: BaseExceptionGroup[BaseException]) -> BaseException:
     return eg  # pragma: no cover - a TaskGroup group is never empty
 
 
+def _collect_interrupts(
+    eg: BaseExceptionGroup[BaseException],
+) -> list[NodeInterrupt]:
+    """Every :class:`NodeInterrupt` leaf in a (possibly nested) exception group.
+
+    A HITL pause inside a parallel superstep arrives as a NodeInterrupt leaf; the run
+    loop uses the COUNT to reject an ambiguous two-member pause and the single one to
+    drive the durable interrupt.
+    """
+    found: list[NodeInterrupt] = []
+    for exc in eg.exceptions:
+        if isinstance(exc, BaseExceptionGroup):
+            found.extend(_collect_interrupts(exc))
+        elif isinstance(exc, NodeInterrupt):
+            found.append(exc)
+    return found
+
+
 def _state_size_bytes(state: GraphState) -> int:
     """Best-effort serialized size of the shared state, for the OOM guard.
 
@@ -738,6 +994,9 @@ __all__ = [
     "GraphError",
     "GraphRecursionError",
     "GraphStateSizeError",
+    "NodeInterrupt",
+    "MemberResumeOutcome",
+    "ResumeMemberFn",
     "add_reducer",
     "GraphRunResult",
     "StateGraph",

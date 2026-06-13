@@ -129,7 +129,9 @@ def test_chat_session_persists_across_invocations(
         == 0
     )
     capsys.readouterr()
-    store = SqliteSessionStore(str(tmp_path / ".himmy" / "sessions.db"))
+    from himmy.config.project import conversations_db_path
+
+    store = SqliteSessionStore(conversations_db_path())
     assert store.load("s1") is not None
     store.close()
 

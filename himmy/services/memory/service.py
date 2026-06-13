@@ -38,7 +38,7 @@ from himmy.services.memory.temporal import filter_as_of, is_valid_at
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from himmy.core.events import EventSink
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
 
 
 class _AlwaysInclude:
@@ -90,7 +90,7 @@ class MemoryService:
         *,
         embedder: EmbedderProtocol | None = None,
         min_similarity: float | None = None,
-        registry: EntityRegistry | None = None,
+        registry: EntityRegistryProtocol | None = None,
         event_sink: EventSink | None = None,
     ) -> None:
         """Wire a (durable or in-memory) store and an embedder for recall.
@@ -248,7 +248,10 @@ class MemoryService:
             EventType.MEMORY_RECALLED,
             {
                 "subject_id": subject_id,
-                "query": query,
+                # Privacy: the raw query is a user prompt — record its size, not its
+                # text, so the audit spine never persists PII (P0-C). The returned
+                # count + top similarity remain as the useful, non-sensitive signal.
+                "query_chars": len(query),
                 "returned": len(hits),
                 "top_similarity": hits[0].similarity if hits else 0.0,
             },

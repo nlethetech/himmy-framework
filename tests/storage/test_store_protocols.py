@@ -15,9 +15,11 @@ Postgres internals are later split into per-concern stores.
 from __future__ import annotations
 
 from himmy.services.storage import (
+    AgentDefStore,
     ContextStore,
     EvaluationStore,
     EventLog,
+    InMemoryAgentDefStore,
     InMemoryContextStore,
     InMemoryEvaluationStore,
     InMemoryEventLog,
@@ -41,6 +43,7 @@ _ALL_PROTOCOLS = (
     ThreadEventStore,
     ContextStore,
     RunStore,
+    AgentDefStore,
     RecommendationStore,
     EvaluationStore,
     OrchestrationStore,
@@ -53,6 +56,7 @@ def test_inmemory_stores_satisfy_their_protocols() -> None:
     assert isinstance(InMemoryEventLog(), EventLog)
     assert isinstance(InMemoryContextStore(), ContextStore)
     assert isinstance(InMemoryRunStore(), RunStore)
+    assert isinstance(InMemoryAgentDefStore(), AgentDefStore)
     assert isinstance(InMemoryRecommendationStore(), RecommendationStore)
     assert isinstance(InMemoryEvaluationStore(), EvaluationStore)
     assert isinstance(InMemoryOrchestrationStore(), OrchestrationStore)

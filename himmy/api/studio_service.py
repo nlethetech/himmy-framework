@@ -10,16 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
 from himmy.config.agent_spec import AgentSpec, load_agent_spec
 from himmy.core.ids import new_uuid, utc_now_iso
 from himmy.runtime import from_spec
+
+if TYPE_CHECKING:  # pragma: no cover - typing only (StudioRun is imported lazily)
+    from himmy.api.studio_runs import StudioRun
+
+logger = logging.getLogger("himmy.api.studio_service")
 
 
 def project_root() -> Path:
@@ -722,6 +728,7 @@ async def stream_agent_run(
     agent_path: str | None = None,
     steer_queue: Any | None = None,
     plan_mode: bool = False,
+    canonical_storage: Any | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run an agent for one user turn, yielding GUI events.
 
@@ -746,6 +753,14 @@ async def stream_agent_run(
     system nudge instructing the agent to publish its plan first and keep step
     statuses current; each call surfaces as a ``plan`` frame. Plan mode is a
     no-op for agents without tools (there is no tool loop to call it from).
+
+    ``canonical_storage`` (T2.2) is the ONE authoritative run store the ``/v1`` +
+    CLI surfaces read (``RunAppService`` storage). When supplied, the run is ALSO
+    projected into it as a canonical :class:`RunRecord` (rich UI fields ride in
+    ``metadata['studio']``) so a Studio run is browsable everywhere — ``.himmy/
+    studio.db`` is then just a presentation cache. The canonical write happens on
+    THIS (main) event loop after the worker-thread studio.db write returns; we never
+    nest a loop inside ``to_thread`` (an asyncpg pool is bound to its creating loop).
     """
     history = history or []
     collected_events: list[Any] = []
@@ -913,9 +928,14 @@ async def stream_agent_run(
             await close_mcp_clients(mcp_clients)
 
     duration_ms = (time.monotonic() - started) * 1000.0
-    # Persist the run (best-effort) so it's browsable under Runs.
+    # Persist the run (best-effort) so it's browsable under Runs. The studio.db
+    # presentation-cache write is synchronous, so it runs in a worker thread and hands
+    # the built StudioRun back; the CANONICAL RunRecord write (T2.2) then happens here,
+    # on the main event loop, so a Studio run is readable by /v1 + the CLI from the one
+    # store. Never nest a loop inside the worker — asyncpg pools bind their creating loop.
+    built: StudioRun | None = None
     try:
-        await asyncio.to_thread(
+        built = await asyncio.to_thread(
             _record_run,
             run_id=run_id,
             spec=spec,
@@ -937,6 +957,7 @@ async def stream_agent_run(
         )
     except Exception:  # noqa: BLE001 - persistence must never break the stream
         pass
+    await _record_canonical(canonical_storage, built)
 
     if interrupted:
         # An interrupted (cancelled) consumer must observe the cancellation, not
@@ -982,8 +1003,14 @@ def _record_run(
     duration_ms: float,
     thread_id: str | None,
     checkpoint_id: str | None = None,
-) -> None:
-    """Build a :class:`StudioRun` and persist it (runs in a worker thread)."""
+) -> StudioRun:
+    """Build a :class:`StudioRun`, persist it to the studio.db cache, and return it.
+
+    Runs in a worker thread (the studio.db write is synchronous). The returned
+    :class:`StudioRun` is the rich projection the caller mirrors into the CANONICAL
+    run store on the main loop (T2.2) — so the studio.db row is only a presentation
+    cache, never the authoritative record.
+    """
     from himmy.api.studio_runs import (
         ModelUsage,
         StudioRun,
@@ -1024,6 +1051,27 @@ def _record_run(
         checkpoint_id=checkpoint_id,
     )
     get_run_store().save(run)
+    return run
+
+
+async def _record_canonical(canonical_storage: Any, built: Any | None) -> None:
+    """Mirror a Studio run into the ONE canonical RunRecord store (T2.2, main loop).
+
+    Best-effort and idempotent: a persistence failure must never break the live
+    stream (the GUI already has its answer). Runs on the calling (main) event loop
+    so an async/asyncpg store is driven on the loop it was created on — the studio.db
+    cache write already happened synchronously in the worker thread. No-op when no
+    canonical store is wired (e.g. a unit test calling the streamer directly) or the
+    studio.db write itself failed.
+    """
+    if canonical_storage is None or built is None:
+        return
+    try:
+        from himmy.api.studio_canonical import save_canonical_run, studio_run_to_record
+
+        await save_canonical_run(canonical_storage, studio_run_to_record(built))
+    except Exception:  # noqa: BLE001 - canonical mirror must never break the stream
+        logger.debug("canonical run mirror failed for %s", built.id, exc_info=True)
 
 
 def _build_timeline(
@@ -1142,6 +1190,7 @@ async def stream_team_run(
     *,
     team_name: str = "team",
     team_path: str | None = None,
+    canonical_storage: Any | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run a multi-agent team for one request, streaming the live routing trail.
 
@@ -1231,8 +1280,12 @@ async def stream_team_run(
             await close_mcp_clients(mcp_clients)
 
     duration_ms = (time.monotonic() - started) * 1000.0
+    # A team run is a SECOND writer; route it through the SAME canonical path (T2.2,
+    # reviewer must-fix) — studio.db cache write in the worker, canonical RunRecord
+    # mirror on the main loop — so a Studio team run is browsable from /v1 + the CLI too.
+    built_team: StudioRun | None = None
     try:
-        await asyncio.to_thread(
+        built_team = await asyncio.to_thread(
             _record_team_run,
             run_id=run_id,
             team_name=team_name,
@@ -1249,6 +1302,7 @@ async def stream_team_run(
         )
     except Exception:  # noqa: BLE001 - persistence must never break the stream
         pass
+    await _record_canonical(canonical_storage, built_team)
 
     if status == "error":
         yield {
@@ -1279,8 +1333,13 @@ def _record_team_run(
     status: str,
     error: str | None,
     duration_ms: float,
-) -> None:
-    """Persist a team run (transcript = prompt + final answer; timeline = the trail)."""
+) -> StudioRun:
+    """Persist a team run to the studio.db cache and return the rich projection.
+
+    Transcript = prompt + final answer; timeline = the routing/delegate/tool trail.
+    The returned :class:`StudioRun` is mirrored into the canonical run store on the
+    main loop by the caller (T2.2), so a team run lands in the one store too.
+    """
     from himmy.api.studio_runs import (
         ModelUsage,
         StudioRun,
@@ -1316,6 +1375,7 @@ def _record_team_run(
         usage_by_model=[ModelUsage(**u) for u in usage.get("by_model", [])],
     )
     get_run_store().save(run)
+    return run
 
 
 __all__ = [

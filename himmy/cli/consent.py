@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 from typing import Any
 
 from himmy.services.governance.consent import (
@@ -37,10 +36,18 @@ def _eprint(*args: Any) -> None:
 
 
 def _consent_db() -> str:
-    """Path to the durable consent registry (``.himmy/consent.db``), dir created."""
-    path = Path(".himmy")
-    path.mkdir(exist_ok=True)
-    return str(path / "consent.db")
+    """Path to the durable consent registry (``.himmy/consent.db``), dir created.
+
+    Resolved against the SAME project-root ``.himmy/`` directory the canonical spine uses
+    (:func:`himmy.config.project.himmy_dir`), so the consent ledger and the security spine
+    co-locate under one project state dir. The consent ledger keeps its OWN ``consent.db``
+    file (deliberately isolated from the audit/lineage ``spine.db`` — nothing else reads
+    it), but both now agree on WHERE that directory is regardless of which subdirectory the
+    CLI is invoked from.
+    """
+    from himmy.config.project import himmy_dir
+
+    return str(himmy_dir() / "consent.db")
 
 
 def _policy() -> ConsentPolicy:
@@ -54,19 +61,16 @@ def _policy() -> ConsentPolicy:
 def _build_ledger() -> Any:
     """Construct a durable :class:`ConsentLedger` + erasure service for the CLI.
 
-    Uses the on-disk :class:`SqliteEntityRegistry`, which exposes the same
-    ``new_version``/``get_latest``/``get_history``/``query`` surface the ledger/retention
-    services consume; the cast bridges the concrete-vs-Sqlite registry types at this
-    boundary (himmy has no shared registry Protocol yet).
+    Uses the on-disk :class:`SqliteEntityRegistry`, which satisfies
+    :class:`EntityRegistryProtocol` — the structural surface the ledger/retention services
+    accept (``new_version``/``get_latest``/``get_history``/``query`` …) — so the durable
+    spine drops in with no cast (the registry Protocol that closes the old gap).
     """
-    from typing import cast
-
-    from himmy.entities.registry import EntityRegistry
     from himmy.entities.sqlite_registry import SqliteEntityRegistry
     from himmy.services.governance.consent_ledger import ConsentLedger
     from himmy.services.governance.retention import RetentionService, SubjectKeyVault
 
-    registry = cast(EntityRegistry, SqliteEntityRegistry(_consent_db()))
+    registry = SqliteEntityRegistry(_consent_db())
     retention = RetentionService(registry, key_vault=SubjectKeyVault())
     return ConsentLedger(registry, policy=_policy(), retention_service=retention)
 

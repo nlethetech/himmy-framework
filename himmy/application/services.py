@@ -25,15 +25,18 @@ Production hardening (see IMPROVEMENTS AAEO-1/3/4/6/8/16):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import time
-from collections.abc import Callable, Collection
+from collections.abc import AsyncIterator, Callable, Collection
 from typing import TYPE_CHECKING, Any, cast
 
 from himmy.application.models import RecommendationEnvelope
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import (
+    LOCAL_WORKSPACE,
+    AgentDefRecord,
     RecommendationItem,
     RecommendationStatus,
     RunRecord,
@@ -42,10 +45,12 @@ from himmy.services.storage.models import (
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.agents.base_agent.task import Task
+    from himmy.agents.base_agent.thread import ChatThread
     from himmy.agents.personas.persona import Persona
+    from himmy.config.agent_spec import AgentSpec
     from himmy.core.ids import utc_now_iso  # noqa: F401
     from himmy.entities.lineage import LineageGraph
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.runtime.single_agent import SingleAgentRuntime
     from himmy.services.context.models import ContextField
     from himmy.services.context.service import ContextService
@@ -74,9 +79,76 @@ MAX_PAGE_LIMIT = 1000
 #: transitions to FAILED with a timeout error rather than hanging forever.
 DEFAULT_RUN_TIMEOUT_SECONDS = 300.0
 
+#: Default per-workspace concurrency cap (T0.4): at most this many of one
+#: workspace's background runs execute at once; the rest queue on a per-workspace
+#: semaphore. Keeps one tenant's fan-out (compare/team/routine) from starving the
+#: shared event loop + provider quota for every other tenant.
+DEFAULT_WORKSPACE_CONCURRENCY = 8
+
+#: Default cap on a single workspace's OUTSTANDING (created-but-not-finished)
+#: background runs (T0.4). A burst beyond this is rejected at create time with a
+#: :class:`WorkspaceRunQuotaExceeded` rather than being silently queued forever, so a
+#: runaway fan-out cannot pin unbounded memory/tasks. ``0`` disables the cap.
+DEFAULT_WORKSPACE_MAX_OUTSTANDING = 64
+
 #: Sentinel default for ``LLMConfig.model_key`` (AAEO-16): a config carrying this
 #: value is treated as "caller did not pick a model" so task.context can win.
 _DEFAULT_MODEL_KEY = "default"
+
+
+class WorkspaceRunQuotaExceeded(Exception):
+    """A workspace exceeded its outstanding-run cap (T0.4 — surfaces as HTTP 429).
+
+    Raised by :meth:`RunAppService.create_run` when a workspace already has its
+    maximum number of in-flight (created-but-not-terminal) background runs. Carries
+    the workspace + the cap so the router can return an informative 429.
+    """
+
+    def __init__(self, workspace_id: str, *, cap: int, outstanding: int) -> None:
+        """Record the workspace and the cap it hit for the API error surface."""
+        self.workspace_id = workspace_id
+        self.cap = cap
+        self.outstanding = outstanding
+        super().__init__(
+            f"workspace {workspace_id!r} has {outstanding} outstanding run(s); "
+            f"the per-workspace cap is {cap}. Retry once in-flight runs complete."
+        )
+
+
+class HitlNotSupportedError(Exception):
+    """A ``hitl=True`` run was requested but no checkpoint store is wired (T2f → 400).
+
+    Raised by :meth:`RunAppService.create_run` when the deployment has no HITL inbox to
+    pause into (e.g. a programmatic offline service built without a checkpoint store), so
+    a caller gets a clear error rather than a silently non-pausable "HITL" run.
+    """
+
+
+class HitlRequiresAgentError(Exception):
+    """A ``hitl=True`` run was requested without a stored agent (T2f → 422).
+
+    HITL needs a tool-bearing per-run runtime (the shared inline runtime has no tools to
+    gate), so the run MUST resolve a stored agent (``agent_id``). Raised by
+    :meth:`RunAppService.create_run` when ``hitl=True`` is paired with an inline persona.
+    """
+
+
+class RunNotApprovableError(Exception):
+    """An approve/reject targeted a run that is not AWAITING_APPROVAL (T2f → 409).
+
+    Raised by :meth:`RunAppService.resume_run` when the run is missing, already terminal,
+    or otherwise not paused on a human decision. Carries the run id + observed status so
+    the router can return an informative 409 (and a double-approve of an already-resumed
+    run is a clean no-op-with-409, never a re-execution of the gated tool).
+    """
+
+    def __init__(self, run_id: str, *, status: str) -> None:
+        """Record the run and its observed (non-approvable) status."""
+        self.run_id = run_id
+        self.status = status
+        super().__init__(
+            f"run {run_id!r} is {status}, not AWAITING_APPROVAL; cannot approve/reject."
+        )
 
 
 def _now() -> str:
@@ -84,6 +156,20 @@ def _now() -> str:
     from himmy.core.ids import utc_now_iso
 
     return utc_now_iso()
+
+
+def _is_resume_claim_loss(exc: BaseException) -> bool:
+    """True when ``exc`` is the exactly-once claim loss from a member resume.
+
+    ``resume_agent_loop`` raises ``HimmyError('checkpoint ... already resolved ...')``
+    when the atomic claim is lost (a double/concurrent approve, or a crash-retry the
+    winner already finished). For an ORCHESTRATION resume this propagates up through
+    ``run_orchestration``, so it must be recognized as a clean NO-OP rather than a
+    failure — exactly as the single-agent resume path treats it.
+    """
+    from himmy.core.errors import HimmyError
+
+    return isinstance(exc, HimmyError) and "already resolved" in str(exc)
 
 
 def _paginate(
@@ -224,7 +310,7 @@ class RecommendationAppService:
         self,
         *,
         storage: StorageService,
-        entity_registry: EntityRegistry | None = None,
+        entity_registry: EntityRegistryProtocol | None = None,
     ) -> None:
         """Wire the backing store and (optionally) the lineage registry.
 
@@ -420,6 +506,29 @@ class RecommendationAppService:
         )
         return len(items)
 
+    async def get(
+        self,
+        recommendation_id: str,
+        *,
+        workspace_id: str | None = None,
+    ) -> RecommendationItem | None:
+        """Return one recommendation by id, tenant-scoped (AAEO-4).
+
+        The app-service getter the read surfaces (``himmy recommendations show`` and
+        the /v1 GET-by-id path) need: a recommendation belonging to another workspace
+        is treated as not found (returns None) instead of being read cross-tenant.
+        Until now the service exposed only ``list``/``count``/``update_status`` plus
+        ``get_recommendation_lineage`` — a single-item read had no app-layer entry, so
+        a caller had to reach into ``storage.get_recommendation`` and re-implement the
+        scope check. This closes that gap (reviewer must_fix for T2h).
+        """
+        item = await self._storage.get_recommendation(recommendation_id)
+        if item is None:
+            return None
+        if workspace_id is not None and item.workspace_id != workspace_id:
+            return None
+        return item
+
     async def update_status(
         self,
         recommendation_id: str,
@@ -490,14 +599,54 @@ class RunAppService:
         *,
         runtime: SingleAgentRuntime,
         storage: StorageService,
-        entity_registry: EntityRegistry | None = None,
+        entity_registry: EntityRegistryProtocol | None = None,
         recommendation_app: RecommendationAppService | None = None,
         run_timeout_seconds: float = DEFAULT_RUN_TIMEOUT_SECONDS,
+        workspace_concurrency: int = DEFAULT_WORKSPACE_CONCURRENCY,
+        workspace_max_outstanding: int = DEFAULT_WORKSPACE_MAX_OUTSTANDING,
+        checkpoint_store: Any = None,
+        agent_resolver: Callable[..., Any] | None = None,
+        conversation_sink: Callable[..., Any] | None = None,
+        graph_checkpoint_store_provider: Callable[[], Any] | None = None,
     ) -> None:
         """Wire the runtime, store, optional registry, and recommendation service.
 
         ``run_timeout_seconds`` (AAEO-1) bounds each background run's wall clock;
         a run that exceeds it transitions to FAILED with a timeout error.
+
+        ``workspace_concurrency`` / ``workspace_max_outstanding`` (T0.4) bound the
+        per-workspace fan-out so one tenant cannot exhaust the shared event loop +
+        provider quota: at most ``workspace_concurrency`` of a workspace's runs
+        execute the runtime at once (the rest wait on a per-workspace semaphore), and
+        a workspace may hold at most ``workspace_max_outstanding`` created-but-not-
+        terminal runs before :meth:`create_run` rejects with
+        :class:`WorkspaceRunQuotaExceeded`. Both default to safe values and apply to
+        EVERY background run path (inline persona and per-run-spec alike), so the
+        offline single-workspace default behaves identically while a multi-tenant
+        deployment is protected.
+
+        ``checkpoint_store`` (T2f) is the SURFACE-OWNED durable HITL inbox: when a
+        ``hitl=True`` run hits an approval-gated tool the per-run runtime pauses into a
+        checkpoint here, and :meth:`resume_run` re-claims it on approve/reject. This is
+        /v1's OWN store, distinct from Studio's — the two surfaces rebuild a paused run
+        from different spec sources (Studio from a filesystem ``agent_path``, /v1 from
+        the stored DB ``AgentSpec`` resolved via ``agent_resolver``), so a shared inbox
+        is a deferred item. ``None`` (the default) leaves the offline/inline path
+        byte-unchanged and disables HITL (a ``hitl=True`` create is then rejected).
+
+        ``agent_resolver`` is an async ``(agent_id, workspace_id) -> AgentDefRecord |
+        None`` used to rebuild the per-run tool-bearing runtime FROM THE STORED DB SPEC
+        on resume (``resume_agent_loop`` HARD-requires a ``tool_service``, so /v1 must
+        rebuild from the spec, not a filesystem path it never had).
+
+        ``conversation_sink`` (T2g) is an optional async ``(conversation_id, run) ->
+        None`` invoked whenever a THREAD-LINKED run (one carrying
+        ``metadata['conversation_id']``) reaches a terminal / AWAITING_APPROVAL state, so
+        the :class:`~himmy.services.storage.conversations.ConversationStore` projection
+        stays in sync after a continuation OR an approval-resume (which completes on a
+        background task the thread router cannot await). Best-effort: a sink failure never
+        fails the run. ``None`` (the default) is a no-op — runs not started via the thread
+        router carry no ``conversation_id`` and never reach it.
         """
         self._runtime = runtime
         self._storage = storage
@@ -506,9 +655,26 @@ class RunAppService:
             storage=storage, entity_registry=entity_registry
         )
         self._run_timeout_seconds = run_timeout_seconds
+        self._checkpoint_store = checkpoint_store
+        self._agent_resolver = agent_resolver
+        self._conversation_sink = conversation_sink
+        # HITL orchestration resume needs the SAME durable graph checkpoint store the
+        # team/workflow run paused into. The surface provides it lazily (a getter, so a
+        # path/env change is honoured); ``None`` means orchestration HITL resume falls
+        # back to an in-memory store (offline/test default — the run paused in-process).
+        self._graph_checkpoint_store_provider = graph_checkpoint_store_provider
         # Keep strong refs to background tasks so they are not GC'd mid-flight and
         # so they can be drained/cancelled on shutdown (AAEO-1).
         self._tasks: set[asyncio.Task[Any]] = set()
+        # T0.4 per-workspace quotas. ``_ws_semaphores`` gates concurrent EXECUTION;
+        # ``_ws_outstanding`` counts created-but-not-terminal runs for the admission
+        # cap. Both are keyed on workspace_id and created lazily so an unused
+        # workspace costs nothing. A semaphore binds the loop it was created on, so it
+        # is created lazily inside the (async) create path, never at construction.
+        self._workspace_concurrency = max(1, int(workspace_concurrency))
+        self._workspace_max_outstanding = max(0, int(workspace_max_outstanding))
+        self._ws_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._ws_outstanding: dict[str, int] = {}
 
     async def create_run(
         self,
@@ -520,6 +686,11 @@ class RunAppService:
         idempotency_key: str | None = None,
         llm_config: LLMConfig | None = None,
         actor: dict[str, Any] | None = None,
+        agent_spec: AgentSpec | None = None,
+        agent_def: AgentDefRecord | None = None,
+        operator_provisioned: bool = False,
+        hitl: bool = False,
+        plan: bool = False,
     ) -> RunRecord:
         """Create (or return the existing) run and launch background execution.
 
@@ -533,10 +704,99 @@ class RunAppService:
         so two concurrent requests with the same key cannot both create a run.
         Background execution is only launched for the run this call actually
         created.
+
+        ``agent_spec`` (T0.2) is the load-bearing seam: when a run resolves to a
+        stored/declarative :class:`AgentSpec` the run executes on a PER-RUN
+        tool-bearing runtime built via
+        :func:`himmy.runtime.from_spec.build_runtime_for_spec` — so a ``/v1`` run can
+        finally call the agent's TOOLS, which the shared (tool-less) runtime cannot.
+        When ``agent_spec`` is ``None`` the existing inline-persona fast path runs on
+        the shared tool-less runtime, byte-unchanged (back-compat). ``agent_spec`` is
+        sanitized against the tenant RCE/SSRF surface (T0.3) unless
+        ``operator_provisioned`` is set AND the operator opted in — a tenant spec
+        carrying ``tools_module``/``http_tools``/``mcp_servers`` is rejected here.
+
+        Per-workspace admission (T0.4): a workspace already holding
+        ``workspace_max_outstanding`` in-flight runs is rejected with
+        :class:`WorkspaceRunQuotaExceeded` BEFORE a record is created, so a runaway
+        fan-out cannot pin unbounded tasks. An idempotent re-submit of an existing
+        run never counts against the cap.
         """
+        # HITL admission (T2f): a ``hitl=True`` run pauses on an approval-gated tool, so
+        # it REQUIRES a per-run tool-bearing runtime (the shared inline runtime carries
+        # no tool_service and cannot call — let alone gate — a tool) AND a checkpoint
+        # store to pause into. Reject early (before any record is written) when either is
+        # missing, so a caller never gets a silently tool-less "HITL" run that can never
+        # pause. The store is resolved on resume from the stored ``agent_id``.
+        #
+        # Plan mode (T2g) pauses at PLAN-READY through the SAME approval gate (a gated
+        # synthetic ``update_plan`` tool), so it has the identical preconditions: a stored
+        # agent (so a per-run registry exists to register the plan tool onto) + a
+        # checkpoint store. A run may set ``plan`` and ``hitl`` together — the plan gate is
+        # simply the first gate the loop hits.
+        if hitl or plan:
+            if self._checkpoint_store is None:
+                raise HitlNotSupportedError(
+                    "this deployment has no checkpoint store; hitl/plan runs are "
+                    "unavailable"
+                )
+            if agent_spec is None or agent_def is None:
+                raise HitlRequiresAgentError(
+                    "hitl/plan runs require a stored agent (agent_id); an inline persona "
+                    "carries no tools to gate"
+                )
+            # Plan mode synthesizes a gated ``update_plan`` tool and registers it onto the
+            # per-run tool registry to force the PLAN-READY pause. A bare persona spec
+            # (e.g. {"name": "x"}) builds NO registry (from_spec returns registry=None and
+            # the runtime gets no tool_service), so there is nowhere to register the plan
+            # tool and the run would silently complete WITHOUT pausing. Reject up front
+            # (422) — consistent with the inline-persona rejection — rather than letting a
+            # legitimate-but-tool-less stored agent slip through to a silently wrong
+            # "plan=true never paused" outcome.
+            if plan and not agent_spec.builds_tool_registry():
+                raise HitlRequiresAgentError(
+                    "plan mode requires a tool-bearing stored agent (one declaring "
+                    "tool_packs/tools_module/http_tools/knowledge/mcp_servers/connectors/"
+                    "allow_spawn/allow_skill_dispatch); a tool-less agent builds no "
+                    "registry to host the gated update_plan tool, so the run could never "
+                    "pause at PLAN-READY"
+                )
+
+        # Fail-closed sanitize a per-run spec against the tenant attack surface
+        # BEFORE anything is persisted or executed (T0.3). Operator-provisioned specs
+        # may keep their tools when the operator opted in; everyone else is stripped
+        # or (default) rejected by ``sanitize_tenant_spec`` raising.
+        if agent_spec is not None:
+            from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+            agent_spec = sanitize_tenant_spec(
+                agent_spec, operator_provisioned=operator_provisioned
+            ).spec
+
         # Stamp the authenticated actor ("who launched this") into the durable
         # metadata JSONB (round-trips on both in-memory and Postgres) so every run
         # records its initiator — the operational half of "who did what" (WS1.3).
+        metadata: dict[str, Any] = {}
+        if actor:
+            metadata["actor"] = actor
+        if agent_spec is not None:
+            metadata["agent_name"] = agent_spec.name
+        # T2e: a run launched by a stored agent records its agent_id so the run<->agent
+        # lineage is reconstructable and the Studio/CLI can show "run of agent X".
+        if agent_def is not None:
+            metadata["agent_id"] = agent_def.agent_id
+        # T2f: mark the run HITL-driven so the resume path (which re-resolves the spec
+        # from agent_id) knows this run is approvable and rebuilds the same gated runtime.
+        # T2g: plan mode is also an agentic, pausable run — mark it so the resume path
+        # re-registers the gated ``update_plan`` tool when rebuilding the runtime.
+        if hitl or plan:
+            metadata["hitl"] = True
+            # ``operator_provisioned`` governs whether the stored spec's privileged tools
+            # survive the run-time re-sanitize; the resume must honor the SAME status so
+            # the gated tool the run paused on is still present when it is approved.
+            metadata["operator_provisioned"] = bool(operator_provisioned)
+        if plan:
+            metadata["plan_mode"] = True
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
@@ -545,31 +805,259 @@ class RunAppService:
             model_key=_resolve_model_key(llm_config, task),
             idempotency_key=idempotency_key,
             status=RunStatus.QUEUED,
-            metadata={"actor": actor} if actor else {},
+            metadata=metadata,
         )
+        # Atomic idempotent insert FIRST (the race-safe primitive), so an idempotent
+        # re-submit (created=False) returns the prior run without ever touching the
+        # T0.4 cap — a duplicate spawns no new task. Only a NEWLY-created run is
+        # admitted against the per-workspace outstanding cap below.
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:
             return stored
 
+        # T0.4 admission: a workspace already at its outstanding-run cap cannot launch
+        # another background task. The record exists (atomicity is preserved), so it is
+        # immediately marked FAILED rather than left as an orphaned QUEUED row, and the
+        # quota error propagates to the caller (HTTP 429).
+        try:
+            self._admit_workspace_run(workspace_id)
+        except WorkspaceRunQuotaExceeded:
+            stored.status = RunStatus.FAILED
+            stored.error = "rejected: workspace run-concurrency quota exceeded"
+            stored.updated_at = _now()
+            try:
+                await self._storage.save_run(stored)
+            except Exception:  # pragma: no cover - best-effort terminal mark
+                logger.warning("failed to mark quota-rejected run %s", stored.run_id)
+            raise
+
         bg = asyncio.create_task(
             self._execute_run(
                 stored.run_id,
+                workspace_id=workspace_id,
                 persona=persona,
                 task=task,
                 llm_config=llm_config,
+                agent_spec=agent_spec,
+                agent_def=agent_def,
+                hitl=hitl,
+                plan=plan,
             )
         )
         self._tasks.add(bg)
         bg.add_done_callback(self._tasks.discard)
         return stored
 
+    async def continue_thread(
+        self,
+        *,
+        workspace_id: str,
+        subject_id: str,
+        conversation_id: str,
+        thread: ChatThread,
+        prompt: str,
+        agent_spec: AgentSpec,
+        agent_def: AgentDefRecord,
+        llm_config: LLMConfig | None = None,
+        idempotency_key: str | None = None,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+        hitl: bool = False,
+        plan: bool = False,
+    ) -> RunRecord:
+        """Continue a stored conversation with a new user turn on the per-run runtime (T2g).
+
+        Unlike :meth:`create_run` (a fresh inline/agent run), this APPENDS a turn to an
+        existing :class:`ChatThread` and drives the AGENTIC loop on the per-run
+        tool-bearing runtime (T0.2) so a ``/v1`` conversation is as capable as a Studio one
+        — the model sees prior turns AND can call the agent's tools / pause for approval
+        (reviewer must_fix: NOT a tool-less single-shot ``run_task_detailed`` masquerading
+        as chat). A continuation always resolves a stored ``agent_id`` (a per-run runtime
+        needs a spec), runs through the SAME admission + sanitizer + quota path as a fresh
+        run, and links the new :class:`RunRecord` to the conversation via
+        ``metadata['conversation_id']`` (the run's ``thread_id`` IS the conversation id) so
+        the thread router (and the ConversationStore projection sink) can find it.
+
+        With ``hitl``/``plan`` the run can pause at ``AWAITING_APPROVAL`` exactly like a
+        fresh agentic run; the SAME ``approve``/``reject`` machinery resumes it.
+        """
+        # A continuation is always agentic + needs a checkpoint store when it can pause.
+        if (hitl or plan) and self._checkpoint_store is None:
+            raise HitlNotSupportedError(
+                "this deployment has no checkpoint store; hitl/plan runs are unavailable"
+            )
+        # Plan mode hosts its gated ``update_plan`` tool on the per-run registry; a
+        # tool-less stored agent builds none, so the run could never pause at PLAN-READY.
+        # Reject up front (422) — same gate as ``create_run`` — rather than silently
+        # running plan=true to completion without a pause.
+        if plan and not agent_spec.builds_tool_registry():
+            raise HitlRequiresAgentError(
+                "plan mode requires a tool-bearing stored agent; a tool-less agent "
+                "builds no registry to host the gated update_plan tool, so the run "
+                "could never pause at PLAN-READY"
+            )
+
+        # Fail-closed sanitize the spec under the request's operator status BEFORE it
+        # runs (defense-in-depth: the stored spec was sanitized at write, this honors the
+        # caller's operator status so a tenant continuation can never reach privileged
+        # tools the stored spec might carry).
+        from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+        agent_spec = sanitize_tenant_spec(
+            agent_spec, operator_provisioned=operator_provisioned
+        ).spec
+
+        # Pin the thread id to the conversation id so the run's thread_id IS the
+        # conversation id (the run<->conversation join the router/sink rely on). The new
+        # user turn is NOT appended here — the runtime's ``run_agent_loop`` /
+        # ``run_task_detailed`` appends it from ``task.prompt`` (appending it twice would
+        # duplicate the message), so the loaded thread carries only the PRIOR turns.
+        thread.thread_id = conversation_id
+
+        persona = agent_spec.to_persona()
+        if llm_config is None:
+            llm_config = agent_spec.to_llm_config()
+        task = agent_spec.make_task(prompt)
+
+        metadata: dict[str, Any] = {"conversation_id": conversation_id}
+        if actor:
+            metadata["actor"] = actor
+        metadata["agent_name"] = agent_spec.name
+        metadata["agent_id"] = agent_def.agent_id
+        if hitl or plan:
+            metadata["hitl"] = True
+            metadata["operator_provisioned"] = bool(operator_provisioned)
+        if plan:
+            metadata["plan_mode"] = True
+
+        run = RunRecord(
+            workspace_id=workspace_id,
+            subject_id=subject_id,
+            task_id=task.task_id,
+            persona_name=persona.name,
+            model_key=_resolve_model_key(llm_config, task),
+            idempotency_key=idempotency_key,
+            status=RunStatus.QUEUED,
+            thread_id=conversation_id,
+            metadata=metadata,
+        )
+        stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
+        if not created:
+            return stored
+
+        try:
+            self._admit_workspace_run(workspace_id)
+        except WorkspaceRunQuotaExceeded:
+            stored.status = RunStatus.FAILED
+            stored.error = "rejected: workspace run-concurrency quota exceeded"
+            stored.updated_at = _now()
+            try:
+                await self._storage.save_run(stored)
+            except Exception:  # pragma: no cover - best-effort terminal mark
+                logger.warning("failed to mark quota-rejected run %s", stored.run_id)
+            raise
+
+        bg = asyncio.create_task(
+            self._execute_run(
+                stored.run_id,
+                workspace_id=workspace_id,
+                persona=persona,
+                task=task,
+                llm_config=llm_config,
+                agent_spec=agent_spec,
+                agent_def=agent_def,
+                hitl=hitl,
+                plan=plan,
+                thread=thread,
+            )
+        )
+        self._tasks.add(bg)
+        bg.add_done_callback(self._tasks.discard)
+        return stored
+
+    # ----------------------------------------------------------- T0.4 quotas
+    def _admit_workspace_run(self, workspace_id: str) -> None:
+        """Reserve one outstanding-run slot for ``workspace_id`` or reject (T0.4).
+
+        Raises :class:`WorkspaceRunQuotaExceeded` when the workspace already holds
+        :attr:`_workspace_max_outstanding` in-flight runs. ``0`` disables the cap.
+        Runs single-threaded in the event loop, so the read-modify-write is atomic.
+        """
+        if self._workspace_max_outstanding <= 0:
+            return
+        current = self._ws_outstanding.get(workspace_id, 0)
+        if current >= self._workspace_max_outstanding:
+            raise WorkspaceRunQuotaExceeded(
+                workspace_id,
+                cap=self._workspace_max_outstanding,
+                outstanding=current,
+            )
+        self._ws_outstanding[workspace_id] = current + 1
+
+    def _release_workspace_run(self, workspace_id: str) -> None:
+        """Release one outstanding-run slot for ``workspace_id`` (floors at 0)."""
+        if self._workspace_max_outstanding <= 0:
+            return
+        current = self._ws_outstanding.get(workspace_id, 0)
+        if current <= 1:
+            self._ws_outstanding.pop(workspace_id, None)
+        else:
+            self._ws_outstanding[workspace_id] = current - 1
+
+    def _workspace_semaphore(self, workspace_id: str) -> asyncio.Semaphore:
+        """Lazily get/create the per-workspace execution semaphore (T0.4).
+
+        Created on first use inside the running loop so it binds the correct event
+        loop (a semaphore created at construction could bind the wrong loop under
+        ``asyncio.run`` test harnesses).
+        """
+        sem = self._ws_semaphores.get(workspace_id)
+        if sem is None:
+            sem = asyncio.Semaphore(self._workspace_concurrency)
+            self._ws_semaphores[workspace_id] = sem
+        return sem
+
+    def workspace_outstanding(self, workspace_id: str) -> int:
+        """Return the current count of in-flight runs for a workspace (introspection)."""
+        return self._ws_outstanding.get(workspace_id, 0)
+
+    @contextlib.asynccontextmanager
+    async def workspace_run_slot(
+        self, workspace_id: str
+    ) -> AsyncIterator[None]:
+        """Reserve one workspace run-slot for a non-``RunRecord`` fan-out (T0.4).
+
+        The same per-workspace admission + concurrency gate that guards full runs, exposed
+        for fan-out work that is NOT a stored run — today the model-compare endpoint
+        (``POST /v1/models/compare``), which spawns N concurrent model calls per request.
+        One compare request counts as ONE outstanding slot (admission caps how many
+        concurrent compares a tenant may pin) and is executed under the per-workspace
+        execution semaphore, so a tenant's fan-outs cannot starve the shared loop/provider
+        quota of other tenants.
+
+        Raises :class:`WorkspaceRunQuotaExceeded` (mapped to HTTP 429) when the workspace is
+        already at its outstanding cap; releases the slot in ``finally`` even on error.
+        """
+        self._admit_workspace_run(workspace_id)
+        try:
+            async with self._workspace_semaphore(workspace_id):
+                yield
+        finally:
+            self._release_workspace_run(workspace_id)
+
     async def _execute_run(
         self,
         run_id: str,
         *,
+        workspace_id: str,
         persona: Persona,
         task: Task,
         llm_config: LLMConfig | None,
+        agent_spec: AgentSpec | None = None,
+        agent_def: AgentDefRecord | None = None,
+        hitl: bool = False,
+        plan: bool = False,
+        thread: ChatThread | None = None,
     ) -> None:
         """Background worker: RUNNING -> run_task -> SUCCEEDED/FAILED + extraction.
 
@@ -578,19 +1066,116 @@ class RunAppService:
         populated and recommendation extraction skipped, instead of being marked
         SUCCEEDED with garbage output. The whole run is bounded by
         ``run_timeout_seconds`` (AAEO-1).
+
+        Runtime selection (T0.2): with ``agent_spec`` set, the run executes on a
+        PER-RUN tool-bearing runtime built from the spec (so the agent's tools fire);
+        otherwise it stays on the shared tool-less runtime (inline-persona
+        back-compat). Execution holds the per-workspace concurrency semaphore (T0.4)
+        and the outstanding-run reservation taken in :meth:`create_run` is released
+        in ``finally`` so a failed/cancelled run frees its slot. ``workspace_id`` is
+        passed in (not re-read from the record) so the slot is always released for the
+        right workspace even on the defensive ``run is None`` path.
         """
-        run = await self._storage.get_run(run_id)
-        if run is None:  # pragma: no cover - defensive
-            return
+        semaphore = self._workspace_semaphore(workspace_id)
+        try:
+            async with semaphore:
+                run = await self._storage.get_run(run_id)
+                if run is None:  # pragma: no cover - defensive
+                    return
+                await self._execute_on_runtime(
+                    run,
+                    persona=persona,
+                    task=task,
+                    llm_config=llm_config,
+                    agent_spec=agent_spec,
+                    agent_def=agent_def,
+                    hitl=hitl,
+                    plan=plan,
+                    thread=thread,
+                )
+        finally:
+            self._release_workspace_run(workspace_id)
+
+    async def _execute_on_runtime(
+        self,
+        run: RunRecord,
+        *,
+        persona: Persona,
+        task: Task,
+        llm_config: LLMConfig | None,
+        agent_spec: AgentSpec | None,
+        agent_def: AgentDefRecord | None = None,
+        hitl: bool = False,
+        plan: bool = False,
+        thread: ChatThread | None = None,
+    ) -> None:
+        """Drive one run to a terminal state on the resolved runtime (T0.2 core).
+
+        With ``hitl=True`` (T2f) the run drives :meth:`SingleAgentRuntime.run_agent_loop`
+        with ``hitl=True`` on a per-run runtime carrying /v1's checkpoint store; if it
+        pauses on an approval-gated tool the run goes AWAITING_APPROVAL (carrying the
+        checkpoint id) and STOPS — never swept, resumable via :meth:`resume_run`. The
+        non-HITL path is byte-identical to before (single ``run_task_detailed`` turn).
+
+        ``plan=True`` (T2g) is an agentic, pausable run too: the per-run runtime carries
+        the gated ``update_plan`` tool so the loop pauses at PLAN-READY through the same
+        approval machinery. ``thread`` (T2g) is the continuation seam — a prior
+        :class:`ChatThread` the loop continues so the model sees earlier turns; ``None``
+        starts a fresh thread (every pre-T2g call site).
+        """
+        # HITL/plan runs pause into /v1's OWN checkpoint store; the plain single-turn path
+        # passes None so the per-run runtime stays exactly as the T0.2 build wired it.
+        agentic = hitl or plan
+        checkpoint_store = self._checkpoint_store if agentic else None
         run.status = RunStatus.RUNNING
         run.updated_at = _now()
         await self._storage.save_run(run)
 
+        # T2g: a plan-first run prepends the plan nudge + binds ``update_plan`` so the
+        # agent publishes (and pauses on) its plan first.
+        if plan:
+            from himmy.runtime.plan_mode import apply_plan_mode_to_task
+
+            apply_plan_mode_to_task(task)
+
         try:
-            result = await asyncio.wait_for(
-                self._runtime.run_task_detailed(persona, task, llm_config=llm_config),
-                timeout=self._run_timeout_seconds,
+            runtime = await self._resolve_runtime(
+                agent_spec, checkpoint_store=checkpoint_store, plan_mode=plan
             )
+        except Exception as exc:  # noqa: BLE001 - spec wiring failure is terminal
+            run.status = RunStatus.FAILED
+            run.error = f"agent runtime build failed: {exc}"
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+
+        # T2f/T2g: the agentic path drives the loop (which can PAUSE on an approval-gated
+        # tool — the HITL gate OR the plan gate); the plain path is the single-turn fast
+        # path, optionally continuing a prior thread (T2g).
+        if agentic:
+            await self._drive_hitl_run(
+                run,
+                persona,
+                task,
+                runtime,
+                llm_config=llm_config,
+                agent_def=agent_def,
+                thread=thread,
+                plan=plan,
+            )
+            return
+
+        try:
+            # Pass ``thread`` ONLY when continuing a prior conversation (T2g); the
+            # fresh-run path omits it so the call is byte-identical to the pre-T2g signature
+            # (``run_task_detailed(persona, task, llm_config=...)``) — back-compat for every
+            # existing call site and test double.
+            coro = (
+                runtime.run_task_detailed(persona, task, thread, llm_config=llm_config)
+                if thread is not None
+                else runtime.run_task_detailed(persona, task, llm_config=llm_config)
+            )
+            result = await asyncio.wait_for(coro, timeout=self._run_timeout_seconds)
         except TimeoutError:
             run.status = RunStatus.FAILED
             run.error = (
@@ -621,6 +1206,12 @@ class RunAppService:
         run.thread_id = thread.thread_id
         run.trace_id = result.trace_id
 
+        # T2e: link the run's chat_thread hub -> the stored agent node so a run launched
+        # by ``agent_id`` carries a durable run<->agent lineage edge (best-effort; the
+        # run never fails because lineage projection did).
+        if agent_def is not None:
+            await self._project_run_agent_link(run, agent_def)
+
         # AAEO-3: honour the FAILED inference path. ``RunResult.succeeded`` is the
         # typed status surface; a failed run records the error and skips extraction.
         if not result.succeeded:
@@ -629,8 +1220,26 @@ class RunAppService:
             run.output_text = result.output_text or None
             run.updated_at = _now()
             await self._storage.save_run(run)
+            await self._notify_conversation_sink(run)
             return
 
+        await self._finalize_succeeded_run(run, result, task=task, llm_config=llm_config)
+        await self._notify_conversation_sink(run)
+
+    async def _finalize_succeeded_run(
+        self,
+        run: RunRecord,
+        result: Any,
+        *,
+        task: Task,
+        llm_config: LLMConfig | None,
+    ) -> None:
+        """Record a terminal-SUCCEEDED run + extract recommendations (shared path).
+
+        Factored out so both the single-turn path and the HITL loop's terminal turn
+        finish identically (structured-output parse, AAEO-6 schema validation, the
+        SUCCEEDED transition, and recommendation extraction).
+        """
         run.output_text = result.output_text or None
         # Prefer the typed structured output; fall back to parsing the text.
         structured = result.output_structured
@@ -656,6 +1265,298 @@ class RunAppService:
         # Auto-extract recommendations when the output matches the envelope.
         if run.output_structured is not None:
             await self._recommendations.extract_from_run(run)
+
+    async def _drive_hitl_run(
+        self,
+        run: RunRecord,
+        persona: Persona,
+        task: Task,
+        runtime: SingleAgentRuntime,
+        *,
+        llm_config: LLMConfig | None,
+        agent_def: AgentDefRecord | None,
+        thread: ChatThread | None = None,
+        plan: bool = False,
+    ) -> None:
+        """Drive a hitl/plan run's agentic loop; pause to AWAITING_APPROVAL on a gate.
+
+        Runs :meth:`SingleAgentRuntime.run_agent_loop` (``hitl=True``) bounded by the
+        per-run timeout. The loop either:
+
+        * pauses on an approval-gated tool — ``stopped_reason == 'awaiting_approval'`` —
+          in which case the run is stamped AWAITING_APPROVAL + ``metadata['checkpoint_id']``
+          and STOPS (never swept, resumable via approve/reject), or
+        * completes — handled exactly like the single-turn success/failure paths via the
+          shared finalizers.
+
+        ``thread`` (T2g) continues a prior conversation; ``plan`` marks a plan-first run
+        so :meth:`_apply_loop_outcome` extracts the published plan into
+        ``metadata['plan']`` when the run pauses at PLAN-READY.
+        """
+        try:
+            # Pass ``thread`` only on a continuation (T2g) so a fresh agentic run's call is
+            # byte-identical to the pre-T2g signature (back-compat for test doubles).
+            loop_coro = (
+                runtime.run_agent_loop(
+                    persona, task, thread, llm_config=llm_config, hitl=True
+                )
+                if thread is not None
+                else runtime.run_agent_loop(
+                    persona, task, llm_config=llm_config, hitl=True
+                )
+            )
+            loop = await asyncio.wait_for(
+                loop_coro, timeout=self._run_timeout_seconds
+            )
+        except TimeoutError:
+            run.status = RunStatus.FAILED
+            run.error = (
+                f"run exceeded {self._run_timeout_seconds:.0f}s execution timeout"
+            )
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+        except asyncio.CancelledError:
+            run.status = RunStatus.FAILED
+            run.error = "run cancelled"
+            run.updated_at = _now()
+            try:
+                await self._storage.save_run(run)
+            except Exception:  # pragma: no cover - best-effort during cancel
+                pass
+            raise
+        except Exception as exc:  # noqa: BLE001 - terminal failure transition
+            run.status = RunStatus.FAILED
+            run.error = str(exc)
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+
+        await self._apply_loop_outcome(
+            run, loop, task=task, llm_config=llm_config, agent_def=agent_def, plan=plan
+        )
+
+    async def _apply_loop_outcome(
+        self,
+        run: RunRecord,
+        loop: Any,
+        *,
+        task: Task,
+        llm_config: LLMConfig | None,
+        agent_def: AgentDefRecord | None,
+        plan: bool = False,
+    ) -> None:
+        """Project a finished/paused :class:`AgentLoopResult` onto the run record (T2f).
+
+        Shared by the initial HITL drive and the resume path so a run pauses-again,
+        succeeds, or fails identically regardless of which entry produced the loop.
+
+        ``plan`` (T2g) makes a PLAN-READY pause stamp the published plan steps into
+        ``metadata['plan']`` so a caller can read the proposed plan before approving.
+        """
+        thread = loop.thread
+        run.thread_id = thread.thread_id
+        # The loop's trace id is derived as ``{thread_id}:{task_id}``; record it so the
+        # canonical event replay (``get_run_events``) finds the turn/tool events.
+        run.trace_id = f"{thread.thread_id}:{task.task_id}"
+
+        # T2e: link the run's chat_thread hub -> the stored agent node (best-effort).
+        if agent_def is not None:
+            await self._project_run_agent_link(run, agent_def)
+
+        if loop.stopped_reason == "awaiting_approval":
+            # The headline T2f transition: the run paused on an approval-gated tool.
+            # Stamp the checkpoint id so approve/reject can re-claim it, and STOP — the
+            # sweeper explicitly skips AWAITING_APPROVAL, so this run is never reaped.
+            run.status = RunStatus.AWAITING_APPROVAL
+            metadata = {
+                **(run.metadata or {}),
+                "checkpoint_id": loop.checkpoint_id,
+            }
+            # T2g: a plan-first run paused on its (gated) ``update_plan`` call — surface
+            # the proposed plan in metadata so a caller reads it before approving.
+            if plan:
+                plan_steps = self._extract_plan_from_checkpoint(loop.checkpoint_id)
+                if plan_steps:
+                    metadata["plan"] = plan_steps
+            run.metadata = metadata
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            await self._notify_conversation_sink(run)
+            return
+
+        final = loop.final
+        if not final.succeeded:
+            run.status = RunStatus.FAILED
+            run.error = final.error or (final.error_code or "inference failed")
+            run.output_text = final.output_text or None
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            await self._notify_conversation_sink(run)
+            return
+
+        await self._finalize_succeeded_run(run, final, task=task, llm_config=llm_config)
+        await self._notify_conversation_sink(run)
+
+    async def _notify_conversation_sink(self, run: RunRecord) -> None:
+        """Re-project a thread-linked run's updated ChatThread (T2g, best-effort).
+
+        Invoked when a run that the thread router started (carrying
+        ``metadata['conversation_id']``) reaches a terminal / AWAITING_APPROVAL state, so
+        the ConversationStore projection reflects the latest turns even when the run
+        finished on a background task the router never awaited (an approval-resume). A
+        no-op when no sink is wired or the run is not thread-linked; any sink error is
+        swallowed (provenance, not the work).
+        """
+        if self._conversation_sink is None:
+            return
+        conversation_id = (run.metadata or {}).get("conversation_id")
+        if not conversation_id:
+            return
+        try:
+            await _maybe_await(self._conversation_sink(conversation_id, run))
+        except Exception:  # noqa: BLE001 - conversation projection is best-effort
+            logger.warning(
+                "failed to project conversation %s for run %s",
+                conversation_id,
+                run.run_id,
+            )
+
+    def _extract_plan_from_checkpoint(
+        self, checkpoint_id: str | None
+    ) -> list[dict[str, str]]:
+        """Read the bounded plan steps out of a PLAN-READY checkpoint (T2g).
+
+        The plan-first run pauses on its gated ``update_plan`` call; that call's args
+        carry the proposed steps. Returns the normalized, bounded steps (an empty list
+        when no checkpoint / no plan call is pending), so a caller can read the plan
+        before approving it.
+        """
+        if not checkpoint_id or self._checkpoint_store is None:
+            return []
+        checkpoint = self._checkpoint_store.load(checkpoint_id)
+        if checkpoint is None:  # pragma: no cover - the pause just wrote it
+            return []
+        from himmy.runtime.plan_mode import PLAN_TOOL, normalize_plan_steps
+
+        for pending in checkpoint.pending_tool_calls:
+            if pending.tool_name == PLAN_TOOL:
+                return normalize_plan_steps((pending.args or {}).get("steps"))
+        return []
+
+    async def _resolve_runtime(
+        self,
+        agent_spec: AgentSpec | None,
+        *,
+        checkpoint_store: Any = None,
+        plan_mode: bool = False,
+    ) -> SingleAgentRuntime:
+        """Pick the runtime for a run: shared tool-less, or a per-run tool-bearing one.
+
+        With ``agent_spec is None`` the existing shared (tool-less) runtime is
+        returned — the inline-persona fast path stays byte-identical (back-compat).
+
+        With a spec present (T0.2) a PER-RUN runtime is built via
+        :func:`himmy.runtime.from_spec.build_runtime_for_spec`, which wires the spec's
+        tool packs / tools / guardrails / knowledge / connectors / MCP + a tool
+        service, so the run can finally CALL the agent's tools (impossible on the
+        shared runtime, which carries no tool_service). It is built off-loop in a
+        worker thread because ``build_runtime_for_spec`` may run an inner
+        ``asyncio.run`` (knowledge ingest) that cannot nest in the running loop.
+
+        Wiring choices that preserve the zero-config offline default: the per-run
+        runtime SHARES this service's storage (so its thread/events/memory land in the
+        one store the app layer reads) and REUSES the shared runtime's inference
+        service when the spec pins no provider — so an offline deployment keeps the
+        stub and a configured deployment keeps its gateway, with no surprise provider
+        switch. When the spec names a provider explicitly, ``build_runtime_for_spec``
+        honors it. ``checkpoint_store`` is threaded so a HITL run can pause (T2f).
+
+        ``plan_mode`` (T2g) registers the APPROVAL-GATED ``update_plan`` tool into the
+        per-run registry so a plan-first run pauses at PLAN-READY through the SAME
+        approval machinery (it MUST be registered on the resume runtime too, hence this
+        flag is threaded both on the initial drive and on resume).
+        """
+        if agent_spec is None:
+            return self._runtime
+        # Reuse the shared runtime's inference only when the spec does not pin its own
+        # provider; otherwise let from_spec build the provider-specific service.
+        shared_inference = (
+            getattr(self._runtime, "inference_service", None)
+            if not agent_spec.provider
+            else None
+        )
+        from himmy.runtime.from_spec import build_runtime_for_spec
+
+        runtime, registry = await asyncio.to_thread(
+            build_runtime_for_spec,
+            agent_spec,
+            inference=shared_inference,
+            storage=self._storage,
+            checkpoint_store=checkpoint_store,
+        )
+        runtime = cast("SingleAgentRuntime", runtime)
+        if plan_mode:
+            # The plan tool must live on a tool registry; a spec with no tools builds no
+            # registry, so resolve the runtime's own tool_service registry as the target.
+            target = registry
+            if target is None:
+                target = getattr(
+                    getattr(runtime, "tool_service", None), "registry", None
+                )
+            if target is not None:
+                from himmy.runtime.plan_mode import register_plan_tool
+
+                register_plan_tool(target)
+        return runtime
+
+    async def _project_run_agent_link(
+        self, run: RunRecord, agent_def: AgentDefRecord
+    ) -> None:
+        """Register the stored-agent node + link the run's thread -> agent (T2e).
+
+        Ensures the ``agent`` entity exists in the shared spine (idempotent,
+        content-addressed) and draws a ``run_of_agent`` edge from the run's
+        ``chat_thread`` hub to that agent node, so a run launched by ``agent_id`` joins
+        the agent's lineage graph. Best-effort: a projection failure never fails the run
+        (it is provenance, not the work).
+        """
+        if self._registry is None or not run.thread_id:
+            return
+        try:
+            from himmy.entities.records import stable_id_for
+
+            agent_record = await _maybe_await(
+                self._registry.register(agent_def.to_record())
+            )
+            thread_sid = stable_id_for(run.thread_id, namespace="chat_thread")
+            thread_record = await _maybe_await(self._registry.get_latest(thread_sid))
+            if thread_record is None:
+                return
+            # Dedupe the edge so a re-run of the same thread/agent never doubles it.
+            existing = await _maybe_await(
+                self._registry.links_from(thread_record.record_id)
+            )
+            for link in existing:
+                if (
+                    link.to_record_id == agent_record.record_id
+                    and link.relation == "run_of_agent"
+                ):
+                    return
+            await _maybe_await(
+                self._registry.link(
+                    from_record_id=thread_record.record_id,
+                    to_record_id=agent_record.record_id,
+                    relation="run_of_agent",
+                    metadata={"run_id": run.run_id, "agent_id": agent_def.agent_id},
+                )
+            )
+        except Exception:  # pragma: no cover - lineage projection is best-effort
+            logger.warning(
+                "failed to project run<->agent lineage for run %s agent %s",
+                run.run_id,
+                agent_def.agent_id,
+            )
 
     @staticmethod
     def _parse_structured(content: str | None) -> Any:
@@ -701,11 +1602,21 @@ class RunAppService:
         cannot complete (their background task is gone), so they are transitioned
         to FAILED with a recovery error. ``ttl_seconds=0`` sweeps all non-terminal
         runs. Returns the swept run ids.
+
+        AWAITING_APPROVAL is DELIBERATELY not swept (T2.2 precondition for T2f): an
+        HITL-paused run is intentionally idle pending a human approve/reject and must
+        never be reaped to FAILED — only QUEUED/RUNNING are recoverable-abandoned.
+        RESOLVING is likewise NOT swept here: a resume that crashed mid-flight is
+        RE-DRIVABLE exactly-once (the member checkpoint claim + idempotency ledger), so it
+        is recovered by :meth:`reconcile_resolving_runs`, not reaped to FAILED.
         """
         swept: list[str] = []
         runs = await self._storage.list_runs()
         now = time.time()
         for run in runs:
+            # Only QUEUED/RUNNING are "abandoned"; SUCCEEDED/FAILED are terminal,
+            # AWAITING_APPROVAL is intentionally paused, and RESOLVING is a re-drivable
+            # crashed resume (reconcile_resolving_runs) — never sweep any of those.
             if run.status not in (RunStatus.QUEUED, RunStatus.RUNNING):
                 continue
             if (
@@ -719,6 +1630,490 @@ class RunAppService:
             await self._storage.save_run(run)
             swept.append(run.run_id)
         return swept
+
+    async def reconcile_resolving_runs(self) -> list[str]:
+        """Re-drive HITL resumes left at RESOLVING by a crash, exactly-once (UNIT 1d).
+
+        A resume that wins the run-level claim flips the run to RESOLVING and persists the
+        approve/reject decision BEFORE launching its background task. If the process dies
+        between the claim and the run reaching a terminal/AWAITING-again state, the run is
+        stranded at RESOLVING — but it is RE-DRIVABLE: the member checkpoint's own
+        ``claim()`` accepts a RESOLVING checkpoint on retry, and the per-tool idempotency
+        ledger replays an already-executed gated tool, so re-driving the recorded decision
+        executes the side effect at most once total (across the crashed attempt + this
+        recovery). Intended for startup, after :meth:`sweep_stuck_runs` (which never reaps
+        a RESOLVING run). Returns the re-driven run ids.
+
+        This is DISTINCT from a concurrent second approve: that loses the run-level CAS at
+        the inbox and 409s without launching anything (no RESOLVING strand to recover);
+        only an in-flight crash leaves a RESOLVING run for this method to pick up.
+        """
+        redriven: list[str] = []
+        runs = await self._storage.list_runs(status=RunStatus.RESOLVING)
+        for run in runs:
+            decision = (run.metadata or {}).get("resume_decision")
+            if decision not in ("approved", "rejected"):
+                # No recorded decision — cannot faithfully re-drive; leave it for an
+                # operator (never guess approve, which would run the gated tool).
+                continue
+            actor = (run.metadata or {}).get("resume_actor") or "recovery"
+            # Re-open to AWAITING_APPROVAL so resume_run re-claims it through the SAME
+            # proven path. Startup recovery is single-threaded (no concurrent approves
+            # yet), so the brief re-open carries no double-resume risk.
+            run.status = RunStatus.AWAITING_APPROVAL
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            try:
+                await self.resume_run(
+                    run.run_id,
+                    approved=decision == "approved",
+                    workspace_id=run.workspace_id,
+                    actor=actor,
+                )
+            except RunNotApprovableError:  # pragma: no cover - lost a concurrent re-claim
+                continue
+            redriven.append(run.run_id)
+        return redriven
+
+    # ----------------------------------------------------------------- HITL (T2f)
+    async def pending_approvals(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        """The redacted pending tool call(s) a HITL-paused run awaits (T2f).
+
+        Tenant-scoped: a run outside ``workspace_id`` reads as None (404). Returns the
+        list of ``{tool_name, args}`` for the checkpoint the run paused on, with secret-
+        looking arg values masked (the same redaction Studio's approvals inbox uses), so
+        a reviewer can see WHAT will run before approving without leaking a credential.
+        None when the run is unknown/out-of-workspace; an empty list when the run carries
+        no checkpoint (e.g. not actually paused) or the checkpoint has been resolved.
+        """
+        run = await self.get_run(run_id, workspace_id=workspace_id)
+        if run is None:
+            return None
+        if self._checkpoint_store is None:
+            return []
+        checkpoint_id = (run.metadata or {}).get("checkpoint_id")
+        if not checkpoint_id:
+            return []
+        checkpoint = self._checkpoint_store.load(checkpoint_id)
+        if checkpoint is None:
+            return []
+        from himmy.runtime.checkpoint import redact_tool_args
+
+        return [
+            {"tool_name": p.tool_name, "args": redact_tool_args(p.args)}
+            for p in checkpoint.pending_tool_calls
+        ]
+
+    async def resume_run(
+        self,
+        run_id: str,
+        *,
+        approved: bool,
+        workspace_id: str | None = None,
+        actor: str = "human",
+    ) -> RunRecord:
+        """Approve/reject a HITL-paused run; resume it on a tracked bg task (T2f).
+
+        Loads the run tenant-scoped (a 404 for unknown/out-of-workspace, a 409 for a
+        terminal/non-paused run), then ATOMICALLY claims ``AWAITING_APPROVAL`` ->
+        ``RESOLVING`` via :meth:`StorageService.claim_run_for_resume` — the run-level
+        compare-and-set that mirrors the member checkpoint ``claim()``. A SECOND concurrent
+        approve (a double-clicked Approve, two tabs, two workers) loses this CAS and is
+        refused with :class:`RunNotApprovableError` (409) BEFORE launching any resume, so
+        for an ORCHESTRATION run the graph advance — which has no claim of its own and
+        could otherwise double-fire DOWNSTREAM members' tools — only ever happens once.
+
+        The winner then REBUILDS its OWN per-run tool-bearing runtime FROM THE STORED DB
+        ``AgentSpec`` (resolved by ``agent_id`` — /v1 has no filesystem ``agent_path`` to
+        rebuild from, and ``resume_agent_loop`` HARD-requires a ``tool_service``) and
+        launches :meth:`SingleAgentRuntime.resume_agent_loop` (or the orchestration graph
+        resume) on a fresh tracked background task. The background task drives the run to
+        SUCCEEDED / FAILED / AWAITING_APPROVAL-again. A resume that crashes mid-flight
+        leaves the run at ``RESOLVING`` so startup recovery can re-drive it exactly-once
+        (the member checkpoint ``claim()`` + idempotency ledger), distinct from this
+        rejected "concurrent second click". Returns the in-progress record (fire-and-
+        forget, mirroring :meth:`create_run`).
+        """
+        run = await self.get_run(run_id, workspace_id=workspace_id)
+        if run is None:
+            raise RunNotApprovableError(run_id, status="unknown")
+        if run.status != RunStatus.AWAITING_APPROVAL:
+            raise RunNotApprovableError(run_id, status=run.status.value)
+        if self._checkpoint_store is None:  # pragma: no cover - guarded at create
+            raise HitlNotSupportedError("no checkpoint store wired; cannot resume")
+
+        # Validate that the resume CAN proceed BEFORE claiming, so a config error
+        # (missing checkpoint / unresolvable agent) 409s without first stranding the run
+        # in RESOLVING. Orchestration runs validate their member ids/graph checkpoint
+        # inside ``_resume_orchestration`` (also pre-claim, below).
+        is_orchestration = (run.metadata or {}).get("hitl_kind") == "orchestration"
+        checkpoint_id = ""
+        agent_def: AgentDefRecord | None = None
+        if not is_orchestration:
+            checkpoint_id = (run.metadata or {}).get("checkpoint_id") or ""
+            if not checkpoint_id:  # pragma: no cover - an AWAITING run always has one
+                raise RunNotApprovableError(run_id, status="no checkpoint")
+            agent_id = (run.metadata or {}).get("agent_id")
+            if not agent_id or self._agent_resolver is None:
+                raise RunNotApprovableError(run_id, status="no resolvable agent")
+            agent_def = await _maybe_await(
+                self._agent_resolver(agent_id, workspace_id=run.workspace_id)
+            )
+            if agent_def is None:
+                raise RunNotApprovableError(run_id, status="agent removed")
+
+        # ATOMIC run-level claim: flip AWAITING_APPROVAL -> RESOLVING exactly once. The
+        # non-atomic check above is only for a clean 404/409 message; THIS compare-and-set
+        # is the authoritative gate. The loser of a concurrent double-approve fails the CAS
+        # here and 409s without launching a resume — so an orchestration graph advance can
+        # never double-fire downstream members' tools. (For a single-agent run the member
+        # checkpoint claim() is a second backstop; for orchestration this is the ONLY gate
+        # on the post-member graph advance.)
+        claimed = await self._storage.claim_run_for_resume(
+            run_id, workspace_id=run.workspace_id
+        )
+        if not claimed:
+            raise RunNotApprovableError(run_id, status=RunStatus.RESOLVING.value)
+        # Reflect the won claim on the local record (the background task flips RESOLVING ->
+        # RUNNING when it actually starts; the returned record shows the in-progress state).
+        # Persist the approve/reject decision + actor onto the run so a resume that CRASHES
+        # mid-flight (leaving the run at RESOLVING) can be re-driven by startup recovery
+        # with the SAME decision — exactly-once is preserved by the member checkpoint
+        # claim() + idempotency ledger; only the decision (run the tool, or not) is needed.
+        run.status = RunStatus.RESOLVING
+        run.metadata = {
+            **(run.metadata or {}),
+            "resume_decision": "approved" if approved else "rejected",
+            "resume_actor": actor,
+        }
+        run.updated_at = _now()
+        await self._storage.save_run(run)
+
+        # HITL ORCHESTRATION pause (a team/workflow member paused): a graph/workflow run
+        # carries a member-agent-id LIST (not a single ``agent_id``) and resumes via the
+        # durable graph splice, not the single-agent resume.
+        if is_orchestration:
+            return await self._resume_orchestration(run, approved=approved, actor=actor)
+
+        # Flip RESOLVING -> RUNNING up front so the inbox reflects "in progress". The
+        # authoritative exactly-once gates are the run-level claim above + the runtime
+        # ``claim()`` (crash-retry replays the per-tool idempotency ledger).
+        run.status = RunStatus.RUNNING
+        run.updated_at = _now()
+        await self._storage.save_run(run)
+
+        assert agent_def is not None  # noqa: S101 - narrowed: validated pre-claim above
+        bg = asyncio.create_task(
+            self._resume_in_background(
+                run_id,
+                checkpoint_id=checkpoint_id,
+                approved=approved,
+                actor=actor,
+                agent_def=agent_def,
+                workspace_id=run.workspace_id,
+            )
+        )
+        self._tasks.add(bg)
+        bg.add_done_callback(self._tasks.discard)
+        return run
+
+    async def _resume_in_background(
+        self,
+        run_id: str,
+        *,
+        checkpoint_id: str,
+        approved: bool,
+        actor: str,
+        agent_def: AgentDefRecord,
+        workspace_id: str,
+    ) -> None:
+        """Background worker: rebuild the runtime from the DB spec + resume the loop (T2f).
+
+        Holds the per-workspace concurrency semaphore (T0.4) for the duration, rebuilds a
+        tool-bearing runtime FROM THE STORED SPEC carrying /v1's checkpoint store, and
+        drives :meth:`SingleAgentRuntime.resume_agent_loop`. A loser of the exactly-once
+        ``claim()`` race (``HimmyError('already resolved')``) is a NO-OP — the run is left
+        at whatever the winner set it to (never re-failed, never re-run).
+        """
+        semaphore = self._workspace_semaphore(workspace_id)
+        async with semaphore:
+            run = await self._storage.get_run(run_id)
+            if run is None:  # pragma: no cover - defensive
+                return
+            # Re-sanitize the stored spec under the SAME operator status the run was
+            # created with, so the approval-gated tool the run paused on is still present
+            # when it executes (a tenant spec would have had its tools stripped at create,
+            # so a paused run could only exist for an operator-provisioned/clean spec). If
+            # the operator has since REVOKED the opt-in (env var unset between pause and
+            # resume), the re-sanitize fail-closes — the resume becomes a clean FAILED,
+            # never a crashed task and never a privileged-tool execution without the opt-in.
+            operator_provisioned = bool(
+                (run.metadata or {}).get("operator_provisioned", False)
+            )
+            # T2g: a plan-first run paused on its gated ``update_plan`` tool — the rebuilt
+            # resume runtime MUST re-register that synthetic tool, else the now-approved
+            # plan call has no handler to execute against.
+            plan_mode = bool((run.metadata or {}).get("plan_mode", False))
+            from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+            try:
+                spec = sanitize_tenant_spec(
+                    agent_def.agent_spec(),
+                    operator_provisioned=operator_provisioned,
+                ).spec
+                runtime = await self._resolve_runtime(
+                    spec,
+                    checkpoint_store=self._checkpoint_store,
+                    plan_mode=plan_mode,
+                )
+            except Exception as exc:  # noqa: BLE001 - spec rebuild failure is terminal
+                run.status = RunStatus.FAILED
+                run.error = f"resume runtime build failed: {exc}"
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+
+            from himmy.core.errors import HimmyError
+
+            try:
+                loop = await asyncio.wait_for(
+                    runtime.resume_agent_loop(
+                        checkpoint_id, approved=approved, actor=actor
+                    ),
+                    timeout=self._run_timeout_seconds,
+                )
+            except HimmyError as exc:
+                # The exactly-once loser: the checkpoint was already resolved by a
+                # concurrent/earlier resume. This is a NO-OP — do NOT touch the run (the
+                # winner owns its terminal state). Leaving it as-is means a double-approve
+                # neither re-runs the tool nor flips a SUCCEEDED run to FAILED.
+                logger.info(
+                    "resume of run %s was a no-op (%s)", run_id, exc
+                )
+                return
+            except TimeoutError:
+                run.status = RunStatus.FAILED
+                run.error = (
+                    f"resume exceeded {self._run_timeout_seconds:.0f}s timeout"
+                )
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+            except asyncio.CancelledError:
+                run.status = RunStatus.FAILED
+                run.error = "resume cancelled"
+                run.updated_at = _now()
+                try:
+                    await self._storage.save_run(run)
+                except Exception:  # pragma: no cover - best-effort during cancel
+                    pass
+                raise
+            except Exception as exc:  # noqa: BLE001 - terminal failure transition
+                run.status = RunStatus.FAILED
+                run.error = str(exc)
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+
+            # Reconstruct the task so the shared finalizers compute the right trace id +
+            # validate structured output against the originally-requested schema.
+            from himmy.agents.base_agent.task import Task as _Task
+
+            task = _Task(title=run.persona_name or "resume", prompt="", context={})
+            if run.task_id:
+                task.task_id = run.task_id
+            await self._apply_loop_outcome(
+                run, loop, task=task, llm_config=None, agent_def=agent_def
+            )
+
+    async def _resume_orchestration(
+        self, run: RunRecord, *, approved: bool, actor: str
+    ) -> RunRecord:
+        """Approve/reject a HITL-paused TEAM/WORKFLOW run; resume the graph (WI-6).
+
+        By the time this runs the caller (``resume_run``) has already won the atomic
+        run-level ``claim_run_for_resume`` CAS, flipping AWAITING_APPROVAL -> RESOLVING;
+        that run-level claim is now the PRIMARY exactly-once gate — a concurrent second
+        approve loses the CAS and 409s before ever reaching here, so the graph advance
+        happens exactly once. This method flips RESOLVING -> RUNNING and launches the
+        durable graph resume on a tracked background task. The MEMBER checkpoint
+        ``claim()`` inside ``resume_agent_loop`` remains a defence-in-depth backstop (a
+        crash re-drive that re-enters here finds the member already resolved -> no-op).
+        Returns the RUNNING record.
+        """
+        graph_resume_id = (run.metadata or {}).get("orchestration_checkpoint_id")
+        if not graph_resume_id:  # pragma: no cover - an orchestration pause always has one
+            raise RunNotApprovableError(run.run_id, status="no orchestration checkpoint")
+        member_agent_ids = list((run.metadata or {}).get("member_agent_ids") or [])
+        if not member_agent_ids or self._agent_resolver is None:
+            raise RunNotApprovableError(run.run_id, status="no resolvable members")
+
+        run.status = RunStatus.RUNNING
+        run.updated_at = _now()
+        await self._storage.save_run(run)
+
+        bg = asyncio.create_task(
+            self._resume_orchestration_in_background(
+                run.run_id,
+                approved=approved,
+                actor=actor,
+                workspace_id=run.workspace_id,
+                graph_resume_id=graph_resume_id,
+                member_agent_ids=member_agent_ids,
+            )
+        )
+        self._tasks.add(bg)
+        bg.add_done_callback(self._tasks.discard)
+        return run
+
+    def _resolve_graph_checkpoint_store(self) -> Any:
+        """The durable graph checkpoint store to resume an orchestration from.
+
+        Uses the surface-provided getter (file-backed in a server, so the SAME db the run
+        paused into is reopened) and falls back to an in-memory store offline/in tests.
+        """
+        if self._graph_checkpoint_store_provider is not None:
+            return self._graph_checkpoint_store_provider()
+        from himmy.runtime.checkpoint import InMemoryGraphCheckpointStore
+
+        return InMemoryGraphCheckpointStore()
+
+    async def _resume_orchestration_in_background(
+        self,
+        run_id: str,
+        *,
+        approved: bool,
+        actor: str,
+        workspace_id: str,
+        graph_resume_id: str,
+        member_agent_ids: list[str],
+    ) -> None:
+        """Background worker: re-resolve members + drive the durable graph resume (WI-6).
+
+        Holds the per-workspace concurrency semaphore for the duration, re-resolves and
+        (via ``run_orchestration``) re-sanitizes the members under the run's operator
+        status — so a revoked opt-in fails closed — rebuilds the graph member runtime with
+        BOTH the member and graph checkpoint stores wired, and resumes the graph. The
+        outcome is projected exactly like the execute path, INCLUDING pausing again at a
+        later member. A claim loser (the member checkpoint already resolved) is a clean
+        no-op — the run is left at the winner's terminal state.
+        """
+        from himmy.application.orchestration_runner import run_orchestration
+
+        semaphore = self._workspace_semaphore(workspace_id)
+        async with semaphore:
+            run = await self._storage.get_run(run_id)
+            if run is None:  # pragma: no cover - defensive
+                return
+            operator_provisioned = bool(
+                (run.metadata or {}).get("operator_provisioned", False)
+            )
+            kind = (run.metadata or {}).get("orchestration_kind", "graph")
+            resource_kind = (run.metadata or {}).get("orchestration", "workflow")
+
+            members: list[AgentDefRecord] = []
+            for agent_id in member_agent_ids:
+                rec = await _maybe_await(
+                    self._agent_resolver(agent_id, workspace_id=workspace_id)
+                    if self._agent_resolver is not None
+                    else None
+                )
+                if rec is None:
+                    run.status = RunStatus.FAILED
+                    run.error = f"resume failed: member agent {agent_id} removed"
+                    run.updated_at = _now()
+                    await self._storage.save_run(run)
+                    return
+                members.append(rec)
+
+            try:
+                outcome = await asyncio.wait_for(
+                    run_orchestration(
+                        kind=kind,
+                        members=members,
+                        prompt="",
+                        resource_kind=resource_kind,
+                        storage=self._storage,
+                        shared_inference=getattr(
+                            self._runtime, "inference_service", None
+                        ),
+                        operator_provisioned=operator_provisioned,
+                        graph_checkpoint_store=self._resolve_graph_checkpoint_store(),
+                        graph_resume_id=graph_resume_id,
+                        checkpoint_store=self._checkpoint_store,
+                        approve_member=approved,
+                        actor=actor,
+                    ),
+                    timeout=self._run_timeout_seconds,
+                )
+            except TimeoutError:
+                run.status = RunStatus.FAILED
+                run.error = f"resume exceeded {self._run_timeout_seconds:.0f}s timeout"
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+            except asyncio.CancelledError:
+                run.status = RunStatus.FAILED
+                run.error = "resume cancelled"
+                run.updated_at = _now()
+                try:
+                    await self._storage.save_run(run)
+                except Exception:  # pragma: no cover - best-effort during cancel
+                    pass
+                raise
+            except Exception as exc:  # noqa: BLE001 - terminal failure transition
+                # A claim-loser raises HimmyError('already resolved') from the member
+                # resume — that is a clean NO-OP (the winner owns the terminal state),
+                # NOT a failure. Distinguish it so a double-approve never flips a
+                # SUCCEEDED run to FAILED.
+                if _is_resume_claim_loss(exc):
+                    logger.info(
+                        "orchestration resume of run %s was a no-op (%s)", run_id, exc
+                    )
+                    return
+                run.status = RunStatus.FAILED
+                run.error = str(exc)
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+
+            await self._apply_orchestration_outcome(run, outcome)
+
+    async def _apply_orchestration_outcome(
+        self, run: RunRecord, outcome: Any
+    ) -> None:
+        """Project a resumed orchestration outcome onto the run (shared with execute).
+
+        Pauses AGAIN at a later member (AWAITING_APPROVAL with restamped ids), or lands
+        terminal SUCCEEDED/FAILED — mirroring the initial execute-path projection.
+        """
+        run.thread_id = outcome.thread_id
+        run.output_text = outcome.output_text or None
+        run.metadata = {
+            **(run.metadata or {}),
+            "stopped_reason": outcome.stopped_reason,
+            "route": outcome.route,
+        }
+        if outcome.graph_checkpoint_id:
+            run.metadata["graph_checkpoint_id"] = outcome.graph_checkpoint_id
+        if outcome.awaiting_approval:
+            run.status = RunStatus.AWAITING_APPROVAL
+            run.metadata["checkpoint_id"] = outcome.member_checkpoint_id
+            run.metadata["orchestration_checkpoint_id"] = (
+                outcome.orchestration_checkpoint_id
+            )
+            run.metadata["awaiting_member"] = outcome.awaiting_member
+            run.metadata["hitl_kind"] = "orchestration"
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+        run.status = RunStatus.FAILED if outcome.failed else RunStatus.SUCCEEDED
+        if outcome.failed:
+            run.error = outcome.error or "orchestration failed"
+        run.updated_at = _now()
+        await self._storage.save_run(run)
 
     # --------------------------------------------------------------------- reads
     async def get_run(
@@ -786,10 +2181,18 @@ class RunAppService:
 
         Ordered ``created_at`` desc with ``run_id`` tiebreak, then windowed by
         ``offset``/``limit`` (capped at :data:`MAX_PAGE_LIMIT`) — AAEO-8.
+
+        Cross-tenant safety (T2.2): the all-workspaces view (``workspace_id is None``,
+        an authenticated admin listing every tenant) EXCLUDES the reserved
+        ``__local__`` workspace so CLI/single-user-local runs never leak into a
+        multi-tenant admin list. An explicit query for ``__local__`` still returns
+        them (the local Studio/CLI browse their own history).
         """
         runs = await self._storage.list_runs(
             workspace_id=workspace_id, subject_id=subject_id, status=status
         )
+        if workspace_id is None:
+            runs = [r for r in runs if r.workspace_id != LOCAL_WORKSPACE]
         return _paginate(
             runs,
             limit=limit,
@@ -804,10 +2207,16 @@ class RunAppService:
         subject_id: str | None = None,
         status: RunStatus | None = None,
     ) -> int:
-        """Total run count for the filter (for pagination envelopes)."""
+        """Total run count for the filter (for pagination envelopes).
+
+        Mirrors :meth:`list_runs`' cross-tenant rule so the count matches the page:
+        the all-workspaces view excludes the reserved ``__local__`` runs (T2.2).
+        """
         runs = await self._storage.list_runs(
             workspace_id=workspace_id, subject_id=subject_id, status=status
         )
+        if workspace_id is None:
+            runs = [r for r in runs if r.workspace_id != LOCAL_WORKSPACE]
         return len(runs)
 
     async def get_run_events(
@@ -837,6 +2246,16 @@ class RunAppService:
             return None
         return await self._storage.load_thread(run.thread_id)
 
+    async def get_run_thread_by_thread_id(self, thread_id: str) -> Any:
+        """Load the authoritative ChatThread the runtime saved under ``thread_id`` (T2g).
+
+        The thread router pins a run's ``thread_id`` to the conversation id, so this reads
+        the latest in-flight thread state from the canonical run store directly (the run
+        record may not yet carry the thread_id when a continuation has only just started).
+        Returns None when nothing is stored under that id.
+        """
+        return await self._storage.load_thread(thread_id)
+
     async def await_run(self, run_id: str, timeout: float = 5.0) -> RunRecord | None:
         """Poll until the run reaches a terminal state (test/example helper)."""
         deadline = time.monotonic() + timeout
@@ -849,6 +2268,619 @@ class RunAppService:
                 return run
             await asyncio.sleep(0.01)
         return await self._storage.get_run(run_id)
+
+    # ----------------------------------------------- T3b team/workflow runs
+    async def create_orchestration_run(
+        self,
+        *,
+        workspace_id: str,
+        subject_id: str,
+        kind: str,
+        members: list[AgentDefRecord],
+        prompt: str,
+        resource_kind: str,
+        resource_id: str,
+        idempotency_key: str | None = None,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+        graph_checkpoint_store: Any = None,
+        graph_resume_id: str | None = None,
+    ) -> RunRecord:
+        """Launch a team/workflow orchestration on the EXISTING run machinery (T3b).
+
+        A team/workflow run is NOT a second executor: it creates a canonical
+        :class:`RunRecord`, admits it against the SAME T0.4 per-workspace quota, and
+        executes on a tracked background task under the per-workspace concurrency semaphore
+        — exactly like :meth:`create_run`. The difference is the body: instead of one
+        per-run agent runtime it builds a TEAM runtime from the ordered member
+        :class:`AgentDefRecord`s (resolved + sanitized) and drives the matching orchestrator
+        (``multi_agent`` | ``group_chat`` for a team; an ordered pipeline for a workflow).
+
+        ``kind`` selects the orchestrator. ``members`` is the ordered, pre-resolved member
+        list (the router validated each exists in the workspace + drew the same-workspace
+        membership check). ``resource_kind``/``resource_id`` (``team``/``workflow`` + its id)
+        are stamped into the run metadata so a run is traceable to the team/workflow that
+        launched it. ``graph_checkpoint_store``/``graph_resume_id`` (the ``graph`` kind)
+        thread the durable :class:`SqliteGraphCheckpointStore` so a long graph run resumes
+        after a restart.
+
+        Returns the QUEUED :class:`RunRecord` immediately; poll ``get_run`` for the outcome.
+        Raises :class:`WorkspaceRunQuotaExceeded` (429) when the workspace is at its cap.
+        """
+        metadata: dict[str, Any] = {
+            "orchestration": resource_kind,
+            "orchestration_kind": kind,
+            f"{resource_kind}_id": resource_id,
+            "member_agent_ids": [m.agent_id for m in members],
+            # Persisted so a HITL resume re-sanitizes the members under the SAME operator
+            # status (a revoked opt-in between pause and resume then fails closed).
+            "operator_provisioned": bool(operator_provisioned),
+        }
+        if actor:
+            metadata["actor"] = actor
+        if graph_resume_id:
+            metadata["graph_resume_id"] = graph_resume_id
+        run = RunRecord(
+            workspace_id=workspace_id,
+            subject_id=subject_id,
+            task_id=None,
+            persona_name=members[0].name if members else resource_kind,
+            model_key="default",
+            idempotency_key=idempotency_key,
+            status=RunStatus.QUEUED,
+            metadata=metadata,
+        )
+        stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
+        if not created:
+            return stored
+
+        try:
+            self._admit_workspace_run(workspace_id)
+        except WorkspaceRunQuotaExceeded:
+            stored.status = RunStatus.FAILED
+            stored.error = "rejected: workspace run-concurrency quota exceeded"
+            stored.updated_at = _now()
+            try:
+                await self._storage.save_run(stored)
+            except Exception:  # pragma: no cover - best-effort terminal mark
+                logger.warning("failed to mark quota-rejected run %s", stored.run_id)
+            raise
+
+        bg = asyncio.create_task(
+            self._execute_orchestration_run(
+                stored.run_id,
+                workspace_id=workspace_id,
+                kind=kind,
+                members=members,
+                prompt=prompt,
+                resource_kind=resource_kind,
+                operator_provisioned=operator_provisioned,
+                graph_checkpoint_store=graph_checkpoint_store,
+                graph_resume_id=graph_resume_id,
+            )
+        )
+        self._tasks.add(bg)
+        bg.add_done_callback(self._tasks.discard)
+        return stored
+
+    async def _execute_orchestration_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: str,
+        kind: str,
+        members: list[AgentDefRecord],
+        prompt: str,
+        resource_kind: str,
+        operator_provisioned: bool,
+        graph_checkpoint_store: Any,
+        graph_resume_id: str | None,
+    ) -> None:
+        """Background worker: build the team runtime + drive the orchestrator (T3b).
+
+        Holds the per-workspace concurrency semaphore (T0.4) and releases the outstanding
+        reservation in ``finally`` (mirroring :meth:`_execute_run`), so a team/workflow run
+        is bounded and accounted exactly like a single-agent run.
+        """
+        from himmy.application.orchestration_runner import run_orchestration
+
+        semaphore = self._workspace_semaphore(workspace_id)
+        try:
+            async with semaphore:
+                run = await self._storage.get_run(run_id)
+                if run is None:  # pragma: no cover - defensive
+                    return
+                run.status = RunStatus.RUNNING
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                try:
+                    outcome = await asyncio.wait_for(
+                        run_orchestration(
+                            kind=kind,
+                            members=members,
+                            prompt=prompt,
+                            resource_kind=resource_kind,
+                            storage=self._storage,
+                            shared_inference=getattr(
+                                self._runtime, "inference_service", None
+                            ),
+                            operator_provisioned=operator_provisioned,
+                            graph_checkpoint_store=graph_checkpoint_store,
+                            graph_resume_id=graph_resume_id,
+                            # HITL: thread the surface-owned AgentCheckpoint store so a
+                            # graph/workflow member calling an approval-gated tool pauses
+                            # to a durable member checkpoint (None disables nested HITL).
+                            checkpoint_store=self._checkpoint_store,
+                        ),
+                        timeout=self._run_timeout_seconds,
+                    )
+                except TimeoutError:
+                    run.status = RunStatus.FAILED
+                    run.error = (
+                        f"run exceeded {self._run_timeout_seconds:.0f}s execution timeout"
+                    )
+                    run.updated_at = _now()
+                    await self._storage.save_run(run)
+                    return
+                except asyncio.CancelledError:
+                    run.status = RunStatus.FAILED
+                    run.error = "run cancelled"
+                    run.updated_at = _now()
+                    try:
+                        await self._storage.save_run(run)
+                    except Exception:  # pragma: no cover - best-effort during cancel
+                        pass
+                    raise
+                except Exception as exc:  # noqa: BLE001 - terminal failure transition
+                    run.status = RunStatus.FAILED
+                    run.error = str(exc)
+                    run.updated_at = _now()
+                    await self._storage.save_run(run)
+                    return
+
+                run.thread_id = outcome.thread_id
+                run.output_text = outcome.output_text or None
+                run.metadata = {
+                    **(run.metadata or {}),
+                    "stopped_reason": outcome.stopped_reason,
+                    "route": outcome.route,
+                }
+                if outcome.graph_checkpoint_id:
+                    run.metadata["graph_checkpoint_id"] = outcome.graph_checkpoint_id
+                # HITL pause: a member called an approval-gated tool. Stamp the MEMBER
+                # checkpoint id under the ``checkpoint_id`` key so the unchanged
+                # pending-approvals path reads it, plus the orchestration (graph)
+                # checkpoint id + awaiting member + a hitl_kind discriminator so
+                # ``resume_run`` routes to the orchestration resume. STOP here — the
+                # sweeper skips AWAITING_APPROVAL, so the paused run is never reaped.
+                if outcome.awaiting_approval:
+                    run.status = RunStatus.AWAITING_APPROVAL
+                    run.metadata["checkpoint_id"] = outcome.member_checkpoint_id
+                    run.metadata["orchestration_checkpoint_id"] = (
+                        outcome.orchestration_checkpoint_id
+                    )
+                    run.metadata["awaiting_member"] = outcome.awaiting_member
+                    run.metadata["hitl_kind"] = "orchestration"
+                    run.updated_at = _now()
+                    await self._storage.save_run(run)
+                    return
+                run.status = (
+                    RunStatus.FAILED if outcome.failed else RunStatus.SUCCEEDED
+                )
+                if outcome.failed:
+                    run.error = outcome.error or "orchestration failed"
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+        finally:
+            self._release_workspace_run(workspace_id)
+
+
+class AgentDefReferencedError(Exception):
+    """A stored agent could not be deleted because it is referenced (T2e must_fix).
+
+    Raised by :meth:`AgentDefAppService.delete_agent_def` when a referential check
+    finds the agent is still used by a team/routine (and ``cascade`` is not set), so a
+    DELETE returns HTTP 409 rather than silently orphaning the reference.
+    """
+
+    def __init__(self, agent_id: str, references: list[str]) -> None:
+        """Record the agent and the references that block its deletion."""
+        self.agent_id = agent_id
+        self.references = list(references)
+        joined = ", ".join(self.references) or "another resource"
+        super().__init__(
+            f"agent {agent_id} cannot be deleted: still referenced by {joined}"
+        )
+
+
+class AgentDefAppService:
+    """Owns the stored-agent (``/v1/agents``) resource lifecycle (T2e).
+
+    A workspace-scoped CRUD service over :class:`AgentDefRecord` that, on every
+    tenant write, runs the spec through the T0.3 sanitizer (the operator-only
+    ``tools_module``/``http_tools``/``mcp_servers`` RCE/SSRF surface is rejected/
+    stripped) BEFORE it is persisted, projects each stored agent as an ``agent``
+    entity into the shared spine (so run->agent lineage links resolve), enforces
+    tenant scoping on every read, supports idempotent create, and refuses to delete an
+    agent still referenced by a team/routine (referential integrity).
+    """
+
+    def __init__(
+        self,
+        *,
+        storage: StorageService,
+        entity_registry: EntityRegistryProtocol | None = None,
+        reference_finder: Any = None,
+    ) -> None:
+        """Wire the store, the optional spine, and an optional reference finder.
+
+        ``reference_finder`` is an optional callable
+        ``(agent_id, workspace_id) -> awaitable[list[str]]`` returning the human
+        references (team/routine ids) that block a delete. It is a forward-looking seam
+        for T3b/T3c (which introduce /v1 teams + routines that reference an agent_id);
+        when ``None`` the referential check is a no-op (nothing references agents yet),
+        so the contract is in place without coupling to not-yet-built resources.
+        """
+        self._storage = storage
+        self._registry = entity_registry
+        self._reference_finder = reference_finder
+
+    async def save_agent_def(
+        self,
+        spec: AgentSpec,
+        *,
+        workspace_id: str,
+        agent_id: str | None = None,
+        idempotency_key: str | None = None,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+    ) -> tuple[AgentDefRecord, bool]:
+        """Sanitize, store (idempotent), and project a stored agent. Returns (rec, created).
+
+        The spec is fail-closed sanitized against the tenant attack surface (T0.3)
+        BEFORE persistence — a tenant spec carrying ``tools_module``/``http_tools``/
+        ``mcp_servers`` is rejected (or stripped when the deployment opts into strip
+        mode), unless operator-provisioned AND the operator opted in. ``idempotency_key``
+        makes a re-submit return the prior record (``created=False``) without creating a
+        duplicate. The stored agent is projected as an ``agent`` entity into the spine.
+        """
+        from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+        clean = sanitize_tenant_spec(
+            spec, operator_provisioned=operator_provisioned
+        ).spec
+        metadata: dict[str, Any] = {}
+        if actor:
+            metadata["actor"] = actor
+        record = AgentDefRecord.from_spec(
+            clean,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            idempotency_key=idempotency_key,
+            metadata=metadata,
+        )
+        stored, created = await self._storage.save_agent_def_if_absent(record)
+        # Re-project on every accepted write (create OR explicit update). An idempotent
+        # no-op re-submit (created=False, same record) still re-registers — the spine is
+        # content-addressed so it dedupes; an edit creates a new version.
+        await self._project_agent(stored)
+        return stored, created
+
+    async def update_agent_def(
+        self,
+        agent_id: str,
+        spec: AgentSpec,
+        *,
+        workspace_id: str,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+    ) -> AgentDefRecord | None:
+        """Replace a stored agent's spec in place (tenant-scoped). None when absent.
+
+        The existing record's ``agent_id``/``created_at``/``idempotency_key`` are
+        preserved; only the (re-sanitized) spec + name/description + ``updated_at``
+        change. Returns ``None`` when the agent does not exist in the workspace (404).
+        """
+        existing = await self._storage.get_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+        if existing is None:
+            return None
+        from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+        clean = sanitize_tenant_spec(
+            spec, operator_provisioned=operator_provisioned
+        ).spec
+        metadata = dict(existing.metadata)
+        if actor:
+            metadata["actor"] = actor
+        updated = AgentDefRecord.from_spec(
+            clean,
+            workspace_id=workspace_id,
+            agent_id=existing.agent_id,
+            idempotency_key=existing.idempotency_key,
+            metadata=metadata,
+        )
+        updated.created_at = existing.created_at
+        stored = await self._storage.save_agent_def(updated)
+        await self._project_agent(stored)
+        return stored
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return a stored agent def by id, tenant-scoped (out-of-workspace → None)."""
+        return await self._storage.get_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List stored agent defs for a workspace."""
+        return await self._storage.list_agent_defs(workspace_id=workspace_id)
+
+    async def delete_agent_def(
+        self,
+        agent_id: str,
+        *,
+        workspace_id: str | None = None,
+        cascade: bool = False,
+    ) -> bool:
+        """Delete a stored agent, refusing if referenced (unless ``cascade``).
+
+        Returns ``True`` when a row was removed, ``False`` when the agent did not exist
+        in the workspace (404). Raises :class:`AgentDefReferencedError` (HTTP 409) when
+        a referential check finds the agent is still used by a team/routine and
+        ``cascade`` is not set — the reviewer must_fix against silently orphaning a
+        reference. ``cascade`` is accepted for forward-compat; the caller owns removing
+        the referencing resources first.
+        """
+        existing = await self._storage.get_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+        if existing is None:
+            return False
+        if not cascade and self._reference_finder is not None:
+            references = await _maybe_await(
+                self._reference_finder(agent_id, existing.workspace_id)
+            )
+            if references:
+                raise AgentDefReferencedError(agent_id, list(references))
+        return await self._storage.delete_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+
+    async def _project_agent(self, record: AgentDefRecord) -> None:
+        """Register the stored agent as an ``agent`` entity in the spine (best-effort)."""
+        if self._registry is None:
+            return
+        try:
+            await _maybe_await(self._registry.register(record.to_record()))
+        except Exception:  # pragma: no cover - projection is best-effort
+            logger.warning("failed to project agent entity for %s", record.agent_id)
+
+
+class ThreadNotFoundError(Exception):
+    """A /v1 thread operation targeted an unknown / out-of-workspace conversation (T2g → 404).
+
+    Workspace ownership is a property of the stored ChatThread (its
+    ``metadata['workspace_id']``); a thread owned by another workspace is treated as
+    absent so a cross-tenant ``thread_id`` is a clean 404, never a leak.
+    """
+
+
+class ThreadAgentRequiredError(Exception):
+    """A /v1 thread continuation was sent without resolving an agent (T2g → 422).
+
+    A continuation runs on the per-run tool-bearing runtime, which needs a stored
+    ``AgentSpec`` (an inline persona carries no tools), so the thread must have been
+    created with an ``agent_id`` (or one must be supplied on the message).
+    """
+
+
+#: Where a /v1 thread stamps its owning workspace in the authoritative ChatThread JSON.
+#: Threads have no native workspace column (ConversationStore is single-user-local by
+#: origin), so workspace ownership rides in the thread metadata and is enforced by
+#: :class:`ThreadAppService` on every read (404 cross-tenant).
+THREAD_WORKSPACE_KEY = "workspace_id"
+#: The stored ``agent_id`` a thread continues with, recorded on the thread metadata at
+#: create so every message turn resolves the same agent without re-supplying it.
+THREAD_AGENT_KEY = "agent_id"
+
+
+class ThreadAppService:
+    """Owns the /v1 thread (conversation) resource over the ONE ConversationStore (T2g).
+
+    A thin orchestration layer that makes a ``/v1`` conversation a first-class,
+    workspace-scoped, agentic resource: it CREATES a workspace-stamped thread, CONTINUES
+    it (loading the authoritative :class:`ChatThread`, appending the user turn, and running
+    it on :class:`RunAppService`'s PER-RUN tool-bearing runtime so the conversation has
+    tools + HITL/plan pauses — reviewer must_fix), and PERSISTS the updated thread back to
+    the same durable ``.himmy/conversations.db`` the CLI and Studio read (so a /v1
+    conversation is browsable everywhere). Workspace ownership is enforced on every read
+    via the thread's ``metadata['workspace_id']`` (cross-tenant → 404).
+
+    It does NOT own a second run executor — every turn lands a canonical
+    :class:`RunRecord` through :class:`RunAppService` (one writer), linked to the
+    conversation by ``metadata['conversation_id']``.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_app: RunAppService,
+        agent_app: AgentDefAppService,
+        conversation_store: Any,
+    ) -> None:
+        """Wire the run service, the stored-agent service, and the conversation store."""
+        self._run_app = run_app
+        self._agent_app = agent_app
+        self._store = conversation_store
+
+    # -- the conversation projection sink (wired into RunAppService) ---------
+
+    async def project_run_thread(self, conversation_id: str, run: RunRecord) -> None:
+        """Re-project a run's updated ChatThread into the ConversationStore (T2g sink).
+
+        Wired as :class:`RunAppService`'s ``conversation_sink`` so a continuation that
+        completes on a background task (notably an approval-resume the message handler
+        never awaited) still lands its latest turns in the durable conversation projection.
+        Loads the authoritative thread from the canonical run store (where the runtime
+        saved it) and re-saves it under the conversation id, preserving the workspace /
+        agent ownership metadata. Best-effort and idempotent.
+        """
+        thread = await self._run_app.get_run_thread(
+            run.run_id, workspace_id=run.workspace_id
+        )
+        if thread is None:
+            return
+        self._persist(conversation_id, thread, run.workspace_id)
+
+    def _persist(self, conversation_id: str, thread: Any, workspace_id: str) -> None:
+        """Stamp ownership onto the thread + upsert it into the ConversationStore."""
+        from himmy.services.storage.conversations import ORIGIN_CLI
+
+        thread.thread_id = conversation_id
+        agent_id = (thread.metadata or {}).get(THREAD_AGENT_KEY)
+        thread.metadata = {
+            **(thread.metadata or {}),
+            THREAD_WORKSPACE_KEY: workspace_id,
+        }
+        # ``origin`` defaults to the CLI/lossless origin (this is an authoritative,
+        # full-fidelity ChatThread, not a flat Studio transcript) so list views show it
+        # as a first-class conversation across surfaces.
+        self._store.save_thread(
+            conversation_id,
+            thread,
+            origin=ORIGIN_CLI,
+            agent_path=agent_id,
+        )
+
+    # -- create -------------------------------------------------------------
+
+    def create_thread(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str | None = None,
+        title: str | None = None,
+    ) -> Any:
+        """Create an empty, workspace-stamped thread (T2g). Returns the ChatThread.
+
+        The workspace (and the optional default ``agent_id`` the thread continues with)
+        are stamped into the thread metadata so every later message turn is scoped + runs
+        the right agent. The thread is persisted immediately so it is listable.
+        """
+        from himmy.agents.base_agent.thread import ChatThread
+
+        metadata: dict[str, Any] = {THREAD_WORKSPACE_KEY: workspace_id}
+        if agent_id:
+            metadata[THREAD_AGENT_KEY] = agent_id
+        thread = ChatThread(agent_id=agent_id, metadata=metadata)
+        self._persist(thread.thread_id, thread, workspace_id)
+        if title:
+            self._store.rename(thread.thread_id, title)
+        return thread
+
+    # -- read ---------------------------------------------------------------
+
+    def load_owned_thread(self, conversation_id: str, *, workspace_id: str) -> Any:
+        """Load a thread, enforcing workspace ownership (T2g). Raises on mismatch.
+
+        Returns the authoritative :class:`ChatThread`. Raises
+        :class:`ThreadNotFoundError` when the conversation is unknown OR owned by another
+        workspace (cross-tenant → 404), so ownership is enforced at one chokepoint.
+        """
+        thread = self._store.load_thread(conversation_id)
+        if thread is None:
+            raise ThreadNotFoundError(conversation_id)
+        owner = (thread.metadata or {}).get(THREAD_WORKSPACE_KEY)
+        if owner != workspace_id:
+            raise ThreadNotFoundError(conversation_id)
+        return thread
+
+    def flat_messages(self, conversation_id: str, *, workspace_id: str) -> list[Any]:
+        """The flat (user/agent) projection of an owned thread (404 cross-tenant)."""
+        # Ownership check first (raises 404 on mismatch / unknown).
+        self.load_owned_thread(conversation_id, workspace_id=workspace_id)
+        return cast("list[Any]", self._store.flat_messages(conversation_id))
+
+    # -- continue -----------------------------------------------------------
+
+    async def append_message(
+        self,
+        *,
+        conversation_id: str,
+        workspace_id: str,
+        subject_id: str,
+        prompt: str,
+        agent_id: str | None = None,
+        idempotency_key: str | None = None,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+        hitl: bool = False,
+        plan: bool = False,
+    ) -> RunRecord:
+        """Append a user turn to an owned thread and run it agentically (T2g).
+
+        Loads the authoritative thread (404 cross-tenant), resolves the agent to continue
+        with (the message's ``agent_id`` overrides the thread's default), and drives
+        :meth:`RunAppService.continue_thread` — so the turn runs WITH TOOLS + can pause for
+        approval (``hitl``) or at PLAN-READY (``plan``). The updated thread is persisted
+        back to the ConversationStore (and re-persisted by the sink when the run later
+        completes on a background task). Returns the linked :class:`RunRecord`.
+        """
+        thread = self.load_owned_thread(conversation_id, workspace_id=workspace_id)
+        resolved_agent_id = agent_id or (thread.metadata or {}).get(THREAD_AGENT_KEY)
+        if not resolved_agent_id:
+            raise ThreadAgentRequiredError(conversation_id)
+        agent_def = await self._agent_app.get_agent_def(
+            resolved_agent_id, workspace_id=workspace_id
+        )
+        if agent_def is None:
+            # The thread references an agent that does not exist in this workspace.
+            raise ThreadAgentRequiredError(resolved_agent_id)
+        agent_spec = agent_def.agent_spec()
+
+        # Carry the resolved agent forward on the thread so a later turn defaults to it
+        # and the persisted thread records which agent it continues with.
+        thread.metadata = {
+            **(thread.metadata or {}),
+            THREAD_AGENT_KEY: resolved_agent_id,
+            THREAD_WORKSPACE_KEY: workspace_id,
+        }
+
+        run = await self._run_app.continue_thread(
+            workspace_id=workspace_id,
+            subject_id=subject_id,
+            conversation_id=conversation_id,
+            thread=thread,
+            prompt=prompt,
+            agent_spec=agent_spec,
+            agent_def=agent_def,
+            idempotency_key=idempotency_key,
+            actor=actor,
+            operator_provisioned=operator_provisioned,
+            hitl=hitl,
+            plan=plan,
+        )
+        # Persist the latest thread state synchronously too (the run also re-projects via
+        # the sink when it reaches a terminal/paused state, but persisting here makes the
+        # new turn immediately visible even before the background run lands).
+        await self._reproject_after_turn(conversation_id, workspace_id)
+        return run
+
+    async def _reproject_after_turn(
+        self, conversation_id: str, workspace_id: str
+    ) -> None:
+        """Best-effort sync of the conversation projection right after a turn starts."""
+        try:
+            thread = await self._run_app.get_run_thread_by_thread_id(conversation_id)
+            if thread is not None:
+                self._persist(conversation_id, thread, workspace_id)
+        except Exception:  # noqa: BLE001 - projection is best-effort
+            logger.warning("failed to reproject conversation %s", conversation_id)
 
 
 def _resolve_model_key(llm_config: LLMConfig | None, task: Task) -> str | None:
@@ -960,7 +2992,7 @@ class DashboardQueryService:
         for rec in recs:
             rec_counts[rec.status.value] = rec_counts.get(rec.status.value, 0) + 1
 
-        evaluation = await self._evaluation_summary()
+        evaluation = await self._evaluation_summary(workspace_id=workspace_id)
 
         return {
             "subject_id": subject_id,
@@ -981,15 +3013,30 @@ class DashboardQueryService:
             "evaluation": evaluation,
         }
 
-    async def _evaluation_summary(self) -> dict[str, Any]:
-        """Fold the latest evaluation run's aggregate into the dashboard (AAEO-15)."""
+    async def _evaluation_summary(
+        self, *, workspace_id: str | None = None
+    ) -> dict[str, Any]:
+        """Fold the latest evaluation run's aggregate into the dashboard (AAEO-15).
+
+        Scoped to ``workspace_id`` (AAEO-4) so the tile never leaks ANOTHER tenant's
+        evaluation runs. The same inclusive rule the context-field tile uses applies:
+        a run stamped with a *different* workspace is excluded, but a legacy/offline
+        run with no stamped workspace stays visible (it belongs to no tenant). The
+        strict-equality filter lives on the GET-by-id IDOR path, not this overview.
+        """
         lister = getattr(self._storage, "list_evaluation_runs", None)
         if lister is None:
             return {"total": 0, "latest_aggregate": None}
         try:
-            runs = await lister()
+            runs = list(await lister())
         except Exception:  # pragma: no cover - eval persistence optional
             return {"total": 0, "latest_aggregate": None}
+        if workspace_id is not None:
+            runs = [
+                r
+                for r in runs
+                if getattr(r, "workspace_id", None) in (None, workspace_id)
+            ]
         if not runs:
             return {"total": 0, "latest_aggregate": None}
         latest = max(runs, key=lambda r: getattr(r, "created_at", "") or "")
@@ -1006,6 +3053,19 @@ __all__ = [
     "RunAppService",
     "RecommendationAppService",
     "DashboardQueryService",
+    "AgentDefAppService",
+    "AgentDefReferencedError",
+    "ThreadAppService",
+    "ThreadNotFoundError",
+    "ThreadAgentRequiredError",
+    "THREAD_AGENT_KEY",
+    "THREAD_WORKSPACE_KEY",
+    "WorkspaceRunQuotaExceeded",
+    "HitlNotSupportedError",
+    "HitlRequiresAgentError",
+    "RunNotApprovableError",
     "DEFAULT_PAGE_LIMIT",
     "MAX_PAGE_LIMIT",
+    "DEFAULT_WORKSPACE_CONCURRENCY",
+    "DEFAULT_WORKSPACE_MAX_OUTSTANDING",
 ]

@@ -62,9 +62,11 @@ def test_connections_crud(client: TestClient) -> None:
 
 
 def test_connections_unknown_type_404(client: TestClient) -> None:
-    assert client.get("/api/studio/connections/slack").status_code == 404
+    assert client.get("/api/studio/connections/nonexistent").status_code == 404
     assert (
-        client.put("/api/studio/connections/slack", json={"fields": {}}).status_code
+        client.put(
+            "/api/studio/connections/nonexistent", json={"fields": {}}
+        ).status_code
         == 404
     )
 

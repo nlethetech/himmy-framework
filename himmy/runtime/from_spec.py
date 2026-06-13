@@ -89,6 +89,66 @@ async def ingest_knowledge_sources(registry: Any, sources: list[str]) -> int:
     return count
 
 
+def _register_outbound_connectors(
+    registry: Any, names: list[str], *, audit: Any = None
+) -> list[str]:
+    """Bind each named OUTBOUND connector's tools into ``registry`` (enabled + ready only).
+
+    For every connector the spec names, this:
+
+    * ensures the built-in connectors are registered on the process-wide registry;
+    * SKIPS the connector cleanly when it is not enabled for the ``outbound`` surface
+      (the operator did not turn it on) — a disabled name is a no-op, never an error;
+    * SKIPS it cleanly when its capability probe fails (missing dependency/credential),
+      so a shared ``agent.yaml`` runs in an environment that lacks one connector's key;
+    * otherwise builds the live connector wired to the RUN'S audit spine (so a tool call
+      it makes lands on the same EntityRecord registry as the run's lineage) and calls
+      :meth:`OutboundToolConnector.register_tools` — which itself re-checks capability and
+      audits the registration. Unknown connector names are skipped (logged via audit by
+      the service, never crashing the wire). Returns the registered tool names.
+
+    Defensive by construction: a per-connector failure is contained so one bad name can
+    never blank out the whole agent's toolset.
+    """
+    from himmy.connectors.manage import (
+        ConnectorService,
+        ensure_builtin_connectors_registered,
+    )
+    from himmy.connectors.sdk import (
+        AuditSink,
+        ConnectorContext,
+        ConnectorError,
+    )
+
+    ensure_builtin_connectors_registered()
+    context = (
+        ConnectorContext(audit=AuditSink.from_registry(audit))
+        if audit is not None
+        else None
+    )
+    service = ConnectorService(context=context)
+    registered: list[str] = []
+    for name in dict.fromkeys(names):  # de-dupe, order-stable
+        try:
+            descriptor = service.descriptor(name)
+        except KeyError:
+            continue  # unknown connector name — skip cleanly
+        if descriptor.kind.value != "outbound":
+            continue  # inbound connectors are mounted by the BFF, not bound as tools
+        if not service.is_enabled(name, "outbound"):
+            continue  # operator has not enabled this connector for outbound
+        if not service.status(name).available:
+            continue  # missing dependency/credential — skip cleanly (no crash)
+        try:
+            connector = service.build_outbound(name)
+        except ConnectorError:
+            continue  # raced to unconfigured between the check and the build
+        # register_tools re-checks capability and audits the registration onto the
+        # run's spine via the connector's ConnectorContext.
+        registered.extend(connector.register_tools(registry))
+    return registered
+
+
 def load_spec_file(
     path: str,
     *,
@@ -127,6 +187,7 @@ def build_runtime_for_spec(
     capture_io: bool = False,
     checkpoint_store: Any = None,
     durable_defaults: bool | None = None,
+    storage: Any = None,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring provider/model overrides + tools.
 
@@ -144,6 +205,12 @@ def build_runtime_for_spec(
     project stores; ``None`` falls back to the server-context flag, which does
     not survive every task/thread boundary (it is set in the app lifespan task)
     — explicit beats inferred at this seam.
+
+    ``storage`` lets a caller thread its OWN store into the per-run runtime instead
+    of letting the factory pick one (T0.2): the ``/v1`` run service passes the same
+    backend the run record lives in so the per-run runtime's thread/events/memory
+    land in the one store the application layer reads. When ``None`` the legacy
+    factory selection (by ``durable_defaults``/server-context) is used unchanged.
     """
     from himmy import build_runtime
     from himmy.cli.provider import build_inference_for
@@ -160,12 +227,17 @@ def build_runtime_for_spec(
     # file-backed SQLite store so an agent's runs/lineage survive restarts; on the
     # one-shot CLI path it is the in-memory store (zero setup). The same instance is
     # reused for the runtime and any memory ContextService below so they share state.
+    # An explicit ``storage`` override (T0.2 per-run runtime) wins over both so the
+    # caller can share its own store.
     from himmy.services.storage.factory import in_server_context
 
     server = durable_defaults if durable_defaults is not None else in_server_context()
-    storage: Any = (
-        StoreFactory.for_context(server=True) if server else StoreFactory.for_context()
-    )
+    if storage is None:
+        storage = (
+            StoreFactory.for_context(server=True)
+            if server
+            else StoreFactory.for_context()
+        )
 
     overrides: dict[str, Any] = {"inference": inference, "storage": storage}
     if on_event is not None:
@@ -194,6 +266,23 @@ def build_runtime_for_spec(
     output_guardrail = build_guardrail_pipeline(output_names)
     overrides["output_guardrail"] = output_guardrail
 
+    # One audit spine shared by the runtime, its tool registry, and (when wired)
+    # memory — so a fact remembered/recalled mid-run lands on the SAME EntityRecord
+    # registry as the run's lineage, and MEMORY_* events flow to the durable
+    # ``storage`` event sink (run_events). P0-C turns this dormant projection on.
+    #
+    # T2.1: resolve the spine through ``SpineFactory.for_context`` so a run's lineage +
+    # security events land on the ONE canonical durable ``.himmy/spine.db`` — the same
+    # database ``himmy seclog`` reads and the server projects into — instead of a bare
+    # in-memory registry that evaporated when the run finished. ``server`` mirrors the same
+    # storage decision (explicit ``durable_defaults`` beats the inferred context flag), so
+    # a server-wired per-spec agent uses the server spine and a one-shot CLI run still uses
+    # the canonical CLI spine (also durable — provenance must outlive the process).
+    from himmy.entities.spine_factory import SpineFactory
+
+    entity_registry = SpineFactory.for_context(server=server)
+    overrides["registry"] = entity_registry
+
     if spec.memory:
         from himmy.services.context.service import ContextService
         from himmy.services.memory import (
@@ -212,6 +301,8 @@ def build_runtime_for_spec(
             store,
             embedder=tk.build_embedder_and_dim()[0],
             min_similarity=tk.memory_min_similarity,
+            registry=entity_registry,
+            event_sink=storage,
         )
         adapter = MemoryContextAdapter(
             memory,
@@ -226,22 +317,20 @@ def build_runtime_for_spec(
         )
 
     registry = None
-    if (
-        spec.tool_packs
-        or spec.tools_module
-        or spec.http_tools
-        or spec.knowledge
-        or spec.mcp_servers
-        or spec.allow_spawn
-        or spec.allow_skill_dispatch
-    ):
-        registry = ToolRegistry()
+    if spec.builds_tool_registry():
+        # Share the run's audit spine so co-registered packs (memory) project their
+        # writes onto the same registry the runtime/tool lineage uses (P0-C).
+        registry = ToolRegistry(entity_registry=entity_registry)
         if spec.tool_packs:
             from himmy.toolkit import ToolkitConfig, register_packs
 
             tk_config = ToolkitConfig.from_sources(load_project().get("toolkit"))
             tk_config.server_context = server
             register_packs(registry, spec.tool_packs, tk_config)
+        if spec.connectors:
+            _register_outbound_connectors(
+                registry, spec.connectors, audit=entity_registry
+            )
         if spec.knowledge:
             # Auto-ingest the declared docs into a local knowledge base and give the
             # agent kb_search — a grounded doc agent with no driver code.
@@ -323,4 +412,5 @@ __all__ = [
     "ingest_knowledge_sources",
     "load_spec_file",
     "build_runtime_for_spec",
+    "_register_outbound_connectors",
 ]

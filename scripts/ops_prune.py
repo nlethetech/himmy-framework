@@ -44,7 +44,9 @@ from typing import Any
 
 _DEFAULT_STORE_PATH = ".himmy/storage.db"
 _DEFAULT_APPROVALS_PATH = ".himmy/approvals.db"
-_DEFAULT_SESSIONS_PATH = ".himmy/sessions.db"
+# As of T2.3 conversations live in the unified .himmy/conversations.db (the old
+# .himmy/sessions.db is folded into it on first open); prune the unified store by default.
+_DEFAULT_SESSIONS_PATH = ".himmy/conversations.db"
 
 
 def _eprint(*args: Any) -> None:
@@ -155,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--sessions-path",
         default=_DEFAULT_SESSIONS_PATH,
-        help="session store path (default .himmy/sessions.db)",
+        help="conversation store path (default .himmy/conversations.db)",
     )
     parser.add_argument(
         "--graph-path",

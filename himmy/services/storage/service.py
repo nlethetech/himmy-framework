@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from himmy.core.events import RunEvent
 from himmy.services.storage.inmemory import (
+    InMemoryAgentDefStore,
     InMemoryContextStore,
     InMemoryEvaluationStore,
     InMemoryEventLog,
@@ -31,6 +32,7 @@ from himmy.services.storage.inmemory import (
 )
 from himmy.services.storage.models import (
     ActionRecord,
+    AgentDefRecord,
     AgentStateRecord,
     EnvironmentStateRecord,
     EpisodicMemoryObject,
@@ -65,6 +67,7 @@ class StorageService:
         self._event_log = InMemoryEventLog()
         self._context_store = InMemoryContextStore()
         self._run_store = InMemoryRunStore()
+        self._agent_def_store = InMemoryAgentDefStore()
         self._recommendation_store = InMemoryRecommendationStore()
         self._evaluation_store = InMemoryEvaluationStore()
         self._orchestration_store = InMemoryOrchestrationStore()
@@ -125,6 +128,14 @@ class StorageService:
         """Atomically create a run unless its idempotency key already exists."""
         return await self._run_store.save_run_if_absent_by_idempotency(run)
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool:
+        """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won)."""
+        return await self._run_store.claim_run_for_resume(
+            run_id, workspace_id=workspace_id
+        )
+
     async def get_run(self, run_id: str) -> RunRecord | None:
         """Return a run record by id, or None."""
         return await self._run_store.get_run(run_id)
@@ -144,6 +155,39 @@ class StorageService:
         """Return the existing run for an idempotency key, or None (O(1) lookup)."""
         return await self._run_store.load_run_by_idempotency(
             workspace_id, idempotency_key
+        )
+
+    # ------------------------------------------------------------- agent defs (T2e)
+    async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
+        """Upsert a stored agent definition keyed by ``agent_id``."""
+        return await self._agent_def_store.save_agent_def(record)
+
+    async def save_agent_def_if_absent(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """Atomically create an agent def unless its idempotency key already exists."""
+        return await self._agent_def_store.save_agent_def_if_absent(record)
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return a stored agent def by id, tenant-scoped (out-of-workspace → None)."""
+        return await self._agent_def_store.get_agent_def(
+            agent_id, workspace_id=workspace_id
+        )
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List stored agent defs for a workspace."""
+        return await self._agent_def_store.list_agent_defs(workspace_id=workspace_id)
+
+    async def delete_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> bool:
+        """Delete a stored agent def, tenant-scoped. Returns True iff removed."""
+        return await self._agent_def_store.delete_agent_def(
+            agent_id, workspace_id=workspace_id
         )
 
     # ---------------------------------------------------------- recommendations
@@ -187,15 +231,21 @@ class StorageService:
         """Upsert an evaluation run keyed by ``run_id``."""
         return await self._evaluation_store.save_evaluation_run(run)
 
-    async def get_evaluation_run(self, run_id: str) -> EvaluationRun | None:
-        """Return an evaluation run by id, or None."""
-        return await self._evaluation_store.get_evaluation_run(run_id)
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> EvaluationRun | None:
+        """Return an evaluation run by id, tenant-scoped (AAEO-4)."""
+        return await self._evaluation_store.get_evaluation_run(
+            run_id, workspace_id=workspace_id
+        )
 
     async def list_evaluation_runs(
-        self, suite_id: str | None = None
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
     ) -> list[EvaluationRun]:
-        """List evaluation runs, optionally filtered by suite id."""
-        return await self._evaluation_store.list_evaluation_runs(suite_id)
+        """List evaluation runs, optionally filtered by suite id and workspace (AAEO-4)."""
+        return await self._evaluation_store.list_evaluation_runs(
+            suite_id, workspace_id=workspace_id
+        )
 
     # --------------------------------------------- memory + orchestration records
     async def save_memory(self, obj: MemoryObject) -> MemoryObject:

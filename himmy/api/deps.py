@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any
 from himmy.services.governance.consent_registry import MESSAGES_CONTENT_FIELD
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.entities.records import EntityRecord
-    from himmy.entities.registry import EntityRegistry
     from himmy.runtime.single_agent import SingleAgentRuntime
     from himmy.services.inference.service import InferenceService
     from himmy.services.storage.service import StorageService
@@ -101,18 +101,23 @@ class ApiContainer:
         self,
         *,
         storage: StorageService,
-        entity_registry: EntityRegistry,
+        entity_registry: EntityRegistryProtocol,
         inference: InferenceService,
         runtime: SingleAgentRuntime,
         context_app: Any,
         run_app: Any,
         recommendation_app: Any,
         dashboard: Any,
+        agent_app: Any = None,
+        thread_app: Any = None,
+        conversation_store: Any = None,
+        knowledge_app: Any = None,
         evaluation: Any = None,
         consent_ledger: Any = None,
         consent_policy: Any = None,
         retention_service: Any = None,
         privacy_audit: Any = None,
+        checkpoint_store: Any = None,
     ) -> None:
         """Store the assembled service singletons.
 
@@ -120,7 +125,8 @@ class ApiContainer:
         the governed branch (``HIMMY_CONSENT`` on); they stay ``None`` on the zero-config
         path so nothing about the offline behaviour changes (WS4.6 A3). ``privacy_audit``
         (WS4.7 B4) is always wired — it is inert over an empty store — and the
-        ``/v1/audit/privacy`` router reads it.
+        ``/v1/audit/privacy`` router reads it. ``checkpoint_store`` (T2f) is /v1's durable
+        HITL inbox; the container owns its handle so :meth:`aclose` releases it.
         """
         self.storage = storage
         self.entity_registry = entity_registry
@@ -128,6 +134,10 @@ class ApiContainer:
         self.runtime = runtime
         self.context_app = context_app
         self.run_app = run_app
+        self.agent_app = agent_app
+        self.thread_app = thread_app
+        self.conversation_store = conversation_store
+        self.knowledge_app = knowledge_app
         self.recommendation_app = recommendation_app
         self.dashboard = dashboard
         self.evaluation = evaluation
@@ -135,6 +145,7 @@ class ApiContainer:
         self.consent_policy = consent_policy
         self.retention_service = retention_service
         self.privacy_audit = privacy_audit
+        self.checkpoint_store = checkpoint_store
 
     @classmethod
     def build_default(cls) -> ApiContainer:
@@ -192,19 +203,30 @@ class ApiContainer:
         TRAIN gate.
         """
         from himmy.application.services import (
+            AgentDefAppService,
             ContextAppService,
             DashboardQueryService,
             RecommendationAppService,
             RunAppService,
         )
-        from himmy.entities.registry import EntityRegistry
+        from himmy.entities.spine_factory import SpineFactory
         from himmy.runtime.single_agent import SingleAgentRuntime
         from himmy.services.context.service import ContextService
         from himmy.services.evaluation.service import EvaluationService
         from himmy.services.prompts.manager import PromptManager
         from himmy.services.prompts.mapper import ContextPromptMapper
 
-        registry = EntityRegistry()
+        # T2.1: the spine is the DURABLE shared entity registry — no longer a bare
+        # in-memory registry that evaporates on restart and is invisible to the
+        # CLI's ``himmy seclog``. ``SpineFactory.for_context`` resolves the ONE
+        # canonical ``.himmy/spine.db`` (or the opt-in Postgres spine) so a run's
+        # provenance/lineage/security events projected here are the same on-disk database
+        # the CLI reads. ``build_default`` runs BEFORE the app lifespan sets server
+        # context, so this honours whatever context is active at construction; the
+        # lifespan ALWAYS rebinds to the server spine before serving a request (so a
+        # zero-DSN server still gets the durable spine — the build-order trap is closed in
+        # ``app._build_lifespan``).
+        registry = SpineFactory.for_context()
         inference = cls._build_inference()
 
         # WS4.6: the spine registry and the storage facade the services/runtime see. The
@@ -233,12 +255,59 @@ class ApiContainer:
         context_app = ContextAppService(
             context_service=context_service, storage=service_storage
         )
+        # T2e: the durable workspace-scoped stored-agent (/v1/agents) resource. Shares
+        # the same storage + spine the run service reads, so a stored agent projects an
+        # ``agent`` node into the one canonical spine and a run launched by ``agent_id``
+        # links back to it. Built BEFORE the run service so the run service can resolve a
+        # paused run's stored spec on HITL resume (T2f) via this service.
+        agent_app = AgentDefAppService(
+            storage=service_storage,
+            entity_registry=service_registry,
+            reference_finder=cls._agent_reference_finder,
+        )
+        # T2f: /v1's OWN durable HITL checkpoint inbox (distinct from Studio's
+        # ``.himmy/approvals.db``). Durable file-backed in a server context (so a paused
+        # run survives a restart and the inbox is visible to all workers); in-memory in
+        # the zero-config offline/test default so ``build_default`` writes no files. The
+        # resolver lets the run service rebuild a paused run's tool-bearing runtime FROM
+        # THE STORED DB SPEC (reviewer must_fix: /v1 has no filesystem ``agent_path``).
+        checkpoint_store = cls._build_v1_checkpoint_store()
+        # T2g: the ONE durable conversation store the CLI + Studio + /v1 all read. In a
+        # server context this is the shared ``.himmy/conversations.db`` singleton (so a /v1
+        # thread is browsable in Studio Chats / ``himmy chat``); in the zero-config offline
+        # default it is a private in-memory store (no files written). Built before the run
+        # service so the thread sink can be wired in.
+        conversation_store = cls._build_conversation_store()
+        # T3a: the durable workspace-namespaced knowledge resource (/v1/knowledge). Reuses
+        # the container's service storage handle so the surface is consistent across
+        # interfaces; the namespace boundary it enforces is a property of an AUTHENTICATED
+        # deployment only (inert offline — see KnowledgeAppService's docstring).
+        knowledge_app = cls._build_knowledge(service_storage)
+        # The thread service is wired AFTER the run service is built (it needs the run
+        # app), so the run service's conversation sink is bound via a late attribute set.
         run_app = RunAppService(
             runtime=runtime,
             storage=service_storage,
             entity_registry=service_registry,
             recommendation_app=recommendation_app,
+            checkpoint_store=checkpoint_store,
+            agent_resolver=agent_app.get_agent_def,
+            # HITL orchestration resume reopens the SAME durable graph checkpoint store the
+            # team/workflow run paused into (file-backed in a server, RAM offline).
+            graph_checkpoint_store_provider=cls._graph_checkpoint_store_provider,
         )
+        # T2g: the /v1 thread (conversation) resource over the one ConversationStore.
+        from himmy.application.services import ThreadAppService
+
+        thread_app = ThreadAppService(
+            run_app=run_app,
+            agent_app=agent_app,
+            conversation_store=conversation_store,
+        )
+        # Wire the run service's conversation sink so an approval-resume (which finishes on
+        # a background task the thread router never awaits) still re-projects the latest
+        # turns into the ConversationStore. A late set keeps the construction order clean.
+        run_app._conversation_sink = thread_app.project_run_thread
         dashboard = DashboardQueryService(storage=service_storage)
         # The LLM-judge metric path (AAEO-10) can reach the inference service.
         evaluation = EvaluationService(
@@ -263,6 +332,10 @@ class ApiContainer:
             runtime=runtime,
             context_app=context_app,
             run_app=run_app,
+            agent_app=agent_app,
+            thread_app=thread_app,
+            conversation_store=conversation_store,
+            knowledge_app=knowledge_app,
             recommendation_app=recommendation_app,
             dashboard=dashboard,
             evaluation=evaluation,
@@ -270,7 +343,134 @@ class ApiContainer:
             consent_policy=overlay.policy,
             retention_service=overlay.retention,
             privacy_audit=privacy_audit,
+            checkpoint_store=checkpoint_store,
         )
+
+    @staticmethod
+    async def _agent_reference_finder(
+        agent_id: str, workspace_id: str
+    ) -> list[str]:
+        """Referential check for :class:`AgentDefAppService` (T3b/T3c): who references ``agent_id``.
+
+        Returns the routine / team / workflow ids in ``workspace_id`` that reference the
+        stored agent, so a ``DELETE /v1/agents/{id}`` of an agent still wired to ANY of them
+        returns HTTP 409 instead of orphaning the binding (the reviewer must_fix — and the
+        production reference_finder the T3b teams/workflows need). Reads the SAME
+        ``.himmy/routines.db`` / ``.himmy/teams.db`` / ``.himmy/workflows.db`` the
+        ``/v1`` + Studio + CLI surfaces drive. Best-effort per store: a store error never
+        blocks a delete (that store contributes no references).
+        """
+        references: list[str] = []
+        try:
+            from himmy.api.routines import get_routines_store
+
+            references += [
+                f"routine:{rid}"
+                for rid in get_routines_store().find_by_agent_id(
+                    agent_id, workspace_id=workspace_id
+                )
+            ]
+        except Exception:  # pragma: no cover - a store error must not block deletes
+            pass
+        try:
+            from himmy.api.teams_store import get_teams_store, get_workflows_store
+
+            references += [
+                f"team:{tid}"
+                for tid in get_teams_store().find_by_agent_id(
+                    agent_id, workspace_id=workspace_id
+                )
+            ]
+            references += [
+                f"workflow:{wid}"
+                for wid in get_workflows_store().find_by_agent_id(
+                    agent_id, workspace_id=workspace_id
+                )
+            ]
+        except Exception:  # pragma: no cover - a store error must not block deletes
+            pass
+        return references
+
+    @staticmethod
+    def _build_v1_checkpoint_store() -> Any:
+        """Build /v1's OWN HITL checkpoint store: durable in a server, in-RAM offline (T2f).
+
+        In a server context (the lifespan-established durable deployment) this is a
+        file-backed :class:`SqliteCheckpointStore` at ``.himmy/v1_approvals.db`` (resolved
+        by :func:`himmy.config.project.v1_approvals_db_path`), DELIBERATELY a different
+        file than Studio's ``.himmy/approvals.db`` — the two surfaces rebuild a paused run
+        from different spec sources, so the inboxes stay per-surface (reviewer must_fix).
+        Outside a server context (the zero-config ``build_default`` offline/test default)
+        it is an in-memory store so no file is written and the offline contract is
+        unchanged. ``build_default`` runs BEFORE the lifespan sets the server context, so
+        the durable upgrade happens in the lifespan's rebuild (mirroring the spine).
+        """
+        from himmy.runtime.checkpoint import (
+            InMemoryCheckpointStore,
+            SqliteCheckpointStore,
+        )
+        from himmy.services.storage.factory import in_server_context
+
+        if in_server_context():
+            from himmy.config.project import v1_approvals_db_path
+
+            return SqliteCheckpointStore(v1_approvals_db_path())
+        return InMemoryCheckpointStore()
+
+    @staticmethod
+    def _graph_checkpoint_store_provider() -> Any:
+        """The durable graph checkpoint store an orchestration HITL resume reopens.
+
+        Delegates to the SAME path-keyed singleton the team/workflow run routers pass into
+        ``create_orchestration_run`` (``teams_store.get_graph_checkpoint_store``), so an
+        approval-resume reopens the exact db the run paused into (file-backed in a server,
+        in-RAM offline). Wired as a lazy getter so a path/env change is honoured.
+        """
+        from himmy.api.teams_store import get_graph_checkpoint_store
+
+        return get_graph_checkpoint_store()
+
+    @staticmethod
+    def _build_conversation_store() -> Any:
+        """Build the conversation store: shared durable singleton in a server, RAM offline.
+
+        In a server context (the lifespan-established durable deployment) this resolves
+        the process-wide :func:`get_conversation_store` singleton at the canonical
+        ``.himmy/conversations.db`` — the SAME database the CLI (``himmy chat``) and Studio
+        Chats read, so a /v1 thread is browsable everywhere (T2g acceptance). Outside a
+        server context (the zero-config ``build_default`` offline/test default) it is a
+        private in-memory :class:`ConversationStore` so no file is written and the offline
+        contract is unchanged. ``build_default`` runs BEFORE the lifespan sets the server
+        context, so the durable upgrade happens in the lifespan's rebuild (mirroring the
+        spine + the checkpoint store).
+        """
+        from himmy.services.storage.conversations import ConversationStore
+        from himmy.services.storage.factory import in_server_context
+
+        if in_server_context():
+            from himmy.services.storage.conversations import get_conversation_store
+
+            return get_conversation_store()
+        return ConversationStore(":memory:")
+
+    @staticmethod
+    def _build_knowledge(storage: Any) -> Any:
+        """Build the workspace-namespaced knowledge service (T3a) over the wired storage.
+
+        Reuses the container's ``storage`` handle (the durable backend in a server
+        context, the in-memory store offline) and the env-configured embedder so the
+        KB's vector dimension matches the embedder that is actually built. The
+        :class:`KnowledgeAppService` threads every operation through the single
+        :func:`~himmy.services.knowledge.app_service.knowledge_namespace` choke point.
+        Constructing it runs no I/O, so the zero-config offline path is unchanged.
+        """
+        from himmy.services.knowledge.app_service import KnowledgeAppService
+        from himmy.services.knowledge.service import KnowledgeBase
+        from himmy.toolkit.config import ToolkitConfig
+
+        embedder, dim = ToolkitConfig.from_env().build_embedder_and_dim()
+        kb = KnowledgeBase(storage=storage, embedder=embedder)
+        return KnowledgeAppService(kb, vector_dim=dim)
 
     @staticmethod
     def _build_privacy_audit(
@@ -386,13 +586,48 @@ class ApiContainer:
         return InferenceService(manager)
 
     async def aclose(self) -> None:
-        """Close any resources the container owns (e.g. a Postgres pool)."""
+        """Close any resources the container owns (storage pool + durable spine).
+
+        The durable spine (SQLite or the opt-in Postgres facade) owns a file handle /
+        connection pool; flushing + closing it here releases the handle and persists any
+        buffered audit writes. Its ``close`` is synchronous on every backend, so it is run
+        without awaiting (the SQLite ``flush`` and the facade's loop teardown are sync).
+        """
         closer = getattr(self.storage, "close", None)
         if closer is not None:
             try:
                 await closer()
             except Exception:  # pragma: no cover - best-effort teardown
                 pass
+        spine_close = getattr(self.entity_registry, "close", None)
+        if spine_close is not None:
+            try:
+                spine_close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+        # T2f: release /v1's durable HITL checkpoint file handle (SQLite). The in-memory
+        # store has no ``close`` — the getattr guard makes this a no-op there.
+        cp_close = getattr(self.checkpoint_store, "close", None)
+        if cp_close is not None:
+            try:
+                cp_close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+        # T2g: close the conversation store ONLY when it is the container-owned (offline,
+        # in-memory) instance. The durable server store is the process-wide singleton the
+        # CLI + Studio share, so closing it here would break their connection — leave it
+        # to its own lifecycle. Identity against the singleton (without forcing it to
+        # construct) distinguishes the two.
+        from himmy.services.storage.conversations import current_conversation_store
+
+        conv = self.conversation_store
+        if conv is not None and conv is not current_conversation_store():
+            conv_close = getattr(conv, "close", None)
+            if conv_close is not None:
+                try:
+                    conv_close()
+                except Exception:  # pragma: no cover - best-effort teardown
+                    pass
 
 
 __all__ = ["ApiContainer"]

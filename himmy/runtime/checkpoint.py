@@ -35,7 +35,26 @@ REJECTED = "rejected"
 
 #: Current :class:`AgentCheckpoint` serialization format. Bump this (and add a
 #: step to ``_MIGRATIONS``) whenever a persisted field changes shape.
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
+
+
+#: Arg-key substrings whose values are masked before a pending tool call is shown to a
+#: human (so an approvals inbox never surfaces a credential). The canonical home for the
+#: redaction, shared by every surface's approvals view (Studio + /v1).
+_SECRETY_ARG_KEYS = ("token", "password", "secret", "key", "authorization", "auth")
+
+
+def redact_tool_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Mask values whose key looks secret, so an approvals UI never shows a credential.
+
+    The single, surface-neutral redaction for HITL pending-tool views: both the Studio
+    approvals inbox and the ``/v1`` ``GET /runs/{id}/pending-approvals`` endpoint reuse it,
+    so the two surfaces redact identically.
+    """
+    out: dict[str, Any] = {}
+    for k, v in (args or {}).items():
+        out[k] = "••••" if any(s in k.lower() for s in _SECRETY_ARG_KEYS) else v
+    return out
 
 
 class PendingToolCall(BaseModel):
@@ -74,6 +93,16 @@ class AgentCheckpoint(BaseModel):
     #: BETWEEN executing a state-mutating tool and resolving the checkpoint —
     #: replays the recorded result instead of executing the tool a second time.
     executed_tool_results: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    #: The member's FINAL output text, recorded durably AT RESOLVE TIME when a HITL
+    #: resume terminates (status flips to ``approved``/``rejected`` and the member
+    #: produces its answer). For an orchestration member this is the durable anchor
+    #: for crash recovery: if a crash strikes BETWEEN the member resolving and the
+    #: graph persisting its advance, the graph state never saw this text, so recovery
+    #: reads it back from HERE and threads the REAL output downstream instead of an
+    #: empty string. ``None`` until the resume terminates (a still-paused member has no
+    #: final answer yet); empty-string is a legitimate recorded answer (model said
+    #: nothing) and is distinct from the not-yet-recorded ``None``.
+    final_output: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
 
 
@@ -88,11 +117,18 @@ def _migrate_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _migrate_v2_to_v3(raw: dict[str, Any]) -> dict[str, Any]:
+    """v2 -> v3: adds ``final_output`` (``None`` — no resume had recorded an answer)."""
+    raw.setdefault("final_output", None)
+    return raw
+
+
 #: Stepwise upgraders keyed by the *from* version; each returns the raw dict at
 #: version ``from + 1``. Every historical format must have an unbroken chain here.
 _MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
 }
 
 
@@ -198,7 +234,7 @@ GRAPH_FAILED = "failed"
 
 #: Current :class:`GraphCheckpoint` serialization format. Bump this (and add a
 #: step to ``_GRAPH_MIGRATIONS``) whenever a persisted field changes shape.
-GRAPH_CHECKPOINT_SCHEMA_VERSION = 1
+GRAPH_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 class GraphCheckpoint(BaseModel):
@@ -210,6 +246,14 @@ class GraphCheckpoint(BaseModel):
     the next superstep, the superstep counter, and the visit counts used by the
     loop guard. ``graph_name`` ties the checkpoint to the graph definition that
     must be re-supplied on resume (the topology itself is code, not serialized).
+
+    The two HITL-interrupt fields (v2) make an APPROVAL pause distinguishable from a
+    timeout/crash interrupt: when a node pauses on an approval-gated tool the run is
+    stamped ``interrupted`` AND ``paused_node`` / ``member_checkpoint_id`` are set, the
+    node is left in the frontier (not completed, not visit-bumped) so a resume re-enters
+    it. A bare timeout interrupt leaves both fields empty, so the orchestration resume
+    splice is gated on their presence and a pre-existing timeout-interrupted row routes
+    through the ordinary durable resume rather than an (impossible) approve.
     """
 
     schema_version: int = GRAPH_CHECKPOINT_SCHEMA_VERSION
@@ -221,6 +265,12 @@ class GraphCheckpoint(BaseModel):
     superstep: int = 0
     visit_counts: dict[str, int] = Field(default_factory=dict)
     completed_nodes: list[str] = Field(default_factory=list)
+    #: HITL pause (v2): the node that paused on an approval-gated tool. Empty for a
+    #: non-HITL interrupt (timeout/crash). Set ⇒ the orchestration resume splice runs.
+    paused_node: str = ""
+    #: HITL pause (v2): the :class:`AgentCheckpoint` id the paused member suspended on.
+    #: The orchestration resume re-claims THIS to drive the gated tool exactly-once.
+    member_checkpoint_id: str = ""
     error: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
@@ -231,10 +281,18 @@ def _migrate_graph_v0_to_v1(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _migrate_graph_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    """v1 -> v2: adds the HITL-interrupt fields (empty — no pause had occurred)."""
+    raw.setdefault("paused_node", "")
+    raw.setdefault("member_checkpoint_id", "")
+    return raw
+
+
 #: Stepwise upgraders keyed by the *from* version; each returns the raw dict at
 #: version ``from + 1``. Every historical format must have an unbroken chain here.
 _GRAPH_MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_graph_v0_to_v1,
+    1: _migrate_graph_v1_to_v2,
 }
 
 
@@ -515,6 +573,7 @@ __all__ = [
     "APPROVED",
     "REJECTED",
     "CHECKPOINT_SCHEMA_VERSION",
+    "redact_tool_args",
     "PendingToolCall",
     "AgentCheckpoint",
     "CheckpointStore",

@@ -55,11 +55,15 @@ class RoutineUpdate(BaseModel):
 
 
 class RoutineView(BaseModel):
-    """One routine, including last-run info, as the GUI sees it."""
+    """One routine, including last-run info, as the single-user-local GUI sees it.
+
+    Studio routines are filesystem (``agent_path``) bound; the ``/v1`` workspace/``agent_id``
+    fields the shared store now carries are not part of this single-user-local view.
+    """
 
     id: str
     name: str
-    agent_path: str
+    agent_path: str | None
     prompt: str
     schedule: svc.Schedule
     provider: str | None
@@ -78,7 +82,22 @@ class RoutineView(BaseModel):
 
 def _view(routine: svc.Routine) -> RoutineView:
     return RoutineView(
-        **routine.model_dump(),
+        id=routine.id,
+        name=routine.name,
+        agent_path=routine.agent_path,
+        prompt=routine.prompt,
+        schedule=routine.schedule,
+        provider=routine.provider,
+        model=routine.model,
+        deliver=routine.deliver,
+        enabled=routine.enabled,
+        created_at=routine.created_at,
+        updated_at=routine.updated_at,
+        last_run_at=routine.last_run_at,
+        last_status=routine.last_status,
+        last_preview=routine.last_preview,
+        last_error=routine.last_error,
+        last_delivery=routine.last_delivery,
         running=svc.get_scheduler().is_running(routine.id),
     )
 
@@ -100,8 +119,14 @@ def _validate_agent_path(rel_path: str) -> None:
 
 @router.get("", response_model=list[RoutineView])
 async def list_routines() -> list[RoutineView]:
-    """All routines, newest first, with their last-run info."""
-    return [_view(r) for r in svc.get_routines_store().list()]
+    """Local routines, newest first, with their last-run info.
+
+    Scoped to the ``__local__`` workspace so the single-user Studio GUI shows only its
+    own ``agent_path`` routines and never an ``agent_id``-bound ``/v1`` tenant row (whose
+    ``agent_path`` is null) when both surfaces share ``.himmy/routines.db``.
+    """
+    rows = svc.get_routines_store().list(workspace_id=svc.LOCAL_WORKSPACE)
+    return [_view(r) for r in rows]
 
 
 @router.post("", response_model=RoutineView)

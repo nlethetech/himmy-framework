@@ -133,6 +133,10 @@ becomes an `AgentSummary` keyed by its project-relative path.
 | Knowledge | `GET/POST /knowledge`, `/{id}/ingest`, `/{id}/search`, `DELETE /{id}` | `studio_knowledge` |
 | Evaluation | `GET /evals`; `POST /evals/run` | `studio_eval` |
 | Workflows | `GET /workflows`; `POST /workflows/run` | `studio_workflows` |
+| MCP servers | `GET/POST/PUT/DELETE /mcp/servers`, `/servers/{n}/test|tools|agents`, `POST /mcp/attach` | `routers/studio_mcp` |
+| Guardrails (read-only) | `GET /guardrails` | `routers/studio_guardrails` |
+| Security log (read-only) | `GET /seclog` | `routers/studio_seclog` |
+| Privacy / governance | `GET /privacy/subjects|consents`, `POST /privacy/erase`, `/privacy/audit/export|verify` | `routers/studio_privacy` |
 | Doctor / health | `GET /health`, `/doctor` | `runtime.diagnostics` |
 
 Run/team/research/approval-resume endpoints stream **Server-Sent Events**
@@ -140,6 +144,48 @@ Run/team/research/approval-resume endpoints stream **Server-Sent Events**
 human-in-the-loop inbox: an approval-gated tool call pauses the run into an
 `AgentCheckpoint` (durable at `.himmy/approvals.db`); the GUI lists pending
 checkpoints, shows one with secret args redacted, and approve/reject resumes the run.
+
+### MCP store model (CLI vs Studio — two stores, one runtime seam)
+
+MCP server configuration is reachable from both front doors, and the two write to
+**different** stores by design — there is no single shared MCP registry, and that is
+intentional, not a gap:
+
+| Surface | What it writes | Store |
+| --- | --- | --- |
+| CLI `himmy mcp add/remove` | the server directly into a spec's `mcp_servers` | `agent.yaml` (`mcp_cmd.py::_write_back`) |
+| Studio **registry** (CRUD/test) | named stdio server *definitions* (env = secret **names** only) | `.himmy/mcp_servers.json` (`studio_mcp.py::_store_path`) |
+| Studio **attach** | a registry server into a chosen spec's `mcp_servers` | `agent.yaml` (same loader round-trip as the CLI) |
+
+The `.himmy/mcp_servers.json` registry is an **additive Studio-only project-global
+staging catalog** with no CLI equivalent — it lets the GUI define/test a server once
+and attach it to many agents. The **runtime seam both honour is `agent.yaml`'s
+`mcp_servers`** (read by `from_spec.py`): a server *attached* via Studio appears in
+`himmy mcp list` for that `agent.yaml`, and a server added via `himmy mcp` is visible
+to a Studio attach view of the same file. So the catalog/spec split is: the catalog
+stages, the spec binds — and the spec is the one shared truth the runtime launches
+with. (On `/v1` the spec's `mcp_servers`/`tools_module`/`http_tools` are tenant-driven
+subprocess/RCE/SSRF surfaces, so they are stripped from tenant-submitted specs unless
+operator-provisioned — see the tenant-spec sanitizer.)
+
+### Read-only governance viewers (data sources)
+
+Two Studio surfaces mirror CLI commands and are pure reads over **existing** durable
+stores — no new state of their own:
+
+- **Guardrails viewer** (`GET /api/studio/guardrails`, `routers/studio_guardrails`) —
+  the GUI sibling of `himmy guardrails`. The built-in catalog is the SAME
+  `builtin_rows()` the CLI prints (`cli/guardrails_view.py`); recent **firings** are
+  read from the Studio run store (`.himmy/studio.db`), where every `GUARDRAIL_APPLIED`
+  event is recorded as a `CognitionStep` of kind `safety` carrying the verdict's
+  `stage`/`blocked`/`redacted`/`flags`/`reasons`, each linked back to its `run_id`.
+- **Security-log viewer** (`GET /api/studio/seclog`, `routers/studio_seclog`) — the GUI
+  sibling of `himmy seclog`, rendered on the Privacy screen. It reads
+  `app.state.security_audit` (a `SecurityAuditLog` over the container's entity
+  registry), which since the `SpineFactory` refactor IS the durable shared
+  `.himmy/spine.db` the CLI also reads — so the viewer's rows are **identical** to
+  `himmy seclog --limit N --type T` for the same project. Single-user-local: no
+  workspace filter; the `limit`/`type` filters mirror `render_seclog`.
 
 ## How it works / launching
 

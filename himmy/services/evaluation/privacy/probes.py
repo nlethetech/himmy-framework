@@ -51,7 +51,7 @@ from himmy.services.evaluation.privacy.catalog import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
 
 #: Namespace for the deterministic suite/case ids (keeps them off the random-uuid path).
 _PROBE_NS = "privacy_probe"
@@ -391,7 +391,7 @@ class PrivacyProbeGenerator:
 
     def from_consent_ledger(
         self,
-        registry: EntityRegistry,
+        registry: EntityRegistryProtocol,
         *,
         consent_service: Any = None,
         name: str = "privacy_probes_from_ledger",
@@ -440,7 +440,7 @@ class PrivacyProbeGenerator:
         return suite
 
     def _ledger_plans(
-        self, registry: EntityRegistry
+        self, registry: EntityRegistryProtocol
     ) -> tuple[list[ScenarioPlan], dict[str, str]]:
         """Build the derived plan list (+ a subject→source map) from the registry.
 

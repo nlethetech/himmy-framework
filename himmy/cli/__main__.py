@@ -20,7 +20,13 @@ from himmy import __version__
 from himmy.cli import commands
 from himmy.cli.audit import add_audit_parser
 from himmy.cli.consent import add_consent_parser
+from himmy.cli.context_cmd import add_context_parser
+from himmy.cli.dashboard_cmd import add_dashboard_parser
+from himmy.cli.models_cmd import cmd_compare, cmd_models
 from himmy.cli.provider import PROVIDERS
+from himmy.cli.recommendations_cmd import add_recommendations_parser
+from himmy.cli.routines_cmd import add_routines_parser
+from himmy.cli.runs_cmd import add_runs_parser
 from himmy.cli.security_audit_cmd import add_seclog_parser
 from himmy.core import HimmyError
 
@@ -84,6 +90,12 @@ def _cmd_skill(args: argparse.Namespace) -> int:
     from himmy.cli.skill_dispatch import cmd_skill
 
     return cmd_skill(args)
+
+
+def _cmd_connectors(args: argparse.Namespace) -> int:
+    from himmy.cli.connectors_cmd import cmd_connectors
+
+    return cmd_connectors(args)
 
 
 def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
@@ -168,13 +180,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="re-run deterministically from a recorded cassette (no provider/network)",
     )
+    p_run.add_argument(
+        "--persist",
+        action="store_true",
+        help="record this run in the canonical store (visible in `himmy runs` + /v1 + "
+        "Studio); default off keeps the run in-RAM",
+    )
     p_run.set_defaults(func=commands.cmd_run)
 
     p_chat = sub.add_parser("chat", help="interactive chat keeping one thread")
     _add_agent_flags(p_chat)
     p_chat.add_argument("--message", help="run a single turn non-interactively")
     p_chat.add_argument(
-        "--session", help="persist/resume this conversation by id (.himmy/sessions.db)"
+        "--session",
+        help="persist/resume this conversation by id (.himmy/conversations.db)",
     )
     p_chat.add_argument(
         "-c",
@@ -182,6 +201,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="continue_last",
         action="store_true",
         help="continue the most recent session (the auto-saved 'last' thread)",
+    )
+    p_chat.add_argument(
+        "--persist",
+        action="store_true",
+        help="record a --message turn in the canonical store (visible in `himmy runs` + "
+        "/v1 + Studio); default off keeps the turn in-RAM",
     )
     p_chat.set_defaults(func=commands.cmd_chat)
 
@@ -258,6 +283,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit non-zero if any model's accuracy is below this floor (0-1), for CI",
     )
     p_bench.set_defaults(func=commands.cmd_bench)
+
+    # models — list the local providers + models himmy can run on (shared catalog seam).
+    p_models = sub.add_parser(
+        "models",
+        help="list local providers + models (with cached bench reliability)",
+    )
+    p_models.add_argument(
+        "--prices",
+        action="store_true",
+        help="append each model's input/output $/1M from the price table",
+    )
+    p_models.add_argument(
+        "--json", action="store_true", help="print the catalog as JSON"
+    )
+    p_models.set_defaults(func=cmd_models)
+
+    # compare — one prompt across N models side-by-side (the quick path; bench is rigorous).
+    p_compare = sub.add_parser(
+        "compare",
+        help="run one prompt across several models side-by-side (quick; bench is rigorous)",
+    )
+    p_compare.add_argument(
+        "prompt", nargs="+", help="the prompt to send to every model"
+    )
+    p_compare.add_argument(
+        "-m",
+        "--models",
+        action="append",
+        metavar="PROVIDER:MODEL",
+        help="a provider:model target (repeatable, or a comma list), "
+        "e.g. -m ollama:llama3.2 -m claude-cli:haiku",
+    )
+    p_compare.add_argument(
+        "--system", help="an optional system prompt sent to every model"
+    )
+    p_compare.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="per-model timeout in seconds (default: 120)",
+    )
+    p_compare.add_argument(
+        "--json", action="store_true", help="print the results as JSON"
+    )
+    p_compare.set_defaults(func=cmd_compare)
 
     p_new = sub.add_parser(
         "new",
@@ -532,6 +602,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_mcp.set_defaults(func=_cmd_mcp)
 
+    # connectors — manage the connectors that bridge agents to Slack/Discord/etc.
+    p_conn = sub.add_parser(
+        "connectors",
+        help="list/configure/enable/test the connectors that bridge agents to "
+        "external systems",
+    )
+    p_conn.add_argument(
+        "action",
+        nargs="?",
+        choices=["list", "set", "enable", "disable", "test"],
+        help="default: list",
+    )
+    p_conn.add_argument(
+        "name", nargs="?", help="connector name (set/enable/disable/test)"
+    )
+    p_conn.add_argument(
+        "--secret",
+        action="append",
+        metavar="NAME=VALUE",
+        help="a credential to write, by secret NAME (set; repeat for several)",
+    )
+    p_conn.add_argument(
+        "--allowlist",
+        help="comma-separated allow-list (channels/repos/senders) for this connector (set)",
+    )
+    p_conn.add_argument(
+        "--surface",
+        choices=["outbound", "inbound"],
+        help="which surface to enable/disable (default: outbound)",
+    )
+    p_conn.set_defaults(func=_cmd_connectors)
+
     # skill — run a single named skill as a focused sub-agent.
     p_skill = sub.add_parser(
         "skill", help="run a named skill as a focused sub-agent on a prompt"
@@ -559,6 +661,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_skill.set_defaults(func=_cmd_skill)
 
+    add_runs_parser(sub)
+    add_routines_parser(sub)
+    add_recommendations_parser(sub)
+    add_context_parser(sub)
+    add_dashboard_parser(sub)
     add_consent_parser(sub)
     add_audit_parser(sub)
     add_seclog_parser(sub)

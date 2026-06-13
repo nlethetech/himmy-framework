@@ -22,6 +22,7 @@ from himmy.entities.lineage import (
 )
 from himmy.entities.postgres import PostgresEntityRegistry
 from himmy.entities.projection import project
+from himmy.entities.protocol import EntityRegistryProtocol
 from himmy.entities.records import (
     EntityLink,
     EntityQuery,
@@ -37,6 +38,7 @@ __all__ = [
     "EntityLink",
     "EntityQuery",
     "EntityRegistry",
+    "EntityRegistryProtocol",
     "PostgresEntityRegistry",
     "SqliteEntityRegistry",
     "LineageGraph",

@@ -228,6 +228,27 @@ def test_run_now_unknown_routine_404(client: TestClient) -> None:
     assert client.post("/api/studio/routines/nope/run-now").status_code == 404
 
 
+def test_run_now_is_409_when_routine_flock_held(client: TestClient) -> None:
+    """Studio run-now surfaces 409 (not 404) when the routine's flock is held elsewhere.
+
+    Reviewer must_fix: the cross-process busy case was being swallowed on the run_now path
+    (``RoutineScheduler._guarded_execute`` ate ``RoutineBusyError`` → ``None`` → router 404),
+    making the Studio ``409`` handler dead code. Hold the flock (standing in for a CLI
+    ``himmy routines run-now`` owning it) and assert the Studio endpoint refuses with 409
+    and never starts a second run.
+    """
+    from himmy.core.process_lock import process_lock
+
+    rid = client.post("/api/studio/routines", json=_body(provider="stub")).json()["id"]
+
+    with process_lock(svc.routine_lock_name(rid)):
+        res = client.post(f"/api/studio/routines/{rid}/run-now")
+    assert res.status_code == 409, res.text
+    assert "already running" in res.json()["detail"]
+    # The guarded body never ran → no Studio run row was recorded.
+    assert client.get("/api/studio/runs").json()["total"] == 0
+
+
 # ---- unattended rails (frozen pipeline) -----------------------------------------
 
 

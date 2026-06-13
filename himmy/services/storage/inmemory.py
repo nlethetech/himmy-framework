@@ -12,12 +12,13 @@ protocols in :mod:`himmy.services.storage.protocols`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from himmy.core.events import RunEvent
 from himmy.core.ids import utc_now_iso
 from himmy.services.storage.models import (
     ActionRecord,
+    AgentDefRecord,
     AgentStateRecord,
     EnvironmentStateRecord,
     EpisodicMemoryObject,
@@ -165,6 +166,32 @@ class InMemoryRunStore:
         self._runs[run.run_id] = run
         return run, True
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool:
+        """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won).
+
+        Compare-and-set ``AWAITING_APPROVAL`` -> ``RESOLVING`` for the run, scoped to
+        ``workspace_id``. There is NO ``await`` between the read and the write, so two
+        concurrent resumes on one event loop cannot both win — exactly one flips the
+        status and returns True; the loser sees a non-AWAITING status and returns False.
+        This is the in-memory analog of the SQLite/Postgres conditional UPDATE, and the
+        run-level mirror of the member checkpoint ``claim()``: only AWAITING_APPROVAL is
+        claimable here (a fresh approve), so a SECOND concurrent click loses and is
+        refused, while a stale RESOLVING run (a crashed resume) is re-driven through the
+        recovery path, not this method.
+        """
+        run = self._runs.get(run_id)
+        if (
+            run is None
+            or run.workspace_id != workspace_id
+            or run.status != RunStatus.AWAITING_APPROVAL
+        ):
+            return False
+        run.status = RunStatus.RESOLVING
+        run.updated_at = utc_now_iso()
+        return True
+
     def _index_idempotency(self, run: RunRecord) -> None:
         """Maintain the (workspace_id, idempotency_key) -> run_id index."""
         if run.idempotency_key is not None:
@@ -199,6 +226,91 @@ class InMemoryRunStore:
         if run_id is None:
             return None
         return self._runs.get(run_id)
+
+
+class InMemoryAgentDefStore:
+    """Process-local workspace-scoped stored agent definitions (T2e).
+
+    Keyed by ``agent_id`` with a ``(workspace_id, idempotency_key)`` index mirroring
+    the run store's idempotency primitive, so an idempotent re-POST returns the prior
+    record. All reads are tenant-scoped: a record from another workspace reads as None.
+    """
+
+    def __init__(self) -> None:
+        self._defs: dict[str, AgentDefRecord] = {}
+        # (workspace_id, idempotency_key) -> agent_id
+        self._by_idempotency: dict[tuple[str, str], str] = {}
+
+    async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
+        """Upsert an agent definition keyed by ``agent_id`` (refreshes ``updated_at``)."""
+        record.updated_at = utc_now_iso()
+        self._index_idempotency(record)
+        self._defs[record.agent_id] = record
+        return record
+
+    async def save_agent_def_if_absent(
+        self, record: AgentDefRecord
+    ) -> tuple[AgentDefRecord, bool]:
+        """Create an agent def unless its ``(workspace, idempotency_key)`` already exists.
+
+        Returns ``(record, created)``. No ``await`` between the read and the write, so
+        two concurrent callers with the same key cannot both create (the in-memory
+        analog of the run store's atomic idempotent insert).
+        """
+        key = record.idempotency_key
+        if key is not None:
+            existing_id = self._by_idempotency.get((record.workspace_id, key))
+            if existing_id is not None:
+                existing = self._defs.get(existing_id)
+                if existing is not None:
+                    return existing, False
+        record.updated_at = utc_now_iso()
+        self._index_idempotency(record)
+        self._defs[record.agent_id] = record
+        return record, True
+
+    def _index_idempotency(self, record: AgentDefRecord) -> None:
+        """Maintain the (workspace_id, idempotency_key) -> agent_id index."""
+        if record.idempotency_key is not None:
+            self._by_idempotency.setdefault(
+                (record.workspace_id, record.idempotency_key), record.agent_id
+            )
+
+    async def get_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> AgentDefRecord | None:
+        """Return an agent def by id, tenant-scoped (out-of-workspace reads as None)."""
+        rec = self._defs.get(agent_id)
+        if rec is None:
+            return None
+        if workspace_id is not None and rec.workspace_id != workspace_id:
+            return None
+        return rec
+
+    async def list_agent_defs(
+        self, *, workspace_id: str | None = None
+    ) -> list[AgentDefRecord]:
+        """List agent defs for a workspace (created_at asc)."""
+        items = [
+            r
+            for r in self._defs.values()
+            if workspace_id is None or r.workspace_id == workspace_id
+        ]
+        return sorted(items, key=lambda r: r.created_at)
+
+    async def delete_agent_def(
+        self, agent_id: str, *, workspace_id: str | None = None
+    ) -> bool:
+        """Delete an agent def, tenant-scoped. Returns True iff a row was removed."""
+        rec = self._defs.get(agent_id)
+        if rec is None:
+            return False
+        if workspace_id is not None and rec.workspace_id != workspace_id:
+            return False
+        self._defs.pop(agent_id, None)
+        if rec.idempotency_key is not None:
+            self._by_idempotency.pop((rec.workspace_id, rec.idempotency_key), None)
+        return True
 
 
 class InMemoryRecommendationStore:
@@ -266,18 +378,36 @@ class InMemoryEvaluationStore:
         self._evaluation_runs[run.run_id] = run
         return run
 
-    async def get_evaluation_run(self, run_id: str) -> EvaluationRun | None:
-        """Return an evaluation run by id, or None."""
-        return self._evaluation_runs.get(run_id)
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> EvaluationRun | None:
+        """Return an evaluation run by id, tenant-scoped (AAEO-4).
+
+        When ``workspace_id`` is supplied, a run belonging to another workspace is
+        treated as not found (returns None).
+        """
+        run = self._evaluation_runs.get(run_id)
+        if run is None:
+            return None
+        if (
+            workspace_id is not None
+            and getattr(run, "workspace_id", None) != workspace_id
+        ):
+            return None
+        return cast("EvaluationRun", run)
 
     async def list_evaluation_runs(
-        self, suite_id: str | None = None
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
     ) -> list[EvaluationRun]:
-        """List evaluation runs, optionally filtered by suite id."""
+        """List evaluation runs, optionally filtered by suite id and workspace (AAEO-4)."""
         return [
             r
             for r in self._evaluation_runs.values()
-            if suite_id is None or getattr(r, "suite_id", None) == suite_id
+            if (suite_id is None or getattr(r, "suite_id", None) == suite_id)
+            and (
+                workspace_id is None
+                or getattr(r, "workspace_id", None) == workspace_id
+            )
         ]
 
 
@@ -399,6 +529,7 @@ class InMemoryOrchestrationStore:
 
 
 __all__ = [
+    "InMemoryAgentDefStore",
     "InMemoryContextStore",
     "InMemoryEvaluationStore",
     "InMemoryEventLog",

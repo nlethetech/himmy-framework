@@ -45,6 +45,19 @@ from himmy.connectors.github import (
     GitHubRateLimitError,
     register_github_connectors,
 )
+from himmy.connectors.manage import (
+    CONNECTOR_CATALOG,
+    ConnectorDescriptor,
+    ConnectorService,
+    ConnectorStatus,
+    ConnectorTestResult,
+    SecretSpec,
+    SecretStatus,
+    ensure_builtin_connectors_registered,
+)
+from himmy.connectors.manage import (
+    ReadOnlyBackendError as ConnectorReadOnlyBackendError,
+)
 from himmy.connectors.models import (
     FeedFailure,
     ForexRate,
@@ -222,4 +235,14 @@ __all__ = [
     "DEFAULT_TIMESTAMP_HEADER",
     "DEFAULT_MAX_TIMESTAMP_SKEW",
     "DEFAULT_MAX_BODY_BYTES",
+    # Connector management service (catalog/configure/enable/test/build)
+    "ConnectorService",
+    "ConnectorDescriptor",
+    "ConnectorStatus",
+    "ConnectorTestResult",
+    "SecretSpec",
+    "SecretStatus",
+    "CONNECTOR_CATALOG",
+    "ConnectorReadOnlyBackendError",
+    "ensure_builtin_connectors_registered",
 ]

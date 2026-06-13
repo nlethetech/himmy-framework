@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -31,9 +31,10 @@ from himmy.api import (
     studio_agents,
     studio_approvals,
     studio_connections,
+    studio_feedback,
     studio_service,
 )
-from himmy.api.auth import require_permission
+from himmy.api.auth import get_principal, require_permission
 from himmy.api.studio_approvals import ApprovalDetail, ApprovalSummary
 from himmy.api.studio_connections import (
     ConnectionStatus,
@@ -41,6 +42,7 @@ from himmy.api.studio_connections import (
     ReadOnlyBackendError,
     SendResult,
 )
+from himmy.api.studio_feedback import RunFeedback
 from himmy.api.studio_runs import (
     RunAnalytics,
     StudioRun,
@@ -159,14 +161,28 @@ def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+def _canonical_storage(request: Request) -> Any | None:
+    """The ONE canonical run store every surface reads (T2.2), or None.
+
+    A Studio run mirrors into this store so it is browsable from ``/v1`` + the CLI.
+    Resolved from the request-bound container's storage (the same backend the
+    ``RunAppService`` writes), so a SQLite *or* Postgres deployment mirrors through the
+    same async store on the main loop. Returns None when no container is attached (a
+    bare test app) so the streamer degrades to studio.db-only, never erroring.
+    """
+    container = getattr(request.app.state, "container", None)
+    return getattr(container, "storage", None) if container is not None else None
+
+
 @router.post("/run")
-async def run(body: RunRequest) -> StreamingResponse:
+async def run(body: RunRequest, request: Request) -> StreamingResponse:
     """Run an agent for one user turn, streaming GUI events over SSE.
 
     Loads the selected ``agent.yaml`` (with project defaults + skills applied),
     wires it exactly like ``himmy run``, and streams ``start``/``token``/``tool``/
     ``message``/``done`` frames. A load/build failure becomes a single ``error``
-    frame so the client always gets a clean end to the stream.
+    frame so the client always gets a clean end to the stream. The run is mirrored
+    into the canonical run store (T2.2) so it is browsable from ``/v1`` + the CLI.
     """
     # Resolve + load up front so a bad path is a clean 4xx, not a mid-stream error.
     try:
@@ -178,6 +194,8 @@ async def run(body: RunRequest) -> StreamingResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    canonical = _canonical_storage(request)
+
     async def _stream() -> AsyncIterator[str]:
         try:
             async for event in studio_service.stream_agent_run(
@@ -187,6 +205,7 @@ async def run(body: RunRequest) -> StreamingResponse:
                 provider=body.provider,
                 model=body.model,
                 agent_path=body.agent_path,
+                canonical_storage=canonical,
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - surface as a terminal error frame
@@ -207,12 +226,13 @@ class RunTeamRequest(BaseModel):
 
 
 @router.post("/run-team")
-async def run_team(body: RunTeamRequest) -> StreamingResponse:
+async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
     """Run a multi-agent team, streaming the live routing/delegate/tool trail (SSE).
 
     Members run on their own providers (e.g. a Claude-CLI manager delegating to local
     Ollama workers). Frames: ``start`` → ``delegate``/``handoff``/``tool`` → ``message``
-    → ``done`` (or a terminal ``error``).
+    → ``done`` (or a terminal ``error``). The team run is mirrored into the canonical
+    run store (T2.2) so it is browsable from ``/v1`` + the CLI.
     """
     try:
         spec = studio_service.load_team(body.team_path)
@@ -223,11 +243,16 @@ async def run_team(body: RunTeamRequest) -> StreamingResponse:
 
     teams = {t.path: t for t in studio_service.list_teams()}
     team_name = teams[body.team_path].name if body.team_path in teams else "team"
+    canonical = _canonical_storage(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
             async for event in studio_service.stream_team_run(
-                spec, body.prompt, team_name=team_name, team_path=body.team_path
+                spec,
+                body.prompt,
+                team_name=team_name,
+                team_path=body.team_path,
+                canonical_storage=canonical,
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
@@ -265,13 +290,14 @@ class ResearchRequest(BaseModel):
 
 
 @router.post("/research")
-async def research(body: ResearchRequest) -> StreamingResponse:
+async def research(body: ResearchRequest, request: Request) -> StreamingResponse:
     """Run a deep-research agent (web search + fetch) for one question over SSE.
 
     Builds an ephemeral research-configured :class:`AgentSpec` (web tools + a
     plan→search→synthesize methodology) and streams the same cognition/tool/message
     frames as a normal run — so the client can show the live search trail and the
     final report. Reuses all existing run machinery; nothing is persisted as an agent.
+    The run is mirrored into the canonical run store (T2.2) like any other Studio run.
     """
     from himmy.config.agent_spec import AgentSpec
 
@@ -285,6 +311,7 @@ async def research(body: ResearchRequest) -> StreamingResponse:
         provider=body.provider,
         model=body.model or "default",
     )
+    canonical = _canonical_storage(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
@@ -294,6 +321,7 @@ async def research(body: ResearchRequest) -> StreamingResponse:
                 provider=body.provider,
                 model=body.model,
                 agent_path="(deep-research)",
+                canonical_storage=canonical,
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
@@ -307,13 +335,23 @@ async def research(body: ResearchRequest) -> StreamingResponse:
 
 
 @router.get("/runs", response_model=StudioRunListResponse)
-async def list_runs(limit: int = 50, offset: int = 0) -> StudioRunListResponse:
-    """List past Studio runs (newest first), paginated."""
+async def list_runs(
+    request: Request, limit: int = 50, offset: int = 0
+) -> StudioRunListResponse:
+    """List past runs (newest first), paginated, from the ONE canonical store (T2.2).
+
+    Reads the canonical run store every surface shares, so runs created by ``/v1`` and
+    the CLI ``--persist`` path appear here too (Studio is the single-user-local browse
+    over the unified store). studio.db is a presentation cache that enriches matching
+    rows + supplies human feedback.
+    """
+    from himmy.api.studio_canonical import list_studio_runs_unified
+
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
-    store = get_run_store()
-    items = store.list(limit=limit, offset=offset)
-    total = store.count()
+    items, total = await list_studio_runs_unified(
+        _canonical_storage(request), limit=limit, offset=offset
+    )
     return StudioRunListResponse(
         items=items,
         total=total,
@@ -330,12 +368,53 @@ async def runs_analytics() -> RunAnalytics:
 
 
 @router.get("/runs/{run_id}", response_model=StudioRun)
-async def get_run(run_id: str) -> StudioRun:
-    """Fetch one run in full: transcript, tools, and the step-by-step timeline."""
-    run = get_run_store().get(run_id)
+async def get_run(run_id: str, request: Request) -> StudioRun:
+    """Fetch one run in full from the canonical store: transcript, tools, timeline.
+
+    Resolves through the ONE canonical run store (T2.2) so a ``/v1``- or CLI-authored
+    run is viewable in the Studio detail panel, with the studio.db cache supplying the
+    richest fields when present.
+    """
+    from himmy.api.studio_canonical import get_studio_run_unified
+
+    run = await get_studio_run_unified(_canonical_storage(request), run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run
+
+
+class RunFeedbackRequest(BaseModel):
+    """A human's thumbs up/down on a run (with an optional note)."""
+
+    verdict: Literal["up", "down"]
+    note: str | None = Field(default=None, max_length=4000)
+
+
+@router.post("/runs/{run_id}/feedback", response_model=RunFeedback)
+async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback:
+    """Record human feedback on a run (the cheapest, least-noisy learning signal).
+
+    Writes the verdict to the run row and appends an immutable, versioned
+    ``run_feedback`` record to the entity spine. Re-rating is allowed and produces
+    a new spine version (a full audit of every verdict change).
+    """
+    try:
+        fb = studio_feedback.record_feedback(
+            run_id, verdict=body.verdict, note=body.note
+        )
+    except ValueError as exc:  # unknown verdict (belt-and-braces vs the Literal)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if fb is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return fb
+
+
+@router.get("/runs/{run_id}/feedback", response_model=RunFeedback | None)
+async def get_run_feedback(run_id: str) -> RunFeedback | None:
+    """Current feedback on a run (latest verdict), or ``null`` if none yet."""
+    if get_run_store().get(run_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return studio_feedback.get_feedback(run_id)
 
 
 # ---- Connections (connect Email/Telegram/Web so agents can act) ---------
@@ -376,6 +455,37 @@ async def delete_connection(ctype: str) -> ConnectionStatus:
         return studio_connections.delete_connection(ctype)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="unknown connection type") from exc
+    except ReadOnlyBackendError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.put("/connections/{ctype}/enable", response_model=ConnectionStatus)
+async def enable_connection(ctype: str) -> ConnectionStatus:
+    """Enable a connector-managed connection for its surface (outbound tool / inbound mount).
+
+    Delegates to the connector-management service so the flag the runtime + CLI honor is the
+    SAME store key. 404 for an unknown or non-enableable connection (email/telegram/web_search
+    are always-on once configured); 409 on a read-only secrets backend.
+    """
+    try:
+        return studio_connections.set_enabled(ctype, True)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="unknown or non-enableable connection"
+        ) from exc
+    except ReadOnlyBackendError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.put("/connections/{ctype}/disable", response_model=ConnectionStatus)
+async def disable_connection(ctype: str) -> ConnectionStatus:
+    """Disable a connector-managed connection (its tool/mount stops being wired)."""
+    try:
+        return studio_connections.set_enabled(ctype, False)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="unknown or non-enableable connection"
+        ) from exc
     except ReadOnlyBackendError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -583,24 +693,39 @@ async def approval(checkpoint_id: str) -> ApprovalDetail:
     return detail
 
 
-def _resolve_stream(checkpoint_id: str, approved: bool) -> StreamingResponse:
+def _approval_actor(request: Request) -> str:
+    """Who resolved this approval: the authenticated subject, else ``human``.
+
+    On the zero-config single-user loopback default the principal is anonymous,
+    so the meaningful label is the local human; with auth on, the real subject is
+    stamped onto the APPROVAL_GRANTED/REJECTED event for who-approved-what mining.
+    """
+    subject = (getattr(get_principal(request), "subject", "") or "").strip()
+    return subject if subject and subject != "anonymous" else "human"
+
+
+def _resolve_stream(
+    checkpoint_id: str, approved: bool, actor: str
+) -> StreamingResponse:
     async def _gen() -> AsyncIterator[str]:
-        async for event in studio_approvals.resolve(checkpoint_id, approved=approved):
+        async for event in studio_approvals.resolve(
+            checkpoint_id, approved=approved, actor=actor
+        ):
             yield _sse(event)
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 @router.post("/approvals/{checkpoint_id}/approve")
-async def approve(checkpoint_id: str) -> StreamingResponse:
+async def approve(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Approve the pending tool call and stream the resumed run."""
-    return _resolve_stream(checkpoint_id, True)
+    return _resolve_stream(checkpoint_id, True, _approval_actor(request))
 
 
 @router.post("/approvals/{checkpoint_id}/reject")
-async def reject(checkpoint_id: str) -> StreamingResponse:
+async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Reject the pending tool call and stream the resumed run."""
-    return _resolve_stream(checkpoint_id, False)
+    return _resolve_stream(checkpoint_id, False, _approval_actor(request))
 
 
 # ---- Models (available providers + models) ------------------------------
@@ -608,42 +733,15 @@ async def reject(checkpoint_id: str) -> StreamingResponse:
 
 @router.get("/models")
 async def models() -> list[dict[str, Any]]:
-    """Available providers + their models, with any cached benchmark stats."""
-    import shutil
+    """Available providers + their models, with any cached benchmark stats.
 
-    from himmy.api import studio_bench
+    Delegates to the shared :func:`himmy.services.inference.compare.build_model_catalog`
+    seam (T3d) — the SAME catalog ``GET /v1/models`` and ``himmy models`` render, so the
+    three surfaces never drift. The response shape is unchanged.
+    """
+    from himmy.services.inference.compare import build_model_catalog
 
-    # model name → {accuracy, latency} from prior `himmy bench` runs
-    stats: dict[str, dict[str, Any]] = {}
-    for e in studio_bench.list_cached():
-        m = e.get("model")
-        if m:
-            stats[m] = {"accuracy": e.get("accuracy"), "latency": e.get("latency")}
-
-    out: list[dict[str, Any]] = []
-
-    ollama = await studio_bench._ollama_models()
-    out.append(
-        {
-            "provider": "ollama",
-            "available": bool(ollama),
-            "models": [{"name": m, **stats.get(m, {})} for m in ollama],
-        }
-    )
-
-    claude = shutil.which("claude") is not None
-    out.append(
-        {
-            "provider": "claude-cli",
-            "available": claude,
-            "models": [
-                {"name": n, **stats.get(n, {})} for n in ("haiku", "sonnet", "opus")
-            ]
-            if claude
-            else [],
-        }
-    )
-    return out
+    return cast(list[dict[str, Any]], await build_model_catalog())
 
 
 # ---- Compare (one prompt, N models, side-by-side) -----------------------
@@ -685,62 +783,33 @@ async def compare(body: CompareRequest) -> list[CompareResult]:
 
     Each target is an isolated model call (no tools, no run history) so the cells
     are directly comparable on output, tokens, cost, and latency.
+
+    Delegates to the shared :func:`himmy.services.inference.compare.run_compare` seam
+    (T3d) — the SAME per-target loop ``POST /v1/models/compare`` and ``himmy compare``
+    drive. The response shape is unchanged.
     """
-    import asyncio
+    from himmy.services.inference.compare import CompareTargetSpec, run_compare
 
-    from himmy.cli.provider import build_manager_for
-    from himmy.services.inference.models import (
-        InferenceMessage,
-        InferenceRequest,
-        InferenceStatus,
+    cells = await run_compare(
+        [CompareTargetSpec(provider=t.provider, model=t.model) for t in body.targets],
+        prompt=body.prompt,
+        system=body.system,
+        timeout_seconds=body.timeout_seconds,
     )
-
-    def _messages() -> list[InferenceMessage]:
-        msgs: list[InferenceMessage] = []
-        if body.system:
-            msgs.append(InferenceMessage(role="system", content=body.system))
-        msgs.append(InferenceMessage(role="user", content=body.prompt))
-        return msgs
-
-    async def _one(target: CompareTarget) -> CompareResult:
-        try:
-            manager = build_manager_for(target.provider, target.model)
-        except Exception as exc:  # noqa: BLE001 - report per-cell, never 500
-            return CompareResult(
-                provider=target.provider,
-                model=target.model,
-                ok=False,
-                error=str(exc),
-            )
-        request = InferenceRequest(
-            model_key=target.model,
-            messages=_messages(),
-            timeout_seconds=body.timeout_seconds,
+    return [
+        CompareResult(
+            provider=cell.provider,
+            model=cell.model,
+            ok=cell.ok,
+            output=cell.output,
+            error=cell.error,
+            input_tokens=cell.input_tokens,
+            output_tokens=cell.output_tokens,
+            cost=cell.cost,
+            latency_ms=cell.latency_ms,
         )
-        try:
-            resp = await manager.generate(request)
-        except Exception as exc:  # noqa: BLE001 - report per-cell
-            return CompareResult(
-                provider=target.provider,
-                model=target.model,
-                ok=False,
-                error=str(exc),
-            )
-        ok = resp.status == InferenceStatus.SUCCESS
-        err_msg = resp.error.message if resp.error else "model call failed"
-        return CompareResult(
-            provider=target.provider,
-            model=target.model,
-            ok=ok,
-            output=resp.output_text or "",
-            error=None if ok else err_msg,
-            input_tokens=resp.input_tokens,
-            output_tokens=resp.output_tokens,
-            cost=resp.cost,
-            latency_ms=resp.latency_ms,
-        )
-
-    return list(await asyncio.gather(*(_one(t) for t in body.targets)))
+        for cell in cells
+    ]
 
 
 # ---- Tasks --------------------------------------------------------------

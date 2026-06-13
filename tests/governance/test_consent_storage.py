@@ -95,5 +95,9 @@ def test_gated_methods_cover_every_subject_bearing_sink() -> None:
         "save_agent_state",
         "save_action",
         "save_environment_state",
+        # T2e: a stored AgentSpec is workspace-scoped tenant config with no
+        # first-class subject_id — not a subject-bearing PII sink.
+        "save_agent_def",
+        "save_agent_def_if_absent",
     }
     assert save_methods == GATED_SAVE_METHODS | known_non_subject

@@ -49,6 +49,85 @@ OnEvent = Callable[[RunEvent], Awaitable[None]]
 HANDOFF_PREFIX = "transfer_to_"
 DELEGATE_PREFIX = "ask_"
 
+
+#: Marker key a delegate handler returns when its WORKER called an approval-gated tool.
+#: The delegate sub-run's own raise is swallowed by the tool service into a generic error
+#: return, so the manager loop instead detects this structured marker on the ``ask_*``
+#: tool return and fails the whole run closed (naming the tool).
+_HITL_UNSUPPORTED_MARKER = "__hitl_unsupported__"
+
+
+class HitlUnsupportedError(HimmyError):
+    """An approval-gated tool fired in an orchestration kind without nested HITL.
+
+    Robust nested HITL ships for the ``graph``/workflow kind only; ``multi_agent`` and
+    ``group_chat`` (and the multi_agent delegate sub-run) FAIL CLOSED — the gated tool
+    is denied by the single tool gate and never runs un-approved, and rather than
+    silently continuing past that denial the run is failed loudly, naming the tool.
+    """
+
+
+def _gated_tool_denied(result: RunResult) -> str | None:
+    """The name of an approval-gated tool that was DENIED in this turn, if any.
+
+    Mirrors the single-agent runtime's pending-approvals detection EXACTLY (a ``denied``
+    outcome with ``error_code == 'POLICY_BLOCKED'``) so an ordinary policy denial is not
+    misclassified — only a ``requires_approval`` gate is. Returns the first such tool
+    name (for the fail-closed error), else ``None``.
+    """
+    denied_ids = {
+        r.tool_call_id
+        for r in result.tool_returns
+        if r.outcome == "denied"
+        and (r.metadata or {}).get("error_code") == "POLICY_BLOCKED"
+    }
+    for call in result.tool_calls:
+        if call.tool_call_id in denied_ids:
+            return call.tool_name
+    return None
+
+
+def _delegate_marker(result: RunResult) -> dict[str, Any] | None:
+    """The HITL-unsupported marker a delegate (``ask_*``) sub-run surfaced, if any.
+
+    A delegate whose WORKER called an approval-gated tool returns the structured
+    :data:`_HITL_UNSUPPORTED_MARKER` (its own raise is swallowed by the tool service);
+    that marker rides back on the ``ask_*`` tool return's content. Returns the marker
+    dict so the manager loop can fail the whole run closed naming the worker's tool.
+    """
+    for ret in result.tool_returns:
+        content = ret.content
+        if isinstance(content, dict) and content.get(_HITL_UNSUPPORTED_MARKER):
+            return content
+    return None
+
+
+def _fail_closed_on_gated_tool(result: RunResult, *, kind: str) -> None:
+    """Raise :class:`HitlUnsupportedError` if ``result`` denied an approval-gated tool.
+
+    Called after each member turn. Two cases fail closed: the member itself called a
+    ``requires_approval`` tool (denied with ``POLICY_BLOCKED``), OR a DELEGATE sub-run
+    one level down did (surfaced via the structured marker on the ``ask_*`` return). The
+    gated tool has ALREADY been denied by the tool gate (it never ran), so this only
+    converts that silent denial into a clean FAILED run naming the tool — never a
+    privileged-tool execution and never a silent continue.
+    """
+    tool = _gated_tool_denied(result)
+    detail = ""
+    if tool is None:
+        marker = _delegate_marker(result)
+        if marker is not None:
+            tool = str(marker.get("tool") or "")
+            kind = str(marker.get("kind") or kind)
+            worker = marker.get("worker")
+            detail = f" (delegated to worker {worker!r})" if worker else ""
+    if tool:
+        raise HitlUnsupportedError(
+            f"approval-gated tool {tool!r} was called inside a {kind} run{detail}, but "
+            f"human-in-the-loop approval is not supported for the {kind} kind "
+            "(use a workflow or a graph team for HITL); the tool was NOT executed."
+        )
+
 #: Serializes synthetic-tool registration on a SHARED :class:`ToolRegistry`. Two
 #: orchestrators constructed concurrently (e.g. per-request wiring on different
 #: threads) must not interleave the check-then-register sequence below, or a genuine
@@ -274,6 +353,22 @@ class MultiAgentOrchestrator:
                 max_turns=self._delegate_max_turns,
                 llm_config=self._cfg(worker),
             )
+            # Fail closed if the WORKER (one level down) called an approval-gated tool:
+            # the delegate sub-run is a nested loop the flat checkpoint cannot represent,
+            # so the gated tool was denied and must not silently continue. The handler's
+            # raise is swallowed by the tool service into a generic error return, so
+            # instead we surface a STRUCTURED marker the manager loop detects (see
+            # ``_fail_closed_on_gated_tool``) — guaranteeing the run fails loudly naming
+            # the tool rather than the manager continuing past the denied delegate.
+            for _turn in loop.turns:
+                gated = _gated_tool_denied(_turn)
+                if gated is not None:
+                    return {
+                        _HITL_UNSUPPORTED_MARKER: True,
+                        "kind": "multi_agent delegate",
+                        "tool": gated,
+                        "worker": worker_name,
+                    }
             answer = loop.final.output_text or ""
             await self._emit(
                 RunEvent(
@@ -334,6 +429,7 @@ class MultiAgentOrchestrator:
             thread=thread,
             llm_config=self._cfg(active),
         )
+        _fail_closed_on_gated_tool(result, kind="multi_agent")
         turns.append((active.name, result))
 
         while True:
@@ -393,6 +489,7 @@ class MultiAgentOrchestrator:
                 task_context=self._ctx(active),
                 llm_config=self._cfg(active),
             )
+            _fail_closed_on_gated_tool(result, kind="multi_agent")
             turns.append((active.name, result))
 
     # --------------------------------------------------------------------- helpers
@@ -518,4 +615,5 @@ __all__ = [
     "MultiAgentOrchestrator",
     "MultiAgentResult",
     "OnEvent",
+    "HitlUnsupportedError",
 ]
