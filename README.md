@@ -21,6 +21,10 @@ spine. State is reconstructed from the latest versioned snapshot (not by folding
 
 Requires Python **3.12+**.
 
+> 🚀 **New here? [Quickstart — deploy in 5 minutes](docs/QUICKSTART.md).** Plain-English,
+> copy-paste steps from install to talking to an agent — including the free, offline,
+> no-API-key path.
+
 ---
 
 ## See it in 30 seconds — fully offline, zero keys

@@ -16,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from himmy.services.sandbox.models import SandboxLimits
+from himmy.services.sandbox.models import SandboxLimits, SandboxPolicy
 
 
 class ToolkitConfig(BaseModel):
@@ -69,9 +69,38 @@ class ToolkitConfig(BaseModel):
 
     # code pack -------------------------------------------------------------
     sandbox_limits: SandboxLimits = Field(default_factory=SandboxLimits)
-    code_exec: str = "subprocess"  # off | subprocess | container (HIMMY_CODE_EXEC)
+    # off | subprocess | container | gvisor | firecracker (HIMMY_CODE_EXEC). The last
+    # two are Linux-only (gVisor) / Linux+KVM-only (Firecracker); see docs/enterprise/sandbox.md.
+    code_exec: str = "subprocess"
     sandbox_image: str = "python:3.12-slim"
     sandbox_engine: str = "docker"
+    #: Hardened-backend isolation contract (network/ephemeral/limits/host/audit). The
+    #: resource envelope is taken from ``sandbox_limits``; the egress fields below feed
+    #: the optional mediated allow-list. Defaults are the locked-down posture.
+    sandbox_network: str = "none"  # none | egress_proxy (HIMMY_SANDBOX_NETWORK)
+    sandbox_egress_network: str | None = None  # HIMMY_SANDBOX_EGRESS_NETWORK
+    sandbox_egress_proxy_url: str | None = None  # HIMMY_SANDBOX_EGRESS_PROXY
+
+    def build_sandbox_policy(self) -> SandboxPolicy:
+        """Assemble the :class:`SandboxPolicy` the hardened backend enforces.
+
+        The resource envelope comes from ``sandbox_limits``; the network posture from
+        the egress fields. An unknown ``sandbox_network`` value falls back to the safe
+        default (deny). The remaining OS-level guarantees keep their locked-down
+        defaults (read-only rootfs, cap-drop ALL, no-new-privileges, non-root, audit).
+        """
+        from himmy.services.sandbox.models import NetworkMode
+
+        try:
+            network = NetworkMode(self.sandbox_network.strip().lower())
+        except ValueError:
+            network = NetworkMode.NONE
+        return SandboxPolicy(
+            limits=self.sandbox_limits,
+            network=network,
+            egress_network=self.sandbox_egress_network,
+            egress_proxy_url=self.sandbox_egress_proxy_url,
+        )
 
     # memory pack -----------------------------------------------------------
     memory_path: str | None = None  # sqlite file → durable; None → in-process
@@ -176,6 +205,9 @@ class ToolkitConfig(BaseModel):
             code_exec=env.get("HIMMY_CODE_EXEC", "subprocess"),
             sandbox_image=env.get("HIMMY_SANDBOX_IMAGE", "python:3.12-slim"),
             sandbox_engine=env.get("HIMMY_SANDBOX_ENGINE", "docker"),
+            sandbox_network=env.get("HIMMY_SANDBOX_NETWORK", "none"),
+            sandbox_egress_network=env.get("HIMMY_SANDBOX_EGRESS_NETWORK"),
+            sandbox_egress_proxy_url=env.get("HIMMY_SANDBOX_EGRESS_PROXY"),
             memory_path=env.get("HIMMY_MEMORY_PATH"),
             memory_subject=env.get("HIMMY_MEMORY_SUBJECT", "default"),
             memory_min_similarity=(

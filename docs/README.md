@@ -11,6 +11,9 @@ under `himmy/`.
 
 ## Start here
 
+- **[Quickstart — deploy in 5 minutes](./QUICKSTART.md)** — the fastest path for a brand-new
+  user: install, bring a model (free offline Ollama **or** an API key), run Studio and/or the
+  CLI, and talk to your first agent. Start here if you've never run Himmy.
 - **[Architecture overview](./architecture/overview.md)** — the layered package map, the
   offline-first philosophy, and the end-to-end shape of a single agent run. Read this first.
 - **[Local-first & hardening](./architecture/local-first.md)** — what runs with zero config,
@@ -58,7 +61,8 @@ under `himmy/`.
 
 | Doc | What it covers |
 | --- | --- |
-| [Sandbox](./services/sandbox.md) | `off`/`subprocess`/`container` code execution, container hardening, gVisor/Kata seam. |
+| [Sandbox (service)](./services/sandbox.md) | `off`/`subprocess`/`container` code execution, container hardening, gVisor/Firecracker seam. |
+| [Sandbox backends (operator guide)](./enterprise/sandbox.md) | The five backends, the security ladder, which to use per tier, and how to deploy/verify gVisor & Firecracker on a Linux+KVM host. |
 | [Guardrails](./services/guardrails.md) | Guardrail pipeline, PII/injection/blocklist built-ins, DLP + reversible tokenization. |
 | [Governance](./services/governance.md) | Retention, crypto-shredding for right-to-erasure, erasure tombstones. |
 | [Audit](./services/audit.md) | `SecurityEvent` records, signed bundles / SIEM export, tamper-evidence. |

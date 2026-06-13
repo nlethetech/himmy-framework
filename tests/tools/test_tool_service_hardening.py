@@ -100,6 +100,446 @@ def test_http_preencoded_basic_passes_through(monkeypatch) -> None:
     assert seen["auth"] == "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
 
 
+def test_http_api_key_query_appends_secret_as_param(monkeypatch) -> None:
+    """API_KEY_QUERY puts the secret in the query string, not a header."""
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    monkeypatch.setenv("APIKEY", "k-xyz")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["api_key"] = request.url.params.get("api_key")
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"ok": True})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="t",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            path_template="/x",
+            auth=HttpAuthConfig(
+                mode=HttpAuthMode.API_KEY_QUERY, env_var="APIKEY", query_param="api_key"
+            ),
+        ),
+    )
+    run_async(svc.execute(ToolInvocation(tool_name="t")))
+    run_async(svc.aclose())
+    assert seen["api_key"] == "k-xyz"
+    assert seen["auth"] is None  # not a header
+
+
+def test_http_basic_auth_with_username(monkeypatch) -> None:
+    """BASIC with a username encodes ``username:secret`` (the secret is the password)."""
+    import base64
+
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    monkeypatch.setenv("PW", "s3cr3t")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"ok": True})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="t",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            path_template="/x",
+            auth=HttpAuthConfig(
+                mode=HttpAuthMode.BASIC, env_var="PW", username="svc-account"
+            ),
+        ),
+    )
+    run_async(svc.execute(ToolInvocation(tool_name="t")))
+    run_async(svc.aclose())
+    expected = base64.b64encode(b"svc-account:s3cr3t").decode()
+    assert seen["auth"] == f"Basic {expected}"
+
+
+def test_http_static_query_always_sent(monkeypatch) -> None:
+    """static_query params are merged onto every request (e.g. an API version)."""
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["v"] = request.url.params.get("v")
+        return httpx.Response(200, json={"ok": True})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="t",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE", path_template="/x", static_query={"v": "2024-01"}
+        ),
+    )
+    run_async(svc.execute(ToolInvocation(tool_name="t")))
+    run_async(svc.aclose())
+    assert seen["v"] == "2024-01"
+
+
+def test_http_idempotency_key_header_on_mutation(monkeypatch) -> None:
+    """A configured idempotency_arg rides as the Idempotency-Key header on a POST."""
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["key"] = request.headers.get("idempotency-key")
+        return httpx.Response(201, json={"created": True})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="t",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            method="POST",
+            path_template="/orders",
+            body_arg_names=["sku"],
+            idempotency_arg="request_id",
+        ),
+    )
+    run_async(
+        svc.execute(
+            ToolInvocation(
+                tool_name="t", args={"sku": "A1", "request_id": "req-7"}
+            )
+        )
+    )
+    run_async(svc.aclose())
+    assert seen["key"] == "req-7"
+
+
+def test_non_idempotent_post_not_retried_on_timeout(monkeypatch) -> None:
+    """A POST with no idempotency key is NOT retried on TIMEOUT (may have landed)."""
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadTimeout("slow", request=request)
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="post_once",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE", method="POST", path_template="/orders"
+        ),
+        retry_hints={"max_attempts": 4, "base_delay_seconds": 0.0},
+    )
+    result = run_async(svc.execute(ToolInvocation(tool_name="post_once")))
+    run_async(svc.aclose())
+    assert result.outcome == "failed"
+    assert result.error_code == ToolErrorCode.TIMEOUT
+    assert calls["n"] == 1  # not retried despite max_attempts=4
+
+
+def test_idempotent_post_is_retried_on_timeout(monkeypatch) -> None:
+    """A POST carrying an idempotency key MAY be retried (upstream dedupes the resend)."""
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(201, json={"created": True})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="post_idem",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            method="POST",
+            path_template="/orders",
+            idempotency_arg="request_id",
+        ),
+        retry_hints={"max_attempts": 3, "base_delay_seconds": 0.0},
+    )
+    result = run_async(
+        svc.execute(
+            ToolInvocation(tool_name="post_idem", args={"request_id": "r1"})
+        )
+    )
+    run_async(svc.aclose())
+    assert result.outcome == "success"
+    assert calls["n"] == 2  # retried once, then succeeded
+
+
+def test_http_cursor_pagination_concatenates(monkeypatch) -> None:
+    """CURSOR pagination follows next-cursor across pages and concatenates records."""
+    from himmy.services.tools.models import HttpPaginationConfig, HttpPaginationMode
+
+    monkeypatch.setenv("BASE", "https://api.example.com")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        if not cursor:
+            return httpx.Response(
+                200, json={"items": [1, 2], "next": "c2"}
+            )
+        if cursor == "c2":
+            return httpx.Response(200, json={"items": [3], "next": None})
+        return httpx.Response(200, json={"items": [], "next": None})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="paged",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            path_template="/x",
+            pagination=HttpPaginationConfig(
+                mode=HttpPaginationMode.CURSOR,
+                items_path="items",
+                cursor_path="next",
+                cursor_param="cursor",
+                max_pages=5,
+            ),
+        ),
+    )
+    result = run_async(svc.execute(ToolInvocation(tool_name="paged")))
+    run_async(svc.aclose())
+    assert result.outcome == "success"
+    assert result.result["items"] == [1, 2, 3]
+
+
+def test_http_pagination_capped_at_max_pages(monkeypatch) -> None:
+    """A never-ending cursor stops at max_pages (the infinite-loop / DoS guard)."""
+    from himmy.services.tools.models import HttpPaginationConfig, HttpPaginationMode
+
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"items": [calls["n"]], "next": "always"})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="paged",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            path_template="/x",
+            pagination=HttpPaginationConfig(
+                mode=HttpPaginationMode.CURSOR,
+                items_path="items",
+                cursor_path="next",
+                max_pages=3,
+            ),
+        ),
+    )
+    result = run_async(svc.execute(ToolInvocation(tool_name="paged")))
+    run_async(svc.aclose())
+    assert result.outcome == "success"
+    assert calls["n"] == 3  # capped
+
+
+def test_non_idempotent_post_with_omitted_key_not_retried(monkeypatch) -> None:
+    """A POST whose idempotency_arg is CONFIGURED but OMITTED at call time is NOT retried.
+
+    Regression for the openapi-harden review: ``_is_retry_safe`` used to return True
+    whenever ``idempotency_arg`` was set, but the ``Idempotency-Key`` header is only
+    attached when the arg is actually supplied — so an omitted key means the upstream
+    gets NO dedup header. Blind-retrying such a call on a ReadTimeout can double-act.
+    """
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    seen: dict = {"keys": [], "n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["n"] += 1
+        seen["keys"].append(request.headers.get("idempotency-key"))
+        raise httpx.ReadTimeout("slow", request=request)
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="post_no_key",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            method="POST",
+            path_template="/orders",
+            body_arg_names=["sku"],
+            idempotency_arg="request_id",
+        ),
+        retry_hints={"max_attempts": 4, "base_delay_seconds": 0.0},
+    )
+    # Invoke WITHOUT request_id — the key is configured but not supplied.
+    result = run_async(
+        svc.execute(ToolInvocation(tool_name="post_no_key", args={"sku": "A1"}))
+    )
+    run_async(svc.aclose())
+    assert result.outcome == "failed"
+    assert result.error_code == ToolErrorCode.TIMEOUT
+    assert seen["n"] == 1  # exactly one wire attempt despite max_attempts=4
+    assert seen["keys"] == [None]  # no Idempotency-Key was ever sent
+
+
+def test_link_header_cross_host_next_is_refused(monkeypatch) -> None:
+    """A cross-host Link rel="next" is refused (default-deny) — bearer secret never leaks.
+
+    Regression for the openapi-harden review: with the default empty egress allow-list,
+    a hostile upstream returning ``Link: <https://evil.example/x>; rel="next"`` must NOT
+    be followed, because the connector reuses its Authorization header on every page and
+    would otherwise forward the bearer to evil.example.
+    """
+    from himmy.services.tools.models import HttpPaginationConfig, HttpPaginationMode
+
+    monkeypatch.setenv("BASE", "https://api.example.com")
+    monkeypatch.setenv("TOKEN", "sek-123")
+    hosts_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts_seen.append(request.url.host)
+        if request.url.host == "api.example.com":
+            return httpx.Response(
+                200,
+                json={"items": [1, 2]},
+                headers={"link": '<https://evil.example/x>; rel="next"'},
+            )
+        # Should never be reached — the cross-host hop must be refused first.
+        return httpx.Response(200, json={"items": [99]})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="paged_link",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            path_template="/x",
+            auth=HttpAuthConfig(mode=HttpAuthMode.BEARER, env_var="TOKEN"),
+            pagination=HttpPaginationConfig(
+                mode=HttpPaginationMode.LINK_HEADER, items_path="items", max_pages=5
+            ),
+        ),
+    )
+    result = run_async(svc.execute(ToolInvocation(tool_name="paged_link")))
+    run_async(svc.aclose())
+    assert result.outcome == "failed"
+    assert result.error_code == ToolErrorCode.INVALID_REQUEST
+    assert "cross-host" in (result.error_message or "")
+    # The second (off-host) request was never issued — the secret stayed put.
+    assert hosts_seen == ["api.example.com"]
+
+
+def test_link_header_same_origin_next_is_followed(monkeypatch) -> None:
+    """A same-origin Link rel="next" IS followed and pages concatenate as expected."""
+    from himmy.services.tools.models import HttpPaginationConfig, HttpPaginationMode
+
+    monkeypatch.setenv("BASE", "https://api.example.com")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("page") != "2":
+            return httpx.Response(
+                200,
+                json={"items": [1, 2]},
+                headers={
+                    "link": '<https://api.example.com/x?page=2>; rel="next"'
+                },
+            )
+        return httpx.Response(200, json={"items": [3]})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="paged_link_ok",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            path_template="/x",
+            pagination=HttpPaginationConfig(
+                mode=HttpPaginationMode.LINK_HEADER, items_path="items", max_pages=5
+            ),
+        ),
+    )
+    result = run_async(svc.execute(ToolInvocation(tool_name="paged_link_ok")))
+    run_async(svc.aclose())
+    assert result.outcome == "success"
+    assert result.result["items"] == [1, 2, 3]
+    assert result.result["page_count"] == 2  # both pages counted
+
+
+def test_link_header_allow_listed_cross_host_next_is_followed(monkeypatch) -> None:
+    """A cross-host Link is followed only when its host is on the egress allow-list."""
+    from himmy.services.tools.models import HttpPaginationConfig, HttpPaginationMode
+
+    monkeypatch.setenv("BASE", "https://api.example.com")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.example.com":
+            return httpx.Response(
+                200,
+                json={"items": [1]},
+                headers={"link": '<https://pages.example.com/x>; rel="next"'},
+            )
+        return httpx.Response(200, json={"items": [2]})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="paged_link_allow",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            path_template="/x",
+            egress_allow_hosts=["api.example.com", "pages.example.com"],
+            pagination=HttpPaginationConfig(
+                mode=HttpPaginationMode.LINK_HEADER, items_path="items", max_pages=5
+            ),
+        ),
+    )
+    result = run_async(svc.execute(ToolInvocation(tool_name="paged_link_allow")))
+    run_async(svc.aclose())
+    assert result.outcome == "success"
+    assert result.result["items"] == [1, 2]
+    assert result.result["page_count"] == 2
+
+
+def test_cursor_pagination_reports_pages_fetched(monkeypatch) -> None:
+    """page_count reflects pages actually fetched in CURSOR mode (not a hardcoded 1).
+
+    Regression for the openapi-harden review: page_count was only bumped in PAGE mode,
+    so CURSOR/LINK_HEADER always reported 1 regardless of how many pages were fetched.
+    """
+    from himmy.services.tools.models import HttpPaginationConfig, HttpPaginationMode
+
+    monkeypatch.setenv("BASE", "https://api.example.com")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        if not cursor:
+            return httpx.Response(200, json={"items": [1, 2], "next": "c2"})
+        if cursor == "c2":
+            return httpx.Response(200, json={"items": [3], "next": None})
+        return httpx.Response(200, json={"items": [], "next": None})
+
+    svc = _http_service(httpx.MockTransport(handler))
+    register_http_tool(
+        svc.registry,
+        name="paged_count",
+        http_config=HttpToolConfig(
+            base_url_env_var="BASE",
+            path_template="/x",
+            pagination=HttpPaginationConfig(
+                mode=HttpPaginationMode.CURSOR,
+                items_path="items",
+                cursor_path="next",
+                cursor_param="cursor",
+                max_pages=5,
+            ),
+        ),
+    )
+    result = run_async(svc.execute(ToolInvocation(tool_name="paged_count")))
+    run_async(svc.aclose())
+    assert result.outcome == "success"
+    assert result.result["items"] == [1, 2, 3]
+    assert result.result["page_count"] == 2  # two pages fetched, not 1
+
+
 def test_http_auth_none_sends_no_authorization(monkeypatch) -> None:
     """NONE auth (the default) attaches no Authorization header."""
     monkeypatch.setenv("BASE", "https://api.example.com")

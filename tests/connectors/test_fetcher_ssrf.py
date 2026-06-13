@@ -126,3 +126,59 @@ def test_body_at_the_cap_is_allowed() -> None:
 
     fetcher = HttpxFetcher(transport=_transport(handler), retries=0, max_bytes=1024)
     assert fetcher.get_bytes("http://example.org/ok") == b"z" * 1024
+
+
+def test_per_request_auth_header_is_sent_on_the_request() -> None:
+    """A per-request Authorization header rides on the GET (the connector-auth path)."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Authorization"))
+        return httpx.Response(200, text="ok")
+
+    fetcher = HttpxFetcher(transport=_transport(handler), retries=0)
+    fetcher.get_text(
+        "http://example.org/api", headers={"Authorization": "Bearer tok"}
+    )
+    assert seen == ["Bearer tok"]
+
+
+def test_auth_header_is_dropped_on_cross_origin_redirect() -> None:
+    """A credential is NEVER replayed to a different host across a redirect hop."""
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.host, request.headers.get("Authorization")))
+        if request.url.host == "api.github.com":
+            # A (guarded, still public) redirect to a THIRD-PARTY host.
+            return httpx.Response(
+                302, headers={"Location": "http://evil.example/collect"}
+            )
+        return httpx.Response(200, text="ok")
+
+    fetcher = HttpxFetcher(transport=_transport(handler), retries=0)
+    fetcher.get_text(
+        "http://api.github.com/issues", headers={"Authorization": "Bearer SECRET"}
+    )
+    # First hop carries the token; the cross-origin hop must NOT.
+    assert ("api.github.com", "Bearer SECRET") in seen
+    assert ("evil.example", None) in seen
+    assert all(host != "evil.example" or auth is None for host, auth in seen)
+
+
+def test_auth_header_is_kept_on_same_origin_redirect() -> None:
+    """A same-origin redirect (e.g. a trailing-slash bounce) keeps the credential."""
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers.get("Authorization")))
+        if request.url.path == "/issues":
+            return httpx.Response(302, headers={"Location": "/issues/"})
+        return httpx.Response(200, text="ok")
+
+    fetcher = HttpxFetcher(transport=_transport(handler), retries=0)
+    fetcher.get_text(
+        "http://api.github.com/issues", headers={"Authorization": "Bearer SECRET"}
+    )
+    # Same scheme/host/port → the credential is preserved across the hop.
+    assert seen == [("/issues", "Bearer SECRET"), ("/issues/", "Bearer SECRET")]

@@ -191,7 +191,8 @@ def collect_doctor_report() -> DoctorReport:
             message=(
                 "No real model yet. Install one (free, local): `ollama pull llama3.2`, "
                 "or set OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY for a "
-                "cloud model."
+                "cloud model. New here? The 5-minute quickstart walks you through it: "
+                "docs/QUICKSTART.md."
             ),
         )
     elif not has_agent:

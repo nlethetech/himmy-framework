@@ -52,8 +52,9 @@ def test_provider_factory_openrouter_builds(monkeypatch: pytest.MonkeyPatch) -> 
 
     No network: we only assert the manager is configured with the OpenRouter
     base_url, the provided key, the default model, and the `openrouter` name.
+    OpenRouter now runs through the direct OpenAI-compatible manager (no pydantic-ai),
+    so the model id passes through verbatim with no ``openai:`` prefix.
     """
-    pytest.importorskip("pydantic_ai")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     # Must NOT require OPENAI_API_KEY to be set as well.
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -64,20 +65,100 @@ def test_provider_factory_openrouter_builds(monkeypatch: pytest.MonkeyPatch) -> 
     assert manager.provider_name == "openrouter"
     assert manager._base_url == "https://openrouter.ai/api/v1"
     assert manager._api_key == "sk-or-test"
-    # The default model is registered as an openai-format slug (with the '/').
-    assert manager.resolve("default") == (
-        "openai:mistralai/mistral-small-3.2-24b-instruct"
-    )
+    # The model id passes through verbatim (no provider-prefix rewriting).
+    assert manager.resolve("default") == "mistralai/mistral-small-3.2-24b-instruct"
 
 
 def test_provider_factory_openrouter_custom_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An explicit --model overrides the OpenRouter default, keeping the slug."""
-    pytest.importorskip("pydantic_ai")
+    """An explicit --model overrides the OpenRouter default, passed through verbatim."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     manager = build_manager_for("openrouter", "anthropic/claude-3.5-sonnet")
-    assert manager.resolve("default") == "openai:anthropic/claude-3.5-sonnet"
+    assert manager.resolve("default") == "anthropic/claude-3.5-sonnet"
+    assert manager._api_key == "sk-or-test"
+
+
+def test_openai_compatible_in_provider_choices() -> None:
+    """`openai-compatible` is a first-class --provider/agent.yaml choice."""
+    assert "openai-compatible" in PROVIDERS
+
+
+def test_provider_factory_openai_compatible_missing_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a base_url env, openai-compatible raises a clear ProviderError."""
+    monkeypatch.delenv("HIMMY_OPENAI_COMPAT_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_COMPAT_BASE_URL", raising=False)
+    with pytest.raises(ProviderError) as exc:
+        build_manager_for("openai-compatible", "some/model")
+    assert "base_url" in str(exc.value)
+
+
+def test_provider_factory_openai_compatible_missing_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """openai-compatible requires an explicit model (no silent default)."""
+    monkeypatch.setenv("HIMMY_OPENAI_COMPAT_BASE_URL", "https://api.groq.com/openai/v1")
+    with pytest.raises(ProviderError) as exc:
+        build_manager_for("openai-compatible")
+    assert "--model" in str(exc.value)
+
+
+def test_provider_factory_openai_compatible_missing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """openai-compatible raises a clear, key-redacting error when no key is set."""
+    monkeypatch.setenv(
+        "HIMMY_OPENAI_COMPAT_BASE_URL", "https://api.together.xyz/v1"
+    )
+    for name in (
+        "HIMMY_OPENAI_COMPAT_API_KEY",
+        "OPENAI_COMPAT_API_KEY",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ProviderError) as exc:
+        build_manager_for("openai-compatible", "meta-llama/Llama-3-70b")
+    # The error names the key env var, never echoes a (missing) secret value.
+    assert "HIMMY_OPENAI_COMPAT_API_KEY" in str(exc.value)
+
+
+def test_provider_factory_openai_compatible_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With base_url + key + model, openai-compatible builds a verbatim-passthrough mgr.
+
+    Covers the Sarvam/Groq/Together shape: one provider, custom endpoint, model id
+    passed through unchanged, key sourced from the secrets layer.
+    """
+    monkeypatch.setenv("HIMMY_OPENAI_COMPAT_BASE_URL", "https://api.sarvam.ai/v1")
+    monkeypatch.setenv("HIMMY_OPENAI_COMPAT_API_KEY", "sk-compat-test")
+    manager = build_manager_for("openai-compatible", "sarvam-m")
+
+    assert manager.provider_name == "openai-compatible"
+    assert manager._base_url == "https://api.sarvam.ai/v1"
+    assert manager._api_key == "sk-compat-test"
+    assert manager.resolve("default") == "sarvam-m"
+
+
+def test_provider_factory_openrouter_attribution_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenRouter's optional HTTP-Referer / X-Title are forwarded when set, not required."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("OPENROUTER_HTTP_REFERER", "https://himmy.example")
+    monkeypatch.setenv("OPENROUTER_X_TITLE", "Himmy Agent")
+    manager = build_manager_for("openrouter")
+    assert manager._default_headers == {
+        "HTTP-Referer": "https://himmy.example",
+        "X-Title": "Himmy Agent",
+    }
+
+    # Unset → no headers (attribution is optional, never required).
+    monkeypatch.delenv("OPENROUTER_HTTP_REFERER", raising=False)
+    monkeypatch.delenv("OPENROUTER_X_TITLE", raising=False)
+    assert build_manager_for("openrouter")._default_headers == {}
 
 
 def test_run_prints_output(capsys: pytest.CaptureFixture[str]) -> None:

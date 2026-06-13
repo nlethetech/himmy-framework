@@ -1,16 +1,50 @@
-"""Nepal connectors: independent, fetch-direct sources (no VPS).
+"""Connectors: the secure pattern that bridges agents to external systems.
 
-Nepali **news** (curated outlet RSS feeds; also a standalone MCP server via
-``python -m himmy.connectors.news_mcp_server``) and **NRB** (foreign-exchange API +
-monthly macroeconomic reports + Excel workbook parsing). Every connector fetches
-directly from the public source through the injectable :class:`Fetcher` seam, so
-the whole layer is testable offline. Live fetching needs the ``connectors`` extra
+The :mod:`himmy.connectors.sdk` defines the abstraction every connector follows —
+:class:`InboundChannelConnector` (receive a channel message → run the agent → reply,
+with a default-deny sender allowlist + HMAC webhook verification) and
+:class:`OutboundToolConnector` (expose typed tools whose credentials come from the
+secrets layer, whose HTTP is SSRF-guarded, and whose side effects are idempotent), plus
+a :class:`ConnectorRegistry`, capability detection, per-connector rate limiting +
+bounded retries, secret-safe error handling, and a structured audit event per action.
+:mod:`himmy.connectors.spec` adds a declarative YAML connector (:class:`ConnectorSpec`).
+
+Concrete built-ins: Nepali **news** (curated outlet RSS feeds; also a standalone MCP
+server via ``python -m himmy.connectors.news_mcp_server``) and **NRB** (foreign-exchange
+API + monthly macroeconomic reports + Excel workbook parsing). Every connector fetches
+directly from the public source through the injectable :class:`Fetcher` seam, so the
+whole layer is testable offline. Live fetching needs the ``connectors`` extra
 (``pip install 'himmy[connectors]'`` — feedparser + openpyxl).
+
+See ``docs/connectors/authoring.md`` to write your own.
 """
 
 from __future__ import annotations
 
+from himmy.connectors.discord import (
+    DISCORD_API_HOST,
+    DISCORD_API_ROOT,
+    DISCORD_BOT_TOKEN_SECRET,
+    DISCORD_PUBLIC_KEY_SECRET,
+    DiscordClient,
+    DiscordGatewayListener,
+    DiscordInteractionsConnector,
+    DiscordOutboundConnector,
+    register_discord_connectors,
+    verify_ed25519_signature,
+)
 from himmy.connectors.fetcher import DEFAULT_USER_AGENT, Fetcher, HttpxFetcher
+from himmy.connectors.github import (
+    GITHUB_API_HOST,
+    GITHUB_API_ROOT,
+    GITHUB_API_VERSION,
+    GITHUB_TOKEN_SECRET,
+    GitHubClient,
+    GitHubError,
+    GitHubOutboundConnector,
+    GitHubRateLimitError,
+    register_github_connectors,
+)
 from himmy.connectors.models import (
     FeedFailure,
     ForexRate,
@@ -24,11 +58,98 @@ from himmy.connectors.news import NEPAL_NEWS_SOURCES, NewsFetcher
 from himmy.connectors.news_tools import NEWS_TOOL_NAMES, register_news_tools
 from himmy.connectors.nrb import NRB_FOREX_API, NRB_MACRO_FEED, NRBClient
 from himmy.connectors.nrb_tools import register_nrb_tools
+from himmy.connectors.sdk import (
+    Capability,
+    Connector,
+    ConnectorContext,
+    ConnectorError,
+    ConnectorKind,
+    ConnectorRegistry,
+    IdempotencyStore,
+    InboundChannelConnector,
+    InboundMessage,
+    OutboundToolConnector,
+    RateLimiter,
+    RetryPolicy,
+    capability,
+    default_registry,
+    redact_args,
+    register_connector,
+    safe_error,
+    verify_hmac_signature,
+)
+from himmy.connectors.slack import (
+    SLACK_API_HOST,
+    SLACK_API_ROOT,
+    SLACK_APP_TOKEN_SECRET,
+    SLACK_BOT_TOKEN_SECRET,
+    SLACK_SIGNING_SECRET,
+    SlackClient,
+    SlackEventsConnector,
+    SlackOutboundConnector,
+    SlackSocketModeListener,
+    register_slack_connectors,
+    verify_slack_signature,
+)
+from himmy.connectors.spec import (
+    ConnectorSpec,
+    SpecToolConnector,
+    register_connector_specs,
+)
+from himmy.connectors.webhook import (
+    DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_TIMESTAMP_SKEW,
+    DEFAULT_SIGNATURE_HEADER,
+    DEFAULT_SIGNATURE_PREFIX,
+    DEFAULT_TIMESTAMP_HEADER,
+    WEBHOOK_SIGNING_SECRET,
+    GuardedCallbackPoster,
+    WebhookInboundConnector,
+    build_webhook_router,
+    make_webhook_connector,
+    sign_webhook_body,
+)
+from himmy.connectors.websearch import (
+    BRAVE_API_HOST,
+    BRAVE_API_KEY_SECRET,
+    BRAVE_SEARCH_URL,
+    TAVILY_API_HOST,
+    TAVILY_API_KEY_SECRET,
+    TAVILY_SEARCH_URL,
+    WEBSEARCH_BACKEND_ENV,
+    WebSearchClient,
+    WebSearchConnector,
+    WebSearchError,
+    register_websearch_connectors,
+)
 
 __all__ = [
     "Fetcher",
     "HttpxFetcher",
     "DEFAULT_USER_AGENT",
+    # SDK
+    "Connector",
+    "ConnectorKind",
+    "ConnectorContext",
+    "ConnectorError",
+    "ConnectorRegistry",
+    "InboundChannelConnector",
+    "InboundMessage",
+    "OutboundToolConnector",
+    "RateLimiter",
+    "RetryPolicy",
+    "IdempotencyStore",
+    "Capability",
+    "capability",
+    "verify_hmac_signature",
+    "safe_error",
+    "redact_args",
+    "default_registry",
+    "register_connector",
+    # declarative spec
+    "ConnectorSpec",
+    "SpecToolConnector",
+    "register_connector_specs",
     "NewsSource",
     "NewsItem",
     "FeedFailure",
@@ -44,4 +165,61 @@ __all__ = [
     "register_nrb_tools",
     "register_news_tools",
     "NEWS_TOOL_NAMES",
+    # Discord connector
+    "DiscordClient",
+    "DiscordOutboundConnector",
+    "DiscordInteractionsConnector",
+    "DiscordGatewayListener",
+    "verify_ed25519_signature",
+    "register_discord_connectors",
+    "DISCORD_API_ROOT",
+    "DISCORD_API_HOST",
+    "DISCORD_BOT_TOKEN_SECRET",
+    "DISCORD_PUBLIC_KEY_SECRET",
+    # Slack connector
+    "SlackClient",
+    "SlackOutboundConnector",
+    "SlackEventsConnector",
+    "SlackSocketModeListener",
+    "verify_slack_signature",
+    "register_slack_connectors",
+    "SLACK_API_ROOT",
+    "SLACK_API_HOST",
+    "SLACK_BOT_TOKEN_SECRET",
+    "SLACK_SIGNING_SECRET",
+    "SLACK_APP_TOKEN_SECRET",
+    # GitHub connector
+    "GitHubClient",
+    "GitHubError",
+    "GitHubRateLimitError",
+    "GitHubOutboundConnector",
+    "register_github_connectors",
+    "GITHUB_API_ROOT",
+    "GITHUB_API_HOST",
+    "GITHUB_API_VERSION",
+    "GITHUB_TOKEN_SECRET",
+    # Web search connector
+    "WebSearchClient",
+    "WebSearchConnector",
+    "WebSearchError",
+    "register_websearch_connectors",
+    "TAVILY_SEARCH_URL",
+    "TAVILY_API_HOST",
+    "TAVILY_API_KEY_SECRET",
+    "BRAVE_SEARCH_URL",
+    "BRAVE_API_HOST",
+    "BRAVE_API_KEY_SECRET",
+    "WEBSEARCH_BACKEND_ENV",
+    # Generic inbound webhook connector
+    "WebhookInboundConnector",
+    "GuardedCallbackPoster",
+    "build_webhook_router",
+    "make_webhook_connector",
+    "sign_webhook_body",
+    "WEBHOOK_SIGNING_SECRET",
+    "DEFAULT_SIGNATURE_HEADER",
+    "DEFAULT_SIGNATURE_PREFIX",
+    "DEFAULT_TIMESTAMP_HEADER",
+    "DEFAULT_MAX_TIMESTAMP_SKEW",
+    "DEFAULT_MAX_BODY_BYTES",
 ]

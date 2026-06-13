@@ -50,6 +50,15 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 #: Schema name handed to ``response_format=json_schema`` (must be a valid identifier).
 _STRUCTURED_SCHEMA_NAME = "structured_output"
 
+#: Default per-request timeout (seconds) for the SDK's underlying HTTP client. Bounded so
+#: a hung endpoint can't wedge a call; the InferenceService adds its own ceiling on top.
+_DEFAULT_TIMEOUT_S = 60.0
+
+#: Default SDK-level retry budget. The openai SDK only retries on its own idempotent,
+#: safe-to-retry conditions (429 / connection / 5xx), never on a partially-applied
+#: request, so this is safe for side-effecting tool turns.
+_DEFAULT_MAX_RETRIES = 2
+
 
 def _normalize_openai_error(exc: BaseException) -> InferenceError:
     """Map an ``openai`` SDK / transport exception to a typed InferenceError.
@@ -134,7 +143,14 @@ class OpenAIClientManager:
     (``client.chat.completions.create(...)``) and the whole layer stays offline. With no
     injected client the real ``openai.AsyncOpenAI`` is built lazily on first use
     (requiring the ``[openai]`` extra + ``OPENAI_API_KEY``, unless a ``base_url`` +
-    ``api_key`` override targets another OpenAI-compatible endpoint such as OpenRouter).
+    ``api_key`` override targets another OpenAI-compatible endpoint such as OpenRouter,
+    Sarvam, Groq, or Together).
+
+    ``default_headers`` are sent on every request — used for OpenRouter's optional
+    ``HTTP-Referer`` / ``X-Title`` attribution headers (supported, never required). The
+    SDK client is built with a bounded ``timeout`` and a conservative ``max_retries``;
+    the SDK only retries its own safe/idempotent conditions, so this never re-applies a
+    side-effecting request.
     """
 
     def __init__(
@@ -144,14 +160,24 @@ class OpenAIClientManager:
         model_registry: dict[str, str] | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
+        default_headers: dict[str, str] | None = None,
+        timeout: float = _DEFAULT_TIMEOUT_S,
+        max_retries: int = _DEFAULT_MAX_RETRIES,
         client: Any | None = None,
         provider_name: str = "openai",
     ) -> None:
-        """Configure the default model, optional key/base_url, and (test) client."""
+        """Configure the default model, optional key/base_url/headers, and (test) client."""
         self._model = model
         self._registry = dict(model_registry or {})
         self._api_key = api_key
         self._base_url = base_url
+        # Drop blank header values so an unset OpenRouter attribution env var never sends
+        # an empty header; keep this a copy so callers can't mutate it later.
+        self._default_headers = {
+            str(k): str(v) for k, v in (default_headers or {}).items() if v
+        }
+        self._timeout = timeout
+        self._max_retries = max_retries
         self._client = client
         self.provider_name = provider_name
 
@@ -171,11 +197,16 @@ class OpenAIClientManager:
             raise ImportError(
                 "openai SDK not installed; pip install 'himmy[openai]'"
             ) from exc
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {
+            "timeout": self._timeout,
+            "max_retries": self._max_retries,
+        }
         if self._api_key is not None:
             kwargs["api_key"] = self._api_key
         if self._base_url is not None:
             kwargs["base_url"] = self._base_url
+        if self._default_headers:
+            kwargs["default_headers"] = dict(self._default_headers)
         self._client = openai.AsyncOpenAI(**kwargs)
         return self._client
 
@@ -204,6 +235,8 @@ class OpenAIClientManager:
         rf = self._response_format(request)
         if rf is not None:
             payload["response_format"] = rf
+        if self._default_headers:
+            payload["extra_headers"] = dict(self._default_headers)
 
         try:
             client = self._build_client()
@@ -314,6 +347,8 @@ class OpenAIClientManager:
             payload["temperature"] = params["temperature"]
         if params.get("max_tokens") is not None:
             payload["max_tokens"] = params["max_tokens"]
+        if self._default_headers:
+            payload["extra_headers"] = dict(self._default_headers)
 
         try:
             client = self._build_client()

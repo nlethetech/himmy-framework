@@ -49,6 +49,7 @@ def guard_url(
     *,
     allow_private: bool = False,
     allow_hosts: Collection[str] | None = None,
+    resolve: bool = True,
 ) -> str:
     """Validate ``url`` for outbound fetching; return it unchanged or raise.
 
@@ -60,6 +61,11 @@ def guard_url(
     When ``allow_hosts`` is provided (egress allow-list, WS3.3), the host must match
     an entry (exact or a subdomain) — everything else is denied, for restricted /
     air-gapped deployments. The allow-list narrows on top of the public-IP check.
+
+    ``resolve=False`` runs only the cheap, offline checks (scheme, no embedded
+    credentials, host present, allow-list) and skips the DNS/IP step — for callers that
+    enforce the public-IP rule at connect time through a pinned transport (so the same
+    resolution isn't done twice, and a DNS hiccup doesn't mask the real connect).
     """
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
@@ -73,7 +79,7 @@ def guard_url(
         raise ToolSecurityError("URL has no host")
     if allow_hosts is not None and not _host_allowed(host, allow_hosts):
         raise ToolSecurityError(f"host {host!r} is not in the egress allow-list")
-    if allow_private:
+    if allow_private or not resolve:
         return url
 
     # A literal IP host is checked directly; a name is resolved and every
@@ -105,6 +111,35 @@ def _validate_resolved_ips(host: str, port: int | None) -> list[str]:
                 f"host {host!r} resolves to a non-public address ({ip})"
             )
     return candidates
+
+
+def _pin_connect_target(
+    host: str, port: int | None, allow_hosts: Collection[str] | None
+) -> str:
+    """Resolve + vet a connect target at connect time; return the literal IP to dial.
+
+    Shared by the sync and async pinning backends (installed only when ``allow_private``
+    is False). A literal-IP host is still run through :func:`_is_blocked_ip` — so a
+    request whose URL was rewritten to (or supplied as) ``127.0.0.1`` / ``169.254.169.254``
+    / an RFC1918 literal is refused, not trusted. A name is allow-list-checked then
+    resolved, and the FIRST vetted address is the one dialed (check==connect, no
+    rebinding window). Raises :class:`ToolSecurityError` on any non-public hit.
+    """
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if allow_hosts is not None and not _host_allowed(host, allow_hosts):
+            raise ToolSecurityError(
+                f"host {host!r} is not in the egress allow-list"
+            ) from None
+        return _validate_resolved_ips(host, port)[0]
+    # A literal IP: still enforce the public-only rule (the backend is only installed
+    # when allow_private is False).
+    if _is_blocked_ip(host):
+        raise ToolSecurityError(
+            f"host {host!r} resolves to a non-public address ({host})"
+        )
+    return host
 
 
 def build_pinned_transport(
@@ -152,15 +187,7 @@ def build_pinned_transport(
         ) -> Any:
             # Resolve + vet here, at connect time, and dial the literal IP we just
             # validated — closing the gap where httpx would re-resolve independently.
-            try:
-                ipaddress.ip_address(host)
-                pinned = host  # already a literal IP (e.g. a fetcher-rewritten URL)
-            except ValueError:
-                if allow_hosts is not None and not _host_allowed(host, allow_hosts):
-                    raise ToolSecurityError(
-                        f"host {host!r} is not in the egress allow-list"
-                    ) from None
-                pinned = _validate_resolved_ips(host, port)[0]
+            pinned = _pin_connect_target(host, port, allow_hosts)
             return base_backend.connect_tcp(
                 pinned,
                 port,
@@ -176,4 +203,54 @@ def build_pinned_transport(
     return http_transport
 
 
-__all__ = ["guard_url", "build_pinned_transport"]
+def build_async_pinned_transport(
+    *,
+    allow_private: bool = False,
+    allow_hosts: Collection[str] | None = None,
+    transport: Any = None,
+) -> Any:
+    """The async twin of :func:`build_pinned_transport` for ``httpx.AsyncClient``.
+
+    The generic OpenAPI/REST connector dispatches on the event loop through a shared
+    ``httpx.AsyncClient``, so it needs the SAME DNS-rebinding (TOCTOU) defense the sync
+    connectors get: resolve the host ONCE at connect time, re-check every candidate IP,
+    dial the validated literal IP, and preserve the Host header + TLS SNI (derived by
+    httpcore from the request, not the connect target). With ``allow_private`` the
+    wrapper is a passthrough. ``transport`` is a test seam: a supplied transport (e.g. a
+    ``MockTransport``) is returned as-is so suites never open real sockets.
+    """
+    import httpx
+
+    if transport is not None:
+        return transport
+    http_transport = httpx.AsyncHTTPTransport()
+    if allow_private:
+        return http_transport
+
+    from httpcore._backends.anyio import AnyIOBackend
+
+    base_backend = AnyIOBackend()
+
+    class _AsyncPinningBackend(AnyIOBackend):  # type: ignore[misc]
+        async def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,
+            local_address: str | None = None,
+            socket_options: Iterable[Any] | None = None,
+        ) -> Any:
+            pinned = _pin_connect_target(host, port, allow_hosts)
+            return await base_backend.connect_tcp(
+                pinned,
+                port,
+                timeout=timeout,
+                local_address=local_address,
+                socket_options=socket_options,
+            )
+
+    http_transport._pool._network_backend = _AsyncPinningBackend()
+    return http_transport
+
+
+__all__ = ["guard_url", "build_pinned_transport", "build_async_pinned_transport"]
