@@ -34,6 +34,7 @@ _TOUCHED = [
     "HIMMY_GITHUB_DEFAULT_REPO",
     "HIMMY_SLACK_BOT_TOKEN",
     "HIMMY_SLACK_ALLOWED_CHANNELS",
+    "HIMMY_SLACK_DEFAULT_CHANNEL",
     "HIMMY_WEBHOOK_SIGNING_SECRET",
     "HIMMY_WEBHOOK_ALLOWED_SOURCES",
     "HIMMY_TAVILY_API_KEY",
@@ -273,6 +274,43 @@ def test_build_outbound_succeeds_when_configured(writable_backend: None) -> None
     connector = svc.build_outbound("github")
     assert connector.name == "github"
     assert connector.available() is True
+
+
+def test_build_outbound_honors_configured_allowlist(writable_backend: None) -> None:
+    """Regression: an allow-list written via configure() (into the SECRETS backend, NOT
+    os.environ) must flow into the built connector — the env-only registry factory would
+    silently drop it and default-deny every call while status() reported it configured.
+    """
+    svc = _svc()
+    # configure() persists into the writable FileSecrets backend, never os.environ.
+    svc.configure(
+        "github",
+        {"HIMMY_GITHUB_TOKEN": "ghp_x", "HIMMY_GITHUB_ALLOWED_REPOS": "o/a"},
+    )
+    assert "HIMMY_GITHUB_ALLOWED_REPOS" not in os.environ  # not leaked to env
+    # status() and build_outbound() must AGREE: both see the configured allow-list.
+    assert svc.status("github").allowlist_set is True
+    connector = svc.build_outbound("github")
+    assert connector._allowed_repos == {"o/a"}
+    assert connector._repo_allowed("o/a") is True
+    assert connector._repo_allowed("o/forbidden") is False
+
+
+def test_build_outbound_honors_configured_default_channel(writable_backend: None) -> None:
+    """The default channel/repo (also secrets-backed) must reach the connector too."""
+    svc = _svc()
+    svc.configure(
+        "slack",
+        {
+            "HIMMY_SLACK_BOT_TOKEN": "xoxb-x",
+            "HIMMY_SLACK_ALLOWED_CHANNELS": "C123",
+            "HIMMY_SLACK_DEFAULT_CHANNEL": "C123",
+        },
+    )
+    assert "HIMMY_SLACK_DEFAULT_CHANNEL" not in os.environ
+    connector = svc.build_outbound("slack")
+    assert connector._allowed_channels == {"C123"}
+    assert connector._default_channel == "C123"
 
 
 def test_build_outbound_rejects_inbound_kind(writable_backend: None) -> None:

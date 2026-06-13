@@ -87,6 +87,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Awaitable, Callable
 
 
+# Non-secret per-connector "default target" store keys (the optional channel/repo a post
+# goes to when the caller names none). They are NOT credentials but ARE configurable, so
+# they live in the secrets backend alongside the token and are written via configure();
+# _direct_outbound reads them through get_secret so they compose with the allow-list.
+SLACK_DEFAULT_CHANNEL_SECRET = "HIMMY_SLACK_DEFAULT_CHANNEL"  # noqa: S105 - a NAME, not a value
+DISCORD_DEFAULT_CHANNEL_SECRET = "HIMMY_DISCORD_DEFAULT_CHANNEL"  # noqa: S105 - a NAME
+GITHUB_DEFAULT_REPO_SECRET = "HIMMY_GITHUB_DEFAULT_REPO"  # noqa: S105 - a NAME, not a value
+
+
 class ReadOnlyBackendError(RuntimeError):
     """Raised when configure/enable/disable is attempted on a read-only secrets backend.
 
@@ -196,6 +205,12 @@ def _build_catalog() -> dict[str, ConnectorDescriptor]:
                     required=False,
                     placeholder="xapp-...",
                 ),
+                SecretSpec(
+                    SLACK_DEFAULT_CHANNEL_SECRET,
+                    "Default channel",
+                    required=False,
+                    placeholder="C0123ABCDEF",
+                ),
             ),
             allowlist_env="HIMMY_SLACK_ALLOWED_CHANNELS",
         ),
@@ -211,6 +226,11 @@ def _build_catalog() -> dict[str, ConnectorDescriptor]:
                     "Public key (inbound)",
                     required=False,
                 ),
+                SecretSpec(
+                    DISCORD_DEFAULT_CHANNEL_SECRET,
+                    "Default channel",
+                    required=False,
+                ),
             ),
             allowlist_env="HIMMY_DISCORD_ALLOWED_CHANNELS",
         ),
@@ -219,7 +239,15 @@ def _build_catalog() -> dict[str, ConnectorDescriptor]:
             title="GitHub",
             description="Read/act on GitHub issues and pull requests.",
             kind=ConnectorKind.OUTBOUND,
-            secrets=(SecretSpec(GITHUB_TOKEN_SECRET, "API token", placeholder="ghp_..."),),
+            secrets=(
+                SecretSpec(GITHUB_TOKEN_SECRET, "API token", placeholder="ghp_..."),
+                SecretSpec(
+                    GITHUB_DEFAULT_REPO_SECRET,
+                    "Default repository",
+                    required=False,
+                    placeholder="owner/repo",
+                ),
+            ),
             allowlist_env="HIMMY_GITHUB_ALLOWED_REPOS",
             probe=_probe_github,
         ),
@@ -627,12 +655,25 @@ class ConnectorService:
 
     # -- internal builders --------------------------------------------------
     def _build_outbound_instance(self, name: str) -> OutboundToolConnector:
-        """Instantiate the outbound connector via the registry (env-driven allow-lists)."""
-        connector = self._registry.get(name)
-        if connector is None:
-            # Fall back to a direct construction so the catalog still works even if a
-            # caller passed a registry without the built-ins.
-            connector = _direct_outbound(name)
+        """Instantiate the outbound connector with SECRETS-AWARE allow-lists/defaults.
+
+        For a built-in connector we construct it through :func:`_direct_outbound`, which
+        reads the allow-list/default via :func:`_split_env`/:func:`get_secret` — so an
+        allow-list written by :meth:`configure` (into the *writable secrets backend*, not
+        ``os.environ``) is actually honored. The registry factory is intentionally NOT
+        used for built-ins: ``_make_outbound`` reads ONLY ``os.environ`` (github.py /
+        slack.py / discord.py), so routing through it would silently ignore the
+        just-configured allow-list and default-deny every call while :meth:`status`
+        (which reads the secrets backend) reported the connector configured+available.
+
+        The registry remains the path for any NON-built-in connector a caller registered
+        directly (a third-party/custom connector the catalog has no descriptor for).
+        """
+        if name in _DIRECT_OUTBOUND_NAMES:
+            connector: Connector = _direct_outbound(name)
+        else:
+            registered = self._registry.get(name)
+            connector = registered if registered is not None else _direct_outbound(name)
         if not isinstance(connector, OutboundToolConnector):
             raise ConnectorError(f"{name!r} is not an outbound connector")
         return connector
@@ -693,22 +734,30 @@ def _split_env(name: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+#: Built-in outbound connectors that :func:`_direct_outbound` can construct directly,
+#: reading their allow-list/default through the secrets layer (not just ``os.environ``).
+#: These are built secrets-aware in :meth:`ConnectorService._build_outbound_instance`
+#: rather than via the env-only registry factory, so :meth:`ConnectorService.configure`
+#: composes with :meth:`ConnectorService.build_outbound`.
+_DIRECT_OUTBOUND_NAMES = frozenset({"slack", "discord", "github", "websearch"})
+
+
 def _direct_outbound(name: str) -> Connector:
-    """Build an outbound connector directly (registry-independent fallback)."""
+    """Build an outbound connector directly (secrets-aware, registry-independent)."""
     if name == "slack":
         return SlackOutboundConnector(
             allowed_channel_ids=_split_env("HIMMY_SLACK_ALLOWED_CHANNELS") or None,
-            default_channel_id=get_secret("HIMMY_SLACK_DEFAULT_CHANNEL"),
+            default_channel_id=get_secret(SLACK_DEFAULT_CHANNEL_SECRET),
         )
     if name == "discord":
         return DiscordOutboundConnector(
             allowed_channel_ids=_split_env("HIMMY_DISCORD_ALLOWED_CHANNELS") or None,
-            default_channel_id=get_secret("HIMMY_DISCORD_DEFAULT_CHANNEL"),
+            default_channel_id=get_secret(DISCORD_DEFAULT_CHANNEL_SECRET),
         )
     if name == "github":
         return GitHubOutboundConnector(
             allowed_repos=_split_env("HIMMY_GITHUB_ALLOWED_REPOS") or None,
-            default_repo=get_secret("HIMMY_GITHUB_DEFAULT_REPO"),
+            default_repo=get_secret(GITHUB_DEFAULT_REPO_SECRET),
         )
     if name == "websearch":
         return WebSearchConnector()
