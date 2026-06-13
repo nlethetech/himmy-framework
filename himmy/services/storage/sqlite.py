@@ -193,7 +193,7 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
 #: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
 #: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
 #: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
-SQLITE_SCHEMA_VERSION = 1
+SQLITE_SCHEMA_VERSION = 2
 
 #: Ordered forward migrations applied after the base DDL, mirroring the Postgres
 #: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
@@ -207,7 +207,30 @@ SQLITE_SCHEMA_VERSION = 1
 #: (Editing :data:`_SCHEMA` to add a column AND re-adding it via a migration would
 #: double-apply the ALTER and break fresh installs.) Append new entries here — never
 #: edit a shipped one — and bump :data:`SQLITE_SCHEMA_VERSION` to match the highest.
-_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ()
+_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    # v2 (P0-B): promote event_type + tool_name to indexed columns on run_events
+    # so learning miners can answer "which tools fail most" / "what gets blocked"
+    # with an index seek instead of a full-table json_extract scan. New writes
+    # populate the columns directly (append_event); existing rows are backfilled
+    # from the stored JSON best-effort (top-level event_type is always plaintext;
+    # the nested tool_name backfills only for unencrypted databases).
+    (
+        2,
+        (
+            "ALTER TABLE run_events ADD COLUMN event_type TEXT",
+            "ALTER TABLE run_events ADD COLUMN tool_name TEXT",
+            "CREATE INDEX IF NOT EXISTS run_events_event_type_idx "
+            "ON run_events (event_type)",
+            "CREATE INDEX IF NOT EXISTS run_events_tool_name_idx "
+            "ON run_events (tool_name)",
+            "UPDATE run_events SET event_type = "
+            "json_extract(payload, '$.event_type') WHERE event_type IS NULL",
+            "UPDATE run_events SET tool_name = "
+            "json_extract(payload, '$.payload.tool_name') "
+            "WHERE tool_name IS NULL AND json_valid(payload)",
+        ),
+    ),
+)
 
 #: Max bound parameters per ``DELETE ... WHERE seq IN (?, …)`` when pruning. SQLite caps
 #: a statement at ``SQLITE_MAX_VARIABLE_NUMBER`` host parameters (999 on libsqlite < 3.32,
@@ -427,14 +450,22 @@ class SqliteStorageService:
             record["payload"] = self._cipher.encrypt_event_payload(
                 record.get("payload") or {}, event_id=event.event_id
             )
+        # P0-B: denormalise event_type + tool_name into indexed columns so the
+        # learning miners query by index. Captured from the live event BEFORE
+        # encryption, so tool_name survives even with payload encryption at rest.
+        event_type = getattr(event.event_type, "value", str(event.event_type))
+        tool_name = (event.payload or {}).get("tool_name")
         await asyncio.to_thread(
             self._write,
-            "INSERT INTO run_events (event_id, thread_id, trace_id, payload) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING",
+            "INSERT INTO run_events "
+            "(event_id, thread_id, trace_id, event_type, tool_name, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING",
             (
                 event.event_id,
                 event.thread_id,
                 event.trace_id,
+                event_type,
+                tool_name,
                 json.dumps(record),
             ),
         )

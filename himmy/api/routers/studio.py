@@ -34,7 +34,7 @@ from himmy.api import (
     studio_feedback,
     studio_service,
 )
-from himmy.api.auth import require_permission
+from himmy.api.auth import get_principal, require_permission
 from himmy.api.studio_approvals import ApprovalDetail, ApprovalSummary
 from himmy.api.studio_connections import (
     ConnectionStatus,
@@ -619,24 +619,39 @@ async def approval(checkpoint_id: str) -> ApprovalDetail:
     return detail
 
 
-def _resolve_stream(checkpoint_id: str, approved: bool) -> StreamingResponse:
+def _approval_actor(request: Request) -> str:
+    """Who resolved this approval: the authenticated subject, else ``human``.
+
+    On the zero-config single-user loopback default the principal is anonymous,
+    so the meaningful label is the local human; with auth on, the real subject is
+    stamped onto the APPROVAL_GRANTED/REJECTED event for who-approved-what mining.
+    """
+    subject = (getattr(get_principal(request), "subject", "") or "").strip()
+    return subject if subject and subject != "anonymous" else "human"
+
+
+def _resolve_stream(
+    checkpoint_id: str, approved: bool, actor: str
+) -> StreamingResponse:
     async def _gen() -> AsyncIterator[str]:
-        async for event in studio_approvals.resolve(checkpoint_id, approved=approved):
+        async for event in studio_approvals.resolve(
+            checkpoint_id, approved=approved, actor=actor
+        ):
             yield _sse(event)
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 @router.post("/approvals/{checkpoint_id}/approve")
-async def approve(checkpoint_id: str) -> StreamingResponse:
+async def approve(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Approve the pending tool call and stream the resumed run."""
-    return _resolve_stream(checkpoint_id, True)
+    return _resolve_stream(checkpoint_id, True, _approval_actor(request))
 
 
 @router.post("/approvals/{checkpoint_id}/reject")
-async def reject(checkpoint_id: str) -> StreamingResponse:
+async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Reject the pending tool call and stream the resumed run."""
-    return _resolve_stream(checkpoint_id, False)
+    return _resolve_stream(checkpoint_id, False, _approval_actor(request))
 
 
 # ---- Models (available providers + models) ------------------------------

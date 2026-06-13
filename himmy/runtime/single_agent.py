@@ -1076,7 +1076,7 @@ class SingleAgentRuntime:
             # so a poisoned memory/KB chunk is redacted/blocked before it reaches the
             # model (indirect prompt-injection seam) — parity with run_task_detailed.
             system_prompt, task_prompt, _missing = await self._render_guarded_prompts(
-                persona, task, ctx, snapshot
+                persona, task, ctx, snapshot, thread_id=thread.thread_id
             )
             if not any(m.role == MessageRole.SYSTEM for m in thread.messages):
                 sys_msg = Message(role=MessageRole.SYSTEM, content=system_prompt)
@@ -1084,7 +1084,11 @@ class SingleAgentRuntime:
                 self._register_message(sys_msg)
             user_msg = Message(
                 role=MessageRole.USER,
-                content=await self._guard_input(task_prompt, agent_id=persona.agent_id),
+                content=await self._guard_input(
+                    task_prompt,
+                    agent_id=persona.agent_id,
+                    thread_id=thread.thread_id,
+                ),
             )
             thread.append_message(user_msg)
             self._register_message(user_msg)
@@ -1137,7 +1141,10 @@ class SingleAgentRuntime:
                         raw_text = delta.response.output_text or ""
                         guarded_text = (
                             await self._guard_output(
-                                raw_text, agent_id=persona.agent_id
+                                raw_text,
+                                agent_id=persona.agent_id,
+                                trace_id=trace_id,
+                                thread_id=thread.thread_id,
                             )
                             or ""
                         )
@@ -1622,6 +1629,7 @@ class SingleAgentRuntime:
         approved: bool,
         llm_config: LLMConfig | None = None,
         hitl: bool = True,
+        actor: str = "human",
     ) -> AgentLoopResult:
         """Resume a paused agent run after a human approves or rejects the action.
 
@@ -1654,6 +1662,7 @@ class SingleAgentRuntime:
                 approved=approved,
                 llm_config=llm_config,
                 hitl=hitl,
+                actor=actor,
             )
 
     async def _resume_agent_loop_locked(
@@ -1663,6 +1672,7 @@ class SingleAgentRuntime:
         approved: bool,
         llm_config: LLMConfig | None,
         hitl: bool,
+        actor: str = "human",
     ) -> AgentLoopResult:
         """The resume body, run under the per-checkpoint lock (see resume_agent_loop)."""
         assert self._checkpoint_store is not None  # guaranteed by the caller
@@ -1750,7 +1760,7 @@ class SingleAgentRuntime:
                             content=execution.result,
                             outcome=execution.outcome,
                             metadata={
-                                "approved_by": "human",
+                                "approved_by": actor,
                                 "error_code": execution.error_code.value
                                 if execution.error_code
                                 else None,
@@ -1765,7 +1775,7 @@ class SingleAgentRuntime:
                             tool_name=call.tool_name,
                             content={"rejected": True, "reason": "rejected by human"},
                             outcome="rejected",
-                            metadata={"approved_by": "human"},
+                            metadata={"approved_by": actor},
                         )
                     ]
                     event_type = EventType.APPROVAL_REJECTED
@@ -1794,9 +1804,18 @@ class SingleAgentRuntime:
                         trace_id=trace_id,
                         thread_id=thread.thread_id,
                         agent_id=persona.agent_id,
+                        tool_call_id=call.tool_call_id,
                         payload={
                             "checkpoint_id": checkpoint_id,
                             "tool_name": call.tool_name,
+                            # Enriched (P0-B) so approvals are mineable per agent /
+                            # tool / decision / latency without re-joining tables.
+                            "decision": "granted" if approved else "rejected",
+                            "agent_name": persona.name,
+                            "actor": actor,
+                            "time_to_decision_ms": _decision_latency_ms(
+                                checkpoint.created_at
+                            ),
                         },
                     )
                 )
@@ -2204,7 +2223,10 @@ class SingleAgentRuntime:
         if assistant_text is None and response.output_structured is not None:
             assistant_text = json.dumps(response.output_structured, default=str)
         assistant_text = await self._guard_output(
-            assistant_text, agent_id=persona.agent_id
+            assistant_text,
+            agent_id=persona.agent_id,
+            trace_id=trace_id,
+            thread_id=thread.thread_id,
         )
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
@@ -2341,7 +2363,7 @@ class SingleAgentRuntime:
         # the guardrail here so a poisoned memory or KB chunk is redacted/blocked
         # before it reaches the model (indirect prompt-injection seam).
         system_prompt, task_prompt, _missing = await self._render_guarded_prompts(
-            persona, task, ctx, snapshot
+            persona, task, ctx, snapshot, thread_id=thread.thread_id
         )
 
         # --- 3. append SYSTEM (first turn) + USER --------------------------
@@ -2352,7 +2374,11 @@ class SingleAgentRuntime:
             self._register_message(system_message)
         user_message = Message(
             role=MessageRole.USER,
-            content=await self._guard_input(task_prompt, agent_id=persona.agent_id),
+            content=await self._guard_input(
+                task_prompt,
+                agent_id=persona.agent_id,
+                thread_id=thread.thread_id,
+            ),
         )
         thread.append_message(user_message)
         self._register_message(user_message)
@@ -2473,7 +2499,10 @@ class SingleAgentRuntime:
         if assistant_text is None and response.output_structured is not None:
             assistant_text = json.dumps(response.output_structured, default=str)
         assistant_text = await self._guard_output(
-            assistant_text, agent_id=persona.agent_id
+            assistant_text,
+            agent_id=persona.agent_id,
+            trace_id=trace_id,
+            thread_id=thread.thread_id,
         )
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
@@ -2563,20 +2592,42 @@ class SingleAgentRuntime:
         )
 
     # ------------------------------------------------------------- snapshot
-    async def _guard_input(self, text: str, *, agent_id: str | None = None) -> str:
+    async def _guard_input(
+        self,
+        text: str,
+        *,
+        agent_id: str | None = None,
+        trace_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> str:
         """Apply the input guardrail to a user prompt (redact); ``None`` → passthrough."""
         return await self._apply_guardrail(
-            self._input_guardrail, text, stage="input", agent_id=agent_id
+            self._input_guardrail,
+            text,
+            stage="input",
+            agent_id=agent_id,
+            trace_id=trace_id,
+            thread_id=thread_id,
         )
 
     async def _guard_output(
-        self, text: str | None, *, agent_id: str | None = None
+        self,
+        text: str | None,
+        *,
+        agent_id: str | None = None,
+        trace_id: str | None = None,
+        thread_id: str | None = None,
     ) -> str | None:
         """Apply the output guardrail to an assistant reply (redact); passthrough None."""
         if text is None:
             return None
         return await self._apply_guardrail(
-            self._output_guardrail, text, stage="output", agent_id=agent_id
+            self._output_guardrail,
+            text,
+            stage="output",
+            agent_id=agent_id,
+            trace_id=trace_id,
+            thread_id=thread_id,
         )
 
     async def _apply_guardrail(
@@ -2586,6 +2637,8 @@ class SingleAgentRuntime:
         *,
         stage: str,
         agent_id: str | None,
+        trace_id: str | None = None,
+        thread_id: str | None = None,
     ) -> str:
         """Run a guardrail and emit GUARDRAIL_APPLIED when it redacts or blocks.
 
@@ -2633,6 +2686,8 @@ class SingleAgentRuntime:
             await self._emit(
                 RunEvent(
                     event_type=EventType.GUARDRAIL_APPLIED,
+                    trace_id=trace_id,
+                    thread_id=thread_id,
                     agent_id=agent_id,
                     payload={
                         "stage": stage,
@@ -2757,6 +2812,9 @@ class SingleAgentRuntime:
         task: Task,
         ctx: dict[str, Any],
         snapshot: Any,
+        *,
+        trace_id: str | None = None,
+        thread_id: str | None = None,
     ) -> tuple[str, str, list[str]]:
         """Render prompts, routing INJECTED context through the guardrail first.
 
@@ -2775,11 +2833,19 @@ class SingleAgentRuntime:
             self._render_prompt_parts(persona, task, ctx, snapshot)
         )
         if sys_block:
-            guarded_sys = await self._guard_input(sys_block, agent_id=persona.agent_id)
+            guarded_sys = await self._guard_input(
+                sys_block,
+                agent_id=persona.agent_id,
+                trace_id=trace_id,
+                thread_id=thread_id,
+            )
             system_prompt = f"{system_prompt}\n\n{guarded_sys}".strip()
         if task_block:
             guarded_task = await self._guard_input(
-                task_block, agent_id=persona.agent_id
+                task_block,
+                agent_id=persona.agent_id,
+                trace_id=trace_id,
+                thread_id=thread_id,
             )
             task_prompt = f"{task_prompt}\n\n{guarded_task}".strip()
         return system_prompt, task_prompt, missing
@@ -3382,6 +3448,26 @@ def message_timestamp() -> str:
     from himmy.core.ids import utc_now_iso
 
     return utc_now_iso()
+
+
+def _decision_latency_ms(created_at: str | None) -> float | None:
+    """Milliseconds from a checkpoint's creation to now (None if unparseable).
+
+    Powers ``time_to_decision_ms`` on approval events — a judge-free signal of how
+    long a human deliberated before approving/rejecting a gated tool.
+    """
+    if not created_at:
+        return None
+    from datetime import UTC, datetime
+
+    try:
+        start = datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    delta = datetime.now(UTC) - start
+    return max(0.0, delta.total_seconds() * 1000.0)
 
 
 def _timeout(seconds: float) -> asyncio.Timeout:
