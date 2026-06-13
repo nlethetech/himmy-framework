@@ -62,6 +62,18 @@ _ADMIN_CROSS_WORKSPACE_READS: dict[tuple[str, str], str] = {
     ("audit", "export_audit_bundle_route"): "admin-only cross-workspace export",
 }
 
+#: Reads of a PROCESS-GLOBAL operator resource that has no tenant dimension at all —
+#: the data is the same for every workspace, so there is nothing to scope (and no
+#: ``resolve_workspace`` to call). Gated by an RBAC permission instead. Each entry
+#: states WHY the resource is not tenant-keyed. New entries are a reviewed decision.
+_GLOBAL_NOT_TENANT_KEYED: dict[tuple[str, str], str] = {
+    # the connector catalog is a process-level operator resource (like /v1/models):
+    # the built-in connectors + their configured/enabled state are the same for every
+    # workspace; read-only + RBAC-gated on connector:read, never echoes a secret.
+    ("connectors", "list_connectors"): "process-global connector catalog; authz only",
+    ("connectors", "get_connector"): "process-global connector catalog; authz only",
+}
+
 
 class _HandlerScope(ast.NodeVisitor):
     """Collects, for one handler body, whether it resolves + threads the workspace."""
@@ -163,6 +175,10 @@ def test_every_v1_get_handler_threads_or_documents_its_workspace_scope() -> None
         if key in _ADMIN_CROSS_WORKSPACE_READS:
             # Documented admin-only cross-workspace export: scoping is intentionally
             # absent (an elevated permission gates it instead).
+            continue
+        if key in _GLOBAL_NOT_TENANT_KEYED:
+            # Documented process-global resource: it has no tenant dimension, so there
+            # is nothing to scope (an RBAC permission gates it instead).
             continue
         offenders.append(f"{module}.{name}")
     assert not offenders, (

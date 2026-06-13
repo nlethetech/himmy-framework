@@ -86,6 +86,12 @@ def _cmd_skill(args: argparse.Namespace) -> int:
     return cmd_skill(args)
 
 
+def _cmd_connectors(args: argparse.Namespace) -> int:
+    from himmy.cli.connectors_cmd import cmd_connectors
+
+    return cmd_connectors(args)
+
+
 def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
     """Shared flags for commands that build/run an agent (run, chat)."""
     parser.add_argument("-f", "--file", help="path to an agent.yaml spec")
@@ -531,6 +537,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="gate this server's tools behind approval (add)",
     )
     p_mcp.set_defaults(func=_cmd_mcp)
+
+    # connectors — manage the connectors that bridge agents to Slack/Discord/etc.
+    p_conn = sub.add_parser(
+        "connectors",
+        help="list/configure/enable/test the connectors that bridge agents to "
+        "external systems",
+    )
+    p_conn.add_argument(
+        "action",
+        nargs="?",
+        choices=["list", "set", "enable", "disable", "test"],
+        help="default: list",
+    )
+    p_conn.add_argument(
+        "name", nargs="?", help="connector name (set/enable/disable/test)"
+    )
+    p_conn.add_argument(
+        "--secret",
+        action="append",
+        metavar="NAME=VALUE",
+        help="a credential to write, by secret NAME (set; repeat for several)",
+    )
+    p_conn.add_argument(
+        "--allowlist",
+        help="comma-separated allow-list (channels/repos/senders) for this connector (set)",
+    )
+    p_conn.add_argument(
+        "--surface",
+        choices=["outbound", "inbound"],
+        help="which surface to enable/disable (default: outbound)",
+    )
+    p_conn.set_defaults(func=_cmd_connectors)
 
     # skill — run a single named skill as a focused sub-agent.
     p_skill = sub.add_parser(

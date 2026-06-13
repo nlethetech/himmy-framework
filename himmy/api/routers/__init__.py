@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from himmy.api.routers import (
+    connectors,
     context,
     dashboard,
     evaluation,
@@ -25,6 +26,7 @@ from himmy.api.routers import (
 )
 
 __all__ = [
+    "connectors",
     "context",
     "runs",
     "recommendations",

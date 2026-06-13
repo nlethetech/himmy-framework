@@ -40,6 +40,7 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "context:read",
         "dashboard:read",
         "evaluation:read",
+        "connector:read",
     ],
     "operator": [
         "run:read",
@@ -53,6 +54,7 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "evaluation:write",
         "consent:read",
         "consent:write",
+        "connector:read",
     ],
     "auditor": [
         "run:read",
@@ -63,6 +65,7 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "audit:read",
         "audit:run",
         "consent:read",
+        "connector:read",
     ],
     # Self-scoped: holds only consent:read (so it can read its own decision/history and
     # exercise withdrawal/erasure). The /v1/consent router enforces it may touch ONLY its
