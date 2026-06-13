@@ -18,8 +18,11 @@ The mechanism reuses the existing approval gate end-to-end:
 * :func:`apply_plan_mode_to_task` prepends the plan-first system nudge and ensures
   ``update_plan`` is bound for the turn (mirroring the Studio nudge), so the agent calls it
   first.
-* :func:`extract_plan_steps` reads the bounded, normalized plan steps out of the pending
-  (paused) ``update_plan`` call so the run service can stamp them into ``metadata['plan']``.
+
+The plan steps are read back out of the paused checkpoint's ``update_plan`` call by
+:meth:`himmy.application.services.RunAppService._extract_plan_from_checkpoint`, which
+normalizes them via :func:`normalize_plan_steps` before stamping them into
+``metadata['plan']`` — one extraction path, not two.
 
 On approve, the run service rebuilds the SAME runtime (re-registering this tool via the
 ``plan_mode`` run-metadata flag) and ``resume_agent_loop`` executes the now-approved
@@ -162,26 +165,12 @@ def apply_plan_mode_to_task(task: Task) -> Task:
     return task
 
 
-def extract_plan_steps(pending: list[dict[str, Any]] | None) -> list[dict[str, str]]:
-    """Pull the normalized plan steps out of a paused run's pending ``update_plan`` call.
-
-    ``pending`` is the run service's redacted pending-tool-call list
-    (``[{tool_name, args}]``). The first ``update_plan`` entry's ``args.steps`` is
-    normalized to the bounded plan shape; an empty list when no plan call is pending.
-    """
-    for call in pending or []:
-        if call.get("tool_name") == PLAN_TOOL:
-            return normalize_plan_steps((call.get("args") or {}).get("steps"))
-    return []
-
-
 __all__ = [
     "PLAN_MAX_STEPS",
     "PLAN_NUDGE",
     "PLAN_TITLE_MAX",
     "PLAN_TOOL",
     "apply_plan_mode_to_task",
-    "extract_plan_steps",
     "normalize_plan_steps",
     "register_plan_tool",
 ]

@@ -317,16 +317,7 @@ def build_runtime_for_spec(
         )
 
     registry = None
-    if (
-        spec.tool_packs
-        or spec.tools_module
-        or spec.http_tools
-        or spec.knowledge
-        or spec.mcp_servers
-        or spec.allow_spawn
-        or spec.allow_skill_dispatch
-        or spec.connectors
-    ):
+    if spec.builds_tool_registry():
         # Share the run's audit spine so co-registered packs (memory) project their
         # writes onto the same registry the runtime/tool lineage uses (P0-C).
         registry = ToolRegistry(entity_registry=entity_registry)

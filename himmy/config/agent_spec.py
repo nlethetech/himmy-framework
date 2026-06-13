@@ -167,6 +167,31 @@ class AgentSpec(BaseModel):
             metadata=dict(self.metadata),
         )
 
+    def builds_tool_registry(self) -> bool:
+        """Whether ``build_runtime_for_spec`` will construct a per-run tool registry.
+
+        Mirrors the exact gate in :func:`himmy.runtime.from_spec.build_runtime_for_spec`
+        (which is the single caller that decides this): a spec that declares any
+        tool-bearing surface — packs, a tools module, declarative HTTP/MCP tools,
+        knowledge auto-ingest, recursive spawn, skill dispatch, or outbound connectors —
+        yields a :class:`ToolRegistry`; a bare persona spec (e.g. ``{"name": "x"}``) does
+        NOT. Callers that need a registry to exist (HITL/plan mode, which register a gated
+        tool onto it) gate on this so a tool-less stored agent is rejected up front rather
+        than silently producing a run that can never pause. ``tools`` (bare names) alone
+        does not build a registry — those names resolve against tools a ``tools_module``
+        registers, so they are not counted here.
+        """
+        return bool(
+            self.tool_packs
+            or self.tools_module
+            or self.http_tools
+            or self.knowledge
+            or self.mcp_servers
+            or self.allow_spawn
+            or self.allow_skill_dispatch
+            or self.connectors
+        )
+
 
 def apply_skills(spec: AgentSpec, registry: SkillRegistry) -> AgentSpec:
     """Expand ``spec.skills`` into the spec: tools, packs, guardrails, and know-how.

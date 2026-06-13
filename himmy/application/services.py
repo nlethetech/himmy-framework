@@ -701,6 +701,22 @@ class RunAppService:
                     "hitl/plan runs require a stored agent (agent_id); an inline persona "
                     "carries no tools to gate"
                 )
+            # Plan mode synthesizes a gated ``update_plan`` tool and registers it onto the
+            # per-run tool registry to force the PLAN-READY pause. A bare persona spec
+            # (e.g. {"name": "x"}) builds NO registry (from_spec returns registry=None and
+            # the runtime gets no tool_service), so there is nowhere to register the plan
+            # tool and the run would silently complete WITHOUT pausing. Reject up front
+            # (422) — consistent with the inline-persona rejection — rather than letting a
+            # legitimate-but-tool-less stored agent slip through to a silently wrong
+            # "plan=true never paused" outcome.
+            if plan and not agent_spec.builds_tool_registry():
+                raise HitlRequiresAgentError(
+                    "plan mode requires a tool-bearing stored agent (one declaring "
+                    "tool_packs/tools_module/http_tools/knowledge/mcp_servers/connectors/"
+                    "allow_spawn/allow_skill_dispatch); a tool-less agent builds no "
+                    "registry to host the gated update_plan tool, so the run could never "
+                    "pause at PLAN-READY"
+                )
 
         # Fail-closed sanitize a per-run spec against the tenant attack surface
         # BEFORE anything is persisted or executed (T0.3). Operator-provisioned specs
@@ -825,6 +841,16 @@ class RunAppService:
         if (hitl or plan) and self._checkpoint_store is None:
             raise HitlNotSupportedError(
                 "this deployment has no checkpoint store; hitl/plan runs are unavailable"
+            )
+        # Plan mode hosts its gated ``update_plan`` tool on the per-run registry; a
+        # tool-less stored agent builds none, so the run could never pause at PLAN-READY.
+        # Reject up front (422) — same gate as ``create_run`` — rather than silently
+        # running plan=true to completion without a pause.
+        if plan and not agent_spec.builds_tool_registry():
+            raise HitlRequiresAgentError(
+                "plan mode requires a tool-bearing stored agent; a tool-less agent "
+                "builds no registry to host the gated update_plan tool, so the run "
+                "could never pause at PLAN-READY"
             )
 
         # Fail-closed sanitize the spec under the request's operator status BEFORE it

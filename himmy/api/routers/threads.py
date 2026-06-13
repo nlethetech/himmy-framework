@@ -225,7 +225,10 @@ async def post_message(
                 "(bind one at create or supply it on the message)"
             ),
         ) from exc
-    except HitlRequiresAgentError as exc:  # pragma: no cover - guarded above
+    except HitlRequiresAgentError as exc:
+        # Reachable when plan=true targets a tool-less stored agent (no per-run registry
+        # to host the gated update_plan tool) — rejected up front rather than running to
+        # completion without a PLAN-READY pause.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except HitlNotSupportedError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

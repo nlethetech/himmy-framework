@@ -343,6 +343,44 @@ def test_plan_with_inline_persona_is_422(client: TestClient) -> None:
     assert res.status_code == 422, res.text
 
 
+def test_plan_with_tool_less_stored_agent_run_is_422(client: TestClient) -> None:
+    """plan=true on a stored-but-tool-LESS agent is a 422, not a silent never-pause (T2g).
+
+    A bare persona spec (no tool_packs/tools_module/...) builds NO per-run registry, so
+    the gated update_plan tool has nowhere to live — the run would silently complete
+    WITHOUT pausing at PLAN-READY. The reviewer must_fix: reject up front (422), exactly
+    like the inline-persona case, rather than slipping through to a wrong outcome.
+    """
+    # Stored agent with no tool surface at all — builds_tool_registry() is False.
+    agent_id = _store_agent(client, name="plainstored")
+    res = client.post(
+        "/v1/runs",
+        json={
+            "workspace_id": "acme",
+            "subject_id": "s1",
+            "agent_id": agent_id,
+            "task": {"title": "t", "prompt": "do the thing"},
+            "plan": True,
+        },
+    )
+    assert res.status_code == 422, res.text
+
+
+def test_plan_with_tool_less_stored_agent_thread_is_422(client: TestClient) -> None:
+    """plan=true continuation on a tool-less stored agent is a 422, not a silent run (T2g).
+
+    Same gate as the plain-run path, but reached through POST
+    /v1/threads/{id}/messages — a tool-less stored agent cannot host the gated plan tool.
+    """
+    agent_id = _store_agent(client, name="plainstored2")
+    thread_id = _create_thread(client, agent_id=agent_id)
+    res = client.post(
+        f"/v1/threads/{thread_id}/messages",
+        json={"workspace_id": "acme", "prompt": "do the thing", "plan": True},
+    )
+    assert res.status_code == 422, res.text
+
+
 # ----------------------------------------------------------------- shapes
 
 

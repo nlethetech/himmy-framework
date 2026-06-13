@@ -336,6 +336,35 @@ def test_hitl_with_inline_persona_is_rejected() -> None:
     run_async(_scenario())
 
 
+def test_plan_with_tool_less_stored_agent_is_rejected() -> None:
+    """plan=True on a stored-but-tool-LESS agent is rejected (reviewer must_fix, T2g).
+
+    A bare persona spec builds no per-run tool registry, so the gated update_plan tool
+    has nowhere to live and the run would silently complete without pausing at
+    PLAN-READY. The service must reject it up front — like the inline-persona case — not
+    let it slip through to a wrong outcome.
+    """
+    _storage, app, agent_app = _hitl_app()
+
+    async def _scenario() -> None:
+        # A stored agent declaring NO tool surface: builds_tool_registry() is False.
+        spec = AgentSpec(name="plainstored")
+        assert spec.builds_tool_registry() is False
+        rec, _ = await agent_app.save_agent_def(spec, workspace_id="w1")
+        with pytest.raises(HitlRequiresAgentError):
+            await app.create_run(
+                workspace_id="w1",
+                subject_id="s1",
+                persona=spec.to_persona(),
+                task=spec.make_task("do the thing"),
+                agent_spec=spec,
+                agent_def=rec,
+                plan=True,
+            )
+
+    run_async(_scenario())
+
+
 def test_hitl_without_checkpoint_store_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
