@@ -113,6 +113,42 @@ class WorkspaceRunQuotaExceeded(Exception):
         )
 
 
+class HitlNotSupportedError(Exception):
+    """A ``hitl=True`` run was requested but no checkpoint store is wired (T2f → 400).
+
+    Raised by :meth:`RunAppService.create_run` when the deployment has no HITL inbox to
+    pause into (e.g. a programmatic offline service built without a checkpoint store), so
+    a caller gets a clear error rather than a silently non-pausable "HITL" run.
+    """
+
+
+class HitlRequiresAgentError(Exception):
+    """A ``hitl=True`` run was requested without a stored agent (T2f → 422).
+
+    HITL needs a tool-bearing per-run runtime (the shared inline runtime has no tools to
+    gate), so the run MUST resolve a stored agent (``agent_id``). Raised by
+    :meth:`RunAppService.create_run` when ``hitl=True`` is paired with an inline persona.
+    """
+
+
+class RunNotApprovableError(Exception):
+    """An approve/reject targeted a run that is not AWAITING_APPROVAL (T2f → 409).
+
+    Raised by :meth:`RunAppService.resume_run` when the run is missing, already terminal,
+    or otherwise not paused on a human decision. Carries the run id + observed status so
+    the router can return an informative 409 (and a double-approve of an already-resumed
+    run is a clean no-op-with-409, never a re-execution of the gated tool).
+    """
+
+    def __init__(self, run_id: str, *, status: str) -> None:
+        """Record the run and its observed (non-approvable) status."""
+        self.run_id = run_id
+        self.status = status
+        super().__init__(
+            f"run {run_id!r} is {status}, not AWAITING_APPROVAL; cannot approve/reject."
+        )
+
+
 def _now() -> str:
     """ISO timestamp helper (kept local to avoid a top-level core import cycle)."""
     from himmy.core.ids import utc_now_iso
@@ -529,6 +565,8 @@ class RunAppService:
         run_timeout_seconds: float = DEFAULT_RUN_TIMEOUT_SECONDS,
         workspace_concurrency: int = DEFAULT_WORKSPACE_CONCURRENCY,
         workspace_max_outstanding: int = DEFAULT_WORKSPACE_MAX_OUTSTANDING,
+        checkpoint_store: Any = None,
+        agent_resolver: Callable[..., Any] | None = None,
     ) -> None:
         """Wire the runtime, store, optional registry, and recommendation service.
 
@@ -545,6 +583,20 @@ class RunAppService:
         EVERY background run path (inline persona and per-run-spec alike), so the
         offline single-workspace default behaves identically while a multi-tenant
         deployment is protected.
+
+        ``checkpoint_store`` (T2f) is the SURFACE-OWNED durable HITL inbox: when a
+        ``hitl=True`` run hits an approval-gated tool the per-run runtime pauses into a
+        checkpoint here, and :meth:`resume_run` re-claims it on approve/reject. This is
+        /v1's OWN store, distinct from Studio's — the two surfaces rebuild a paused run
+        from different spec sources (Studio from a filesystem ``agent_path``, /v1 from
+        the stored DB ``AgentSpec`` resolved via ``agent_resolver``), so a shared inbox
+        is a deferred item. ``None`` (the default) leaves the offline/inline path
+        byte-unchanged and disables HITL (a ``hitl=True`` create is then rejected).
+
+        ``agent_resolver`` is an async ``(agent_id, workspace_id) -> AgentDefRecord |
+        None`` used to rebuild the per-run tool-bearing runtime FROM THE STORED DB SPEC
+        on resume (``resume_agent_loop`` HARD-requires a ``tool_service``, so /v1 must
+        rebuild from the spec, not a filesystem path it never had).
         """
         self._runtime = runtime
         self._storage = storage
@@ -553,6 +605,8 @@ class RunAppService:
             storage=storage, entity_registry=entity_registry
         )
         self._run_timeout_seconds = run_timeout_seconds
+        self._checkpoint_store = checkpoint_store
+        self._agent_resolver = agent_resolver
         # Keep strong refs to background tasks so they are not GC'd mid-flight and
         # so they can be drained/cancelled on shutdown (AAEO-1).
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -579,7 +633,7 @@ class RunAppService:
         agent_spec: AgentSpec | None = None,
         agent_def: AgentDefRecord | None = None,
         operator_provisioned: bool = False,
-        checkpoint_store: Any = None,
+        hitl: bool = False,
     ) -> RunRecord:
         """Create (or return the existing) run and launch background execution.
 
@@ -611,6 +665,23 @@ class RunAppService:
         fan-out cannot pin unbounded tasks. An idempotent re-submit of an existing
         run never counts against the cap.
         """
+        # HITL admission (T2f): a ``hitl=True`` run pauses on an approval-gated tool, so
+        # it REQUIRES a per-run tool-bearing runtime (the shared inline runtime carries
+        # no tool_service and cannot call — let alone gate — a tool) AND a checkpoint
+        # store to pause into. Reject early (before any record is written) when either is
+        # missing, so a caller never gets a silently tool-less "HITL" run that can never
+        # pause. The store is resolved on resume from the stored ``agent_id``.
+        if hitl:
+            if self._checkpoint_store is None:
+                raise HitlNotSupportedError(
+                    "this deployment has no checkpoint store; hitl runs are unavailable"
+                )
+            if agent_spec is None or agent_def is None:
+                raise HitlRequiresAgentError(
+                    "hitl=True requires a stored agent (agent_id); an inline persona "
+                    "carries no tools to gate"
+                )
+
         # Fail-closed sanitize a per-run spec against the tenant attack surface
         # BEFORE anything is persisted or executed (T0.3). Operator-provisioned specs
         # may keep their tools when the operator opted in; everyone else is stripped
@@ -634,6 +705,14 @@ class RunAppService:
         # lineage is reconstructable and the Studio/CLI can show "run of agent X".
         if agent_def is not None:
             metadata["agent_id"] = agent_def.agent_id
+        # T2f: mark the run HITL-driven so the resume path (which re-resolves the spec
+        # from agent_id) knows this run is approvable and rebuilds the same gated runtime.
+        if hitl:
+            metadata["hitl"] = True
+            # ``operator_provisioned`` governs whether the stored spec's privileged tools
+            # survive the run-time re-sanitize; the resume must honor the SAME status so
+            # the gated tool the run paused on is still present when it is approved.
+            metadata["operator_provisioned"] = bool(operator_provisioned)
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
@@ -677,7 +756,7 @@ class RunAppService:
                 llm_config=llm_config,
                 agent_spec=agent_spec,
                 agent_def=agent_def,
-                checkpoint_store=checkpoint_store,
+                hitl=hitl,
             )
         )
         self._tasks.add(bg)
@@ -740,7 +819,7 @@ class RunAppService:
         llm_config: LLMConfig | None,
         agent_spec: AgentSpec | None = None,
         agent_def: AgentDefRecord | None = None,
-        checkpoint_store: Any = None,
+        hitl: bool = False,
     ) -> None:
         """Background worker: RUNNING -> run_task -> SUCCEEDED/FAILED + extraction.
 
@@ -772,7 +851,7 @@ class RunAppService:
                     llm_config=llm_config,
                     agent_spec=agent_spec,
                     agent_def=agent_def,
-                    checkpoint_store=checkpoint_store,
+                    hitl=hitl,
                 )
         finally:
             self._release_workspace_run(workspace_id)
@@ -786,9 +865,19 @@ class RunAppService:
         llm_config: LLMConfig | None,
         agent_spec: AgentSpec | None,
         agent_def: AgentDefRecord | None = None,
-        checkpoint_store: Any,
+        hitl: bool = False,
     ) -> None:
-        """Drive one run to a terminal state on the resolved runtime (T0.2 core)."""
+        """Drive one run to a terminal state on the resolved runtime (T0.2 core).
+
+        With ``hitl=True`` (T2f) the run drives :meth:`SingleAgentRuntime.run_agent_loop`
+        with ``hitl=True`` on a per-run runtime carrying /v1's checkpoint store; if it
+        pauses on an approval-gated tool the run goes AWAITING_APPROVAL (carrying the
+        checkpoint id) and STOPS — never swept, resumable via :meth:`resume_run`. The
+        non-HITL path is byte-identical to before (single ``run_task_detailed`` turn).
+        """
+        # HITL runs pause into /v1's OWN checkpoint store; the non-HITL path passes None
+        # so the per-run runtime stays exactly as the T0.2 build wired it.
+        checkpoint_store = self._checkpoint_store if hitl else None
         run.status = RunStatus.RUNNING
         run.updated_at = _now()
         await self._storage.save_run(run)
@@ -802,6 +891,14 @@ class RunAppService:
             run.error = f"agent runtime build failed: {exc}"
             run.updated_at = _now()
             await self._storage.save_run(run)
+            return
+
+        # T2f: the HITL path drives the agentic loop (which can PAUSE on an approval-gated
+        # tool); the non-HITL path is the unchanged single-turn fast path.
+        if hitl:
+            await self._drive_hitl_run(
+                run, persona, task, runtime, llm_config=llm_config, agent_def=agent_def
+            )
             return
 
         try:
@@ -855,6 +952,22 @@ class RunAppService:
             await self._storage.save_run(run)
             return
 
+        await self._finalize_succeeded_run(run, result, task=task, llm_config=llm_config)
+
+    async def _finalize_succeeded_run(
+        self,
+        run: RunRecord,
+        result: Any,
+        *,
+        task: Task,
+        llm_config: LLMConfig | None,
+    ) -> None:
+        """Record a terminal-SUCCEEDED run + extract recommendations (shared path).
+
+        Factored out so both the single-turn path and the HITL loop's terminal turn
+        finish identically (structured-output parse, AAEO-6 schema validation, the
+        SUCCEEDED transition, and recommendation extraction).
+        """
         run.output_text = result.output_text or None
         # Prefer the typed structured output; fall back to parsing the text.
         structured = result.output_structured
@@ -880,6 +993,108 @@ class RunAppService:
         # Auto-extract recommendations when the output matches the envelope.
         if run.output_structured is not None:
             await self._recommendations.extract_from_run(run)
+
+    async def _drive_hitl_run(
+        self,
+        run: RunRecord,
+        persona: Persona,
+        task: Task,
+        runtime: SingleAgentRuntime,
+        *,
+        llm_config: LLMConfig | None,
+        agent_def: AgentDefRecord | None,
+    ) -> None:
+        """Drive a hitl=True run's agentic loop; pause to AWAITING_APPROVAL on a gate.
+
+        Runs :meth:`SingleAgentRuntime.run_agent_loop` (``hitl=True``) bounded by the
+        per-run timeout. The loop either:
+
+        * pauses on an approval-gated tool — ``stopped_reason == 'awaiting_approval'`` —
+          in which case the run is stamped AWAITING_APPROVAL + ``metadata['checkpoint_id']``
+          and STOPS (never swept, resumable via approve/reject), or
+        * completes — handled exactly like the single-turn success/failure paths via the
+          shared finalizers.
+        """
+        try:
+            loop = await asyncio.wait_for(
+                runtime.run_agent_loop(persona, task, llm_config=llm_config, hitl=True),
+                timeout=self._run_timeout_seconds,
+            )
+        except TimeoutError:
+            run.status = RunStatus.FAILED
+            run.error = (
+                f"run exceeded {self._run_timeout_seconds:.0f}s execution timeout"
+            )
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+        except asyncio.CancelledError:
+            run.status = RunStatus.FAILED
+            run.error = "run cancelled"
+            run.updated_at = _now()
+            try:
+                await self._storage.save_run(run)
+            except Exception:  # pragma: no cover - best-effort during cancel
+                pass
+            raise
+        except Exception as exc:  # noqa: BLE001 - terminal failure transition
+            run.status = RunStatus.FAILED
+            run.error = str(exc)
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+
+        await self._apply_loop_outcome(
+            run, loop, task=task, llm_config=llm_config, agent_def=agent_def
+        )
+
+    async def _apply_loop_outcome(
+        self,
+        run: RunRecord,
+        loop: Any,
+        *,
+        task: Task,
+        llm_config: LLMConfig | None,
+        agent_def: AgentDefRecord | None,
+    ) -> None:
+        """Project a finished/paused :class:`AgentLoopResult` onto the run record (T2f).
+
+        Shared by the initial HITL drive and the resume path so a run pauses-again,
+        succeeds, or fails identically regardless of which entry produced the loop.
+        """
+        thread = loop.thread
+        run.thread_id = thread.thread_id
+        # The loop's trace id is derived as ``{thread_id}:{task_id}``; record it so the
+        # canonical event replay (``get_run_events``) finds the turn/tool events.
+        run.trace_id = f"{thread.thread_id}:{task.task_id}"
+
+        # T2e: link the run's chat_thread hub -> the stored agent node (best-effort).
+        if agent_def is not None:
+            await self._project_run_agent_link(run, agent_def)
+
+        if loop.stopped_reason == "awaiting_approval":
+            # The headline T2f transition: the run paused on an approval-gated tool.
+            # Stamp the checkpoint id so approve/reject can re-claim it, and STOP — the
+            # sweeper explicitly skips AWAITING_APPROVAL, so this run is never reaped.
+            run.status = RunStatus.AWAITING_APPROVAL
+            run.metadata = {
+                **(run.metadata or {}),
+                "checkpoint_id": loop.checkpoint_id,
+            }
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+
+        final = loop.final
+        if not final.succeeded:
+            run.status = RunStatus.FAILED
+            run.error = final.error or (final.error_code or "inference failed")
+            run.output_text = final.output_text or None
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+
+        await self._finalize_succeeded_run(run, final, task=task, llm_config=llm_config)
 
     async def _resolve_runtime(
         self, agent_spec: AgentSpec | None, *, checkpoint_store: Any = None
@@ -1041,6 +1256,206 @@ class RunAppService:
             await self._storage.save_run(run)
             swept.append(run.run_id)
         return swept
+
+    # ----------------------------------------------------------------- HITL (T2f)
+    async def pending_approvals(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> list[dict[str, Any]] | None:
+        """The redacted pending tool call(s) a HITL-paused run awaits (T2f).
+
+        Tenant-scoped: a run outside ``workspace_id`` reads as None (404). Returns the
+        list of ``{tool_name, args}`` for the checkpoint the run paused on, with secret-
+        looking arg values masked (the same redaction Studio's approvals inbox uses), so
+        a reviewer can see WHAT will run before approving without leaking a credential.
+        None when the run is unknown/out-of-workspace; an empty list when the run carries
+        no checkpoint (e.g. not actually paused) or the checkpoint has been resolved.
+        """
+        run = await self.get_run(run_id, workspace_id=workspace_id)
+        if run is None:
+            return None
+        if self._checkpoint_store is None:
+            return []
+        checkpoint_id = (run.metadata or {}).get("checkpoint_id")
+        if not checkpoint_id:
+            return []
+        checkpoint = self._checkpoint_store.load(checkpoint_id)
+        if checkpoint is None:
+            return []
+        from himmy.runtime.checkpoint import redact_tool_args
+
+        return [
+            {"tool_name": p.tool_name, "args": redact_tool_args(p.args)}
+            for p in checkpoint.pending_tool_calls
+        ]
+
+    async def resume_run(
+        self,
+        run_id: str,
+        *,
+        approved: bool,
+        workspace_id: str | None = None,
+        actor: str = "human",
+    ) -> RunRecord:
+        """Approve/reject a HITL-paused run; resume it on a tracked bg task (T2f).
+
+        Loads the run tenant-scoped, refuses anything not AWAITING_APPROVAL with
+        :class:`RunNotApprovableError` (HTTP 409 — so a double-approve of a run already
+        resumed is a clean no-op, never a second execution of the gated tool), reads the
+        ``checkpoint_id`` it paused on, REBUILDS its OWN per-run tool-bearing runtime FROM
+        THE STORED DB ``AgentSpec`` (resolved by ``agent_id`` — /v1 has no filesystem
+        ``agent_path`` to rebuild from, and ``resume_agent_loop`` HARD-requires a
+        ``tool_service``), and launches :meth:`SingleAgentRuntime.resume_agent_loop` on a
+        fresh tracked background task. The run is flipped to RUNNING first so the inbox
+        immediately reflects "in progress"; the background task drives it to SUCCEEDED /
+        FAILED / AWAITING_APPROVAL-again. Exactly-once is the runtime's ``claim()``: if a
+        concurrent resume already won, this resume's loop is a no-op and the run is left at
+        its resolved state. Returns the RUNNING record (fire-and-forget, mirroring
+        :meth:`create_run`).
+        """
+        run = await self.get_run(run_id, workspace_id=workspace_id)
+        if run is None:
+            raise RunNotApprovableError(run_id, status="unknown")
+        if run.status != RunStatus.AWAITING_APPROVAL:
+            raise RunNotApprovableError(run_id, status=run.status.value)
+        if self._checkpoint_store is None:  # pragma: no cover - guarded at create
+            raise HitlNotSupportedError("no checkpoint store wired; cannot resume")
+
+        checkpoint_id = (run.metadata or {}).get("checkpoint_id")
+        if not checkpoint_id:  # pragma: no cover - an AWAITING run always has one
+            raise RunNotApprovableError(run_id, status="no checkpoint")
+
+        agent_id = (run.metadata or {}).get("agent_id")
+        if not agent_id or self._agent_resolver is None:
+            raise RunNotApprovableError(run_id, status="no resolvable agent")
+        agent_def = await _maybe_await(
+            self._agent_resolver(agent_id, workspace_id=run.workspace_id)
+        )
+        if agent_def is None:
+            raise RunNotApprovableError(run_id, status="agent removed")
+
+        # Flip AWAITING_APPROVAL -> RUNNING up front so the inbox stops listing it and a
+        # second approve (if it loses the race below) sees a non-approvable status. The
+        # authoritative exactly-once gate remains the runtime ``claim()``.
+        run.status = RunStatus.RUNNING
+        run.updated_at = _now()
+        await self._storage.save_run(run)
+
+        bg = asyncio.create_task(
+            self._resume_in_background(
+                run_id,
+                checkpoint_id=checkpoint_id,
+                approved=approved,
+                actor=actor,
+                agent_def=agent_def,
+                workspace_id=run.workspace_id,
+            )
+        )
+        self._tasks.add(bg)
+        bg.add_done_callback(self._tasks.discard)
+        return run
+
+    async def _resume_in_background(
+        self,
+        run_id: str,
+        *,
+        checkpoint_id: str,
+        approved: bool,
+        actor: str,
+        agent_def: AgentDefRecord,
+        workspace_id: str,
+    ) -> None:
+        """Background worker: rebuild the runtime from the DB spec + resume the loop (T2f).
+
+        Holds the per-workspace concurrency semaphore (T0.4) for the duration, rebuilds a
+        tool-bearing runtime FROM THE STORED SPEC carrying /v1's checkpoint store, and
+        drives :meth:`SingleAgentRuntime.resume_agent_loop`. A loser of the exactly-once
+        ``claim()`` race (``HimmyError('already resolved')``) is a NO-OP — the run is left
+        at whatever the winner set it to (never re-failed, never re-run).
+        """
+        semaphore = self._workspace_semaphore(workspace_id)
+        async with semaphore:
+            run = await self._storage.get_run(run_id)
+            if run is None:  # pragma: no cover - defensive
+                return
+            # Re-sanitize the stored spec under the SAME operator status the run was
+            # created with, so the approval-gated tool the run paused on is still present
+            # when it executes (a tenant spec would have had its tools stripped at create,
+            # so a paused run could only exist for an operator-provisioned/clean spec). If
+            # the operator has since REVOKED the opt-in (env var unset between pause and
+            # resume), the re-sanitize fail-closes — the resume becomes a clean FAILED,
+            # never a crashed task and never a privileged-tool execution without the opt-in.
+            operator_provisioned = bool(
+                (run.metadata or {}).get("operator_provisioned", False)
+            )
+            from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+            try:
+                spec = sanitize_tenant_spec(
+                    agent_def.agent_spec(),
+                    operator_provisioned=operator_provisioned,
+                ).spec
+                runtime = await self._resolve_runtime(
+                    spec, checkpoint_store=self._checkpoint_store
+                )
+            except Exception as exc:  # noqa: BLE001 - spec rebuild failure is terminal
+                run.status = RunStatus.FAILED
+                run.error = f"resume runtime build failed: {exc}"
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+
+            from himmy.core.errors import HimmyError
+
+            try:
+                loop = await asyncio.wait_for(
+                    runtime.resume_agent_loop(
+                        checkpoint_id, approved=approved, actor=actor
+                    ),
+                    timeout=self._run_timeout_seconds,
+                )
+            except HimmyError as exc:
+                # The exactly-once loser: the checkpoint was already resolved by a
+                # concurrent/earlier resume. This is a NO-OP — do NOT touch the run (the
+                # winner owns its terminal state). Leaving it as-is means a double-approve
+                # neither re-runs the tool nor flips a SUCCEEDED run to FAILED.
+                logger.info(
+                    "resume of run %s was a no-op (%s)", run_id, exc
+                )
+                return
+            except TimeoutError:
+                run.status = RunStatus.FAILED
+                run.error = (
+                    f"resume exceeded {self._run_timeout_seconds:.0f}s timeout"
+                )
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+            except asyncio.CancelledError:
+                run.status = RunStatus.FAILED
+                run.error = "resume cancelled"
+                run.updated_at = _now()
+                try:
+                    await self._storage.save_run(run)
+                except Exception:  # pragma: no cover - best-effort during cancel
+                    pass
+                raise
+            except Exception as exc:  # noqa: BLE001 - terminal failure transition
+                run.status = RunStatus.FAILED
+                run.error = str(exc)
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+
+            # Reconstruct the task so the shared finalizers compute the right trace id +
+            # validate structured output against the originally-requested schema.
+            from himmy.agents.base_agent.task import Task as _Task
+
+            task = _Task(title=run.persona_name or "resume", prompt="", context={})
+            if run.task_id:
+                task.task_id = run.task_id
+            await self._apply_loop_outcome(
+                run, loop, task=task, llm_config=None, agent_def=agent_def
+            )
 
     # --------------------------------------------------------------------- reads
     async def get_run(
@@ -1543,7 +1958,12 @@ __all__ = [
     "RunAppService",
     "RecommendationAppService",
     "DashboardQueryService",
+    "AgentDefAppService",
+    "AgentDefReferencedError",
     "WorkspaceRunQuotaExceeded",
+    "HitlNotSupportedError",
+    "HitlRequiresAgentError",
+    "RunNotApprovableError",
     "DEFAULT_PAGE_LIMIT",
     "MAX_PAGE_LIMIT",
     "DEFAULT_WORKSPACE_CONCURRENCY",

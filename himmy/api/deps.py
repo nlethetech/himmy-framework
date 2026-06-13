@@ -114,6 +114,7 @@ class ApiContainer:
         consent_policy: Any = None,
         retention_service: Any = None,
         privacy_audit: Any = None,
+        checkpoint_store: Any = None,
     ) -> None:
         """Store the assembled service singletons.
 
@@ -121,7 +122,8 @@ class ApiContainer:
         the governed branch (``HIMMY_CONSENT`` on); they stay ``None`` on the zero-config
         path so nothing about the offline behaviour changes (WS4.6 A3). ``privacy_audit``
         (WS4.7 B4) is always wired — it is inert over an empty store — and the
-        ``/v1/audit/privacy`` router reads it.
+        ``/v1/audit/privacy`` router reads it. ``checkpoint_store`` (T2f) is /v1's durable
+        HITL inbox; the container owns its handle so :meth:`aclose` releases it.
         """
         self.storage = storage
         self.entity_registry = entity_registry
@@ -137,6 +139,7 @@ class ApiContainer:
         self.consent_policy = consent_policy
         self.retention_service = retention_service
         self.privacy_audit = privacy_audit
+        self.checkpoint_store = checkpoint_store
 
     @classmethod
     def build_default(cls) -> ApiContainer:
@@ -246,19 +249,29 @@ class ApiContainer:
         context_app = ContextAppService(
             context_service=context_service, storage=service_storage
         )
+        # T2e: the durable workspace-scoped stored-agent (/v1/agents) resource. Shares
+        # the same storage + spine the run service reads, so a stored agent projects an
+        # ``agent`` node into the one canonical spine and a run launched by ``agent_id``
+        # links back to it. Built BEFORE the run service so the run service can resolve a
+        # paused run's stored spec on HITL resume (T2f) via this service.
+        agent_app = AgentDefAppService(
+            storage=service_storage,
+            entity_registry=service_registry,
+        )
+        # T2f: /v1's OWN durable HITL checkpoint inbox (distinct from Studio's
+        # ``.himmy/approvals.db``). Durable file-backed in a server context (so a paused
+        # run survives a restart and the inbox is visible to all workers); in-memory in
+        # the zero-config offline/test default so ``build_default`` writes no files. The
+        # resolver lets the run service rebuild a paused run's tool-bearing runtime FROM
+        # THE STORED DB SPEC (reviewer must_fix: /v1 has no filesystem ``agent_path``).
+        checkpoint_store = cls._build_v1_checkpoint_store()
         run_app = RunAppService(
             runtime=runtime,
             storage=service_storage,
             entity_registry=service_registry,
             recommendation_app=recommendation_app,
-        )
-        # T2e: the durable workspace-scoped stored-agent (/v1/agents) resource. Shares
-        # the same storage + spine the run service reads, so a stored agent projects an
-        # ``agent`` node into the one canonical spine and a run launched by ``agent_id``
-        # links back to it.
-        agent_app = AgentDefAppService(
-            storage=service_storage,
-            entity_registry=service_registry,
+            checkpoint_store=checkpoint_store,
+            agent_resolver=agent_app.get_agent_def,
         )
         dashboard = DashboardQueryService(storage=service_storage)
         # The LLM-judge metric path (AAEO-10) can reach the inference service.
@@ -292,7 +305,34 @@ class ApiContainer:
             consent_policy=overlay.policy,
             retention_service=overlay.retention,
             privacy_audit=privacy_audit,
+            checkpoint_store=checkpoint_store,
         )
+
+    @staticmethod
+    def _build_v1_checkpoint_store() -> Any:
+        """Build /v1's OWN HITL checkpoint store: durable in a server, in-RAM offline (T2f).
+
+        In a server context (the lifespan-established durable deployment) this is a
+        file-backed :class:`SqliteCheckpointStore` at ``.himmy/v1_approvals.db`` (resolved
+        by :func:`himmy.config.project.v1_approvals_db_path`), DELIBERATELY a different
+        file than Studio's ``.himmy/approvals.db`` — the two surfaces rebuild a paused run
+        from different spec sources, so the inboxes stay per-surface (reviewer must_fix).
+        Outside a server context (the zero-config ``build_default`` offline/test default)
+        it is an in-memory store so no file is written and the offline contract is
+        unchanged. ``build_default`` runs BEFORE the lifespan sets the server context, so
+        the durable upgrade happens in the lifespan's rebuild (mirroring the spine).
+        """
+        from himmy.runtime.checkpoint import (
+            InMemoryCheckpointStore,
+            SqliteCheckpointStore,
+        )
+        from himmy.services.storage.factory import in_server_context
+
+        if in_server_context():
+            from himmy.config.project import v1_approvals_db_path
+
+            return SqliteCheckpointStore(v1_approvals_db_path())
+        return InMemoryCheckpointStore()
 
     @staticmethod
     def _build_privacy_audit(
@@ -425,6 +465,14 @@ class ApiContainer:
         if spine_close is not None:
             try:
                 spine_close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+        # T2f: release /v1's durable HITL checkpoint file handle (SQLite). The in-memory
+        # store has no ``close`` — the getattr guard makes this a no-op there.
+        cp_close = getattr(self.checkpoint_store, "close", None)
+        if cp_close is not None:
+            try:
+                cp_close()
             except Exception:  # pragma: no cover - best-effort teardown
                 pass
 

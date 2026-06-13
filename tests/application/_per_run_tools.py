@@ -17,10 +17,18 @@ from himmy.services.tools.registry import ToolRegistry, register_local_tool
 
 #: Every ``ping`` invocation appends its args here so a test can prove the tool ran.
 CALLS: list[dict[str, Any]] = []
+#: Every ``wire_money`` execution appends here — used by the /v1 HITL tests (T2f) to prove
+#: the approval-gated tool fired EXACTLY ONCE after approve (and NEVER after reject).
+WIRE_CALLS: list[dict[str, Any]] = []
 
 
 def register(registry: ToolRegistry) -> None:
-    """Register the ``ping`` recording tool onto ``registry`` (the from_spec entrypoint)."""
+    """Register the recording tools onto ``registry`` (the from_spec entrypoint).
+
+    ``ping`` is a read-only probe (no approval). ``wire_money`` is approval-gated
+    (``requires_approval=True``), so a ``hitl=True`` run that calls it PAUSES into a
+    checkpoint — the seam the /v1 HITL approve/reject tests (T2f) drive.
+    """
 
     async def _ping(args: dict[str, Any]) -> dict[str, Any]:
         CALLS.append(dict(args))
@@ -36,4 +44,20 @@ def register(registry: ToolRegistry) -> None:
             "properties": {"message": {"type": "string"}},
         },
         read_only=True,
+    )
+
+    async def _wire_money(args: dict[str, Any]) -> dict[str, Any]:
+        WIRE_CALLS.append(dict(args))
+        return {"sent": True, "amount": args.get("amount", 0)}
+
+    register_local_tool(
+        registry,
+        name="wire_money",
+        handler=_wire_money,
+        description="An approval-gated money transfer (records each execution).",
+        args_json_schema={
+            "type": "object",
+            "properties": {"amount": {"type": "number"}},
+        },
+        requires_approval=True,
     )

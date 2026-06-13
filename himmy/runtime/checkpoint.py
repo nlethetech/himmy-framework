@@ -38,6 +38,25 @@ REJECTED = "rejected"
 CHECKPOINT_SCHEMA_VERSION = 2
 
 
+#: Arg-key substrings whose values are masked before a pending tool call is shown to a
+#: human (so an approvals inbox never surfaces a credential). The canonical home for the
+#: redaction, shared by every surface's approvals view (Studio + /v1).
+_SECRETY_ARG_KEYS = ("token", "password", "secret", "key", "authorization", "auth")
+
+
+def redact_tool_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Mask values whose key looks secret, so an approvals UI never shows a credential.
+
+    The single, surface-neutral redaction for HITL pending-tool views: both the Studio
+    approvals inbox and the ``/v1`` ``GET /runs/{id}/pending-approvals`` endpoint reuse it,
+    so the two surfaces redact identically.
+    """
+    out: dict[str, Any] = {}
+    for k, v in (args or {}).items():
+        out[k] = "••••" if any(s in k.lower() for s in _SECRETY_ARG_KEYS) else v
+    return out
+
+
 class PendingToolCall(BaseModel):
     """A tool call the model made that is blocked awaiting human approval."""
 
@@ -515,6 +534,7 @@ __all__ = [
     "APPROVED",
     "REJECTED",
     "CHECKPOINT_SCHEMA_VERSION",
+    "redact_tool_args",
     "PendingToolCall",
     "AgentCheckpoint",
     "CheckpointStore",

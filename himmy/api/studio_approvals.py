@@ -22,6 +22,7 @@ from himmy.runtime.checkpoint import (
     AWAITING_APPROVAL,
     RESOLVING,
     SqliteCheckpointStore,
+    redact_tool_args,
 )
 
 #: The checkpoint statuses a human can still act on from the inbox: a fresh
@@ -33,15 +34,9 @@ from himmy.runtime.checkpoint import (
 #: refused by ``resolve``).
 _RESUMABLE = (AWAITING_APPROVAL, RESOLVING)
 
-_SECRETY = ("token", "password", "secret", "key", "authorization", "auth")
-
-
-def _redact_args(args: dict[str, Any]) -> dict[str, Any]:
-    """Mask values whose key looks secret, so the GUI never shows a credential."""
-    out: dict[str, Any] = {}
-    for k, v in (args or {}).items():
-        out[k] = "••••" if any(s in k.lower() for s in _SECRETY) else v
-    return out
+#: Back-compat alias: the canonical redaction now lives in ``himmy.runtime.checkpoint``
+#: (surface-neutral, shared with /v1). Kept so existing imports of ``_redact_args`` work.
+_redact_args = redact_tool_args
 
 
 # ---- store singleton (cwd-keyed, like get_run_store) --------------------

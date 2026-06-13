@@ -24,7 +24,13 @@ from himmy.api.models import (
     RunListResponse,
 )
 from himmy.api.security_audit import audit_event
-from himmy.application.services import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+from himmy.application.services import (
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    HitlNotSupportedError,
+    HitlRequiresAgentError,
+    RunNotApprovableError,
+)
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import RunRecord, RunStatus
 
@@ -51,6 +57,27 @@ class TaskInput(BaseModel):
     context: dict[str, Any] = {}
 
 
+class ApprovalDecisionRequest(BaseModel):
+    """Optional body for approve/reject: an explicit workspace scope (else inferred)."""
+
+    workspace_id: str | None = None
+
+
+class PendingToolCallView(BaseModel):
+    """A pending, approval-gated tool call (args redacted) a paused run awaits (T2f)."""
+
+    tool_name: str
+    args: dict[str, Any] = {}
+
+
+class PendingApprovalsResponse(BaseModel):
+    """The redacted pending tool call(s) a HITL-paused run is blocked on (T2f)."""
+
+    run_id: str
+    status: RunStatus
+    pending_tool_calls: list[PendingToolCallView] = []
+
+
 class CreateRunRequest(BaseModel):
     """The POST /v1/runs body: subject scope + persona/agent + task + idempotency.
 
@@ -66,6 +93,7 @@ class CreateRunRequest(BaseModel):
     agent_id: str | None = None
     task: TaskInput
     idempotency_key: str | None = None
+    hitl: bool = False
 
 
 def _container(request: Request) -> Any:
@@ -80,6 +108,12 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
     Two mutually-exclusive identity sources (T2e): an inline ``persona`` (tool-less,
     byte-unchanged back-compat) OR an ``agent_id`` that resolves a stored ``AgentSpec``
     and executes WITH ITS TOOLS on the per-run runtime, recording an agent lineage edge.
+
+    With ``hitl=true`` (T2f) the run drives the agentic loop and PAUSES at
+    ``AWAITING_APPROVAL`` when it hits an approval-gated tool — resumable via
+    ``POST /v1/runs/{id}/approve|reject``. HITL requires a stored ``agent_id`` (an inline
+    persona carries no tools to gate → 422) and a deployment with a checkpoint store
+    (→ 400 when absent).
     """
     from himmy.agents.base_agent.task import Task
     from himmy.agents.personas.persona import Persona
@@ -129,21 +163,27 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
             metadata=body.persona.metadata,
         )
 
-    run: RunRecord = cast(
-        RunRecord,
-        await _container(request).run_app.create_run(
-            workspace_id=workspace_id,
-            subject_id=body.subject_id,
-            persona=persona,
-            task=task,
-            idempotency_key=body.idempotency_key,
-            llm_config=llm_config,
-            agent_spec=agent_spec,
-            agent_def=agent_def,
-            operator_provisioned=operator_provisioned,
-            actor=get_principal(request).actor_metadata(),
-        ),
-    )
+    try:
+        run: RunRecord = cast(
+            RunRecord,
+            await _container(request).run_app.create_run(
+                workspace_id=workspace_id,
+                subject_id=body.subject_id,
+                persona=persona,
+                task=task,
+                idempotency_key=body.idempotency_key,
+                llm_config=llm_config,
+                agent_spec=agent_spec,
+                agent_def=agent_def,
+                operator_provisioned=operator_provisioned,
+                hitl=body.hitl,
+                actor=get_principal(request).actor_metadata(),
+            ),
+        )
+    except HitlRequiresAgentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HitlNotSupportedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     audit_event(
         request,
         event_type="access",
@@ -154,6 +194,123 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
         detail=f"run {run.run_id} created",
     )
     return run
+
+
+async def _resume_run(
+    run_id: str,
+    body: ApprovalDecisionRequest,
+    request: Request,
+    *,
+    approved: bool,
+) -> RunRecord:
+    """Shared approve/reject handler: resume a HITL-paused run (T2f).
+
+    Tenant-scoped (``resolve_workspace`` + a service-side workspace check); a 409 when the
+    run is not AWAITING_APPROVAL (so a double-approve of an already-resumed run is a clean
+    no-op, never a second firing of the gated tool). Stamps the approver actor and audits
+    the decision. The actual gated-tool execution + continuation happen on a fresh tracked
+    background task; the response is the RUNNING record (fire-and-forget, like create).
+    """
+    workspace_id = resolve_workspace(request, body.workspace_id)
+    principal = get_principal(request)
+    try:
+        run = cast(
+            RunRecord,
+            await _container(request).run_app.resume_run(
+                run_id,
+                approved=approved,
+                workspace_id=workspace_id,
+                actor=principal.subject,
+            ),
+        )
+    except RunNotApprovableError as exc:
+        # An unknown / out-of-workspace run is a 404; a known-but-not-paused run is a 409.
+        if exc.status == "unknown":
+            raise HTTPException(status_code=404, detail="run not found") from exc
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HitlNotSupportedError as exc:  # pragma: no cover - guarded at create
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit_event(
+        request,
+        event_type="access",
+        outcome="allow",
+        resource="run",
+        action="approve" if approved else "reject",
+        workspace_id=run.workspace_id,
+        detail=f"run {run_id} {'approved' if approved else 'rejected'}",
+    )
+    return run
+
+
+@router.post(
+    "/{run_id}/approve",
+    response_model=RunRecord,
+    responses=NOT_FOUND_RESPONSE,
+    dependencies=_WRITE,
+)
+async def approve_run(
+    run_id: str,
+    request: Request,
+    body: ApprovalDecisionRequest = ApprovalDecisionRequest(),
+) -> RunRecord:
+    """Approve a HITL-paused run: fire the gated tool EXACTLY ONCE and continue (T2f).
+
+    The run must be AWAITING_APPROVAL (else 409). Resumes via the runtime's atomic
+    ``claim()`` so a double-approve is a no-op (the gated tool never fires twice).
+    """
+    return await _resume_run(run_id, body, request, approved=True)
+
+
+@router.post(
+    "/{run_id}/reject",
+    response_model=RunRecord,
+    responses=NOT_FOUND_RESPONSE,
+    dependencies=_WRITE,
+)
+async def reject_run(
+    run_id: str,
+    request: Request,
+    body: ApprovalDecisionRequest = ApprovalDecisionRequest(),
+) -> RunRecord:
+    """Reject a HITL-paused run: record the rejection WITHOUT running the gated tool (T2f).
+
+    The run must be AWAITING_APPROVAL (else 409). The model sees the rejection and the
+    loop continues to a terminal state; the gated tool is never executed.
+    """
+    return await _resume_run(run_id, body, request, approved=False)
+
+
+@router.get(
+    "/{run_id}/pending-approvals",
+    response_model=PendingApprovalsResponse,
+    responses=NOT_FOUND_RESPONSE,
+    dependencies=_READ,
+)
+async def get_pending_approvals(
+    run_id: str,
+    request: Request,
+    workspace_id: str | None = None,
+) -> PendingApprovalsResponse:
+    """The redacted pending tool call(s) a HITL-paused run awaits (T2f).
+
+    Tenant-scoped (404 when the run is unknown/out-of-workspace). Secret-looking arg
+    values are masked (the same redaction the Studio approvals inbox uses).
+    """
+    workspace_id = resolve_workspace(request, workspace_id)
+    run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    pending = await _container(request).run_app.pending_approvals(
+        run_id, workspace_id=workspace_id
+    )
+    return PendingApprovalsResponse(
+        run_id=run_id,
+        status=run.status,
+        pending_tool_calls=[
+            PendingToolCallView(tool_name=p["tool_name"], args=p["args"])
+            for p in (pending or [])
+        ],
+    )
 
 
 @router.get("", response_model=RunListResponse, dependencies=_READ)

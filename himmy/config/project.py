@@ -36,6 +36,14 @@ HIMMY_SPINE_PATH_ENV = "HIMMY_SPINE_PATH"
 #: default). When set it is honoured verbatim — the parent directory is created on first use.
 HIMMY_CONVERSATIONS_PATH_ENV = "HIMMY_CONVERSATIONS_PATH"
 
+#: Override for the /v1 HITL checkpoint store (``.himmy/v1_approvals.db`` by default).
+#: This is the SURFACE-OWNED durable inbox for ``/v1`` approval-gated runs (T2f), kept
+#: DISTINCT from Studio's ``.himmy/approvals.db`` — the two surfaces resume from their own
+#: spec source (Studio from an ``agent_path`` filesystem file, /v1 from a stored DB
+#: ``AgentSpec``), so a single shared inbox is a deferred item, not this tier. When set the
+#: value is honoured verbatim — the parent directory is created on first use.
+HIMMY_V1_APPROVALS_PATH_ENV = "HIMMY_V1_APPROVALS_PATH"
+
 
 def find_project_config(start: str | Path | None = None) -> Path | None:
     """Locate ``himmy.toml`` (cwd) or ``~/.himmy/config.toml``, or ``None``."""
@@ -116,6 +124,26 @@ def conversations_db_path(start: str | Path | None = None) -> str:
     return str(himmy_dir(start) / "conversations.db")
 
 
+def v1_approvals_db_path(start: str | Path | None = None) -> str:
+    """The durable /v1 HITL checkpoint store path (per-surface inbox, T2f).
+
+    Resolution: ``HIMMY_V1_APPROVALS_PATH`` when set (honoured verbatim, its parent dir
+    created), otherwise ``<project-root>/.himmy/v1_approvals.db`` (project root resolved by
+    :func:`find_project_root`). DELIBERATELY a different file than Studio's
+    ``.himmy/approvals.db``: the two surfaces rebuild their paused runtime from different
+    spec sources (Studio from a filesystem ``agent_path``; /v1 from a stored DB
+    ``AgentSpec`` a /v1 row carries but a Studio row does not), so a drop-in shared inbox
+    is a future item — keeping the inboxes per-surface here is the reviewer must_fix.
+    """
+    override = os.environ.get(HIMMY_V1_APPROVALS_PATH_ENV)
+    if override and override.strip():
+        path = Path(override.strip()).expanduser()
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    return str(himmy_dir(start) / "v1_approvals.db")
+
+
 def load_project_config(start: str | Path | None = None) -> dict[str, Any]:
     """Load the project config as a dict (empty when no file is found)."""
     path = find_project_config(start)
@@ -129,10 +157,12 @@ __all__ = [
     "HIMMY_CONVERSATIONS_PATH_ENV",
     "HIMMY_DIR_NAME",
     "HIMMY_SPINE_PATH_ENV",
+    "HIMMY_V1_APPROVALS_PATH_ENV",
     "conversations_db_path",
     "find_project_config",
     "find_project_root",
     "himmy_dir",
+    "v1_approvals_db_path",
     "load_project_config",
     "spine_db_path",
 ]
