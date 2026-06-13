@@ -37,7 +37,10 @@ CREATE TABLE IF NOT EXISTS studio_runs (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cost          REAL NOT NULL DEFAULT 0,
     usage_by_model TEXT NOT NULL DEFAULT '[]',
-    checkpoint_id TEXT
+    checkpoint_id TEXT,
+    feedback_verdict TEXT,
+    feedback_note TEXT,
+    feedback_at TEXT
 );
 CREATE INDEX IF NOT EXISTS studio_runs_created_idx ON studio_runs (created_at);
 """
@@ -51,7 +54,17 @@ _LATER_COLUMNS = {
     "cost": "REAL NOT NULL DEFAULT 0",
     "usage_by_model": "TEXT NOT NULL DEFAULT '[]'",
     "checkpoint_id": "TEXT",
+    # P0-A run feedback (human thumbs up/down + optional note). The
+    # authoritative current-state copy; the immutable history lives on the
+    # entity spine (kind='run_feedback'). Written only by set_feedback(), never
+    # by save(), so re-saving a run (e.g. an HITL resume) never clobbers it.
+    "feedback_verdict": "TEXT",
+    "feedback_note": "TEXT",
+    "feedback_at": "TEXT",
 }
+
+#: Allowed feedback verdicts (kept in sync with the API + entity payload).
+FEEDBACK_VERDICTS: frozenset[str] = frozenset({"up", "down"})
 
 
 class TimelineStep(BaseModel):
@@ -124,6 +137,10 @@ class StudioRunSummary(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    # P0-A: human feedback on this run, if any ("up" | "down").
+    feedback_verdict: str | None = None
+    feedback_note: str | None = None
+    feedback_at: str | None = None
 
 
 class ModelUsage(BaseModel):
@@ -213,6 +230,11 @@ class RunAnalytics(BaseModel):
     avg_latency_ms: float = 0.0
     p50_latency_ms: float = 0.0
     p95_latency_ms: float = 0.0
+    # P0-A: explicit human-feedback tallies over the window (the cheapest,
+    # least-noisy learning signal — surfaced so the founder can see at a glance
+    # how much rated traffic exists before any loop relies on it).
+    feedback_up: int = 0
+    feedback_down: int = 0
     by_model: list[ModelAnalytics] = []
     by_day: list[DayAnalytics] = []
 
@@ -240,13 +262,30 @@ class StudioRunStore:
                 self._conn.execute(f"ALTER TABLE studio_runs ADD COLUMN {name} {decl}")
 
     def save(self, run: StudioRun) -> None:
-        """Insert (or replace) one run record."""
+        """Insert or update one run record, PRESERVING any human feedback.
+
+        Uses ``ON CONFLICT(id) DO UPDATE`` rather than ``INSERT OR REPLACE`` so
+        re-saving a run (an HITL resume persists the continuation under the same
+        id) overwrites only the run-content columns — ``feedback_*`` is owned by
+        :meth:`set_feedback` and is never touched here.
+        """
         self._conn.execute(
-            "INSERT OR REPLACE INTO studio_runs (id, created_at, agent_name, "
+            "INSERT INTO studio_runs (id, created_at, agent_name, "
             "agent_path, provider, model, prompt, output, status, duration_ms, "
             "thread_id, tools, messages, timeline, steps, input_tokens, "
             "output_tokens, cost, usage_by_model, checkpoint_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "created_at=excluded.created_at, agent_name=excluded.agent_name, "
+            "agent_path=excluded.agent_path, provider=excluded.provider, "
+            "model=excluded.model, prompt=excluded.prompt, output=excluded.output, "
+            "status=excluded.status, duration_ms=excluded.duration_ms, "
+            "thread_id=excluded.thread_id, tools=excluded.tools, "
+            "messages=excluded.messages, timeline=excluded.timeline, "
+            "steps=excluded.steps, input_tokens=excluded.input_tokens, "
+            "output_tokens=excluded.output_tokens, cost=excluded.cost, "
+            "usage_by_model=excluded.usage_by_model, "
+            "checkpoint_id=excluded.checkpoint_id",
             (
                 run.id,
                 run.created_at,
@@ -271,6 +310,28 @@ class StudioRunStore:
             ),
         )
         self._conn.commit()
+
+    def set_feedback(
+        self, run_id: str, *, verdict: str, note: str | None, at: str
+    ) -> bool:
+        """Record human feedback on a run. Returns False when the run is unknown.
+
+        Idempotent and re-settable: a later call overwrites the current-state
+        columns (the immutable history lives on the entity spine). Raises
+        ``ValueError`` on an unknown verdict so the caller can return 422.
+        """
+        if verdict not in FEEDBACK_VERDICTS:
+            raise ValueError(
+                f"unknown feedback verdict {verdict!r}; "
+                f"expected one of {sorted(FEEDBACK_VERDICTS)}"
+            )
+        cur = self._conn.execute(
+            "UPDATE studio_runs SET feedback_verdict = ?, feedback_note = ?, "
+            "feedback_at = ? WHERE id = ?",
+            (verdict, note, at, run_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM studio_runs").fetchone()[0])
@@ -307,7 +368,7 @@ class StudioRunStore:
         """
         rows = self._conn.execute(
             "SELECT created_at, status, duration_ms, cost, input_tokens, "
-            "output_tokens, model, usage_by_model FROM studio_runs "
+            "output_tokens, model, usage_by_model, feedback_verdict FROM studio_runs "
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -315,6 +376,10 @@ class StudioRunStore:
             return RunAnalytics()
 
         ok = sum(1 for r in rows if r["status"] == "ok")
+        feedback_up = sum(1 for r in rows if _col(r, "feedback_verdict", None) == "up")
+        feedback_down = sum(
+            1 for r in rows if _col(r, "feedback_verdict", None) == "down"
+        )
         latencies = [float(r["duration_ms"]) for r in rows if r["duration_ms"]]
         by_model: dict[str, ModelAnalytics] = {}
         by_day: dict[str, DayAnalytics] = {}
@@ -368,6 +433,8 @@ class StudioRunStore:
             avg_latency_ms=(sum(latencies) / len(latencies)) if latencies else 0.0,
             p50_latency_ms=_pct(latencies, 0.50),
             p95_latency_ms=_pct(latencies, 0.95),
+            feedback_up=feedback_up,
+            feedback_down=feedback_down,
             by_model=sorted(by_model.values(), key=lambda m: m.cost, reverse=True),
             by_day=[by_day[k] for k in sorted(by_day)],
         )
@@ -392,6 +459,9 @@ class StudioRunStore:
             input_tokens=_col(row, "input_tokens", 0),
             output_tokens=_col(row, "output_tokens", 0),
             cost=_col(row, "cost", 0.0),
+            feedback_verdict=_col(row, "feedback_verdict", None),
+            feedback_note=_col(row, "feedback_note", None),
+            feedback_at=_col(row, "feedback_at", None),
         )
 
     @staticmethod
@@ -429,6 +499,9 @@ class StudioRunStore:
             ],
             checkpoint_id=_col(row, "checkpoint_id", None),
             tool_count=len(json.loads(row["tools"] or "[]")),
+            feedback_verdict=_col(row, "feedback_verdict", None),
+            feedback_note=_col(row, "feedback_note", None),
+            feedback_at=_col(row, "feedback_at", None),
         )
 
 

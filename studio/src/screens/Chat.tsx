@@ -5,7 +5,9 @@ import {
   streamTeamRun,
   getChat,
   saveChat,
+  setRunFeedback,
   type AgentSummary,
+  type FeedbackVerdict,
   type TeamSummary,
 } from "../lib/api";
 import { Topbar } from "../components/Page";
@@ -105,6 +107,8 @@ export default function Chat() {
   const [path, setPath] = useState<string>("");
   const [provider, setProvider] = useState<string>("");
   const [messages, setMessages] = useState<Msg[]>([]);
+  // P0-A: per-run human feedback (runId → verdict), so the thumbs reflect state.
+  const [feedback, setFeedback] = useState<Record<string, FeedbackVerdict>>({});
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [loadErr, setLoadErr] = useState<string | null>(null);
@@ -656,6 +660,28 @@ export default function Chat() {
     }
   };
 
+  // P0-A: rate a run thumbs up/down. A "down" optionally captures a short note
+  // (the most actionable feedback). Optimistic; reverts the chip on failure.
+  const rateRun = async (runId: string, verdict: FeedbackVerdict) => {
+    const prev = feedback[runId];
+    setFeedback((f) => ({ ...f, [runId]: verdict }));
+    let note: string | null = null;
+    if (verdict === "down") {
+      note = window.prompt("What was wrong? (optional)")?.trim() || null;
+    }
+    try {
+      await setRunFeedback(runId, verdict, note);
+    } catch {
+      // revert the optimistic chip if the write failed
+      setFeedback((f) => {
+        const next = { ...f };
+        if (prev) next[runId] = prev;
+        else delete next[runId];
+        return next;
+      });
+    }
+  };
+
   const sub = picked
     ? isTeam
       ? `team · ${(picked.item as TeamSummary).members.length} agents`
@@ -803,10 +829,49 @@ export default function Chat() {
                       </span>
                     ))}
                   {m.role === "agent" && m.runId && !m.streaming && (
-                    <div className="mt8">
+                    <div
+                      className="mt8"
+                      style={{ display: "flex", gap: 12, alignItems: "center" }}
+                    >
                       <Link to={`/activity/${m.runId}`} className="dim" style={{ fontSize: 12 }}>
                         ↗ view trace
                       </Link>
+                      <span style={{ display: "inline-flex", gap: 4 }}>
+                        <button
+                          type="button"
+                          className="dim"
+                          title="Good response"
+                          aria-label="Rate good"
+                          aria-pressed={feedback[m.runId] === "up"}
+                          onClick={() => m.runId && rateRun(m.runId, "up")}
+                          style={{
+                            background: "none",
+                            border: "none",
+                            cursor: "pointer",
+                            fontSize: 12,
+                            opacity: feedback[m.runId] === "up" ? 1 : 0.55,
+                          }}
+                        >
+                          {feedback[m.runId] === "up" ? "👍" : "👍🏻"}
+                        </button>
+                        <button
+                          type="button"
+                          className="dim"
+                          title="Bad response"
+                          aria-label="Rate bad"
+                          aria-pressed={feedback[m.runId] === "down"}
+                          onClick={() => m.runId && rateRun(m.runId, "down")}
+                          style={{
+                            background: "none",
+                            border: "none",
+                            cursor: "pointer",
+                            fontSize: 12,
+                            opacity: feedback[m.runId] === "down" ? 1 : 0.55,
+                          }}
+                        >
+                          {feedback[m.runId] === "down" ? "👎" : "👎🏻"}
+                        </button>
+                      </span>
                     </div>
                   )}
                 </div>

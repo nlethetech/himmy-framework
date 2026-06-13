@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -31,6 +31,7 @@ from himmy.api import (
     studio_agents,
     studio_approvals,
     studio_connections,
+    studio_feedback,
     studio_service,
 )
 from himmy.api.auth import require_permission
@@ -41,6 +42,7 @@ from himmy.api.studio_connections import (
     ReadOnlyBackendError,
     SendResult,
 )
+from himmy.api.studio_feedback import RunFeedback
 from himmy.api.studio_runs import (
     RunAnalytics,
     StudioRun,
@@ -336,6 +338,40 @@ async def get_run(run_id: str) -> StudioRun:
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run
+
+
+class RunFeedbackRequest(BaseModel):
+    """A human's thumbs up/down on a run (with an optional note)."""
+
+    verdict: Literal["up", "down"]
+    note: str | None = Field(default=None, max_length=4000)
+
+
+@router.post("/runs/{run_id}/feedback", response_model=RunFeedback)
+async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback:
+    """Record human feedback on a run (the cheapest, least-noisy learning signal).
+
+    Writes the verdict to the run row and appends an immutable, versioned
+    ``run_feedback`` record to the entity spine. Re-rating is allowed and produces
+    a new spine version (a full audit of every verdict change).
+    """
+    try:
+        fb = studio_feedback.record_feedback(
+            run_id, verdict=body.verdict, note=body.note
+        )
+    except ValueError as exc:  # unknown verdict (belt-and-braces vs the Literal)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if fb is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return fb
+
+
+@router.get("/runs/{run_id}/feedback", response_model=RunFeedback | None)
+async def get_run_feedback(run_id: str) -> RunFeedback | None:
+    """Current feedback on a run (latest verdict), or ``null`` if none yet."""
+    if get_run_store().get(run_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return studio_feedback.get_feedback(run_id)
 
 
 # ---- Connections (connect Email/Telegram/Web so agents can act) ---------
