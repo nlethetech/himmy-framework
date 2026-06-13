@@ -32,11 +32,23 @@ STUDIO_METADATA_KEY = "studio"
 
 
 class RunStatus(str, Enum):
-    """Lifecycle state of an async agent run."""
+    """Lifecycle state of an async agent run.
+
+    ``RESOLVING`` is the transient claim state for a HITL approve/reject: the resume
+    that wins the atomic compare-and-set flips ``AWAITING_APPROVAL`` -> ``RESOLVING``
+    BEFORE launching any resume work, so a second concurrent approve (a double-clicked
+    Approve, two tabs, two workers on the shared run store) loses the claim and is
+    refused at the inbox — never launching a second resume that could double-advance an
+    orchestration graph. It mirrors the member-checkpoint ``resolving`` state and is an
+    in-progress (non-terminal) state: a resume that crashes mid-flight leaves the run at
+    ``RESOLVING`` so startup recovery can re-drive it exactly-once (via the member
+    checkpoint claim + idempotency ledger), rather than being reaped to FAILED.
+    """
 
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    RESOLVING = "RESOLVING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
 

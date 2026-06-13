@@ -145,6 +145,59 @@ def test_run_idempotent_create(tmp_path: Path) -> None:
     assert found is not None and found.run_id == r1.run_id
 
 
+def test_claim_run_for_resume_cas(tmp_path: Path) -> None:
+    """The run-level resume CAS flips AWAITING_APPROVAL -> RESOLVING exactly once."""
+    storage = _store(tmp_path)
+    run = RunRecord(
+        workspace_id="w1", subject_id="s1", status=RunStatus.AWAITING_APPROVAL
+    )
+    run_async(storage.save_run(run))
+
+    # First claim wins; the persisted status (column AND payload-derived read) is RESOLVING.
+    assert run_async(storage.claim_run_for_resume(run.run_id, workspace_id="w1")) is True
+    got = run_async(storage.get_run(run.run_id))
+    assert got is not None and got.status is RunStatus.RESOLVING
+
+    # A second claim of the now-RESOLVING run loses (only AWAITING_APPROVAL is claimable).
+    assert (
+        run_async(storage.claim_run_for_resume(run.run_id, workspace_id="w1")) is False
+    )
+
+
+def test_claim_run_for_resume_is_workspace_scoped(tmp_path: Path) -> None:
+    """A claim from the wrong workspace cannot flip the run (tenant isolation)."""
+    storage = _store(tmp_path)
+    run = RunRecord(
+        workspace_id="w1", subject_id="s1", status=RunStatus.AWAITING_APPROVAL
+    )
+    run_async(storage.save_run(run))
+
+    assert (
+        run_async(storage.claim_run_for_resume(run.run_id, workspace_id="other"))
+        is False
+    )
+    still = run_async(storage.get_run(run.run_id))
+    assert still is not None and still.status is RunStatus.AWAITING_APPROVAL
+
+
+def test_claim_run_for_resume_concurrent_one_winner(tmp_path: Path) -> None:
+    """asyncio.gather of N concurrent claims yields exactly one winner (durable CAS)."""
+    import asyncio
+
+    async def scenario() -> None:
+        storage = _store(tmp_path)
+        run = RunRecord(
+            workspace_id="w1", subject_id="s1", status=RunStatus.AWAITING_APPROVAL
+        )
+        await storage.save_run(run)
+        results = await asyncio.gather(
+            *(storage.claim_run_for_resume(run.run_id, workspace_id="w1") for _ in range(20))
+        )
+        assert sum(1 for won in results if won) == 1
+
+    run_async(scenario())
+
+
 def test_recommendation_round_trip_and_update(tmp_path: Path) -> None:
     """Recommendations round-trip, list with filters, and update status/notes in place."""
     storage = _store(tmp_path)

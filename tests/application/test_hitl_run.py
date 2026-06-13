@@ -43,9 +43,15 @@ from tests.conftest import run_async
 _TOOLS_MODULE = "tests.application._per_run_tools"
 
 
-def _hitl_app() -> tuple[StorageService, RunAppService, AgentDefAppService]:
-    """A RunAppService wired with a HITL checkpoint store + a stored-agent resolver."""
-    storage = StorageService()
+def _hitl_app(storage: object | None = None) -> tuple[object, RunAppService, AgentDefAppService]:
+    """A RunAppService wired with a HITL checkpoint store + a stored-agent resolver.
+
+    ``storage`` defaults to the in-memory :class:`StorageService`; pass a durable backend
+    (e.g. :class:`SqliteStorageService`) to exercise the atomic run-level resume claim on a
+    backend whose ``get_run`` returns independent snapshots (so the non-atomic check alone
+    cannot mask a concurrent double-approve — only the CAS does).
+    """
+    storage = storage or StorageService()
     registry = EntityRegistry()
     context = ContextService(storage_service=storage, entity_registry=registry)
     runtime = SingleAgentRuntime(
@@ -218,6 +224,83 @@ def test_double_approve_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         assert done is not None and done.status == RunStatus.SUCCEEDED
         # Still exactly one execution despite the second approve attempt.
+        assert len(_per_run_tools.WIRE_CALLS) == 1
+
+    run_async(_scenario())
+
+
+def test_concurrent_resume_run_claims_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two concurrent ``resume_run`` approves: one wins the run-level CAS, one 409s (UNIT 1).
+
+    Drives the PUBLIC ``resume_run`` path (not the lower-level background helper) so the
+    new atomic run-level claim is exercised: an ``asyncio.gather`` of two approves before
+    either flips the status — both used to pass the non-atomic check; now exactly one wins
+    the compare-and-set and launches the resume, the other raises RunNotApprovableError,
+    and the gated tool fires exactly once.
+    """
+    monkeypatch.setenv("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "1")
+    _storage, app, agent_app = _hitl_app()
+
+    async def _scenario() -> None:
+        rec = await _store_gated_agent(agent_app)
+        paused = await _create_hitl_run(app, rec)
+        assert paused.status == RunStatus.AWAITING_APPROVAL
+
+        results = await asyncio.gather(
+            app.resume_run(paused.run_id, approved=True, workspace_id="w1"),
+            app.resume_run(paused.run_id, approved=True, workspace_id="w1"),
+            return_exceptions=True,
+        )
+        winners = [r for r in results if not isinstance(r, BaseException)]
+        losers = [r for r in results if isinstance(r, RunNotApprovableError)]
+        assert len(winners) == 1  # exactly one claim won
+        assert len(losers) == 1  # the other lost the CAS and 409'd
+
+        done = await _await_status(
+            app, paused.run_id, {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        )
+        assert done is not None and done.status == RunStatus.SUCCEEDED
+        assert len(_per_run_tools.WIRE_CALLS) == 1  # the gated tool fired exactly once
+
+    run_async(_scenario())
+
+
+def test_concurrent_resume_run_claims_once_durable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The atomic claim gates concurrent approves on a DURABLE backend (UNIT 1).
+
+    On SQLite, ``get_run`` returns an INDEPENDENT snapshot per call — so the non-atomic
+    run-status check alone could NOT catch a concurrent double-approve (both snapshots
+    would read AWAITING_APPROVAL). Only the atomic ``claim_run_for_resume`` compare-and-set
+    closes it: exactly one approve wins + launches, the other 409s, the gated tool fires
+    once. This is the proof the fix is the CAS, not an in-memory shared-reference accident.
+    """
+    from himmy.services.storage.sqlite import SqliteStorageService
+
+    monkeypatch.setenv("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "1")
+    storage = SqliteStorageService(str(tmp_path / "hitl.db"))
+    _storage, app, agent_app = _hitl_app(storage)
+
+    async def _scenario() -> None:
+        rec = await _store_gated_agent(agent_app)
+        paused = await _create_hitl_run(app, rec)
+        assert paused.status == RunStatus.AWAITING_APPROVAL
+
+        results = await asyncio.gather(
+            app.resume_run(paused.run_id, approved=True, workspace_id="w1"),
+            app.resume_run(paused.run_id, approved=True, workspace_id="w1"),
+            return_exceptions=True,
+        )
+        winners = [r for r in results if not isinstance(r, BaseException)]
+        losers = [r for r in results if isinstance(r, RunNotApprovableError)]
+        assert len(winners) == 1
+        assert len(losers) == 1
+
+        done = await _await_status(
+            app, paused.run_id, {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        )
+        assert done is not None and done.status == RunStatus.SUCCEEDED
         assert len(_per_run_tools.WIRE_CALLS) == 1
 
     run_async(_scenario())

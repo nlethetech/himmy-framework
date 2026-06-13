@@ -107,6 +107,10 @@ class RunStore(Protocol):
         self, run: RunRecord
     ) -> tuple[RunRecord, bool]: ...
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool: ...
+
     async def get_run(self, run_id: str) -> RunRecord | None: ...
 
     async def list_runs(

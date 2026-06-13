@@ -1606,13 +1606,17 @@ class RunAppService:
         AWAITING_APPROVAL is DELIBERATELY not swept (T2.2 precondition for T2f): an
         HITL-paused run is intentionally idle pending a human approve/reject and must
         never be reaped to FAILED — only QUEUED/RUNNING are recoverable-abandoned.
+        RESOLVING is likewise NOT swept here: a resume that crashed mid-flight is
+        RE-DRIVABLE exactly-once (the member checkpoint claim + idempotency ledger), so it
+        is recovered by :meth:`reconcile_resolving_runs`, not reaped to FAILED.
         """
         swept: list[str] = []
         runs = await self._storage.list_runs()
         now = time.time()
         for run in runs:
-            # Only QUEUED/RUNNING are "abandoned"; SUCCEEDED/FAILED are terminal and
-            # AWAITING_APPROVAL is intentionally paused (never sweep a paused run).
+            # Only QUEUED/RUNNING are "abandoned"; SUCCEEDED/FAILED are terminal,
+            # AWAITING_APPROVAL is intentionally paused, and RESOLVING is a re-drivable
+            # crashed resume (reconcile_resolving_runs) — never sweep any of those.
             if run.status not in (RunStatus.QUEUED, RunStatus.RUNNING):
                 continue
             if (
@@ -1626,6 +1630,50 @@ class RunAppService:
             await self._storage.save_run(run)
             swept.append(run.run_id)
         return swept
+
+    async def reconcile_resolving_runs(self) -> list[str]:
+        """Re-drive HITL resumes left at RESOLVING by a crash, exactly-once (UNIT 1d).
+
+        A resume that wins the run-level claim flips the run to RESOLVING and persists the
+        approve/reject decision BEFORE launching its background task. If the process dies
+        between the claim and the run reaching a terminal/AWAITING-again state, the run is
+        stranded at RESOLVING — but it is RE-DRIVABLE: the member checkpoint's own
+        ``claim()`` accepts a RESOLVING checkpoint on retry, and the per-tool idempotency
+        ledger replays an already-executed gated tool, so re-driving the recorded decision
+        executes the side effect at most once total (across the crashed attempt + this
+        recovery). Intended for startup, after :meth:`sweep_stuck_runs` (which never reaps
+        a RESOLVING run). Returns the re-driven run ids.
+
+        This is DISTINCT from a concurrent second approve: that loses the run-level CAS at
+        the inbox and 409s without launching anything (no RESOLVING strand to recover);
+        only an in-flight crash leaves a RESOLVING run for this method to pick up.
+        """
+        redriven: list[str] = []
+        runs = await self._storage.list_runs(status=RunStatus.RESOLVING)
+        for run in runs:
+            decision = (run.metadata or {}).get("resume_decision")
+            if decision not in ("approved", "rejected"):
+                # No recorded decision — cannot faithfully re-drive; leave it for an
+                # operator (never guess approve, which would run the gated tool).
+                continue
+            actor = (run.metadata or {}).get("resume_actor") or "recovery"
+            # Re-open to AWAITING_APPROVAL so resume_run re-claims it through the SAME
+            # proven path. Startup recovery is single-threaded (no concurrent approves
+            # yet), so the brief re-open carries no double-resume risk.
+            run.status = RunStatus.AWAITING_APPROVAL
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            try:
+                await self.resume_run(
+                    run.run_id,
+                    approved=decision == "approved",
+                    workspace_id=run.workspace_id,
+                    actor=actor,
+                )
+            except RunNotApprovableError:  # pragma: no cover - lost a concurrent re-claim
+                continue
+            redriven.append(run.run_id)
+        return redriven
 
     # ----------------------------------------------------------------- HITL (T2f)
     async def pending_approvals(
@@ -1668,19 +1716,25 @@ class RunAppService:
     ) -> RunRecord:
         """Approve/reject a HITL-paused run; resume it on a tracked bg task (T2f).
 
-        Loads the run tenant-scoped, refuses anything not AWAITING_APPROVAL with
-        :class:`RunNotApprovableError` (HTTP 409 — so a double-approve of a run already
-        resumed is a clean no-op, never a second execution of the gated tool), reads the
-        ``checkpoint_id`` it paused on, REBUILDS its OWN per-run tool-bearing runtime FROM
-        THE STORED DB ``AgentSpec`` (resolved by ``agent_id`` — /v1 has no filesystem
-        ``agent_path`` to rebuild from, and ``resume_agent_loop`` HARD-requires a
-        ``tool_service``), and launches :meth:`SingleAgentRuntime.resume_agent_loop` on a
-        fresh tracked background task. The run is flipped to RUNNING first so the inbox
-        immediately reflects "in progress"; the background task drives it to SUCCEEDED /
-        FAILED / AWAITING_APPROVAL-again. Exactly-once is the runtime's ``claim()``: if a
-        concurrent resume already won, this resume's loop is a no-op and the run is left at
-        its resolved state. Returns the RUNNING record (fire-and-forget, mirroring
-        :meth:`create_run`).
+        Loads the run tenant-scoped (a 404 for unknown/out-of-workspace, a 409 for a
+        terminal/non-paused run), then ATOMICALLY claims ``AWAITING_APPROVAL`` ->
+        ``RESOLVING`` via :meth:`StorageService.claim_run_for_resume` — the run-level
+        compare-and-set that mirrors the member checkpoint ``claim()``. A SECOND concurrent
+        approve (a double-clicked Approve, two tabs, two workers) loses this CAS and is
+        refused with :class:`RunNotApprovableError` (409) BEFORE launching any resume, so
+        for an ORCHESTRATION run the graph advance — which has no claim of its own and
+        could otherwise double-fire DOWNSTREAM members' tools — only ever happens once.
+
+        The winner then REBUILDS its OWN per-run tool-bearing runtime FROM THE STORED DB
+        ``AgentSpec`` (resolved by ``agent_id`` — /v1 has no filesystem ``agent_path`` to
+        rebuild from, and ``resume_agent_loop`` HARD-requires a ``tool_service``) and
+        launches :meth:`SingleAgentRuntime.resume_agent_loop` (or the orchestration graph
+        resume) on a fresh tracked background task. The background task drives the run to
+        SUCCEEDED / FAILED / AWAITING_APPROVAL-again. A resume that crashes mid-flight
+        leaves the run at ``RESOLVING`` so startup recovery can re-drive it exactly-once
+        (the member checkpoint ``claim()`` + idempotency ledger), distinct from this
+        rejected "concurrent second click". Returns the in-progress record (fire-and-
+        forget, mirroring :meth:`create_run`).
         """
         run = await self.get_run(run_id, workspace_id=workspace_id)
         if run is None:
@@ -1690,33 +1744,67 @@ class RunAppService:
         if self._checkpoint_store is None:  # pragma: no cover - guarded at create
             raise HitlNotSupportedError("no checkpoint store wired; cannot resume")
 
+        # Validate that the resume CAN proceed BEFORE claiming, so a config error
+        # (missing checkpoint / unresolvable agent) 409s without first stranding the run
+        # in RESOLVING. Orchestration runs validate their member ids/graph checkpoint
+        # inside ``_resume_orchestration`` (also pre-claim, below).
+        is_orchestration = (run.metadata or {}).get("hitl_kind") == "orchestration"
+        checkpoint_id = ""
+        agent_def: AgentDefRecord | None = None
+        if not is_orchestration:
+            checkpoint_id = (run.metadata or {}).get("checkpoint_id") or ""
+            if not checkpoint_id:  # pragma: no cover - an AWAITING run always has one
+                raise RunNotApprovableError(run_id, status="no checkpoint")
+            agent_id = (run.metadata or {}).get("agent_id")
+            if not agent_id or self._agent_resolver is None:
+                raise RunNotApprovableError(run_id, status="no resolvable agent")
+            agent_def = await _maybe_await(
+                self._agent_resolver(agent_id, workspace_id=run.workspace_id)
+            )
+            if agent_def is None:
+                raise RunNotApprovableError(run_id, status="agent removed")
+
+        # ATOMIC run-level claim: flip AWAITING_APPROVAL -> RESOLVING exactly once. The
+        # non-atomic check above is only for a clean 404/409 message; THIS compare-and-set
+        # is the authoritative gate. The loser of a concurrent double-approve fails the CAS
+        # here and 409s without launching a resume — so an orchestration graph advance can
+        # never double-fire downstream members' tools. (For a single-agent run the member
+        # checkpoint claim() is a second backstop; for orchestration this is the ONLY gate
+        # on the post-member graph advance.)
+        claimed = await self._storage.claim_run_for_resume(
+            run_id, workspace_id=run.workspace_id
+        )
+        if not claimed:
+            raise RunNotApprovableError(run_id, status=RunStatus.RESOLVING.value)
+        # Reflect the won claim on the local record (the background task flips RESOLVING ->
+        # RUNNING when it actually starts; the returned record shows the in-progress state).
+        # Persist the approve/reject decision + actor onto the run so a resume that CRASHES
+        # mid-flight (leaving the run at RESOLVING) can be re-driven by startup recovery
+        # with the SAME decision — exactly-once is preserved by the member checkpoint
+        # claim() + idempotency ledger; only the decision (run the tool, or not) is needed.
+        run.status = RunStatus.RESOLVING
+        run.metadata = {
+            **(run.metadata or {}),
+            "resume_decision": "approved" if approved else "rejected",
+            "resume_actor": actor,
+        }
+        run.updated_at = _now()
+        await self._storage.save_run(run)
+
         # HITL ORCHESTRATION pause (a team/workflow member paused): a graph/workflow run
         # carries a member-agent-id LIST (not a single ``agent_id``) and resumes via the
-        # durable graph splice, not the single-agent resume. Dispatch early so the
-        # single-agent path below never tries to read a non-existent single agent id.
-        if (run.metadata or {}).get("hitl_kind") == "orchestration":
+        # durable graph splice, not the single-agent resume.
+        if is_orchestration:
             return await self._resume_orchestration(run, approved=approved, actor=actor)
 
-        checkpoint_id = (run.metadata or {}).get("checkpoint_id")
-        if not checkpoint_id:  # pragma: no cover - an AWAITING run always has one
-            raise RunNotApprovableError(run_id, status="no checkpoint")
-
-        agent_id = (run.metadata or {}).get("agent_id")
-        if not agent_id or self._agent_resolver is None:
-            raise RunNotApprovableError(run_id, status="no resolvable agent")
-        agent_def = await _maybe_await(
-            self._agent_resolver(agent_id, workspace_id=run.workspace_id)
-        )
-        if agent_def is None:
-            raise RunNotApprovableError(run_id, status="agent removed")
-
-        # Flip AWAITING_APPROVAL -> RUNNING up front so the inbox stops listing it and a
-        # second approve (if it loses the race below) sees a non-approvable status. The
-        # authoritative exactly-once gate remains the runtime ``claim()``.
+        # Flip RESOLVING -> RUNNING up front so the inbox reflects "in progress". The
+        # authoritative exactly-once gates are the run-level claim above + the runtime
+        # ``claim()`` (crash-retry replays the per-tool idempotency ledger).
         run.status = RunStatus.RUNNING
         run.updated_at = _now()
         await self._storage.save_run(run)
 
+        assert agent_def is not None  # noqa: S101 - narrowed: validated pre-claim above
         bg = asyncio.create_task(
             self._resume_in_background(
                 run_id,

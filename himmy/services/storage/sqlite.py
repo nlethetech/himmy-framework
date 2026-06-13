@@ -769,6 +769,55 @@ class SqliteStorageService:
                 self._rollback_quietly()
                 raise
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool:
+        """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won).
+
+        The run-level mirror of :meth:`SqliteCheckpointStore.claim`: a single conditional
+        UPDATE under ``BEGIN IMMEDIATE`` (which takes the write lock up front) flips
+        ``AWAITING_APPROVAL`` -> ``RESOLVING`` for ``(run_id, workspace_id)``, returning
+        ``rowcount == 1`` for the winner. Two concurrent resumes — even across processes
+        sharing this file — serialize on the write lock; the first matches
+        ``AWAITING_APPROVAL`` and flips it, the second now sees ``RESOLVING`` and matches
+        nothing (rowcount 0), so a SECOND concurrent approve loses the CAS and is refused
+        BEFORE any resume launches (closing the orchestration double-advance race). Only
+        ``AWAITING_APPROVAL`` is claimable here; a stale ``RESOLVING`` (a crashed resume)
+        is re-driven by recovery, not re-claimed by a fresh approve. Both the ``status``
+        column and the JSON ``payload``'s ``$.status`` are rewritten (and ``updated_at``)
+        so a later ``get_run`` is consistent with the column.
+        """
+        return await asyncio.to_thread(
+            self._claim_run_for_resume_sync, run_id, workspace_id
+        )
+
+    def _claim_run_for_resume_sync(self, run_id: str, workspace_id: str) -> bool:
+        """The locked conditional UPDATE for the run-level resume claim."""
+        now = utc_now_iso()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cur = self._conn.execute(
+                    "UPDATE runs SET status = ?, updated_at = ?, "
+                    "payload = json_set(payload, '$.status', ?, '$.updated_at', ?) "
+                    "WHERE run_id = ? AND workspace_id = ? AND status = ?",
+                    (
+                        RunStatus.RESOLVING.value,
+                        now,
+                        RunStatus.RESOLVING.value,
+                        now,
+                        run_id,
+                        workspace_id,
+                        RunStatus.AWAITING_APPROVAL.value,
+                    ),
+                )
+                won = cur.rowcount == 1
+                self._conn.commit()
+                return won
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
     @staticmethod
     def _run_upsert(run: RunRecord) -> tuple[str, tuple[Any, ...]]:
         """The upsert-by-run_id statement + params for a run record."""

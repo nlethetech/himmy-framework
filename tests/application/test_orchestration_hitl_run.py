@@ -265,3 +265,135 @@ def test_double_approve_is_a_no_op() -> None:
         assert len(_per_run_tools.WIRE_CALLS) == 1
 
     run_async(_scenario())
+
+
+async def _launch_paused_with_downstream_tool(
+    app: RunAppService, agent_app: AgentDefAppService, graph_store
+):
+    """Launch a 2-member workflow: step1 gates; step2 has a downstream (non-gated) tool.
+
+    step2's ``ping`` fires during the GRAPH ADVANCE that follows the approved member — the
+    seam with NO member-checkpoint claim of its own. A concurrent double-approve that both
+    advanced the graph would fire ``ping`` TWICE; the run-level resume claim makes it once.
+    """
+    step1 = await _store_member(agent_app, "step1", tools=["wire_money"])
+    step2 = await _store_member(agent_app, "step2", tools=["ping"])
+    run = await app.create_orchestration_run(
+        workspace_id="w1",
+        subject_id="s1",
+        kind="graph",
+        members=[step1, step2],
+        prompt="go",
+        resource_kind="workflow",
+        resource_id="wf1",
+        operator_provisioned=True,
+        graph_checkpoint_store=graph_store,
+    )
+    return await _await_status(app, run.run_id, _TERMINAL)
+
+
+def test_concurrent_double_approve_orchestration_advances_graph_once() -> None:
+    """CONCURRENT double approve of an ORCHESTRATION run: downstream tool fires ONCE.
+
+    The gap this closes (UNIT 1): two ``resume_run`` approves raced via ``asyncio.gather``
+    BOTH used to pass the non-atomic run-status check, BOTH launched a graph resume, and
+    the post-member GRAPH ADVANCE (running step2 + its tool) — which has no claim of its
+    own — could double-fire. With the atomic run-level claim, exactly one approve advances
+    the graph (step2's ``ping`` fires once, step1's gated ``wire_money`` fires once) and
+    the loser raises :class:`RunNotApprovableError`.
+    """
+
+    async def _scenario() -> None:
+        _storage, app, agent_app, graph_store = _app()
+        run = await _launch_paused_with_downstream_tool(app, agent_app, graph_store)
+        assert run.status == RunStatus.AWAITING_APPROVAL
+
+        results = await asyncio.gather(
+            app.resume_run(run.run_id, approved=True, workspace_id="w1"),
+            app.resume_run(run.run_id, approved=True, workspace_id="w1"),
+            return_exceptions=True,
+        )
+        # Exactly one approve won; the other lost the CAS and 409'd.
+        winners = [r for r in results if not isinstance(r, BaseException)]
+        losers = [r for r in results if isinstance(r, RunNotApprovableError)]
+        assert len(winners) == 1
+        assert len(losers) == 1
+
+        done = await _await_status(
+            app, run.run_id, {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        )
+        assert done.status == RunStatus.SUCCEEDED, done.error
+        # The DOWNSTREAM member's tool advanced the graph EXACTLY ONCE (the headline fix).
+        assert len(_per_run_tools.CALLS) == 1
+        # The gated member's tool also fired exactly once.
+        assert len(_per_run_tools.WIRE_CALLS) == 1
+        assert (done.metadata or {}).get("route") == ["step1", "step2"]
+
+    run_async(_scenario())
+
+
+def test_resolving_orchestration_run_is_recovered_exactly_once() -> None:
+    """A crash-stranded RESOLVING orchestration run is re-driven exactly-once (UNIT 1d).
+
+    Simulate a resume that won the claim (run at RESOLVING with the persisted decision) but
+    crashed before reaching terminal — the bg task never ran. ``reconcile_resolving_runs``
+    re-drives it: the gated tool fires exactly once (the member claim + ledger) and the run
+    completes. A stale RESOLVING is NEVER swept to FAILED.
+    """
+
+    async def _scenario() -> None:
+        storage, app, agent_app, graph_store = _app()
+        run = await _launch_paused_with_downstream_tool(app, agent_app, graph_store)
+        cp_id = run.metadata["checkpoint_id"]
+        orch_cp = run.metadata["orchestration_checkpoint_id"]
+
+        # Simulate the crash window: the claim won + decision persisted, but the resume
+        # never completed (bg task lost). The run is stranded at RESOLVING.
+        run.status = RunStatus.RESOLVING
+        run.metadata = {
+            **(run.metadata or {}),
+            "resume_decision": "approved",
+            "resume_actor": "alice",
+            "checkpoint_id": cp_id,
+            "orchestration_checkpoint_id": orch_cp,
+        }
+        await storage.save_run(run)
+
+        # The sweeper must NOT reap a RESOLVING run.
+        swept = await app.sweep_stuck_runs(ttl_seconds=0.0)
+        assert run.run_id not in swept
+
+        # Recovery re-drives it to completion, exactly-once.
+        redriven = await app.reconcile_resolving_runs()
+        assert run.run_id in redriven
+        done = await _await_status(
+            app, run.run_id, {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        )
+        assert done.status == RunStatus.SUCCEEDED, done.error
+        assert len(_per_run_tools.WIRE_CALLS) == 1  # gated tool fired exactly once
+        assert len(_per_run_tools.CALLS) == 1  # downstream tool advanced once
+
+    run_async(_scenario())
+
+
+def test_terminal_state_resume_is_clean_409() -> None:
+    """Approving an already-terminal run is a clean 409 (no re-run); reject path clean."""
+
+    async def _scenario() -> None:
+        _storage, app, agent_app, graph_store = _app()
+        run = await _launch_paused(app, agent_app, graph_store)
+
+        # Reject completes the run without running the gated tool.
+        await app.resume_run(run.run_id, approved=False, workspace_id="w1")
+        done = await _await_status(
+            app, run.run_id, {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        )
+        assert done.status == RunStatus.SUCCEEDED
+        assert not _per_run_tools.WIRE_CALLS
+
+        # A resume of the now-terminal run is refused with the observed status (409).
+        with pytest.raises(RunNotApprovableError) as exc:
+            await app.resume_run(run.run_id, approved=True, workspace_id="w1")
+        assert exc.value.status == RunStatus.SUCCEEDED.value
+
+    run_async(_scenario())

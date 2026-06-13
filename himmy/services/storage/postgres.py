@@ -897,6 +897,40 @@ class PostgresRunStore(_PgStoreBase):
             )
         return _row_to_run(existing), False
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool:
+        """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won).
+
+        The run-level mirror of the member checkpoint claim: a single conditional
+        ``UPDATE ... WHERE run_id = $1 AND workspace_id = $2 AND status = 'AWAITING_APPROVAL'``
+        flips the status to ``RESOLVING`` and ``RETURNING run_id`` proves the winner. Row-
+        level locking serializes two concurrent resumes (even across pool connections /
+        processes): the first matches ``AWAITING_APPROVAL`` and flips it; the second now
+        sees ``RESOLVING`` and matches nothing, so a SECOND concurrent approve loses the
+        CAS and is refused BEFORE any resume launches (closing the orchestration double-
+        advance race). Only ``AWAITING_APPROVAL`` is claimable; a stale ``RESOLVING`` (a
+        crashed resume) is re-driven by recovery, not re-claimed by a fresh approve.
+        """
+        from himmy.core.ids import utc_now_iso
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE runs
+                SET status = $3, updated_at = $4
+                WHERE run_id = $1 AND workspace_id = $2 AND status = $5
+                RETURNING run_id
+                """,
+                run_id,
+                workspace_id,
+                RunStatus.RESOLVING.value,
+                utc_now_iso(),
+                RunStatus.AWAITING_APPROVAL.value,
+            )
+        return row is not None
+
     _RUN_UPSERT_BY_ID = """
         INSERT INTO runs
             (run_id, workspace_id, subject_id, task_id, thread_id, snapshot_id,
@@ -1719,6 +1753,14 @@ class PostgresStorageService:
     ) -> tuple[RunRecord, bool]:
         """Atomically create a run unless its idempotency key already exists."""
         return await self._run_store.save_run_if_absent_by_idempotency(run)
+
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool:
+        """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won)."""
+        return await self._run_store.claim_run_for_resume(
+            run_id, workspace_id=workspace_id
+        )
 
     async def get_run(self, run_id: str) -> RunRecord | None:
         """Return a run record by id, or None."""

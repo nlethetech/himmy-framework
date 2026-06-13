@@ -128,6 +128,14 @@ class StorageService:
         """Atomically create a run unless its idempotency key already exists."""
         return await self._run_store.save_run_if_absent_by_idempotency(run)
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool:
+        """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won)."""
+        return await self._run_store.claim_run_for_resume(
+            run_id, workspace_id=workspace_id
+        )
+
     async def get_run(self, run_id: str) -> RunRecord | None:
         """Return a run record by id, or None."""
         return await self._run_store.get_run(run_id)

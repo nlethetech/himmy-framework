@@ -279,6 +279,17 @@ def _build_lifespan(
                     )
             except Exception:  # pragma: no cover - startup sweep is best-effort
                 logger.warning("startup run sweep failed", exc_info=True)
+            # Re-drive HITL resumes left at RESOLVING by a crash (exactly-once via the
+            # member checkpoint claim + ledger). Done AFTER the sweep, which never reaps a
+            # RESOLVING run.
+            try:
+                redriven = await run_app.reconcile_resolving_runs()
+                if redriven:
+                    logger.info(
+                        "re-drove %d crashed HITL resume(s) on startup", len(redriven)
+                    )
+            except Exception:  # pragma: no cover - startup reconcile is best-effort
+                logger.warning("startup resume reconcile failed", exc_info=True)
         # Materialize Studio "connection" non-secret fields (SMTP host, search
         # backend, …) from the writable secrets backend into the process env so
         # tool config picks them up without a restart.

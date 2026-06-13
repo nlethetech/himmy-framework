@@ -166,6 +166,32 @@ class InMemoryRunStore:
         self._runs[run.run_id] = run
         return run, True
 
+    async def claim_run_for_resume(
+        self, run_id: str, *, workspace_id: str
+    ) -> bool:
+        """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won).
+
+        Compare-and-set ``AWAITING_APPROVAL`` -> ``RESOLVING`` for the run, scoped to
+        ``workspace_id``. There is NO ``await`` between the read and the write, so two
+        concurrent resumes on one event loop cannot both win — exactly one flips the
+        status and returns True; the loser sees a non-AWAITING status and returns False.
+        This is the in-memory analog of the SQLite/Postgres conditional UPDATE, and the
+        run-level mirror of the member checkpoint ``claim()``: only AWAITING_APPROVAL is
+        claimable here (a fresh approve), so a SECOND concurrent click loses and is
+        refused, while a stale RESOLVING run (a crashed resume) is re-driven through the
+        recovery path, not this method.
+        """
+        run = self._runs.get(run_id)
+        if (
+            run is None
+            or run.workspace_id != workspace_id
+            or run.status != RunStatus.AWAITING_APPROVAL
+        ):
+            return False
+        run.status = RunStatus.RESOLVING
+        run.updated_at = utc_now_iso()
+        return True
+
     def _index_idempotency(self, run: RunRecord) -> None:
         """Maintain the (workspace_id, idempotency_key) -> run_id index."""
         if run.idempotency_key is not None:
