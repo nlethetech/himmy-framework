@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any
 from himmy.services.governance.consent_registry import MESSAGES_CONTENT_FIELD
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.entities.records import EntityRecord
-    from himmy.entities.registry import EntityRegistry
     from himmy.runtime.single_agent import SingleAgentRuntime
     from himmy.services.inference.service import InferenceService
     from himmy.services.storage.service import StorageService
@@ -101,7 +101,7 @@ class ApiContainer:
         self,
         *,
         storage: StorageService,
-        entity_registry: EntityRegistry,
+        entity_registry: EntityRegistryProtocol,
         inference: InferenceService,
         runtime: SingleAgentRuntime,
         context_app: Any,

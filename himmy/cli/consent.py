@@ -54,19 +54,16 @@ def _policy() -> ConsentPolicy:
 def _build_ledger() -> Any:
     """Construct a durable :class:`ConsentLedger` + erasure service for the CLI.
 
-    Uses the on-disk :class:`SqliteEntityRegistry`, which exposes the same
-    ``new_version``/``get_latest``/``get_history``/``query`` surface the ledger/retention
-    services consume; the cast bridges the concrete-vs-Sqlite registry types at this
-    boundary (himmy has no shared registry Protocol yet).
+    Uses the on-disk :class:`SqliteEntityRegistry`, which satisfies
+    :class:`EntityRegistryProtocol` — the structural surface the ledger/retention services
+    accept (``new_version``/``get_latest``/``get_history``/``query`` …) — so the durable
+    spine drops in with no cast (the registry Protocol that closes the old gap).
     """
-    from typing import cast
-
-    from himmy.entities.registry import EntityRegistry
     from himmy.entities.sqlite_registry import SqliteEntityRegistry
     from himmy.services.governance.consent_ledger import ConsentLedger
     from himmy.services.governance.retention import RetentionService, SubjectKeyVault
 
-    registry = cast(EntityRegistry, SqliteEntityRegistry(_consent_db()))
+    registry = SqliteEntityRegistry(_consent_db())
     retention = RetentionService(registry, key_vault=SubjectKeyVault())
     return ConsentLedger(registry, policy=_policy(), retention_service=retention)
 

@@ -33,8 +33,8 @@ from himmy.services.governance.consent import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable
 
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.entities.records import EntityRecord
-    from himmy.entities.registry import EntityRegistry
     from himmy.services.governance.retention import RetentionService
 
 #: How many times to retry a version write when another writer raced us.
@@ -46,7 +46,7 @@ class ConsentLedger:
 
     def __init__(
         self,
-        entity_registry: EntityRegistry,
+        entity_registry: EntityRegistryProtocol,
         *,
         policy: ConsentPolicy | None = None,
         retention_service: RetentionService | None = None,

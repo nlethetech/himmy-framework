@@ -46,10 +46,13 @@ def _build_service() -> Any:
     No provider is wired, so the LLM probe metrics stay skipped (must_fix #5).
 
     NOTE: the registry is in-memory rather than the durable on-disk
-    :class:`~himmy.entities.sqlite_registry.SqliteEntityRegistry` because
-    :class:`~himmy.services.evaluation.privacy.models.RecordedDataContext` validates the
-    registry against the concrete :class:`EntityRegistry` type; a durable-spine CLI scan is
-    a documented follow-up (the HTTP surface already scans the live container's registry).
+    :class:`~himmy.entities.sqlite_registry.SqliteEntityRegistry`. The old blocker — that
+    :class:`~himmy.services.evaluation.privacy.models.RecordedDataContext` validated the
+    registry against the concrete :class:`EntityRegistry` type — is GONE (that field is now
+    typed against :class:`~himmy.entities.protocol.EntityRegistryProtocol`, so a durable
+    registry validates in fine). Pointing this CLI scan at the durable shared spine is a
+    deliberate follow-on (plan item T2.1, SpineFactory); the HTTP surface already scans the
+    live container's registry.
     """
     from himmy.entities.registry import EntityRegistry
     from himmy.services.audit.log import SecurityAuditLog

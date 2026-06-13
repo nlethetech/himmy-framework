@@ -59,8 +59,8 @@ from himmy.services.evaluation.privacy.probes import build_privacy_probe_suite
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.agents.personas.persona import Persona
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.entities.records import EntityRecord
-    from himmy.entities.registry import EntityRegistry
     from himmy.services.evaluation.models import EvaluationRun, EvaluationSuite
     from himmy.services.evaluation.privacy.metrics import RecordedDataMetric
     from himmy.services.evaluation.service import EvaluationService
@@ -89,7 +89,7 @@ class PrivacyAuditService:
     def __init__(
         self,
         *,
-        entity_registry: EntityRegistry,
+        entity_registry: EntityRegistryProtocol,
         evaluation_service: EvaluationService,
         runtime: Any = None,
         security_audit: Any = None,

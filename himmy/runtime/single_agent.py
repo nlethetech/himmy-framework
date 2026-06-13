@@ -57,7 +57,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.agents.base_agent.task import Task
     from himmy.agents.base_agent.thread import ChatThread
     from himmy.agents.personas.persona import Persona
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.services.context.service import ContextService
     from himmy.services.governance.consent import Decision, Purpose
     from himmy.services.guardrails.base import GuardrailPipeline
@@ -544,7 +544,7 @@ class SingleAgentRuntime:
         context_service: ContextService | None = None,
         prompt_manager: PromptManager | None = None,
         context_prompt_mapper: ContextPromptMapper | None = None,
-        entity_registry: EntityRegistry | None = None,
+        entity_registry: EntityRegistryProtocol | None = None,
         default_model_key: str = "default",
         save_threads: bool = True,
         default_deadline_seconds: float | None = None,

@@ -20,12 +20,16 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
 from himmy.core import HimmyError
 from himmy.skills.models import Skill
 from himmy.skills.registry import SkillRegistry
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.entities.protocol import EntityRegistryProtocol
 
 _LOG = logging.getLogger("himmy.skills")
 _SKILL_SUFFIXES = (".yaml", ".yml")
@@ -83,14 +87,12 @@ def discover_skill_dirs(extra: list[str] | None = None) -> list[Path]:
 
 def build_skill_registry(
     *,
-    entity_registry: object | None = None,
+    entity_registry: EntityRegistryProtocol | None = None,
     extra_dirs: list[str] | None = None,
     include_builtins: bool = True,
 ) -> SkillRegistry:
     """Built-in catalog with project-local skills overlaid (project shadows built-in)."""
-    from himmy.entities.registry import EntityRegistry  # noqa: F401 (type hint only)
-
-    registry = SkillRegistry(entity_registry=entity_registry)  # type: ignore[arg-type]
+    registry = SkillRegistry(entity_registry=entity_registry)
     if include_builtins:
         from himmy.skills.builtin import BUILTIN_SKILLS
 

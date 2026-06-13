@@ -50,7 +50,7 @@ from himmy.services.tools.security import ToolSecurityError, redact_mapping
 from himmy.toolkit._net import build_pinned_transport, guard_url
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.services.tools.registry import ToolRegistry
 
 
@@ -127,8 +127,8 @@ class AuditSink:
         self._record(event)
 
     @classmethod
-    def from_registry(cls, registry: EntityRegistry) -> AuditSink:
-        """Wrap an :class:`EntityRegistry` in a :class:`SecurityAuditLog` sink."""
+    def from_registry(cls, registry: EntityRegistryProtocol) -> AuditSink:
+        """Wrap an entity registry in a :class:`SecurityAuditLog` sink."""
         from himmy.services.audit.log import SecurityAuditLog
 
         return cls(SecurityAuditLog(registry).record)

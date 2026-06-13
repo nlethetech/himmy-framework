@@ -24,7 +24,7 @@ from himmy.entities.records import EntityRecord
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable, Iterable
 
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.services.storage.encryption import FieldEncryptor, KekProvider
 
 #: EntityRecord kind for an erasure tombstone (the immutable proof of erasure).
@@ -84,7 +84,7 @@ class RetentionService:
 
     def __init__(
         self,
-        entity_registry: EntityRegistry,
+        entity_registry: EntityRegistryProtocol,
         *,
         key_vault: SubjectKeyVault | None = None,
         clock: Callable[[], str] | None = None,

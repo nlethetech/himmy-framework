@@ -14,13 +14,15 @@ from himmy.skills.errors import SkillCollisionError
 from himmy.skills.models import Skill
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
 
 
 class SkillRegistry:
     """A catalog of :class:`Skill`s keyed by name."""
 
-    def __init__(self, *, entity_registry: EntityRegistry | None = None) -> None:
+    def __init__(
+        self, *, entity_registry: EntityRegistryProtocol | None = None
+    ) -> None:
         self._skills: dict[str, Skill] = {}
         self._entity_registry = entity_registry
 
@@ -61,7 +63,7 @@ class SkillRegistry:
 
     @classmethod
     def with_builtins(
-        cls, *, entity_registry: EntityRegistry | None = None
+        cls, *, entity_registry: EntityRegistryProtocol | None = None
     ) -> SkillRegistry:
         """A registry pre-loaded with the built-in skill catalog."""
         from himmy.skills.builtin import BUILTIN_SKILLS

@@ -32,7 +32,7 @@ from himmy.services.memory.store import MemoryRecord
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.core.events import EventSink
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.services.inference.client_manager import ClientManager
     from himmy.services.memory.service import MemoryService
 
@@ -79,7 +79,7 @@ class MemoryConsolidator:
         memory: MemoryService,
         *,
         client_manager: ClientManager | None = None,
-        registry: EntityRegistry | None = None,
+        registry: EntityRegistryProtocol | None = None,
         event_sink: EventSink | None = None,
         dup_threshold: float = 0.95,
         update_threshold: float = 0.80,

@@ -45,7 +45,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.agents.personas.persona import Persona
     from himmy.core.ids import utc_now_iso  # noqa: F401
     from himmy.entities.lineage import LineageGraph
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.runtime.single_agent import SingleAgentRuntime
     from himmy.services.context.models import ContextField
     from himmy.services.context.service import ContextService
@@ -224,7 +224,7 @@ class RecommendationAppService:
         self,
         *,
         storage: StorageService,
-        entity_registry: EntityRegistry | None = None,
+        entity_registry: EntityRegistryProtocol | None = None,
     ) -> None:
         """Wire the backing store and (optionally) the lineage registry.
 
@@ -490,7 +490,7 @@ class RunAppService:
         *,
         runtime: SingleAgentRuntime,
         storage: StorageService,
-        entity_registry: EntityRegistry | None = None,
+        entity_registry: EntityRegistryProtocol | None = None,
         recommendation_app: RecommendationAppService | None = None,
         run_timeout_seconds: float = DEFAULT_RUN_TIMEOUT_SECONDS,
     ) -> None:

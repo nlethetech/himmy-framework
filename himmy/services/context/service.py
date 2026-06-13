@@ -23,7 +23,7 @@ from himmy.services.context.models import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
-    from himmy.entities.registry import EntityRegistry
+    from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.services.storage.service import StorageService
 
 
@@ -39,7 +39,7 @@ class ContextService:
         *,
         storage_service: StorageService,
         adapters: list[ContextAdapter] | None = None,
-        entity_registry: EntityRegistry | None = None,
+        entity_registry: EntityRegistryProtocol | None = None,
     ) -> None:
         """Wire the service with a storage backend and optional adapters/registry."""
         self._storage = storage_service

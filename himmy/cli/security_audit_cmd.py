@@ -65,18 +65,14 @@ def cli_security_log() -> SecurityAuditLog:
 
     The single durable security log the CLI both WRITES (at RBAC deny / approval
     decision points) and READS (``himmy seclog`` / ``/seclog``). Built over the on-disk
-    :class:`SqliteEntityRegistry`, which exposes the ``register``/``list_by_kind``
-    surface :class:`SecurityAuditLog` needs; the cast bridges the concrete-vs-Sqlite
-    registry types at this boundary (himmy has no shared registry Protocol yet).
+    :class:`SqliteEntityRegistry`, which satisfies :class:`EntityRegistryProtocol` —
+    the structural surface :class:`SecurityAuditLog` accepts — so the durable spine drops
+    in with no cast (the registry Protocol that closes the old concrete-vs-Sqlite gap).
     """
-    from typing import cast
-
-    from himmy.entities.registry import EntityRegistry
     from himmy.entities.sqlite_registry import SqliteEntityRegistry
     from himmy.services.audit.log import SecurityAuditLog
 
-    registry = cast(EntityRegistry, SqliteEntityRegistry(_spine_db()))
-    return SecurityAuditLog(registry)
+    return SecurityAuditLog(SqliteEntityRegistry(_spine_db()))
 
 
 def record_security_event(

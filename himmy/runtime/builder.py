@@ -20,7 +20,7 @@ model. Every collaborator can be overridden via keyword for tests/advanced wirin
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from himmy.entities.registry import EntityRegistry
 from himmy.runtime.single_agent import SingleAgentRuntime
@@ -36,6 +36,9 @@ from himmy.services.prompts.mapper import ContextPromptMapper
 from himmy.services.storage.service import StorageService
 from himmy.services.tools.registry import ToolRegistry
 from himmy.services.tools.service import ToolService
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.entities.protocol import EntityRegistryProtocol
 
 
 def _pydantic_ai_available() -> bool:
@@ -152,7 +155,7 @@ def build_runtime(
 
     inference: InferenceService = overrides.get("inference") or build_inference()
     storage: StorageService = overrides.get("storage") or build_storage()
-    registry: EntityRegistry = overrides.get("registry") or EntityRegistry()
+    registry: EntityRegistryProtocol = overrides.get("registry") or EntityRegistry()
 
     context_service: ContextService = overrides.get(
         "context_service"
