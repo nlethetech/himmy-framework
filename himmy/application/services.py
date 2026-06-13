@@ -44,6 +44,7 @@ from himmy.services.storage.models import (
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.agents.base_agent.task import Task
+    from himmy.agents.base_agent.thread import ChatThread
     from himmy.agents.personas.persona import Persona
     from himmy.config.agent_spec import AgentSpec
     from himmy.core.ids import utc_now_iso  # noqa: F401
@@ -567,6 +568,7 @@ class RunAppService:
         workspace_max_outstanding: int = DEFAULT_WORKSPACE_MAX_OUTSTANDING,
         checkpoint_store: Any = None,
         agent_resolver: Callable[..., Any] | None = None,
+        conversation_sink: Callable[..., Any] | None = None,
     ) -> None:
         """Wire the runtime, store, optional registry, and recommendation service.
 
@@ -597,6 +599,15 @@ class RunAppService:
         None`` used to rebuild the per-run tool-bearing runtime FROM THE STORED DB SPEC
         on resume (``resume_agent_loop`` HARD-requires a ``tool_service``, so /v1 must
         rebuild from the spec, not a filesystem path it never had).
+
+        ``conversation_sink`` (T2g) is an optional async ``(conversation_id, run) ->
+        None`` invoked whenever a THREAD-LINKED run (one carrying
+        ``metadata['conversation_id']``) reaches a terminal / AWAITING_APPROVAL state, so
+        the :class:`~himmy.services.storage.conversations.ConversationStore` projection
+        stays in sync after a continuation OR an approval-resume (which completes on a
+        background task the thread router cannot await). Best-effort: a sink failure never
+        fails the run. ``None`` (the default) is a no-op — runs not started via the thread
+        router carry no ``conversation_id`` and never reach it.
         """
         self._runtime = runtime
         self._storage = storage
@@ -607,6 +618,7 @@ class RunAppService:
         self._run_timeout_seconds = run_timeout_seconds
         self._checkpoint_store = checkpoint_store
         self._agent_resolver = agent_resolver
+        self._conversation_sink = conversation_sink
         # Keep strong refs to background tasks so they are not GC'd mid-flight and
         # so they can be drained/cancelled on shutdown (AAEO-1).
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -634,6 +646,7 @@ class RunAppService:
         agent_def: AgentDefRecord | None = None,
         operator_provisioned: bool = False,
         hitl: bool = False,
+        plan: bool = False,
     ) -> RunRecord:
         """Create (or return the existing) run and launch background execution.
 
@@ -671,14 +684,21 @@ class RunAppService:
         # store to pause into. Reject early (before any record is written) when either is
         # missing, so a caller never gets a silently tool-less "HITL" run that can never
         # pause. The store is resolved on resume from the stored ``agent_id``.
-        if hitl:
+        #
+        # Plan mode (T2g) pauses at PLAN-READY through the SAME approval gate (a gated
+        # synthetic ``update_plan`` tool), so it has the identical preconditions: a stored
+        # agent (so a per-run registry exists to register the plan tool onto) + a
+        # checkpoint store. A run may set ``plan`` and ``hitl`` together — the plan gate is
+        # simply the first gate the loop hits.
+        if hitl or plan:
             if self._checkpoint_store is None:
                 raise HitlNotSupportedError(
-                    "this deployment has no checkpoint store; hitl runs are unavailable"
+                    "this deployment has no checkpoint store; hitl/plan runs are "
+                    "unavailable"
                 )
             if agent_spec is None or agent_def is None:
                 raise HitlRequiresAgentError(
-                    "hitl=True requires a stored agent (agent_id); an inline persona "
+                    "hitl/plan runs require a stored agent (agent_id); an inline persona "
                     "carries no tools to gate"
                 )
 
@@ -707,12 +727,16 @@ class RunAppService:
             metadata["agent_id"] = agent_def.agent_id
         # T2f: mark the run HITL-driven so the resume path (which re-resolves the spec
         # from agent_id) knows this run is approvable and rebuilds the same gated runtime.
-        if hitl:
+        # T2g: plan mode is also an agentic, pausable run — mark it so the resume path
+        # re-registers the gated ``update_plan`` tool when rebuilding the runtime.
+        if hitl or plan:
             metadata["hitl"] = True
             # ``operator_provisioned`` governs whether the stored spec's privileged tools
             # survive the run-time re-sanitize; the resume must honor the SAME status so
             # the gated tool the run paused on is still present when it is approved.
             metadata["operator_provisioned"] = bool(operator_provisioned)
+        if plan:
+            metadata["plan_mode"] = True
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
@@ -757,6 +781,124 @@ class RunAppService:
                 agent_spec=agent_spec,
                 agent_def=agent_def,
                 hitl=hitl,
+                plan=plan,
+            )
+        )
+        self._tasks.add(bg)
+        bg.add_done_callback(self._tasks.discard)
+        return stored
+
+    async def continue_thread(
+        self,
+        *,
+        workspace_id: str,
+        subject_id: str,
+        conversation_id: str,
+        thread: ChatThread,
+        prompt: str,
+        agent_spec: AgentSpec,
+        agent_def: AgentDefRecord,
+        llm_config: LLMConfig | None = None,
+        idempotency_key: str | None = None,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+        hitl: bool = False,
+        plan: bool = False,
+    ) -> RunRecord:
+        """Continue a stored conversation with a new user turn on the per-run runtime (T2g).
+
+        Unlike :meth:`create_run` (a fresh inline/agent run), this APPENDS a turn to an
+        existing :class:`ChatThread` and drives the AGENTIC loop on the per-run
+        tool-bearing runtime (T0.2) so a ``/v1`` conversation is as capable as a Studio one
+        — the model sees prior turns AND can call the agent's tools / pause for approval
+        (reviewer must_fix: NOT a tool-less single-shot ``run_task_detailed`` masquerading
+        as chat). A continuation always resolves a stored ``agent_id`` (a per-run runtime
+        needs a spec), runs through the SAME admission + sanitizer + quota path as a fresh
+        run, and links the new :class:`RunRecord` to the conversation via
+        ``metadata['conversation_id']`` (the run's ``thread_id`` IS the conversation id) so
+        the thread router (and the ConversationStore projection sink) can find it.
+
+        With ``hitl``/``plan`` the run can pause at ``AWAITING_APPROVAL`` exactly like a
+        fresh agentic run; the SAME ``approve``/``reject`` machinery resumes it.
+        """
+        # A continuation is always agentic + needs a checkpoint store when it can pause.
+        if (hitl or plan) and self._checkpoint_store is None:
+            raise HitlNotSupportedError(
+                "this deployment has no checkpoint store; hitl/plan runs are unavailable"
+            )
+
+        # Fail-closed sanitize the spec under the request's operator status BEFORE it
+        # runs (defense-in-depth: the stored spec was sanitized at write, this honors the
+        # caller's operator status so a tenant continuation can never reach privileged
+        # tools the stored spec might carry).
+        from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+        agent_spec = sanitize_tenant_spec(
+            agent_spec, operator_provisioned=operator_provisioned
+        ).spec
+
+        # Pin the thread id to the conversation id so the run's thread_id IS the
+        # conversation id (the run<->conversation join the router/sink rely on). The new
+        # user turn is NOT appended here — the runtime's ``run_agent_loop`` /
+        # ``run_task_detailed`` appends it from ``task.prompt`` (appending it twice would
+        # duplicate the message), so the loaded thread carries only the PRIOR turns.
+        thread.thread_id = conversation_id
+
+        persona = agent_spec.to_persona()
+        if llm_config is None:
+            llm_config = agent_spec.to_llm_config()
+        task = agent_spec.make_task(prompt)
+
+        metadata: dict[str, Any] = {"conversation_id": conversation_id}
+        if actor:
+            metadata["actor"] = actor
+        metadata["agent_name"] = agent_spec.name
+        metadata["agent_id"] = agent_def.agent_id
+        if hitl or plan:
+            metadata["hitl"] = True
+            metadata["operator_provisioned"] = bool(operator_provisioned)
+        if plan:
+            metadata["plan_mode"] = True
+
+        run = RunRecord(
+            workspace_id=workspace_id,
+            subject_id=subject_id,
+            task_id=task.task_id,
+            persona_name=persona.name,
+            model_key=_resolve_model_key(llm_config, task),
+            idempotency_key=idempotency_key,
+            status=RunStatus.QUEUED,
+            thread_id=conversation_id,
+            metadata=metadata,
+        )
+        stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
+        if not created:
+            return stored
+
+        try:
+            self._admit_workspace_run(workspace_id)
+        except WorkspaceRunQuotaExceeded:
+            stored.status = RunStatus.FAILED
+            stored.error = "rejected: workspace run-concurrency quota exceeded"
+            stored.updated_at = _now()
+            try:
+                await self._storage.save_run(stored)
+            except Exception:  # pragma: no cover - best-effort terminal mark
+                logger.warning("failed to mark quota-rejected run %s", stored.run_id)
+            raise
+
+        bg = asyncio.create_task(
+            self._execute_run(
+                stored.run_id,
+                workspace_id=workspace_id,
+                persona=persona,
+                task=task,
+                llm_config=llm_config,
+                agent_spec=agent_spec,
+                agent_def=agent_def,
+                hitl=hitl,
+                plan=plan,
+                thread=thread,
             )
         )
         self._tasks.add(bg)
@@ -820,6 +962,8 @@ class RunAppService:
         agent_spec: AgentSpec | None = None,
         agent_def: AgentDefRecord | None = None,
         hitl: bool = False,
+        plan: bool = False,
+        thread: ChatThread | None = None,
     ) -> None:
         """Background worker: RUNNING -> run_task -> SUCCEEDED/FAILED + extraction.
 
@@ -852,6 +996,8 @@ class RunAppService:
                     agent_spec=agent_spec,
                     agent_def=agent_def,
                     hitl=hitl,
+                    plan=plan,
+                    thread=thread,
                 )
         finally:
             self._release_workspace_run(workspace_id)
@@ -866,6 +1012,8 @@ class RunAppService:
         agent_spec: AgentSpec | None,
         agent_def: AgentDefRecord | None = None,
         hitl: bool = False,
+        plan: bool = False,
+        thread: ChatThread | None = None,
     ) -> None:
         """Drive one run to a terminal state on the resolved runtime (T0.2 core).
 
@@ -874,17 +1022,31 @@ class RunAppService:
         pauses on an approval-gated tool the run goes AWAITING_APPROVAL (carrying the
         checkpoint id) and STOPS — never swept, resumable via :meth:`resume_run`. The
         non-HITL path is byte-identical to before (single ``run_task_detailed`` turn).
+
+        ``plan=True`` (T2g) is an agentic, pausable run too: the per-run runtime carries
+        the gated ``update_plan`` tool so the loop pauses at PLAN-READY through the same
+        approval machinery. ``thread`` (T2g) is the continuation seam — a prior
+        :class:`ChatThread` the loop continues so the model sees earlier turns; ``None``
+        starts a fresh thread (every pre-T2g call site).
         """
-        # HITL runs pause into /v1's OWN checkpoint store; the non-HITL path passes None
-        # so the per-run runtime stays exactly as the T0.2 build wired it.
-        checkpoint_store = self._checkpoint_store if hitl else None
+        # HITL/plan runs pause into /v1's OWN checkpoint store; the plain single-turn path
+        # passes None so the per-run runtime stays exactly as the T0.2 build wired it.
+        agentic = hitl or plan
+        checkpoint_store = self._checkpoint_store if agentic else None
         run.status = RunStatus.RUNNING
         run.updated_at = _now()
         await self._storage.save_run(run)
 
+        # T2g: a plan-first run prepends the plan nudge + binds ``update_plan`` so the
+        # agent publishes (and pauses on) its plan first.
+        if plan:
+            from himmy.runtime.plan_mode import apply_plan_mode_to_task
+
+            apply_plan_mode_to_task(task)
+
         try:
             runtime = await self._resolve_runtime(
-                agent_spec, checkpoint_store=checkpoint_store
+                agent_spec, checkpoint_store=checkpoint_store, plan_mode=plan
             )
         except Exception as exc:  # noqa: BLE001 - spec wiring failure is terminal
             run.status = RunStatus.FAILED
@@ -893,19 +1055,33 @@ class RunAppService:
             await self._storage.save_run(run)
             return
 
-        # T2f: the HITL path drives the agentic loop (which can PAUSE on an approval-gated
-        # tool); the non-HITL path is the unchanged single-turn fast path.
-        if hitl:
+        # T2f/T2g: the agentic path drives the loop (which can PAUSE on an approval-gated
+        # tool — the HITL gate OR the plan gate); the plain path is the single-turn fast
+        # path, optionally continuing a prior thread (T2g).
+        if agentic:
             await self._drive_hitl_run(
-                run, persona, task, runtime, llm_config=llm_config, agent_def=agent_def
+                run,
+                persona,
+                task,
+                runtime,
+                llm_config=llm_config,
+                agent_def=agent_def,
+                thread=thread,
+                plan=plan,
             )
             return
 
         try:
-            result = await asyncio.wait_for(
-                runtime.run_task_detailed(persona, task, llm_config=llm_config),
-                timeout=self._run_timeout_seconds,
+            # Pass ``thread`` ONLY when continuing a prior conversation (T2g); the
+            # fresh-run path omits it so the call is byte-identical to the pre-T2g signature
+            # (``run_task_detailed(persona, task, llm_config=...)``) — back-compat for every
+            # existing call site and test double.
+            coro = (
+                runtime.run_task_detailed(persona, task, thread, llm_config=llm_config)
+                if thread is not None
+                else runtime.run_task_detailed(persona, task, llm_config=llm_config)
             )
+            result = await asyncio.wait_for(coro, timeout=self._run_timeout_seconds)
         except TimeoutError:
             run.status = RunStatus.FAILED
             run.error = (
@@ -950,9 +1126,11 @@ class RunAppService:
             run.output_text = result.output_text or None
             run.updated_at = _now()
             await self._storage.save_run(run)
+            await self._notify_conversation_sink(run)
             return
 
         await self._finalize_succeeded_run(run, result, task=task, llm_config=llm_config)
+        await self._notify_conversation_sink(run)
 
     async def _finalize_succeeded_run(
         self,
@@ -1003,8 +1181,10 @@ class RunAppService:
         *,
         llm_config: LLMConfig | None,
         agent_def: AgentDefRecord | None,
+        thread: ChatThread | None = None,
+        plan: bool = False,
     ) -> None:
-        """Drive a hitl=True run's agentic loop; pause to AWAITING_APPROVAL on a gate.
+        """Drive a hitl/plan run's agentic loop; pause to AWAITING_APPROVAL on a gate.
 
         Runs :meth:`SingleAgentRuntime.run_agent_loop` (``hitl=True``) bounded by the
         per-run timeout. The loop either:
@@ -1014,11 +1194,25 @@ class RunAppService:
           and STOPS (never swept, resumable via approve/reject), or
         * completes — handled exactly like the single-turn success/failure paths via the
           shared finalizers.
+
+        ``thread`` (T2g) continues a prior conversation; ``plan`` marks a plan-first run
+        so :meth:`_apply_loop_outcome` extracts the published plan into
+        ``metadata['plan']`` when the run pauses at PLAN-READY.
         """
         try:
+            # Pass ``thread`` only on a continuation (T2g) so a fresh agentic run's call is
+            # byte-identical to the pre-T2g signature (back-compat for test doubles).
+            loop_coro = (
+                runtime.run_agent_loop(
+                    persona, task, thread, llm_config=llm_config, hitl=True
+                )
+                if thread is not None
+                else runtime.run_agent_loop(
+                    persona, task, llm_config=llm_config, hitl=True
+                )
+            )
             loop = await asyncio.wait_for(
-                runtime.run_agent_loop(persona, task, llm_config=llm_config, hitl=True),
-                timeout=self._run_timeout_seconds,
+                loop_coro, timeout=self._run_timeout_seconds
             )
         except TimeoutError:
             run.status = RunStatus.FAILED
@@ -1045,7 +1239,7 @@ class RunAppService:
             return
 
         await self._apply_loop_outcome(
-            run, loop, task=task, llm_config=llm_config, agent_def=agent_def
+            run, loop, task=task, llm_config=llm_config, agent_def=agent_def, plan=plan
         )
 
     async def _apply_loop_outcome(
@@ -1056,11 +1250,15 @@ class RunAppService:
         task: Task,
         llm_config: LLMConfig | None,
         agent_def: AgentDefRecord | None,
+        plan: bool = False,
     ) -> None:
         """Project a finished/paused :class:`AgentLoopResult` onto the run record (T2f).
 
         Shared by the initial HITL drive and the resume path so a run pauses-again,
         succeeds, or fails identically regardless of which entry produced the loop.
+
+        ``plan`` (T2g) makes a PLAN-READY pause stamp the published plan steps into
+        ``metadata['plan']`` so a caller can read the proposed plan before approving.
         """
         thread = loop.thread
         run.thread_id = thread.thread_id
@@ -1077,12 +1275,20 @@ class RunAppService:
             # Stamp the checkpoint id so approve/reject can re-claim it, and STOP — the
             # sweeper explicitly skips AWAITING_APPROVAL, so this run is never reaped.
             run.status = RunStatus.AWAITING_APPROVAL
-            run.metadata = {
+            metadata = {
                 **(run.metadata or {}),
                 "checkpoint_id": loop.checkpoint_id,
             }
+            # T2g: a plan-first run paused on its (gated) ``update_plan`` call — surface
+            # the proposed plan in metadata so a caller reads it before approving.
+            if plan:
+                plan_steps = self._extract_plan_from_checkpoint(loop.checkpoint_id)
+                if plan_steps:
+                    metadata["plan"] = plan_steps
+            run.metadata = metadata
             run.updated_at = _now()
             await self._storage.save_run(run)
+            await self._notify_conversation_sink(run)
             return
 
         final = loop.final
@@ -1092,12 +1298,64 @@ class RunAppService:
             run.output_text = final.output_text or None
             run.updated_at = _now()
             await self._storage.save_run(run)
+            await self._notify_conversation_sink(run)
             return
 
         await self._finalize_succeeded_run(run, final, task=task, llm_config=llm_config)
+        await self._notify_conversation_sink(run)
+
+    async def _notify_conversation_sink(self, run: RunRecord) -> None:
+        """Re-project a thread-linked run's updated ChatThread (T2g, best-effort).
+
+        Invoked when a run that the thread router started (carrying
+        ``metadata['conversation_id']``) reaches a terminal / AWAITING_APPROVAL state, so
+        the ConversationStore projection reflects the latest turns even when the run
+        finished on a background task the router never awaited (an approval-resume). A
+        no-op when no sink is wired or the run is not thread-linked; any sink error is
+        swallowed (provenance, not the work).
+        """
+        if self._conversation_sink is None:
+            return
+        conversation_id = (run.metadata or {}).get("conversation_id")
+        if not conversation_id:
+            return
+        try:
+            await _maybe_await(self._conversation_sink(conversation_id, run))
+        except Exception:  # noqa: BLE001 - conversation projection is best-effort
+            logger.warning(
+                "failed to project conversation %s for run %s",
+                conversation_id,
+                run.run_id,
+            )
+
+    def _extract_plan_from_checkpoint(
+        self, checkpoint_id: str | None
+    ) -> list[dict[str, str]]:
+        """Read the bounded plan steps out of a PLAN-READY checkpoint (T2g).
+
+        The plan-first run pauses on its gated ``update_plan`` call; that call's args
+        carry the proposed steps. Returns the normalized, bounded steps (an empty list
+        when no checkpoint / no plan call is pending), so a caller can read the plan
+        before approving it.
+        """
+        if not checkpoint_id or self._checkpoint_store is None:
+            return []
+        checkpoint = self._checkpoint_store.load(checkpoint_id)
+        if checkpoint is None:  # pragma: no cover - the pause just wrote it
+            return []
+        from himmy.runtime.plan_mode import PLAN_TOOL, normalize_plan_steps
+
+        for pending in checkpoint.pending_tool_calls:
+            if pending.tool_name == PLAN_TOOL:
+                return normalize_plan_steps((pending.args or {}).get("steps"))
+        return []
 
     async def _resolve_runtime(
-        self, agent_spec: AgentSpec | None, *, checkpoint_store: Any = None
+        self,
+        agent_spec: AgentSpec | None,
+        *,
+        checkpoint_store: Any = None,
+        plan_mode: bool = False,
     ) -> SingleAgentRuntime:
         """Pick the runtime for a run: shared tool-less, or a per-run tool-bearing one.
 
@@ -1119,6 +1377,11 @@ class RunAppService:
         stub and a configured deployment keeps its gateway, with no surprise provider
         switch. When the spec names a provider explicitly, ``build_runtime_for_spec``
         honors it. ``checkpoint_store`` is threaded so a HITL run can pause (T2f).
+
+        ``plan_mode`` (T2g) registers the APPROVAL-GATED ``update_plan`` tool into the
+        per-run registry so a plan-first run pauses at PLAN-READY through the SAME
+        approval machinery (it MUST be registered on the resume runtime too, hence this
+        flag is threaded both on the initial drive and on resume).
         """
         if agent_spec is None:
             return self._runtime
@@ -1131,14 +1394,27 @@ class RunAppService:
         )
         from himmy.runtime.from_spec import build_runtime_for_spec
 
-        runtime, _registry = await asyncio.to_thread(
+        runtime, registry = await asyncio.to_thread(
             build_runtime_for_spec,
             agent_spec,
             inference=shared_inference,
             storage=self._storage,
             checkpoint_store=checkpoint_store,
         )
-        return cast("SingleAgentRuntime", runtime)
+        runtime = cast("SingleAgentRuntime", runtime)
+        if plan_mode:
+            # The plan tool must live on a tool registry; a spec with no tools builds no
+            # registry, so resolve the runtime's own tool_service registry as the target.
+            target = registry
+            if target is None:
+                target = getattr(
+                    getattr(runtime, "tool_service", None), "registry", None
+                )
+            if target is not None:
+                from himmy.runtime.plan_mode import register_plan_tool
+
+                register_plan_tool(target)
+        return runtime
 
     async def _project_run_agent_link(
         self, run: RunRecord, agent_def: AgentDefRecord
@@ -1387,6 +1663,10 @@ class RunAppService:
             operator_provisioned = bool(
                 (run.metadata or {}).get("operator_provisioned", False)
             )
+            # T2g: a plan-first run paused on its gated ``update_plan`` tool — the rebuilt
+            # resume runtime MUST re-register that synthetic tool, else the now-approved
+            # plan call has no handler to execute against.
+            plan_mode = bool((run.metadata or {}).get("plan_mode", False))
             from himmy.config.spec_sanitizer import sanitize_tenant_spec
 
             try:
@@ -1395,7 +1675,9 @@ class RunAppService:
                     operator_provisioned=operator_provisioned,
                 ).spec
                 runtime = await self._resolve_runtime(
-                    spec, checkpoint_store=self._checkpoint_store
+                    spec,
+                    checkpoint_store=self._checkpoint_store,
+                    plan_mode=plan_mode,
                 )
             except Exception as exc:  # noqa: BLE001 - spec rebuild failure is terminal
                 run.status = RunStatus.FAILED
@@ -1587,6 +1869,16 @@ class RunAppService:
         if run is None or run.thread_id is None:
             return None
         return await self._storage.load_thread(run.thread_id)
+
+    async def get_run_thread_by_thread_id(self, thread_id: str) -> Any:
+        """Load the authoritative ChatThread the runtime saved under ``thread_id`` (T2g).
+
+        The thread router pins a run's ``thread_id`` to the conversation id, so this reads
+        the latest in-flight thread state from the canonical run store directly (the run
+        record may not yet carry the thread_id when a continuation has only just started).
+        Returns None when nothing is stored under that id.
+        """
+        return await self._storage.load_thread(thread_id)
 
     async def await_run(self, run_id: str, timeout: float = 5.0) -> RunRecord | None:
         """Poll until the run reaches a terminal state (test/example helper)."""
@@ -1788,6 +2080,228 @@ class AgentDefAppService:
             logger.warning("failed to project agent entity for %s", record.agent_id)
 
 
+class ThreadNotFoundError(Exception):
+    """A /v1 thread operation targeted an unknown / out-of-workspace conversation (T2g → 404).
+
+    Workspace ownership is a property of the stored ChatThread (its
+    ``metadata['workspace_id']``); a thread owned by another workspace is treated as
+    absent so a cross-tenant ``thread_id`` is a clean 404, never a leak.
+    """
+
+
+class ThreadAgentRequiredError(Exception):
+    """A /v1 thread continuation was sent without resolving an agent (T2g → 422).
+
+    A continuation runs on the per-run tool-bearing runtime, which needs a stored
+    ``AgentSpec`` (an inline persona carries no tools), so the thread must have been
+    created with an ``agent_id`` (or one must be supplied on the message).
+    """
+
+
+#: Where a /v1 thread stamps its owning workspace in the authoritative ChatThread JSON.
+#: Threads have no native workspace column (ConversationStore is single-user-local by
+#: origin), so workspace ownership rides in the thread metadata and is enforced by
+#: :class:`ThreadAppService` on every read (404 cross-tenant).
+THREAD_WORKSPACE_KEY = "workspace_id"
+#: The stored ``agent_id`` a thread continues with, recorded on the thread metadata at
+#: create so every message turn resolves the same agent without re-supplying it.
+THREAD_AGENT_KEY = "agent_id"
+
+
+class ThreadAppService:
+    """Owns the /v1 thread (conversation) resource over the ONE ConversationStore (T2g).
+
+    A thin orchestration layer that makes a ``/v1`` conversation a first-class,
+    workspace-scoped, agentic resource: it CREATES a workspace-stamped thread, CONTINUES
+    it (loading the authoritative :class:`ChatThread`, appending the user turn, and running
+    it on :class:`RunAppService`'s PER-RUN tool-bearing runtime so the conversation has
+    tools + HITL/plan pauses — reviewer must_fix), and PERSISTS the updated thread back to
+    the same durable ``.himmy/conversations.db`` the CLI and Studio read (so a /v1
+    conversation is browsable everywhere). Workspace ownership is enforced on every read
+    via the thread's ``metadata['workspace_id']`` (cross-tenant → 404).
+
+    It does NOT own a second run executor — every turn lands a canonical
+    :class:`RunRecord` through :class:`RunAppService` (one writer), linked to the
+    conversation by ``metadata['conversation_id']``.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_app: RunAppService,
+        agent_app: AgentDefAppService,
+        conversation_store: Any,
+    ) -> None:
+        """Wire the run service, the stored-agent service, and the conversation store."""
+        self._run_app = run_app
+        self._agent_app = agent_app
+        self._store = conversation_store
+
+    # -- the conversation projection sink (wired into RunAppService) ---------
+
+    async def project_run_thread(self, conversation_id: str, run: RunRecord) -> None:
+        """Re-project a run's updated ChatThread into the ConversationStore (T2g sink).
+
+        Wired as :class:`RunAppService`'s ``conversation_sink`` so a continuation that
+        completes on a background task (notably an approval-resume the message handler
+        never awaited) still lands its latest turns in the durable conversation projection.
+        Loads the authoritative thread from the canonical run store (where the runtime
+        saved it) and re-saves it under the conversation id, preserving the workspace /
+        agent ownership metadata. Best-effort and idempotent.
+        """
+        thread = await self._run_app.get_run_thread(
+            run.run_id, workspace_id=run.workspace_id
+        )
+        if thread is None:
+            return
+        self._persist(conversation_id, thread, run.workspace_id)
+
+    def _persist(self, conversation_id: str, thread: Any, workspace_id: str) -> None:
+        """Stamp ownership onto the thread + upsert it into the ConversationStore."""
+        from himmy.services.storage.conversations import ORIGIN_CLI
+
+        thread.thread_id = conversation_id
+        agent_id = (thread.metadata or {}).get(THREAD_AGENT_KEY)
+        thread.metadata = {
+            **(thread.metadata or {}),
+            THREAD_WORKSPACE_KEY: workspace_id,
+        }
+        # ``origin`` defaults to the CLI/lossless origin (this is an authoritative,
+        # full-fidelity ChatThread, not a flat Studio transcript) so list views show it
+        # as a first-class conversation across surfaces.
+        self._store.save_thread(
+            conversation_id,
+            thread,
+            origin=ORIGIN_CLI,
+            agent_path=agent_id,
+        )
+
+    # -- create -------------------------------------------------------------
+
+    def create_thread(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str | None = None,
+        title: str | None = None,
+    ) -> Any:
+        """Create an empty, workspace-stamped thread (T2g). Returns the ChatThread.
+
+        The workspace (and the optional default ``agent_id`` the thread continues with)
+        are stamped into the thread metadata so every later message turn is scoped + runs
+        the right agent. The thread is persisted immediately so it is listable.
+        """
+        from himmy.agents.base_agent.thread import ChatThread
+
+        metadata: dict[str, Any] = {THREAD_WORKSPACE_KEY: workspace_id}
+        if agent_id:
+            metadata[THREAD_AGENT_KEY] = agent_id
+        thread = ChatThread(agent_id=agent_id, metadata=metadata)
+        self._persist(thread.thread_id, thread, workspace_id)
+        if title:
+            self._store.rename(thread.thread_id, title)
+        return thread
+
+    # -- read ---------------------------------------------------------------
+
+    def load_owned_thread(self, conversation_id: str, *, workspace_id: str) -> Any:
+        """Load a thread, enforcing workspace ownership (T2g). Raises on mismatch.
+
+        Returns the authoritative :class:`ChatThread`. Raises
+        :class:`ThreadNotFoundError` when the conversation is unknown OR owned by another
+        workspace (cross-tenant → 404), so ownership is enforced at one chokepoint.
+        """
+        thread = self._store.load_thread(conversation_id)
+        if thread is None:
+            raise ThreadNotFoundError(conversation_id)
+        owner = (thread.metadata or {}).get(THREAD_WORKSPACE_KEY)
+        if owner != workspace_id:
+            raise ThreadNotFoundError(conversation_id)
+        return thread
+
+    def flat_messages(self, conversation_id: str, *, workspace_id: str) -> list[Any]:
+        """The flat (user/agent) projection of an owned thread (404 cross-tenant)."""
+        # Ownership check first (raises 404 on mismatch / unknown).
+        self.load_owned_thread(conversation_id, workspace_id=workspace_id)
+        return cast("list[Any]", self._store.flat_messages(conversation_id))
+
+    # -- continue -----------------------------------------------------------
+
+    async def append_message(
+        self,
+        *,
+        conversation_id: str,
+        workspace_id: str,
+        subject_id: str,
+        prompt: str,
+        agent_id: str | None = None,
+        idempotency_key: str | None = None,
+        actor: dict[str, Any] | None = None,
+        operator_provisioned: bool = False,
+        hitl: bool = False,
+        plan: bool = False,
+    ) -> RunRecord:
+        """Append a user turn to an owned thread and run it agentically (T2g).
+
+        Loads the authoritative thread (404 cross-tenant), resolves the agent to continue
+        with (the message's ``agent_id`` overrides the thread's default), and drives
+        :meth:`RunAppService.continue_thread` — so the turn runs WITH TOOLS + can pause for
+        approval (``hitl``) or at PLAN-READY (``plan``). The updated thread is persisted
+        back to the ConversationStore (and re-persisted by the sink when the run later
+        completes on a background task). Returns the linked :class:`RunRecord`.
+        """
+        thread = self.load_owned_thread(conversation_id, workspace_id=workspace_id)
+        resolved_agent_id = agent_id or (thread.metadata or {}).get(THREAD_AGENT_KEY)
+        if not resolved_agent_id:
+            raise ThreadAgentRequiredError(conversation_id)
+        agent_def = await self._agent_app.get_agent_def(
+            resolved_agent_id, workspace_id=workspace_id
+        )
+        if agent_def is None:
+            # The thread references an agent that does not exist in this workspace.
+            raise ThreadAgentRequiredError(resolved_agent_id)
+        agent_spec = agent_def.agent_spec()
+
+        # Carry the resolved agent forward on the thread so a later turn defaults to it
+        # and the persisted thread records which agent it continues with.
+        thread.metadata = {
+            **(thread.metadata or {}),
+            THREAD_AGENT_KEY: resolved_agent_id,
+            THREAD_WORKSPACE_KEY: workspace_id,
+        }
+
+        run = await self._run_app.continue_thread(
+            workspace_id=workspace_id,
+            subject_id=subject_id,
+            conversation_id=conversation_id,
+            thread=thread,
+            prompt=prompt,
+            agent_spec=agent_spec,
+            agent_def=agent_def,
+            idempotency_key=idempotency_key,
+            actor=actor,
+            operator_provisioned=operator_provisioned,
+            hitl=hitl,
+            plan=plan,
+        )
+        # Persist the latest thread state synchronously too (the run also re-projects via
+        # the sink when it reaches a terminal/paused state, but persisting here makes the
+        # new turn immediately visible even before the background run lands).
+        await self._reproject_after_turn(conversation_id, workspace_id)
+        return run
+
+    async def _reproject_after_turn(
+        self, conversation_id: str, workspace_id: str
+    ) -> None:
+        """Best-effort sync of the conversation projection right after a turn starts."""
+        try:
+            thread = await self._run_app.get_run_thread_by_thread_id(conversation_id)
+            if thread is not None:
+                self._persist(conversation_id, thread, workspace_id)
+        except Exception:  # noqa: BLE001 - projection is best-effort
+            logger.warning("failed to reproject conversation %s", conversation_id)
+
+
 def _resolve_model_key(llm_config: LLMConfig | None, task: Task) -> str | None:
     """Resolve a run's model_key with explicit precedence (AAEO-16).
 
@@ -1960,6 +2474,11 @@ __all__ = [
     "DashboardQueryService",
     "AgentDefAppService",
     "AgentDefReferencedError",
+    "ThreadAppService",
+    "ThreadNotFoundError",
+    "ThreadAgentRequiredError",
+    "THREAD_AGENT_KEY",
+    "THREAD_WORKSPACE_KEY",
     "WorkspaceRunQuotaExceeded",
     "HitlNotSupportedError",
     "HitlRequiresAgentError",

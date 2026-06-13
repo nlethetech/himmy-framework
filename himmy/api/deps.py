@@ -109,6 +109,8 @@ class ApiContainer:
         recommendation_app: Any,
         dashboard: Any,
         agent_app: Any = None,
+        thread_app: Any = None,
+        conversation_store: Any = None,
         evaluation: Any = None,
         consent_ledger: Any = None,
         consent_policy: Any = None,
@@ -132,6 +134,8 @@ class ApiContainer:
         self.context_app = context_app
         self.run_app = run_app
         self.agent_app = agent_app
+        self.thread_app = thread_app
+        self.conversation_store = conversation_store
         self.recommendation_app = recommendation_app
         self.dashboard = dashboard
         self.evaluation = evaluation
@@ -265,6 +269,14 @@ class ApiContainer:
         # resolver lets the run service rebuild a paused run's tool-bearing runtime FROM
         # THE STORED DB SPEC (reviewer must_fix: /v1 has no filesystem ``agent_path``).
         checkpoint_store = cls._build_v1_checkpoint_store()
+        # T2g: the ONE durable conversation store the CLI + Studio + /v1 all read. In a
+        # server context this is the shared ``.himmy/conversations.db`` singleton (so a /v1
+        # thread is browsable in Studio Chats / ``himmy chat``); in the zero-config offline
+        # default it is a private in-memory store (no files written). Built before the run
+        # service so the thread sink can be wired in.
+        conversation_store = cls._build_conversation_store()
+        # The thread service is wired AFTER the run service is built (it needs the run
+        # app), so the run service's conversation sink is bound via a late attribute set.
         run_app = RunAppService(
             runtime=runtime,
             storage=service_storage,
@@ -273,6 +285,18 @@ class ApiContainer:
             checkpoint_store=checkpoint_store,
             agent_resolver=agent_app.get_agent_def,
         )
+        # T2g: the /v1 thread (conversation) resource over the one ConversationStore.
+        from himmy.application.services import ThreadAppService
+
+        thread_app = ThreadAppService(
+            run_app=run_app,
+            agent_app=agent_app,
+            conversation_store=conversation_store,
+        )
+        # Wire the run service's conversation sink so an approval-resume (which finishes on
+        # a background task the thread router never awaits) still re-projects the latest
+        # turns into the ConversationStore. A late set keeps the construction order clean.
+        run_app._conversation_sink = thread_app.project_run_thread
         dashboard = DashboardQueryService(storage=service_storage)
         # The LLM-judge metric path (AAEO-10) can reach the inference service.
         evaluation = EvaluationService(
@@ -298,6 +322,8 @@ class ApiContainer:
             context_app=context_app,
             run_app=run_app,
             agent_app=agent_app,
+            thread_app=thread_app,
+            conversation_store=conversation_store,
             recommendation_app=recommendation_app,
             dashboard=dashboard,
             evaluation=evaluation,
@@ -333,6 +359,29 @@ class ApiContainer:
 
             return SqliteCheckpointStore(v1_approvals_db_path())
         return InMemoryCheckpointStore()
+
+    @staticmethod
+    def _build_conversation_store() -> Any:
+        """Build the conversation store: shared durable singleton in a server, RAM offline.
+
+        In a server context (the lifespan-established durable deployment) this resolves
+        the process-wide :func:`get_conversation_store` singleton at the canonical
+        ``.himmy/conversations.db`` — the SAME database the CLI (``himmy chat``) and Studio
+        Chats read, so a /v1 thread is browsable everywhere (T2g acceptance). Outside a
+        server context (the zero-config ``build_default`` offline/test default) it is a
+        private in-memory :class:`ConversationStore` so no file is written and the offline
+        contract is unchanged. ``build_default`` runs BEFORE the lifespan sets the server
+        context, so the durable upgrade happens in the lifespan's rebuild (mirroring the
+        spine + the checkpoint store).
+        """
+        from himmy.services.storage.conversations import ConversationStore
+        from himmy.services.storage.factory import in_server_context
+
+        if in_server_context():
+            from himmy.services.storage.conversations import get_conversation_store
+
+            return get_conversation_store()
+        return ConversationStore(":memory:")
 
     @staticmethod
     def _build_privacy_audit(
@@ -475,6 +524,21 @@ class ApiContainer:
                 cp_close()
             except Exception:  # pragma: no cover - best-effort teardown
                 pass
+        # T2g: close the conversation store ONLY when it is the container-owned (offline,
+        # in-memory) instance. The durable server store is the process-wide singleton the
+        # CLI + Studio share, so closing it here would break their connection — leave it
+        # to its own lifecycle. Identity against the singleton (without forcing it to
+        # construct) distinguishes the two.
+        from himmy.services.storage.conversations import current_conversation_store
+
+        conv = self.conversation_store
+        if conv is not None and conv is not current_conversation_store():
+            conv_close = getattr(conv, "close", None)
+            if conv_close is not None:
+                try:
+                    conv_close()
+                except Exception:  # pragma: no cover - best-effort teardown
+                    pass
 
 
 __all__ = ["ApiContainer"]

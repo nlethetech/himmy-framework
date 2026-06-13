@@ -94,6 +94,7 @@ class CreateRunRequest(BaseModel):
     task: TaskInput
     idempotency_key: str | None = None
     hitl: bool = False
+    plan: bool = False
 
 
 def _container(request: Request) -> Any:
@@ -114,6 +115,11 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
     ``POST /v1/runs/{id}/approve|reject``. HITL requires a stored ``agent_id`` (an inline
     persona carries no tools to gate → 422) and a deployment with a checkpoint store
     (→ 400 when absent).
+
+    With ``plan=true`` (T2g) the run pauses at PLAN-READY: the agent publishes its plan
+    (carried in ``metadata['plan']``) and the run stops at ``AWAITING_APPROVAL``,
+    resumable via the SAME ``approve`` endpoint. Plan mode has the same preconditions as
+    HITL (a stored ``agent_id`` + a checkpoint store).
     """
     from himmy.agents.base_agent.task import Task
     from himmy.agents.personas.persona import Persona
@@ -177,6 +183,7 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
                 agent_def=agent_def,
                 operator_provisioned=operator_provisioned,
                 hitl=body.hitl,
+                plan=body.plan,
                 actor=get_principal(request).actor_metadata(),
             ),
         )

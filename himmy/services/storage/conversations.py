@@ -850,6 +850,16 @@ def _maybe_import_legacy(store: ConversationStore, path: str) -> None:
         pass
 
 
+def current_conversation_store() -> ConversationStore | None:
+    """Return the already-open process-wide store WITHOUT constructing one (or None).
+
+    Used to distinguish the container-owned (offline, in-memory) store from the shared
+    durable singleton at teardown: closing the shared one would break the CLI + Studio
+    that hold the same connection, so only a private (non-singleton) store is closed.
+    """
+    return _STORE
+
+
 def reset_conversation_store() -> None:
     """Close + drop the singleton (test hook; the next access reopens at the current path)."""
     global _STORE, _PATH
@@ -868,6 +878,7 @@ __all__ = [
     "ConversationStore",
     "ConversationSummary",
     "FlatMessage",
+    "current_conversation_store",
     "flat_from_thread",
     "flat_role",
     "get_conversation_store",
