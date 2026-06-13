@@ -59,12 +59,23 @@ def _ipv4_ok(text: str) -> bool:
 
 
 def _phone_ok(text: str) -> bool:
-    """False only for a bare decimal number — a lat/long coordinate, price, or version
-    like ``27.7172453`` — which the broad phone pattern would otherwise redact as
-    ``[REDACTED-PHONE]``. Everything else (real phones, long digit runs the phone rule
-    catches as a safety net) is left for redaction.
+    """False for values the broad phone pattern over-catches and must NOT redact:
+
+    * a bare decimal number — a lat/long coordinate, price, or version like
+      ``27.7172453``;
+    * an ISO-8601 calendar date like ``2026-06-12`` — legitimate input for
+      date-aware tools (a forex ``from_date``, a calendar query), and no real phone
+      number is shaped ``YYYY-MM-DD``.
+
+    Everything else (real phones, long digit runs the phone rule catches as a safety
+    net) returns True and is left for redaction.
     """
-    return re.fullmatch(r"\d+\.\d+", text.strip()) is None
+    stripped = text.strip()
+    if re.fullmatch(r"\d+\.\d+", stripped):  # lat/long, price, version number
+        return False
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stripped):  # ISO-8601 date
+        return False
+    return True
 
 
 def _redact(text: str, rules: list[PIIRule]) -> tuple[str, list[str]]:

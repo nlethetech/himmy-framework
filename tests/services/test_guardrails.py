@@ -45,6 +45,20 @@ def test_pii_ipv4_octet_validation() -> None:
     assert "pii:ipv4" not in g.inspect("code 999.999.999.999", context={}).flags
 
 
+def test_pii_keeps_iso_dates_and_coordinates() -> None:
+    """The broad phone rule must NOT redact an ISO-8601 date or a bare lat/long — both
+    are legitimate input for a civic/date-aware agent (a forex from_date, a coordinate).
+    Real phone numbers in the same shape-space still redact.
+    """
+    g = PIIGuardrail()
+    kept = g.inspect("USD rate on 2026-06-12 near lat 27.7172453", context={})
+    assert "2026-06-12" in kept.text
+    assert "27.7172453" in kept.text
+    assert "[REDACTED-PHONE]" not in kept.text
+    # A real phone is still caught (the exemption is date/decimal-shaped only).
+    assert "[REDACTED-PHONE]" in g.inspect("call +9779812345678", context={}).text
+
+
 def test_pii_detects_keys_jwt_url_mac() -> None:
     g = PIIGuardrail()
     assert (
