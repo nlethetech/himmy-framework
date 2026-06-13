@@ -43,6 +43,7 @@ from himmy.services.storage.models import (
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.agents.base_agent.task import Task
     from himmy.agents.personas.persona import Persona
+    from himmy.config.agent_spec import AgentSpec
     from himmy.core.ids import utc_now_iso  # noqa: F401
     from himmy.entities.lineage import LineageGraph
     from himmy.entities.protocol import EntityRegistryProtocol
@@ -74,9 +75,40 @@ MAX_PAGE_LIMIT = 1000
 #: transitions to FAILED with a timeout error rather than hanging forever.
 DEFAULT_RUN_TIMEOUT_SECONDS = 300.0
 
+#: Default per-workspace concurrency cap (T0.4): at most this many of one
+#: workspace's background runs execute at once; the rest queue on a per-workspace
+#: semaphore. Keeps one tenant's fan-out (compare/team/routine) from starving the
+#: shared event loop + provider quota for every other tenant.
+DEFAULT_WORKSPACE_CONCURRENCY = 8
+
+#: Default cap on a single workspace's OUTSTANDING (created-but-not-finished)
+#: background runs (T0.4). A burst beyond this is rejected at create time with a
+#: :class:`WorkspaceRunQuotaExceeded` rather than being silently queued forever, so a
+#: runaway fan-out cannot pin unbounded memory/tasks. ``0`` disables the cap.
+DEFAULT_WORKSPACE_MAX_OUTSTANDING = 64
+
 #: Sentinel default for ``LLMConfig.model_key`` (AAEO-16): a config carrying this
 #: value is treated as "caller did not pick a model" so task.context can win.
 _DEFAULT_MODEL_KEY = "default"
+
+
+class WorkspaceRunQuotaExceeded(Exception):
+    """A workspace exceeded its outstanding-run cap (T0.4 — surfaces as HTTP 429).
+
+    Raised by :meth:`RunAppService.create_run` when a workspace already has its
+    maximum number of in-flight (created-but-not-terminal) background runs. Carries
+    the workspace + the cap so the router can return an informative 429.
+    """
+
+    def __init__(self, workspace_id: str, *, cap: int, outstanding: int) -> None:
+        """Record the workspace and the cap it hit for the API error surface."""
+        self.workspace_id = workspace_id
+        self.cap = cap
+        self.outstanding = outstanding
+        super().__init__(
+            f"workspace {workspace_id!r} has {outstanding} outstanding run(s); "
+            f"the per-workspace cap is {cap}. Retry once in-flight runs complete."
+        )
 
 
 def _now() -> str:
@@ -493,11 +525,24 @@ class RunAppService:
         entity_registry: EntityRegistryProtocol | None = None,
         recommendation_app: RecommendationAppService | None = None,
         run_timeout_seconds: float = DEFAULT_RUN_TIMEOUT_SECONDS,
+        workspace_concurrency: int = DEFAULT_WORKSPACE_CONCURRENCY,
+        workspace_max_outstanding: int = DEFAULT_WORKSPACE_MAX_OUTSTANDING,
     ) -> None:
         """Wire the runtime, store, optional registry, and recommendation service.
 
         ``run_timeout_seconds`` (AAEO-1) bounds each background run's wall clock;
         a run that exceeds it transitions to FAILED with a timeout error.
+
+        ``workspace_concurrency`` / ``workspace_max_outstanding`` (T0.4) bound the
+        per-workspace fan-out so one tenant cannot exhaust the shared event loop +
+        provider quota: at most ``workspace_concurrency`` of a workspace's runs
+        execute the runtime at once (the rest wait on a per-workspace semaphore), and
+        a workspace may hold at most ``workspace_max_outstanding`` created-but-not-
+        terminal runs before :meth:`create_run` rejects with
+        :class:`WorkspaceRunQuotaExceeded`. Both default to safe values and apply to
+        EVERY background run path (inline persona and per-run-spec alike), so the
+        offline single-workspace default behaves identically while a multi-tenant
+        deployment is protected.
         """
         self._runtime = runtime
         self._storage = storage
@@ -509,6 +554,15 @@ class RunAppService:
         # Keep strong refs to background tasks so they are not GC'd mid-flight and
         # so they can be drained/cancelled on shutdown (AAEO-1).
         self._tasks: set[asyncio.Task[Any]] = set()
+        # T0.4 per-workspace quotas. ``_ws_semaphores`` gates concurrent EXECUTION;
+        # ``_ws_outstanding`` counts created-but-not-terminal runs for the admission
+        # cap. Both are keyed on workspace_id and created lazily so an unused
+        # workspace costs nothing. A semaphore binds the loop it was created on, so it
+        # is created lazily inside the (async) create path, never at construction.
+        self._workspace_concurrency = max(1, int(workspace_concurrency))
+        self._workspace_max_outstanding = max(0, int(workspace_max_outstanding))
+        self._ws_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._ws_outstanding: dict[str, int] = {}
 
     async def create_run(
         self,
@@ -520,6 +574,9 @@ class RunAppService:
         idempotency_key: str | None = None,
         llm_config: LLMConfig | None = None,
         actor: dict[str, Any] | None = None,
+        agent_spec: AgentSpec | None = None,
+        operator_provisioned: bool = False,
+        checkpoint_store: Any = None,
     ) -> RunRecord:
         """Create (or return the existing) run and launch background execution.
 
@@ -533,10 +590,43 @@ class RunAppService:
         so two concurrent requests with the same key cannot both create a run.
         Background execution is only launched for the run this call actually
         created.
+
+        ``agent_spec`` (T0.2) is the load-bearing seam: when a run resolves to a
+        stored/declarative :class:`AgentSpec` the run executes on a PER-RUN
+        tool-bearing runtime built via
+        :func:`himmy.runtime.from_spec.build_runtime_for_spec` — so a ``/v1`` run can
+        finally call the agent's TOOLS, which the shared (tool-less) runtime cannot.
+        When ``agent_spec`` is ``None`` the existing inline-persona fast path runs on
+        the shared tool-less runtime, byte-unchanged (back-compat). ``agent_spec`` is
+        sanitized against the tenant RCE/SSRF surface (T0.3) unless
+        ``operator_provisioned`` is set AND the operator opted in — a tenant spec
+        carrying ``tools_module``/``http_tools``/``mcp_servers`` is rejected here.
+
+        Per-workspace admission (T0.4): a workspace already holding
+        ``workspace_max_outstanding`` in-flight runs is rejected with
+        :class:`WorkspaceRunQuotaExceeded` BEFORE a record is created, so a runaway
+        fan-out cannot pin unbounded tasks. An idempotent re-submit of an existing
+        run never counts against the cap.
         """
+        # Fail-closed sanitize a per-run spec against the tenant attack surface
+        # BEFORE anything is persisted or executed (T0.3). Operator-provisioned specs
+        # may keep their tools when the operator opted in; everyone else is stripped
+        # or (default) rejected by ``sanitize_tenant_spec`` raising.
+        if agent_spec is not None:
+            from himmy.config.spec_sanitizer import sanitize_tenant_spec
+
+            agent_spec = sanitize_tenant_spec(
+                agent_spec, operator_provisioned=operator_provisioned
+            ).spec
+
         # Stamp the authenticated actor ("who launched this") into the durable
         # metadata JSONB (round-trips on both in-memory and Postgres) so every run
         # records its initiator — the operational half of "who did what" (WS1.3).
+        metadata: dict[str, Any] = {}
+        if actor:
+            metadata["actor"] = actor
+        if agent_spec is not None:
+            metadata["agent_name"] = agent_spec.name
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
@@ -545,31 +635,103 @@ class RunAppService:
             model_key=_resolve_model_key(llm_config, task),
             idempotency_key=idempotency_key,
             status=RunStatus.QUEUED,
-            metadata={"actor": actor} if actor else {},
+            metadata=metadata,
         )
+        # Atomic idempotent insert FIRST (the race-safe primitive), so an idempotent
+        # re-submit (created=False) returns the prior run without ever touching the
+        # T0.4 cap — a duplicate spawns no new task. Only a NEWLY-created run is
+        # admitted against the per-workspace outstanding cap below.
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:
             return stored
 
+        # T0.4 admission: a workspace already at its outstanding-run cap cannot launch
+        # another background task. The record exists (atomicity is preserved), so it is
+        # immediately marked FAILED rather than left as an orphaned QUEUED row, and the
+        # quota error propagates to the caller (HTTP 429).
+        try:
+            self._admit_workspace_run(workspace_id)
+        except WorkspaceRunQuotaExceeded:
+            stored.status = RunStatus.FAILED
+            stored.error = "rejected: workspace run-concurrency quota exceeded"
+            stored.updated_at = _now()
+            try:
+                await self._storage.save_run(stored)
+            except Exception:  # pragma: no cover - best-effort terminal mark
+                logger.warning("failed to mark quota-rejected run %s", stored.run_id)
+            raise
+
         bg = asyncio.create_task(
             self._execute_run(
                 stored.run_id,
+                workspace_id=workspace_id,
                 persona=persona,
                 task=task,
                 llm_config=llm_config,
+                agent_spec=agent_spec,
+                checkpoint_store=checkpoint_store,
             )
         )
         self._tasks.add(bg)
         bg.add_done_callback(self._tasks.discard)
         return stored
 
+    # ----------------------------------------------------------- T0.4 quotas
+    def _admit_workspace_run(self, workspace_id: str) -> None:
+        """Reserve one outstanding-run slot for ``workspace_id`` or reject (T0.4).
+
+        Raises :class:`WorkspaceRunQuotaExceeded` when the workspace already holds
+        :attr:`_workspace_max_outstanding` in-flight runs. ``0`` disables the cap.
+        Runs single-threaded in the event loop, so the read-modify-write is atomic.
+        """
+        if self._workspace_max_outstanding <= 0:
+            return
+        current = self._ws_outstanding.get(workspace_id, 0)
+        if current >= self._workspace_max_outstanding:
+            raise WorkspaceRunQuotaExceeded(
+                workspace_id,
+                cap=self._workspace_max_outstanding,
+                outstanding=current,
+            )
+        self._ws_outstanding[workspace_id] = current + 1
+
+    def _release_workspace_run(self, workspace_id: str) -> None:
+        """Release one outstanding-run slot for ``workspace_id`` (floors at 0)."""
+        if self._workspace_max_outstanding <= 0:
+            return
+        current = self._ws_outstanding.get(workspace_id, 0)
+        if current <= 1:
+            self._ws_outstanding.pop(workspace_id, None)
+        else:
+            self._ws_outstanding[workspace_id] = current - 1
+
+    def _workspace_semaphore(self, workspace_id: str) -> asyncio.Semaphore:
+        """Lazily get/create the per-workspace execution semaphore (T0.4).
+
+        Created on first use inside the running loop so it binds the correct event
+        loop (a semaphore created at construction could bind the wrong loop under
+        ``asyncio.run`` test harnesses).
+        """
+        sem = self._ws_semaphores.get(workspace_id)
+        if sem is None:
+            sem = asyncio.Semaphore(self._workspace_concurrency)
+            self._ws_semaphores[workspace_id] = sem
+        return sem
+
+    def workspace_outstanding(self, workspace_id: str) -> int:
+        """Return the current count of in-flight runs for a workspace (introspection)."""
+        return self._ws_outstanding.get(workspace_id, 0)
+
     async def _execute_run(
         self,
         run_id: str,
         *,
+        workspace_id: str,
         persona: Persona,
         task: Task,
         llm_config: LLMConfig | None,
+        agent_spec: AgentSpec | None = None,
+        checkpoint_store: Any = None,
     ) -> None:
         """Background worker: RUNNING -> run_task -> SUCCEEDED/FAILED + extraction.
 
@@ -578,17 +740,62 @@ class RunAppService:
         populated and recommendation extraction skipped, instead of being marked
         SUCCEEDED with garbage output. The whole run is bounded by
         ``run_timeout_seconds`` (AAEO-1).
+
+        Runtime selection (T0.2): with ``agent_spec`` set, the run executes on a
+        PER-RUN tool-bearing runtime built from the spec (so the agent's tools fire);
+        otherwise it stays on the shared tool-less runtime (inline-persona
+        back-compat). Execution holds the per-workspace concurrency semaphore (T0.4)
+        and the outstanding-run reservation taken in :meth:`create_run` is released
+        in ``finally`` so a failed/cancelled run frees its slot. ``workspace_id`` is
+        passed in (not re-read from the record) so the slot is always released for the
+        right workspace even on the defensive ``run is None`` path.
         """
-        run = await self._storage.get_run(run_id)
-        if run is None:  # pragma: no cover - defensive
-            return
+        semaphore = self._workspace_semaphore(workspace_id)
+        try:
+            async with semaphore:
+                run = await self._storage.get_run(run_id)
+                if run is None:  # pragma: no cover - defensive
+                    return
+                await self._execute_on_runtime(
+                    run,
+                    persona=persona,
+                    task=task,
+                    llm_config=llm_config,
+                    agent_spec=agent_spec,
+                    checkpoint_store=checkpoint_store,
+                )
+        finally:
+            self._release_workspace_run(workspace_id)
+
+    async def _execute_on_runtime(
+        self,
+        run: RunRecord,
+        *,
+        persona: Persona,
+        task: Task,
+        llm_config: LLMConfig | None,
+        agent_spec: AgentSpec | None,
+        checkpoint_store: Any,
+    ) -> None:
+        """Drive one run to a terminal state on the resolved runtime (T0.2 core)."""
         run.status = RunStatus.RUNNING
         run.updated_at = _now()
         await self._storage.save_run(run)
 
         try:
+            runtime = await self._resolve_runtime(
+                agent_spec, checkpoint_store=checkpoint_store
+            )
+        except Exception as exc:  # noqa: BLE001 - spec wiring failure is terminal
+            run.status = RunStatus.FAILED
+            run.error = f"agent runtime build failed: {exc}"
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+
+        try:
             result = await asyncio.wait_for(
-                self._runtime.run_task_detailed(persona, task, llm_config=llm_config),
+                runtime.run_task_detailed(persona, task, llm_config=llm_config),
                 timeout=self._run_timeout_seconds,
             )
         except TimeoutError:
@@ -656,6 +863,50 @@ class RunAppService:
         # Auto-extract recommendations when the output matches the envelope.
         if run.output_structured is not None:
             await self._recommendations.extract_from_run(run)
+
+    async def _resolve_runtime(
+        self, agent_spec: AgentSpec | None, *, checkpoint_store: Any = None
+    ) -> SingleAgentRuntime:
+        """Pick the runtime for a run: shared tool-less, or a per-run tool-bearing one.
+
+        With ``agent_spec is None`` the existing shared (tool-less) runtime is
+        returned — the inline-persona fast path stays byte-identical (back-compat).
+
+        With a spec present (T0.2) a PER-RUN runtime is built via
+        :func:`himmy.runtime.from_spec.build_runtime_for_spec`, which wires the spec's
+        tool packs / tools / guardrails / knowledge / connectors / MCP + a tool
+        service, so the run can finally CALL the agent's tools (impossible on the
+        shared runtime, which carries no tool_service). It is built off-loop in a
+        worker thread because ``build_runtime_for_spec`` may run an inner
+        ``asyncio.run`` (knowledge ingest) that cannot nest in the running loop.
+
+        Wiring choices that preserve the zero-config offline default: the per-run
+        runtime SHARES this service's storage (so its thread/events/memory land in the
+        one store the app layer reads) and REUSES the shared runtime's inference
+        service when the spec pins no provider — so an offline deployment keeps the
+        stub and a configured deployment keeps its gateway, with no surprise provider
+        switch. When the spec names a provider explicitly, ``build_runtime_for_spec``
+        honors it. ``checkpoint_store`` is threaded so a HITL run can pause (T2f).
+        """
+        if agent_spec is None:
+            return self._runtime
+        # Reuse the shared runtime's inference only when the spec does not pin its own
+        # provider; otherwise let from_spec build the provider-specific service.
+        shared_inference = (
+            getattr(self._runtime, "inference_service", None)
+            if not agent_spec.provider
+            else None
+        )
+        from himmy.runtime.from_spec import build_runtime_for_spec
+
+        runtime, _registry = await asyncio.to_thread(
+            build_runtime_for_spec,
+            agent_spec,
+            inference=shared_inference,
+            storage=self._storage,
+            checkpoint_store=checkpoint_store,
+        )
+        return cast("SingleAgentRuntime", runtime)
 
     @staticmethod
     def _parse_structured(content: str | None) -> Any:
@@ -1021,6 +1272,9 @@ __all__ = [
     "RunAppService",
     "RecommendationAppService",
     "DashboardQueryService",
+    "WorkspaceRunQuotaExceeded",
     "DEFAULT_PAGE_LIMIT",
     "MAX_PAGE_LIMIT",
+    "DEFAULT_WORKSPACE_CONCURRENCY",
+    "DEFAULT_WORKSPACE_MAX_OUTSTANDING",
 ]

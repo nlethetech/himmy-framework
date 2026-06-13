@@ -8,6 +8,7 @@ from himmy.application.services import (
     DashboardQueryService,
     RecommendationAppService,
     RunAppService,
+    WorkspaceRunQuotaExceeded,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "RunAppService",
     "RecommendationAppService",
     "DashboardQueryService",
+    "WorkspaceRunQuotaExceeded",
 ]
