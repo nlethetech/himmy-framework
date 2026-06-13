@@ -161,14 +161,28 @@ def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+def _canonical_storage(request: Request) -> Any | None:
+    """The ONE canonical run store every surface reads (T2.2), or None.
+
+    A Studio run mirrors into this store so it is browsable from ``/v1`` + the CLI.
+    Resolved from the request-bound container's storage (the same backend the
+    ``RunAppService`` writes), so a SQLite *or* Postgres deployment mirrors through the
+    same async store on the main loop. Returns None when no container is attached (a
+    bare test app) so the streamer degrades to studio.db-only, never erroring.
+    """
+    container = getattr(request.app.state, "container", None)
+    return getattr(container, "storage", None) if container is not None else None
+
+
 @router.post("/run")
-async def run(body: RunRequest) -> StreamingResponse:
+async def run(body: RunRequest, request: Request) -> StreamingResponse:
     """Run an agent for one user turn, streaming GUI events over SSE.
 
     Loads the selected ``agent.yaml`` (with project defaults + skills applied),
     wires it exactly like ``himmy run``, and streams ``start``/``token``/``tool``/
     ``message``/``done`` frames. A load/build failure becomes a single ``error``
-    frame so the client always gets a clean end to the stream.
+    frame so the client always gets a clean end to the stream. The run is mirrored
+    into the canonical run store (T2.2) so it is browsable from ``/v1`` + the CLI.
     """
     # Resolve + load up front so a bad path is a clean 4xx, not a mid-stream error.
     try:
@@ -180,6 +194,8 @@ async def run(body: RunRequest) -> StreamingResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    canonical = _canonical_storage(request)
+
     async def _stream() -> AsyncIterator[str]:
         try:
             async for event in studio_service.stream_agent_run(
@@ -189,6 +205,7 @@ async def run(body: RunRequest) -> StreamingResponse:
                 provider=body.provider,
                 model=body.model,
                 agent_path=body.agent_path,
+                canonical_storage=canonical,
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - surface as a terminal error frame
@@ -209,12 +226,13 @@ class RunTeamRequest(BaseModel):
 
 
 @router.post("/run-team")
-async def run_team(body: RunTeamRequest) -> StreamingResponse:
+async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
     """Run a multi-agent team, streaming the live routing/delegate/tool trail (SSE).
 
     Members run on their own providers (e.g. a Claude-CLI manager delegating to local
     Ollama workers). Frames: ``start`` → ``delegate``/``handoff``/``tool`` → ``message``
-    → ``done`` (or a terminal ``error``).
+    → ``done`` (or a terminal ``error``). The team run is mirrored into the canonical
+    run store (T2.2) so it is browsable from ``/v1`` + the CLI.
     """
     try:
         spec = studio_service.load_team(body.team_path)
@@ -225,11 +243,16 @@ async def run_team(body: RunTeamRequest) -> StreamingResponse:
 
     teams = {t.path: t for t in studio_service.list_teams()}
     team_name = teams[body.team_path].name if body.team_path in teams else "team"
+    canonical = _canonical_storage(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
             async for event in studio_service.stream_team_run(
-                spec, body.prompt, team_name=team_name, team_path=body.team_path
+                spec,
+                body.prompt,
+                team_name=team_name,
+                team_path=body.team_path,
+                canonical_storage=canonical,
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
@@ -267,13 +290,14 @@ class ResearchRequest(BaseModel):
 
 
 @router.post("/research")
-async def research(body: ResearchRequest) -> StreamingResponse:
+async def research(body: ResearchRequest, request: Request) -> StreamingResponse:
     """Run a deep-research agent (web search + fetch) for one question over SSE.
 
     Builds an ephemeral research-configured :class:`AgentSpec` (web tools + a
     plan→search→synthesize methodology) and streams the same cognition/tool/message
     frames as a normal run — so the client can show the live search trail and the
     final report. Reuses all existing run machinery; nothing is persisted as an agent.
+    The run is mirrored into the canonical run store (T2.2) like any other Studio run.
     """
     from himmy.config.agent_spec import AgentSpec
 
@@ -287,6 +311,7 @@ async def research(body: ResearchRequest) -> StreamingResponse:
         provider=body.provider,
         model=body.model or "default",
     )
+    canonical = _canonical_storage(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
@@ -296,6 +321,7 @@ async def research(body: ResearchRequest) -> StreamingResponse:
                 provider=body.provider,
                 model=body.model,
                 agent_path="(deep-research)",
+                canonical_storage=canonical,
             ):
                 yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
@@ -309,13 +335,23 @@ async def research(body: ResearchRequest) -> StreamingResponse:
 
 
 @router.get("/runs", response_model=StudioRunListResponse)
-async def list_runs(limit: int = 50, offset: int = 0) -> StudioRunListResponse:
-    """List past Studio runs (newest first), paginated."""
+async def list_runs(
+    request: Request, limit: int = 50, offset: int = 0
+) -> StudioRunListResponse:
+    """List past runs (newest first), paginated, from the ONE canonical store (T2.2).
+
+    Reads the canonical run store every surface shares, so runs created by ``/v1`` and
+    the CLI ``--persist`` path appear here too (Studio is the single-user-local browse
+    over the unified store). studio.db is a presentation cache that enriches matching
+    rows + supplies human feedback.
+    """
+    from himmy.api.studio_canonical import list_studio_runs_unified
+
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
-    store = get_run_store()
-    items = store.list(limit=limit, offset=offset)
-    total = store.count()
+    items, total = await list_studio_runs_unified(
+        _canonical_storage(request), limit=limit, offset=offset
+    )
     return StudioRunListResponse(
         items=items,
         total=total,
@@ -332,9 +368,16 @@ async def runs_analytics() -> RunAnalytics:
 
 
 @router.get("/runs/{run_id}", response_model=StudioRun)
-async def get_run(run_id: str) -> StudioRun:
-    """Fetch one run in full: transcript, tools, and the step-by-step timeline."""
-    run = get_run_store().get(run_id)
+async def get_run(run_id: str, request: Request) -> StudioRun:
+    """Fetch one run in full from the canonical store: transcript, tools, timeline.
+
+    Resolves through the ONE canonical run store (T2.2) so a ``/v1``- or CLI-authored
+    run is viewable in the Studio detail panel, with the studio.db cache supplying the
+    richest fields when present.
+    """
+    from himmy.api.studio_canonical import get_studio_run_unified
+
+    run = await get_studio_run_unified(_canonical_storage(request), run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run

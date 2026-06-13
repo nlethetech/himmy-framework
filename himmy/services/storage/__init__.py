@@ -12,6 +12,9 @@ from himmy.services.storage.inmemory import (
     InMemoryThreadStore,
 )
 from himmy.services.storage.models import (
+    LOCAL_SUBJECT,
+    LOCAL_WORKSPACE,
+    STUDIO_METADATA_KEY,
     ActionRecord,
     AgentStateRecord,
     ContextEvidenceRecord,
@@ -59,6 +62,9 @@ __all__ = [
     "InMemoryEvaluationStore",
     "InMemoryOrchestrationStore",
     # Records.
+    "LOCAL_SUBJECT",
+    "LOCAL_WORKSPACE",
+    "STUDIO_METADATA_KEY",
     "RunRecord",
     "RunStatus",
     "RecommendationItem",

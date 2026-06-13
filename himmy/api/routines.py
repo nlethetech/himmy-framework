@@ -361,10 +361,14 @@ async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
 
     Returns ``(status, output_text, error)``. ``stream_agent_run`` persists the
     run to the runs store itself; an approval-gated tool pauses the run on a
-    durable checkpoint (status ``awaiting_approval``) — it is NOT executed.
+    durable checkpoint (status ``awaiting_approval``) — it is NOT executed. The run
+    is mirrored into the canonical run store (T3c) so a scheduled run is visible in
+    ``himmy runs`` and ``/v1`` too, not just the local studio.db.
     """
     from himmy.api import studio_service
+    from himmy.api.studio_canonical import resolve_canonical_storage
 
+    canonical = resolve_canonical_storage()
     try:
         spec = studio_service.load_studio_spec(
             routine.agent_path, provider=routine.provider, model=routine.model
@@ -386,6 +390,7 @@ async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
             provider=routine.provider,
             model=routine.model,
             agent_path=routine.agent_path,
+            canonical_storage=canonical,
         ):
             kind = event.get("type")
             if kind == "message":

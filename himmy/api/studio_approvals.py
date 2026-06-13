@@ -166,6 +166,7 @@ async def resolve(
     import time
 
     from himmy.api import studio_service as ss
+    from himmy.api.studio_canonical import resolve_canonical_storage
     from himmy.api.studio_runs import get_run_store
     from himmy.core.ids import new_uuid
     from himmy.runtime import from_spec
@@ -239,8 +240,13 @@ async def resolve(
         error_msg = str(exc)
 
     duration_ms = (time.monotonic() - started) * 1000.0
+    # The studio.db cache write is synchronous (worker thread); the canonical mirror
+    # (T2.2) is then upserted on the main loop so the resume's terminal/paused status
+    # is reflected in the ONE store /v1 + the CLI read — the last-write-wins guard keeps
+    # an authoritative AWAITING_APPROVAL from being rolled back by a stale projection.
+    built: Any | None = None
     try:
-        await asyncio.to_thread(
+        built = await asyncio.to_thread(
             ss._record_run,
             run_id=run_id,
             spec=spec,
@@ -262,6 +268,7 @@ async def resolve(
         )
     except Exception:  # noqa: BLE001
         pass
+    await ss._record_canonical(resolve_canonical_storage(), built)
 
     if status == "error":
         yield {

@@ -13,11 +13,30 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.entities.records import EntityRecord
 
 
+#: The reserved workspace/subject for CLI + single-user-local (Studio) runs (T2.2).
+#: A run authored by a one-shot CLI invocation or by the local single-user Studio GUI
+#: belongs to no tenant; it is stamped ``__local__`` so it can still land in the ONE
+#: canonical run store every surface reads, yet be EXCLUDED from cross-tenant
+#: all-workspaces list views (an authenticated admin listing every tenant must not see
+#: a local developer's runs leak in). A concrete query for ``__local__`` still returns
+#: them (that is how the local Studio/CLI browse their own history).
+LOCAL_WORKSPACE = "__local__"
+LOCAL_SUBJECT = "__local__"
+
+#: ``metadata`` key under which a run carries its rich Studio presentation payload
+#: (transcript, timeline, cognition steps, per-model usage, tools, agent path). The
+#: canonical :class:`RunRecord` is the single authoritative record; ``.himmy/studio.db``
+#: is demoted to a run_id-keyed presentation CACHE rebuildable from this field, so a run
+#: created by any surface (``/v1``, CLI, Studio) is fully renderable from the one store.
+STUDIO_METADATA_KEY = "studio"
+
+
 class RunStatus(str, Enum):
     """Lifecycle state of an async agent run."""
 
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
 
@@ -174,6 +193,9 @@ class ContextEvidenceRecord(BaseModel):
 
 
 __all__ = [
+    "LOCAL_SUBJECT",
+    "LOCAL_WORKSPACE",
+    "STUDIO_METADATA_KEY",
     "RunStatus",
     "RecommendationStatus",
     "RunRecord",

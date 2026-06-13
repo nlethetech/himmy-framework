@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, cast
 from himmy.application.models import RecommendationEnvelope
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import (
+    LOCAL_WORKSPACE,
     RecommendationItem,
     RecommendationStatus,
     RunRecord,
@@ -952,11 +953,17 @@ class RunAppService:
         cannot complete (their background task is gone), so they are transitioned
         to FAILED with a recovery error. ``ttl_seconds=0`` sweeps all non-terminal
         runs. Returns the swept run ids.
+
+        AWAITING_APPROVAL is DELIBERATELY not swept (T2.2 precondition for T2f): an
+        HITL-paused run is intentionally idle pending a human approve/reject and must
+        never be reaped to FAILED — only QUEUED/RUNNING are recoverable-abandoned.
         """
         swept: list[str] = []
         runs = await self._storage.list_runs()
         now = time.time()
         for run in runs:
+            # Only QUEUED/RUNNING are "abandoned"; SUCCEEDED/FAILED are terminal and
+            # AWAITING_APPROVAL is intentionally paused (never sweep a paused run).
             if run.status not in (RunStatus.QUEUED, RunStatus.RUNNING):
                 continue
             if (
@@ -1037,10 +1044,18 @@ class RunAppService:
 
         Ordered ``created_at`` desc with ``run_id`` tiebreak, then windowed by
         ``offset``/``limit`` (capped at :data:`MAX_PAGE_LIMIT`) — AAEO-8.
+
+        Cross-tenant safety (T2.2): the all-workspaces view (``workspace_id is None``,
+        an authenticated admin listing every tenant) EXCLUDES the reserved
+        ``__local__`` workspace so CLI/single-user-local runs never leak into a
+        multi-tenant admin list. An explicit query for ``__local__`` still returns
+        them (the local Studio/CLI browse their own history).
         """
         runs = await self._storage.list_runs(
             workspace_id=workspace_id, subject_id=subject_id, status=status
         )
+        if workspace_id is None:
+            runs = [r for r in runs if r.workspace_id != LOCAL_WORKSPACE]
         return _paginate(
             runs,
             limit=limit,
@@ -1055,10 +1070,16 @@ class RunAppService:
         subject_id: str | None = None,
         status: RunStatus | None = None,
     ) -> int:
-        """Total run count for the filter (for pagination envelopes)."""
+        """Total run count for the filter (for pagination envelopes).
+
+        Mirrors :meth:`list_runs`' cross-tenant rule so the count matches the page:
+        the all-workspaces view excludes the reserved ``__local__`` runs (T2.2).
+        """
         runs = await self._storage.list_runs(
             workspace_id=workspace_id, subject_id=subject_id, status=status
         )
+        if workspace_id is None:
+            runs = [r for r in runs if r.workspace_id != LOCAL_WORKSPACE]
         return len(runs)
 
     async def get_run_events(

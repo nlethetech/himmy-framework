@@ -234,6 +234,7 @@ class MissionRegistry:
         """
         from himmy.api import studio_service
         from himmy.api.routers.studio_notify import record_notification
+        from himmy.api.studio_canonical import resolve_canonical_storage
 
         status = _DONE
         cancelled = False
@@ -247,6 +248,7 @@ class MissionRegistry:
                 agent_path=mission.agent_path,
                 steer_queue=mission.steer_queue,
                 plan_mode=mission.plan_mode,
+                canonical_storage=resolve_canonical_storage(),
             ):
                 await self._append(mission, frame)
                 ftype = frame.get("type")

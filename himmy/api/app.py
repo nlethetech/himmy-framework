@@ -252,6 +252,10 @@ def _build_lifespan(
                 )
                 active = container
 
+        # The routine canonical-storage provider is wired in ``create_app`` to read
+        # ``app.state.container.storage`` dynamically, so the rebind above (to the
+        # durable store) is automatically reflected — no re-wiring needed here.
+
         # Startup: sweep runs left non-terminal by a previous process so they
         # reach a terminal state instead of hanging in QUEUED/RUNNING forever.
         run_app = getattr(active, "run_app", None)
@@ -295,6 +299,14 @@ def _build_lifespan(
                     await container.aclose()
                 except Exception:  # pragma: no cover - shutdown best-effort
                     pass
+            # Clear the canonical-storage provider so a later in-process CLI/test run
+            # does not mirror into this (now-closed) container's store.
+            try:
+                from himmy.api.studio_canonical import set_canonical_storage_provider
+
+                set_canonical_storage_provider(None)
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
             # Clear the server-context flag so a subsequent in-process CLI/test run
             # reverts to the in-memory one-shot default.
             try:
@@ -360,6 +372,22 @@ def create_app(
         lifespan=_build_lifespan(container, upgrade_to_durable=container_was_none),
     )
     app.state.container = container
+
+    # T2.2/T3c: point the routine scheduler at the SAME canonical run store the Studio
+    # runs reader uses (``app.state.container.storage``), resolved dynamically so a
+    # lifespan rebind to the durable store is reflected without re-wiring. Set in
+    # ``create_app`` (not only the lifespan) so even a bare ``TestClient(create_app())``
+    # — which never enters the lifespan — mirrors a scheduled run into the one store the
+    # GUI reads, keeping "all runs, one store" coherent.
+    try:
+        from himmy.api.studio_canonical import set_canonical_storage_provider
+
+        set_canonical_storage_provider(
+            lambda: getattr(getattr(app.state, "container", None), "storage", None)
+        )
+    except Exception:  # pragma: no cover - canonical wiring is best-effort
+        logger.warning("wiring canonical run store failed", exc_info=True)
+
     app.state.authenticator = authenticator
     # Authorization: role → permission policy (data-driven via HIMMY_RBAC_FILE).
     # Enforced per-route via require_permission; bypassed when auth is off.
