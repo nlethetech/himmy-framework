@@ -302,6 +302,24 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "base_schema",
         [STORAGE_DDL],
     ),
+    # v2 (T1.1): promote workspace_id to an indexed column on evaluation_runs so
+    # GET /v1/evaluation/runs/{id} can be tenant-scoped (close the cross-tenant
+    # IDOR) and lists can filter by workspace. New writes populate the column
+    # directly; existing rows are backfilled from the stored JSONB payload. Added
+    # via a migration (not the frozen base DDL) so a fresh database lays down the
+    # base then runs this ALTER exactly once, never double-applying it.
+    (
+        2,
+        "evaluation_runs_workspace_id",
+        [
+            "ALTER TABLE evaluation_runs "
+            "ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS evaluation_runs_workspace_id_idx "
+            "ON evaluation_runs (workspace_id)",
+            "UPDATE evaluation_runs SET workspace_id = payload->>'workspace_id' "
+            "WHERE workspace_id IS NULL",
+        ],
+    ),
 ]
 
 
@@ -1052,57 +1070,75 @@ class PostgresEvaluationStore(_PgStoreBase):
     """Postgres-backed evaluation runs keyed by ``run_id``."""
 
     async def save_evaluation_run(self, run: Any) -> Any:
-        """Upsert an evaluation run keyed by ``run_id``."""
+        """Upsert an evaluation run keyed by ``run_id`` (stamping its workspace)."""
         pool = self._require_pool()
         async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO evaluation_runs
-                    (run_id, suite_id, suite_name, aggregate_score, payload,
-                     created_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                    (run_id, suite_id, suite_name, workspace_id, aggregate_score,
+                     payload, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (run_id) DO UPDATE SET
                     suite_id = EXCLUDED.suite_id,
                     suite_name = EXCLUDED.suite_name,
+                    workspace_id = EXCLUDED.workspace_id,
                     aggregate_score = EXCLUDED.aggregate_score,
                     payload = EXCLUDED.payload
                 """,
                 run.run_id,
                 getattr(run, "suite_id", None),
                 getattr(run, "suite_name", None),
+                getattr(run, "workspace_id", None),
                 getattr(run, "aggregate_score", 0.0),
                 run.model_dump(mode="json"),
                 getattr(run, "created_at", None) or _utc_now(),
             )
         return run
 
-    async def get_evaluation_run(self, run_id: str) -> Any | None:
-        """Return an evaluation run by id, or None."""
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> Any | None:
+        """Return an evaluation run by id, tenant-scoped (AAEO-4).
+
+        When ``workspace_id`` is supplied, a run belonging to another workspace is
+        treated as not found (returns None) — closing the cross-tenant IDOR.
+        """
         from himmy.services.evaluation.models import EvaluationRun
 
         pool = self._require_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT payload FROM evaluation_runs WHERE run_id = $1", run_id
+        if workspace_id is None:
+            sql = "SELECT payload FROM evaluation_runs WHERE run_id = $1"
+            params: list[Any] = [run_id]
+        else:
+            sql = (
+                "SELECT payload FROM evaluation_runs "
+                "WHERE run_id = $1 AND workspace_id = $2"
             )
+            params = [run_id, workspace_id]
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(sql, *params)
         if row is None:
             return None
         return EvaluationRun.model_validate(row["payload"])
 
-    async def list_evaluation_runs(self, suite_id: str | None = None) -> list[Any]:
-        """List evaluation runs, optionally filtered by suite id."""
+    async def list_evaluation_runs(
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
+    ) -> list[Any]:
+        """List evaluation runs, optionally filtered by suite id and workspace (AAEO-4)."""
         from himmy.services.evaluation.models import EvaluationRun
 
         pool = self._require_pool()
-        if suite_id is None:
-            sql = "SELECT payload FROM evaluation_runs ORDER BY created_at ASC"
-            params: list[Any] = []
-        else:
-            sql = (
-                "SELECT payload FROM evaluation_runs WHERE suite_id = $1 "
-                "ORDER BY created_at ASC"
-            )
-            params = [suite_id]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if suite_id is not None:
+            params.append(suite_id)
+            clauses.append(f"suite_id = ${len(params)}")
+        if workspace_id is not None:
+            params.append(workspace_id)
+            clauses.append(f"workspace_id = ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT payload FROM evaluation_runs{where} ORDER BY created_at ASC"
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         return [EvaluationRun.model_validate(r["payload"]) for r in rows]
@@ -1560,13 +1596,21 @@ class PostgresStorageService:
         """Upsert an evaluation run keyed by ``run_id``."""
         return await self._evaluation_store.save_evaluation_run(run)
 
-    async def get_evaluation_run(self, run_id: str) -> Any | None:
-        """Return an evaluation run by id, or None."""
-        return await self._evaluation_store.get_evaluation_run(run_id)
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> Any | None:
+        """Return an evaluation run by id, tenant-scoped (AAEO-4)."""
+        return await self._evaluation_store.get_evaluation_run(
+            run_id, workspace_id=workspace_id
+        )
 
-    async def list_evaluation_runs(self, suite_id: str | None = None) -> list[Any]:
-        """List evaluation runs, optionally filtered by suite id."""
-        return await self._evaluation_store.list_evaluation_runs(suite_id)
+    async def list_evaluation_runs(
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
+    ) -> list[Any]:
+        """List evaluation runs, optionally filtered by suite id and workspace (AAEO-4)."""
+        return await self._evaluation_store.list_evaluation_runs(
+            suite_id, workspace_id=workspace_id
+        )
 
     # --------------------------------------------- memory + orchestration records
     async def save_memory(self, obj: MemoryObject) -> MemoryObject:

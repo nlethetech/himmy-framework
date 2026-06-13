@@ -187,15 +187,21 @@ class StorageService:
         """Upsert an evaluation run keyed by ``run_id``."""
         return await self._evaluation_store.save_evaluation_run(run)
 
-    async def get_evaluation_run(self, run_id: str) -> EvaluationRun | None:
-        """Return an evaluation run by id, or None."""
-        return await self._evaluation_store.get_evaluation_run(run_id)
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> EvaluationRun | None:
+        """Return an evaluation run by id, tenant-scoped (AAEO-4)."""
+        return await self._evaluation_store.get_evaluation_run(
+            run_id, workspace_id=workspace_id
+        )
 
     async def list_evaluation_runs(
-        self, suite_id: str | None = None
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
     ) -> list[EvaluationRun]:
-        """List evaluation runs, optionally filtered by suite id."""
-        return await self._evaluation_store.list_evaluation_runs(suite_id)
+        """List evaluation runs, optionally filtered by suite id and workspace (AAEO-4)."""
+        return await self._evaluation_store.list_evaluation_runs(
+            suite_id, workspace_id=workspace_id
+        )
 
     # --------------------------------------------- memory + orchestration records
     async def save_memory(self, obj: MemoryObject) -> MemoryObject:

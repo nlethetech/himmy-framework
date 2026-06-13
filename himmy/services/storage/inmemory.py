@@ -12,7 +12,7 @@ protocols in :mod:`himmy.services.storage.protocols`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from himmy.core.events import RunEvent
 from himmy.core.ids import utc_now_iso
@@ -266,18 +266,36 @@ class InMemoryEvaluationStore:
         self._evaluation_runs[run.run_id] = run
         return run
 
-    async def get_evaluation_run(self, run_id: str) -> EvaluationRun | None:
-        """Return an evaluation run by id, or None."""
-        return self._evaluation_runs.get(run_id)
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> EvaluationRun | None:
+        """Return an evaluation run by id, tenant-scoped (AAEO-4).
+
+        When ``workspace_id`` is supplied, a run belonging to another workspace is
+        treated as not found (returns None).
+        """
+        run = self._evaluation_runs.get(run_id)
+        if run is None:
+            return None
+        if (
+            workspace_id is not None
+            and getattr(run, "workspace_id", None) != workspace_id
+        ):
+            return None
+        return cast("EvaluationRun", run)
 
     async def list_evaluation_runs(
-        self, suite_id: str | None = None
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
     ) -> list[EvaluationRun]:
-        """List evaluation runs, optionally filtered by suite id."""
+        """List evaluation runs, optionally filtered by suite id and workspace (AAEO-4)."""
         return [
             r
             for r in self._evaluation_runs.values()
-            if suite_id is None or getattr(r, "suite_id", None) == suite_id
+            if (suite_id is None or getattr(r, "suite_id", None) == suite_id)
+            and (
+                workspace_id is None
+                or getattr(r, "workspace_id", None) == workspace_id
+            )
         ]
 
 

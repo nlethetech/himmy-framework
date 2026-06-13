@@ -156,10 +156,12 @@ class EvaluationStore(Protocol):
 
     async def save_evaluation_run(self, run: EvaluationRun) -> EvaluationRun: ...
 
-    async def get_evaluation_run(self, run_id: str) -> EvaluationRun | None: ...
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> EvaluationRun | None: ...
 
     async def list_evaluation_runs(
-        self, suite_id: str | None = None
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
     ) -> list[EvaluationRun]: ...
 
 

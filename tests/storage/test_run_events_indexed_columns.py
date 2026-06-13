@@ -39,7 +39,9 @@ def _indexes(db: Path, table: str) -> set[str]:
 def test_fresh_db_is_v2_with_indexed_columns(tmp_path: Path) -> None:
     db = tmp_path / "s.db"
     svc = SqliteStorageService(str(db))
-    assert svc.schema_version == SQLITE_SCHEMA_VERSION == 2
+    # A fresh db lays down every migration and stamps the highest version (v2 added
+    # the run_events indexed columns; later migrations only raise the stamp).
+    assert svc.schema_version == SQLITE_SCHEMA_VERSION >= 2
 
     assert {"event_type", "tool_name"} <= _cols(db, "run_events")
     idx = _indexes(db, "run_events")
@@ -107,9 +109,10 @@ def test_legacy_v1_db_upgrades_and_backfills(tmp_path: Path) -> None:
     raw.close()
     assert "event_type" not in _cols(db, "run_events")  # truly a v1 shape
 
-    # Opening with the service applies migration v2 (ALTER + index + backfill).
+    # Opening with the service applies migration v2 (ALTER + index + backfill) and
+    # every later migration, stamping the current highest version.
     svc = SqliteStorageService(str(db))
-    assert svc.schema_version == 2
+    assert svc.schema_version == SQLITE_SCHEMA_VERSION >= 2
 
     raw = sqlite3.connect(db)
     try:

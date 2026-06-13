@@ -119,11 +119,14 @@ def test_concurrent_migrate_applies_each_migration_once() -> None:
 
         results = await asyncio.gather(first.migrate(), second.migrate())
 
-        # Exactly one runner applied the base schema; the loser re-read
+        # Exactly one runner applied every pending migration; the loser re-read
         # schema_migrations under the lock and found nothing left to do.
-        assert sorted(results, key=len) == [[], [1]]
+        all_versions = [version for version, _name, _stmts in STORAGE_MIGRATIONS]
+        assert sorted(results, key=len) == [[], all_versions]
         assert db.applied_statements.count(STORAGE_MIGRATIONS[0][2][0]) == 1
-        assert db.migrations == {1: "base_schema"}
+        assert db.migrations == {
+            version: name for version, name, _stmts in STORAGE_MIGRATIONS
+        }
         # Both runners locked and unlocked; nothing is left held.
         assert db.lock_acquires == 2
         assert db.lock_releases == 2
@@ -137,7 +140,7 @@ def test_migrate_fast_path_locks_and_unlocks_once() -> None:
 
     async def scenario() -> None:
         db = _FakeDatabase()
-        db.migrations = {1: "base_schema"}
+        db.migrations = {version: name for version, name, _stmts in STORAGE_MIGRATIONS}
         storage = PostgresStorageService(pool=_FakePool(db))
 
         assert await storage.migrate() == []

@@ -100,8 +100,18 @@ class EvaluationService:
         *,
         suite: EvaluationSuite,
         actual_outputs: dict[str, Any],
+        workspace_id: str | None = None,
+        actor: dict[str, Any] | None = None,
     ) -> EvaluationRun:
-        """Score ``suite`` against ``actual_outputs`` (keyed by ``case_id``)."""
+        """Score ``suite`` against ``actual_outputs`` (keyed by ``case_id``).
+
+        ``workspace_id`` (when supplied) stamps the run with its owning tenant so
+        the persisted row — and every later read of it — is tenant-scoped (AAEO-4).
+        It is ``None`` on the offline/single-tenant path, preserving legacy behavior.
+        ``actor`` (a compact, log-safe principal descriptor) is folded into the run
+        metadata for the audit spine when this run is created by an authenticated
+        caller.
+        """
         semaphore = asyncio.Semaphore(self._concurrency)
 
         async def _run_case(case: Any) -> EvaluationCaseResult:
@@ -132,6 +142,7 @@ class EvaluationService:
         run = EvaluationRun(
             suite_id=suite.suite_id,
             suite_name=suite.name,
+            workspace_id=workspace_id,
             aggregate_score=overall,
             case_results=case_results,
         )
@@ -140,6 +151,9 @@ class EvaluationService:
         ece = self._suite_ece(case_results)
         if ece is not None:
             run.metadata = {**(run.metadata or {}), "calibration_ece": ece}
+        # T1.1: stamp the creating actor into the run metadata for the audit spine.
+        if actor:
+            run.metadata = {**(run.metadata or {}), "actor": dict(actor)}
 
         if self._storage is not None:
             try:

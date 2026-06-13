@@ -193,7 +193,7 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
 #: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
 #: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
 #: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
-SQLITE_SCHEMA_VERSION = 2
+SQLITE_SCHEMA_VERSION = 3
 
 #: Ordered forward migrations applied after the base DDL, mirroring the Postgres
 #: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
@@ -228,6 +228,23 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "UPDATE run_events SET tool_name = "
             "json_extract(payload, '$.payload.tool_name') "
             "WHERE tool_name IS NULL AND json_valid(payload)",
+        ),
+    ),
+    # v3 (T1.1): promote workspace_id to an indexed column on evaluation_runs so
+    # GET /v1/evaluation/runs/{id} can be tenant-scoped (close the cross-tenant
+    # IDOR) and lists can filter by workspace with an index seek. New writes
+    # populate the column directly (save_evaluation_run); existing rows are
+    # backfilled best-effort from the stored JSON payload (top-level
+    # workspace_id; only for unencrypted databases where the column is plaintext).
+    (
+        3,
+        (
+            "ALTER TABLE evaluation_runs ADD COLUMN workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS evaluation_runs_workspace_id_idx "
+            "ON evaluation_runs (workspace_id)",
+            "UPDATE evaluation_runs SET workspace_id = "
+            "json_extract(payload, '$.workspace_id') "
+            "WHERE workspace_id IS NULL AND json_valid(payload)",
         ),
     ),
 )
@@ -916,48 +933,67 @@ class SqliteStorageService:
 
     # --------------------------------------------------------------- evaluation
     async def save_evaluation_run(self, run: EvaluationRun) -> EvaluationRun:
-        """Upsert an evaluation run keyed by ``run_id``."""
+        """Upsert an evaluation run keyed by ``run_id`` (stamping its workspace)."""
         await asyncio.to_thread(
             self._write,
-            "INSERT INTO evaluation_runs (run_id, suite_id, payload, created_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET "
-            "suite_id = excluded.suite_id, payload = excluded.payload",
+            "INSERT INTO evaluation_runs "
+            "(run_id, suite_id, workspace_id, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET "
+            "suite_id = excluded.suite_id, "
+            "workspace_id = excluded.workspace_id, payload = excluded.payload",
             (
                 run.run_id,
                 getattr(run, "suite_id", None),
+                getattr(run, "workspace_id", None),
                 self._dump(run),
                 str(getattr(run, "created_at", None) or utc_now_iso()),
             ),
         )
         return run
 
-    async def get_evaluation_run(self, run_id: str) -> EvaluationRun | None:
-        """Return an evaluation run by id, or None."""
+    async def get_evaluation_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> EvaluationRun | None:
+        """Return an evaluation run by id, tenant-scoped (AAEO-4).
+
+        When ``workspace_id`` is supplied, a run belonging to another workspace is
+        treated as not found (returns None) — closing the cross-tenant IDOR.
+        """
         from himmy.services.evaluation.models import EvaluationRun
 
-        row = await asyncio.to_thread(
-            self._fetchone,
-            "SELECT payload FROM evaluation_runs WHERE run_id = ?",
-            (run_id,),
-        )
+        if workspace_id is None:
+            sql = "SELECT payload FROM evaluation_runs WHERE run_id = ?"
+            params: tuple[Any, ...] = (run_id,)
+        else:
+            sql = (
+                "SELECT payload FROM evaluation_runs "
+                "WHERE run_id = ? AND workspace_id = ?"
+            )
+            params = (run_id, workspace_id)
+        row = await asyncio.to_thread(self._fetchone, sql, params)
         return EvaluationRun.model_validate(json.loads(row["payload"])) if row else None
 
     async def list_evaluation_runs(
-        self, suite_id: str | None = None
+        self, suite_id: str | None = None, *, workspace_id: str | None = None
     ) -> list[EvaluationRun]:
-        """List evaluation runs, optionally filtered by suite id."""
+        """List evaluation runs, optionally filtered by suite id and workspace (AAEO-4)."""
         from himmy.services.evaluation.models import EvaluationRun
 
-        if suite_id is None:
-            sql = "SELECT payload FROM evaluation_runs ORDER BY created_at ASC"
-            params: tuple[Any, ...] = ()
-        else:
-            sql = (
-                "SELECT payload FROM evaluation_runs WHERE suite_id = ? "
-                "ORDER BY created_at ASC"
-            )
-            params = (suite_id,)
-        rows = await asyncio.to_thread(self._fetchall, sql, params)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if suite_id is not None:
+            clauses.append("suite_id = ?")
+            params.append(suite_id)
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            params.append(workspace_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = await asyncio.to_thread(
+            self._fetchall,
+            # clauses are constant column literals; values are bound params.
+            f"SELECT payload FROM evaluation_runs{where} ORDER BY created_at ASC",  # noqa: S608
+            tuple(params),
+        )
         return [EvaluationRun.model_validate(json.loads(r["payload"])) for r in rows]
 
     # --------------------------------------------- memory + orchestration records

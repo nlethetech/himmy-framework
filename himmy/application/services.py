@@ -960,7 +960,7 @@ class DashboardQueryService:
         for rec in recs:
             rec_counts[rec.status.value] = rec_counts.get(rec.status.value, 0) + 1
 
-        evaluation = await self._evaluation_summary()
+        evaluation = await self._evaluation_summary(workspace_id=workspace_id)
 
         return {
             "subject_id": subject_id,
@@ -981,15 +981,30 @@ class DashboardQueryService:
             "evaluation": evaluation,
         }
 
-    async def _evaluation_summary(self) -> dict[str, Any]:
-        """Fold the latest evaluation run's aggregate into the dashboard (AAEO-15)."""
+    async def _evaluation_summary(
+        self, *, workspace_id: str | None = None
+    ) -> dict[str, Any]:
+        """Fold the latest evaluation run's aggregate into the dashboard (AAEO-15).
+
+        Scoped to ``workspace_id`` (AAEO-4) so the tile never leaks ANOTHER tenant's
+        evaluation runs. The same inclusive rule the context-field tile uses applies:
+        a run stamped with a *different* workspace is excluded, but a legacy/offline
+        run with no stamped workspace stays visible (it belongs to no tenant). The
+        strict-equality filter lives on the GET-by-id IDOR path, not this overview.
+        """
         lister = getattr(self._storage, "list_evaluation_runs", None)
         if lister is None:
             return {"total": 0, "latest_aggregate": None}
         try:
-            runs = await lister()
+            runs = list(await lister())
         except Exception:  # pragma: no cover - eval persistence optional
             return {"total": 0, "latest_aggregate": None}
+        if workspace_id is not None:
+            runs = [
+                r
+                for r in runs
+                if getattr(r, "workspace_id", None) in (None, workspace_id)
+            ]
         if not runs:
             return {"total": 0, "latest_aggregate": None}
         latest = max(runs, key=lambda r: getattr(r, "created_at", "") or "")
