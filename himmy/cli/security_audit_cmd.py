@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from himmy.cli.ui import styles
@@ -49,30 +48,34 @@ def _eprint(*args: Any) -> None:
 
 
 def _spine_db() -> str:
-    """Path to the durable CLI security spine (``.himmy/spine.db``), dir created.
+    """Path to the ONE canonical durable spine (``.himmy/spine.db``), dir created.
 
-    Mirrors :func:`himmy.cli.consent._consent_db`: a per-project on-disk registry so
-    security events persist across CLI invocations (a deny recorded by ``himmy run``
-    is visible to a later ``himmy seclog``).
+    Resolved by :func:`himmy.config.project.spine_db_path` — the single decision point
+    (``HIMMY_SPINE_PATH`` override + project-root resolution) that the server and Studio
+    also resolve through :class:`~himmy.entities.spine_factory.SpineFactory`. That is what
+    lets a deny recorded by ``himmy run`` and a run's provenance projected by the server
+    land in the SAME on-disk database a later ``himmy seclog`` reads (T2.1 coherence).
     """
-    path = Path(".himmy")
-    path.mkdir(exist_ok=True)
-    return str(path / "spine.db")
+    from himmy.config.project import spine_db_path
+
+    return spine_db_path()
 
 
 def cli_security_log() -> SecurityAuditLog:
-    """A :class:`SecurityAuditLog` over the durable CLI spine (``.himmy/spine.db``).
+    """A :class:`SecurityAuditLog` over the ONE canonical durable spine (T2.1).
 
     The single durable security log the CLI both WRITES (at RBAC deny / approval
-    decision points) and READS (``himmy seclog`` / ``/seclog``). Built over the on-disk
-    :class:`SqliteEntityRegistry`, which satisfies :class:`EntityRegistryProtocol` —
-    the structural surface :class:`SecurityAuditLog` accepts — so the durable spine drops
-    in with no cast (the registry Protocol that closes the old concrete-vs-Sqlite gap).
+    decision points) and READS (``himmy seclog`` / ``/seclog``). The registry is resolved
+    through :class:`~himmy.entities.spine_factory.SpineFactory` (``for_cli`` → the durable
+    on-disk :class:`SqliteEntityRegistry` at the canonical ``.himmy/spine.db``), which
+    satisfies :class:`EntityRegistryProtocol` — the structural surface
+    :class:`SecurityAuditLog` accepts — so the durable spine drops in with no cast and the
+    CLI shares ONE spine with the server (the registry Protocol closes the old gap).
     """
-    from himmy.entities.sqlite_registry import SqliteEntityRegistry
+    from himmy.entities.spine_factory import SpineFactory
     from himmy.services.audit.log import SecurityAuditLog
 
-    return SecurityAuditLog(SqliteEntityRegistry(_spine_db()))
+    return SecurityAuditLog(SpineFactory.for_cli())
 
 
 def record_security_event(

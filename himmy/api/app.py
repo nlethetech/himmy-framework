@@ -212,6 +212,7 @@ def _build_lifespan(
         # durable build fails we keep the in-memory container running (degraded but up).
         active = container
         built_durable = False
+        rebuilt_for_spine = False
         if upgrade_to_durable and _wants_durable_store():
             try:
                 active = await ApiContainer.build_default_async()
@@ -222,6 +223,31 @@ def _build_lifespan(
                 logger.warning(
                     "durable storage requested but could not be wired; "
                     "falling back to in-memory storage",
+                    exc_info=True,
+                )
+                active = container
+        elif upgrade_to_durable:
+            # BUILD-ORDER trap (T2.1 reviewer must_fix): ``build_default`` ran BEFORE the
+            # server-context flag was set above, so the container resolved its spine on the
+            # CLI path. ``SpineFactory.for_cli`` is already durable (the canonical
+            # ``.himmy/spine.db``), so the common zero-DSN case is correct at construction;
+            # but if ``HIMMY_SPINE_DATABASE_URL`` is set the SERVER spine is Postgres, which
+            # is ONLY resolved on the server path — the construction-time spine would be the
+            # wrong (SQLite) backend. So when we are NOT building a durable container, ALWAYS
+            # rebuild the in-memory default container under the now-active server context:
+            # this re-resolves the spine through ``SpineFactory.for_context`` (server) while
+            # keeping the in-memory run store the zero-config server expects. The
+            # construction-time run store is empty (no request served yet), so discarding it
+            # is safe, and a run's lineage now survives a restart on the durable spine.
+            try:
+                rebuilt = ApiContainer.build_default()
+                _rebind_container(app, rebuilt)
+                active = rebuilt
+                rebuilt_for_spine = True
+                logger.info("durable spine wired for the zero-DSN server entrypoint")
+            except Exception:  # pragma: no cover - defensive: stay up on spine failure
+                logger.warning(
+                    "durable spine rebind failed; serving the construction-time spine",
                     exc_info=True,
                 )
                 active = container
@@ -261,8 +287,10 @@ def _build_lifespan(
                 await active.aclose()
             except Exception:  # pragma: no cover - shutdown best-effort
                 pass
-            # Also close the original in-memory container if we swapped it out.
-            if built_durable and active is not container:
+            # Also close the original container if we swapped it out (for a durable
+            # store OR a durable-spine rebind) so its construction-time spine/store
+            # handle is released.
+            if (built_durable or rebuilt_for_spine) and active is not container:
                 try:
                     await container.aclose()
                 except Exception:  # pragma: no cover - shutdown best-effort

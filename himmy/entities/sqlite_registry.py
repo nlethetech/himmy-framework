@@ -69,21 +69,56 @@ _LINK_COLS = "link_id, from_record_id, to_record_id, relation, metadata, created
 class SqliteEntityRegistry:
     """A synchronous, durable SQLite-backed registry mirroring ``EntityRegistry``."""
 
-    def __init__(self, path: str = ":memory:") -> None:
+    def __init__(self, path: str = ":memory:", *, register_buffer: int = 1) -> None:
         """Open (or create) the SQLite database at ``path`` (``:memory:`` default).
 
         The connection is opened via :func:`connect_hardened` (WAL + busy timeout +
         ``synchronous=NORMAL``) so concurrent connections coordinate instead of
         raising ``database is locked`` immediately. A process-level write lock
         serialises writers sharing this connection across threads.
+
+        ``register_buffer`` (default ``1`` = commit every :meth:`register`) trades a
+        little durability for throughput on a write-heavy hot path: a multi-tool agent
+        run fires one :meth:`register` per ``RunEvent``, and committing each one is the
+        dominant cost (measured ~50µs/event vs ~12µs/event batched). When set >1,
+        :meth:`register` of a NEW record defers its commit and only flushes once
+        ``register_buffer`` rows have accumulated — or sooner, whenever a read
+        (:meth:`get`/:meth:`query`/…), a versioned write (:meth:`new_version`), a
+        :meth:`link`, an explicit :meth:`flush`, or :meth:`close` needs the pending rows
+        on disk. Content-addressing is unchanged (the records and their ``content_hash``
+        are byte-identical regardless of when the commit lands), so an in-memory vs SQLite
+        bundle stays parity-identical; the only window is that a hard crash can lose the
+        not-yet-flushed tail of the audit trail. Default ``1`` keeps the full per-event
+        durability the spine contract assumes.
         """
         self._conn = connect_hardened(path)
         self._write_lock = threading.Lock()
+        self._register_buffer = max(1, int(register_buffer))
+        self._pending = 0
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
+    def _commit_locked(self) -> None:
+        """Commit + clear the deferred-register counter (caller holds the write lock)."""
+        self._conn.commit()
+        self._pending = 0
+
+    def flush(self) -> None:
+        """Commit any buffered :meth:`register` writes (no-op when nothing is pending).
+
+        Idempotent; safe to call on a non-buffered registry. Reads and versioned writes
+        call it implicitly, so a caller only needs it to force durability at a checkpoint.
+        """
+        with self._write_lock:
+            if self._pending:
+                self._commit_locked()
+
     def close(self) -> None:
-        """Close the underlying connection (idempotent)."""
+        """Flush any buffered writes, then close the connection (idempotent)."""
+        try:
+            self.flush()
+        except Exception:  # pragma: no cover - best-effort flush on teardown
+            pass
         self._conn.close()
 
     def __enter__(self) -> SqliteEntityRegistry:
@@ -138,13 +173,22 @@ class SqliteEntityRegistry:
         return record
 
     def register(self, record: EntityRecord) -> EntityRecord:
-        """Register a record; idempotent on identical content, raises on collision."""
+        """Register a record; idempotent on identical content, raises on collision.
+
+        When ``register_buffer`` > 1 the commit is deferred (see :meth:`__init__`): the
+        row is written but the transaction only commits once the buffer fills, so a
+        write-heavy run amortises commit cost. A rollback on error still discards the
+        whole pending batch, which is acceptable for a best-effort audit sink.
+        """
         with self._write_lock:
             try:
                 stored = self._insert_record(record)
-                self._conn.commit()
+                self._pending += 1
+                if self._pending >= self._register_buffer:
+                    self._commit_locked()
             except BaseException:
                 self._conn.rollback()
+                self._pending = 0
                 raise
         return stored
 
@@ -165,6 +209,10 @@ class SqliteEntityRegistry:
         file) instead of silently losing an update.
         """
         with self._write_lock:
+            # Flush any deferred register writes first so the IMMEDIATE txn below opens
+            # cleanly (autocommit) and reads the freshest version chain.
+            if self._pending:
+                self._commit_locked()
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 latest = self.get_latest(stable_id)
@@ -218,7 +266,9 @@ class SqliteEntityRegistry:
                     link.created_at,
                 ),
             )
-            self._conn.commit()
+            # This commit also lands any deferred register writes batched on the shared
+            # connection — keep the pending counter honest so flush() stays a no-op.
+            self._commit_locked()
         return link
 
     # -------------------------------------------------------------------- reads

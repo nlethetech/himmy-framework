@@ -197,14 +197,24 @@ class ApiContainer:
             RecommendationAppService,
             RunAppService,
         )
-        from himmy.entities.registry import EntityRegistry
+        from himmy.entities.spine_factory import SpineFactory
         from himmy.runtime.single_agent import SingleAgentRuntime
         from himmy.services.context.service import ContextService
         from himmy.services.evaluation.service import EvaluationService
         from himmy.services.prompts.manager import PromptManager
         from himmy.services.prompts.mapper import ContextPromptMapper
 
-        registry = EntityRegistry()
+        # T2.1: the spine is the DURABLE shared entity registry — no longer a bare
+        # in-memory registry that evaporates on restart and is invisible to the
+        # CLI's ``himmy seclog``. ``SpineFactory.for_context`` resolves the ONE
+        # canonical ``.himmy/spine.db`` (or the opt-in Postgres spine) so a run's
+        # provenance/lineage/security events projected here are the same on-disk database
+        # the CLI reads. ``build_default`` runs BEFORE the app lifespan sets server
+        # context, so this honours whatever context is active at construction; the
+        # lifespan ALWAYS rebinds to the server spine before serving a request (so a
+        # zero-DSN server still gets the durable spine — the build-order trap is closed in
+        # ``app._build_lifespan``).
+        registry = SpineFactory.for_context()
         inference = cls._build_inference()
 
         # WS4.6: the spine registry and the storage facade the services/runtime see. The
@@ -386,11 +396,23 @@ class ApiContainer:
         return InferenceService(manager)
 
     async def aclose(self) -> None:
-        """Close any resources the container owns (e.g. a Postgres pool)."""
+        """Close any resources the container owns (storage pool + durable spine).
+
+        The durable spine (SQLite or the opt-in Postgres facade) owns a file handle /
+        connection pool; flushing + closing it here releases the handle and persists any
+        buffered audit writes. Its ``close`` is synchronous on every backend, so it is run
+        without awaiting (the SQLite ``flush`` and the facade's loop teardown are sync).
+        """
         closer = getattr(self.storage, "close", None)
         if closer is not None:
             try:
                 await closer()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+        spine_close = getattr(self.entity_registry, "close", None)
+        if spine_close is not None:
+            try:
+                spine_close()
             except Exception:  # pragma: no cover - best-effort teardown
                 pass
 

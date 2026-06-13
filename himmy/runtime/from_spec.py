@@ -270,9 +270,17 @@ def build_runtime_for_spec(
     # memory — so a fact remembered/recalled mid-run lands on the SAME EntityRecord
     # registry as the run's lineage, and MEMORY_* events flow to the durable
     # ``storage`` event sink (run_events). P0-C turns this dormant projection on.
-    from himmy.entities.registry import EntityRegistry
+    #
+    # T2.1: resolve the spine through ``SpineFactory.for_context`` so a run's lineage +
+    # security events land on the ONE canonical durable ``.himmy/spine.db`` — the same
+    # database ``himmy seclog`` reads and the server projects into — instead of a bare
+    # in-memory registry that evaporated when the run finished. ``server`` mirrors the same
+    # storage decision (explicit ``durable_defaults`` beats the inferred context flag), so
+    # a server-wired per-spec agent uses the server spine and a one-shot CLI run still uses
+    # the canonical CLI spine (also durable — provenance must outlive the process).
+    from himmy.entities.spine_factory import SpineFactory
 
-    entity_registry = EntityRegistry()
+    entity_registry = SpineFactory.for_context(server=server)
     overrides["registry"] = entity_registry
 
     if spec.memory:

@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 from typing import Any
 
 from himmy.services.governance.consent import (
@@ -37,10 +36,18 @@ def _eprint(*args: Any) -> None:
 
 
 def _consent_db() -> str:
-    """Path to the durable consent registry (``.himmy/consent.db``), dir created."""
-    path = Path(".himmy")
-    path.mkdir(exist_ok=True)
-    return str(path / "consent.db")
+    """Path to the durable consent registry (``.himmy/consent.db``), dir created.
+
+    Resolved against the SAME project-root ``.himmy/`` directory the canonical spine uses
+    (:func:`himmy.config.project.himmy_dir`), so the consent ledger and the security spine
+    co-locate under one project state dir. The consent ledger keeps its OWN ``consent.db``
+    file (deliberately isolated from the audit/lineage ``spine.db`` — nothing else reads
+    it), but both now agree on WHERE that directory is regardless of which subdirectory the
+    CLI is invoked from.
+    """
+    from himmy.config.project import himmy_dir
+
+    return str(himmy_dir() / "consent.db")
 
 
 def _policy() -> ConsentPolicy:

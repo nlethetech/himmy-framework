@@ -144,6 +144,9 @@ def test_cli_security_log_is_durable_across_calls(
 ) -> None:
     """A SecurityEvent recorded via one cli_security_log() is visible to a fresh one
     (the spine is the on-disk .himmy/spine.db, not a per-call in-memory registry)."""
+    # Exercise the cwd-relative default path explicitly (the global test fixture pins
+    # HIMMY_SPINE_PATH for isolation; this test verifies the unset/default resolution).
+    monkeypatch.delenv("HIMMY_SPINE_PATH", raising=False)
     monkeypatch.chdir(tmp_path)
     seclog_cmd.record_security_event(
         event_type="authz_denied",
