@@ -158,6 +158,20 @@ def _now() -> str:
     return utc_now_iso()
 
 
+def _is_resume_claim_loss(exc: BaseException) -> bool:
+    """True when ``exc`` is the exactly-once claim loss from a member resume.
+
+    ``resume_agent_loop`` raises ``HimmyError('checkpoint ... already resolved ...')``
+    when the atomic claim is lost (a double/concurrent approve, or a crash-retry the
+    winner already finished). For an ORCHESTRATION resume this propagates up through
+    ``run_orchestration``, so it must be recognized as a clean NO-OP rather than a
+    failure — exactly as the single-agent resume path treats it.
+    """
+    from himmy.core.errors import HimmyError
+
+    return isinstance(exc, HimmyError) and "already resolved" in str(exc)
+
+
 def _paginate(
     items: list[Any],
     *,
@@ -593,6 +607,7 @@ class RunAppService:
         checkpoint_store: Any = None,
         agent_resolver: Callable[..., Any] | None = None,
         conversation_sink: Callable[..., Any] | None = None,
+        graph_checkpoint_store_provider: Callable[[], Any] | None = None,
     ) -> None:
         """Wire the runtime, store, optional registry, and recommendation service.
 
@@ -643,6 +658,11 @@ class RunAppService:
         self._checkpoint_store = checkpoint_store
         self._agent_resolver = agent_resolver
         self._conversation_sink = conversation_sink
+        # HITL orchestration resume needs the SAME durable graph checkpoint store the
+        # team/workflow run paused into. The surface provides it lazily (a getter, so a
+        # path/env change is honoured); ``None`` means orchestration HITL resume falls
+        # back to an in-memory store (offline/test default — the run paused in-process).
+        self._graph_checkpoint_store_provider = graph_checkpoint_store_provider
         # Keep strong refs to background tasks so they are not GC'd mid-flight and
         # so they can be drained/cancelled on shutdown (AAEO-1).
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -1670,6 +1690,13 @@ class RunAppService:
         if self._checkpoint_store is None:  # pragma: no cover - guarded at create
             raise HitlNotSupportedError("no checkpoint store wired; cannot resume")
 
+        # HITL ORCHESTRATION pause (a team/workflow member paused): a graph/workflow run
+        # carries a member-agent-id LIST (not a single ``agent_id``) and resumes via the
+        # durable graph splice, not the single-agent resume. Dispatch early so the
+        # single-agent path below never tries to read a non-existent single agent id.
+        if (run.metadata or {}).get("hitl_kind") == "orchestration":
+            return await self._resume_orchestration(run, approved=approved, actor=actor)
+
         checkpoint_id = (run.metadata or {}).get("checkpoint_id")
         if not checkpoint_id:  # pragma: no cover - an AWAITING run always has one
             raise RunNotApprovableError(run_id, status="no checkpoint")
@@ -1812,6 +1839,188 @@ class RunAppService:
             await self._apply_loop_outcome(
                 run, loop, task=task, llm_config=None, agent_def=agent_def
             )
+
+    async def _resume_orchestration(
+        self, run: RunRecord, *, approved: bool, actor: str
+    ) -> RunRecord:
+        """Approve/reject a HITL-paused TEAM/WORKFLOW run; resume the graph (WI-6).
+
+        Flips AWAITING_APPROVAL -> RUNNING up front (the inbox gate) and launches the
+        durable graph resume on a tracked background task. The authoritative exactly-once
+        gate stays the MEMBER checkpoint ``claim()`` inside ``resume_agent_loop`` — a
+        double-approve loses the claim and is a clean no-op. Returns the RUNNING record.
+        """
+        graph_resume_id = (run.metadata or {}).get("orchestration_checkpoint_id")
+        if not graph_resume_id:  # pragma: no cover - an orchestration pause always has one
+            raise RunNotApprovableError(run.run_id, status="no orchestration checkpoint")
+        member_agent_ids = list((run.metadata or {}).get("member_agent_ids") or [])
+        if not member_agent_ids or self._agent_resolver is None:
+            raise RunNotApprovableError(run.run_id, status="no resolvable members")
+
+        run.status = RunStatus.RUNNING
+        run.updated_at = _now()
+        await self._storage.save_run(run)
+
+        bg = asyncio.create_task(
+            self._resume_orchestration_in_background(
+                run.run_id,
+                approved=approved,
+                actor=actor,
+                workspace_id=run.workspace_id,
+                graph_resume_id=graph_resume_id,
+                member_agent_ids=member_agent_ids,
+            )
+        )
+        self._tasks.add(bg)
+        bg.add_done_callback(self._tasks.discard)
+        return run
+
+    def _resolve_graph_checkpoint_store(self) -> Any:
+        """The durable graph checkpoint store to resume an orchestration from.
+
+        Uses the surface-provided getter (file-backed in a server, so the SAME db the run
+        paused into is reopened) and falls back to an in-memory store offline/in tests.
+        """
+        if self._graph_checkpoint_store_provider is not None:
+            return self._graph_checkpoint_store_provider()
+        from himmy.runtime.checkpoint import InMemoryGraphCheckpointStore
+
+        return InMemoryGraphCheckpointStore()
+
+    async def _resume_orchestration_in_background(
+        self,
+        run_id: str,
+        *,
+        approved: bool,
+        actor: str,
+        workspace_id: str,
+        graph_resume_id: str,
+        member_agent_ids: list[str],
+    ) -> None:
+        """Background worker: re-resolve members + drive the durable graph resume (WI-6).
+
+        Holds the per-workspace concurrency semaphore for the duration, re-resolves and
+        (via ``run_orchestration``) re-sanitizes the members under the run's operator
+        status — so a revoked opt-in fails closed — rebuilds the graph member runtime with
+        BOTH the member and graph checkpoint stores wired, and resumes the graph. The
+        outcome is projected exactly like the execute path, INCLUDING pausing again at a
+        later member. A claim loser (the member checkpoint already resolved) is a clean
+        no-op — the run is left at the winner's terminal state.
+        """
+        from himmy.application.orchestration_runner import run_orchestration
+
+        semaphore = self._workspace_semaphore(workspace_id)
+        async with semaphore:
+            run = await self._storage.get_run(run_id)
+            if run is None:  # pragma: no cover - defensive
+                return
+            operator_provisioned = bool(
+                (run.metadata or {}).get("operator_provisioned", False)
+            )
+            kind = (run.metadata or {}).get("orchestration_kind", "graph")
+            resource_kind = (run.metadata or {}).get("orchestration", "workflow")
+
+            members: list[AgentDefRecord] = []
+            for agent_id in member_agent_ids:
+                rec = await _maybe_await(
+                    self._agent_resolver(agent_id, workspace_id=workspace_id)
+                    if self._agent_resolver is not None
+                    else None
+                )
+                if rec is None:
+                    run.status = RunStatus.FAILED
+                    run.error = f"resume failed: member agent {agent_id} removed"
+                    run.updated_at = _now()
+                    await self._storage.save_run(run)
+                    return
+                members.append(rec)
+
+            try:
+                outcome = await asyncio.wait_for(
+                    run_orchestration(
+                        kind=kind,
+                        members=members,
+                        prompt="",
+                        resource_kind=resource_kind,
+                        storage=self._storage,
+                        shared_inference=getattr(
+                            self._runtime, "inference_service", None
+                        ),
+                        operator_provisioned=operator_provisioned,
+                        graph_checkpoint_store=self._resolve_graph_checkpoint_store(),
+                        graph_resume_id=graph_resume_id,
+                        checkpoint_store=self._checkpoint_store,
+                        approve_member=approved,
+                        actor=actor,
+                    ),
+                    timeout=self._run_timeout_seconds,
+                )
+            except TimeoutError:
+                run.status = RunStatus.FAILED
+                run.error = f"resume exceeded {self._run_timeout_seconds:.0f}s timeout"
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+            except asyncio.CancelledError:
+                run.status = RunStatus.FAILED
+                run.error = "resume cancelled"
+                run.updated_at = _now()
+                try:
+                    await self._storage.save_run(run)
+                except Exception:  # pragma: no cover - best-effort during cancel
+                    pass
+                raise
+            except Exception as exc:  # noqa: BLE001 - terminal failure transition
+                # A claim-loser raises HimmyError('already resolved') from the member
+                # resume — that is a clean NO-OP (the winner owns the terminal state),
+                # NOT a failure. Distinguish it so a double-approve never flips a
+                # SUCCEEDED run to FAILED.
+                if _is_resume_claim_loss(exc):
+                    logger.info(
+                        "orchestration resume of run %s was a no-op (%s)", run_id, exc
+                    )
+                    return
+                run.status = RunStatus.FAILED
+                run.error = str(exc)
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+
+            await self._apply_orchestration_outcome(run, outcome)
+
+    async def _apply_orchestration_outcome(
+        self, run: RunRecord, outcome: Any
+    ) -> None:
+        """Project a resumed orchestration outcome onto the run (shared with execute).
+
+        Pauses AGAIN at a later member (AWAITING_APPROVAL with restamped ids), or lands
+        terminal SUCCEEDED/FAILED — mirroring the initial execute-path projection.
+        """
+        run.thread_id = outcome.thread_id
+        run.output_text = outcome.output_text or None
+        run.metadata = {
+            **(run.metadata or {}),
+            "stopped_reason": outcome.stopped_reason,
+            "route": outcome.route,
+        }
+        if outcome.graph_checkpoint_id:
+            run.metadata["graph_checkpoint_id"] = outcome.graph_checkpoint_id
+        if outcome.awaiting_approval:
+            run.status = RunStatus.AWAITING_APPROVAL
+            run.metadata["checkpoint_id"] = outcome.member_checkpoint_id
+            run.metadata["orchestration_checkpoint_id"] = (
+                outcome.orchestration_checkpoint_id
+            )
+            run.metadata["awaiting_member"] = outcome.awaiting_member
+            run.metadata["hitl_kind"] = "orchestration"
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+        run.status = RunStatus.FAILED if outcome.failed else RunStatus.SUCCEEDED
+        if outcome.failed:
+            run.error = outcome.error or "orchestration failed"
+        run.updated_at = _now()
+        await self._storage.save_run(run)
 
     # --------------------------------------------------------------------- reads
     async def get_run(
@@ -2010,6 +2219,9 @@ class RunAppService:
             "orchestration_kind": kind,
             f"{resource_kind}_id": resource_id,
             "member_agent_ids": [m.agent_id for m in members],
+            # Persisted so a HITL resume re-sanitizes the members under the SAME operator
+            # status (a revoked opt-in between pause and resume then fails closed).
+            "operator_provisioned": bool(operator_provisioned),
         }
         if actor:
             metadata["actor"] = actor
@@ -2102,6 +2314,10 @@ class RunAppService:
                             operator_provisioned=operator_provisioned,
                             graph_checkpoint_store=graph_checkpoint_store,
                             graph_resume_id=graph_resume_id,
+                            # HITL: thread the surface-owned AgentCheckpoint store so a
+                            # graph/workflow member calling an approval-gated tool pauses
+                            # to a durable member checkpoint (None disables nested HITL).
+                            checkpoint_store=self._checkpoint_store,
                         ),
                         timeout=self._run_timeout_seconds,
                     )
@@ -2138,6 +2354,23 @@ class RunAppService:
                 }
                 if outcome.graph_checkpoint_id:
                     run.metadata["graph_checkpoint_id"] = outcome.graph_checkpoint_id
+                # HITL pause: a member called an approval-gated tool. Stamp the MEMBER
+                # checkpoint id under the ``checkpoint_id`` key so the unchanged
+                # pending-approvals path reads it, plus the orchestration (graph)
+                # checkpoint id + awaiting member + a hitl_kind discriminator so
+                # ``resume_run`` routes to the orchestration resume. STOP here — the
+                # sweeper skips AWAITING_APPROVAL, so the paused run is never reaped.
+                if outcome.awaiting_approval:
+                    run.status = RunStatus.AWAITING_APPROVAL
+                    run.metadata["checkpoint_id"] = outcome.member_checkpoint_id
+                    run.metadata["orchestration_checkpoint_id"] = (
+                        outcome.orchestration_checkpoint_id
+                    )
+                    run.metadata["awaiting_member"] = outcome.awaiting_member
+                    run.metadata["hitl_kind"] = "orchestration"
+                    run.updated_at = _now()
+                    await self._storage.save_run(run)
+                    return
                 run.status = (
                     RunStatus.FAILED if outcome.failed else RunStatus.SUCCEEDED
                 )

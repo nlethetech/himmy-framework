@@ -32,6 +32,9 @@ from himmy.orchestrators.state_graph import (
     GraphRecursionError,
     GraphRunResult,
     GraphStateSizeError,
+    MemberResumeOutcome,
+    NodeInterrupt,
+    ResumeMemberFn,
     StateGraph,
     add_reducer,
 )
@@ -78,5 +81,8 @@ __all__ = [
     "GraphError",
     "GraphRecursionError",
     "GraphStateSizeError",
+    "NodeInterrupt",
+    "MemberResumeOutcome",
+    "ResumeMemberFn",
     "add_reducer",
 ]

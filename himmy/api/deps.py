@@ -292,6 +292,9 @@ class ApiContainer:
             recommendation_app=recommendation_app,
             checkpoint_store=checkpoint_store,
             agent_resolver=agent_app.get_agent_def,
+            # HITL orchestration resume reopens the SAME durable graph checkpoint store the
+            # team/workflow run paused into (file-backed in a server, RAM offline).
+            graph_checkpoint_store_provider=cls._graph_checkpoint_store_provider,
         )
         # T2g: the /v1 thread (conversation) resource over the one ConversationStore.
         from himmy.application.services import ThreadAppService
@@ -413,6 +416,19 @@ class ApiContainer:
 
             return SqliteCheckpointStore(v1_approvals_db_path())
         return InMemoryCheckpointStore()
+
+    @staticmethod
+    def _graph_checkpoint_store_provider() -> Any:
+        """The durable graph checkpoint store an orchestration HITL resume reopens.
+
+        Delegates to the SAME path-keyed singleton the team/workflow run routers pass into
+        ``create_orchestration_run`` (``teams_store.get_graph_checkpoint_store``), so an
+        approval-resume reopens the exact db the run paused into (file-backed in a server,
+        in-RAM offline). Wired as a lazy getter so a path/env change is honoured.
+        """
+        from himmy.api.teams_store import get_graph_checkpoint_store
+
+        return get_graph_checkpoint_store()
 
     @staticmethod
     def _build_conversation_store() -> Any:

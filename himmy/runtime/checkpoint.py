@@ -217,7 +217,7 @@ GRAPH_FAILED = "failed"
 
 #: Current :class:`GraphCheckpoint` serialization format. Bump this (and add a
 #: step to ``_GRAPH_MIGRATIONS``) whenever a persisted field changes shape.
-GRAPH_CHECKPOINT_SCHEMA_VERSION = 1
+GRAPH_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 class GraphCheckpoint(BaseModel):
@@ -229,6 +229,14 @@ class GraphCheckpoint(BaseModel):
     the next superstep, the superstep counter, and the visit counts used by the
     loop guard. ``graph_name`` ties the checkpoint to the graph definition that
     must be re-supplied on resume (the topology itself is code, not serialized).
+
+    The two HITL-interrupt fields (v2) make an APPROVAL pause distinguishable from a
+    timeout/crash interrupt: when a node pauses on an approval-gated tool the run is
+    stamped ``interrupted`` AND ``paused_node`` / ``member_checkpoint_id`` are set, the
+    node is left in the frontier (not completed, not visit-bumped) so a resume re-enters
+    it. A bare timeout interrupt leaves both fields empty, so the orchestration resume
+    splice is gated on their presence and a pre-existing timeout-interrupted row routes
+    through the ordinary durable resume rather than an (impossible) approve.
     """
 
     schema_version: int = GRAPH_CHECKPOINT_SCHEMA_VERSION
@@ -240,6 +248,12 @@ class GraphCheckpoint(BaseModel):
     superstep: int = 0
     visit_counts: dict[str, int] = Field(default_factory=dict)
     completed_nodes: list[str] = Field(default_factory=list)
+    #: HITL pause (v2): the node that paused on an approval-gated tool. Empty for a
+    #: non-HITL interrupt (timeout/crash). Set ⇒ the orchestration resume splice runs.
+    paused_node: str = ""
+    #: HITL pause (v2): the :class:`AgentCheckpoint` id the paused member suspended on.
+    #: The orchestration resume re-claims THIS to drive the gated tool exactly-once.
+    member_checkpoint_id: str = ""
     error: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
@@ -250,10 +264,18 @@ def _migrate_graph_v0_to_v1(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _migrate_graph_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    """v1 -> v2: adds the HITL-interrupt fields (empty — no pause had occurred)."""
+    raw.setdefault("paused_node", "")
+    raw.setdefault("member_checkpoint_id", "")
+    return raw
+
+
 #: Stepwise upgraders keyed by the *from* version; each returns the raw dict at
 #: version ``from + 1``. Every historical format must have an unbroken chain here.
 _GRAPH_MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_graph_v0_to_v1,
+    1: _migrate_graph_v1_to_v2,
 }
 
 
