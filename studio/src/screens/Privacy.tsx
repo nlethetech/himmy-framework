@@ -9,9 +9,11 @@ import {
   exportAuditBundle,
   getPrivacyConsents,
   getPrivacySubjects,
+  getSeclog,
   verifyAuditBundle,
   type ConsentEntry,
   type PrivacySubject,
+  type SeclogEvent,
   type VerifyResult,
 } from "../lib/privacyApi";
 import "../styles/privacy.css";
@@ -51,6 +53,28 @@ export default function Privacy() {
   const [auditNote, setAuditNote] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // ---- security events (seclog) — mirrors `himmy seclog` -----------------
+  const [seclog, setSeclog] = useState<SeclogEvent[]>([]);
+  const [seclogTypes, setSeclogTypes] = useState<string[]>([]);
+  const [seclogType, setSeclogType] = useState(""); // "" = all event types
+  const [seclogError, setSeclogError] = useState<string | null>(null);
+
+  const loadSeclog = useCallback(async (type?: string) => {
+    setSeclogError(null);
+    try {
+      const res = await getSeclog({ limit: 100, type: type || undefined });
+      setSeclog(res.items);
+      // Keep the filter options stable from the unfiltered window the server returns.
+      setSeclogTypes((prev) =>
+        res.types.length ? res.types : prev,
+      );
+    } catch (e) {
+      setSeclogError(
+        e instanceof Error ? e.message : "could not load security events",
+      );
+    }
+  }, []);
+
   const load = useCallback(async (subject?: string) => {
     setLoadError(null);
     try {
@@ -71,6 +95,10 @@ export default function Privacy() {
   useEffect(() => {
     void load(filter);
   }, [load, filter]);
+
+  useEffect(() => {
+    void loadSeclog(seclogType);
+  }, [loadSeclog, seclogType]);
 
   const startErase = (s: PrivacySubject) => {
     setEraseTarget(s);
@@ -314,6 +342,65 @@ export default function Privacy() {
                 </span>
               </div>
             ))}
+        </section>
+
+        {/* ---- security events (seclog) ---------------------------------- */}
+        <section className="home-sec">
+          <div className="home-sec-head">
+            <span>Security events</span>
+            <span className="mono">{seclog.length || ""}</span>
+          </div>
+          {seclogTypes.length > 0 && (
+            <div className="priv-filter-row">
+              <PickMenu
+                value={seclogType}
+                groups={[
+                  {
+                    options: [
+                      { value: "", label: "All event types" },
+                      ...seclogTypes.map((t) => ({ value: t, label: t })),
+                    ],
+                  },
+                ]}
+                onChange={setSeclogType}
+                placeholder="All event types"
+                title="Filter the security log by event type"
+              />
+            </div>
+          )}
+          {seclogError ? (
+            <div className="priv-note priv-fail">
+              {seclogError} —{" "}
+              <button onClick={() => void loadSeclog(seclogType)}>retry</button>
+            </div>
+          ) : seclog.length === 0 ? (
+            <div className="priv-note">
+              {seclogType
+                ? `No ${seclogType} events recorded.`
+                : "No security events recorded — a clean trail. Denied tools, approvals, and authz decisions land here (same as `himmy seclog`)."}
+            </div>
+          ) : (
+            seclog.map((ev) => (
+              <div className="run-line" key={ev.event_id}>
+                <span className="run-line-prompt">
+                  {ev.action || ev.event_type}
+                  {ev.resource && (
+                    <span className="run-line-meta mono"> · {ev.resource}</span>
+                  )}
+                </span>
+                <span
+                  className={
+                    "priv-verdict" + (ev.outcome === "deny" ? " fail" : "")
+                  }
+                >
+                  {ev.outcome}
+                </span>
+                <span className="run-line-meta mono">
+                  {ev.actor} · {ev.event_type} · {when(ev.created_at) || "—"}
+                </span>
+              </div>
+            ))
+          )}
         </section>
       </div>
 

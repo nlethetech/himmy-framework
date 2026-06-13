@@ -3537,6 +3537,57 @@ mark.hl.hl-first {
   flex-wrap: wrap;
   gap: 5px;
 }
+.tools-shield {
+  filter: grayscale(0.2);
+}
+
+/* ---- Guardrail firings (read-only viewer) ------------------------------ */
+.guardrail-firings {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--sp-2);
+}
+.guardrail-firing {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: var(--fs-sm);
+}
+.guardrail-firing:hover {
+  text-decoration: none;
+  background: var(--hover, rgba(255, 255, 255, 0.02));
+}
+.guardrail-firing-shield {
+  opacity: 0.7;
+}
+.guardrail-firing-name {
+  font-weight: 600;
+  color: var(--gold, var(--text));
+}
+.guardrail-firing-action {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+.guardrail-firing-action.blocked {
+  color: var(--red);
+}
+.guardrail-firing-detail {
+  color: var(--text-muted);
+}
+.guardrail-firing-stage {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
+.guardrail-firing-meta {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+}
 
 /* ---- Brain ------------------------------------------------------------- */
 .brain-grid {
