@@ -25,10 +25,11 @@ Production hardening (see IMPROVEMENTS AAEO-1/3/4/6/8/16):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import time
-from collections.abc import Callable, Collection
+from collections.abc import AsyncIterator, Callable, Collection
 from typing import TYPE_CHECKING, Any, cast
 
 from himmy.application.models import RecommendationEnvelope
@@ -999,6 +1000,30 @@ class RunAppService:
     def workspace_outstanding(self, workspace_id: str) -> int:
         """Return the current count of in-flight runs for a workspace (introspection)."""
         return self._ws_outstanding.get(workspace_id, 0)
+
+    @contextlib.asynccontextmanager
+    async def workspace_run_slot(
+        self, workspace_id: str
+    ) -> AsyncIterator[None]:
+        """Reserve one workspace run-slot for a non-``RunRecord`` fan-out (T0.4).
+
+        The same per-workspace admission + concurrency gate that guards full runs, exposed
+        for fan-out work that is NOT a stored run — today the model-compare endpoint
+        (``POST /v1/models/compare``), which spawns N concurrent model calls per request.
+        One compare request counts as ONE outstanding slot (admission caps how many
+        concurrent compares a tenant may pin) and is executed under the per-workspace
+        execution semaphore, so a tenant's fan-outs cannot starve the shared loop/provider
+        quota of other tenants.
+
+        Raises :class:`WorkspaceRunQuotaExceeded` (mapped to HTTP 429) when the workspace is
+        already at its outstanding cap; releases the slot in ``finally`` even on error.
+        """
+        self._admit_workspace_run(workspace_id)
+        try:
+            async with self._workspace_semaphore(workspace_id):
+                yield
+        finally:
+            self._release_workspace_run(workspace_id)
 
     async def _execute_run(
         self,

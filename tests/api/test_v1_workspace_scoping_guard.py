@@ -72,6 +72,14 @@ _GLOBAL_NOT_TENANT_KEYED: dict[tuple[str, str], str] = {
     # workspace; read-only + RBAC-gated on connector:read, never echoes a secret.
     ("connectors", "list_connectors"): "process-global connector catalog; authz only",
     ("connectors", "get_connector"): "process-global connector catalog; authz only",
+    # the model catalog is a process-level infra fact (which providers/models this host
+    # can run): identical for every workspace; read-only + RBAC-gated on model:read,
+    # carries no secret material. (T3d)
+    ("models", "list_models"): "process-global model catalog; authz only",
+    # global diagnostics (doctor + storage/spine/scheduler health) is infra, not
+    # per-tenant: a per-tenant doctor is not meaningful; RBAC-gated on diagnostics:read,
+    # secrets redacted. (T3d)
+    ("diagnostics", "diagnostics"): "process-global infra health; authz only",
 }
 
 

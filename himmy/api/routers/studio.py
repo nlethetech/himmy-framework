@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -733,42 +733,15 @@ async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
 
 @router.get("/models")
 async def models() -> list[dict[str, Any]]:
-    """Available providers + their models, with any cached benchmark stats."""
-    import shutil
+    """Available providers + their models, with any cached benchmark stats.
 
-    from himmy.api import studio_bench
+    Delegates to the shared :func:`himmy.services.inference.compare.build_model_catalog`
+    seam (T3d) — the SAME catalog ``GET /v1/models`` and ``himmy models`` render, so the
+    three surfaces never drift. The response shape is unchanged.
+    """
+    from himmy.services.inference.compare import build_model_catalog
 
-    # model name → {accuracy, latency} from prior `himmy bench` runs
-    stats: dict[str, dict[str, Any]] = {}
-    for e in studio_bench.list_cached():
-        m = e.get("model")
-        if m:
-            stats[m] = {"accuracy": e.get("accuracy"), "latency": e.get("latency")}
-
-    out: list[dict[str, Any]] = []
-
-    ollama = await studio_bench._ollama_models()
-    out.append(
-        {
-            "provider": "ollama",
-            "available": bool(ollama),
-            "models": [{"name": m, **stats.get(m, {})} for m in ollama],
-        }
-    )
-
-    claude = shutil.which("claude") is not None
-    out.append(
-        {
-            "provider": "claude-cli",
-            "available": claude,
-            "models": [
-                {"name": n, **stats.get(n, {})} for n in ("haiku", "sonnet", "opus")
-            ]
-            if claude
-            else [],
-        }
-    )
-    return out
+    return cast(list[dict[str, Any]], await build_model_catalog())
 
 
 # ---- Compare (one prompt, N models, side-by-side) -----------------------
@@ -810,62 +783,33 @@ async def compare(body: CompareRequest) -> list[CompareResult]:
 
     Each target is an isolated model call (no tools, no run history) so the cells
     are directly comparable on output, tokens, cost, and latency.
+
+    Delegates to the shared :func:`himmy.services.inference.compare.run_compare` seam
+    (T3d) — the SAME per-target loop ``POST /v1/models/compare`` and ``himmy compare``
+    drive. The response shape is unchanged.
     """
-    import asyncio
+    from himmy.services.inference.compare import CompareTargetSpec, run_compare
 
-    from himmy.cli.provider import build_manager_for
-    from himmy.services.inference.models import (
-        InferenceMessage,
-        InferenceRequest,
-        InferenceStatus,
+    cells = await run_compare(
+        [CompareTargetSpec(provider=t.provider, model=t.model) for t in body.targets],
+        prompt=body.prompt,
+        system=body.system,
+        timeout_seconds=body.timeout_seconds,
     )
-
-    def _messages() -> list[InferenceMessage]:
-        msgs: list[InferenceMessage] = []
-        if body.system:
-            msgs.append(InferenceMessage(role="system", content=body.system))
-        msgs.append(InferenceMessage(role="user", content=body.prompt))
-        return msgs
-
-    async def _one(target: CompareTarget) -> CompareResult:
-        try:
-            manager = build_manager_for(target.provider, target.model)
-        except Exception as exc:  # noqa: BLE001 - report per-cell, never 500
-            return CompareResult(
-                provider=target.provider,
-                model=target.model,
-                ok=False,
-                error=str(exc),
-            )
-        request = InferenceRequest(
-            model_key=target.model,
-            messages=_messages(),
-            timeout_seconds=body.timeout_seconds,
+    return [
+        CompareResult(
+            provider=cell.provider,
+            model=cell.model,
+            ok=cell.ok,
+            output=cell.output,
+            error=cell.error,
+            input_tokens=cell.input_tokens,
+            output_tokens=cell.output_tokens,
+            cost=cell.cost,
+            latency_ms=cell.latency_ms,
         )
-        try:
-            resp = await manager.generate(request)
-        except Exception as exc:  # noqa: BLE001 - report per-cell
-            return CompareResult(
-                provider=target.provider,
-                model=target.model,
-                ok=False,
-                error=str(exc),
-            )
-        ok = resp.status == InferenceStatus.SUCCESS
-        err_msg = resp.error.message if resp.error else "model call failed"
-        return CompareResult(
-            provider=target.provider,
-            model=target.model,
-            ok=ok,
-            output=resp.output_text or "",
-            error=None if ok else err_msg,
-            input_tokens=resp.input_tokens,
-            output_tokens=resp.output_tokens,
-            cost=resp.cost,
-            latency_ms=resp.latency_ms,
-        )
-
-    return list(await asyncio.gather(*(_one(t) for t in body.targets)))
+        for cell in cells
+    ]
 
 
 # ---- Tasks --------------------------------------------------------------

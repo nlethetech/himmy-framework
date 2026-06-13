@@ -28,9 +28,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.api.auth.principal import Principal
 
 #: The built-in role catalogue. ``admin`` is unrestricted; ``viewer`` reads
-#: operational data; ``operator`` reads + writes it; ``auditor`` additionally reads the
-#: audit surface AND runs the WS4.7 privacy audit (``audit:run``). ``data_subject`` is a
-#: self-scoped role for a person exercising
+#: operational data (incl. the read-only model catalog + global diagnostics);
+#: ``operator`` reads + writes it (``model:write`` covers the run-fanning compare);
+#: ``auditor`` additionally reads the audit surface AND runs the WS4.7 privacy audit
+#: (``audit:run``). ``data_subject`` is a self-scoped role for a person exercising
 #: their own consent/erasure rights (the router additionally restricts it to its own
 #: ``subject_id``). Operators ship their own via ``HIMMY_RBAC_FILE``.
 DEFAULT_RBAC: dict[str, list[str]] = {
@@ -42,6 +43,8 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "evaluation:read",
         "connector:read",
         "agent:read",
+        "model:read",
+        "diagnostics:read",
     ],
     "operator": [
         "run:read",
@@ -58,6 +61,9 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "connector:read",
         "agent:read",
         "agent:write",
+        "model:read",
+        "model:write",
+        "diagnostics:read",
     ],
     "auditor": [
         "run:read",
@@ -70,6 +76,8 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "consent:read",
         "connector:read",
         "agent:read",
+        "model:read",
+        "diagnostics:read",
     ],
     # Self-scoped: holds only consent:read (so it can read its own decision/history and
     # exercise withdrawal/erasure). The /v1/consent router enforces it may touch ONLY its

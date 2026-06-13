@@ -22,6 +22,7 @@ from himmy.cli.audit import add_audit_parser
 from himmy.cli.consent import add_consent_parser
 from himmy.cli.context_cmd import add_context_parser
 from himmy.cli.dashboard_cmd import add_dashboard_parser
+from himmy.cli.models_cmd import cmd_compare, cmd_models
 from himmy.cli.provider import PROVIDERS
 from himmy.cli.recommendations_cmd import add_recommendations_parser
 from himmy.cli.runs_cmd import add_runs_parser
@@ -281,6 +282,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit non-zero if any model's accuracy is below this floor (0-1), for CI",
     )
     p_bench.set_defaults(func=commands.cmd_bench)
+
+    # models — list the local providers + models himmy can run on (shared catalog seam).
+    p_models = sub.add_parser(
+        "models",
+        help="list local providers + models (with cached bench reliability)",
+    )
+    p_models.add_argument(
+        "--prices",
+        action="store_true",
+        help="append each model's input/output $/1M from the price table",
+    )
+    p_models.add_argument(
+        "--json", action="store_true", help="print the catalog as JSON"
+    )
+    p_models.set_defaults(func=cmd_models)
+
+    # compare — one prompt across N models side-by-side (the quick path; bench is rigorous).
+    p_compare = sub.add_parser(
+        "compare",
+        help="run one prompt across several models side-by-side (quick; bench is rigorous)",
+    )
+    p_compare.add_argument(
+        "prompt", nargs="+", help="the prompt to send to every model"
+    )
+    p_compare.add_argument(
+        "-m",
+        "--models",
+        action="append",
+        metavar="PROVIDER:MODEL",
+        help="a provider:model target (repeatable, or a comma list), "
+        "e.g. -m ollama:llama3.2 -m claude-cli:haiku",
+    )
+    p_compare.add_argument(
+        "--system", help="an optional system prompt sent to every model"
+    )
+    p_compare.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="per-model timeout in seconds (default: 120)",
+    )
+    p_compare.add_argument(
+        "--json", action="store_true", help="print the results as JSON"
+    )
+    p_compare.set_defaults(func=cmd_compare)
 
     p_new = sub.add_parser(
         "new",
