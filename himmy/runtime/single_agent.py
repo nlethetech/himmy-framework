@@ -2151,6 +2151,34 @@ class SingleAgentRuntime:
             )
         )
 
+        # P0-C: the compaction summary is the run's distilled experience ("every
+        # fact, decision, tool result"). Instead of discarding it when the thread
+        # middle is replaced, persist it as an episodic trace so learning loops have
+        # a corpus of "what happened" from day one. Best-effort: a persistence
+        # failure must never break the run (the in-context summary already applied).
+        save_episodic = getattr(self.memory_store, "save_episodic_memory", None)
+        if save_episodic is not None:
+            from himmy.services.storage.models import EpisodicMemoryObject
+
+            subject_raw = ctx.get("subject_id")
+            with contextlib.suppress(Exception):
+                await save_episodic(
+                    EpisodicMemoryObject(
+                        subject_id=str(subject_raw) if subject_raw else None,
+                        agent_id=persona.agent_id,
+                        payload={
+                            "summary": summary_text,
+                            "source": "compaction",
+                            "tier": "archival",
+                        },
+                        metadata={
+                            "trace_id": trace_id,
+                            "thread_id": thread.thread_id,
+                            "summarized_messages": compacted_count,
+                        },
+                    )
+                )
+
     async def _continue_turn(
         self,
         persona: Persona,

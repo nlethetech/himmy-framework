@@ -248,7 +248,10 @@ class MemoryService:
             EventType.MEMORY_RECALLED,
             {
                 "subject_id": subject_id,
-                "query": query,
+                # Privacy: the raw query is a user prompt — record its size, not its
+                # text, so the audit spine never persists PII (P0-C). The returned
+                # count + top similarity remain as the useful, non-sensitive signal.
+                "query_chars": len(query),
                 "returned": len(hits),
                 "top_similarity": hits[0].similarity if hits else 0.0,
             },

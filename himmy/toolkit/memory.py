@@ -107,8 +107,14 @@ def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     path = effective_memory_path(config, server=config.server_context or None)
     store = SqliteMemoryStore(path) if path else InMemoryMemoryStore()
     embedder, _dim = config.build_embedder_and_dim()
+    # P0-C: project memory writes onto the spine the tool registry shares (when the
+    # caller wired one — e.g. from_spec). None ⇒ audit stays off, unchanged.
+    spine = registry.entity_registry
     memory = MemoryService(
-        store, embedder=embedder, min_similarity=config.memory_min_similarity
+        store,
+        embedder=embedder,
+        min_similarity=config.memory_min_similarity,
+        registry=spine,
     )
     subject = config.memory_subject
 
@@ -162,7 +168,7 @@ def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     if config.memory_consolidate:
         from himmy.services.memory.consolidation import MemoryConsolidator
 
-        consolidator = MemoryConsolidator(memory)
+        consolidator = MemoryConsolidator(memory, registry=spine)
 
         async def consolidate(args: dict[str, Any]) -> dict[str, Any]:
             result = await consolidator.consolidate(

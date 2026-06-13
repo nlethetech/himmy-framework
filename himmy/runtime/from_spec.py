@@ -194,6 +194,15 @@ def build_runtime_for_spec(
     output_guardrail = build_guardrail_pipeline(output_names)
     overrides["output_guardrail"] = output_guardrail
 
+    # One audit spine shared by the runtime, its tool registry, and (when wired)
+    # memory — so a fact remembered/recalled mid-run lands on the SAME EntityRecord
+    # registry as the run's lineage, and MEMORY_* events flow to the durable
+    # ``storage`` event sink (run_events). P0-C turns this dormant projection on.
+    from himmy.entities.registry import EntityRegistry
+
+    entity_registry = EntityRegistry()
+    overrides["registry"] = entity_registry
+
     if spec.memory:
         from himmy.services.context.service import ContextService
         from himmy.services.memory import (
@@ -212,6 +221,8 @@ def build_runtime_for_spec(
             store,
             embedder=tk.build_embedder_and_dim()[0],
             min_similarity=tk.memory_min_similarity,
+            registry=entity_registry,
+            event_sink=storage,
         )
         adapter = MemoryContextAdapter(
             memory,
@@ -235,7 +246,9 @@ def build_runtime_for_spec(
         or spec.allow_spawn
         or spec.allow_skill_dispatch
     ):
-        registry = ToolRegistry()
+        # Share the run's audit spine so co-registered packs (memory) project their
+        # writes onto the same registry the runtime/tool lineage uses (P0-C).
+        registry = ToolRegistry(entity_registry=entity_registry)
         if spec.tool_packs:
             from himmy.toolkit import ToolkitConfig, register_packs
 
