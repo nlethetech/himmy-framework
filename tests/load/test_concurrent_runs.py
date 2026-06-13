@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from himmy.application.services import DEFAULT_WORKSPACE_MAX_OUTSTANDING
 from tests.conftest import run_async
 from tests.load.metrics import LoadTestMetrics
 
@@ -102,18 +103,31 @@ async def _drain_runs(client: Any, run_ids: list[str], *, timeout: float = 20.0)
 def test_concurrent_run_creates_have_zero_errors(
     client_factory: Callable[..., Any], concurrency: int
 ) -> None:
-    """Fanning out N concurrent POST /v1/runs yields N runs with a 0% error rate."""
+    """Fanning out N concurrent POST /v1/runs yields no *unexpected* errors.
 
-    async def _body() -> LoadTestMetrics:
+    A single workspace may hold at most ``DEFAULT_WORKSPACE_MAX_OUTSTANDING`` (T0.4)
+    in-flight runs at once. Because the whole batch is admitted before any run drains,
+    a fan-out larger than that cap is *expected* to have its overflow rejected — but
+    with a clean ``429`` (backpressure), never a ``5xx`` or a raised exception. The
+    invariant asserted here is therefore "zero unexpected errors": every request is
+    either an accepted ``200`` or a deliberate ``429``, and the accepted count is
+    capped exactly at the quota.
+    """
+
+    async def _body() -> tuple[LoadTestMetrics, list[str], list[int]]:
         async with client_factory() as client:
             created: list[str] = []
+            statuses: list[int] = []
 
             async def _create(_: int) -> bool:
                 resp = await client.post("/v1/runs", json=_RUN_BODY)
-                if resp.status_code != 200:
-                    return False
-                created.append(resp.json()["run_id"])
-                return True
+                statuses.append(resp.status_code)
+                # 200 = accepted, 429 = deliberate quota backpressure. Both are
+                # "expected" (not errors); anything else is a real failure.
+                if resp.status_code == 200:
+                    created.append(resp.json()["run_id"])
+                    return True
+                return resp.status_code == 429
 
             metrics = await _timed_gather(
                 f"create-runs-c{concurrency}", concurrency, _create
@@ -121,14 +135,20 @@ def test_concurrent_run_creates_have_zero_errors(
             # Drain so background tasks complete before the client/loop tears down
             # (keeps the event loop clean for xdist + avoids dangling-task warnings).
             await _drain_runs(client, created)
-            assert len(created) == concurrency
-            return metrics
+            return metrics, created, statuses
 
-    metrics = run_async(_body())
+    metrics, created, statuses = run_async(_body())
     print(metrics.summary_line())
+    # No unexpected errors: every request resolved to an expected status (200/429).
     assert metrics.error_rate == 0.0
     assert metrics.total_requests == concurrency
     assert metrics.error_count == 0
+    # Only 200 (accepted) and 429 (quota backpressure) are allowed — never a 5xx.
+    assert set(statuses) <= {200, 429}
+    expected_accepted = min(concurrency, DEFAULT_WORKSPACE_MAX_OUTSTANDING)
+    assert len(created) == expected_accepted
+    assert statuses.count(200) == expected_accepted
+    assert statuses.count(429) == concurrency - expected_accepted
 
 
 @pytest.mark.parametrize("concurrency", CONCURRENCY_LEVELS)

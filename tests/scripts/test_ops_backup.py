@@ -93,7 +93,10 @@ def test_backup_restore_round_trip(tmp_path: Path) -> None:
         manifest = json.loads(tar.extractfile("manifest.json").read())  # type: ignore[union-attr]
     names = {f["name"] for f in manifest["files"]}
     assert {"storage.db", "memory.db", "secrets/postgres_password"} <= names
-    assert manifest["schema_version"] == 1
+    # The manifest stamps the live storage schema version (max of the forward
+    # migration chain), not a frozen constant — assert it tracks ops_backup's own
+    # resolver so the round-trip stays correct as new migrations are appended.
+    assert manifest["schema_version"] == ops._schema_version()
     assert manifest["secrets_included"] is True
 
     # wipe and restore into a fresh store dir

@@ -51,6 +51,7 @@ from himmy.api.routers import (
     studio_routines,
     studio_teams,
 )
+from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.core.errors import HimmyError
 from himmy.services.audit import SecurityAuditLog
 
@@ -356,6 +357,21 @@ def create_app(
         return JSONResponse(
             status_code=400,
             content=ErrorResponse(detail=str(exc), code="himmy_error").model_dump(),
+        )
+
+    # T0.4: a workspace at its outstanding-run cap is a backpressure signal, not a
+    # server fault — surface it as a clean 429 (the exception's own contract) instead
+    # of letting it fall through to the generic 500 handler.
+    @app.exception_handler(WorkspaceRunQuotaExceeded)
+    async def _run_quota_handler(
+        request: Request, exc: WorkspaceRunQuotaExceeded
+    ) -> JSONResponse:
+        """Map a per-workspace run-concurrency quota breach to a structured 429."""
+        return JSONResponse(
+            status_code=429,
+            content=ErrorResponse(
+                detail=str(exc), code="run_quota_exceeded"
+            ).model_dump(),
         )
 
     app.include_router(context.router)

@@ -405,3 +405,52 @@ def test_per_workspace_concurrency_is_bounded() -> None:
         await app.drain(timeout=5.0)
 
     run_async(_scenario())
+
+
+def test_run_quota_breach_surfaces_as_http_429() -> None:
+    """A workspace over its outstanding-run cap returns a clean 429 over HTTP (T0.4).
+
+    The quota error must not fall through to the generic 500 handler — it is
+    backpressure, so the BFF maps :class:`WorkspaceRunQuotaExceeded` to a structured
+    ``429`` (the exception's documented contract). We block the runtime so the first
+    run stays in-flight, set the cap to 1, and assert the second create is a 429 with
+    the ``run_quota_exceeded`` code while a different workspace still gets a 200.
+    """
+    from fastapi.testclient import TestClient
+
+    from himmy.api import ApiContainer, create_app
+
+    container = ApiContainer.build_default()
+    container.run_app._workspace_max_outstanding = 1  # type: ignore[attr-defined]
+    gate = asyncio.Event()
+
+    async def _blocking(*_a: object, **_k: object):  # type: ignore[no-untyped-def]
+        await gate.wait()
+        raise AssertionError("unreachable")
+
+    container.run_app._runtime.run_task_detailed = _blocking  # type: ignore[attr-defined]
+
+    body = {
+        "workspace_id": "wA",
+        "subject_id": "s1",
+        "persona": {"name": "A", "description": ""},
+        "task": {"title": "t", "prompt": "hi"},
+    }
+    try:
+        with TestClient(create_app(container)) as client:
+            first = client.post("/v1/runs", json=body)
+            assert first.status_code == 200
+
+            # wA is now at cap (1 in-flight, blocked) — the next create is rejected.
+            second = client.post("/v1/runs", json=body)
+            assert second.status_code == 429
+            payload = second.json()
+            assert payload["code"] == "run_quota_exceeded"
+            assert "cap" in payload["detail"].lower()
+
+            # A DIFFERENT workspace is unaffected by wA's cap.
+            other = client.post("/v1/runs", json={**body, "workspace_id": "wB"})
+            assert other.status_code == 200
+    finally:
+        gate.set()
+        run_async(container.run_app.drain(timeout=5.0))
