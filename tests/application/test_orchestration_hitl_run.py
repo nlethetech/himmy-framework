@@ -36,6 +36,7 @@ from himmy.services.inference.client_manager import StubClientManager
 from himmy.services.inference.service import InferenceService
 from himmy.services.storage.models import RunStatus
 from himmy.services.storage.service import StorageService
+from himmy.services.storage.sqlite import SqliteStorageService
 from tests.application import _per_run_tools
 from tests.conftest import run_async
 
@@ -54,9 +55,18 @@ def _allow_operator_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "1")
 
 
-def _app() -> tuple[StorageService, RunAppService, AgentDefAppService, object]:
-    """A RunAppService wired with a HITL checkpoint store + a shared graph store."""
-    storage = StorageService()
+def _app(
+    storage: object | None = None,
+) -> tuple[object, RunAppService, AgentDefAppService, object]:
+    """A RunAppService wired with a HITL checkpoint store + a shared graph store.
+
+    ``storage`` defaults to the in-memory :class:`StorageService`; pass a durable backend
+    (e.g. :class:`SqliteStorageService`) to exercise the atomic run-level resume claim on a
+    backend whose ``get_run`` returns INDEPENDENT snapshots — so a concurrent double-approve
+    cannot be masked by a shared in-memory object reference and is gated solely by the
+    run-level CAS (not the graph-recovery backstop).
+    """
+    storage = storage or StorageService()
     registry = EntityRegistry()
     context = ContextService(storage_service=storage, entity_registry=registry)
     runtime = SingleAgentRuntime(
@@ -326,6 +336,47 @@ def test_concurrent_double_approve_orchestration_advances_graph_once() -> None:
         # The DOWNSTREAM member's tool advanced the graph EXACTLY ONCE (the headline fix).
         assert len(_per_run_tools.CALLS) == 1
         # The gated member's tool also fired exactly once.
+        assert len(_per_run_tools.WIRE_CALLS) == 1
+        assert (done.metadata or {}).get("route") == ["step1", "step2"]
+
+    run_async(_scenario())
+
+
+def test_concurrent_double_approve_orchestration_advances_graph_once_durable(
+    tmp_path,
+) -> None:
+    """The orchestration concurrency guarantee, on the DURABLE (sqlite) backend (UNIT 1).
+
+    The in-memory variant above can pass on the graph-recovery backstop alone, because
+    ``StorageService.get_run`` hands both racing resumes the SAME object reference. On
+    SQLite each ``get_run`` is an INDEPENDENT snapshot, so the non-atomic check cannot mask
+    the race — only the atomic run-level ``claim_run_for_resume`` CAS keeps exactly one
+    resume from advancing the graph. This pins the exact seam UNIT 1 names: the downstream
+    member's tool fires once and the loser raises :class:`RunNotApprovableError`.
+    """
+
+    async def _scenario() -> None:
+        storage = SqliteStorageService(str(tmp_path / "orch_hitl.db"))
+        _storage, app, agent_app, graph_store = _app(storage)
+        run = await _launch_paused_with_downstream_tool(app, agent_app, graph_store)
+        assert run.status == RunStatus.AWAITING_APPROVAL
+
+        results = await asyncio.gather(
+            app.resume_run(run.run_id, approved=True, workspace_id="w1"),
+            app.resume_run(run.run_id, approved=True, workspace_id="w1"),
+            return_exceptions=True,
+        )
+        winners = [r for r in results if not isinstance(r, BaseException)]
+        losers = [r for r in results if isinstance(r, RunNotApprovableError)]
+        assert len(winners) == 1
+        assert len(losers) == 1
+
+        done = await _await_status(
+            app, run.run_id, {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        )
+        assert done.status == RunStatus.SUCCEEDED, done.error
+        # The DOWNSTREAM member's tool advanced the graph EXACTLY ONCE (the headline fix).
+        assert len(_per_run_tools.CALLS) == 1
         assert len(_per_run_tools.WIRE_CALLS) == 1
         assert (done.metadata or {}).get("route") == ["step1", "step2"]
 

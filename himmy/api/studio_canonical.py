@@ -109,6 +109,14 @@ _RUN_STATUS_TO_STUDIO: dict[RunStatus, str] = {
     RunStatus.QUEUED: "ok",
     RunStatus.RUNNING: "ok",
     RunStatus.AWAITING_APPROVAL: "awaiting_approval",
+    # RESOLVING is the transient HITL-resume claim state: a non-terminal "in
+    # progress" run (like RUNNING) — both for the normal resume window and for a
+    # crash-stranded run awaiting recovery. It MUST live here: this map is keyed by
+    # the exhaustive RunStatus enum and subscripted unguarded from the Studio list +
+    # detail readers (which scan EVERY canonical run with no tenant scope), so a
+    # missing key would KeyError-crash the Studio runs screen whenever any run is
+    # RESOLVING.
+    RunStatus.RESOLVING: "ok",
     RunStatus.SUCCEEDED: "ok",
     RunStatus.FAILED: "error",
 }
@@ -118,6 +126,11 @@ _RUN_STATUS_TO_STUDIO: dict[RunStatus, str] = {
 _STATUS_RANK: dict[RunStatus, int] = {
     RunStatus.QUEUED: 0,
     RunStatus.RUNNING: 1,
+    # RESOLVING ranks with RUNNING: both are non-terminal "in progress" states. This
+    # keeps the last-write-wins guard from letting a re-projected RESOLVING row roll
+    # back an AWAITING_APPROVAL/terminal row (the .get default of 0 would rank it
+    # below RUNNING, which is directionally wrong).
+    RunStatus.RESOLVING: 1,
     RunStatus.AWAITING_APPROVAL: 2,
     RunStatus.SUCCEEDED: 3,
     RunStatus.FAILED: 3,

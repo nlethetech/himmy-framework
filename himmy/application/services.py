@@ -1933,10 +1933,15 @@ class RunAppService:
     ) -> RunRecord:
         """Approve/reject a HITL-paused TEAM/WORKFLOW run; resume the graph (WI-6).
 
-        Flips AWAITING_APPROVAL -> RUNNING up front (the inbox gate) and launches the
-        durable graph resume on a tracked background task. The authoritative exactly-once
-        gate stays the MEMBER checkpoint ``claim()`` inside ``resume_agent_loop`` — a
-        double-approve loses the claim and is a clean no-op. Returns the RUNNING record.
+        By the time this runs the caller (``resume_run``) has already won the atomic
+        run-level ``claim_run_for_resume`` CAS, flipping AWAITING_APPROVAL -> RESOLVING;
+        that run-level claim is now the PRIMARY exactly-once gate — a concurrent second
+        approve loses the CAS and 409s before ever reaching here, so the graph advance
+        happens exactly once. This method flips RESOLVING -> RUNNING and launches the
+        durable graph resume on a tracked background task. The MEMBER checkpoint
+        ``claim()`` inside ``resume_agent_loop`` remains a defence-in-depth backstop (a
+        crash re-drive that re-enters here finds the member already resolved -> no-op).
+        Returns the RUNNING record.
         """
         graph_resume_id = (run.metadata or {}).get("orchestration_checkpoint_id")
         if not graph_resume_id:  # pragma: no cover - an orchestration pause always has one

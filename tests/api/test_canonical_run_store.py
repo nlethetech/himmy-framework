@@ -274,3 +274,44 @@ def test_record_to_studio_run_renders_v1_only_record() -> None:
     assert view.status == "awaiting_approval"
     assert view.output == "partial output"
     assert view.checkpoint_id == "cp-9"
+
+
+@pytest.mark.asyncio
+async def test_resolving_run_projects_without_keyerror() -> None:
+    """A RESOLVING run renders through the Studio readers without crashing the screen.
+
+    Regression: ``_RUN_STATUS_TO_STUDIO`` is keyed by the exhaustive ``RunStatus`` enum
+    and subscripted UNGUARDED from the Studio list + detail readers (which scan every
+    canonical run with no tenant scope). The HITL resume CAS makes ``RESOLVING`` a real,
+    durable, observable run state (during every resume and for crash-stranded runs), so a
+    missing key would KeyError-crash the Studio runs list/detail whenever any run is
+    RESOLVING. RESOLVING must project to a non-terminal Studio status ("ok") like RUNNING.
+    """
+    from himmy.api.studio_canonical import (
+        get_studio_run_unified,
+        list_studio_runs_unified,
+    )
+
+    rec = RunRecord(
+        run_id="resolving-1",
+        workspace_id="acme",
+        subject_id="u",
+        status=RunStatus.RESOLVING,
+        output_text="mid-resume",
+    )
+
+    # 1) Direct projection (the synthesize branch, no studio.db cache row).
+    view = record_to_studio_run(rec)
+    assert view.id == "resolving-1"
+    assert view.status == "ok"  # non-terminal, shown as in-progress like RUNNING
+
+    # 2) The list + detail readers scan EVERY canonical run with no tenant scope.
+    storage = StorageService()
+    await storage.save_run(rec)
+    summaries, total = await list_studio_runs_unified(storage, limit=50, offset=0)
+    assert total == 1
+    assert summaries[0].id == "resolving-1"
+    assert summaries[0].status == "ok"
+
+    detail = await get_studio_run_unified(storage, "resolving-1")
+    assert detail is not None and detail.status == "ok"
