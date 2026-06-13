@@ -411,10 +411,16 @@ async def _run_graph(
             #    too (it is no longer interrupted-at-this-member) — re-raise so the
             #    service treats it as a clean exactly-once no-op (never a double advance);
             #  * a genuine CRASH-RETRY: the member resolved but the graph never advanced
-            #    (still interrupted at this node) — recover the recorded output and advance
-            #    ANYWAY so the run is never stranded. The gated tool already ran once.
+            #    (still interrupted at this node) — recover the member's REAL final output
+            #    from its durable checkpoint and advance ANYWAY so the run is never
+            #    stranded AND downstream sees the real text. The gated tool already ran
+            #    once (the ledger); this only re-threads the lost text.
             recovered = _recovered_member_advance(
-                graph_checkpoint_store, graph_resume_id, node, member_cp
+                graph_checkpoint_store,
+                graph_resume_id,
+                node,
+                member_cp,
+                checkpoint_store,
             )
             if recovered is None:
                 raise
@@ -451,6 +457,7 @@ def _recovered_member_advance(
     graph_resume_id: str | None,
     node: str,
     member_cp: str,
+    checkpoint_store: Any = None,
 ) -> str | None:
     """Recover a resolved member's output for a crash-retry advance, or None (no-op).
 
@@ -458,9 +465,16 @@ def _recovered_member_advance(
     STILL interrupted at exactly this node + member (a genuine crash between the member
     resolving and the graph advancing). When a sibling has already advanced the graph (a
     concurrent double-approve loser) this returns ``None`` so the caller re-raises and the
-    advance happens exactly once. The recovered text is the last assistant message on the
-    resolved member checkpoint's thread (best-effort; the gated tool's side effect already
-    ran exactly once via the ledger, so this only re-threads text).
+    advance happens exactly once.
+
+    The recovered text is the member's REAL final answer, read from the ``final_output``
+    the resolved member checkpoint recorded AT RESOLVE TIME (closing #2): the graph state
+    never saw it (the crash struck before the advance persisted), so threading it from the
+    durable member record is what lets downstream see the true output rather than an empty
+    string. The gated tool's side effect already ran exactly once via the ledger, so this
+    only re-threads the lost text. A member checkpoint that never recorded a final answer
+    (``final_output is None`` — an older/partial record, or no member store wired) falls
+    back to the empty string so recovery still ADVANCES (never strands the run).
     """
     if graph_checkpoint_store is None or not graph_resume_id:
         return None
@@ -472,6 +486,10 @@ def _recovered_member_advance(
     ):
         # The graph already advanced past this member — a concurrent loser; no-op.
         return None
+    if checkpoint_store is not None:
+        member_chk = checkpoint_store.load(member_cp)
+        if member_chk is not None and member_chk.final_output is not None:
+            return str(member_chk.final_output)
     return ""
 
 

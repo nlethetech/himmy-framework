@@ -35,7 +35,7 @@ REJECTED = "rejected"
 
 #: Current :class:`AgentCheckpoint` serialization format. Bump this (and add a
 #: step to ``_MIGRATIONS``) whenever a persisted field changes shape.
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 
 
 #: Arg-key substrings whose values are masked before a pending tool call is shown to a
@@ -93,6 +93,16 @@ class AgentCheckpoint(BaseModel):
     #: BETWEEN executing a state-mutating tool and resolving the checkpoint —
     #: replays the recorded result instead of executing the tool a second time.
     executed_tool_results: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    #: The member's FINAL output text, recorded durably AT RESOLVE TIME when a HITL
+    #: resume terminates (status flips to ``approved``/``rejected`` and the member
+    #: produces its answer). For an orchestration member this is the durable anchor
+    #: for crash recovery: if a crash strikes BETWEEN the member resolving and the
+    #: graph persisting its advance, the graph state never saw this text, so recovery
+    #: reads it back from HERE and threads the REAL output downstream instead of an
+    #: empty string. ``None`` until the resume terminates (a still-paused member has no
+    #: final answer yet); empty-string is a legitimate recorded answer (model said
+    #: nothing) and is distinct from the not-yet-recorded ``None``.
+    final_output: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
 
 
@@ -107,11 +117,18 @@ def _migrate_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _migrate_v2_to_v3(raw: dict[str, Any]) -> dict[str, Any]:
+    """v2 -> v3: adds ``final_output`` (``None`` — no resume had recorded an answer)."""
+    raw.setdefault("final_output", None)
+    return raw
+
+
 #: Stepwise upgraders keyed by the *from* version; each returns the raw dict at
 #: version ``from + 1``. Every historical format must have an unbroken chain here.
 _MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
 }
 
 

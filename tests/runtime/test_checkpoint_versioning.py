@@ -189,6 +189,24 @@ def test_future_version_is_rejected_with_a_clear_error(tmp_path) -> None:
     store.close()
 
 
+def test_v2_checkpoint_migrates_to_final_output_none() -> None:
+    """A v2 record (no ``final_output``) migrates forward with the field defaulted None.
+
+    The v2->v3 step (added with the crash-recovery anchor, #2) must leave the not-yet-
+    recorded sentinel as ``None`` — distinct from a legitimately-recorded empty answer.
+    """
+    migrated = _migrate_checkpoint(
+        {"schema_version": 2, "persona": {"name": "p"}, "executed_tool_results": {}}
+    )
+    assert migrated["schema_version"] == CHECKPOINT_SCHEMA_VERSION
+    assert migrated["final_output"] is None
+    # A v2 row that somehow already carried the field keeps its value (idempotent).
+    kept = _migrate_checkpoint(
+        {"schema_version": 2, "persona": {"name": "p"}, "final_output": "answer"}
+    )
+    assert kept["final_output"] == "answer"
+
+
 def test_migrate_checkpoint_unit_behaviors() -> None:
     """_migrate_checkpoint stamps legacy dicts and rejects bad versions."""
     migrated = _migrate_checkpoint({"persona": {"name": "p"}})

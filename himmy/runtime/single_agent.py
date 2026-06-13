@@ -1844,7 +1844,7 @@ class SingleAgentRuntime:
                 persona, thread, ctx, trace_id, llm_config=resume_llm
             )
             await self._emit_turn_completed(trace_id, thread, persona, index, result)
-            return await self._drive_loop(
+            loop = await self._drive_loop(
                 persona,
                 task,
                 thread,
@@ -1859,6 +1859,40 @@ class SingleAgentRuntime:
                 turns_offset=checkpoint.turns_completed,
                 cost_offset=checkpoint.cost_completed,
             )
+            self._record_resume_final_output(checkpoint_id, loop)
+            return loop
+
+    def _record_resume_final_output(
+        self, checkpoint_id: str, loop: AgentLoopResult
+    ) -> None:
+        """Persist the resolved member's FINAL output onto its terminal checkpoint (#2).
+
+        The crash-recovery anchor for orchestration HITL. By the time this runs the
+        gated tool has fired exactly once and the checkpoint is already resolved
+        (``approved``/``rejected``); the member's final answer is only produced by the
+        drive loop AFTER that terminal save, so it is written back here — DURABLY, onto
+        the SAME store row that holds the claim + idempotency ledger, BEFORE the caller
+        returns (and therefore before the orchestration graph advance persists). If a
+        crash then strikes between the member resolving and the graph persisting its
+        advance, the graph recovery reads this text back and threads the REAL member
+        output downstream instead of an empty string.
+
+        A member that paused AGAIN on a second gated tool has NOT produced a final
+        answer (the original checkpoint stays terminal but re-pauses into a fresh
+        checkpoint), so nothing is recorded — ``final_output`` stays ``None``. The
+        write merges onto a freshly LOADED row so the ledger written during execution
+        is preserved, and never resurrects a since-pruned checkpoint.
+        """
+        assert self._checkpoint_store is not None  # guaranteed by the caller
+        if loop.stopped_reason == "awaiting_approval":
+            return
+        latest = self._checkpoint_store.load(checkpoint_id)
+        if latest is None:  # pragma: no cover - pruned mid-resume; nothing to anchor
+            return
+        final_text = (loop.final.output_text or "") if loop.turns else ""
+        self._checkpoint_store.save(
+            latest.model_copy(update={"final_output": final_text})
+        )
 
     async def _drive_loop(
         self,

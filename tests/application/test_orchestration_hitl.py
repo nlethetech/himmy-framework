@@ -344,6 +344,130 @@ def test_crash_after_resolve_advances_not_stuck(tmp_path: Path) -> None:
     assert len(_per_run_tools.WIRE_CALLS) == before
 
 
+class _CrashOnAdvanceGraphStore:
+    """Wraps a real graph store but RAISES on the advance-persist (#2 crash window).
+
+    Delegates every read + the interrupt-persist (the save that STAMPS ``paused_node``)
+    to the real durable store, then raises on the FIRST save that CLEARS ``paused_node``
+    — i.e. the post-member graph advance. So the member's ``resume_agent_loop`` has fully
+    run (gated tool fired once, ``final_output`` recorded durably on the member
+    checkpoint) but the graph never advanced: exactly the crash between member-resolve and
+    graph-persist that #2 must survive.
+    """
+
+    def __init__(self, inner: SqliteGraphCheckpointStore) -> None:
+        self._inner = inner
+        self.crashed = False
+
+    def save(self, checkpoint) -> None:  # type: ignore[no-untyped-def]
+        if not checkpoint.paused_node and not self.crashed:
+            self.crashed = True
+            raise RuntimeError("simulated crash after member resolve, before advance")
+        self._inner.save(checkpoint)
+
+    def load(self, checkpoint_id: str):  # type: ignore[no-untyped-def]
+        return self._inner.load(checkpoint_id)
+
+    def list_by_status(self, status: str):  # type: ignore[no-untyped-def]
+        return self._inner.list_by_status(status)
+
+
+def test_crash_recovery_threads_real_member_output_downstream(tmp_path: Path) -> None:
+    """The headline #2: a crash between member-resolve and graph-persist still threads the
+    member's REAL final output downstream on recovery — not an empty string — while the
+    gated tool stays exactly-once.
+
+    Drive the ACTUAL member resume (so its ``final_output`` is recorded durably), crash on
+    the graph advance-persist, then simulate a process restart (fresh stores over the SAME
+    sqlite files — no in-process graph state) and re-resume. Recovery reads the durable
+    member output and threads it into the downstream node.
+    """
+    g_db = str(tmp_path / "g.db")
+    cp_db = str(tmp_path / "cp.db")
+    graph_store = SqliteGraphCheckpointStore(g_db)
+    cp_store = SqliteCheckpointStore(cp_db)
+    members, outcome = _pause(graph_store, cp_store)
+    orch_cp = outcome.orchestration_checkpoint_id
+    member_cp = outcome.member_checkpoint_id
+
+    # Resume through a graph store that crashes on the advance-persist: the member resolves
+    # (tool fires once, final_output recorded), but the graph never advances.
+    crashing = _CrashOnAdvanceGraphStore(graph_store)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_async(
+            run_orchestration(
+                kind="graph",
+                members=members,
+                prompt="",
+                resource_kind="workflow",
+                storage=StorageService(),
+                shared_inference=None,
+                operator_provisioned=True,
+                graph_checkpoint_store=crashing,
+                checkpoint_store=cp_store,
+                graph_resume_id=orch_cp,
+                approve_member=True,
+            )
+        )
+    assert len(_per_run_tools.WIRE_CALLS) == 1  # tool fired exactly once pre-crash
+
+    # The member recorded its REAL final answer durably AT RESOLVE TIME (the anchor #2
+    # recovers from); the graph is STILL interrupted at step1 (the advance never persisted).
+    resolved_member = cp_store.load(member_cp)
+    assert resolved_member is not None
+    assert resolved_member.status == "approved"
+    real_output = resolved_member.final_output
+    assert real_output is not None and real_output != ""  # a real, non-empty answer
+    still_paused = graph_store.load(orch_cp)
+    assert still_paused is not None
+    assert still_paused.status == "interrupted"
+    assert still_paused.paused_node == "step1"  # graph did NOT advance
+
+    # Simulate a process restart: brand-new stores over the SAME files (no shared in-process
+    # graph state), then re-resume — recovery threads the REAL member output downstream.
+    resumed = run_async(
+        run_orchestration(
+            kind="graph",
+            members=members,
+            prompt="",
+            resource_kind="workflow",
+            storage=StorageService(),
+            shared_inference=None,
+            operator_provisioned=True,
+            graph_checkpoint_store=SqliteGraphCheckpointStore(g_db),
+            checkpoint_store=SqliteCheckpointStore(cp_db),
+            graph_resume_id=orch_cp,
+            approve_member=True,
+        )
+    )
+
+    assert resumed.failed is False
+    assert resumed.stopped_reason == "completed"
+    assert resumed.route == ["step1", "step2"]  # advanced past the resolved member
+    assert len(_per_run_tools.WIRE_CALLS) == 1  # STILL exactly once across the crash-retry
+    # The DURABLE proof the recovery threaded the REAL member output downstream (the #2
+    # acceptance): step1's recovered text — not an empty string — is what the graph state
+    # carries forward (both the per-node ``outputs[step1]`` AND the ``last_output`` the
+    # splice set before step2 ran), so step2 ran against step1's true answer.
+    completed = SqliteGraphCheckpointStore(g_db).load(resumed.graph_checkpoint_id)
+    assert completed is not None
+    assert completed.state.get("outputs", {}).get("step1") == real_output
+    assert completed.completed_nodes == ["step1", "step2"]
+    # Cross-check against a clean (never-crashed) run: the recovered text equals exactly
+    # what an uninterrupted resume would have threaded — recovery is lossless, not "best
+    # effort empty".
+    clean_g = SqliteGraphCheckpointStore(str(tmp_path / "clean_g.db"))
+    clean_cp = SqliteCheckpointStore(str(tmp_path / "clean_cp.db"))
+    _per_run_tools.WIRE_CALLS.clear()
+    clean_members, _clean_out = _pause(clean_g, clean_cp)
+    clean = _resume(clean_members, clean_g, clean_cp, approve=True)
+    clean_state = SqliteGraphCheckpointStore(str(tmp_path / "clean_g.db")).load(
+        clean.graph_checkpoint_id
+    )
+    assert clean_state is not None
+    assert clean_state.state.get("outputs", {}).get("step1") == real_output
+
+
 @pytest.mark.parametrize("kind", ["multi_agent", "group_chat"])
 def test_unsupported_kind_fails_closed(kind: str) -> None:
     """A gated tool in a multi_agent / group_chat run FAILS CLOSED naming the tool."""
