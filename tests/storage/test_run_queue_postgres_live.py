@@ -39,6 +39,20 @@ async def _fresh_storage() -> PostgresStorageService:
     return storage
 
 
+async def _drain_queue(storage: PostgresStorageService) -> None:
+    """Claim away any PRE-EXISTING queued runs so the shared test DB is clean.
+
+    ``claim_next_queued_run`` is GLOBAL (a worker claims the next queued run across every
+    workspace — correct for a shared work queue), so these tests' assertions about claiming
+    EXACTLY their own runs only hold on an empty queue. Other live suites sharing the one
+    ``himmy_test`` database leave queued runs behind; drain them (claiming flips them to
+    RUNNING, out of the queue) before enqueuing this test's runs. The properties under test
+    — at-most-once SKIP LOCKED, lease renewal, reaping, redrive — are unaffected.
+    """
+    while await storage.claim_next_queued_run("drain", 300) is not None:
+        pass
+
+
 def _uid(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4()}"
 
@@ -49,6 +63,7 @@ def test_concurrent_claims_are_at_most_once() -> None:
     async def scenario() -> None:
         storage = await _fresh_storage()
         try:
+            await _drain_queue(storage)
             ws = _uid("ws")
             ids = [_uid("run") for _ in range(12)]
             for rid in ids:
@@ -79,6 +94,7 @@ def test_renew_reap_redrive_live() -> None:
     async def scenario() -> None:
         storage = await _fresh_storage()
         try:
+            await _drain_queue(storage)
             ws = _uid("ws")
             rid = _uid("run")
             await storage.save_run(
@@ -112,6 +128,7 @@ def test_lane_keying_live() -> None:
     async def scenario() -> None:
         storage = await _fresh_storage()
         try:
+            await _drain_queue(storage)
             ws = _uid("ws")
             local_id, cloud_id = _uid("run"), _uid("run")
             await storage.save_run(

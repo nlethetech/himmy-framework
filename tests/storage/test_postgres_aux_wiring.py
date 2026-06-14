@@ -95,11 +95,55 @@ def _install_pool(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> None:
     import himmy.services.storage.postgres_aux as aux
 
     monkeypatch.setattr(aux, "aux_pool", lambda: pool, raising=False)
-    # postgres_aux imports aux_pool lazily inside _AuxPgPool._resolve via the factory
+    # postgres_aux imports aux_pool lazily inside _AuxPgPool._resolve_async via the factory
     # module, so patch THAT symbol (the import site).
     import himmy.services.storage.aux_store_factory as factory
 
     monkeypatch.setattr(factory, "aux_pool", lambda: pool)
+
+
+def test_owned_pool_resolves_inline_without_nested_loop_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owned-pool path opens its pool by AWAITING inline — never a nested loop.run().
+
+    Regression for the K3/K4 owned-pool deadlock: an aux store with a DSN but no
+    server-published pool (tests, or any non-server embedding) resolves its pool from inside
+    an async body already running ON the shared aux loop. The OLD ``_resolve`` did a nested
+    ``self._loop.run(...)``, parking the loop's only thread in ``Future.result()`` while
+    submitting a coroutine to that same loop — a hard deadlock. ``acquire()`` must instead
+    defer to ``_resolve_async`` and ``await`` pool creation. A loop stand-in whose ``run``
+    explodes proves resolution never blocks on it (offline: no asyncpg, no live DB).
+    """
+    import asyncio
+
+    import himmy.services.storage.aux_store_factory as factory
+    from himmy.services.storage.postgres_aux import _AuxPgPool
+
+    monkeypatch.setattr(factory, "aux_pool", lambda: None)  # force the owned-pool branch
+
+    class _ExplodingLoop:
+        def run(self, coro: Any) -> Any:  # pragma: no cover - asserted unreached
+            coro.close()
+            raise AssertionError(
+                "owned-pool resolution must await inline, not nest a _LoopThread.run"
+            )
+
+    pool = _AuxPgPool(_ExplodingLoop(), dsn="postgresql://u@h/db")
+    fake = _FakePool()
+
+    async def _fake_create(_dsn: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(pool, "_create_owned_pool", _fake_create)
+
+    async def _drive() -> Any:
+        async with pool.acquire() as conn:
+            return conn
+
+    conn = asyncio.run(_drive())
+    assert conn is fake.conn
+    assert pool._owned_pool is fake  # created once, memoised
 
 
 # --------------------------------------------------------------------- routing wiring

@@ -39,6 +39,7 @@ zero-config default keeps using the durable SQLite (server) / in-memory (CLI) st
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -84,21 +85,39 @@ class _AuxPgPool:
         self._loop = loop
         self._dsn = dsn
         self._owned_pool: Any | None = None
+        # Guards lazy owned-pool creation against two loop coroutines racing to open it.
+        # Created lazily inside :meth:`_resolve_async` so it always binds to the aux loop.
+        self._create_lock: asyncio.Lock | None = None
 
-    def _resolve(self) -> Any:
-        """Return the pool to use — the published one, else a lazily-created owned pool."""
+    async def _resolve_async(self) -> Any:
+        """Return the pool to use, awaiting owned-pool creation INLINE on the loop.
+
+        The aux store's async bodies run ON the shared aux loop, so pool resolution must
+        ``await`` — NEVER block on a nested :meth:`_LoopThread.run`. A nested ``run`` would
+        submit a coroutine to the very loop whose only thread is already parked in
+        ``Future.result()``, deadlocking it (the K3 owned-pool path: a DSN-backed store with
+        no server-published pool, e.g. tests or any non-server embedding). The server path
+        publishes a shared pool, so :func:`aux_pool` short-circuits before we get here.
+        """
         from himmy.services.storage.aux_store_factory import aux_pool
 
         published = aux_pool()
         if published is not None:
             return published
-        if self._owned_pool is None:
-            if not self._dsn:
-                raise HimmyError(
-                    "an aux Postgres store needs either the server's published pool "
-                    "or a DSN to open its own; neither is available."
-                )
-            self._owned_pool = self._loop.run(self._create_owned_pool(self._dsn))
+        if self._owned_pool is not None:
+            return self._owned_pool
+        if not self._dsn:
+            raise HimmyError(
+                "an aux Postgres store needs either the server's published pool "
+                "or a DSN to open its own; neither is available."
+            )
+        # Lazily bind the lock to the running (aux) loop; the check-then-set has no await,
+        # so it is atomic on the single-threaded loop.
+        if self._create_lock is None:
+            self._create_lock = asyncio.Lock()
+        async with self._create_lock:
+            if self._owned_pool is None:
+                self._owned_pool = await self._create_owned_pool(self._dsn)
         return self._owned_pool
 
     async def _create_owned_pool(self, dsn: str) -> Any:
@@ -119,9 +138,14 @@ class _AuxPgPool:
         """Drive ``coro`` to completion on the shared aux loop and return the result."""
         return self._loop.run(coro)
 
-    def acquire(self) -> Any:
-        """Return the resolved pool's ``acquire()`` async context manager."""
-        return self._resolve().acquire()
+    def acquire(self) -> _AuxAcquire:
+        """Return an async context manager yielding a pooled connection.
+
+        Resolution is deferred to ``__aenter__`` so the (possibly owned-pool-creating)
+        ``await`` happens INLINE on the aux loop — see :meth:`_resolve_async` for why a
+        synchronous resolve here would deadlock the loop.
+        """
+        return _AuxAcquire(self)
 
     def close(self) -> None:
         """Close the OWNED pool only (never the server's published pool). Idempotent."""
@@ -132,6 +156,34 @@ class _AuxPgPool:
                 self._loop.run(owned.close())
             except Exception:  # pragma: no cover - best-effort teardown
                 pass
+
+
+class _AuxAcquire:
+    """Async context manager that resolves the aux pool, then leases a connection.
+
+    Resolving on ``__aenter__`` keeps owned-pool creation an ``await`` on the running aux
+    loop instead of a nested blocking :meth:`_LoopThread.run`, which would deadlock the
+    single-threaded loop. Delegates to the underlying asyncpg pool's own acquire context
+    manager so connection release is unchanged.
+    """
+
+    __slots__ = ("_aux", "_cm", "_conn")
+
+    def __init__(self, aux: _AuxPgPool) -> None:
+        self._aux = aux
+        self._cm: Any = None
+        self._conn: Any = None
+
+    async def __aenter__(self) -> Any:
+        pool = await self._aux._resolve_async()
+        self._cm = pool.acquire()
+        self._conn = await self._cm.__aenter__()
+        return self._conn
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        if self._cm is not None:
+            return await self._cm.__aexit__(*exc_info)
+        return None
 
 
 def _new_aux_pool(dsn: str | None = None) -> _AuxPgPool:
