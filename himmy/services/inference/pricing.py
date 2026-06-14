@@ -60,10 +60,20 @@ def _prices_from_raw(data: dict[str, Any]) -> dict[str, ModelPrice]:
         out_tok = spec.get("output_cost_per_token")
         if in_tok is None and out_tok is None:
             continue
+        # Optional per-model prompt-cache rate tier (multipliers of the input rate).
+        # Absent -> None -> provider-family default in prompt_cache.resolve_cache_rates.
+        read_mult = spec.get("cache_read_multiplier")
+        write_mult = spec.get("cache_write_multiplier")
         # LiteLLM is USD-per-token; ModelPrice is per-1K.
         table[name] = ModelPrice(
             input_per_1k=float(in_tok or 0.0) * 1000.0,
             output_per_1k=float(out_tok or 0.0) * 1000.0,
+            cache_read_multiplier=(
+                float(read_mult) if read_mult is not None else None
+            ),
+            cache_write_multiplier=(
+                float(write_mult) if write_mult is not None else None
+            ),
         )
     return table
 

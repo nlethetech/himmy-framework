@@ -228,8 +228,16 @@ def test_structured_request_forces_synthetic_tool_choice() -> None:
 
 
 # ------------------------------------------------------ response normalization
-def test_text_blocks_join_and_cache_usage_folds_into_input() -> None:
-    """Multiple text blocks join with newlines; cache reads/writes count as input."""
+def test_text_blocks_join_and_cache_usage_bills_reads_at_discount() -> None:
+    """Text blocks join; input_tokens stays the FULL total but cache tokens bill cheap.
+
+    The cross-provider cost-accounting fix (C2): ``input_tokens`` remains the full
+    total (uncached + cache_read + cache_creation) for back-compat, but ``cost`` now
+    bills cache READS at Anthropic's 0.1x read rate and cache WRITES at the 1.25x (5m)
+    premium — NOT the previous full 1.0x on every folded token — and the discount is
+    surfaced on ``metadata``. (Previously this asserted full-rate cost on all 42
+    tokens; that was the ~10x mis-billing this item fixes.)
+    """
     client = _client(
         [_TextBlock("first"), _TextBlock("second")],
         _Usage(
@@ -244,13 +252,28 @@ def test_text_blocks_join_and_cache_usage_folds_into_input() -> None:
 
     assert resp.status == InferenceStatus.SUCCESS
     assert resp.output_text == "first\nsecond"
-    assert resp.input_tokens == 42  # 10 + 30 cache-read + 2 cache-creation
+    # FULL total preserved for downstream consumers: 10 + 30 read + 2 creation.
+    assert resp.input_tokens == 42
     assert resp.output_tokens == 5
-    expected = pricing.price_for(f"anthropic:{PRICED_MODEL}").cost(
-        input_tokens=42, output_tokens=5
-    )
+
+    price = pricing.price_for(f"anthropic:{PRICED_MODEL}")
+    # Uncached input (10) + output (5) at full rate, then 30 reads at 0.1x and
+    # 2 writes at the 5m 1.25x premium of the input rate.
+    expected = price.cost(input_tokens=10, output_tokens=5) + (
+        price.input_per_1k / 1000.0
+    ) * (30 * 0.1 + 2 * 1.25)
     assert resp.cost == pytest.approx(expected)
     assert resp.cost > 0.0
+    # The discount must be strictly cheaper than the old full-rate-on-everything math.
+    full_rate = price.cost(input_tokens=42, output_tokens=5)
+    assert resp.cost < full_rate
+    # Additive metadata carries the cache breakdown + dollar savings.
+    assert resp.metadata["cache_read_tokens"] == 30
+    assert resp.metadata["cache_creation_tokens"] == 2
+    expected_savings = (price.input_per_1k / 1000.0) * (
+        (30 + 2) - (30 * 0.1 + 2 * 1.25)
+    )
+    assert resp.metadata["cache_savings_usd"] == pytest.approx(expected_savings)
 
 
 def test_tool_use_blocks_normalize_ids_args_and_execute() -> None:

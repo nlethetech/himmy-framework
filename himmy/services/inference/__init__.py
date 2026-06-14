@@ -30,6 +30,7 @@ from himmy.services.inference.models import (
     BatchInferenceRequest,
     BatchInferenceResponse,
     BoundTool,
+    CachePolicy,
     GatewayModelConfig,
     GatewayRuntimeConfig,
     InferenceError,
@@ -49,6 +50,16 @@ from himmy.services.inference.models import (
     synthesize_from_schema,
 )
 from himmy.services.inference.openai_manager import OpenAIClientManager
+from himmy.services.inference.prompt_cache import (
+    CacheCapability,
+    UsageBreakdown,
+    compute_cached_cost,
+    min_cacheable_tokens,
+    read_anthropic_usage,
+    read_openai_usage,
+    resolve_cache_rates,
+    stable_prefix_estimate_tokens,
+)
 from himmy.services.inference.pydantic_ai_manager import (
     PydanticAIClientManager,
 )
@@ -93,6 +104,15 @@ __all__ = [
     "OpenAIClientManager",
     "synthesize_from_schema",
     "ModelPrice",
+    "CachePolicy",
+    "CacheCapability",
+    "UsageBreakdown",
+    "compute_cached_cost",
+    "min_cacheable_tokens",
+    "read_anthropic_usage",
+    "read_openai_usage",
+    "resolve_cache_rates",
+    "stable_prefix_estimate_tokens",
     "StreamDelta",
     "InferenceCache",
     "NoopInferenceCache",

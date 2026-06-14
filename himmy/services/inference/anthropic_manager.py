@@ -40,8 +40,17 @@ from himmy.services.inference.models import (
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
+    ModelPrice,
     ResponseFormat,
     ToolCallRecord,
+)
+from himmy.services.inference.prompt_cache import (
+    CacheCapability,
+    UsageBreakdown,
+    cache_savings_usd,
+    compute_cached_cost,
+    read_anthropic_usage,
+    resolve_cache_rates,
 )
 from himmy.services.tools.access import describe_for_model
 
@@ -156,6 +165,10 @@ class AnthropicClientManager:
     injected client the real ``anthropic.AsyncAnthropic`` is built lazily on first use
     (requiring the ``[anthropic]`` extra + ``ANTHROPIC_API_KEY``).
     """
+
+    #: Anthropic is the explicit-cache provider (``cache_control`` breakpoints). The
+    #: runtime resolves this at the call site to decide how to mark the stable prefix.
+    cache_capability: CacheCapability = CacheCapability.ANTHROPIC_EXPLICIT
 
     def __init__(
         self,
@@ -324,11 +337,21 @@ class AnthropicClientManager:
         if wants_structured and structured is not None:
             output_text = json.dumps(structured)
 
-        input_tokens, output_tokens = _usage_tokens(message)
+        breakdown = read_anthropic_usage(getattr(message, "usage", None))
         price = pricing.price_for(model_path)
         if price.input_per_1k == 0.0 and price.output_per_1k == 0.0:
             price = pricing.price_for(request.model_key)
-        cost = price.cost(input_tokens=input_tokens, output_tokens=output_tokens)
+        ttl = self._policy_ttl(request)
+        read_rate, write_mult = resolve_cache_rates(
+            price,
+            capability=self.cache_capability,
+            ttl=ttl,
+            cache_read_multiplier=price.cache_read_multiplier,
+            cache_write_multiplier=price.cache_write_multiplier,
+        )
+        cost = compute_cached_cost(
+            price, breakdown, read_rate=read_rate, write_mult=write_mult
+        )
 
         return InferenceResponse(
             request_id=request.request_id,
@@ -337,13 +360,21 @@ class AnthropicClientManager:
             output_structured=structured,
             tool_calls=raw_calls,
             tool_returns=tool_returns,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            # input/output tokens stay FULL totals for back-compat downstream.
+            input_tokens=breakdown.total_input,
+            output_tokens=breakdown.output,
             cost=cost,
             model_path=model_path,
             provider_name=self.provider_name,
             latency_ms=(time.perf_counter() - started) * 1000.0,
+            metadata=_cache_metadata(price, breakdown, read_rate, write_mult),
         )
+
+    @staticmethod
+    def _policy_ttl(request: InferenceRequest) -> str:
+        """The cache TTL to bill writes at (from the request policy, default 5m)."""
+        policy = request.cache_policy
+        return policy.ttl if policy is not None else "5m"
 
     async def generate_stream(
         self, request: InferenceRequest
@@ -384,16 +415,26 @@ class AnthropicClientManager:
             yield await self.generate(request)
 
 
-def _usage_tokens(message: Any) -> tuple[int, int]:
-    """Read ``usage.input_tokens``/``output_tokens`` (folding cache reads into input)."""
-    usage = getattr(message, "usage", None)
-    if usage is None:
-        return 0, 0
-    in_tok = int(getattr(usage, "input_tokens", 0) or 0)
-    in_tok += int(getattr(usage, "cache_read_input_tokens", 0) or 0)
-    in_tok += int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-    out_tok = int(getattr(usage, "output_tokens", 0) or 0)
-    return in_tok, out_tok
+def _cache_metadata(
+    price: ModelPrice,
+    breakdown: UsageBreakdown,
+    read_rate: float,
+    write_mult: float,
+) -> dict[str, Any]:
+    """Additive cache observability stamped onto ``InferenceResponse.metadata``.
+
+    Only present when there were cache reads/creations, so the no-cache path stays
+    metadata-clean (and byte-identical for downstream consumers that key on absence).
+    """
+    if breakdown.cache_read == 0 and breakdown.cache_creation == 0:
+        return {}
+    return {
+        "cache_read_tokens": breakdown.cache_read,
+        "cache_creation_tokens": breakdown.cache_creation,
+        "cache_savings_usd": cache_savings_usd(
+            price, breakdown, read_rate=read_rate, write_mult=write_mult
+        ),
+    }
 
 
 __all__ = ["AnthropicClientManager", "DEFAULT_ANTHROPIC_MODEL"]

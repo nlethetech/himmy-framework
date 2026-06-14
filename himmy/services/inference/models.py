@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -183,6 +183,34 @@ class WorkflowState(BaseModel):
         )
 
 
+class CachePolicy(BaseModel):
+    """A provider-agnostic request hint that the stable prompt prefix is cacheable.
+
+    Caching is a request-side *hint*, never a parallel channel: a ``CachePolicy`` on
+    :class:`InferenceRequest` lets a manager mark (or guarantee the stability of) the
+    stable prefix — joined system text plus the bound-tools array — so the provider
+    can serve a prefix cache hit. ``None`` on the request means byte-identical payloads
+    to the no-cache path; this object is only consulted when an adapter that *supports*
+    caching sees a non-``None`` policy with ``enabled=True``.
+
+    Semantics shared across providers: the stable prefix is ``system + bound_tools``;
+    everything after the last system message is volatile and never inside the cache
+    breakpoint. ``min_prefix_tokens`` of ``None`` means "use the per-model default"
+    (see :data:`himmy.services.inference.prompt_cache.MIN_CACHEABLE_TOKENS`).
+    """
+
+    #: Master opt-out for a single request even when a manager supports caching.
+    enabled: bool = True
+    #: Which part of the stable prefix to treat as cacheable.
+    scope: Literal["system_and_tools", "system_only", "none"] = "system_and_tools"
+    #: Override the per-model minimum cacheable-prefix token floor (``None`` = default).
+    min_prefix_tokens: int | None = None
+    #: Anthropic ephemeral cache TTL; ``1h`` is version-gated by the adapter.
+    ttl: Literal["5m", "1h"] = "5m"
+    #: Optional OpenAI-family ``prompt_cache_key`` routing hint (omitted elsewhere).
+    cache_key: str | None = None
+
+
 class InferenceRequest(BaseModel):
     """The single typed request envelope for every model call."""
 
@@ -204,6 +232,10 @@ class InferenceRequest(BaseModel):
     #: ``None`` means no execution capability — managers then synthesize stub results.
     tool_executor: ToolExecutor | None = None
     tool_names_override: list[str] | None = None
+    #: Optional prompt-cache hint for the stable system+tools prefix. ``None`` (the
+    #: default) yields byte-identical payloads to the no-cache path; a manager that
+    #: supports caching consults it only when it is non-``None`` and ``enabled``.
+    cache_policy: CachePolicy | None = None
 
     @model_validator(mode="after")
     def _derive_response_format(self) -> InferenceRequest:
@@ -334,10 +366,19 @@ class BatchInferenceResponse(BaseModel):
 
 
 class ModelPrice(BaseModel):
-    """Per-model token pricing in USD per 1K tokens (input/output split)."""
+    """Per-model token pricing in USD per 1K tokens (input/output split).
+
+    ``cache_read_multiplier`` / ``cache_write_multiplier`` are OPTIONAL per-model
+    overrides for the prompt-cache rate tier (multipliers of ``input_per_1k``).
+    ``None`` means "use the provider-family default" — see
+    :func:`himmy.services.inference.prompt_cache.resolve_cache_rates`. These never
+    affect the non-cached :meth:`cost`.
+    """
 
     input_per_1k: float = 0.0
     output_per_1k: float = 0.0
+    cache_read_multiplier: float | None = None
+    cache_write_multiplier: float | None = None
 
     def cost(self, *, input_tokens: int, output_tokens: int) -> float:
         """Compute USD cost for a usage split."""

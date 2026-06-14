@@ -193,8 +193,8 @@ def test_structured_tool_choice_validates_against_sdk_typeddict() -> None:
 
 
 # --------------------------------------------------- SDK response -> normalized
-def test_real_text_message_normalizes_with_cache_usage_folding() -> None:
-    """A real Message with TextBlocks maps to text + cache-folded usage."""
+def test_real_text_message_normalizes_with_cache_usage_total() -> None:
+    """A real Message maps to text + a FULL input total (cache reads/writes included)."""
     from anthropic.types import TextBlock
 
     message = _real_message(
@@ -209,9 +209,12 @@ def test_real_text_message_normalizes_with_cache_usage_folding() -> None:
 
     assert resp.status == InferenceStatus.SUCCESS
     assert resp.output_text == "first\nsecond"
-    assert resp.input_tokens == 42  # 10 + 30 cache-read + 2 cache-creation
+    # input_tokens stays the FULL total; cost bills reads/writes at their cache rates.
+    assert resp.input_tokens == 42  # 10 uncached + 30 cache-read + 2 cache-creation
     assert resp.output_tokens == 5
     assert resp.cost > 0.0
+    assert resp.metadata["cache_read_tokens"] == 30
+    assert resp.metadata["cache_creation_tokens"] == 2
     assert resp.model_path == f"anthropic:{MODEL}"
 
 
