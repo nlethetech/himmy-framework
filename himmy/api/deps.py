@@ -11,6 +11,7 @@ zero configuration. Swap ``_build_inference`` / ``_build_storage`` or wrap
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -99,6 +100,29 @@ class _LazyStoreProxy:
         if store is None:
             return 0
         return int(store.delete_by_subject(subject_id))
+
+
+def _spine_eraser(storage: Any) -> Callable[[str], int]:
+    """A sync ``(subject_id) -> int`` that hard-deletes the subject's spine threads+events.
+
+    Adapts the wired storage backend's :meth:`delete_by_subject` (sync on the SQLite /
+    in-memory facade, a coroutine on the Postgres backend) to the sync callable the
+    :class:`SubjectReachMap` drives. A coroutine result is run on the shared aux
+    :class:`_LoopThread` (a SEPARATE loop thread), so this never re-enters the request
+    event loop that ``erase_subject`` runs on. ``storage`` is the INNER durable backend
+    (the one ``_governed_overlay`` wraps), so its ``chat_threads`` + ``run_events`` rows —
+    encrypted under the store-wide KEK, never the per-subject key — are physically removed.
+    """
+
+    def _erase(subject_id: str) -> int:
+        result = storage.delete_by_subject(subject_id)
+        if asyncio.iscoroutine(result):
+            from himmy.services.storage.aux_store_factory import aux_loop
+
+            return int(aux_loop().run(result))
+        return int(result)
+
+    return _erase
 
 
 @dataclass(frozen=True)
@@ -647,6 +671,13 @@ class ApiContainer:
         reach = SubjectReachMap(
             memory_store=_LazyStoreProxy(cls._resolve_memory_store),
             conversation_store=_LazyStoreProxy(cls._resolve_conversation_store),
+            # S3 must_fix #1: the runtime persists every governed run's full transcript +
+            # event stream into storage.db chat_threads/run_events ENCRYPTED UNDER THE
+            # STORE-WIDE KEK (consent_storage.ConsentGatedStorage delegates save_thread /
+            # append_event straight through to the inner backend — they are NOT per-subject
+            # keyed). A crypto-shred of the subject key therefore leaves them recoverable, so
+            # erasure HARD-DELETES them here. ``storage`` is that inner backend.
+            spine_eraser=_spine_eraser(storage),
             knowledge_eraser=None,
         )
         retention = RetentionService(

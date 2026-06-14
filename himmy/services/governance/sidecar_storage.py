@@ -196,8 +196,13 @@ class ConsentGatedConversationStore:
     The store's ``subject_id`` column (added by its own additive migration) records the
     linkage so :class:`SubjectReachMap` can find + delete a subject's conversations.
 
-    All reads (``load_thread`` / ``flat_messages`` / ``list_summaries`` / …) decrypt
-    transparently; every non-gated method is delegated unchanged.
+    All message-text reads decrypt transparently: ``load_thread`` rebuilds the rich thread,
+    while ``flat_messages`` / ``list_summaries`` / ``get_summary`` /
+    ``project_conversation_summaries`` (the flat projection + derived titles both UIs read)
+    decrypt per-message under the conversation's subject key. Encryption binds each message
+    ``content`` to the SUBJECT as AAD (not the thread id), so the flat-row tokens — and the
+    title derived from the first user turn — decrypt with the same subject encryptor. Every
+    other (non-text-bearing) method is delegated unchanged.
     """
 
     def __init__(
@@ -242,6 +247,14 @@ class ConsentGatedConversationStore:
             )
             return None
         stored = self._encrypt_thread(thread, subject_id)
+        # The inner store derives the title from the (now-encrypted) thread, which would
+        # both leak nothing AND store an unusable truncated ciphertext (``_derive_title``
+        # trims to 60 chars — a sliced token can't be decrypted). So derive the title from
+        # the PLAINTEXT thread here and pass it pre-encrypted as ONE clean token (subject
+        # AAD), unless the caller already supplied an explicit title. Reads decrypt it via
+        # ``_decrypt_summary``.
+        if "title" not in kwargs or kwargs.get("title") is None:
+            kwargs["title"] = self._encrypt_title(thread, subject_id)
         return cast(
             "ConversationSummary",
             self._inner.save_thread(
@@ -257,7 +270,74 @@ class ConsentGatedConversationStore:
         subject = self._inner.subject_of(conversation_id)
         return self._decrypt_thread(thread, subject) if subject else thread
 
+    def flat_messages(self, conversation_id: str) -> list[Any]:
+        """The flat transcript both UIs read, with each row's ``text`` decrypted.
+
+        The flat ``conversation_messages`` projection is regenerated from the at-rest
+        (encrypted) thread, so each row holds a per-message ciphertext token bound to the
+        conversation's subject as AAD. Decrypt each here so a governed Studio/CLI surface
+        renders plaintext rather than ciphertext; an un-attributed conversation (no subject)
+        and legacy plaintext rows round-trip untouched.
+        """
+        rows = self._inner.flat_messages(conversation_id)
+        subject = self._inner.subject_of(conversation_id)
+        if not subject or not _is_governed_subject(subject):
+            return list(rows)
+        from himmy.services.storage.conversations import FlatMessage
+
+        return [
+            FlatMessage(role=r.role, text=self._decrypt_text(r.text, subject))
+            for r in rows
+        ]
+
+    def get_summary(self, conversation_id: str) -> Any | None:
+        """Return a summary with its derived ``title`` decrypted (subject-scoped)."""
+        summary = self._inner.get_summary(conversation_id)
+        if summary is None:
+            return summary
+        return self._decrypt_summary(summary)
+
+    def list_summaries(self, **kwargs: Any) -> list[Any]:
+        """List conversation summaries with each derived ``title`` decrypted.
+
+        The title is derived from the first user turn, which is ciphertext at rest for a
+        governed subject — decrypt per-summary so the chat list shows readable titles. An
+        un-attributed conversation's title is left untouched.
+        """
+        return [self._decrypt_summary(s) for s in self._inner.list_summaries(**kwargs)]
+
+    def project_conversation_summaries(self, project_id: str) -> list[Any]:
+        """Project-scoped summaries with each derived ``title`` decrypted (subject-scoped)."""
+        return [
+            self._decrypt_summary(s)
+            for s in self._inner.project_conversation_summaries(project_id)
+        ]
+
     # ------------------------------------------------------------------ cipher
+    def _decrypt_summary(self, summary: Any) -> Any:
+        """Return ``summary`` with its ``title`` decrypted under the conversation's subject."""
+        subject = self._inner.subject_of(summary.conversation_id)
+        if not subject or not _is_governed_subject(subject):
+            return summary
+        title = self._decrypt_text(summary.title, subject)
+        if title == summary.title:
+            return summary
+        import dataclasses
+
+        return dataclasses.replace(summary, title=title)
+
+    def _decrypt_text(self, text: str, subject: str) -> str:
+        """Decrypt one flat/title token under ``subject`` (plaintext-safe; shred → ``""``)."""
+        if self._vault is None or not text:
+            return text
+        from himmy.services.storage.encryption import FieldEncryptor
+
+        if not FieldEncryptor.is_encrypted(text):
+            return text
+        if not self._vault.has(subject):
+            return ""  # crypto-shredded: permanently unrecoverable
+        return self._vault.encryptor_for(subject).decrypt(text, aad=subject.encode())
+
     def _encrypt_thread(self, thread: ChatThread, subject: str) -> ChatThread:
         """Return a copy of ``thread`` with each message ``content`` encrypted (subject AAD)."""
         if self._vault is None or not _is_governed_subject(subject):
@@ -271,6 +351,22 @@ class ConsentGatedConversationStore:
             payload, thread_id=subject
         )
         return _Thread.model_validate(payload)
+
+    def _encrypt_title(self, thread: ChatThread, subject: str) -> str | None:
+        """Derive the title from the PLAINTEXT thread and return it encrypted (subject AAD).
+
+        ``None`` when not governed/keyed (the inner store then derives a plaintext title as
+        today). Encrypting the already-trimmed title (not the inner store's slice of the
+        ciphertext) keeps the token whole + decryptable on read.
+        """
+        if self._vault is None or not _is_governed_subject(subject):
+            return None
+        from himmy.services.storage.conversations import _derive_title
+
+        title = _derive_title(thread)
+        if not title:
+            return None
+        return self._vault.encryptor_for(subject).encrypt(title, aad=subject.encode())
 
     def _decrypt_thread(self, thread: ChatThread, subject: str) -> ChatThread:
         """Return a copy of ``thread`` with each message ``content`` decrypted (or as-is)."""

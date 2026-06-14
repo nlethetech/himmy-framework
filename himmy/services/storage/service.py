@@ -92,6 +92,21 @@ class StorageService:
         """List events, optionally filtered by ``thread_id`` and/or ``trace_id``."""
         return await self._event_log.list_events(thread_id, trace_id)
 
+    def delete_by_subject(self, subject_id: str) -> int:
+        """Hard-DELETE a subject's chat_threads + run_events (S4 right-to-erasure).
+
+        Mirrors the durable backends' :meth:`SqliteStorageService.delete_by_subject`: a
+        subject's runs name the threads + event streams the runtime persisted for it, so
+        we resolve those ids and drop the matching threads + events. Synchronous so the
+        sync ``SubjectReachMap.erase`` can drive it directly. Returns rows removed.
+        """
+        thread_ids, trace_ids = self._run_store.thread_and_trace_ids_for_subject(
+            subject_id
+        )
+        removed = self._thread_store.delete_threads(thread_ids)
+        removed += self._event_log.delete_events(thread_ids, trace_ids)
+        return removed
+
     # ------------------------------------------------------------------ context
     async def save_context_field(self, field: ContextField) -> ContextField:
         """Upsert a context field keyed by ``(subject_id, key)``."""

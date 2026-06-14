@@ -50,6 +50,14 @@ class InMemoryThreadStore:
         """Return a stored chat thread by id, or None."""
         return self._threads.get(thread_id)
 
+    def delete_threads(self, thread_ids: set[str]) -> int:
+        """Drop the named threads; return the count removed (S4 erasure)."""
+        removed = 0
+        for tid in thread_ids:
+            if self._threads.pop(tid, None) is not None:
+                removed += 1
+        return removed
+
 
 class InMemoryEventLog:
     """Process-local append-only run-event stream (EventSink surface)."""
@@ -71,6 +79,16 @@ class InMemoryEventLog:
             if (thread_id is None or e.thread_id == thread_id)
             and (trace_id is None or e.trace_id == trace_id)
         ]
+
+    def delete_events(self, thread_ids: set[str], trace_ids: set[str]) -> int:
+        """Drop events whose thread_id OR trace_id is named; return count (S4 erasure)."""
+        before = len(self._events)
+        self._events = [
+            e
+            for e in self._events
+            if e.thread_id not in thread_ids and e.trace_id not in trace_ids
+        ]
+        return before - len(self._events)
 
 
 class InMemoryContextStore:
@@ -226,6 +244,21 @@ class InMemoryRunStore:
         if run_id is None:
             return None
         return self._runs.get(run_id)
+
+    def thread_and_trace_ids_for_subject(
+        self, subject_id: str
+    ) -> tuple[set[str], set[str]]:
+        """The thread_ids + trace_ids of a subject's runs (the S4 erasure linkage)."""
+        thread_ids: set[str] = set()
+        trace_ids: set[str] = set()
+        for run in self._runs.values():
+            if run.subject_id != subject_id:
+                continue
+            if run.thread_id:
+                thread_ids.add(run.thread_id)
+            if run.trace_id:
+                trace_ids.add(run.trace_id)
+        return thread_ids, trace_ids
 
 
 class InMemoryAgentDefStore:

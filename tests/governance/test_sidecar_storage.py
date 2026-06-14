@@ -168,6 +168,76 @@ def test_conversation_allow_encrypts_messages_and_links_subject() -> None:
     assert [m.content for m in back.messages] == ["my SSN is 123", "noted"]
 
 
+def test_conversation_governed_flat_read_and_title_decrypt() -> None:
+    """The S3 must_fix #2: flat_messages / list_summaries / titles decrypt for a subject.
+
+    The flat ``conversation_messages`` projection (and the title derived from the first
+    user turn) is what BOTH UIs read; it is ciphertext at rest for a governed subject, so
+    the gated store must decrypt it on read — otherwise a governed Studio deployment shows
+    ciphertext. Asserts BOTH: at rest stays ciphertext (no leak), and the governed flat
+    read returns plaintext.
+    """
+    ledger, vault, _ = _governed()
+    ledger.grant("hugo", Purpose.RETAIN)
+    inner = ConversationStore(":memory:")
+    gated = ConsentGatedConversationStore(
+        inner, decider=ledger.decision, key_vault=vault
+    )
+    # A long first line so the inner ``_derive_title`` 60-char trim is exercised — a sliced
+    # CIPHERTEXT would be undecryptable, which is exactly why the gated store pre-encrypts
+    # the already-trimmed plaintext title.
+    long_first = "my SSN is 123-45-6789 " + "x" * 80
+    gated.save_thread(
+        "c1",
+        _thread((MessageRole.USER, long_first), (MessageRole.ASSISTANT, "ok")),
+        subject_id="hugo",
+    )
+
+    # At rest the flat rows + the derived title are ciphertext (no plaintext leak).
+    raw_flat = inner.flat_messages("c1")
+    assert all(FieldEncryptor.is_encrypted(m.text) for m in raw_flat)
+    assert "123-45-6789" not in " ".join(m.text for m in raw_flat)
+    assert FieldEncryptor.is_encrypted(inner.get_summary("c1").title)
+
+    # The governed flat read decrypts symmetrically (BOTH UIs read this).
+    flat = gated.flat_messages("c1")
+    assert [m.text for m in flat] == [long_first, "ok"]
+    # The governed summary list + single-summary read decrypt the derived title.
+    [summary] = gated.list_summaries()
+    assert "123-45-6789" in summary.title
+    assert "123-45-6789" in gated.get_summary("c1").title
+
+
+def test_conversation_shredded_subject_flat_read_is_unrecoverable() -> None:
+    """After crypto-shred, a governed flat read yields the tombstone marker, never a crash."""
+    ledger, vault, _ = _governed()
+    ledger.grant("ivy", Purpose.RETAIN)
+    inner = ConversationStore(":memory:")
+    gated = ConsentGatedConversationStore(
+        inner, decider=ledger.decision, key_vault=vault
+    )
+    gated.save_thread(
+        "c1", _thread((MessageRole.USER, "secret note")), subject_id="ivy"
+    )
+    assert vault.destroy("ivy") is True
+    # Reads no longer recover the content (key gone), but never raise.
+    assert [m.text for m in gated.flat_messages("c1")] == [""]
+    assert gated.get_summary("c1").title == ""
+
+
+def test_conversation_unattributed_flat_read_untouched() -> None:
+    """An un-attributed (no-subject) conversation's flat read is plaintext, as today."""
+    ledger, vault, _ = _governed()
+    inner = ConversationStore(":memory:")
+    gated = ConsentGatedConversationStore(
+        inner, decider=ledger.decision, key_vault=vault
+    )
+    gated.save_thread("c9", _thread((MessageRole.USER, "hello world")))
+    assert [m.text for m in gated.flat_messages("c9")] == ["hello world"]
+    [summary] = gated.list_summaries()
+    assert summary.title == "hello world"
+
+
 def test_conversation_denied_subject_is_skipped() -> None:
     ledger, vault, audit = _governed()
     inner = ConversationStore(":memory:")

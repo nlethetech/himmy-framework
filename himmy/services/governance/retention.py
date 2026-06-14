@@ -325,10 +325,10 @@ class StoreErasureResult:
     """The outcome of erasing one subject from one mutable sidecar store (S4).
 
     ``store`` names the durable location (e.g. ``"memory"`` / ``"conversations"`` /
-    ``"knowledge"``); ``deleted`` is the row count hard-removed; ``ok`` is ``False`` (with
-    ``error`` set) when the store raised, so a partial mid-erase failure is recorded — and
-    re-running ``erase_subject`` is idempotent (a re-run deletes whatever survived and
-    flips ``ok`` to ``True`` once the store is clean).
+    ``"knowledge"`` / ``"spine_storage"``); ``deleted`` is the row count hard-removed;
+    ``ok`` is ``False`` (with ``error`` set) when the store raised, so a partial mid-erase
+    failure is recorded — and re-running ``erase_subject`` is idempotent (a re-run deletes
+    whatever survived and flips ``ok`` to ``True`` once the store is clean).
     """
 
     store: str
@@ -397,6 +397,12 @@ class SubjectReachMap:
 
     * ``memory_store`` — the memory module's ``MemoryStore`` (``delete_by_subject``).
     * ``conversation_store`` — the unified ``ConversationStore`` (``delete_by_subject``).
+    * ``spine_eraser`` — a callable ``(subject_id) -> int`` hard-deleting the subject's
+      ``storage.db`` ``chat_threads`` + ``run_events`` rows. The runtime persists every
+      governed run's full transcript + event stream there encrypted under the store-WIDE
+      KEK (NOT the per-subject key), so a crypto-shred alone leaves them recoverable; this
+      reaches them. The wiring layer adapts the storage backend's ``delete_by_subject``
+      (sync on SQLite/in-memory, async on Postgres) to this callable; ``None`` offline.
     * ``knowledge_eraser`` — a callable ``(subject_id) -> int`` deleting a subject-scoped KB's
       rows (the pgvector backend is async + scoped by ``client_id == subject``, so the wiring
       layer adapts it to this sync callable; ``None`` when no knowledge backend is wired).
@@ -404,6 +410,7 @@ class SubjectReachMap:
 
     memory_store: Any = None
     conversation_store: Any = None
+    spine_eraser: Callable[[str], int] | None = None
     knowledge_eraser: Callable[[str], int] | None = None
 
     def erase(self, subject_id: str) -> list[StoreErasureResult]:
@@ -425,6 +432,10 @@ class SubjectReachMap:
                     self.conversation_store.delete_by_subject,
                     subject_id,
                 )
+            )
+        if self.spine_eraser is not None:
+            results.append(
+                _safe_delete("spine_storage", self.spine_eraser, subject_id)
             )
         if self.knowledge_eraser is not None:
             results.append(

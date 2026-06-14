@@ -1953,6 +1953,41 @@ class PostgresStorageService:
         """List events, optionally filtered by thread/trace id (insertion order)."""
         return await self._event_log.list_events(thread_id, trace_id)
 
+    async def delete_by_subject(self, subject_id: str) -> int:
+        """Hard-DELETE a subject's chat_threads + run_events (S4 right-to-erasure).
+
+        The Postgres mirror of :meth:`SqliteStorageService.delete_by_subject`: these tables
+        are encrypted at rest under the store-WIDE cipher (not the per-subject key), so a
+        crypto-shred alone leaves them recoverable — erasure hard-deletes them. A subject's
+        runs (``runs.subject_id``) name every ``thread_id`` / ``trace_id`` the runtime
+        persisted, resolved here via the ``runs`` row's typed columns. Runs in ONE
+        transaction so a mid-delete failure rolls back; idempotent. Returns rows removed.
+        """
+        pool = self._require_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "SELECT thread_id, trace_id FROM runs WHERE subject_id = $1",
+                subject_id,
+            )
+            thread_ids = [r["thread_id"] for r in rows if r["thread_id"]]
+            trace_ids = [r["trace_id"] for r in rows if r["trace_id"]]
+            deleted = 0
+            if thread_ids:
+                tag = await conn.execute(
+                    "DELETE FROM chat_threads WHERE thread_id = ANY($1::text[])",
+                    thread_ids,
+                )
+                deleted += int(str(tag).rsplit(" ", 1)[-1])
+            if thread_ids or trace_ids:
+                tag = await conn.execute(
+                    "DELETE FROM run_events "
+                    "WHERE thread_id = ANY($1::text[]) OR trace_id = ANY($2::text[])",
+                    thread_ids,
+                    trace_ids,
+                )
+                deleted += int(str(tag).rsplit(" ", 1)[-1])
+        return deleted
+
     # ------------------------------------------------------------------ context
     async def save_context_field(self, field: Any) -> Any:
         """Upsert a context field keyed by ``(subject_id, key)``."""

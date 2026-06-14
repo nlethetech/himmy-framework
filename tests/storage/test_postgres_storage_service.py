@@ -133,6 +133,68 @@ def test_thread_round_trip() -> None:
     run_async(scenario())
 
 
+def test_delete_by_subject_removes_threads_and_events() -> None:
+    """S4: a subject's chat_threads + run_events are hard-deleted; controls survive."""
+
+    async def scenario() -> None:
+        storage = await _fresh_storage()
+        try:
+            ws = _uid("w")
+            t1, tr1 = _uid("t"), _uid("tr")
+            t2, tr2 = _uid("t"), _uid("tr")
+            # alice's run names thread t1 / trace tr1; bob's names t2 / tr2.
+            await storage.save_run(
+                RunRecord(
+                    workspace_id=ws,
+                    subject_id="alice",
+                    thread_id=t1,
+                    trace_id=tr1,
+                    status=RunStatus.SUCCEEDED,
+                )
+            )
+            await storage.save_run(
+                RunRecord(
+                    workspace_id=ws,
+                    subject_id="bob",
+                    thread_id=t2,
+                    trace_id=tr2,
+                    status=RunStatus.SUCCEEDED,
+                )
+            )
+            alice_thread = ChatThread(thread_id=t1)
+            alice_thread.append_message(
+                Message(role=MessageRole.USER, content="alice secret")
+            )
+            await storage.save_thread(alice_thread)
+            bob_thread = ChatThread(thread_id=t2)
+            bob_thread.append_message(
+                Message(role=MessageRole.USER, content="bob data")
+            )
+            await storage.save_thread(bob_thread)
+            await storage.append_event(
+                RunEvent(event_type=EventType.AGENT_RUN_STARTED, thread_id=t1, trace_id=tr1)
+            )
+            await storage.append_event(
+                RunEvent(event_type=EventType.AGENT_RUN_STARTED, thread_id=t2, trace_id=tr2)
+            )
+
+            deleted = await storage.delete_by_subject("alice")
+            assert deleted == 2  # one thread + one event
+
+            assert await storage.load_thread(t1) is None
+            assert await storage.list_events(thread_id=t1) == []
+            # The control subject is untouched.
+            assert await storage.load_thread(t2) is not None
+            assert await storage.list_events(thread_id=t2)
+
+            # Idempotent: a re-run removes nothing more.
+            assert await storage.delete_by_subject("alice") == 0
+        finally:
+            await storage.close()
+
+    run_async(scenario())
+
+
 def test_run_jsonb_round_trip_and_idempotency() -> None:
     """Nested-dict metadata/output round-trips; idempotency upsert is race-free (SE-1/2/4)."""
 

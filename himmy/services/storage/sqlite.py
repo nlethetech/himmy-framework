@@ -601,6 +601,57 @@ class SqliteStorageService:
                 self._rollback_quietly()
                 raise
 
+    def delete_by_subject(self, subject_id: str) -> int:
+        """Hard-DELETE a subject's spine ``chat_threads`` + ``run_events`` rows (S4).
+
+        These two tables hold the subject's full conversation transcript and run-event
+        stream, encrypted at rest under the store-WIDE KEK (``self._cipher``) — NOT the
+        per-subject key — so a crypto-shred of the subject key leaves them recoverable.
+        Right-to-erasure therefore reaches them by HARD-DELETE here (mirroring the mutable
+        sidecars), the cheaper match to the reach-map design than re-keying every spine
+        write per subject.
+
+        The subject->thread/trace linkage is the ``runs`` table (``runs.subject_id`` is an
+        indexed column; each run's ``payload`` carries its ``thread_id`` / ``trace_id``):
+        a subject's runs name every thread + event-stream the runtime persisted for it.
+        We resolve those ids, then delete the matching ``chat_threads`` (by ``thread_id``)
+        and ``run_events`` (by ``thread_id`` OR ``trace_id``). Returns the total rows
+        removed. Runs as ONE transaction under the write lock so a mid-delete failure
+        leaves the tables untouched; idempotent (a re-run deletes whatever survived and
+        returns 0 once clean). Synchronous so the sync ``SubjectReachMap.erase`` can drive
+        it directly without re-entering the request event loop.
+        """
+        with self._lock:
+            try:
+                run_rows = self._conn.execute(
+                    "SELECT json_extract(payload, '$.thread_id') AS thread_id, "
+                    "json_extract(payload, '$.trace_id') AS trace_id "
+                    "FROM runs WHERE subject_id = ?",
+                    (subject_id,),
+                ).fetchall()
+                thread_ids = {r["thread_id"] for r in run_rows if r["thread_id"]}
+                trace_ids = {r["trace_id"] for r in run_rows if r["trace_id"]}
+                deleted = 0
+                for tid in thread_ids:
+                    cur = self._conn.execute(
+                        "DELETE FROM chat_threads WHERE thread_id = ?", (tid,)
+                    )
+                    deleted += cur.rowcount
+                    cur = self._conn.execute(
+                        "DELETE FROM run_events WHERE thread_id = ?", (tid,)
+                    )
+                    deleted += cur.rowcount
+                for trace in trace_ids:
+                    cur = self._conn.execute(
+                        "DELETE FROM run_events WHERE trace_id = ?", (trace,)
+                    )
+                    deleted += cur.rowcount
+                self._conn.commit()
+                return deleted
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
     def _event_timestamp(self, record: dict[str, Any]) -> Any:
         """Parse a stored event's ISO ``timestamp`` to an aware datetime, or None."""
         from datetime import datetime

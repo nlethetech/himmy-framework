@@ -131,6 +131,50 @@ def test_reach_map_skips_unwired_stores() -> None:
     assert cert.complete is True
 
 
+def test_spine_eraser_is_walked_and_recorded_in_certificate() -> None:
+    """The S3 must_fix #1: storage.db chat_threads/run_events are reached by erasure.
+
+    The runtime persists a governed run's transcript + events under the store-WIDE KEK
+    (not per-subject), so a crypto-shred alone leaves them recoverable. The reach map's
+    ``spine_eraser`` hard-deletes them and the certificate records the per-store count.
+    """
+    import asyncio
+
+    from himmy.services.storage.models import RunRecord, RunStatus
+    from himmy.services.storage.service import StorageService
+
+    storage = StorageService()
+
+    async def _seed() -> None:
+        await storage.save_run(
+            RunRecord(
+                workspace_id="w",
+                subject_id="subj",
+                thread_id="t1",
+                trace_id="tr1",
+                status=RunStatus.SUCCEEDED,
+            )
+        )
+        t = ChatThread(thread_id="t1")
+        t.append_message(Message(role=MessageRole.USER, content="transcript secret"))
+        await storage.save_thread(t)
+
+    asyncio.run(_seed())
+
+    registry = EntityRegistry()
+    vault = SubjectKeyVault()
+    reach = SubjectReachMap(spine_eraser=storage.delete_by_subject)
+    service = RetentionService(registry, key_vault=vault, reach_map=reach)
+
+    cert = service.erase_subject("subj")
+    by_store = {r.store: r for r in cert.per_store}
+    assert by_store["spine_storage"].deleted == 1  # the one thread row
+    assert by_store["spine_storage"].ok is True
+    assert cert.complete is True
+    # The transcript is physically gone from the spine storage.
+    assert asyncio.run(storage.load_thread("t1")) is None
+
+
 def test_knowledge_eraser_callable_is_walked() -> None:
     registry = EntityRegistry()
     vault = SubjectKeyVault()
