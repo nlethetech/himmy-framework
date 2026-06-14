@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from himmy.services.inference.anthropic_manager import AnthropicClientManager
 from himmy.services.inference.models import (
     BoundTool,
@@ -41,7 +43,6 @@ from himmy.services.inference.prompt_cache import (
 )
 from himmy.services.inference.prompt_cache import (
     anthropic_system_blocks,
-    anthropic_ttl_supported,
     is_openai_family_model,
     openrouter_passthrough_backend,
     should_cache_prefix,
@@ -165,13 +166,20 @@ def test_anthropic_scope_none_stays_plain_string() -> None:
     assert client.messages.seen["system"] == BIG_SYSTEM
 
 
-def test_anthropic_1h_ttl_is_version_gated_degrades_to_5m() -> None:
+def test_anthropic_1h_ttl_is_version_gated_degrades_to_5m(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """1h TTL degrades to 5m + no beta header when the SDK can't be introspected.
 
-    ``anthropic`` is not installed in this checkout, so ``anthropic_ttl_supported()`` is
-    False and the adapter must NOT emit a ``ttl`` key or the extended-cache beta header.
+    We force the unsupported path so the contract is pinned DETERMINISTICALLY: the
+    ambient ``anthropic`` SDK version (absent on the lean install, but >=0.49 when the
+    ``[anthropic]`` extra is present — at which point ttl IS supported) must not flip
+    this test. ``_parse_version`` correctness is covered separately by unit tests.
     """
-    assert anthropic_ttl_supported() is False
+    monkeypatch.setattr(
+        "himmy.services.inference.anthropic_manager.anthropic_ttl_supported",
+        lambda *a, **k: False,
+    )
     client = _aclient()
     mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
     run_async(
@@ -180,6 +188,29 @@ def test_anthropic_1h_ttl_is_version_gated_degrades_to_5m() -> None:
     block = client.messages.seen["system"][0]
     assert block["cache_control"] == {"type": "ephemeral"}  # no ttl key
     assert "extra_headers" not in client.messages.seen
+
+
+def test_anthropic_1h_ttl_emits_block_and_header_when_sdk_supports_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manager emits the 1h ttl block + extended-cache beta header when the SDK
+    supports it — the symmetric counterpart to the degrade test, forced deterministically
+    so it holds whether or not ``anthropic`` is installed in this checkout."""
+    monkeypatch.setattr(
+        "himmy.services.inference.anthropic_manager.anthropic_ttl_supported",
+        lambda *a, **k: True,
+    )
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    run_async(
+        mgr.generate(_areq(BIG_SYSTEM, cache_policy=CachePolicy(ttl="1h")))
+    )
+    block = client.messages.seen["system"][0]
+    assert block["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert (
+        client.messages.seen["extra_headers"]["anthropic-beta"]
+        == "extended-cache-ttl-2025-04-11"
+    )
 
 
 def test_anthropic_1h_ttl_emits_block_and_header_when_supported() -> None:

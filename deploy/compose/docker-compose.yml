@@ -116,7 +116,7 @@ services:
         condition: service_healthy
 
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc  # pgvector/pgvector:pg16
     container_name: himmy_postgres_full
     restart: unless-stopped
     environment:
@@ -141,9 +141,9 @@ services:
       retries: 10
 
   ollama:
-    # Pinned to match the CI Ollama pin (0.13.5). No digest — tag is sufficient
-    # for a self-hosted deployment and keeps the file portable across registries.
-    image: ollama/ollama:0.13.5
+    # Pinned to match the CI Ollama pin (0.13.5), by digest for bit-reproducible
+    # air-gap bundles. The human tag is kept in the trailing comment for legibility.
+    image: ollama/ollama:0.13.5@sha256:2c9595c555fd70a28363489ac03bd5bf9e7c5bdf2890373c3a830ffd7252ce6d  # ollama/ollama:0.13.5
     container_name: himmy_ollama
     restart: unless-stopped
     profiles: ["ollama"]
@@ -159,7 +159,7 @@ services:
   ollama-init:
     # One-shot model puller. Idempotent: `ollama pull` is a no-op if the model
     # is already present, so re-running `up` is safe. Exits after pulling.
-    image: ollama/ollama:0.13.5
+    image: ollama/ollama:0.13.5@sha256:2c9595c555fd70a28363489ac03bd5bf9e7c5bdf2890373c3a830ffd7252ce6d  # ollama/ollama:0.13.5
     container_name: himmy_ollama_init
     profiles: ["ollama"]
     depends_on:

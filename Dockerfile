@@ -11,7 +11,7 @@
 #   docker run --rm -p 8765:8765 himmy-studio   # → http://localhost:8765
 
 # ---- build the Studio frontend ----
-FROM node:20-slim AS web
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS web   # node:20-slim
 WORKDIR /app
 COPY studio/package.json studio/package-lock.json studio/
 RUN cd studio && npm ci
@@ -19,7 +19,7 @@ COPY studio/ studio/
 RUN cd studio && npm run build   # emits to /app/himmy/api/_studio_static
 
 # ---- runtime ----
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9 AS runtime   # python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HIMMY_SECRETS=file

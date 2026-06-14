@@ -56,14 +56,29 @@ MANIFEST_SCHEMA_VERSION = 1
 # (no host-side mount of a docker-managed volume needed). Also SAVED into the
 # bundle so the air-gapped installer can untar the models volume without a
 # registry pull (busybox is ~2 MB gzipped).
-BUSYBOX_IMAGE = "busybox:1.36"
+# Pinned by digest (supply-chain): the human tag is kept ahead of the @sha256 so
+# the ref stays legible AND bit-reproducible — `docker pull`/`docker save` honor
+# the digest, the tag is informational. MUST stay byte-identical to the ref pinned
+# in deploy/compose/docker-compose.yml — otherwise `docker load` registers one ref
+# on the air-gapped target and `compose up` tries to pull another and fails. A test
+# parses the compose file and enforces that every image: ref it references is
+# covered by the bundle's saved image set, so these constants cannot drift.
+BUSYBOX_IMAGE = (
+    "busybox:1.36@sha256:"
+    "73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+)
 
-# Ollama runtime image. MUST stay byte-identical to the tag pinned in
-# deploy/compose/docker-compose.yml — otherwise `docker load` registers one tag
-# on the air-gapped target and `compose up` tries to pull the other and fails.
-# A test parses the compose file and enforces that every image: tag it references
-# is covered by the bundle's saved image set, so this constant cannot drift.
-OLLAMA_IMAGE = "ollama/ollama:0.13.5"
+# Ollama runtime image (pinned by digest; tag retained for legibility).
+OLLAMA_IMAGE = (
+    "ollama/ollama:0.13.5@sha256:"
+    "2c9595c555fd70a28363489ac03bd5bf9e7c5bdf2890373c3a830ffd7252ce6d"
+)
+
+# pgvector image (pinned by digest; tag retained for legibility).
+PGVECTOR_IMAGE = (
+    "pgvector/pgvector:pg16@sha256:"
+    "00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc"
+)
 
 # The Ollama models a default himmy stack expects (chat + two embedders).
 DEFAULT_MODELS: tuple[str, ...] = (
@@ -82,6 +97,13 @@ PIP_PYTHON_VERSION = "312"
 # Volume name MUST match deploy/compose so `docker load`ed models land where the
 # studio stack reads them.
 OLLAMA_VOLUME = "himmy_ollama"
+
+# The uv lockfile, single-sourced from pyproject (runtime ranges stay floating;
+# the lock pins exact versions + hashes for reproducible INSTALLS). When present,
+# the wheelhouse downloads from a hash-locked requirements export of this file so
+# re-runs are bit-reproducible; absent it, we fall back to resolving the extras
+# live. Generated/refreshed with `uv lock` (verified in CI via `uv lock --check`).
+LOCK_FILE = _REPO_ROOT / "uv.lock"
 
 # A ``run`` callable: mirrors subprocess.run's keyword surface we use, returns an
 # object exposing ``.stdout`` (str) when ``capture`` is requested.
@@ -111,7 +133,7 @@ def image_specs(version: str, studio_image: str | None = None) -> dict[str, str]
     """
     return {
         "studio": studio_image or f"himmy-studio:{version}",
-        "pgvector": "pgvector/pgvector:pg16",
+        "pgvector": PGVECTOR_IMAGE,
         "ollama": OLLAMA_IMAGE,
         "busybox": BUSYBOX_IMAGE,
     }
@@ -137,6 +159,53 @@ def wheel_download_argv(platform: str = "linux/amd64") -> list[str]:
         PIP_PYTHON_VERSION,
         "--only-binary=:all:",
         f".[{WHEELHOUSE_EXTRAS}]",
+    ]
+
+
+def uv_export_argv(req_out: Path) -> list[str]:
+    """Exact ``uv export`` argv that renders the locked wheelhouse to ``req_out``.
+
+    Exports the default deps + every wheelhouse extra from ``uv.lock`` into a
+    hash-pinned ``requirements.txt``. ``--frozen`` forbids re-resolution (the lock
+    is authoritative — fail loud if it is stale), ``--no-emit-project`` drops the
+    local ``himmy`` line (it has no published wheel; its deps ARE pinned), and
+    ``--no-dev`` keeps test-only deps out of the deployed wheelhouse.
+    """
+    argv = [
+        "uv",
+        "export",
+        "--frozen",
+        "--no-dev",
+        "--no-emit-project",
+        "--output-file",
+        str(req_out),
+    ]
+    for extra in WHEELHOUSE_EXTRAS.split(","):
+        argv += ["--extra", extra]
+    return argv
+
+
+def locked_wheel_download_argv(req_file: Path, platform: str = "linux/amd64") -> list[str]:
+    """``pip download`` argv that pulls the wheelhouse from a hash-locked req file.
+
+    Same manylinux/cpython target as ``wheel_download_argv``, but reads exact,
+    hash-pinned versions from ``req_file`` (a ``uv export`` of ``uv.lock``) and
+    enforces ``--require-hashes`` so a re-run is bit-reproducible and a swapped
+    artifact fails the download.
+    """
+    return [
+        sys.executable,
+        "-m",
+        "pip",
+        "download",
+        "--platform",
+        PIP_PLATFORM,
+        "--python-version",
+        PIP_PYTHON_VERSION,
+        "--only-binary=:all:",
+        "--require-hashes",
+        "-r",
+        str(req_file),
     ]
 
 
@@ -456,9 +525,20 @@ _PIP_LOCAL_PROJECT_REFUSAL = (
 
 
 def _wheelhouse(run: RunFn, dest: Path, platform: str) -> None:
-    """Populate the offline wheelhouse, with a clear manylinux failure message."""
+    """Populate the offline wheelhouse, with a clear manylinux failure message.
+
+    When ``uv.lock`` exists, the wheelhouse is downloaded from a hash-pinned
+    export of the lock (``--require-hashes``) so re-runs are bit-reproducible and
+    a swapped artifact fails loudly. Absent the lock, falls back to resolving the
+    extras live (``pip download .[extras]``).
+    """
     dest.mkdir(parents=True, exist_ok=True)
-    argv = wheel_download_argv(platform) + ["--dest", str(dest)]
+    if LOCK_FILE.is_file():
+        req = dest / "requirements.lock.txt"
+        run(uv_export_argv(req), check=True, cwd=str(_REPO_ROOT))
+        argv = locked_wheel_download_argv(req, platform) + ["--dest", str(dest)]
+    else:
+        argv = wheel_download_argv(platform) + ["--dest", str(dest)]
     try:
         run(argv, check=True, cwd=str(_REPO_ROOT))
     except subprocess.CalledProcessError as exc:  # pragma: no cover - real pip only

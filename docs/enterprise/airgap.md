@@ -12,7 +12,7 @@ machine with only `docker` + `docker compose` — no pip, no network, no `jq`.
 
 | Path | Contents |
 |---|---|
-| `images/*.tar.gz` | gzipped `docker save` of `himmy-studio`, `pgvector/pgvector:pg16`, `ollama/ollama:0.13.5` (pinned to match compose), and `busybox:1.36` (~2 MB — the installer needs it to untar the models volume offline) |
+| `images/*.tar.gz` | gzipped `docker save` of `himmy-studio`, `pgvector/pgvector:pg16`, `ollama/ollama:0.13.5` (pinned to match compose), and `busybox:1.36` (~2 MB — the installer needs it to untar the models volume offline). The three upstream images are pinned **by digest** (`tag@sha256:…`, tag kept for legibility) in both `scripts/airgap_bundle.py` and `deploy/compose/docker-compose.yml`, so a re-pull resolves byte-identical bits. |
 | `wheels/` | a `manylinux2014_x86_64` / cpython-3.12 wheelhouse for `himmy[studio,knowledge,postgres,encryption,auth]` |
 | `models/ollama-models.tar` | the Ollama models volume, tarred via busybox |
 | `compose/` | a copy of `deploy/compose/` |
@@ -41,6 +41,42 @@ if your deployment doesn't use it.
 > (~1–4 GB each). Images add ~2–4 GB gzipped and the wheelhouse ~0.2–0.6 GB.
 > The `--dry-run` plan prints a coarse estimate before you commit the disk and
 > the transfer.
+
+## Reproducible installs — the dependency lock (`uv.lock`)
+
+himmy is a **library**, so its `pyproject.toml` runtime requirements stay
+floating (`>=`) — that is correct for a consumer that pins on its own side. For
+the parts that need a *reproducible install* (the air-gap wheelhouse and CI), the
+exact resolution is captured once in **`uv.lock`** (generated with [`uv`](https://docs.astral.sh/uv/)):
+
+```sh
+uv lock            # generate / refresh the lock from pyproject (run after any dep change)
+uv lock --check    # CI gate: fail if pyproject drifted from the lock
+```
+
+The lock pins every transitive dependency to an exact version **with sha256
+hashes**, across the whole extras universe. It never alters the floating ranges
+in `pyproject.toml`.
+
+**Where the lock is used:**
+
+- **Air-gap wheelhouse.** When `uv.lock` is present, `scripts/airgap_bundle.py`
+  exports the wheelhouse extras from the lock to a hash-pinned requirements file
+  (`uv export --frozen …`) and downloads with `pip download --require-hashes`, so
+  two runs produce a **bit-reproducible** `wheels/` set and a swapped artifact
+  fails the download. Without the lock it falls back to resolving `.[extras]`
+  live (older behaviour).
+- **CI.** The Deploy workflow runs `uv lock --check` so a dependency change that
+  forgets to refresh the lock fails the build. An air-gapped/CI install can sync
+  straight from the lock with `uv sync --frozen --extra studio --extra knowledge
+  --extra postgres --extra encryption --extra auth`.
+
+> **Why `uv` (not pip-tools)?** `uv` is the resolver available in this
+> environment and produces a single cross-extra, hash-pinned lock with a
+> first-class `--check` consistency gate and a `pip download`-compatible
+> `uv export`. If you must reproduce this without `uv`, the equivalent pip-tools
+> command is `pip-compile --generate-hashes --all-extras -o requirements.lock
+> pyproject.toml` — but `uv.lock` is the source of truth here.
 
 ## Installing (air-gapped host)
 

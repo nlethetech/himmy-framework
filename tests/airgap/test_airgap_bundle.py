@@ -41,13 +41,17 @@ def test_bundle_name() -> None:
 def test_image_specs_default_and_override() -> None:
     default = airgap.image_specs("9.9.9")
     assert default["studio"] == "himmy-studio:9.9.9"
-    assert default["pgvector"] == "pgvector/pgvector:pg16"
-    # ollama MUST be the compose-pinned tag, never :latest (else docker load
-    # registers one tag and compose up pulls another).
-    assert default["ollama"] == "ollama/ollama:0.13.5"
+    # The bundled images are pinned by digest for bit-reproducible offline
+    # bundles, but keep the human version tag in the ref (tag@sha256 form) so the
+    # version pin stays asserted AND never drifts to :latest.
+    assert default["pgvector"].startswith("pgvector/pgvector:pg16@sha256:")
+    assert default["pgvector"] == airgap.PGVECTOR_IMAGE
+    # ollama MUST carry the compose-pinned tag, never :latest (else docker load
+    # registers one ref and compose up pulls another).
+    assert default["ollama"].startswith("ollama/ollama:0.13.5@sha256:")
     assert default["ollama"] == airgap.OLLAMA_IMAGE
     # busybox is shipped so the air-gapped installer can untar models offline.
-    assert default["busybox"] == "busybox:1.36"
+    assert default["busybox"].startswith("busybox:1.36@sha256:")
     assert default["busybox"] == airgap.BUSYBOX_IMAGE
 
     override = airgap.image_specs("9.9.9", studio_image="reg/himmy:custom")
@@ -58,7 +62,10 @@ def test_image_specs_default_and_override() -> None:
 
 
 def test_ollama_tag_matches_compose_pin() -> None:
-    """The bundled ollama tag must equal the tag pinned in compose, byte-for-byte."""
+    """The bundled ollama ref must equal the ref pinned in compose, byte-for-byte.
+
+    Both are digest-pinned (tag@sha256), so this also enforces the digest matches.
+    """
     compose = airgap._COMPOSE_DIR / "docker-compose.yml"
     if not compose.is_file():
         pytest.skip("compose file absent (produced by the compose lane)")
@@ -66,6 +73,8 @@ def test_ollama_tag_matches_compose_pin() -> None:
     ollama_refs = {r for r in refs if r.startswith("ollama/ollama")}
     assert ollama_refs, "compose declares no ollama/ollama image"
     assert ollama_refs == {airgap.OLLAMA_IMAGE}
+    # the version pin is still present in the digest-pinned ref
+    assert airgap.OLLAMA_IMAGE.startswith("ollama/ollama:0.13.5@sha256:")
 
 
 def test_wheel_download_argv_is_exact() -> None:
@@ -165,10 +174,16 @@ def test_resolve_compose_var_defaults() -> None:
 
 
 def test_wheelhouse_local_project_refusal_prints_workaround(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The pip local-project + --only-binary refusal must surface the doc'd fix."""
+    """The pip local-project + --only-binary refusal must surface the doc'd fix.
+
+    This is the lock-ABSENT fallback path (resolving ``.[extras]`` live), so point
+    LOCK_FILE at a nonexistent file to force it.
+    """
     import subprocess
+
+    monkeypatch.setattr(airgap, "LOCK_FILE", tmp_path / "no-such-uv.lock")
 
     def fake_run(argv: Any, *, check: bool = True, cwd: str | None = None) -> Any:
         raise subprocess.CalledProcessError(
@@ -182,6 +197,56 @@ def test_wheelhouse_local_project_refusal_prints_workaround(
     msg = str(ei.value)
     assert "python3 -m build --wheel" in msg
     assert "--no-index" not in msg  # this is the build-side message, not install
+
+
+def test_uv_export_argv_covers_lock_and_extras(tmp_path: Path) -> None:
+    """The lock export must be frozen, drop the local project, and emit hashes."""
+    req = tmp_path / "requirements.lock.txt"
+    argv = airgap.uv_export_argv(req)
+    assert argv[:2] == ["uv", "export"]
+    assert "--frozen" in argv  # never silently re-resolve a stale lock
+    assert "--no-dev" in argv  # test-only deps stay out of the deployed wheelhouse
+    assert "--no-emit-project" in argv  # himmy itself has no published wheel here
+    assert argv[argv.index("--output-file") + 1] == str(req)
+    # every wheelhouse extra is exported
+    for extra in airgap.WHEELHOUSE_EXTRAS.split(","):
+        assert ["--extra", extra] == argv[argv.index(extra) - 1 : argv.index(extra) + 1]
+
+
+def test_locked_wheel_download_argv_requires_hashes(tmp_path: Path) -> None:
+    """The locked download must enforce hashes for a bit-reproducible wheelhouse."""
+    req = tmp_path / "requirements.lock.txt"
+    argv = airgap.locked_wheel_download_argv(req)
+    assert "download" in argv
+    assert argv[argv.index("--platform") + 1] == "manylinux2014_x86_64"
+    assert argv[argv.index("--python-version") + 1] == "312"
+    assert "--only-binary=:all:" in argv
+    assert "--require-hashes" in argv  # a swapped artifact must fail the download
+    assert argv[argv.index("-r") + 1] == str(req)
+
+
+def test_wheelhouse_uses_lock_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a lock present, the wheelhouse exports it then downloads with hashes."""
+    lock = tmp_path / "uv.lock"
+    lock.write_text("# lock\n", encoding="utf-8")
+    monkeypatch.setattr(airgap, "LOCK_FILE", lock)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: Any, *, check: bool = True, cwd: str | None = None) -> Any:
+        calls.append(list(argv))
+        return SimpleNamespace(stdout="", returncode=0)
+
+    airgap._wheelhouse(fake_run, tmp_path / "wheels", "linux/amd64")
+    flat = "\n".join(" ".join(c) for c in calls)
+    # exported from the lock, then pip-downloaded with --require-hashes -r <req>
+    assert "uv export --frozen" in flat
+    assert "--require-hashes" in flat
+    assert " -r " in flat
+    # the live `.[extras]` local-project resolution path is NOT used when locked
+    assert f".[{airgap.WHEELHOUSE_EXTRAS}]" not in flat
 
 
 def test_sha256sums_text_is_coreutils_format() -> None:
@@ -294,7 +359,9 @@ def test_build_bundle_happy_path(
     assert manifest["schema_version"] == 1
     assert manifest["models"] == ["qwen2.5:3b-instruct"]
     ollama = next(i for i in manifest["images"] if i["name"] == "ollama")
-    assert ollama["ref"] == "ollama/ollama:0.13.5"
+    # digest-pinned ref (tag@sha256); the version pin is retained in the ref
+    assert ollama["ref"] == airgap.OLLAMA_IMAGE
+    assert ollama["ref"].startswith("ollama/ollama:0.13.5@sha256:")
     assert ollama["platform"] == "linux/amd64"
     studio = next(i for i in manifest["images"] if i["name"] == "studio")
     assert studio["platform"] == "local"
