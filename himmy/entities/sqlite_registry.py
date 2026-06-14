@@ -194,6 +194,14 @@ class SqliteEntityRegistry:
         """
         with self._write_lock:
             current = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            target = max(SPINE_SCHEMA_VERSION, current)
+            # Opening an already-current database must stay a READ-ONLY operation: a
+            # second connection to a file whose first writer holds an open (e.g. buffered)
+            # transaction would otherwise deadlock on `PRAGMA user_version`/commit
+            # (`database is locked`). Only acquire the write lock when there is real DDL
+            # to apply — a fresh/legacy file at version 0, or a pending forward migration.
+            if current == target and current != 0:
+                return
             try:
                 if current == 0:
                     # Either a brand-new database, OR a legacy file written before
@@ -205,7 +213,6 @@ class SqliteEntityRegistry:
                         for statement in statements:
                             self._conn.execute(statement)  # noqa: S608 - constant DDL
                 # Stamp the highest known version (PRAGMA cannot be parameterised).
-                target = max(SPINE_SCHEMA_VERSION, current)
                 self._conn.execute(f"PRAGMA user_version = {int(target)}")
                 self._conn.commit()
             except BaseException:
