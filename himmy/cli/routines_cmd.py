@@ -154,7 +154,10 @@ def _cmd_add(args: argparse.Namespace) -> int:
 
 def _resolve_local(routine_id: str) -> svc.Routine | None:
     """Fetch a routine in the local workspace (None when unknown / out-of-workspace)."""
-    return svc.get_routines_store().get(routine_id, workspace_id=svc.LOCAL_WORKSPACE)
+    routine: svc.Routine | None = svc.get_routines_store().get(
+        routine_id, workspace_id=svc.LOCAL_WORKSPACE
+    )
+    return routine
 
 
 def _cmd_show(args: argparse.Namespace) -> int:

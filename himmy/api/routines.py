@@ -47,6 +47,24 @@ logger = logging.getLogger("himmy.api.routines")
 #: the builtin generic for the type checker — e.g. ``find_by_agent_id -> _list[str]``.
 _list = list
 
+
+class _Unconditional:
+    """Sentinel: ``mark_started`` should stamp the start WITHOUT a ``last_run_at`` guard.
+
+    Distinct from a real ``last_run_at`` sentinel (a string OR ``None`` for a never-run
+    routine): the conditional claim is the TICK path's anti-double-fire guard, but the
+    manual ``run_now`` path must always fire (overlap is prevented by the host flock), so it
+    passes :data:`UNCONDITIONAL` to skip the predicate.
+    """
+
+
+#: The "no ``last_run_at`` guard" marker for the manual ``run_now`` start stamp.
+UNCONDITIONAL = _Unconditional()
+
+#: A captured-sentinel type: either a real ``last_run_at`` value (str / ``None``) to gate
+#: the atomic claim on, or :data:`UNCONDITIONAL` to skip the gate.
+_StartAnchor = "str | None | _Unconditional"
+
 # ---- schedule grammar -----------------------------------------------------
 
 _AT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
@@ -443,15 +461,39 @@ class RoutinesStore:
         ).fetchall()
         return [r["id"] for r in rows]
 
-    def mark_started(self, routine_id: str, started_at: str) -> None:
+    def mark_started(
+        self,
+        routine_id: str,
+        started_at: str,
+        *,
+        expected_last_run_at: Any = UNCONDITIONAL,
+    ) -> bool:
         """Stamp the run start — also the due-math anchor, so a slow run can't
-        re-trigger itself on the next tick."""
-        self._conn.execute(
-            "UPDATE routines SET last_run_at = ?, last_status = 'running',"
-            " last_error = NULL, last_delivery = NULL WHERE id = ?",
-            (started_at, routine_id),
-        )
+        re-trigger itself on the next tick. Returns ``True`` iff the start was claimed.
+
+        ``expected_last_run_at`` is the value read at due-evaluation in
+        :meth:`RoutineScheduler.tick`: passing it makes the stamp a CONDITIONAL UPDATE
+        (``WHERE last_run_at IS ?`` — ``IS`` matches the NULL first-run case) so a routine
+        due on every tick is claimed exactly once even across processes — the same contract
+        the Postgres mirror gives across replicas (the SQLite box ALSO keeps the host
+        flock). The manual ``run_now`` path passes :data:`UNCONDITIONAL` (the default) to
+        always fire — overlap there is prevented by the flock, not the anchor.
+        """
+        if isinstance(expected_last_run_at, _Unconditional):
+            cur = self._conn.execute(
+                "UPDATE routines SET last_run_at = ?, last_status = 'running',"
+                " last_error = NULL, last_delivery = NULL WHERE id = ?",
+                (started_at, routine_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE routines SET last_run_at = ?, last_status = 'running',"
+                " last_error = NULL, last_delivery = NULL"
+                " WHERE id = ? AND last_run_at IS ?",
+                (started_at, routine_id, expected_last_run_at),
+            )
         self._conn.commit()
+        return cur.rowcount == 1
 
     def record_result(
         self,
@@ -473,7 +515,9 @@ class RoutinesStore:
         self._conn.close()
 
 
-_STORE: RoutinesStore | None = None
+#: ``Any`` because under a Postgres DSN this is the K4 :class:`PostgresRoutinesStore`
+#: (whose ``mark_started`` is the atomic cluster-wide claim) rather than the SQLite store.
+_STORE: Any | None = None
 _PATH: str | None = None
 
 
@@ -486,16 +530,29 @@ def routines_db_path() -> str:
     return str(d / "routines.db")
 
 
-def get_routines_store() -> RoutinesStore:
+def get_routines_store() -> Any:
+    """Resolve the process-wide routines store.
+
+    Under a Postgres DSN this is the K4 Postgres mirror (``"local"`` tenant) whose
+    ``mark_started`` is the atomic cluster-wide claim (a routine due on every tick fires
+    exactly once across N replicas); offline the durable SQLite file store byte-for-byte,
+    guarded by the host flock.
+    """
     global _STORE, _PATH
     path = routines_db_path()
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        # K2: route through the one aux-store selector (Postgres mirror = K4; None today).
+        # K4: route through the one aux-store selector — the Postgres mirror is the
+        # ``"local"``-tenant routines store; the SQLite builder is the offline default.
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _STORE = select_aux_store(lambda: RoutinesStore(path))
+        def _pg() -> Any:
+            from himmy.services.storage.postgres_aux import PostgresRoutinesStore
+
+            return PostgresRoutinesStore(tenant="local")
+
+        _STORE = select_aux_store(lambda: RoutinesStore(path), _pg)
         _PATH = path
     return _STORE
 
@@ -801,7 +858,10 @@ def routine_lock_name(routine_id: str) -> str:
 
 
 async def execute_routine(
-    routine_id: str, *, now: Callable[[], datetime] | None = None
+    routine_id: str,
+    *,
+    now: Callable[[], datetime] | None = None,
+    expected_last_run_at: Any = UNCONDITIONAL,
 ) -> Routine | None:
     """Run one routine end-to-end: run → deliver → record → notify.
 
@@ -815,6 +875,13 @@ async def execute_routine(
     :func:`process_lock` keyed ``routine-<id>`` is held for the whole execution; a
     concurrent attempt anywhere on the host raises :class:`RoutineBusyError` (mapped to
     a 409 / a CLI "already running" message) rather than executing twice.
+
+    Cluster-wide single-flight (K4 reviewer must_fix): on the Postgres mirror the host
+    flock does NOT span replicas, so ``expected_last_run_at`` — the ``last_run_at`` captured
+    at due-evaluation in :meth:`RoutineScheduler.tick` — gates an ATOMIC start claim in
+    ``mark_started``. If another replica already claimed this tick (the conditional UPDATE
+    matched 0 rows), this call returns the routine unchanged WITHOUT running. ``run_now``
+    passes :data:`UNCONDITIONAL` so a manual trigger always fires.
     """
     from himmy.core.process_lock import ProcessLockBusy, process_lock
 
@@ -824,7 +891,12 @@ async def execute_routine(
         return None
     try:
         with process_lock(routine_lock_name(routine_id)):
-            return await _execute_locked(routine_id, routine, now=now)
+            return await _execute_locked(
+                routine_id,
+                routine,
+                now=now,
+                expected_last_run_at=expected_last_run_at,
+            )
     except ProcessLockBusy as exc:
         raise RoutineBusyError(routine_id) from exc
 
@@ -834,11 +906,26 @@ async def _execute_locked(
     routine: Routine,
     *,
     now: Callable[[], datetime] | None = None,
+    expected_last_run_at: Any = UNCONDITIONAL,
 ) -> Routine | None:
-    """The guarded body of :func:`execute_routine` (runs while the flock is held)."""
+    """The guarded body of :func:`execute_routine` (runs while the flock is held).
+
+    The start stamp is the atomic claim: when ``expected_last_run_at`` is a captured
+    sentinel (the tick path) and the conditional ``mark_started`` matches 0 rows, a peer
+    replica already won this tick — return the routine WITHOUT running so the gated tools /
+    deliveries fire exactly once cluster-wide.
+    """
     store = get_routines_store()
     now_fn = now or _default_now
-    store.mark_started(routine_id, now_fn().isoformat())
+    claimed = store.mark_started(
+        routine_id,
+        now_fn().isoformat(),
+        expected_last_run_at=expected_last_run_at,
+    )
+    if not claimed:
+        # A peer replica won this tick's atomic claim — do not double-run.
+        peer_won: Routine | None = store.get(routine_id)
+        return peer_won
     try:
         status, output, error = await _run_headless(routine)
     except asyncio.CancelledError:
@@ -857,7 +944,8 @@ async def _execute_locked(
         routine_id, status=status, preview=preview, error=error, delivery=delivery
     )
     _notify(routine, status, preview, error)
-    return store.get(routine_id)
+    refreshed: Routine | None = store.get(routine_id)
+    return refreshed
 
 
 # ---- the scheduler -----------------------------------------------------------
@@ -949,20 +1037,28 @@ class RoutineScheduler:
                 continue
             if not is_due(routine, now):
                 continue
-            self._launch(routine.id)
+            # Capture last_run_at AT due-evaluation (the SAME value is_due anchored on) and
+            # thread it into the atomic start claim, so the cluster-wide conditional UPDATE
+            # gates on the value this tick observed — not a fresh re-read that a peer replica
+            # may already have moved (K4 reviewer must_fix).
+            self._launch(routine.id, routine.last_run_at)
             launched.append(routine.id)
         return launched
 
-    def _launch(self, routine_id: str) -> asyncio.Task[Routine | None]:
+    def _launch(
+        self, routine_id: str, expected_last_run_at: Any
+    ) -> asyncio.Task[Routine | None]:
         """Fire-and-forget launch for the tick loop — failures are swallowed.
 
         The tick path never awaits the returned task, so a genuine run failure (or
         cross-process flock contention) must not escape: :func:`_guarded_execute`
         funnels everything to a logged ``None``. ``run_now`` does NOT use this path
         precisely because it must let :class:`RoutineBusyError` surface (a 409).
+        ``expected_last_run_at`` is the due-time sentinel for the atomic cluster-wide claim.
         """
         task = asyncio.create_task(
-            self._guarded_execute(routine_id), name=f"himmy-routine-{routine_id}"
+            self._guarded_execute(routine_id, expected_last_run_at),
+            name=f"himmy-routine-{routine_id}",
         )
         self._track(routine_id, task)
         return task
@@ -972,9 +1068,15 @@ class RoutineScheduler:
         self._running[routine_id] = task
         task.add_done_callback(lambda _t: self._running.pop(routine_id, None))
 
-    async def _guarded_execute(self, routine_id: str) -> Routine | None:
+    async def _guarded_execute(
+        self, routine_id: str, expected_last_run_at: Any
+    ) -> Routine | None:
         try:
-            return await execute_routine(routine_id, now=self._now)
+            return await execute_routine(
+                routine_id,
+                now=self._now,
+                expected_last_run_at=expected_last_run_at,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - one failed run never kills the scheduler

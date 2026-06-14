@@ -33,7 +33,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -399,9 +399,11 @@ class WorkflowsStore:
 
 # ---- process-wide singletons (path-keyed, like the routines store) ----------
 
-_TEAMS_STORE: TeamsStore | None = None
+#: ``Any`` because under a Postgres DSN these are the K4 Postgres mirrors rather than the
+#: SQLite stores; both expose the same list/get/upsert/delete/find_by_agent_id surface.
+_TEAMS_STORE: Any | None = None
 _TEAMS_PATH: str | None = None
-_WORKFLOWS_STORE: WorkflowsStore | None = None
+_WORKFLOWS_STORE: Any | None = None
 _WORKFLOWS_PATH: str | None = None
 
 
@@ -425,32 +427,52 @@ def workflows_db_path() -> str:
     return str(d / "workflows.db")
 
 
-def get_teams_store() -> TeamsStore:
-    """Resolve the process-wide teams store, rebuilding it if the path changed."""
+def get_teams_store() -> Any:
+    """Resolve the process-wide teams store, rebuilding it if the path changed.
+
+    Under a Postgres DSN this is the K4 Postgres mirror (``"local"`` tenant); offline the
+    durable SQLite file store at ``.himmy/teams.db`` byte-for-byte.
+    """
     global _TEAMS_STORE, _TEAMS_PATH
     path = teams_db_path()
     if _TEAMS_STORE is None or _TEAMS_PATH != path:
         if _TEAMS_STORE is not None:
             _TEAMS_STORE.close()
-        # K2: route through the one aux-store selector (Postgres mirror = K4; None today).
+        # K4: route through the one aux-store selector — the Postgres mirror is the
+        # ``"local"``-tenant teams store; the SQLite builder is the offline default.
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _TEAMS_STORE = select_aux_store(lambda: TeamsStore(path))
+        def _pg() -> Any:
+            from himmy.services.storage.postgres_aux import PostgresTeamsStore
+
+            return PostgresTeamsStore(tenant="local")
+
+        _TEAMS_STORE = select_aux_store(lambda: TeamsStore(path), _pg)
         _TEAMS_PATH = path
     return _TEAMS_STORE
 
 
-def get_workflows_store() -> WorkflowsStore:
-    """Resolve the process-wide workflows store, rebuilding it if the path changed."""
+def get_workflows_store() -> Any:
+    """Resolve the process-wide workflows store, rebuilding it if the path changed.
+
+    Under a Postgres DSN this is the K4 Postgres mirror (``"local"`` tenant); offline the
+    durable SQLite file store at ``.himmy/workflows.db`` byte-for-byte.
+    """
     global _WORKFLOWS_STORE, _WORKFLOWS_PATH
     path = workflows_db_path()
     if _WORKFLOWS_STORE is None or _WORKFLOWS_PATH != path:
         if _WORKFLOWS_STORE is not None:
             _WORKFLOWS_STORE.close()
-        # K2: route through the one aux-store selector (Postgres mirror = K4; None today).
+        # K4: route through the one aux-store selector — the Postgres mirror is the
+        # ``"local"``-tenant workflows store; the SQLite builder is the offline default.
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _WORKFLOWS_STORE = select_aux_store(lambda: WorkflowsStore(path))
+        def _pg() -> Any:
+            from himmy.services.storage.postgres_aux import PostgresWorkflowsStore
+
+            return PostgresWorkflowsStore(tenant="local")
+
+        _WORKFLOWS_STORE = select_aux_store(lambda: WorkflowsStore(path), _pg)
         _WORKFLOWS_PATH = path
     return _WORKFLOWS_STORE
 
@@ -503,14 +525,21 @@ def get_graph_checkpoint_store() -> object:
         return _GRAPH_CP_STORE
 
     from himmy.config.project import graph_checkpoints_db_path
+    from himmy.services.storage.aux_store_factory import aux_postgres_enabled
+
+    # K3: under a Postgres DSN the durable graph-checkpoint store is the Postgres mirror
+    # (``"local"`` tenant — the shared single-box surface); otherwise the SQLite file store.
+    if aux_postgres_enabled():
+        from himmy.services.storage.postgres_aux import PostgresGraphCheckpointStore
+
+        if not isinstance(_GRAPH_CP_STORE, PostgresGraphCheckpointStore):
+            _GRAPH_CP_STORE = PostgresGraphCheckpointStore(tenant="local")
+            _GRAPH_CP_PATH = None
+        return _GRAPH_CP_STORE
 
     path = graph_checkpoints_db_path()
     if not isinstance(_GRAPH_CP_STORE, SqliteGraphCheckpointStore) or _GRAPH_CP_PATH != path:
-        # K2: in a server context the durable backend choice routes through the one
-        # aux-store selector (tenant-scoped Postgres mirror = K3; None today → SQLite).
-        from himmy.services.storage.aux_store_factory import select_aux_store
-
-        _GRAPH_CP_STORE = select_aux_store(lambda: SqliteGraphCheckpointStore(path))
+        _GRAPH_CP_STORE = SqliteGraphCheckpointStore(path)
         _GRAPH_CP_PATH = path
     return _GRAPH_CP_STORE
 

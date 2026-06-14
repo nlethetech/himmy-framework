@@ -1,0 +1,1412 @@
+"""Storage kernel: Postgres mirrors of the auxiliary stores (K3 + K4).
+
+himmy's auxiliary stores (the HITL approval checkpoints, the graph-run checkpoints, the
+unified conversation store, routines, teams, and workflows) historically wrote file-backed
+SQLite sidecars (``.himmy/*.db``) with no Postgres branch, so a ``HIMMY_DATABASE_URL``
+Postgres deployment was silently HYBRID — runs/spine in Postgres, these on local SQLite. K3
+(the two HITL checkpoint stores) and K4 (conversations + routines + teams + workflows)
+route these into Postgres through the K2 :mod:`himmy.services.storage.aux_store_factory`
+choke point, under the ONE ``schema_migrations`` ledger (the ``aux_*`` tables in
+:data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`).
+
+Each mirror is the SYNCHRONOUS twin of its SQLite store (the callers — the runtime's
+``_emit`` hot path, the Studio approvals router, the routine scheduler — call these
+synchronously), so each is a thin facade that drives async asyncpg work on the SHARED aux
+event loop (:func:`himmy.services.storage.aux_store_factory.aux_loop`) and reuses the ONE
+asyncpg pool the K1 lifespan published (:func:`aux_pool`) rather than opening N pools. The
+async bodies live on the matching ``_Async*`` classes; the sync facades just ``loop.run``
+them.
+
+Two reviewer-grade properties from the plan are load-bearing here:
+
+* **Tenant discriminator (K3 must_fix).** Studio's ``approvals.db`` and /v1's
+  ``v1_approvals.db`` are DELIBERATELY separate surfaces; collapsing them into one
+  undifferentiated Postgres table would let a /v1 tenant read Studio's (or another
+  tenant's) checkpoints. Every aux table carries a ``tenant`` column and EVERY read/write
+  is scoped on it, so the two HITL inboxes stay isolated. The tenant is bound at store
+  construction (``"studio"`` for Studio, ``"v1"`` for /v1, ``"local"`` for the
+  shared conversation/teams/workflows/graph singletons).
+* **Per-record JSON schema migration on read (K3 must_fix).** A checkpoint's
+  ``schema_version`` is a ROW-LEVEL blob migration (``_migrate_checkpoint`` /
+  ``_migrate_graph_checkpoint``), NOT table DDL. The Postgres path reuses the SAME
+  upgraders on read, so a legacy-version blob written by an older build is upgraded
+  identically whether it came from SQLite or Postgres.
+
+Offline-first is preserved byte-for-byte: nothing here is imported unless
+``HIMMY_DATABASE_URL`` is a ``postgres://`` DSN AND a Postgres aux pool is reachable; the
+zero-config default keeps using the durable SQLite (server) / in-memory (CLI) stores.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING, Any
+
+from himmy.core.errors import HimmyError
+from himmy.core.ids import new_uuid, utc_now_iso
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Sequence
+
+    from himmy.agents.base_agent.thread import ChatThread
+    from himmy.entities.sync_facade import _LoopThread
+    from himmy.runtime.checkpoint import (
+        AgentCheckpoint,
+        GraphCheckpoint,
+    )
+    from himmy.services.storage.conversations import (
+        ConversationSummary,
+        FlatMessage,
+    )
+
+#: Builtin ``list`` aliased so annotations on methods that follow a ``def list`` (which
+#: shadows the builtin name in class scope) still resolve to the builtin generic — the
+#: same pattern the SQLite stores use.
+_list = list
+
+
+# --------------------------------------------------------------------------- pool plumbing
+
+
+class _AuxPgPool:
+    """A lazily-resolved asyncpg pool for the aux Postgres stores.
+
+    Prefers the ONE pool the K1 lifespan published (via
+    :func:`himmy.services.storage.aux_store_factory.aux_pool`) so an aux store reuses the
+    server's existing pool instead of opening a second one. When no pool is published (a
+    direct/programmatic construction with a DSN), it opens its OWN asyncpg pool on the
+    shared aux loop and owns its teardown. ``acquire()`` returns the resolved pool's
+    connection context manager; the JSONB codec is registered on every pooled connection so
+    ``data`` round-trips as native dict/list.
+    """
+
+    def __init__(self, loop: _LoopThread, dsn: str | None) -> None:
+        self._loop = loop
+        self._dsn = dsn
+        self._owned_pool: Any | None = None
+
+    def _resolve(self) -> Any:
+        """Return the pool to use — the published one, else a lazily-created owned pool."""
+        from himmy.services.storage.aux_store_factory import aux_pool
+
+        published = aux_pool()
+        if published is not None:
+            return published
+        if self._owned_pool is None:
+            if not self._dsn:
+                raise HimmyError(
+                    "an aux Postgres store needs either the server's published pool "
+                    "or a DSN to open its own; neither is available."
+                )
+            self._owned_pool = self._loop.run(self._create_owned_pool(self._dsn))
+        return self._owned_pool
+
+    async def _create_owned_pool(self, dsn: str) -> Any:
+        """Create an owned asyncpg pool with the shared JSONB codec init."""
+        from himmy.services.storage.postgres import _register_codecs, _require_asyncpg
+
+        asyncpg = _require_asyncpg()
+        return await asyncpg.create_pool(
+            dsn,
+            min_size=1,
+            max_size=5,
+            timeout=30.0,
+            command_timeout=30.0,
+            init=_register_codecs,
+        )
+
+    def run(self, coro: Any) -> Any:
+        """Drive ``coro`` to completion on the shared aux loop and return the result."""
+        return self._loop.run(coro)
+
+    def acquire(self) -> Any:
+        """Return the resolved pool's ``acquire()`` async context manager."""
+        return self._resolve().acquire()
+
+    def close(self) -> None:
+        """Close the OWNED pool only (never the server's published pool). Idempotent."""
+        if self._owned_pool is not None:
+            owned = self._owned_pool
+            self._owned_pool = None
+            try:
+                self._loop.run(owned.close())
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+
+
+def _new_aux_pool(dsn: str | None = None) -> _AuxPgPool:
+    """Build an :class:`_AuxPgPool` bound to the process-wide shared aux loop."""
+    from himmy.services.storage.aux_store_factory import aux_loop
+
+    return _AuxPgPool(aux_loop(), dsn)
+
+
+# ============================================================ K3: HITL checkpoint mirrors
+
+
+class _AsyncCheckpointStore:
+    """Async body of the Postgres HITL approval checkpoint store (tenant-scoped)."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def save(self, checkpoint: AgentCheckpoint) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_agent_checkpoints "
+                "(tenant, checkpoint_id, status, data, created_at) "
+                "VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (tenant, checkpoint_id) DO UPDATE SET "
+                "status = EXCLUDED.status, data = EXCLUDED.data",
+                self._tenant,
+                checkpoint.checkpoint_id,
+                checkpoint.status,
+                json.loads(checkpoint.model_dump_json()),
+                checkpoint.created_at,
+            )
+
+    async def load(self, checkpoint_id: str) -> AgentCheckpoint | None:
+        from himmy.runtime.checkpoint import AgentCheckpoint, _migrate_checkpoint
+
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data FROM aux_agent_checkpoints "
+                "WHERE tenant = $1 AND checkpoint_id = $2",
+                self._tenant,
+                checkpoint_id,
+            )
+        if row is None:
+            return None
+        return AgentCheckpoint.model_validate(_migrate_checkpoint(dict(row["data"])))
+
+    async def claim(self, checkpoint_id: str) -> bool:
+        """Atomic claimable-status CAS -> ``resolving`` (the exactly-once HITL gate).
+
+        The structural twin of :meth:`SqliteCheckpointStore.claim`: a single conditional
+        UPDATE under Postgres' row lock flips a claimable (``awaiting_approval`` /
+        ``resolving``) row to ``resolving`` and rewrites the JSON blob's ``status`` so a
+        later load is consistent. Two concurrent resumes (across replicas) serialise on the
+        row lock; exactly one sees ``rowcount == 1``.
+        """
+        from himmy.runtime.checkpoint import (
+            AWAITING_APPROVAL,
+            RESOLVING,
+        )
+
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE aux_agent_checkpoints "
+                "SET status = $1, data = jsonb_set(data, '{status}', to_jsonb($1::text)) "
+                "WHERE tenant = $2 AND checkpoint_id = $3 "
+                "AND status IN ($4, $5)",
+                RESOLVING,
+                self._tenant,
+                checkpoint_id,
+                AWAITING_APPROVAL,
+                RESOLVING,
+            )
+        return _rowcount(result) == 1
+
+    async def list_by_status(self, status: str) -> list[AgentCheckpoint]:
+        from himmy.runtime.checkpoint import AgentCheckpoint, _migrate_checkpoint
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT data FROM aux_agent_checkpoints "
+                "WHERE tenant = $1 AND status = $2 ORDER BY created_at DESC",
+                self._tenant,
+                status,
+            )
+        return [
+            AgentCheckpoint.model_validate(_migrate_checkpoint(dict(r["data"])))
+            for r in rows
+        ]
+
+    async def prune_resolved(self, older_than_days: float) -> int:
+        from datetime import UTC, datetime, timedelta
+
+        from himmy.runtime.checkpoint import APPROVED, REJECTED
+
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM aux_agent_checkpoints "
+                "WHERE tenant = $1 AND status IN ($2, $3) AND created_at < $4",
+                self._tenant,
+                APPROVED,
+                REJECTED,
+                cutoff,
+            )
+        return _rowcount(result)
+
+
+class PostgresCheckpointStore:
+    """Synchronous, tenant-scoped Postgres mirror of :class:`SqliteCheckpointStore` (K3).
+
+    Drop-in for the SQLite checkpoint store: same ``save``/``load``/``claim``/
+    ``list_by_status``/``prune_resolved`` surface, every method blocking on the shared aux
+    loop. The ``tenant`` discriminator keeps Studio's inbox isolated from each /v1
+    workspace's.
+    """
+
+    def __init__(self, *, tenant: str, dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncCheckpointStore(self._pool, tenant)
+
+    def save(self, checkpoint: AgentCheckpoint) -> None:
+        self._pool.run(self._async.save(checkpoint))
+
+    def load(self, checkpoint_id: str) -> AgentCheckpoint | None:
+        return self._pool.run(self._async.load(checkpoint_id))  # type: ignore[no-any-return]
+
+    def claim(self, checkpoint_id: str) -> bool:
+        return bool(self._pool.run(self._async.claim(checkpoint_id)))
+
+    def list_by_status(self, status: str) -> list[AgentCheckpoint]:
+        return self._pool.run(self._async.list_by_status(status))  # type: ignore[no-any-return]
+
+    def prune_resolved(self, *, older_than_days: float = 30.0) -> int:
+        return int(self._pool.run(self._async.prune_resolved(older_than_days)))
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+class _AsyncGraphCheckpointStore:
+    """Async body of the Postgres durable graph-run checkpoint store (tenant-scoped)."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def save(self, checkpoint: GraphCheckpoint) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_graph_checkpoints "
+                "(tenant, checkpoint_id, graph_name, status, data, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                "ON CONFLICT (tenant, checkpoint_id) DO UPDATE SET "
+                "graph_name = EXCLUDED.graph_name, status = EXCLUDED.status, "
+                "data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+                self._tenant,
+                checkpoint.checkpoint_id,
+                checkpoint.graph_name,
+                checkpoint.status,
+                json.loads(checkpoint.model_dump_json()),
+                checkpoint.created_at,
+                checkpoint.updated_at,
+            )
+
+    async def load(self, checkpoint_id: str) -> GraphCheckpoint | None:
+        from himmy.runtime.checkpoint import (
+            GraphCheckpoint,
+            _migrate_graph_checkpoint,
+        )
+
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data FROM aux_graph_checkpoints "
+                "WHERE tenant = $1 AND checkpoint_id = $2",
+                self._tenant,
+                checkpoint_id,
+            )
+        if row is None:
+            return None
+        return GraphCheckpoint.model_validate(
+            _migrate_graph_checkpoint(dict(row["data"]))
+        )
+
+    async def list_by_status(self, status: str) -> list[GraphCheckpoint]:
+        from himmy.runtime.checkpoint import (
+            GraphCheckpoint,
+            _migrate_graph_checkpoint,
+        )
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT data FROM aux_graph_checkpoints "
+                "WHERE tenant = $1 AND status = $2 ORDER BY updated_at DESC",
+                self._tenant,
+                status,
+            )
+        return [
+            GraphCheckpoint.model_validate(_migrate_graph_checkpoint(dict(r["data"])))
+            for r in rows
+        ]
+
+    async def prune_terminal(self, older_than_days: float) -> int:
+        from datetime import UTC, datetime, timedelta
+
+        from himmy.runtime.checkpoint import GRAPH_COMPLETED, GRAPH_FAILED
+
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM aux_graph_checkpoints "
+                "WHERE tenant = $1 AND status IN ($2, $3) AND updated_at < $4",
+                self._tenant,
+                GRAPH_COMPLETED,
+                GRAPH_FAILED,
+                cutoff,
+            )
+        return _rowcount(result)
+
+
+class PostgresGraphCheckpointStore:
+    """Synchronous, tenant-scoped Postgres mirror of :class:`SqliteGraphCheckpointStore`."""
+
+    def __init__(self, *, tenant: str, dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncGraphCheckpointStore(self._pool, tenant)
+
+    def save(self, checkpoint: GraphCheckpoint) -> None:
+        self._pool.run(self._async.save(checkpoint))
+
+    def load(self, checkpoint_id: str) -> GraphCheckpoint | None:
+        return self._pool.run(self._async.load(checkpoint_id))  # type: ignore[no-any-return]
+
+    def list_by_status(self, status: str) -> list[GraphCheckpoint]:
+        return self._pool.run(self._async.list_by_status(status))  # type: ignore[no-any-return]
+
+    def prune_terminal(self, *, older_than_days: float = 30.0) -> int:
+        return int(self._pool.run(self._async.prune_terminal(older_than_days)))
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+# ============================================================ K4: conversation mirror
+
+
+class _AsyncConversationStore:
+    """Async body of the Postgres unified-conversation store (tenant-scoped)."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def save_thread(
+        self,
+        conversation_id: str,
+        thread: ChatThread,
+        *,
+        origin: str,
+        title: str | None,
+        agent_path: str | None,
+        provider: str | None,
+        project_id: str | None,
+    ) -> ConversationSummary:
+        from himmy.services.storage.conversations import (
+            ORIGIN_CLI,
+            ConversationSummary,
+            _derive_title,
+            flat_from_thread,
+        )
+
+        now = utc_now_iso()
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                existing = await conn.fetchrow(
+                    "SELECT created_at, project_id, agent_path, provider, origin "
+                    "FROM aux_conversations WHERE tenant = $1 AND conversation_id = $2",
+                    self._tenant,
+                    conversation_id,
+                )
+                created = existing["created_at"] if existing else now
+                resolved_title = (title or "").strip() or _derive_title(thread)
+                resolved_agent = (
+                    agent_path
+                    if agent_path is not None
+                    else (existing["agent_path"] if existing else thread.agent_id)
+                )
+                resolved_provider = (
+                    provider
+                    if provider is not None
+                    else (existing["provider"] if existing else None)
+                )
+                effective_project = project_id or (
+                    existing["project_id"] if existing else None
+                )
+                resolved_origin = origin or (
+                    existing["origin"] if existing else ORIGIN_CLI
+                )
+                await conn.execute(
+                    "INSERT INTO aux_conversations "
+                    "(tenant, conversation_id, thread, origin, title, agent_path, "
+                    "provider, project_id, created_at, updated_at) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
+                    "ON CONFLICT (tenant, conversation_id) DO UPDATE SET "
+                    "thread = EXCLUDED.thread, title = EXCLUDED.title, "
+                    "agent_path = EXCLUDED.agent_path, provider = EXCLUDED.provider, "
+                    "project_id = EXCLUDED.project_id, updated_at = EXCLUDED.updated_at",
+                    self._tenant,
+                    conversation_id,
+                    json.loads(thread.model_dump_json()),
+                    resolved_origin,
+                    resolved_title,
+                    resolved_agent,
+                    resolved_provider,
+                    effective_project,
+                    _norm_ts(created),
+                    now,
+                )
+                await self._reproject(conn, conversation_id, thread, now)
+        flat = flat_from_thread(thread)
+        return ConversationSummary(
+            conversation_id=conversation_id,
+            origin=resolved_origin,
+            title=resolved_title,
+            agent_path=resolved_agent,
+            provider=resolved_provider,
+            project_id=effective_project,
+            created_at=_norm_ts(created),
+            updated_at=now,
+            message_count=len(flat),
+        )
+
+    async def _reproject(
+        self, conn: Any, conversation_id: str, thread: ChatThread, now: str
+    ) -> None:
+        from himmy.services.storage.conversations import flat_from_thread
+
+        await conn.execute(
+            "DELETE FROM aux_conversation_messages "
+            "WHERE tenant = $1 AND conversation_id = $2",
+            self._tenant,
+            conversation_id,
+        )
+        for seq, (role, text) in enumerate(flat_from_thread(thread)):
+            await conn.execute(
+                "INSERT INTO aux_conversation_messages "
+                "(tenant, id, conversation_id, role, text, seq, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                self._tenant,
+                new_uuid(),
+                conversation_id,
+                role,
+                text,
+                seq,
+                now,
+            )
+
+    async def load_thread(self, conversation_id: str) -> ChatThread | None:
+        from himmy.agents.base_agent.thread import ChatThread
+
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT thread FROM aux_conversations "
+                "WHERE tenant = $1 AND conversation_id = $2",
+                self._tenant,
+                conversation_id,
+            )
+        if row is None:
+            return None
+        try:
+            return ChatThread.model_validate(dict(row["thread"]))
+        except Exception:  # noqa: BLE001 - a corrupt row must not break the caller
+            return None
+
+    async def get_summary(self, conversation_id: str) -> ConversationSummary | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT *, ("
+                "  SELECT COUNT(*) FROM aux_conversation_messages m "
+                "  WHERE m.tenant = c.tenant "
+                "  AND m.conversation_id = c.conversation_id) AS n "
+                "FROM aux_conversations c "
+                "WHERE c.tenant = $1 AND c.conversation_id = $2",
+                self._tenant,
+                conversation_id,
+            )
+        if row is None:
+            return None
+        return _row_to_summary(row, int(row["n"]))
+
+    async def flat_messages(self, conversation_id: str) -> list[FlatMessage]:
+        from himmy.services.storage.conversations import FlatMessage
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT role, text FROM aux_conversation_messages "
+                "WHERE tenant = $1 AND conversation_id = $2 ORDER BY seq",
+                self._tenant,
+                conversation_id,
+            )
+        return [FlatMessage(role=r["role"], text=r["text"]) for r in rows]
+
+    async def list_summaries(
+        self, *, limit: int | None, origin: str | None
+    ) -> list[ConversationSummary]:
+        sql = (
+            "SELECT c.*, ("
+            "  SELECT COUNT(*) FROM aux_conversation_messages m "
+            "  WHERE m.tenant = c.tenant "
+            "  AND m.conversation_id = c.conversation_id) AS n "
+            "FROM aux_conversations c WHERE c.tenant = $1"
+        )
+        params: list[Any] = [self._tenant]
+        if origin is not None:
+            params.append(origin)
+            sql += f" AND c.origin = ${len(params)}"
+        sql += " ORDER BY c.updated_at DESC"
+        if limit is not None:
+            params.append(int(limit))
+            sql += f" LIMIT ${len(params)}"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [_row_to_summary(r, int(r["n"])) for r in rows]
+
+    async def rename(self, conversation_id: str, title: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE aux_conversations SET title = $1, updated_at = $2 "
+                "WHERE tenant = $3 AND conversation_id = $4",
+                title,
+                utc_now_iso(),
+                self._tenant,
+                conversation_id,
+            )
+        return _rowcount(result) > 0
+
+    async def delete(self, conversation_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM aux_conversation_messages "
+                    "WHERE tenant = $1 AND conversation_id = $2",
+                    self._tenant,
+                    conversation_id,
+                )
+                result = await conn.execute(
+                    "DELETE FROM aux_conversations "
+                    "WHERE tenant = $1 AND conversation_id = $2",
+                    self._tenant,
+                    conversation_id,
+                )
+        return _rowcount(result) > 0
+
+    async def set_project(
+        self, conversation_id: str, project_id: str | None
+    ) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE aux_conversations SET project_id = $1 "
+                "WHERE tenant = $2 AND conversation_id = $3",
+                project_id,
+                self._tenant,
+                conversation_id,
+            )
+        return _rowcount(result) > 0
+
+    # -- projects ------------------------------------------------------------
+
+    async def create_project(
+        self,
+        *,
+        name: str,
+        description: str,
+        kb_id: str | None,
+        agent_path: str | None,
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        pid = new_uuid()
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_projects "
+                "(tenant, id, name, description, kb_id, agent_path, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                self._tenant,
+                pid,
+                name,
+                description,
+                kb_id,
+                agent_path,
+                now,
+                now,
+            )
+        return {
+            "id": pid,
+            "name": name,
+            "description": description,
+            "kb_id": kb_id,
+            "agent_path": agent_path,
+            "created_at": now,
+            "updated_at": now,
+            "chat_count": 0,
+        }
+
+    async def get_project_row(self, project_id: str) -> dict[str, Any] | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM aux_projects WHERE tenant = $1 AND id = $2",
+                self._tenant,
+                project_id,
+            )
+        return _project_dict(row) if row is not None else None
+
+    async def project_chat_count(self, project_id: str) -> int:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) AS n FROM aux_conversations "
+                "WHERE tenant = $1 AND project_id = $2",
+                self._tenant,
+                project_id,
+            )
+        return int(row["n"]) if row else 0
+
+    async def list_project_rows(self) -> list[tuple[dict[str, Any], int]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT p.*, ("
+                "  SELECT COUNT(*) FROM aux_conversations c "
+                "  WHERE c.tenant = p.tenant AND c.project_id = p.id) AS n "
+                "FROM aux_projects p WHERE p.tenant = $1 ORDER BY p.updated_at DESC",
+                self._tenant,
+            )
+        return [(_project_dict(r), int(r["n"])) for r in rows]
+
+    async def update_project(
+        self, project_id: str, assignments: dict[str, str | None]
+    ) -> bool:
+        if not assignments:
+            return (await self.get_project_row(project_id)) is not None
+        cols = ", ".join(f"{k} = ${i + 1}" for i, k in enumerate(assignments))
+        params: list[Any] = list(assignments.values())
+        params.append(utc_now_iso())
+        params.append(self._tenant)
+        params.append(project_id)
+        sql = (
+            f"UPDATE aux_projects SET {cols}, updated_at = ${len(params) - 2} "  # noqa: S608
+            f"WHERE tenant = ${len(params) - 1} AND id = ${len(params)}"
+        )
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(sql, *params)
+        return _rowcount(result) > 0
+
+    async def delete_project(self, project_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE aux_conversations SET project_id = NULL "
+                    "WHERE tenant = $1 AND project_id = $2",
+                    self._tenant,
+                    project_id,
+                )
+                result = await conn.execute(
+                    "DELETE FROM aux_projects WHERE tenant = $1 AND id = $2",
+                    self._tenant,
+                    project_id,
+                )
+        return _rowcount(result) > 0
+
+    async def project_conversation_summaries(
+        self, project_id: str
+    ) -> list[ConversationSummary]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT c.*, ("
+                "  SELECT COUNT(*) FROM aux_conversation_messages m "
+                "  WHERE m.tenant = c.tenant "
+                "  AND m.conversation_id = c.conversation_id) AS n "
+                "FROM aux_conversations c "
+                "WHERE c.tenant = $1 AND c.project_id = $2 "
+                "ORDER BY c.updated_at DESC",
+                self._tenant,
+                project_id,
+            )
+        return [_row_to_summary(r, int(r["n"])) for r in rows]
+
+    async def assign_conversation(
+        self, project_id: str, conversation_id: str
+    ) -> bool:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchrow(
+                    "SELECT 1 FROM aux_projects WHERE tenant = $1 AND id = $2",
+                    self._tenant,
+                    project_id,
+                )
+                if exists is None:
+                    return False
+                result = await conn.execute(
+                    "UPDATE aux_conversations SET project_id = $1 "
+                    "WHERE tenant = $2 AND conversation_id = $3",
+                    project_id,
+                    self._tenant,
+                    conversation_id,
+                )
+                if _rowcount(result) > 0:
+                    await conn.execute(
+                        "UPDATE aux_projects SET updated_at = $1 "
+                        "WHERE tenant = $2 AND id = $3",
+                        utc_now_iso(),
+                        self._tenant,
+                        project_id,
+                    )
+        return _rowcount(result) > 0
+
+    async def unassign_conversation(self, conversation_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE aux_conversations SET project_id = NULL "
+                "WHERE tenant = $1 AND conversation_id = $2 AND project_id IS NOT NULL",
+                self._tenant,
+                conversation_id,
+            )
+        return _rowcount(result) > 0
+
+
+class PostgresConversationStore:
+    """Synchronous Postgres mirror of :class:`ConversationStore` (K4).
+
+    The full ConversationStore surface (authoritative thread + regenerated flat projection
+    + projects), every method blocking on the shared aux loop. Tenant-scoped on a single
+    ``tenant`` value (``"local"`` for the shared CLI/Studio/v1 singleton). ``save_flat`` and
+    ``import_legacy`` are implemented in Python over the sync surface, mirroring the SQLite
+    store's own composition.
+    """
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncConversationStore(self._pool, tenant)
+
+    def save_thread(
+        self,
+        conversation_id: str,
+        thread: ChatThread,
+        *,
+        origin: str | None = None,
+        title: str | None = None,
+        agent_path: str | None = None,
+        provider: str | None = None,
+        project_id: str | None = None,
+    ) -> ConversationSummary:
+        from himmy.services.storage.conversations import ORIGIN_CLI
+
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.save_thread(
+                conversation_id,
+                thread,
+                origin=origin or ORIGIN_CLI,
+                title=title,
+                agent_path=agent_path,
+                provider=provider,
+                project_id=project_id,
+            )
+        )
+
+    def save_flat(
+        self,
+        *,
+        conversation_id: str | None,
+        title: str | None,
+        agent_path: str | None,
+        provider: str | None,
+        flat_messages: Sequence[tuple[str, str]],
+        project_id: str | None = None,
+        origin: str | None = None,
+    ) -> ConversationSummary:
+        from himmy.services.storage.conversations import (
+            ORIGIN_STUDIO,
+            thread_from_flat,
+        )
+
+        cid = conversation_id or new_uuid()
+        thread = thread_from_flat(
+            conversation_id=cid, agent_path=agent_path, flat_messages=flat_messages
+        )
+        return self.save_thread(
+            cid,
+            thread,
+            origin=origin or ORIGIN_STUDIO,
+            title=title,
+            agent_path=agent_path,
+            provider=provider,
+            project_id=project_id,
+        )
+
+    def load_thread(self, conversation_id: str) -> ChatThread | None:
+        return self._pool.run(self._async.load_thread(conversation_id))  # type: ignore[no-any-return]
+
+    def get_summary(self, conversation_id: str) -> ConversationSummary | None:
+        return self._pool.run(self._async.get_summary(conversation_id))  # type: ignore[no-any-return]
+
+    def flat_messages(self, conversation_id: str) -> list[FlatMessage]:
+        return self._pool.run(self._async.flat_messages(conversation_id))  # type: ignore[no-any-return]
+
+    def list_summaries(
+        self, *, limit: int | None = None, origin: str | None = None
+    ) -> list[ConversationSummary]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.list_summaries(limit=limit, origin=origin)
+        )
+
+    def rename(self, conversation_id: str, title: str) -> bool:
+        return bool(self._pool.run(self._async.rename(conversation_id, title)))
+
+    def delete(self, conversation_id: str) -> bool:
+        return bool(self._pool.run(self._async.delete(conversation_id)))
+
+    def set_project(self, conversation_id: str, project_id: str | None) -> bool:
+        return bool(
+            self._pool.run(self._async.set_project(conversation_id, project_id))
+        )
+
+    def create_project(
+        self,
+        *,
+        name: str,
+        description: str = "",
+        kb_id: str | None = None,
+        agent_path: str | None = None,
+    ) -> dict[str, object]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.create_project(
+                name=name,
+                description=description,
+                kb_id=kb_id,
+                agent_path=agent_path,
+            )
+        )
+
+    def get_project_row(self, project_id: str) -> dict[str, Any] | None:
+        return self._pool.run(self._async.get_project_row(project_id))  # type: ignore[no-any-return]
+
+    def project_chat_count(self, project_id: str) -> int:
+        return int(self._pool.run(self._async.project_chat_count(project_id)))
+
+    def list_project_rows(self) -> list[tuple[dict[str, Any], int]]:
+        return self._pool.run(self._async.list_project_rows())  # type: ignore[no-any-return]
+
+    def update_project(
+        self, project_id: str, assignments: dict[str, str | None]
+    ) -> bool:
+        return bool(
+            self._pool.run(self._async.update_project(project_id, assignments))
+        )
+
+    def delete_project(self, project_id: str) -> bool:
+        return bool(self._pool.run(self._async.delete_project(project_id)))
+
+    def project_conversation_summaries(
+        self, project_id: str
+    ) -> list[ConversationSummary]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.project_conversation_summaries(project_id)
+        )
+
+    def assign_conversation(self, project_id: str, conversation_id: str) -> bool:
+        return bool(
+            self._pool.run(
+                self._async.assign_conversation(project_id, conversation_id)
+            )
+        )
+
+    def unassign_conversation(self, conversation_id: str) -> bool:
+        return bool(self._pool.run(self._async.unassign_conversation(conversation_id)))
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+def _row_to_summary(row: Any, count: int) -> ConversationSummary:
+    from himmy.services.storage.conversations import ConversationSummary
+
+    return ConversationSummary(
+        conversation_id=row["conversation_id"],
+        origin=row["origin"],
+        title=row["title"],
+        agent_path=row["agent_path"],
+        provider=row["provider"],
+        project_id=row["project_id"],
+        created_at=_norm_ts(row["created_at"]),
+        updated_at=_norm_ts(row["updated_at"]),
+        message_count=count,
+    )
+
+
+def _project_dict(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"],
+        "kb_id": row["kb_id"],
+        "agent_path": row["agent_path"],
+        "created_at": _norm_ts(row["created_at"]),
+        "updated_at": _norm_ts(row["updated_at"]),
+    }
+
+
+# ============================================================ K4: routines mirror
+
+
+class _AsyncRoutinesStore:
+    """Async body of the Postgres routines store with the atomic cluster-wide tick CAS."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def list(self, workspace_id: str | None) -> list[Any]:
+        from himmy.api.routines import Routine
+
+        if workspace_id is None:
+            sql = (
+                "SELECT data FROM aux_routines WHERE tenant = $1 "
+                "ORDER BY created_at DESC"
+            )
+            params: list[Any] = [self._tenant]
+        else:
+            sql = (
+                "SELECT data FROM aux_routines WHERE tenant = $1 AND workspace_id = $2 "
+                "ORDER BY created_at DESC"
+            )
+            params = [self._tenant, workspace_id]
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [Routine.model_validate(dict(r["data"])) for r in rows]
+
+    async def get(self, routine_id: str, workspace_id: str | None) -> Any | None:
+        from himmy.api.routines import Routine
+
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT data FROM aux_routines WHERE tenant = $1 AND id = $2",
+                self._tenant,
+                routine_id,
+            )
+        if row is None:
+            return None
+        routine = Routine.model_validate(dict(row["data"]))
+        if workspace_id is not None and routine.workspace_id != workspace_id:
+            return None
+        return routine
+
+    async def upsert(self, routine: Any) -> Any:
+        routine.updated_at = utc_now_iso()
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_routines "
+                "(tenant, id, workspace_id, data, last_run_at, agent_id, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                "ON CONFLICT (tenant, id) DO UPDATE SET "
+                "workspace_id = EXCLUDED.workspace_id, data = EXCLUDED.data, "
+                "last_run_at = EXCLUDED.last_run_at, agent_id = EXCLUDED.agent_id",
+                self._tenant,
+                routine.id,
+                routine.workspace_id,
+                json.loads(routine.model_dump_json()),
+                routine.last_run_at,
+                routine.agent_id,
+                _norm_ts(routine.created_at),
+            )
+        return routine
+
+    async def delete(self, routine_id: str, workspace_id: str | None) -> bool:
+        async with self._pool.acquire() as conn:
+            if workspace_id is None:
+                result = await conn.execute(
+                    "DELETE FROM aux_routines WHERE tenant = $1 AND id = $2",
+                    self._tenant,
+                    routine_id,
+                )
+            else:
+                result = await conn.execute(
+                    "DELETE FROM aux_routines "
+                    "WHERE tenant = $1 AND id = $2 AND workspace_id = $3",
+                    self._tenant,
+                    routine_id,
+                    workspace_id,
+                )
+        return _rowcount(result) > 0
+
+    async def find_by_agent_id(
+        self, agent_id: str, workspace_id: str
+    ) -> _list[str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id FROM aux_routines "
+                "WHERE tenant = $1 AND agent_id = $2 AND workspace_id = $3",
+                self._tenant,
+                agent_id,
+                workspace_id,
+            )
+        return [r["id"] for r in rows]
+
+    async def mark_started(
+        self,
+        routine_id: str,
+        started_at: str,
+        expected_last_run_at: Any,
+        *,
+        conditional: bool,
+    ) -> bool:
+        """Atomic cluster-wide start claim: stamp the run start IFF ``last_run_at`` is
+        still the value read at due-evaluation (the conditional-UPDATE tick).
+
+        The cluster-wide double-execution fix (K4 reviewer must_fix): a routine due on
+        every tick is claimed by the FIRST replica whose ``last_run_at`` still matches the
+        sentinel captured at due-time. ``IS NOT DISTINCT FROM`` handles the NULL first-run
+        case (a fresh routine's ``last_run_at`` is NULL). The claim is a single
+        ``SELECT … FOR UPDATE`` + UPDATE in one transaction, so two racing replicas
+        serialise on the row lock and exactly one sees the row; the loser's predicate no
+        longer matches (the winner moved ``last_run_at``) and it returns ``False``.
+
+        ``conditional`` is ``False`` for the manual ``run_now`` path (always fire — overlap
+        is prevented by the host flock), ``True`` for the scheduler tick. The JSON blob's
+        ``last_run_at`` / ``last_status`` / ``last_error`` / ``last_delivery`` are kept
+        consistent with the indexed column via a read-modify-write of the claimed row, so a
+        later load reflects the claim.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                if conditional:
+                    row = await conn.fetchrow(
+                        "SELECT data FROM aux_routines "
+                        "WHERE tenant = $1 AND id = $2 "
+                        "AND last_run_at IS NOT DISTINCT FROM $3 "
+                        "FOR UPDATE",
+                        self._tenant,
+                        routine_id,
+                        expected_last_run_at,
+                    )
+                else:
+                    row = await conn.fetchrow(
+                        "SELECT data FROM aux_routines "
+                        "WHERE tenant = $1 AND id = $2 FOR UPDATE",
+                        self._tenant,
+                        routine_id,
+                    )
+                if row is None:
+                    return False
+                data = dict(row["data"])
+                data["last_run_at"] = started_at
+                data["last_status"] = "running"
+                data["last_error"] = None
+                data["last_delivery"] = None
+                await conn.execute(
+                    "UPDATE aux_routines SET last_run_at = $1, data = $2 "
+                    "WHERE tenant = $3 AND id = $4",
+                    started_at,
+                    data,
+                    self._tenant,
+                    routine_id,
+                )
+        return True
+
+    async def record_result(
+        self,
+        routine_id: str,
+        *,
+        status: str,
+        preview: str,
+        error: str | None,
+        delivery: str | None,
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT data FROM aux_routines "
+                    "WHERE tenant = $1 AND id = $2 FOR UPDATE",
+                    self._tenant,
+                    routine_id,
+                )
+                if row is None:
+                    return
+                data = dict(row["data"])
+                data["last_status"] = status
+                data["last_preview"] = preview
+                data["last_error"] = error
+                data["last_delivery"] = delivery
+                await conn.execute(
+                    "UPDATE aux_routines SET data = $1 WHERE tenant = $2 AND id = $3",
+                    data,
+                    self._tenant,
+                    routine_id,
+                )
+
+
+class PostgresRoutinesStore:
+    """Synchronous Postgres mirror of :class:`RoutinesStore` (K4) with the atomic tick.
+
+    Same surface as the SQLite store EXCEPT ``mark_started``, which gains an
+    ``expected_last_run_at`` sentinel and returns whether THIS replica won the claim — the
+    conditional UPDATE that makes a routine fire exactly once across N replicas. The SQLite
+    store keeps its host ``flock`` instead (single box).
+    """
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncRoutinesStore(self._pool, tenant)
+
+    def list(self, *, workspace_id: str | None = None) -> _list[Any]:
+        return self._pool.run(self._async.list(workspace_id))  # type: ignore[no-any-return]
+
+    def get(self, routine_id: str, *, workspace_id: str | None = None) -> Any | None:
+        return self._pool.run(self._async.get(routine_id, workspace_id))  # type: ignore[no-any-return]
+
+    def upsert(self, routine: Any) -> Any:
+        return self._pool.run(self._async.upsert(routine))
+
+    def delete(self, routine_id: str, *, workspace_id: str | None = None) -> bool:
+        return bool(self._pool.run(self._async.delete(routine_id, workspace_id)))
+
+    def find_by_agent_id(self, agent_id: str, *, workspace_id: str) -> _list[str]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.find_by_agent_id(agent_id, workspace_id)
+        )
+
+    def mark_started(
+        self,
+        routine_id: str,
+        started_at: str,
+        *,
+        expected_last_run_at: Any = None,
+    ) -> bool:
+        """Atomic start-claim CAS (see :meth:`_AsyncRoutinesStore.mark_started`).
+
+        Returns ``True`` iff this replica won the claim. The scheduler tick captures the
+        ``last_run_at`` value at due-evaluation and passes it here, gating the claim
+        (``IS NOT DISTINCT FROM``, NULL-safe for the first run). The manual ``run_now`` path
+        passes :data:`himmy.api.routines.UNCONDITIONAL` to fire regardless (overlap there is
+        the host flock's job, not the anchor's).
+        """
+        from himmy.api.routines import _Unconditional
+
+        conditional = not isinstance(expected_last_run_at, _Unconditional)
+        sentinel = None if not conditional else expected_last_run_at
+        return bool(
+            self._pool.run(
+                self._async.mark_started(
+                    routine_id, started_at, sentinel, conditional=conditional
+                )
+            )
+        )
+
+    def record_result(
+        self,
+        routine_id: str,
+        *,
+        status: str,
+        preview: str,
+        error: str | None = None,
+        delivery: str | None = None,
+    ) -> None:
+        from himmy.api.routines import PREVIEW_MAX_CHARS
+
+        self._pool.run(
+            self._async.record_result(
+                routine_id,
+                status=status,
+                preview=preview[:PREVIEW_MAX_CHARS],
+                error=error,
+                delivery=delivery,
+            )
+        )
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+# ============================================================ K4: teams + workflows mirrors
+
+
+class _AsyncBindingStore:
+    """Async body shared by the teams and workflows Postgres mirrors (same shape)."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str, table: str, model: Any) -> None:
+        self._pool = pool
+        self._tenant = tenant
+        self._table = table
+        self._model = model
+
+    async def list(self, workspace_id: str | None) -> list[Any]:
+        if workspace_id is None:
+            sql = (
+                f"SELECT data FROM {self._table} WHERE tenant = $1 "  # noqa: S608
+                "ORDER BY created_at DESC"
+            )
+            params: list[Any] = [self._tenant]
+        else:
+            sql = (
+                f"SELECT data FROM {self._table} "  # noqa: S608
+                "WHERE tenant = $1 AND workspace_id = $2 ORDER BY created_at DESC"
+            )
+            params = [self._tenant, workspace_id]
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [self._model.model_validate(dict(r["data"])) for r in rows]
+
+    async def get(self, record_id: str, workspace_id: str | None) -> Any | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT data FROM {self._table} WHERE tenant = $1 AND id = $2",  # noqa: S608
+                self._tenant,
+                record_id,
+            )
+        if row is None:
+            return None
+        record = self._model.model_validate(dict(row["data"]))
+        if workspace_id is not None and record.workspace_id != workspace_id:
+            return None
+        return record
+
+    async def get_by_idempotency_key(
+        self, key: str, workspace_id: str
+    ) -> Any | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT data FROM {self._table} "  # noqa: S608
+                "WHERE tenant = $1 AND idempotency_key = $2 AND workspace_id = $3",
+                self._tenant,
+                key,
+                workspace_id,
+            )
+        return self._model.model_validate(dict(row["data"])) if row else None
+
+    async def upsert(self, record: Any) -> Any:
+        record.updated_at = utc_now_iso()
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO {self._table} "  # noqa: S608
+                "(tenant, id, workspace_id, data, idempotency_key, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6) "
+                "ON CONFLICT (tenant, id) DO UPDATE SET "
+                "workspace_id = EXCLUDED.workspace_id, data = EXCLUDED.data, "
+                "idempotency_key = EXCLUDED.idempotency_key",
+                self._tenant,
+                record.id,
+                record.workspace_id,
+                json.loads(record.model_dump_json()),
+                record.idempotency_key,
+                _norm_ts(record.created_at),
+            )
+        return record
+
+    async def delete(self, record_id: str, workspace_id: str | None) -> bool:
+        async with self._pool.acquire() as conn:
+            if workspace_id is None:
+                result = await conn.execute(
+                    f"DELETE FROM {self._table} WHERE tenant = $1 AND id = $2",  # noqa: S608
+                    self._tenant,
+                    record_id,
+                )
+            else:
+                result = await conn.execute(
+                    f"DELETE FROM {self._table} "  # noqa: S608
+                    "WHERE tenant = $1 AND id = $2 AND workspace_id = $3",
+                    self._tenant,
+                    record_id,
+                    workspace_id,
+                )
+        return _rowcount(result) > 0
+
+    async def find_by_agent_id(
+        self, agent_id: str, workspace_id: str
+    ) -> _list[str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT id, data FROM {self._table} "  # noqa: S608
+                "WHERE tenant = $1 AND workspace_id = $2",
+                self._tenant,
+                workspace_id,
+            )
+        out: _list[str] = []
+        for r in rows:
+            members = (dict(r["data"]).get("members")) or []
+            if agent_id in members:
+                out.append(r["id"])
+        return out
+
+
+class _PostgresBindingStore:
+    """Synchronous facade shared by the teams + workflows Postgres mirrors."""
+
+    def __init__(
+        self, *, tenant: str, table: str, model: Any, dsn: str | None
+    ) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncBindingStore(self._pool, tenant, table, model)
+
+    def list(self, *, workspace_id: str | None = None) -> _list[Any]:
+        return self._pool.run(self._async.list(workspace_id))  # type: ignore[no-any-return]
+
+    def get(self, record_id: str, *, workspace_id: str | None = None) -> Any | None:
+        return self._pool.run(self._async.get(record_id, workspace_id))  # type: ignore[no-any-return]
+
+    def get_by_idempotency_key(self, key: str, *, workspace_id: str) -> Any | None:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.get_by_idempotency_key(key, workspace_id)
+        )
+
+    def upsert(self, record: Any) -> Any:
+        return self._pool.run(self._async.upsert(record))
+
+    def delete(self, record_id: str, *, workspace_id: str | None = None) -> bool:
+        return bool(self._pool.run(self._async.delete(record_id, workspace_id)))
+
+    def find_by_agent_id(self, agent_id: str, *, workspace_id: str) -> _list[str]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.find_by_agent_id(agent_id, workspace_id)
+        )
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+class PostgresTeamsStore(_PostgresBindingStore):
+    """Synchronous Postgres mirror of :class:`TeamsStore` (K4)."""
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        from himmy.api.teams_store import TeamRecord
+
+        super().__init__(tenant=tenant, table="aux_teams", model=TeamRecord, dsn=dsn)
+
+
+class PostgresWorkflowsStore(_PostgresBindingStore):
+    """Synchronous Postgres mirror of :class:`WorkflowsStore` (K4)."""
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        from himmy.api.teams_store import WorkflowRecord
+
+        super().__init__(
+            tenant=tenant, table="aux_workflows", model=WorkflowRecord, dsn=dsn
+        )
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def _rowcount(result: Any) -> int:
+    """Parse asyncpg's command tag (``'UPDATE 1'`` / ``'DELETE 3'``) into a row count."""
+    if not isinstance(result, str):  # pragma: no cover - defensive
+        return 0
+    parts = result.split()
+    try:
+        return int(parts[-1])
+    except (ValueError, IndexError):  # pragma: no cover - defensive
+        return 0
+
+
+def _norm_ts(value: Any) -> str:
+    """Normalise a timestamp (str or asyncpg datetime) back to an ISO-8601 string."""
+    if value is None:
+        return utc_now_iso()
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+__all__ = [
+    "PostgresCheckpointStore",
+    "PostgresConversationStore",
+    "PostgresGraphCheckpointStore",
+    "PostgresRoutinesStore",
+    "PostgresTeamsStore",
+    "PostgresWorkflowsStore",
+]

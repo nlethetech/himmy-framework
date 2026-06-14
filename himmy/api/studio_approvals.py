@@ -41,7 +41,10 @@ _redact_args = redact_tool_args
 
 # ---- store singleton (cwd-keyed, like get_run_store) --------------------
 
-_STORE: SqliteCheckpointStore | None = None
+#: The process-wide checkpoint store. ``Any`` because under a Postgres DSN it is the K3
+#: :class:`PostgresCheckpointStore` (tenant-scoped) rather than the SQLite store; both
+#: expose the same save/load/claim/list_by_status surface the approvals service uses.
+_STORE: Any | None = None
 _STORE_PATH: str | None = None
 
 
@@ -51,19 +54,29 @@ def _db_path() -> str:
     return str(d / "approvals.db")
 
 
-def get_checkpoint_store() -> SqliteCheckpointStore:
-    """Process-wide durable checkpoint store, reopened if the project root changed."""
+def get_checkpoint_store() -> Any:
+    """Process-wide durable checkpoint store, reopened if the project root changed.
+
+    Under a Postgres DSN this is the tenant-scoped Postgres mirror (K3) bound to the
+    ``"studio"`` tenant — DELIBERATELY distinct from /v1's ``"v1"`` tenant — so a /v1
+    tenant can never read Studio's HITL checkpoints (and vice-versa). Offline / SQLite the
+    durable file-backed checkpoint store at ``.himmy/approvals.db`` is used byte-for-byte.
+    """
     global _STORE, _STORE_PATH
     path = _db_path()
     if _STORE is None or _STORE_PATH != path:
         if _STORE is not None:
             _STORE.close()
-        # K2: route through the one aux-store selector. The tenant-scoped Postgres mirror
-        # for HITL checkpoints lands in K3; until then the Postgres builder is None and
-        # this resolves to the durable SQLite checkpoint store byte-for-byte.
+        # K3: route through the one aux-store selector — the Postgres mirror is the
+        # ``"studio"``-tenant checkpoint store; the SQLite builder is the offline default.
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _STORE = select_aux_store(lambda: SqliteCheckpointStore(path))
+        def _pg() -> Any:
+            from himmy.services.storage.postgres_aux import PostgresCheckpointStore
+
+            return PostgresCheckpointStore(tenant="studio")
+
+        _STORE = select_aux_store(lambda: SqliteCheckpointStore(path), _pg)
         _STORE_PATH = path
     return _STORE
 

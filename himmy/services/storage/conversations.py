@@ -807,30 +807,42 @@ class ConversationStore:
 # (and one durable .himmy/conversations.db). On first open in a project, any pre-existing
 # legacy sessions.db / chats.db are folded in once (best-effort, idempotent).
 
-_STORE: ConversationStore | None = None
+_STORE: object | None = None
 _PATH: str | None = None
 _IMPORTED: set[str] = set()
 
 
-def get_conversation_store() -> ConversationStore:
-    """Return the process-wide :class:`ConversationStore` for the canonical path.
+def get_conversation_store() -> object:
+    """Return the process-wide conversation store for the canonical path.
 
-    Resolves the path via :func:`himmy.config.project.conversations_db_path` (cwd/project
-    keyed) and reuses one open store across calls; a path change (e.g. a test pointing
-    ``HIMMY_CONVERSATIONS_PATH`` at a tmp dir) transparently reopens. On the FIRST open of a
-    given path, legacy ``sessions.db``/``chats.db`` siblings are imported once.
+    Under a Postgres DSN this is the K4 Postgres mirror (``"local"`` tenant — the shared
+    CLI/Studio/v1 surface); otherwise the durable SQLite :class:`ConversationStore`.
+    Resolves the SQLite path via :func:`himmy.config.project.conversations_db_path`
+    (cwd/project keyed) and reuses one open store across calls; a path change (e.g. a test
+    pointing ``HIMMY_CONVERSATIONS_PATH`` at a tmp dir) transparently reopens. On the FIRST
+    open of a given SQLite path, legacy ``sessions.db``/``chats.db`` siblings are imported
+    once (the Postgres mirror has no local sidecar to fold in).
     """
     global _STORE, _PATH
+    from himmy.services.storage.aux_store_factory import aux_postgres_enabled
+
+    if aux_postgres_enabled():
+        from himmy.services.storage.postgres_aux import PostgresConversationStore
+
+        if not isinstance(_STORE, PostgresConversationStore):
+            _STORE = PostgresConversationStore(tenant="local")
+            _PATH = None
+        return _STORE
+
     from himmy.config.project import conversations_db_path
 
     path = conversations_db_path()
-    if _STORE is None or _PATH != path:
+    if not isinstance(_STORE, ConversationStore) or _PATH != path:
         if _STORE is not None:
-            _STORE.close()
-        # K2: route through the one aux-store selector (Postgres mirror = K4; None today).
-        from himmy.services.storage.aux_store_factory import select_aux_store
-
-        _STORE = select_aux_store(lambda: ConversationStore(path))
+            close = getattr(_STORE, "close", None)
+            if callable(close):
+                close()
+        _STORE = ConversationStore(path)
         _PATH = path
         _maybe_import_legacy(_STORE, path)
     return _STORE
@@ -853,12 +865,14 @@ def _maybe_import_legacy(store: ConversationStore, path: str) -> None:
         pass
 
 
-def current_conversation_store() -> ConversationStore | None:
+def current_conversation_store() -> object | None:
     """Return the already-open process-wide store WITHOUT constructing one (or None).
 
-    Used to distinguish the container-owned (offline, in-memory) store from the shared
-    durable singleton at teardown: closing the shared one would break the CLI + Studio
-    that hold the same connection, so only a private (non-singleton) store is closed.
+    ``object`` because under a Postgres DSN the singleton is the K4 Postgres mirror rather
+    than a :class:`ConversationStore`. Used to distinguish the container-owned (offline,
+    in-memory) store from the shared durable singleton at teardown: closing the shared one
+    would break the CLI + Studio that hold the same connection, so only a private
+    (non-singleton) store is closed.
     """
     return _STORE
 
@@ -867,7 +881,9 @@ def reset_conversation_store() -> None:
     """Close + drop the singleton (test hook; the next access reopens at the current path)."""
     global _STORE, _PATH
     if _STORE is not None:
-        _STORE.close()
+        close = getattr(_STORE, "close", None)
+        if callable(close):
+            close()
     _STORE = None
     _PATH = None
     _IMPORTED.clear()

@@ -358,6 +358,116 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "WHERE idempotency_key IS NOT NULL",
         ],
     ),
+    # v4 (K3 + K4): the auxiliary stores' Postgres mirrors, routed by HIMMY_DATABASE_URL
+    # through the K2 aux-store selector so a Postgres deployment stops forking these to
+    # local .himmy/*.db sidecars. Every aux table carries a ``tenant`` discriminator (K3
+    # reviewer must_fix): Studio's HITL inbox (``approvals.db``) and /v1's
+    # (``v1_approvals.db``) are DELIBERATELY separate surfaces, so a single undifferentiated
+    # table would let a /v1 tenant read Studio's (or another tenant's) checkpoints. All reads
+    # are scoped on ``tenant``. The per-record JSON ``schema_version`` migration
+    # (``_migrate_*`` in himmy.runtime.checkpoint) is still applied ON READ on the Postgres
+    # path — appending a table here does nothing for the per-record blob schema.
+    #
+    # The bodies are JSON blobs (``data``) mirroring the SQLite stores 1:1 (durability
+    # routing only; per-subject envelope-encryption is a later phase, S3). Indexed columns
+    # carry the discriminators the SQLite stores filter on (status / workspace_id / origin).
+    (
+        4,
+        "aux_store_mirrors",
+        [
+            # --- K3: HITL approval checkpoints (Studio + /v1, tenant-scoped) ---
+            "CREATE TABLE IF NOT EXISTS aux_agent_checkpoints ("
+            "tenant TEXT NOT NULL, "
+            "checkpoint_id TEXT NOT NULL, "
+            "status TEXT NOT NULL, "
+            "data JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (tenant, checkpoint_id))",
+            "CREATE INDEX IF NOT EXISTS aux_agent_checkpoints_status_idx "
+            "ON aux_agent_checkpoints (tenant, status)",
+            # --- K3: durable graph-run checkpoints (long team/workflow runs) ---
+            "CREATE TABLE IF NOT EXISTS aux_graph_checkpoints ("
+            "tenant TEXT NOT NULL, "
+            "checkpoint_id TEXT NOT NULL, "
+            "graph_name TEXT NOT NULL DEFAULT '', "
+            "status TEXT NOT NULL, "
+            "data JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (tenant, checkpoint_id))",
+            "CREATE INDEX IF NOT EXISTS aux_graph_checkpoints_status_idx "
+            "ON aux_graph_checkpoints (tenant, status)",
+            # --- K4: unified conversation store (CLI sessions + Studio chats) ---
+            "CREATE TABLE IF NOT EXISTS aux_conversations ("
+            "tenant TEXT NOT NULL, "
+            "conversation_id TEXT NOT NULL, "
+            "thread JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "origin TEXT NOT NULL DEFAULT 'cli', "
+            "title TEXT, "
+            "agent_path TEXT, "
+            "provider TEXT, "
+            "project_id TEXT, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (tenant, conversation_id))",
+            "CREATE INDEX IF NOT EXISTS aux_conversations_updated_idx "
+            "ON aux_conversations (tenant, updated_at DESC)",
+            "CREATE TABLE IF NOT EXISTS aux_conversation_messages ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "conversation_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, "
+            "text TEXT NOT NULL, "
+            "seq INTEGER NOT NULL, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE INDEX IF NOT EXISTS aux_conversation_messages_conv_idx "
+            "ON aux_conversation_messages (tenant, conversation_id, seq)",
+            "CREATE TABLE IF NOT EXISTS aux_projects ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "name TEXT NOT NULL, "
+            "description TEXT NOT NULL DEFAULT '', "
+            "kb_id TEXT, "
+            "agent_path TEXT, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (tenant, id))",
+            # --- K4: scheduled routines (atomic cluster-wide tick via last_run_at CAS) ---
+            "CREATE TABLE IF NOT EXISTS aux_routines ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "workspace_id TEXT NOT NULL DEFAULT '__local__', "
+            "data JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "last_run_at TEXT, "
+            "agent_id TEXT, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE INDEX IF NOT EXISTS aux_routines_workspace_idx "
+            "ON aux_routines (tenant, workspace_id)",
+            # --- K4: teams + workflows (stored-agent orchestration bindings) ---
+            "CREATE TABLE IF NOT EXISTS aux_teams ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "workspace_id TEXT NOT NULL DEFAULT '__local__', "
+            "data JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "idempotency_key TEXT, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE INDEX IF NOT EXISTS aux_teams_workspace_idx "
+            "ON aux_teams (tenant, workspace_id)",
+            "CREATE TABLE IF NOT EXISTS aux_workflows ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "workspace_id TEXT NOT NULL DEFAULT '__local__', "
+            "data JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "idempotency_key TEXT, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE INDEX IF NOT EXISTS aux_workflows_workspace_idx "
+            "ON aux_workflows (tenant, workspace_id)",
+        ],
+    ),
 ]
 
 

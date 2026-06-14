@@ -29,6 +29,7 @@ from __future__ import annotations
 import builtins
 import os
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -97,12 +98,20 @@ class ChatsStore:
     accessor reuses the process-wide one.
     """
 
-    def __init__(self, path: str = ":memory:", *, store: ConversationStore | None = None) -> None:
+    def __init__(self, path: str = ":memory:", *, store: Any = None) -> None:
+        # ``store`` is the unified conversation store: a SQLite ``ConversationStore`` OR, under
+        # a Postgres DSN (K4), the ``PostgresConversationStore`` mirror — both expose the same
+        # save_flat/list_summaries/... surface this facade calls. Typed ``Any`` because the two
+        # share a duck-typed surface, not a nominal base.
         self._store = store if store is not None else ConversationStore(path)
 
     @property
-    def _conn(self):  # type: ignore[no-untyped-def]
-        """The unified store's live SQLite connection (back-compat for direct-SQL tests)."""
+    def _conn(self) -> Any:
+        """The unified store's live SQLite connection (back-compat for direct-SQL tests).
+
+        Only the SQLite ``ConversationStore`` exposes ``_conn``; the Postgres mirror has no
+        single connection, so this raises ``AttributeError`` there (the property is a
+        test-only direct-SQL shim never exercised on the Postgres path)."""
         return self._store._conn
 
     # ---- chats ------------------------------------------------------------

@@ -412,9 +412,22 @@ class ApiContainer:
         from himmy.services.storage.factory import in_server_context
 
         if in_server_context():
+            # K3: under a Postgres DSN this is the tenant-scoped Postgres mirror bound to
+            # the ``"v1"`` tenant — DELIBERATELY distinct from Studio's ``"studio"`` tenant
+            # so /v1 and Studio checkpoints stay isolated (the v1_approvals.db/approvals.db
+            # split is preserved AS a discriminator, not collapsed). SQLite file-backed
+            # otherwise; in-memory off-server.
             from himmy.config.project import v1_approvals_db_path
+            from himmy.services.storage.aux_store_factory import select_aux_store
 
-            return SqliteCheckpointStore(v1_approvals_db_path())
+            def _pg() -> Any:
+                from himmy.services.storage.postgres_aux import PostgresCheckpointStore
+
+                return PostgresCheckpointStore(tenant="v1")
+
+            return select_aux_store(
+                lambda: SqliteCheckpointStore(v1_approvals_db_path()), _pg
+            )
         return InMemoryCheckpointStore()
 
     @staticmethod

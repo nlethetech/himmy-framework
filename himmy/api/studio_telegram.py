@@ -269,7 +269,11 @@ class TelegramListenerManager:
 
         return _handle
 
-    def _store(self) -> ConversationStore:
+    def _store(self) -> Any:
+        # The shared conversation store: a SQLite ``ConversationStore`` OR, under a Postgres
+        # DSN (K4), the ``PostgresConversationStore`` mirror — both expose the same
+        # save_thread/load_thread/list_summaries surface this agent uses (duck-typed, no
+        # nominal base), so the return is typed ``Any``.
         return self._store_override or get_conversation_store()
 
     async def _run_turn_canonical(

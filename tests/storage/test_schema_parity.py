@@ -74,6 +74,25 @@ def _postgres_views() -> set[str]:
     return set(_CREATE_VIEW_RE.findall(STORAGE_DDL))
 
 
+#: The K3/K4 auxiliary-store Postgres mirror tables. They live in the ONE Postgres
+#: ``schema_migrations`` ledger (migration v4) but are NAMESPACED (``aux_*``) and so are
+#: deliberately absent from the CORE SQLite storage schema — each aux store keeps its OWN
+#: per-file SQLite table under a DIFFERENT name (e.g. ``agent_checkpoints`` vs
+#: ``aux_agent_checkpoints``). The per-store SQLite<->Postgres mapping is asserted by
+#: :func:`test_aux_postgres_mirror_tables_present` below, not by core-table name equality.
+_AUX_POSTGRES_TABLES = frozenset(
+    {
+        "aux_agent_checkpoints",
+        "aux_graph_checkpoints",
+        "aux_conversations",
+        "aux_conversation_messages",
+        "aux_projects",
+        "aux_routines",
+        "aux_teams",
+        "aux_workflows",
+    }
+)
+
 #: Tables the Postgres core surface declares that the SQLite core surface deliberately
 #: does NOT. Each is an explicit, documented divergence — adding to this set is a
 #: deliberate act that requires updating this constant (the whole point of the guard).
@@ -82,7 +101,10 @@ def _postgres_views() -> set[str]:
 #:   version in ``PRAGMA user_version`` instead, so there is no table.
 #: * ``evaluation_suites`` — a Postgres-only analytics table; the SQLite store does not
 #:   persist evaluation suites (only ``evaluation_runs``).
-_POSTGRES_ONLY_TABLES = frozenset({"schema_migrations", "evaluation_suites"})
+#: * the ``aux_*`` mirrors — namespaced K3/K4 aux-store tables (mapped per-store below).
+_POSTGRES_ONLY_TABLES = (
+    frozenset({"schema_migrations", "evaluation_suites"}) | _AUX_POSTGRES_TABLES
+)
 
 #: Views the Postgres surface declares that SQLite lacks. ``ai_call_log`` flattens the
 #: request/response run-event pair into one analytics row — a Postgres-only convenience.
@@ -269,3 +291,66 @@ def test_aux_registry_enumerates_every_routed_store() -> None:
         "memory",
     }
     assert set(_AUX_SQLITE_TABLES) == routed
+
+
+# ----------------------------------------------------------------- K3/K4 aux PG mirrors
+#: Per aux store, the Postgres mirror table(s) the K3/K4 items add to STORAGE_MIGRATIONS,
+#: mapped to the SQLite table(s) they mirror. ``None`` = no Postgres mirror in K3/K4 (the
+#: K5 stores: calendar/cookbook/notes/tasks/memory). A K3/K4 store with a SQLite table but
+#: no listed mirror — or a mirror name absent from the committed Postgres DDL — reds the
+#: test below, so a mirror can never silently drift from its SQLite source.
+_AUX_PG_MIRROR: dict[str, set[str] | None] = {
+    "approvals": {"aux_agent_checkpoints"},
+    "graph_checkpoints": {"aux_graph_checkpoints"},
+    "conversations": {
+        "aux_conversations",
+        "aux_conversation_messages",
+        "aux_projects",
+    },
+    "routines": {"aux_routines"},
+    "teams": {"aux_teams"},
+    "workflows": {"aux_workflows"},
+    # K5 (not in this unit): no Postgres mirror yet.
+    "calendar": None,
+    "cookbook": None,
+    "notes": None,
+    "tasks": None,
+    "memory": None,
+}
+
+
+def test_aux_pg_mirror_map_enumerates_every_aux_store() -> None:
+    """The K3/K4 mirror map covers exactly the aux stores the SQLite registry enumerates."""
+    assert set(_AUX_PG_MIRROR) == set(_AUX_SQLITE_TABLES)
+
+
+def test_aux_postgres_mirror_tables_present() -> None:
+    """Every K3/K4 Postgres mirror table is declared in the committed Postgres migrations.
+
+    The K3/K4 trip-wire's Postgres half: a store whose SQLite side is routed into Postgres
+    must have its mirror table(s) in ``STORAGE_MIGRATIONS``. Adding a SQLite aux table for a
+    K3/K4 store without the matching ``aux_*`` Postgres mirror (or vice-versa) reds here.
+    """
+    postgres_tables = _postgres_core_tables()
+    for name, mirror in _AUX_PG_MIRROR.items():
+        if mirror is None:
+            continue
+        missing = mirror - postgres_tables
+        assert not missing, (
+            f"aux store {name!r} Postgres mirror tables absent from STORAGE_MIGRATIONS: "
+            f"{sorted(missing)}"
+        )
+
+
+def test_aux_pg_mirror_tables_match_documented_pg_only_set() -> None:
+    """The union of K3/K4 mirror tables equals the documented ``aux_*`` Postgres-only set.
+
+    Keeps :data:`_AUX_POSTGRES_TABLES` honest: if a mirror table is added to the map but not
+    the documented set (or vice-versa) this reds, so the core-table divergence allowlist and
+    the per-store mirror map can never drift apart.
+    """
+    declared: set[str] = set()
+    for mirror in _AUX_PG_MIRROR.values():
+        if mirror is not None:
+            declared |= mirror
+    assert declared == set(_AUX_POSTGRES_TABLES)
