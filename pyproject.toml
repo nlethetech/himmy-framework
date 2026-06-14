@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "himmy"
-version = "0.1.0"
+# Single-sourced from himmy.__version__ (the one human-edited literal). setuptools
+# AST-extracts the string with NO module import, so this stays safe to build offline.
+dynamic = ["version"]
 description = "Himmy Agent Framework — an offline-first, entity-backed Python agent framework."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -116,6 +118,11 @@ all = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
 ]
+
+[tool.setuptools.dynamic]
+# The lone version literal lives in himmy/__init__.py; setuptools reads it via AST
+# (no import), so building never executes the package.
+version = { attr = "himmy.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["himmy*"]

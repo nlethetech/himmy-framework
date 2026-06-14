@@ -59,7 +59,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: himmy-studio:${HIMMY_VERSION:-0.1.0}
+    image: himmy-studio:${HIMMY_VERSION:-0.2.0}
     container_name: himmy_studio
     restart: unless-stopped
     ports:

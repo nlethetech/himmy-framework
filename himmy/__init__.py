@@ -13,7 +13,7 @@ from himmy.agents.base_agent.agent import Agent
 from himmy.agents.base_agent.task import Task
 from himmy.agents.personas.persona import Persona
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",

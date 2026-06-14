@@ -7,7 +7,50 @@ providers, Postgres/pgvector, and observability.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-13
+
 ### Added
+- **Interface coherence — one run machinery behind CLI, Studio, and `/v1`.** The
+  durable spine, run store, and conversations now back every surface, and the `/v1`
+  REST API reaches feature-parity with Studio (enumerated from the
+  `feat/interface-coherence` line, commit range `b6041a4..74b3467`).
+  - **Durable shared spine via `SpineFactory`** (`HIMMY_SPINE_DATABASE_URL`): the
+    entity audit registry runs on SQLite by default and Postgres when a DSN is set,
+    fronted by a synchronous facade so the offline single-box path is unchanged.
+  - **One canonical run store**: agent runs unify into a single `RunRecord` across
+    CLI/Studio/`/v1` (no more per-surface run tables), and CLI sessions + Studio
+    chats unify into one `conversations.db` (`ConversationStore`) — `/v1` thread
+    continuation + plan mode read/write that same store.
+  - **`/v1` resources over the run machinery**: `/v1/knowledge` (workspace-namespaced
+    CRUD + ingest + search), `/v1/teams` and `/v1/workflows` (execution over the same
+    run engine), `/v1/routines` (+ `himmy routines` CLI, cross-process safe via a host
+    flock that surfaces a busy peer as `409`), and a unified model catalog + compare +
+    diagnostics shared across `/v1`, the CLI, and Studio.
+  - **Inbound Telegram listener manager** (Studio): a managed long-poll listener that
+    routes channel messages into the run machinery.
+  - **Secure per-run `/v1` runtime**: tool-bearing runs go through a tenant-spec
+    sanitizer + per-workspace quota, and Studio adds read-only guardrail + security-log
+    viewers over the same audit spine.
+- **Release engineering — himmy is pinnable.** The version is single-sourced from
+  `himmy.__version__` (`pyproject.toml` reads it dynamically; the API/MCP/news-server
+  and compose/Helm `appVersion` all resolve to it), a tag-triggered `release.yml`
+  publishes to PyPI via OIDC Trusted Publishing (no stored token, reusing the
+  build-wheel GUI-in-wheel assert + clean-venv smoke), and an API stability contract
+  (`docs/STABILITY.md` + a `/v1`-scoped OpenAPI snapshot test + a `himmy.__all__`
+  public-symbol snapshot) reds the build on any breaking public change.
+
+### Changed
+- **Nested human-in-the-loop is robust for workflow/graph member runs**: a member run
+  that pauses for approval suspends and resumes its parent correctly, and run-level
+  resume is now an atomic transition that closes the concurrent double-approve race.
+  Graph/workflow nodes route to the pinned provider (not the stub), and `RESOLVING` is
+  mapped in the exhaustive Studio status projection. A resumed member's output is
+  durably anchored before continuation so a crash mid-resume recovers.
+- **Auditable parity guard in CI**: the feature × interface coverage matrix is encoded
+  as a CI test (including the empty-index Studio loophole), so a feature shipped on one
+  surface but missing from another reds the build.
+
+### Earlier (folded into 0.2.0)
 - **Deployment engineering — ship himmy, don't hand-assemble it.** Closes the gap
   between the container-ready runtime and the missing artifacts an operator needs to
   stand it up.

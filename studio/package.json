@@ -1,7 +1,7 @@
 {
   "name": "himmy-studio",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Himmy Studio — the local web GUI for the Himmy agent framework.",
   "scripts": {

@@ -8,7 +8,7 @@ type: application
 # Chart version — bump on every chart change.
 version: 0.1.0
 # Application version — tracks the himmy release this chart targets.
-appVersion: "0.1.0"
+appVersion: "0.2.0"
 keywords:
   - himmy
   - studio

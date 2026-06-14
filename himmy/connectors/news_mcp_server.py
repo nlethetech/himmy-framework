@@ -17,6 +17,7 @@ import os
 import sys
 from typing import Any
 
+from himmy import __version__
 from himmy.connectors.fetcher import Fetcher, HttpxFetcher
 from himmy.connectors.news import NewsFetcher
 
@@ -135,7 +136,7 @@ def main() -> None:
                 {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "himmy-news", "version": "0.1.0"},
+                    "serverInfo": {"name": "himmy-news", "version": __version__},
                 },
             )
         elif method == "notifications/initialized":

@@ -26,7 +26,7 @@ Usage:
     python scripts/airgap_bundle.py build --dry-run
     python scripts/airgap_bundle.py build --out dist/
     python scripts/airgap_bundle.py build --out dist/ --models qwen2.5:3b-instruct
-    python scripts/airgap_bundle.py build --studio-image himmy-studio:0.1.0 --platform linux/amd64
+    python scripts/airgap_bundle.py build --studio-image himmy-studio:0.2.0 --platform linux/amd64
 """
 
 from __future__ import annotations

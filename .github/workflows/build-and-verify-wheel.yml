@@ -1,0 +1,151 @@
+name: Build & Verify Wheel (reusable)
+
+# Single source of truth for "build a wheel that actually ships the Studio GUI and
+# survives a clean-venv install". Consumed by BOTH build-wheel.yml (CI on PRs) and
+# release.yml (tag publish) so the GUI-in-wheel assert + clean-venv smoke live in
+# ONE place — copy-pasting these ~60 lines is exactly the "hardcoded in two places"
+# footgun this release work exists to remove.
+#
+# Steps: build the Studio SPA into the package -> `python -m build` -> assert the
+# built SPA shell (himmy/api/_studio_static/index.html + a hashed asset) is inside
+# the wheel -> install that wheel into a CLEAN venv -> smoke-test the published
+# artifact (himmy --version, import, create_app(), studio_is_built()).
+on:
+  workflow_call:
+    inputs:
+      # When set (release.yml passes the pushed git tag, e.g. "v0.2.0"), the build
+      # asserts the wheel's version matches the tag so a forgotten __version__ bump
+      # can never publish under the wrong tag.
+      expected-tag:
+        description: "Git tag (vX.Y.Z) that must equal the wheel version; empty to skip the guard."
+        required: false
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: "The version the built wheel reports (himmy.__version__)."
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + assert GUI + clean-install smoke
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.smoke.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build the Studio SPA into the package
+        # Emits the built frontend into himmy/api/_studio_static so the wheel
+        # picks it up via [tool.setuptools.package-data]. This is the step a bare
+        # `python -m build` does NOT do — its absence is exactly the gap we close.
+        run: |
+          cd studio
+          npm ci
+          npm run build
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Assert the wheel ships the Studio GUI
+        # Fail the build if the SPA shell isn't packaged — that's a wheel that
+        # would install cleanly but leave `himmy studio` unable to serve the GUI.
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel in dist/, found {wheels!r}")
+          wheel = wheels[0]
+          names = set(zipfile.ZipFile(wheel).namelist())
+
+          required = "himmy/api/_studio_static/index.html"
+          if required not in names:
+              shipped = sorted(n for n in names if "_studio_static" in n)
+              sys.exit(
+                  f"::error::{wheel} is MISSING {required} — the Studio GUI was "
+                  f"not packaged. Did `npm run build` run before `python -m build`? "
+                  f"_studio_static entries found: {shipped}"
+              )
+          # Also require at least one hashed asset, so an empty/stale build dir
+          # (just an index.html) can't pass the gate.
+          assets = [n for n in names if n.startswith("himmy/api/_studio_static/assets/")]
+          if not assets:
+              sys.exit(
+                  f"::error::{wheel} ships index.html but no built assets under "
+                  f"himmy/api/_studio_static/assets/ — the SPA build is incomplete."
+              )
+          print(f"OK: {wheel} ships {required} and {len(assets)} hashed asset(s).")
+          PY
+
+      - name: Install the built wheel into a CLEAN venv
+        # A fresh venv with NO editable source on sys.path — this exercises the
+        # published artifact exactly as `pip install himmy[studio]` would for a
+        # new user, not the working tree.
+        run: |
+          python -m venv /tmp/himmy_clean_venv
+          WHEEL="$(ls dist/*.whl)"
+          /tmp/himmy_clean_venv/bin/pip install --upgrade pip
+          /tmp/himmy_clean_venv/bin/pip install "${WHEEL}[studio]"
+
+      - name: Smoke check the published artifact
+        id: smoke
+        # `himmy --version` exercises the console-script entry point; the import
+        # check boots the FastAPI app factory; studio_is_built() must be True,
+        # proving the GUI shipped inside the wheel (not just on the build runner).
+        # When EXPECTED_TAG is set (release), assert tag == wheel version so a
+        # forgotten bump can never publish under the wrong tag.
+        env:
+          EXPECTED_TAG: ${{ inputs.expected-tag }}
+        run: |
+          /tmp/himmy_clean_venv/bin/himmy --version
+          VERSION="$(/tmp/himmy_clean_venv/bin/python - <<'PY'
+          import himmy
+          from himmy.api.app import create_app, studio_is_built
+
+          assert studio_is_built(), (
+              "studio_is_built() is False in the installed wheel — the SPA shell "
+              "did not make it into site-packages."
+          )
+          create_app()  # the BFF (with the Studio SPA mounted) constructs cleanly
+          print(himmy.__version__)
+          PY
+          )"
+          echo "smoke ok: himmy ${VERSION}, studio_is_built=True"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [ -n "${EXPECTED_TAG}" ]; then
+            if [ "${EXPECTED_TAG}" != "v${VERSION}" ]; then
+              echo "::error::tag ${EXPECTED_TAG} does not match wheel version v${VERSION} — bump himmy.__version__ to match the tag (or tag the right commit)."
+              exit 1
+            fi
+            echo "tag guard ok: ${EXPECTED_TAG} == v${VERSION}"
+          fi
+
+      - name: Upload the wheel
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: himmy-wheel
+          path: dist/*.whl
+          if-no-files-found: ignore

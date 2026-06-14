@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
+from himmy import __version__
 from himmy.api.auth import (
     build_access_policy,
     build_authenticator,
@@ -422,7 +423,7 @@ def create_app(
     _enforce_auth_posture(authenticator, effective_host)
     app = FastAPI(
         title="Himmy API",
-        version="0.1.0",
+        version=__version__,
         description="Backend-for-frontend over the Himmy application services.",
         # Authenticate first (so the limiter can key on the principal), then throttle.
         dependencies=[
@@ -828,9 +829,6 @@ def _install_openapi_security(app: FastAPI, authenticator: object | None) -> Non
         return schema
 
     app.openapi = _custom_openapi  # type: ignore[method-assign]
-
-
-__all__ = ["create_app", "set_rate_limiter"]
 
 
 __all__ = ["create_app", "set_rate_limiter"]

@@ -73,11 +73,15 @@ class MCPClient:
         spec: MCPServerSpec,
         *,
         client_name: str = "himmy",
-        client_version: str = "0.1.0",
+        client_version: str | None = None,
         protocol_version: str = DEFAULT_PROTOCOL_VERSION,
         request_timeout: float = 30.0,
     ) -> MCPClient:
         """Spawn the server, run the MCP handshake, and return a ready client."""
+        if client_version is None:
+            from himmy import __version__
+
+            client_version = __version__
         try:
             proc = await asyncio.create_subprocess_exec(
                 spec.command,

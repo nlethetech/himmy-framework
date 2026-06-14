@@ -1,0 +1,121 @@
+name: Release
+
+# Tag-triggered PyPI publish via OIDC Trusted Publishing — NO long-lived token
+# secret. Pushing an annotated tag `vX.Y.Z` runs the SHARED build-and-verify job
+# (Studio SPA -> wheel -> GUI-in-wheel assert -> clean-venv smoke -> tag==version
+# guard), then a publish job that rebuilds the GUI-bearing wheel + sdist, runs
+# `twine check`, installs the wheel and `pip-audit`s the INSTALLED environment
+# (security.yml audits an installed env, not a bare .whl — same shape here), and
+# publishes through pypa/gh-action-pypi-publish with id-token: write + the `pypi`
+# environment.
+#
+# ONE-TIME EXTERNAL SETUP (before the first tag):
+#   1. Confirm the project name `himmy` is available / owned on PyPI.
+#   2. Register a PyPI Trusted Publisher for this repo + the `release.yml` workflow
+#      + the `pypi` environment (PyPI project settings -> Publishing). No API token
+#      is ever stored in GitHub.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag to (re)build, e.g. v0.2.0 — must already exist."
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Reuse the exact GUI-in-wheel assert + clean-venv smoke CI uses, and bolt on the
+  # tag==himmy.__version__ guard so a forgotten bump can't publish a mislabeled tag.
+  verify:
+    uses: ./.github/workflows/build-and-verify-wheel.yml
+    with:
+      expected-tag: ${{ github.ref_type == 'tag' && github.ref_name || inputs.ref }}
+
+  publish:
+    name: build sdist+wheel, audit, publish (OIDC)
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # OIDC token for PyPI Trusted Publishing; no token secret needed.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build the Studio SPA into the package
+        # The published wheel MUST carry the GUI; rebuild it here (the verify job
+        # runs in a separate workflow whose dist/ is not shared with this job).
+        run: |
+          cd studio
+          npm ci
+          npm run build
+
+      - name: Install build + twine (neither is in any extra)
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Assert the wheel ships the Studio GUI
+        # Same gate as the reusable job — a publish must never ship a GUI-less wheel.
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel in dist/, found {wheels!r}")
+          names = set(zipfile.ZipFile(wheels[0]).namelist())
+          required = "himmy/api/_studio_static/index.html"
+          if required not in names:
+              sys.exit(f"::error::{wheels[0]} is MISSING {required} — GUI not packaged.")
+          if not any(n.startswith("himmy/api/_studio_static/assets/") for n in names):
+              sys.exit(f"::error::{wheels[0]} ships index.html but no built assets.")
+          print(f"OK: {wheels[0]} ships the Studio GUI.")
+          PY
+
+      - name: twine check the artifacts
+        run: twine check dist/*
+
+      - name: pip-audit the installed wheel
+        # security.yml audits an INSTALLED environment, not a .whl — mirror that:
+        # install the freshly built wheel into a clean venv FIRST, then audit that
+        # environment so transitive dependency CVEs are caught against what ships.
+        run: |
+          python -m venv /tmp/himmy_audit_venv
+          WHEEL="$(ls dist/*.whl)"
+          /tmp/himmy_audit_venv/bin/pip install --upgrade pip pip-audit
+          /tmp/himmy_audit_venv/bin/pip install "${WHEEL}[studio]"
+          /tmp/himmy_audit_venv/bin/pip-audit --desc
+
+      - name: Publish to PyPI via Trusted Publishing (OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # No `password:` — OIDC id-token authenticates this workflow to PyPI.
+          packages-dir: dist/
+          print-hash: true

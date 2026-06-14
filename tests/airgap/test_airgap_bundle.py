@@ -314,8 +314,13 @@ def test_bundle_covers_every_compose_image() -> None:
     compose_refs = airgap.compose_image_refs(compose.read_text("utf-8"))
     assert compose_refs, "parsed no image: refs from compose"
 
-    # The bundle ships these refs (studio uses the compose default version).
-    bundled = set(airgap.image_specs("0.1.0").values())
+    # The bundle ships these refs (studio uses the compose default version). Derive
+    # the studio version from what compose actually references so this guard never
+    # drifts when HIMMY_VERSION is bumped.
+    studio_refs = [r for r in compose_refs if r.startswith("himmy-studio:")]
+    assert len(studio_refs) == 1, f"expected one himmy-studio ref, got {studio_refs}"
+    studio_version = studio_refs[0].split(":", 1)[1]
+    bundled = set(airgap.image_specs(studio_version).values())
 
     missing = compose_refs - bundled
     assert not missing, (
