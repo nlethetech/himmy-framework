@@ -586,6 +586,7 @@ def make_webhook_connector(
     egress_allow_hosts: Collection[str] | None = None,
     allow_private_hosts: bool = False,
     ack_only: bool = False,
+    idempotency: IdempotencyStore | None = None,
     context: ConnectorContext | None = None,
 ) -> WebhookInboundConnector:
     """Build a :class:`WebhookInboundConnector` from the secrets/allowlist environment.
@@ -595,6 +596,11 @@ def make_webhook_connector(
     result POST is validated against the same egress policy and signed with the same secret).
     A deployment that sets only the secret gets a connector that is capability-OK but refuses
     every delivery (default-deny) until a source is allow-listed.
+
+    ``idempotency`` lets the inbound-mount seam inject a DURABLE dedup store (Q4): on a
+    durable (SQLite/Postgres) deployment ``build_inbound('webhook', ..., idempotency=<store>)``
+    forwards it here so a delivery id seen before a restart stays deduped after restart. The
+    offline in-memory default passes ``None`` and falls back to a process-local store.
     """
     from himmy.config.secrets import get_secret
 
@@ -613,6 +619,7 @@ def make_webhook_connector(
         result_callback=poster,
         callback_url=callback_url,
         ack_only=ack_only,
+        idempotency=idempotency,
         context=context,
     )
 

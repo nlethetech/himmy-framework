@@ -260,6 +260,50 @@ def test_health_gate_excludes_local_lane_when_probe_down() -> None:
     run_async(go())
 
 
+def test_orchestration_run_is_claimable_under_default_lane_when_probe_down() -> None:
+    """An enqueued ORCHESTRATION run drains through the neutral DEFAULT lane (probe down).
+
+    Regression: create_orchestration_run must stamp ``lane_key = LANE_DEFAULT`` (not NULL).
+    The claim filter is ``lane_key IN (...)`` and SQL NULL never matches an IN/ANY list, so a
+    NULL-lane orchestration run would sit QUEUED forever exactly when the local probe gates out
+    the local lane — the laptop transient the health gate is meant to drain through. This drives
+    the REAL enqueue path (create_orchestration_run) and then claims under the probe-down lanes.
+    """
+    from himmy.services.storage.models import AgentDefRecord
+    from himmy.services.storage.run_lane import LANE_DEFAULT
+
+    db = str(Path(tempfile.mkdtemp()) / "q.db")
+    storage, run_app = _durable_stack(db)
+    run_app.enable_dispatch()
+
+    async def go() -> None:
+        member = AgentDefRecord(workspace_id="w", name="analyst")
+        run = await run_app.create_orchestration_run(
+            workspace_id="w",
+            subject_id="s",
+            kind="multi_agent",
+            members=[member],
+            prompt="diagnose the outage",
+            resource_kind="team",
+            resource_id="team-1",
+        )
+        # Enqueued (recoverable), and stamped onto the always-included neutral lane.
+        assert run.status == RunStatus.QUEUED
+        assert run.lane_key == LANE_DEFAULT
+
+        # Probe DOWN -> claimable lanes are [CLOUD, DEFAULT]; the orchestration run MUST be
+        # claimable (it would be invisible to ``lane_key IN (...)`` had the lane stayed NULL).
+        dispatcher = RunDispatcher(
+            run_app, probe=LocalProviderProbe(probe=lambda: False)
+        )
+        lanes = await dispatcher._claimable_lanes()
+        assert lanes is not None and LANE_DEFAULT in lanes
+        claimed = await storage.claim_next_queued_run("w0", 300, lanes=lanes)
+        assert claimed is not None and claimed.run_id == run.run_id
+
+    run_async(go())
+
+
 def test_inline_mode_runs_immediately_without_a_dispatcher() -> None:
     """No-dispatcher fallback: an INLINE RunAppService executes the create right away."""
     db = str(Path(tempfile.mkdtemp()) / "q.db")

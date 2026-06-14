@@ -141,3 +141,59 @@ def test_mounted_signed_delivery_runs_agent_unsigned_is_401(env: Path) -> None:
 
         unsigned = client.post("/v1/connectors/webhook", content=body)
         assert unsigned.status_code == 401
+
+
+def test_durable_container_mounts_webhook_with_durable_dedup(env: Path) -> None:
+    """Q4 regression: under a DURABLE container the webhook router mounts (NOT skipped).
+
+    Before the fix ``make_webhook_connector`` had no ``idempotency`` parameter, so the durable
+    store injected through the ``build_inbound(**kwargs) -> idempotency=`` seam raised a
+    ``TypeError`` that ``mount_inbound_connectors`` swallowed as 'failed to mount ... skipping' —
+    silently removing the endpoint on every SQLite/Postgres deployment AND defeating durable
+    dedup. With a durable (SQLite) container injected, ``_durable_idempotency_store`` returns a
+    real ``DurableIdempotencyStore``; this test asserts (a) the route IS mounted (the seam no
+    longer drops it) and (b) durable dedup actually engages — a repeated delivery id is deduped.
+    """
+    from himmy.api.deps import ApiContainer
+    from himmy.services.storage.sqlite import SqliteStorageService
+
+    svc = ConnectorService()
+    svc.configure(
+        "webhook",
+        {
+            "HIMMY_WEBHOOK_SIGNING_SECRET": _SECRET,
+            "HIMMY_WEBHOOK_ALLOWED_SOURCES": "ci",
+        },
+    )
+    svc.enable("webhook", "inbound")
+    os.environ[INBOUND_AGENT_PATH_ENV] = str(env / "agent.yaml")
+
+    # An INJECTED durable container (file-backed SQLite) — so the mount, which runs at
+    # create_app time, sees a durable backend and injects the durable dedup store. (The
+    # in-memory default returns None, which is why the offline path stays on the built-in
+    # store.) Injected ⇒ the lifespan does not upgrade it; the durable backend is served as-is.
+    durable = ApiContainer._assemble(
+        SqliteStorageService(str(env / "storage.db"))
+    )
+    app = create_app(durable)
+    assert "/v1/connectors/webhook" in _mounted_paths(app)
+
+    body = json.dumps({"source": "ci", "text": "build it", "id": "dup-1"}).encode()
+    sig = "sha256=" + hmac.new(_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/connectors/webhook",
+            content=body,
+            headers={"X-Himmy-Signature": sig},
+        )
+        assert first.status_code == 200
+        assert first.json()["handled"] is True
+        # The SAME delivery id again is deduped by the DURABLE store (not re-run).
+        second = client.post(
+            "/v1/connectors/webhook",
+            content=body,
+            headers={"X-Himmy-Signature": sig},
+        )
+        assert second.status_code == 200
+        body2 = second.json()
+        assert body2["handled"] is False and body2.get("deduplicated") is True

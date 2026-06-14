@@ -362,6 +362,61 @@ def test_durable_dedup_survives_a_restart() -> None:
     assert runs == ["build 1234 passed"]  # the agent did NOT fire again after restart
 
 
+def test_make_webhook_connector_forwards_idempotency_store() -> None:
+    """``make_webhook_connector(idempotency=...)`` wires the injected store onto ``_dedupe``.
+
+    Regression: the builder previously had no ``idempotency`` parameter, so the durable store
+    passed through the ``build_inbound(**kwargs)`` seam raised TypeError and the connector was
+    silently dropped on every durable deployment. Assert the kwarg now flows through.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from himmy.services.storage.sqlite import SqliteStorageService
+    from himmy.services.storage.trigger_dedup import DurableIdempotencyStore
+
+    configure_secrets(_MemSecrets({WEBHOOK_SIGNING_SECRET: _SECRET}))
+
+    async def handler(sender_id: str, text: str) -> str:  # pragma: no cover - not run
+        return ""
+
+    db = str(Path(tempfile.mkdtemp()) / "dedup.db")
+    store = DurableIdempotencyStore(SqliteStorageService(db), scope="webhook")
+    conn = make_webhook_connector(
+        handler, allowed_sources=["ci"], idempotency=store
+    )
+    assert conn._dedupe is store
+
+
+def test_connector_service_build_inbound_injects_durable_store() -> None:
+    """The REAL seam: ConnectorService.build_inbound('webhook', handler, idempotency=store).
+
+    This is the seam that mount_inbound_connectors uses on a durable deployment. The finding's
+    reproduction was a TypeError here (the builder dropped the kwarg), which mount swallowed as
+    'failed to mount inbound connector ... skipping' — silently removing the webhook endpoint
+    AND defeating durable dedup. Drive the full ConnectorService -> _build_inbound_instance ->
+    make_webhook_connector path and assert the connector's ``_dedupe`` is the durable store.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from himmy.connectors.manage import ConnectorService
+    from himmy.services.storage.sqlite import SqliteStorageService
+    from himmy.services.storage.trigger_dedup import DurableIdempotencyStore
+
+    configure_secrets(_MemSecrets({WEBHOOK_SIGNING_SECRET: _SECRET}))
+
+    async def handler(sender_id: str, text: str) -> str:  # pragma: no cover - not run
+        return ""
+
+    db = str(Path(tempfile.mkdtemp()) / "dedup.db")
+    store = DurableIdempotencyStore(SqliteStorageService(db), scope="webhook")
+    service = ConnectorService()
+    connector = service.build_inbound("webhook", handler, idempotency=store)
+    assert isinstance(connector, WebhookInboundConnector)
+    assert connector._dedupe is store
+
+
 # ------------------------------------------------------------------ capability + secrets
 def test_capability_is_unavailable_without_a_secret() -> None:
     async def handler(sender_id: str, text: str) -> str:  # pragma: no cover - not run

@@ -2752,7 +2752,13 @@ class RunAppService:
             # The orchestration run has no single-agent input_blob; its lane is the neutral
             # default (members may target mixed providers) + its retry ceiling is stamped so
             # the dispatcher claims + drives it via the orchestration reconstruction path.
-            run.lane_key = None
+            # It MUST be the literal LANE_DEFAULT, not NULL: the claim filter is
+            # ``lane_key IN (...)`` and SQL NULL never matches an IN/ANY list, so a NULL lane
+            # would sit QUEUED forever whenever the local probe gates out the local lane —
+            # exactly the laptop-transient the health gate is meant to drain through.
+            from himmy.services.storage.run_lane import LANE_DEFAULT
+
+            run.lane_key = LANE_DEFAULT
             run.max_attempts = self._default_max_attempts
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:
