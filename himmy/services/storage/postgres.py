@@ -578,6 +578,21 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ON aux_memory_links (tenant, to_memory_id)",
         ],
     ),
+    # v6 (S3): the data-subject linkage column on the conversation mirror, so
+    # right-to-erasure (S4 SubjectReachMap.delete_by_subject) can find + hard-delete a
+    # subject's transcripts on the Postgres path too. Mirrors the SQLite ConversationStore
+    # ``subject_id`` ADD COLUMN + index, keeping the two backends in lockstep (the K2
+    # parity guard enforces it). ``IF NOT EXISTS`` makes a fresh-vs-legacy run converge.
+    (
+        6,
+        "aux_conversations_subject_id",
+        [
+            "ALTER TABLE aux_conversations "
+            "ADD COLUMN IF NOT EXISTS subject_id TEXT",
+            "CREATE INDEX IF NOT EXISTS aux_conversations_subject_idx "
+            "ON aux_conversations (tenant, subject_id)",
+        ],
+    ),
 ]
 
 

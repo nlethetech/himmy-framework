@@ -183,6 +183,8 @@ class MemoryStore(Protocol):
 
     def delete(self, memory_id: str) -> bool: ...
 
+    def delete_by_subject(self, subject_id: str) -> int: ...
+
     # -- typed relational links (graph memory) ------------------------------
     def save_link(self, link: MemoryLink) -> MemoryLink: ...
 
@@ -233,6 +235,15 @@ class InMemoryMemoryStore:
 
     def delete(self, memory_id: str) -> bool:
         return self._records.pop(memory_id, None) is not None
+
+    def delete_by_subject(self, subject_id: str) -> int:
+        """Hard-DELETE every memory for ``subject_id`` (the S4 reach for this store)."""
+        doomed = [
+            mid for mid, r in self._records.items() if r.subject_id == subject_id
+        ]
+        for mid in doomed:
+            del self._records[mid]
+        return len(doomed)
 
     # -- typed relational links (graph memory) ------------------------------
     def save_link(self, link: MemoryLink) -> MemoryLink:
@@ -394,6 +405,17 @@ class SqliteMemoryStore:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def delete_by_subject(self, subject_id: str) -> int:
+        """Hard-DELETE every memory row for ``subject_id`` (the S4 reach for this store).
+
+        Idempotent: a re-run after the subject is gone deletes nothing and returns 0.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM memories WHERE subject_id = ?", (subject_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""

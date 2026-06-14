@@ -398,6 +398,7 @@ class _AsyncConversationStore:
         agent_path: str | None,
         provider: str | None,
         project_id: str | None,
+        subject_id: str | None = None,
     ) -> ConversationSummary:
         from himmy.services.storage.conversations import (
             ORIGIN_CLI,
@@ -410,7 +411,8 @@ class _AsyncConversationStore:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 existing = await conn.fetchrow(
-                    "SELECT created_at, project_id, agent_path, provider, origin "
+                    "SELECT created_at, project_id, agent_path, provider, origin, "
+                    "subject_id "
                     "FROM aux_conversations WHERE tenant = $1 AND conversation_id = $2",
                     self._tenant,
                     conversation_id,
@@ -430,18 +432,23 @@ class _AsyncConversationStore:
                 effective_project = project_id or (
                     existing["project_id"] if existing else None
                 )
+                resolved_subject = subject_id or (
+                    existing["subject_id"] if existing else None
+                )
                 resolved_origin = origin or (
                     existing["origin"] if existing else ORIGIN_CLI
                 )
                 await conn.execute(
                     "INSERT INTO aux_conversations "
                     "(tenant, conversation_id, thread, origin, title, agent_path, "
-                    "provider, project_id, created_at, updated_at) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
+                    "provider, project_id, subject_id, created_at, updated_at) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) "
                     "ON CONFLICT (tenant, conversation_id) DO UPDATE SET "
                     "thread = EXCLUDED.thread, title = EXCLUDED.title, "
                     "agent_path = EXCLUDED.agent_path, provider = EXCLUDED.provider, "
-                    "project_id = EXCLUDED.project_id, updated_at = EXCLUDED.updated_at",
+                    "project_id = EXCLUDED.project_id, "
+                    "subject_id = EXCLUDED.subject_id, "
+                    "updated_at = EXCLUDED.updated_at",
                     self._tenant,
                     conversation_id,
                     json.loads(thread.model_dump_json()),
@@ -450,6 +457,7 @@ class _AsyncConversationStore:
                     resolved_agent,
                     resolved_provider,
                     effective_project,
+                    resolved_subject,
                     _norm_ts(created),
                     now,
                 )
@@ -587,6 +595,45 @@ class _AsyncConversationStore:
                     conversation_id,
                 )
         return _rowcount(result) > 0
+
+    async def subject_of(self, conversation_id: str) -> str | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT subject_id FROM aux_conversations "
+                "WHERE tenant = $1 AND conversation_id = $2",
+                self._tenant,
+                conversation_id,
+            )
+        return row["subject_id"] if row and row["subject_id"] else None
+
+    async def conversation_ids_for_subject(self, subject_id: str) -> list[str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT conversation_id FROM aux_conversations "
+                "WHERE tenant = $1 AND subject_id = $2",
+                self._tenant,
+                subject_id,
+            )
+        return [r["conversation_id"] for r in rows]
+
+    async def delete_by_subject(self, subject_id: str) -> int:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM aux_conversation_messages WHERE tenant = $1 "
+                    "AND conversation_id IN ("
+                    "  SELECT conversation_id FROM aux_conversations "
+                    "  WHERE tenant = $1 AND subject_id = $2)",
+                    self._tenant,
+                    subject_id,
+                )
+                result = await conn.execute(
+                    "DELETE FROM aux_conversations "
+                    "WHERE tenant = $1 AND subject_id = $2",
+                    self._tenant,
+                    subject_id,
+                )
+        return _rowcount(result)
 
     async def set_project(
         self, conversation_id: str, project_id: str | None
@@ -784,6 +831,7 @@ class PostgresConversationStore:
         agent_path: str | None = None,
         provider: str | None = None,
         project_id: str | None = None,
+        subject_id: str | None = None,
     ) -> ConversationSummary:
         from himmy.services.storage.conversations import ORIGIN_CLI
 
@@ -796,6 +844,7 @@ class PostgresConversationStore:
                 agent_path=agent_path,
                 provider=provider,
                 project_id=project_id,
+                subject_id=subject_id,
             )
         )
 
@@ -850,6 +899,17 @@ class PostgresConversationStore:
 
     def delete(self, conversation_id: str) -> bool:
         return bool(self._pool.run(self._async.delete(conversation_id)))
+
+    def subject_of(self, conversation_id: str) -> str | None:
+        return self._pool.run(self._async.subject_of(conversation_id))  # type: ignore[no-any-return]
+
+    def conversation_ids_for_subject(self, subject_id: str) -> list[str]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.conversation_ids_for_subject(subject_id)
+        )
+
+    def delete_by_subject(self, subject_id: str) -> int:
+        return int(self._pool.run(self._async.delete_by_subject(subject_id)))
 
     def set_project(self, conversation_id: str, project_id: str | None) -> bool:
         return bool(
@@ -1981,6 +2041,15 @@ class _AsyncMemoryStore:
             )
         return _rowcount(result) > 0
 
+    async def delete_by_subject(self, subject_id: str) -> int:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM aux_memories WHERE tenant = $1 AND subject_id = $2",
+                self._tenant,
+                subject_id,
+            )
+        return _rowcount(result)
+
     async def save_link(self, link: Any) -> Any:
         async with self._pool.acquire() as conn:
             await conn.execute(
@@ -2053,6 +2122,9 @@ class PostgresMemoryStore:
 
     def delete(self, memory_id: str) -> bool:
         return bool(self._pool.run(self._async.delete(memory_id)))
+
+    def delete_by_subject(self, subject_id: str) -> int:
+        return int(self._pool.run(self._async.delete_by_subject(subject_id)))
 
     def save_link(self, link: Any) -> Any:
         return self._pool.run(self._async.save_link(link))

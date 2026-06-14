@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     agent_path      TEXT,
     provider        TEXT,
     project_id      TEXT,
+    subject_id      TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -251,8 +252,31 @@ class ConversationStore:
         self._conn = connect_hardened(path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.executescript(_COMPAT_VIEWS)
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Additively add the S3 ``subject_id`` column on a legacy db (idempotent).
+
+        ``CREATE TABLE IF NOT EXISTS`` never reaches a column on an existing file, so the
+        per-subject linkage column (which S3/S4 erasure walks) is backfilled here with an
+        ``ADD COLUMN`` guarded by a ``PRAGMA table_info`` presence check — no data loss; old
+        rows read ``NULL`` (un-attributed). The lookup index is ``IF NOT EXISTS`` in
+        :data:`_SCHEMA` so it lands once the column exists.
+        """
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(conversations)").fetchall()
+        }
+        if "subject_id" not in cols:
+            self._conn.execute("ALTER TABLE conversations ADD COLUMN subject_id TEXT")
+        # The lookup index is created here (not in _SCHEMA) so it lands only AFTER the
+        # column is guaranteed to exist — on both a fresh db and a migrated legacy one.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_subject "
+            "ON conversations (subject_id)"
+        )
 
     # -- authoritative writes ------------------------------------------------
 
@@ -266,17 +290,20 @@ class ConversationStore:
         agent_path: str | None = None,
         provider: str | None = None,
         project_id: str | None = None,
+        subject_id: str | None = None,
     ) -> ConversationSummary:
         """Upsert the authoritative ``thread`` and regenerate its flat projection.
 
         ``title``/``agent_path``/``provider`` default to values derived from the thread
         when not given (so the lossless CLI path needs to pass nothing). ``project_id``
         follows the Studio "leave assignment alone" contract: ``None`` keeps any existing
-        assignment rather than clearing it. ``created_at`` is preserved across re-saves.
+        assignment rather than clearing it. ``subject_id`` records the S3 data-subject
+        linkage (so erasure can reach this conversation) and follows the same
+        leave-alone-on-``None`` contract. ``created_at`` is preserved across re-saves.
         """
         now = utc_now_iso()
         existing = self._conn.execute(
-            "SELECT created_at, project_id, agent_path, provider, origin "
+            "SELECT created_at, project_id, agent_path, provider, origin, subject_id "
             "FROM conversations WHERE conversation_id = ?",
             (conversation_id,),
         ).fetchone()
@@ -291,19 +318,21 @@ class ConversationStore:
             provider if provider is not None else (existing["provider"] if existing else None)
         )
         effective_project = project_id or (existing["project_id"] if existing else None)
+        resolved_subject = subject_id or (existing["subject_id"] if existing else None)
         resolved_origin = origin or (existing["origin"] if existing else ORIGIN_CLI)
         self._conn.execute(
             """
             INSERT INTO conversations
                 (conversation_id, thread, origin, title, agent_path, provider,
-                 project_id, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
+                 project_id, subject_id, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 thread=excluded.thread,
                 title=excluded.title,
                 agent_path=excluded.agent_path,
                 provider=excluded.provider,
                 project_id=excluded.project_id,
+                subject_id=excluded.subject_id,
                 updated_at=excluded.updated_at
             """,
             (
@@ -314,6 +343,7 @@ class ConversationStore:
                 resolved_agent,
                 resolved_provider,
                 effective_project,
+                resolved_subject,
                 created,
                 now,
             ),
@@ -466,6 +496,44 @@ class ConversationStore:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    # -- subject linkage (S3/S4 right-to-erasure) ----------------------------
+
+    def subject_of(self, conversation_id: str) -> str | None:
+        """Return the data subject linked to a conversation (or ``None`` if un-attributed)."""
+        row = self._conn.execute(
+            "SELECT subject_id FROM conversations WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return row["subject_id"] if row and row["subject_id"] else None
+
+    def conversation_ids_for_subject(self, subject_id: str) -> list[str]:
+        """Every conversation id linked to ``subject_id`` (the S4 reach-map for this store)."""
+        rows = self._conn.execute(
+            "SELECT conversation_id FROM conversations WHERE subject_id = ?",
+            (subject_id,),
+        ).fetchall()
+        return [r["conversation_id"] for r in rows]
+
+    def delete_by_subject(self, subject_id: str) -> int:
+        """Hard-DELETE every conversation (and its flat projection) for ``subject_id``.
+
+        Returns the count of conversations removed. Used by ``RetentionService.erase_subject``
+        to make a subject's transcripts unrecoverable from this sidecar (the crypto-shred of
+        the subject key already renders any residual ciphertext undecryptable; this also
+        physically removes the rows). Idempotent: a re-run after a partial failure deletes
+        whatever remains and returns 0 once the subject is gone.
+        """
+        ids = self.conversation_ids_for_subject(subject_id)
+        for cid in ids:
+            self._conn.execute(
+                "DELETE FROM conversation_messages WHERE conversation_id = ?", (cid,)
+            )
+        self._conn.execute(
+            "DELETE FROM conversations WHERE subject_id = ?", (subject_id,)
+        )
+        self._conn.commit()
+        return len(ids)
 
     def set_project(self, conversation_id: str, project_id: str | None) -> bool:
         """Assign/clear the project of a conversation (touch ``updated_at`` only on change)."""

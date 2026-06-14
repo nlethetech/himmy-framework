@@ -380,3 +380,34 @@ def test_notify_pg_mirror_tables_present() -> None:
     assert not missing, (
         f"notify Postgres mirror tables absent from STORAGE_MIGRATIONS: {sorted(missing)}"
     )
+
+
+def test_s3_conversation_subject_id_column_in_lockstep() -> None:
+    """S3: the conversation ``subject_id`` linkage column exists on BOTH backends.
+
+    The presence guard above is table-scoped; this asserts the specific S3 column was added
+    to the SQLite ConversationStore AND mirrored into the Postgres ``aux_conversations`` table
+    via a STORAGE_MIGRATIONS entry (the lockstep the K2 guard requires for a new column).
+    """
+    from himmy.services.storage.conversations import ConversationStore
+
+    store = ConversationStore(":memory:")
+    try:
+        cols = {
+            r["name"]
+            for r in store._conn.execute(
+                "PRAGMA table_info(conversations)"
+            ).fetchall()
+        }
+    finally:
+        store.close()
+    assert "subject_id" in cols
+
+    # The Postgres mirror adds the same column via a migration ALTER (offline string check).
+    alters = [
+        stmt
+        for _v, _n, stmts in STORAGE_MIGRATIONS
+        for stmt in stmts
+        if "aux_conversations" in stmt and "subject_id" in stmt
+    ]
+    assert alters, "no STORAGE_MIGRATIONS entry adds aux_conversations.subject_id"

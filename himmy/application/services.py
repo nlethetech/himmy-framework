@@ -2735,10 +2735,25 @@ class ThreadAppService:
         )
         if thread is None:
             return
-        self._persist(conversation_id, thread, run.workspace_id)
+        self._persist(
+            conversation_id, thread, run.workspace_id, subject_id=run.subject_id
+        )
 
-    def _persist(self, conversation_id: str, thread: Any, workspace_id: str) -> None:
-        """Stamp ownership onto the thread + upsert it into the ConversationStore."""
+    def _persist(
+        self,
+        conversation_id: str,
+        thread: Any,
+        workspace_id: str,
+        *,
+        subject_id: str | None = None,
+    ) -> None:
+        """Stamp ownership onto the thread + upsert it into the ConversationStore.
+
+        ``subject_id`` (the run's data subject) is threaded through so a governed deployment's
+        :class:`ConsentGatedConversationStore` can gate + per-subject-encrypt the transcript
+        and record the subject linkage the S4 reach map needs; the bare store stores it as the
+        linkage column and is otherwise unchanged.
+        """
         from himmy.services.storage.conversations import ORIGIN_CLI
 
         thread.thread_id = conversation_id
@@ -2755,6 +2770,7 @@ class ThreadAppService:
             thread,
             origin=ORIGIN_CLI,
             agent_path=agent_id,
+            subject_id=subject_id,
         )
 
     # -- create -------------------------------------------------------------

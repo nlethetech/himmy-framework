@@ -12,7 +12,9 @@ from cryptography.exceptions import InvalidTag
 
 from himmy.entities.registry import EntityRegistry  # noqa: E402
 from himmy.services.governance.retention import (  # noqa: E402
+    DELETION_CERTIFICATE_KIND,
     ERASURE_KIND,
+    DeletionCertificate,
     RetentionService,
     SubjectKeyVault,
 )
@@ -28,7 +30,7 @@ def test_erase_subject_crypto_shreds_and_tombstones() -> None:
     token = enc.encrypt("alice's medical record")
     assert enc.decrypt(token) == "alice's medical record"
 
-    tombstone = service.erase_subject("alice", reason="GDPR request #42")
+    cert = service.erase_subject("alice", reason="GDPR request #42")
 
     # Crypto-shredded: the key is gone, so the ciphertext is unrecoverable. A later
     # re-onboarding of the same subject mints a FRESH key (so re-consent doesn't crash), but
@@ -37,11 +39,20 @@ def test_erase_subject_crypto_shreds_and_tombstones() -> None:
     with pytest.raises(Exception):  # noqa: B017,PT011 - re-minted key never decrypts old token
         vault.encryptor_for("alice").decrypt(token)
 
-    # The tombstone is an immutable, audit-covered proof of erasure.
-    assert tombstone.kind == ERASURE_KIND
-    assert tombstone.payload["subject_id"] == "alice"
-    assert tombstone.payload["crypto_shredded"] is True
-    assert registry.list_by_kind(ERASURE_KIND)[0].record_id == tombstone.record_id
+    # S4: erase_subject now returns a signed DeletionCertificate (crypto_shred + per-store).
+    assert isinstance(cert, DeletionCertificate)
+    assert cert.subject_id == "alice"
+    assert cert.crypto_shredded is True
+    assert cert.complete is True  # no sidecars wired → vacuously complete
+
+    # The immutable erasure tombstone is still registered (proof of erasure, unchanged).
+    stones = registry.list_by_kind(ERASURE_KIND)
+    assert stones and stones[0].payload["subject_id"] == "alice"
+    assert stones[0].payload["crypto_shredded"] is True
+    # AND the structured certificate is registered on the spine (signed by the bundle).
+    certs = registry.list_by_kind(DELETION_CERTIFICATE_KIND)
+    assert certs and certs[0].payload["subject_id"] == "alice"
+    assert certs[0].payload["complete"] is True
 
 
 def test_rotate_subject_key_rewraps_without_decrypting_plaintext() -> None:
@@ -87,8 +98,9 @@ def test_rotate_subject_key_rejects_erased_subject() -> None:
 def test_erase_without_vault_still_tombstones() -> None:
     registry = EntityRegistry()
     service = RetentionService(registry)
-    tombstone = service.erase_subject("bob")
-    assert tombstone.payload["crypto_shredded"] is False
+    cert = service.erase_subject("bob")
+    assert cert.crypto_shredded is False
+    assert registry.list_by_kind(ERASURE_KIND)[0].payload["crypto_shredded"] is False
 
 
 def test_expired_identifies_old_records() -> None:

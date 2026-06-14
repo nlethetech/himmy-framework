@@ -74,6 +74,10 @@ def get_memory_service() -> MemoryService:
             return PostgresMemoryStore(tenant="local")
 
         _STORE = select_aux_store(lambda: SqliteMemoryStore(path), _pg)
+        # S3: a governed deployment wraps the durable memory store so each fact's ``text`` is
+        # RETAIN-gated + per-subject envelope-encrypted at rest (so crypto-shred can render it
+        # unrecoverable). No-op on the ungoverned/offline path — the bare store is returned.
+        _STORE = _gate_memory_store(_STORE)
         embedder, _dim = ToolkitConfig.from_env().build_embedder_and_dim()
         # P0-C: project every memory mutation onto the durable Studio entity spine
         # (memory_fact records + MEMORY_* audit events) — the dormant audit path,
@@ -86,6 +90,35 @@ def get_memory_service() -> MemoryService:
         )
         _PATH = path
     return _SERVICE
+
+
+def _gate_memory_store(store: MemoryStore) -> MemoryStore:
+    """Wrap ``store`` in the S3 :class:`ConsentGatedMemoryStore` when governed (else as-is).
+
+    Consults the same ``HIMMY_CONSENT`` policy the API container's governed overlay does, and
+    builds the shared durable :class:`SubjectKeyVault` (``.himmy/keyvault.db``) + spine-backed
+    decider so a memory written here is gated + encrypted exactly like a spine record. On the
+    ungoverned/offline default the bare store is returned unchanged (byte-for-byte).
+    """
+    from himmy.services.governance.consent import build_consent_policy
+
+    policy = build_consent_policy()
+    if not policy.governed:
+        return store
+    from himmy.api.studio_entities import get_entity_registry
+    from himmy.config.project import keyvault_db_path
+    from himmy.services.audit.log import SecurityAuditLog
+    from himmy.services.governance.consent_ledger import ConsentLedger
+    from himmy.services.governance.retention import SubjectKeyVault
+    from himmy.services.governance.sidecar_storage import ConsentGatedMemoryStore
+
+    registry = get_entity_registry()
+    audit = SecurityAuditLog(registry)
+    key_vault = SubjectKeyVault(keyvault_db_path())
+    ledger = ConsentLedger(registry, policy=policy)
+    return ConsentGatedMemoryStore(
+        store, decider=ledger.decision, key_vault=key_vault, audit=audit
+    )
 
 
 def reset_memory_service() -> None:
@@ -102,6 +135,16 @@ def reset_memory_service() -> None:
 def _store() -> MemoryStore:
     get_memory_service()
     assert _STORE is not None
+    return _STORE
+
+
+def current_memory_store() -> MemoryStore | None:
+    """Return the already-open durable memory store WITHOUT constructing one (or ``None``).
+
+    Used by the S4 reach map so right-to-erasure can hard-delete a subject's memories from
+    the same durable singleton the Studio/agent memory surfaces use, without forcing the
+    store open (an un-opened store has no persisted rows to erase).
+    """
     return _STORE
 
 

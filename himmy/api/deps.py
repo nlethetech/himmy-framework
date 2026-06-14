@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any
 from himmy.services.governance.consent_registry import MESSAGES_CONTENT_FIELD
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Callable
+
     from himmy.entities.protocol import EntityRegistryProtocol
     from himmy.entities.records import EntityRecord
     from himmy.runtime.single_agent import SingleAgentRuntime
@@ -78,6 +80,27 @@ def _spine_encrypted_fields_for(kind: str) -> tuple[str, ...]:
     return _SPINE_ENCRYPTED_FIELDS.get(kind, ())
 
 
+class _LazyStoreProxy:
+    """A reach-map store handle that resolves its target lazily at erase time (S4).
+
+    The governed overlay (and thus the :class:`RetentionService`) is built BEFORE the durable
+    memory + conversation singletons exist, yet the reach map needs their handles. This proxy
+    defers resolution: ``delete_by_subject`` calls the injected resolver at erase time, returns
+    ``0`` (no-op) when it resolves to ``None`` (offline / store never opened), and otherwise
+    delegates ``delete_by_subject`` to the live store. It exposes ONLY that one method so a
+    reach walk can never accidentally reach a non-erasure method.
+    """
+
+    def __init__(self, resolver: Callable[[], Any]) -> None:
+        self._resolver = resolver
+
+    def delete_by_subject(self, subject_id: str) -> int:
+        store = self._resolver()
+        if store is None:
+            return 0
+        return int(store.delete_by_subject(subject_id))
+
+
 @dataclass(frozen=True)
 class _GovernedOverlay:
     """The storage/registry the services see + the WS4.6 governance singletons.
@@ -92,6 +115,28 @@ class _GovernedOverlay:
     ledger: Any = None
     policy: Any = None
     retention: Any = None
+    key_vault: Any = None
+    audit: Any = None
+
+    def gate_conversation_store(self, store: Any) -> Any:
+        """Wrap ``store`` in the S3 :class:`ConsentGatedConversationStore` when governed.
+
+        Returns ``store`` unchanged on the ungoverned path (``consent_decider`` is ``None``),
+        so the offline conversation store is byte-identical; otherwise the subject-attributed
+        transcript is RETAIN-gated and per-subject envelope-encrypted at rest.
+        """
+        if self.consent_decider is None:
+            return store
+        from himmy.services.governance.sidecar_storage import (
+            ConsentGatedConversationStore,
+        )
+
+        return ConsentGatedConversationStore(
+            store,
+            decider=self.consent_decider,
+            key_vault=self.key_vault,
+            audit=self.audit,
+        )
 
 
 class ApiContainer:
@@ -278,6 +323,10 @@ class ApiContainer:
         # default it is a private in-memory store (no files written). Built before the run
         # service so the thread sink can be wired in.
         conversation_store = cls._build_conversation_store()
+        # S3: a governed deployment wraps the conversation store so a subject-attributed
+        # transcript is RETAIN-gated + per-subject envelope-encrypted at rest (and carries the
+        # subject linkage the S4 reach map deletes by). No-op on the ungoverned/offline path.
+        conversation_store = overlay.gate_conversation_store(conversation_store)
         # T3a: the durable workspace-namespaced knowledge resource (/v1/knowledge). Reuses
         # the container's service storage handle so the surface is consistent across
         # interfaces; the namespace boundary it enforces is a property of an AUTHENTICATED
@@ -444,6 +493,38 @@ class ApiContainer:
         return get_graph_checkpoint_store()
 
     @staticmethod
+    def _resolve_conversation_store() -> Any:
+        """Resolve the live conversation store for the S4 reach map (or ``None`` offline).
+
+        Only the SHARED durable singleton (a server deployment) is a real erasure target: a
+        zero-config offline run uses a private in-memory store that holds no persisted PII, so
+        it returns ``None`` (the reach step is skipped). This is read at erase time, so it sees
+        the singleton the lifespan rebound to — not whatever existed when the overlay was built.
+        """
+        from himmy.services.storage.conversations import current_conversation_store
+        from himmy.services.storage.factory import in_server_context
+
+        if not in_server_context():
+            return None
+        return current_conversation_store()
+
+    @staticmethod
+    def _resolve_memory_store() -> Any:
+        """Resolve the live memory module store for the S4 reach map (or ``None`` offline).
+
+        Mirrors :meth:`_resolve_conversation_store`: in a server context this is the durable
+        Studio/agent memory singleton (``.himmy/memory.db`` or the K5 Postgres mirror); the
+        offline default writes no durable memory sidecar, so it returns ``None``.
+        """
+        from himmy.services.storage.factory import in_server_context
+
+        if not in_server_context():
+            return None
+        from himmy.api.studio_memory import current_memory_store
+
+        return current_memory_store()
+
+    @staticmethod
     def _build_conversation_store() -> Any:
         """Build the conversation store: shared durable singleton in a server, RAM offline.
 
@@ -522,8 +603,8 @@ class ApiContainer:
             config=PrivacyAuditConfig(provider=provider),
         )
 
-    @staticmethod
-    def _governed_overlay(storage: Any, registry: Any) -> _GovernedOverlay:
+    @classmethod
+    def _governed_overlay(cls, storage: Any, registry: Any) -> _GovernedOverlay:
         """Build the WS4.6 governance overlay (no-op unless ``HIMMY_CONSENT`` is on).
 
         Off (default): returns the bare ``storage``/``registry`` and ``None`` for the
@@ -547,6 +628,7 @@ class ApiContainer:
         from himmy.services.governance.retention import (
             RetentionService,
             SubjectKeyVault,
+            SubjectReachMap,
         )
 
         # The audit + ledger + erasure services all write to the INNER spine so their
@@ -557,7 +639,19 @@ class ApiContainer:
         # spine.db's backup/residency posture — destroying it IS whole-system erasure.
         audit = SecurityAuditLog(registry)
         key_vault = SubjectKeyVault(keyvault_db_path())
-        retention = RetentionService(registry, key_vault=key_vault)
+        # S4: the reach map enumerates every MUTABLE sidecar a subject lives in so
+        # erase_subject hard-deletes them (the append-only spine stays as undecryptable
+        # ciphertext). The handles resolve LAZILY to the same process-wide durable singletons
+        # the server's memory + conversation surfaces use — built AFTER this overlay, so a
+        # lazy callable avoids a construction-order trap while still reaching the live stores.
+        reach = SubjectReachMap(
+            memory_store=_LazyStoreProxy(cls._resolve_memory_store),
+            conversation_store=_LazyStoreProxy(cls._resolve_conversation_store),
+            knowledge_eraser=None,
+        )
+        retention = RetentionService(
+            registry, key_vault=key_vault, reach_map=reach
+        )
         ledger = ConsentLedger(registry, policy=policy, retention_service=retention)
         decider = ledger.decision
 
@@ -578,6 +672,8 @@ class ApiContainer:
             ledger=ledger,
             policy=policy,
             retention=retention,
+            key_vault=key_vault,
+            audit=audit,
         )
 
     @staticmethod

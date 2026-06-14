@@ -27,9 +27,19 @@ from himmy.services.governance.consent_storage import (
     ConsentGatedStorage,
 )
 from himmy.services.governance.retention import (
+    DELETION_CERTIFICATE_KIND,
     ERASURE_KIND,
+    DeletionCertificate,
     RetentionService,
+    StoreErasureResult,
     SubjectKeyVault,
+    SubjectReachMap,
+)
+from himmy.services.governance.sidecar_storage import (
+    DEFAULT_MEMORY_SUBJECT,
+    ConsentGatedConversationStore,
+    ConsentGatedMemoryStore,
+    SubjectKnowledgeCipher,
 )
 from himmy.services.governance.training_export import ConsentFilteredExporter
 
@@ -53,8 +63,17 @@ __all__ = [
     "GATED_SAVE_METHODS",
     "ConsentAwareRegistry",
     "ConsentFilteredExporter",
-    # retention / erasure (WS4.2)
+    # S3 sidecar consent-gating + per-subject envelope encryption
+    "ConsentGatedMemoryStore",
+    "ConsentGatedConversationStore",
+    "SubjectKnowledgeCipher",
+    "DEFAULT_MEMORY_SUBJECT",
+    # retention / erasure (WS4.2 + S4)
     "ERASURE_KIND",
+    "DELETION_CERTIFICATE_KIND",
     "RetentionService",
     "SubjectKeyVault",
+    "SubjectReachMap",
+    "DeletionCertificate",
+    "StoreErasureResult",
 ]
