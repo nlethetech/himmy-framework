@@ -50,6 +50,14 @@ HIMMY_V1_APPROVALS_PATH_ENV = "HIMMY_V1_APPROVALS_PATH"
 #: first use; otherwise ``<project-root>/.himmy/graph_checkpoints.db`` is used.
 HIMMY_GRAPH_CHECKPOINTS_PATH_ENV = "HIMMY_GRAPH_CHECKPOINTS_PATH"
 
+#: Override for the durable SubjectKeyVault (``.himmy/keyvault.db`` by default, S2). This is
+#: the single most SECURITY-CRITICAL file in a governed deployment: it holds every subject's
+#: KEK (wrapped under the configured meta-KEK provider), and **destroying it IS erasure** —
+#: a lost or unbacked keyvault.db permanently crypto-shreds every governed subject. It must
+#: share the same backup/residency posture as ``spine.db`` (operator warning). When set the
+#: value is honoured verbatim — the parent directory is created on first use.
+HIMMY_KEYVAULT_PATH_ENV = "HIMMY_KEYVAULT_PATH"
+
 
 def find_project_config(start: str | Path | None = None) -> Path | None:
     """Locate ``himmy.toml`` (cwd) or ``~/.himmy/config.toml``, or ``None``."""
@@ -167,6 +175,25 @@ def graph_checkpoints_db_path(start: str | Path | None = None) -> str:
     return str(himmy_dir(start) / "graph_checkpoints.db")
 
 
+def keyvault_db_path(start: str | Path | None = None) -> str:
+    """The durable SubjectKeyVault path (``.himmy/keyvault.db`` by default, S2).
+
+    Resolution: ``HIMMY_KEYVAULT_PATH`` when set (honoured verbatim, its parent dir
+    created), otherwise ``<project-root>/.himmy/keyvault.db`` (project root resolved by
+    :func:`find_project_root`, so it sits next to ``spine.db``). This is the durable home
+    for per-subject KEKs: destroying a subject's row crypto-shreds that subject, and losing
+    the whole file shreds every governed subject — give it the SAME backup/residency posture
+    as ``spine.db``.
+    """
+    override = os.environ.get(HIMMY_KEYVAULT_PATH_ENV)
+    if override and override.strip():
+        path = Path(override.strip()).expanduser()
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    return str(himmy_dir(start) / "keyvault.db")
+
+
 def load_project_config(start: str | Path | None = None) -> dict[str, Any]:
     """Load the project config as a dict (empty when no file is found)."""
     path = find_project_config(start)
@@ -180,6 +207,7 @@ __all__ = [
     "HIMMY_CONVERSATIONS_PATH_ENV",
     "HIMMY_DIR_NAME",
     "HIMMY_GRAPH_CHECKPOINTS_PATH_ENV",
+    "HIMMY_KEYVAULT_PATH_ENV",
     "HIMMY_SPINE_PATH_ENV",
     "HIMMY_V1_APPROVALS_PATH_ENV",
     "conversations_db_path",
@@ -187,6 +215,7 @@ __all__ = [
     "find_project_root",
     "graph_checkpoints_db_path",
     "himmy_dir",
+    "keyvault_db_path",
     "v1_approvals_db_path",
     "load_project_config",
     "spine_db_path",

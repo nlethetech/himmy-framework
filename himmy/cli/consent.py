@@ -66,12 +66,17 @@ def _build_ledger() -> Any:
     accept (``new_version``/``get_latest``/``get_history``/``query`` …) — so the durable
     spine drops in with no cast (the registry Protocol that closes the old gap).
     """
+    from himmy.config.project import keyvault_db_path
     from himmy.entities.sqlite_registry import SqliteEntityRegistry
     from himmy.services.governance.consent_ledger import ConsentLedger
     from himmy.services.governance.retention import RetentionService, SubjectKeyVault
 
     registry = SqliteEntityRegistry(_consent_db())
-    retention = RetentionService(registry, key_vault=SubjectKeyVault())
+    # Durable key vault (S2): the canonical .himmy/keyvault.db so a CLI `himmy consent erase`
+    # crypto-shred survives a restart (the in-RAM vault destroyed nothing durable).
+    retention = RetentionService(
+        registry, key_vault=SubjectKeyVault(keyvault_db_path())
+    )
     return ConsentLedger(registry, policy=_policy(), retention_service=retention)
 
 

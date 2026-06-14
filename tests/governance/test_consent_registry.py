@@ -108,13 +108,14 @@ def test_allow_encrypts_subject_fields_under_shreddable_key() -> None:
     assert stored.payload["text"].startswith(ENC_PREFIX)
     assert "carol's prompt" not in stored.payload["text"]
 
-    # Crypto-shred: destroying the subject key makes the ciphertext unrecoverable.
+    # Crypto-shred: destroying the subject key makes the ciphertext unrecoverable. The
+    # durable vault refuses to re-mint a key for an erased subject (would silently un-shred),
+    # so re-access raises rather than returning a fresh (wrong) key.
     token = stored.payload["text"]
+    assert token  # ciphertext exists pre-shred
     vault.destroy("carol")
-    from cryptography.exceptions import InvalidTag
-
-    with pytest.raises(InvalidTag):
-        vault.encryptor_for("carol").decrypt(token, aad=b"carol")
+    with pytest.raises(KeyError, match="carol"):
+        vault.encryptor_for("carol")
 
 
 def test_chat_thread_nested_message_content_is_encrypted_on_spine() -> None:
@@ -165,10 +166,10 @@ def test_chat_thread_nested_message_content_is_encrypted_on_spine() -> None:
     assert "4242" not in blob and "noted" not in blob
     assert stored.payload["messages"][0]["content"].startswith(ENC_PREFIX)
 
-    # Crypto-shred the subject: the nested ciphertext is now permanently unreadable.
+    # Crypto-shred the subject: the nested ciphertext is now permanently unreadable. The
+    # durable vault refuses to re-mint a key for the erased subject (no silent un-shred).
     token = stored.payload["messages"][0]["content"]
+    assert token  # ciphertext exists pre-shred
     vault.destroy("dave")
-    from cryptography.exceptions import InvalidTag
-
-    with pytest.raises(InvalidTag):
-        vault.encryptor_for("dave").decrypt(token, aad=b"dave")
+    with pytest.raises(KeyError, match="dave"):
+        vault.encryptor_for("dave")

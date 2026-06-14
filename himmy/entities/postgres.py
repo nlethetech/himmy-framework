@@ -77,6 +77,46 @@ CREATE INDEX IF NOT EXISTS entity_links_to_idx
 """
 
 
+#: Ordered forward migrations for the Postgres audit spine, mirroring the SQLite spine's
+#: :data:`himmy.entities.sqlite_registry._MIGRATIONS` and copying the proven storage
+#: migrator (:data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`). Each entry is
+#: ``(version, name, [statements...])`` and is applied at most once, tracked in a
+#: ``schema_migrations`` table under a session-level ``pg_advisory_lock`` so two booting
+#: processes serialise. Migration 1 is the frozen base DDL (``CREATE ... IF NOT EXISTS``),
+#: so it is safe on a fresh or partially-migrated database. Append new entries here (never
+#: edit a shipped one) to evolve the spine beyond the version-1 shape in lock-step with the
+#: SQLite spine — the CI parity guard fails if one chain gains a table/column without the
+#: other.
+SPINE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
+    (
+        1,
+        "base_schema",
+        [ENTITY_REGISTRY_DDL],
+    ),
+]
+
+
+def _spine_migration_advisory_lock_key() -> int:
+    """Derive the spine migration runner's stable signed-64-bit advisory-lock key.
+
+    DELIBERATELY hashed off a DISTINCT module name from the storage migrator's
+    :func:`himmy.services.storage.postgres._migration_advisory_lock_key` so a spine
+    ``migrate()`` and a storage ``migrate()`` running against the same database never
+    serialise against each other (different keys = independent locks).
+    """
+    import hashlib
+
+    digest = hashlib.sha256(b"himmy.entities.spine.schema_migrations").digest()[:8]
+    value = int.from_bytes(digest, "big", signed=False)
+    # pg_advisory_lock takes a signed bigint; fold into that range.
+    return value - (1 << 63)
+
+
+#: Session-level advisory-lock key serialising concurrent spine ``migrate()`` callers
+#: across processes (distinct from the storage migrator's key — see above).
+SPINE_MIGRATION_ADVISORY_LOCK_KEY = _spine_migration_advisory_lock_key()
+
+
 def _require_asyncpg() -> Any:
     """Import asyncpg lazily, raising a clear error when the extra is missing."""
     try:
@@ -188,10 +228,67 @@ class PostgresEntityRegistry:
         await self.close()
 
     async def create_schema(self) -> None:
-        """Apply the idempotent registry DDL."""
+        """Provision/upgrade the registry schema via the governed migration runner.
+
+        Replaces the historical bare ``execute(ENTITY_REGISTRY_DDL)`` (which could never
+        evolve a column on an existing database) with :meth:`migrate`, so the Postgres
+        spine gains the same forward-migration governance as the SQLite spine: a fresh
+        database lays down the version-1 base DDL and an existing one steps through every
+        pending :data:`SPINE_MIGRATIONS` entry, all tracked in ``schema_migrations`` under
+        a session-level advisory lock.
+        """
+        await self.migrate()
+
+    async def migrate(self) -> list[int]:
+        """Run pending forward spine migrations; return the versions newly applied.
+
+        Each migration in :data:`SPINE_MIGRATIONS` is applied at most once, tracked in the
+        ``schema_migrations`` table, inside a transaction. Migration 1 is the frozen base
+        DDL (``CREATE ... IF NOT EXISTS``), so this is safe on a fresh or partially-migrated
+        database. Concurrent migrators (two processes booting simultaneously) are serialised
+        by a session-level ``pg_advisory_lock`` on :data:`SPINE_MIGRATION_ADVISORY_LOCK_KEY`
+        (distinct from the storage migrator's key) held for the duration of the run: the
+        loser blocks until the winner finishes, re-reads ``schema_migrations`` and applies
+        nothing. This is a near-verbatim copy of
+        :meth:`himmy.services.storage.postgres.PostgresStorageService.migrate`.
+        """
         pool = self._require_pool()
+        applied: list[int] = []
         async with pool.acquire() as conn:
-            await conn.execute(ENTITY_REGISTRY_DDL)
+            await conn.execute(
+                "SELECT pg_advisory_lock($1)", SPINE_MIGRATION_ADVISORY_LOCK_KEY
+            )
+            try:
+                # Bootstrap the tracking table so the first migration can record itself.
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        version    INTEGER PRIMARY KEY,
+                        name       TEXT NOT NULL,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+                rows = await conn.fetch("SELECT version FROM schema_migrations")
+                done = {r["version"] for r in rows}
+                for version, name, statements in sorted(SPINE_MIGRATIONS):
+                    if version in done:
+                        continue
+                    async with conn.transaction():
+                        for statement in statements:
+                            await conn.execute(statement)
+                        await conn.execute(
+                            "INSERT INTO schema_migrations (version, name) "
+                            "VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
+                            version,
+                            name,
+                        )
+                    applied.append(version)
+            finally:
+                await conn.execute(
+                    "SELECT pg_advisory_unlock($1)", SPINE_MIGRATION_ADVISORY_LOCK_KEY
+                )
+        return applied
 
     def _require_pool(self) -> Any:
         if self._pool is None:
@@ -620,4 +717,10 @@ def _is_unique_violation(exc: Exception) -> bool:
     return exc.__class__.__name__ == "UniqueViolationError"
 
 
-__all__ = ["PostgresEntityRegistry", "ENTITY_REGISTRY_DDL", "record_id_for"]
+__all__ = [
+    "PostgresEntityRegistry",
+    "ENTITY_REGISTRY_DDL",
+    "SPINE_MIGRATIONS",
+    "SPINE_MIGRATION_ADVISORY_LOCK_KEY",
+    "record_id_for",
+]

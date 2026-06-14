@@ -72,6 +72,30 @@ def _isolated_spine(
 
 
 @pytest.fixture(autouse=True)
+def _isolated_keyvault(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Point the durable SubjectKeyVault at a per-test temp file (S2 isolation).
+
+    The vault used to be an in-RAM ``dict`` rebuilt per ``build_default``, so a governed
+    container test that crypto-shred a subject (``ledger.withdraw`` -> ``erase_subject``)
+    left no trace for the next test. Now the vault persists each subject's KEK to the
+    canonical ``.himmy/keyvault.db`` AND a shred is a DURABLE tombstone (the whole point of
+    S2) — so without isolation a test that shreds ``subject_X`` would make a LATER test
+    re-using that subject id raise on key access. Setting ``HIMMY_KEYVAULT_PATH`` to a unique
+    temp file per test restores isolation while still exercising the real durable path (a
+    throwaway on-disk SQLite vault). Tests that want a specific path override the env after
+    this fixture (their ``setenv`` wins). Skipped for ``integration`` tests.
+    """
+    if request.node.get_closest_marker("integration"):
+        return
+    keyvault_db = tmp_path_factory.mktemp("keyvault") / "keyvault.db"
+    monkeypatch.setenv("HIMMY_KEYVAULT_PATH", str(keyvault_db))
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_embedder_cascade(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:

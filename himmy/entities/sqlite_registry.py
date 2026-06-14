@@ -35,6 +35,11 @@ from himmy.entities.records import (
     metadata_contains,
 )
 
+#: Frozen version-1 shape of the audit spine. This is the base DDL a fresh database lays
+#: down; it is **never edited in place** — schema evolution rides :data:`_MIGRATIONS`
+#: instead (frozen base + forward migrations), exactly like
+#: :data:`himmy.services.storage.sqlite._SCHEMA`. Editing this to add a column AND
+#: re-adding it via a migration would double-apply the ALTER and break fresh installs.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entity_records (
     record_id    TEXT PRIMARY KEY,
@@ -61,6 +66,29 @@ CREATE TABLE IF NOT EXISTS entity_links (
 CREATE INDEX IF NOT EXISTS entity_links_from_idx ON entity_links (from_record_id);
 CREATE INDEX IF NOT EXISTS entity_links_to_idx ON entity_links (to_record_id);
 """
+
+#: Schema version of the base :data:`_SCHEMA` above (``PRAGMA user_version`` after it is
+#: applied). The audit spine is APPEND-ONLY and content-addressed, so it historically ran
+#: ``executescript(_SCHEMA)`` once with no version stamp and could therefore never evolve a
+#: column in place — yet right-to-erasure (and any future spine field, e.g. the optional
+#: DB-resident hash chain) needs exactly that. This mirrors the proven storage-migrator
+#: (:data:`himmy.services.storage.sqlite.SQLITE_SCHEMA_VERSION`): bump this and append to
+#: :data:`_MIGRATIONS` whenever a column/index/table is added so existing ``.himmy/spine.db``
+#: files upgrade forward in lock-step with the Postgres spine rather than silently diverging
+#: (``CREATE ... IF NOT EXISTS`` is a no-op on an existing db, so it never reaches a column).
+SPINE_SCHEMA_VERSION = 1
+
+#: Ordered forward migrations applied after the base DDL, gated by ``PRAGMA user_version``
+#: (a database steps through every migration whose version exceeds its current
+#: ``user_version`` and is then stamped at the highest). Mirrors the Postgres spine's
+#: :data:`himmy.entities.postgres.SPINE_MIGRATIONS`. **Frozen base + forward migrations**:
+#: :data:`_SCHEMA` is the version-1 shape and is never edited; a fresh db (``user_version``
+#: 0) lays down that frozen base and then runs *every* migration just like a legacy file,
+#: converging to the same schema by either path. Append new entries here — never edit a
+#: shipped one — and bump :data:`SPINE_SCHEMA_VERSION` to match the highest. Empty today:
+#: the spine is at its version-1 shape, so a default install only stamps ``user_version``
+#: and the schema is byte-identical to before this governance landed.
+_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ()
 
 _REC_COLS = "record_id, stable_id, version, kind, payload, metadata, created_at"
 _LINK_COLS = "link_id, from_record_id, to_record_id, relation, metadata, created_at"
@@ -95,8 +123,50 @@ class SqliteEntityRegistry:
         self._write_lock = threading.Lock()
         self._register_buffer = max(1, int(register_buffer))
         self._pending = 0
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        self._apply_schema()
+
+    def _apply_schema(self) -> None:
+        """Create/upgrade the spine schema and stamp ``PRAGMA user_version`` (idempotent).
+
+        Copies the proven storage-migrator pattern
+        (:meth:`himmy.services.storage.sqlite.SqliteStorageService._apply_schema`): the base
+        :data:`_SCHEMA` is ``CREATE ... IF NOT EXISTS``, so a fresh database (``user_version``
+        0, no tables) gets the frozen base DDL and a legacy file (also ``user_version`` 0,
+        written before versioning existed — re-running the idempotent base is safe) does too,
+        and BOTH then step through every entry in :data:`_MIGRATIONS` whose version exceeds
+        the stored ``user_version`` (so a fresh db converges to the same schema a legacy file
+        reaches) before the highest known version is stamped. The whole upgrade runs under the
+        process write lock so concurrent workers/processes sharing the file cannot
+        double-apply a step.
+        """
+        with self._write_lock:
+            current = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            try:
+                if current == 0:
+                    # Either a brand-new database, OR a legacy file written before
+                    # versioning existed (user_version defaults to 0). Re-running the
+                    # idempotent base DDL is safe in both cases.
+                    self._conn.executescript(_SCHEMA)
+                for version, statements in sorted(_MIGRATIONS):
+                    if version > current:
+                        for statement in statements:
+                            self._conn.execute(statement)  # noqa: S608 - constant DDL
+                # Stamp the highest known version (PRAGMA cannot be parameterised).
+                target = max(SPINE_SCHEMA_VERSION, current)
+                self._conn.execute(f"PRAGMA user_version = {int(target)}")
+                self._conn.commit()
+            except BaseException:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:  # pragma: no cover - rollback on a dead connection
+                    pass
+                raise
+
+    @property
+    def schema_version(self) -> int:
+        """The applied schema version (``PRAGMA user_version``) of the backing file."""
+        with self._write_lock:
+            return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
 
     def _commit_locked(self) -> None:
         """Commit + clear the deferred-register counter (caller holds the write lock)."""
@@ -466,4 +536,4 @@ class SqliteEntityRegistry:
         )
 
 
-__all__ = ["SqliteEntityRegistry"]
+__all__ = ["SqliteEntityRegistry", "SPINE_SCHEMA_VERSION"]

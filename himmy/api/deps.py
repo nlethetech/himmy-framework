@@ -539,6 +539,7 @@ class ApiContainer:
         if not policy.governed:
             return _GovernedOverlay(storage=storage, registry=registry)
 
+        from himmy.config.project import keyvault_db_path
         from himmy.services.audit.log import SecurityAuditLog
         from himmy.services.governance.consent_ledger import ConsentLedger
         from himmy.services.governance.consent_registry import ConsentAwareRegistry
@@ -549,9 +550,13 @@ class ApiContainer:
         )
 
         # The audit + ledger + erasure services all write to the INNER spine so their
-        # records (security_event / consent / erasure_tombstone) are never gated.
+        # records (security_event / consent / erasure_tombstone) are never gated. The key
+        # vault is DURABLE (S2): it persists each subject's KEK at the canonical
+        # .himmy/keyvault.db so a crypto-shred survives a restart (the in-RAM vault made
+        # erase_subject report success against an already-volatile key). keyvault.db shares
+        # spine.db's backup/residency posture — destroying it IS whole-system erasure.
         audit = SecurityAuditLog(registry)
-        key_vault = SubjectKeyVault()
+        key_vault = SubjectKeyVault(keyvault_db_path())
         retention = RetentionService(registry, key_vault=key_vault)
         ledger = ConsentLedger(registry, policy=policy, retention_service=retention)
         decider = ledger.decision
