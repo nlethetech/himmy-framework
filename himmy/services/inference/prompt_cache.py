@@ -40,6 +40,12 @@ from himmy.services.inference.models import (
     ModelPrice,
 )
 
+#: The lowest ``anthropic`` SDK version known to accept ``cache_control`` with a
+#: ``ttl`` field and ``extra_headers`` on ``messages.create`` (the extended-cache-ttl
+#: surface). Below this — or when the SDK can't be introspected — the adapter degrades
+#: to the default 5m ephemeral cache, which every cache-capable version accepts.
+_ANTHROPIC_TTL_FLOOR: tuple[int, int, int] = (0, 49, 0)
+
 
 class CacheCapability(str, Enum):
     """How a concrete client manager participates in prompt caching.
@@ -173,6 +179,143 @@ def stable_prefix_estimate_tokens(request: InferenceRequest) -> int:
     system_text = "\n\n".join(system_parts)
     tools_text = _tools_text(request.bound_tools)
     return _estimate_tokens(system_text) + _estimate_tokens(tools_text)
+
+
+def cache_policy_active(request: InferenceRequest) -> bool:
+    """True only when the request carries a non-``None`` policy with ``enabled=True``.
+
+    This is the SINGLE branch every adapter keys on. When it is ``False`` (the default,
+    ``cache_policy is None``), the adapter must emit a byte-identical payload to the
+    no-cache path — that invariant is what the provider contract tests pin.
+    """
+    policy = request.cache_policy
+    return policy is not None and policy.enabled
+
+
+def should_cache_prefix(
+    request: InferenceRequest, model: str, capability: CacheCapability
+) -> bool:
+    """Decide whether to mark the stable system+tools prefix as cacheable.
+
+    True iff the policy is active, the manager supports caching, the requested scope
+    includes the system prefix, and the deterministic prefix-size estimate clears the
+    per-model floor. A borderline misgate only produces a harmless no-op marker, so this
+    is intentionally conservative (unknown families fall back to a high floor).
+    """
+    if capability is CacheCapability.NONE:
+        return False
+    if not cache_policy_active(request):
+        return False
+    policy = request.cache_policy
+    assert policy is not None  # narrowed by cache_policy_active
+    if policy.scope == "none":
+        return False
+    estimate = stable_prefix_estimate_tokens(request)
+    floor = min_cacheable_tokens(model, policy.min_prefix_tokens)
+    return estimate >= floor
+
+
+def _parse_version(version: str | None) -> tuple[int, int, int] | None:
+    """Parse a ``major.minor.patch`` SDK version string, tolerating extra suffixes."""
+    if not version:
+        return None
+    head = version.strip().split("+", 1)[0].split("-", 1)[0]
+    parts = head.split(".")
+    nums: list[int] = []
+    for part in parts[:3]:
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        nums.append(int(digits))
+    if not nums:
+        return None
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
+
+
+def anthropic_ttl_supported(sdk_version: str | None = None) -> bool:
+    """True when the installed ``anthropic`` SDK is known to accept ``ttl`` + headers.
+
+    Degrades safe: if the SDK isn't importable, carries no ``__version__``, or the string
+    can't be parsed, this returns ``False`` and the adapter falls back to the 5m cache
+    (no ``ttl`` field, no beta header) — never breaking the request on uncertainty.
+    """
+    version = sdk_version
+    if version is None:
+        try:
+            import anthropic  # type: ignore
+
+            version = getattr(anthropic, "__version__", None)
+        except Exception:  # noqa: BLE001 - any import failure → degrade to 5m
+            return False
+    parsed = _parse_version(version)
+    if parsed is None:
+        return False
+    return parsed >= _ANTHROPIC_TTL_FLOOR
+
+
+#: Lowercased model-id prefixes that name an OpenAI-family model (so ``prompt_cache_key``
+#: is accepted). Used directly and as OpenRouter ``openai/...`` underlying ids.
+_OPENAI_FAMILY_PREFIXES: tuple[str, ...] = (
+    "gpt-",
+    "o1",
+    "o3",
+    "o4",
+    "chatgpt",
+    "text-",
+    "davinci",
+)
+
+
+def is_openai_family_model(model: str) -> bool:
+    """True when ``model`` names an OpenAI-family model (accepts ``prompt_cache_key``).
+
+    Matches both bare OpenAI ids (``gpt-4o``, ``o3-mini``) and OpenRouter's
+    ``openai/...`` slash form. OpenRouter ids for other backends (``anthropic/...``,
+    ``google/...``) are NOT OpenAI-family — those route through block-form passthrough.
+    """
+    lowered = (model or "").lower()
+    if lowered.startswith("openai/"):
+        return True
+    return lowered.startswith(_OPENAI_FAMILY_PREFIXES)
+
+
+def openrouter_passthrough_backend(model: str) -> str | None:
+    """For an OpenRouter ``vendor/model`` id, the backend that takes block-form caching.
+
+    Returns ``"anthropic"`` for ``anthropic/...`` and ``"google"`` for ``google/...``
+    ids (which accept a ``cache_control`` block on the system message via OpenRouter's
+    passthrough), else ``None`` (openai-backed and everything else rely on automatic
+    prefix caching).
+    """
+    lowered = (model or "").lower()
+    if lowered.startswith("anthropic/"):
+        return "anthropic"
+    if lowered.startswith("google/"):
+        return "google"
+    return None
+
+
+def anthropic_system_blocks(
+    system: str, *, ttl: str, ttl_supported: bool
+) -> list[dict[str, Any]]:
+    """Build the block-form ``system`` with one ``cache_control`` breakpoint.
+
+    Anthropic renders ``tools -> system -> messages``, so a single breakpoint on the
+    last (here only) system block caches BOTH tools and system — the whole stable prefix.
+    A ``1h`` TTL is emitted only when the SDK is known to support it; otherwise the block
+    carries a plain 5m ``ephemeral`` marker (no ``ttl`` key).
+    """
+    cache_control: dict[str, Any] = {"type": "ephemeral"}
+    if ttl == "1h" and ttl_supported:
+        cache_control["ttl"] = "1h"
+    return [{"type": "text", "text": system, "cache_control": cache_control}]
 
 
 class UsageBreakdown(BaseModel):
@@ -353,11 +496,17 @@ __all__ = [
     "DEFAULT_MIN_CACHEABLE_TOKENS",
     "MIN_CACHEABLE_TOKENS",
     "UsageBreakdown",
+    "anthropic_system_blocks",
+    "anthropic_ttl_supported",
+    "cache_policy_active",
     "cache_savings_usd",
     "compute_cached_cost",
+    "is_openai_family_model",
     "min_cacheable_tokens",
+    "openrouter_passthrough_backend",
     "read_anthropic_usage",
     "read_openai_usage",
     "resolve_cache_rates",
+    "should_cache_prefix",
     "stable_prefix_estimate_tokens",
 ]

@@ -46,8 +46,11 @@ from himmy.services.inference.models import (
 from himmy.services.inference.prompt_cache import (
     CacheCapability,
     UsageBreakdown,
+    cache_policy_active,
     cache_savings_usd,
     compute_cached_cost,
+    is_openai_family_model,
+    openrouter_passthrough_backend,
     read_openai_usage,
     resolve_cache_rates,
 )
@@ -118,9 +121,20 @@ def _openai_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
     ]
 
 
-def _openai_messages(request: InferenceRequest) -> list[dict[str, Any]]:
-    """Project the request into OpenAI chat ``messages`` (role-preserving)."""
+def _openai_messages(
+    request: InferenceRequest, *, cache_system: bool = False
+) -> list[dict[str, Any]]:
+    """Project the request into OpenAI chat ``messages`` (role-preserving).
+
+    With ``cache_system=True`` the LAST system message's content is rewritten from a
+    plain string into a single-block array carrying ``cache_control`` — the shape
+    OpenRouter forwards to an Anthropic/Gemini backend for explicit prefix caching. This
+    path is taken ONLY for OpenRouter passthrough models with caching enabled; the
+    default (``cache_system=False``) emits string content, byte-identical to today and
+    pinned by the OpenAI shape contract.
+    """
     messages: list[dict[str, Any]] = []
+    last_system_idx = -1
     for m in request.messages:
         role = (m.role or "user").lower()
         if role == "tool":
@@ -133,8 +147,19 @@ def _openai_messages(request: InferenceRequest) -> list[dict[str, Any]]:
             )
         elif role in ("system", "assistant", "user"):
             messages.append({"role": role, "content": m.content})
+            if role == "system":
+                last_system_idx = len(messages) - 1
         else:
             messages.append({"role": "user", "content": m.content})
+    if cache_system and last_system_idx >= 0:
+        text = messages[last_system_idx]["content"]
+        messages[last_system_idx]["content"] = [
+            {
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
     return messages
 
 
@@ -234,9 +259,10 @@ class OpenAIClientManager:
         started = time.perf_counter()
         params = request.generation_params or {}
 
+        cache_system = self._passthrough_caches_system(request, model)
         payload: dict[str, Any] = {
             "model": model,
-            "messages": _openai_messages(request),
+            "messages": _openai_messages(request, cache_system=cache_system),
         }
         if params.get("temperature") is not None:
             payload["temperature"] = params["temperature"]
@@ -245,10 +271,11 @@ class OpenAIClientManager:
         if params.get("top_p") is not None:
             payload["top_p"] = params["top_p"]
         if request.bound_tools:
-            payload["tools"] = _openai_tools(request.bound_tools)
+            payload["tools"] = self._tools_payload(request)
         rf = self._response_format(request)
         if rf is not None:
             payload["response_format"] = rf
+        self._apply_prompt_cache_key(request, model, payload)
         if self._default_headers:
             payload["extra_headers"] = dict(self._default_headers)
 
@@ -283,6 +310,57 @@ class OpenAIClientManager:
                 },
             }
         return None
+
+    def _passthrough_caches_system(
+        self, request: InferenceRequest, model: str
+    ) -> bool:
+        """True when this is OpenRouter forwarding to an Anthropic/Gemini backend + caching.
+
+        Only ``provider_name == "openrouter"`` with an ``anthropic/...`` or ``google/...``
+        underlying model id, and an active (non-``None``, ``enabled``) cache policy,
+        warrants rewriting the system message to block form. openai-backed OpenRouter
+        models and direct OpenAI/Groq/Together rely on AUTOMATIC prefix caching, so they
+        keep the string-content shape the contract test pins.
+        """
+        if self.provider_name != "openrouter":
+            return False
+        if not cache_policy_active(request):
+            return False
+        policy = request.cache_policy
+        assert policy is not None  # narrowed by cache_policy_active
+        if policy.scope == "none":
+            return False
+        return openrouter_passthrough_backend(model) is not None
+
+    def _tools_payload(self, request: InferenceRequest) -> list[dict[str, Any]]:
+        """Project bound tools, name-sorting them when caching is active for stability.
+
+        OpenAI-family caching is AUTOMATIC on a byte-stable prefix; the tool array is part
+        of that prefix, so an active cache policy sorts tools by name for a deterministic
+        order (consistent with the response-cache key in ``cache.py``). Sorting is gated
+        on the active policy so the default path keeps registry order and stays
+        byte-identical to the pinned contract.
+        """
+        tools = request.bound_tools
+        if cache_policy_active(request):
+            tools = sorted(tools, key=lambda t: t.name)
+        return _openai_tools(tools)
+
+    def _apply_prompt_cache_key(
+        self, request: InferenceRequest, model: str, payload: dict[str, Any]
+    ) -> None:
+        """Add ``prompt_cache_key`` when the policy names one AND the model is OpenAI-family.
+
+        ``prompt_cache_key`` is an OpenAI routing hint; it is omitted for every non-OpenAI
+        backend (including OpenRouter's Anthropic/Gemini passthrough) so a non-OpenAI
+        endpoint never sees an unsupported param.
+        """
+        if not cache_policy_active(request):
+            return
+        policy = request.cache_policy
+        assert policy is not None  # narrowed by cache_policy_active
+        if policy.cache_key and is_openai_family_model(model):
+            payload["prompt_cache_key"] = policy.cache_key
 
     async def _map_completion(
         self,
@@ -361,9 +439,10 @@ class OpenAIClientManager:
         model_path = f"openai:{model}"
         started = time.perf_counter()
         params = request.generation_params or {}
+        cache_system = self._passthrough_caches_system(request, model)
         payload: dict[str, Any] = {
             "model": model,
-            "messages": _openai_messages(request),
+            "messages": _openai_messages(request, cache_system=cache_system),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -371,6 +450,7 @@ class OpenAIClientManager:
             payload["temperature"] = params["temperature"]
         if params.get("max_tokens") is not None:
             payload["max_tokens"] = params["max_tokens"]
+        self._apply_prompt_cache_key(request, model, payload)
         if self._default_headers:
             payload["extra_headers"] = dict(self._default_headers)
 

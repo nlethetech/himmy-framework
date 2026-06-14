@@ -47,10 +47,13 @@ from himmy.services.inference.models import (
 from himmy.services.inference.prompt_cache import (
     CacheCapability,
     UsageBreakdown,
+    anthropic_system_blocks,
+    anthropic_ttl_supported,
     cache_savings_usd,
     compute_cached_cost,
     read_anthropic_usage,
     resolve_cache_rates,
+    should_cache_prefix,
 )
 from himmy.services.tools.access import describe_for_model
 
@@ -243,7 +246,7 @@ class AnthropicClientManager:
             )
             system = f"{system}\n\n{instruction}" if system else instruction
         if system:
-            payload["system"] = system
+            self._apply_system(request, model, payload, system)
         if params.get("temperature") is not None:
             payload["temperature"] = params["temperature"]
         if params.get("top_p") is not None:
@@ -285,6 +288,37 @@ class AnthropicClientManager:
         if request.bound_tools:
             return _anthropic_tools(request.bound_tools)
         return []
+
+    def _apply_system(
+        self,
+        request: InferenceRequest,
+        model: str,
+        payload: dict[str, Any],
+        system: str,
+    ) -> None:
+        """Set ``payload['system']`` — block-form with a cache breakpoint, or a plain string.
+
+        When the request opts into caching (a non-``None``, ``enabled`` policy whose
+        ``system_and_tools``/``system_only`` scope and prefix size clear the per-model
+        floor) the system becomes a single block carrying ``cache_control`` — one
+        breakpoint caches BOTH tools and system per Anthropic's render order. A ``1h``
+        TTL is emitted only behind an SDK-version gate (degrading to 5m on uncertainty),
+        and adds the extended-cache beta header. Otherwise the system stays a plain
+        string, byte-identical to the no-cache path.
+        """
+        if not should_cache_prefix(request, model, self.cache_capability):
+            payload["system"] = system
+            return
+        policy = request.cache_policy
+        assert policy is not None  # narrowed by should_cache_prefix
+        ttl_supported = anthropic_ttl_supported()
+        payload["system"] = anthropic_system_blocks(
+            system, ttl=policy.ttl, ttl_supported=ttl_supported
+        )
+        if policy.ttl == "1h" and ttl_supported:
+            payload["extra_headers"] = {
+                "anthropic-beta": "extended-cache-ttl-2025-04-11"
+            }
 
     async def _map_message(
         self,
@@ -397,7 +431,7 @@ class AnthropicClientManager:
         }
         system = _system_text(request)
         if system:
-            payload["system"] = system
+            self._apply_system(request, model, payload, system)
         if params.get("temperature") is not None:
             payload["temperature"] = params["temperature"]
         if request.bound_tools:
