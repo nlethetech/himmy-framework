@@ -15,6 +15,7 @@ tamper-evidence layer in :mod:`himmy.entities.integrity`.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from collections.abc import Collection
@@ -22,7 +23,8 @@ from typing import Any
 
 from himmy.core.errors import HimmyError
 from himmy.core.sqlite_util import connect_hardened
-from himmy.entities.integrity import content_hash
+from himmy.entities.db_chain import DbChainRow
+from himmy.entities.integrity import CHAIN_GENESIS_HASH, _chain_step, content_hash
 from himmy.entities.lineage import (
     DEFAULT_TRACE_DEPTH,
     LineageDirection,
@@ -76,7 +78,7 @@ CREATE INDEX IF NOT EXISTS entity_links_to_idx ON entity_links (to_record_id);
 #: :data:`_MIGRATIONS` whenever a column/index/table is added so existing ``.himmy/spine.db``
 #: files upgrade forward in lock-step with the Postgres spine rather than silently diverging
 #: (``CREATE ... IF NOT EXISTS`` is a no-op on an existing db, so it never reaches a column).
-SPINE_SCHEMA_VERSION = 1
+SPINE_SCHEMA_VERSION = 2
 
 #: Ordered forward migrations applied after the base DDL, gated by ``PRAGMA user_version``
 #: (a database steps through every migration whose version exceeds its current
@@ -85,19 +87,54 @@ SPINE_SCHEMA_VERSION = 1
 #: :data:`_SCHEMA` is the version-1 shape and is never edited; a fresh db (``user_version``
 #: 0) lays down that frozen base and then runs *every* migration just like a legacy file,
 #: converging to the same schema by either path. Append new entries here — never edit a
-#: shipped one — and bump :data:`SPINE_SCHEMA_VERSION` to match the highest. Empty today:
-#: the spine is at its version-1 shape, so a default install only stamps ``user_version``
-#: and the schema is byte-identical to before this governance landed.
-_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = ()
+#: shipped one — and bump :data:`SPINE_SCHEMA_VERSION` to match the highest.
+#:
+#: * **v2** adds the OPT-IN, DB-resident hash-chain column ``prev_hash`` (S6): the
+#:   predecessor's chain hash for the EXISTING :mod:`himmy.entities.integrity` chain, persisted
+#:   so tamper-evidence is verifiable from the DB alone (no separately-held bundle). The column
+#:   stays NULL until the chain is explicitly enabled, so a default install is unaffected
+#:   beyond the column existing. ``CREATE ... IF NOT EXISTS`` never adds a column to an existing
+#:   table, so this ``ALTER`` is the only way a legacy ``.himmy/spine.db`` gains it.
+_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (
+        2,
+        (
+            "ALTER TABLE entity_records ADD COLUMN prev_hash TEXT",
+            "CREATE INDEX IF NOT EXISTS entity_records_prev_hash_idx "
+            "ON entity_records (prev_hash)",
+        ),
+    ),
+)
 
 _REC_COLS = "record_id, stable_id, version, kind, payload, metadata, created_at"
 _LINK_COLS = "link_id, from_record_id, to_record_id, relation, metadata, created_at"
+
+#: Env flag enabling the opt-in DB-resident hash chain (S6). Default OFF.
+_DB_CHAIN_ENV = "HIMMY_SPINE_DB_CHAIN"
+
+
+def _resolve_db_chain_flag(explicit: bool | None) -> bool:
+    """Resolve the DB-chain flag: explicit arg wins, else ``HIMMY_SPINE_DB_CHAIN`` (default OFF)."""
+    if explicit is not None:
+        return explicit
+    return (os.environ.get(_DB_CHAIN_ENV) or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class SqliteEntityRegistry:
     """A synchronous, durable SQLite-backed registry mirroring ``EntityRegistry``."""
 
-    def __init__(self, path: str = ":memory:", *, register_buffer: int = 1) -> None:
+    def __init__(
+        self,
+        path: str = ":memory:",
+        *,
+        register_buffer: int = 1,
+        db_chain: bool | None = None,
+    ) -> None:
         """Open (or create) the SQLite database at ``path`` (``:memory:`` default).
 
         The connection is opened via :func:`connect_hardened` (WAL + busy timeout +
@@ -118,12 +155,28 @@ class SqliteEntityRegistry:
         bundle stays parity-identical; the only window is that a hard crash can lose the
         not-yet-flushed tail of the audit trail. Default ``1`` keeps the full per-event
         durability the spine contract assumes.
+
+        ``db_chain`` (S6) enables the OPT-IN, DB-resident tamper-evidence chain: each NEW
+        :meth:`register` records the predecessor's chain hash in the ``prev_hash`` column so the
+        chain is verifiable from the database ALONE (:func:`himmy.entities.db_chain.verify_db_chain`)
+        — no separately-held bundle. ``None`` (default) resolves it from ``HIMMY_SPINE_DB_CHAIN``
+        (default OFF), so a default install leaves ``prev_hash`` NULL and is byte-identical. The
+        chain REUSES :mod:`himmy.entities.integrity` (``content_hash`` + ``_chain_step``); it is
+        NOT a second mechanism.
         """
         self._conn = connect_hardened(path)
         self._write_lock = threading.Lock()
         self._register_buffer = max(1, int(register_buffer))
         self._pending = 0
+        self._db_chain = _resolve_db_chain_flag(db_chain)
         self._apply_schema()
+        #: In-RAM chain tip (the last committed chained row's chain_hash). Recomputed from the
+        #: committed DB tail on startup so a restart resumes the existing chain; reset to the
+        #: committed tail on any register/new_version rollback so a discarded batch never leaves
+        #: the tip ahead of the durable tail (which would falsely report tampering — S6 must_fix).
+        self._chain_tip: str = (
+            self._recompute_committed_tip() if self._db_chain else CHAIN_GENESIS_HASH
+        )
 
     def _apply_schema(self) -> None:
         """Create/upgrade the spine schema and stamp ``PRAGMA user_version`` (idempotent).
@@ -167,6 +220,35 @@ class SqliteEntityRegistry:
         """The applied schema version (``PRAGMA user_version``) of the backing file."""
         with self._write_lock:
             return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    # ---------------------------------------------------------- DB chain (S6)
+    def _recompute_committed_tip(self) -> str:
+        """Compute the chain tip from the COMMITTED rows (resume the chain on restart).
+
+        Walks the persisted ``prev_hash`` linked list from genesis to its end, recomputing each
+        row's ``chain_hash`` via the integrity primitives, and returns the final hash. This is
+        the durable tail the in-RAM tip must equal — used at startup AND to reset the tip after a
+        rollback so a discarded batch never leaves the tip ahead of disk (which would falsely
+        report tampering). Returns :data:`CHAIN_GENESIS_HASH` for an empty/absent chain.
+        """
+        rows = self._conn.execute(
+            "SELECT prev_hash, " + _REC_COLS + " FROM entity_records "
+            "WHERE prev_hash IS NOT NULL"
+        ).fetchall()
+        if not rows:
+            return CHAIN_GENESIS_HASH
+        by_prev: dict[str, Any] = {}
+        for row in rows:
+            by_prev[row[0]] = row
+        cursor = CHAIN_GENESIS_HASH
+        # Bound the walk by the row count so a corrupt/forked chain cannot loop forever.
+        for _ in range(len(rows)):
+            row = by_prev.get(cursor)
+            if row is None:
+                break
+            record = self._row_to_record(row[1:])
+            cursor = _chain_step(cursor, content_hash(record))
+        return cursor
 
     def _commit_locked(self) -> None:
         """Commit + clear the deferred-register counter (caller holds the write lock)."""
@@ -219,10 +301,14 @@ class SqliteEntityRegistry:
             stored = self.get(record.record_id)
             assert stored is not None
             return stored
+        # S6: when the DB-resident chain is on, bind this row to the current tip by writing
+        # its predecessor's chain hash into prev_hash, then advance the in-RAM tip. The tip is
+        # only authoritative once the enclosing txn commits — a rollback resets it from disk.
+        prev_hash = self._chain_tip if self._db_chain else None
         try:
             self._conn.execute(
-                f"INSERT INTO entity_records ({_REC_COLS}, content_hash) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO entity_records ({_REC_COLS}, content_hash, prev_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.record_id,
                     record.stable_id,
@@ -232,6 +318,7 @@ class SqliteEntityRegistry:
                     json.dumps(record.metadata),
                     record.created_at,
                     content_hash(record),
+                    prev_hash,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -240,6 +327,8 @@ class SqliteEntityRegistry:
                 f"(kind={record.kind!r}, version={record.version}): another writer "
                 "registered this version first. Retry new_version()."
             ) from exc
+        if self._db_chain and prev_hash is not None:
+            self._chain_tip = _chain_step(prev_hash, content_hash(record))
         return record
 
     def register(self, record: EntityRecord) -> EntityRecord:
@@ -259,8 +348,18 @@ class SqliteEntityRegistry:
             except BaseException:
                 self._conn.rollback()
                 self._pending = 0
+                # S6 must_fix: a rollback under register_buffer>1 discards the whole pending
+                # batch, so any in-RAM tip advanced for the discarded rows is now ahead of the
+                # committed tail. Reset it to the durable tip so the chain never falsely reports
+                # tampering.
+                self._reset_chain_tip_after_rollback()
                 raise
         return stored
+
+    def _reset_chain_tip_after_rollback(self) -> None:
+        """Re-anchor the in-RAM chain tip to the committed DB tail (no-op when chain off)."""
+        if self._db_chain:
+            self._chain_tip = self._recompute_committed_tip()
 
     def new_version(
         self,
@@ -306,6 +405,9 @@ class SqliteEntityRegistry:
                 self._conn.commit()
             except BaseException:
                 self._conn.rollback()
+                # The IMMEDIATE txn discarded the new row (and any chain-tip advance it made);
+                # re-anchor the tip to the committed tail so the chain stays consistent (S6).
+                self._reset_chain_tip_after_rollback()
                 raise
         return stored
 
@@ -511,6 +613,24 @@ class SqliteEntityRegistry:
         rows = self._conn.execute(f"SELECT {_LINK_COLS} FROM entity_links").fetchall()
         return [self._row_to_link(r) for r in rows]
 
+    @property
+    def db_chain_enabled(self) -> bool:
+        """Whether the opt-in DB-resident hash chain (S6) is active on this registry."""
+        return self._db_chain
+
+    def db_chain_rows(self) -> list[DbChainRow]:
+        """Every record paired with its stored ``prev_hash`` (for from-DB chain verification).
+
+        Feed the result to :func:`himmy.entities.db_chain.verify_db_chain` to detect an
+        in-place row mutation from the DATABASE ALONE — no separately-held bundle. Pending
+        buffered writes are flushed first so the snapshot reflects the durable tail.
+        """
+        self.flush()
+        rows = self._conn.execute(
+            f"SELECT {_REC_COLS}, prev_hash FROM entity_records"
+        ).fetchall()
+        return [DbChainRow(record=self._row_to_record(r), prev_hash=r[7]) for r in rows]
+
     # ------------------------------------------------------------------ codecs
     @staticmethod
     def _row_to_record(row: Any) -> EntityRecord:
@@ -536,4 +656,4 @@ class SqliteEntityRegistry:
         )
 
 
-__all__ = ["SqliteEntityRegistry", "SPINE_SCHEMA_VERSION"]
+__all__ = ["SqliteEntityRegistry", "SPINE_SCHEMA_VERSION", "_DB_CHAIN_ENV"]

@@ -27,15 +27,22 @@ providers need their own optional extra (``kms-aws`` → boto3), lazily imported
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 from collections.abc import Iterable
 from typing import Any, Protocol, runtime_checkable
+
+from himmy.core.errors import HimmyError
 
 #: Marker so we can recognize (and not double-encrypt) our own ciphertext.
 ENC_PREFIX = "himmy:enc:v1:"
 
 #: Version tag for the built-in local (raw-key) KEK provider.
 LOCAL_VERSION = "LOCAL"
+
+#: HKDF ``info`` context binding a derived per-workspace KEK to its purpose (domain
+#: separation, so the same master never produces a colliding key for another use).
+_WORKSPACE_HKDF_INFO = b"himmy:workspace-kek:v1"
 
 
 @runtime_checkable
@@ -109,6 +116,170 @@ class LocalKekProvider:
 
         wrap_nonce, blob = wrapped_dek[:12], wrapped_dek[12:]
         return AESGCM(self._kek).decrypt(wrap_nonce, blob, b"")
+
+
+@runtime_checkable
+class WorkspaceKekProvider(Protocol):
+    """Selects a per-workspace :class:`KekProvider` so one tenant is independently shreddable.
+
+    A single process-wide KEK (the historical default) cannot cryptographically erase ONE
+    tenant: destroying it shreds everyone. A workspace KEK provider returns a DISTINCT KEK
+    per ``workspace_id`` (via :meth:`for_workspace`), so the per-subject DEKs of one workspace
+    are wrapped under that workspace's KEK alone. "Shred the tenant" is then a single
+    operation — :meth:`disable_workspace` — after which :meth:`for_workspace` refuses to
+    re-derive that KEK, rendering every subject ciphertext in the workspace permanently
+    undecryptable while every other workspace still decrypts.
+
+    ``workspaces_disabled`` is consulted so an already-shredded workspace is never silently
+    re-derived (the durable disabled set is injected, so a disable survives a restart).
+    """
+
+    def for_workspace(self, workspace_id: str) -> KekProvider:
+        """Return the KEK provider for ``workspace_id`` (raises if it is disabled/shredded)."""
+        ...
+
+    def disable_workspace(self, workspace_id: str) -> None:
+        """Mark ``workspace_id`` shredded so its KEK can no longer be derived/selected."""
+        ...
+
+    def is_disabled(self, workspace_id: str) -> bool:
+        """Whether ``workspace_id`` has been shredded (its KEK is gone)."""
+        ...
+
+
+class WorkspaceShredded(HimmyError):
+    """Raised when a disabled (cryptographically shredded) workspace's KEK is requested."""
+
+
+class HkdfWorkspaceKekProvider:
+    """Derive each workspace's KEK as ``HKDF(master, salt=workspace_id)`` (the portable path).
+
+    The same long-lived master never appears on disk as a workspace KEK: a workspace's KEK is
+    derived on demand from ``(master, salt=workspace_id)`` with a stable per-workspace
+    ``key_version`` of ``"local-ws.<fp>"`` (``<fp>`` = the first 16 hex chars of
+    ``SHA-256(workspace_id)`` — a non-secret fingerprint that ties a token to its workspace
+    without storing the id; mirrors :class:`AwsKmsKekProvider`). Because HKDF is deterministic,
+    a per-tenant shred cannot rely on "forgetting" derivation material (the master still
+    exists for other tenants). Instead a DURABLE disabled-set (injected via ``disabled`` —
+    the keyvault persists it) gates derivation: a disabled workspace raises
+    :class:`WorkspaceShredded` from :meth:`for_workspace`, so no subject DEK in that workspace
+    can be unwrapped. This is the standard crypto-shred-without-destroying-the-master pattern;
+    the AWS path (:class:`AwsKmsWorkspaceKekProvider`) ALSO disables the real CMK.
+
+    ``disabled`` defaults to an in-process ``set`` (the offline/test default). The governed
+    server injects a durable, restart-surviving disabled-set so a shred is permanent.
+    """
+
+    def __init__(
+        self,
+        master_key: bytes,
+        *,
+        disabled: _DisabledWorkspaces | None = None,
+    ) -> None:
+        if len(master_key) < 16:
+            raise ValueError("workspace master key must be at least 16 bytes")
+        self._master = master_key
+        self._disabled: _DisabledWorkspaces = (
+            disabled if disabled is not None else _InMemoryDisabledWorkspaces()
+        )
+
+    @classmethod
+    def from_key_b64(
+        cls, key_b64: str, *, disabled: _DisabledWorkspaces | None = None
+    ) -> HkdfWorkspaceKekProvider:
+        """Build from a base64-encoded master key."""
+        return cls(base64.b64decode(key_b64), disabled=disabled)
+
+    @classmethod
+    def generate(
+        cls, *, disabled: _DisabledWorkspaces | None = None
+    ) -> HkdfWorkspaceKekProvider:
+        """Generate a fresh 32-byte master (for bootstrapping / tests)."""
+        return cls(os.urandom(32), disabled=disabled)
+
+    @staticmethod
+    def _fingerprint(workspace_id: str) -> str:
+        return hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:16]
+
+    def _derive(self, workspace_id: str) -> bytes:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=workspace_id.encode("utf-8"),
+            info=_WORKSPACE_HKDF_INFO,
+        )
+        return hkdf.derive(self._master)
+
+    def for_workspace(self, workspace_id: str) -> KekProvider:
+        """Return the HKDF-derived :class:`LocalKekProvider` for ``workspace_id``.
+
+        Raises :class:`WorkspaceShredded` if the workspace was disabled — that is the
+        per-tenant crypto-shred: the KEK is no longer derivable, so the workspace's subject
+        DEKs (and therefore its ciphertext) are permanently unrecoverable.
+        """
+        if self._disabled.is_disabled(workspace_id):
+            raise WorkspaceShredded(
+                f"workspace {workspace_id!r} has been cryptographically shredded "
+                "(its KEK is disabled and can no longer be derived)"
+            )
+        return _TaggedLocalKekProvider(
+            self._derive(workspace_id), f"local-ws.{self._fingerprint(workspace_id)}"
+        )
+
+    def disable_workspace(self, workspace_id: str) -> None:
+        """Durably mark ``workspace_id`` shredded (idempotent)."""
+        self._disabled.disable(workspace_id)
+
+    def is_disabled(self, workspace_id: str) -> bool:
+        return self._disabled.is_disabled(workspace_id)
+
+
+class _TaggedLocalKekProvider(LocalKekProvider):
+    """A :class:`LocalKekProvider` carrying an explicit, workspace-scoped ``key_version``.
+
+    The base provider always reports ``"LOCAL"``; a workspace KEK needs a DISTINCT version
+    per workspace so a token records WHICH workspace KEK wrapped it (and a wrong-workspace
+    read fails loud rather than silently using the wrong derived key). Wrap/unwrap are
+    inherited unchanged — only the version tag differs.
+    """
+
+    def __init__(self, kek: bytes, key_version: str) -> None:
+        super().__init__(kek)
+        if ":" in key_version:
+            raise ValueError("key_version must not contain ':' (token delimiter)")
+        self._version = key_version
+
+    @property
+    def key_version(self) -> str:
+        return self._version
+
+    def wrap_dek(self, plaintext_dek: bytes) -> tuple[bytes, str]:
+        wrapped, _ = super().wrap_dek(plaintext_dek)
+        return wrapped, self._version
+
+
+@runtime_checkable
+class _DisabledWorkspaces(Protocol):
+    """A (durable) record of which workspaces have been cryptographically shredded."""
+
+    def is_disabled(self, workspace_id: str) -> bool: ...
+    def disable(self, workspace_id: str) -> None: ...
+
+
+class _InMemoryDisabledWorkspaces:
+    """The default, ephemeral disabled-set (offline/test path)."""
+
+    def __init__(self) -> None:
+        self._disabled: set[str] = set()
+
+    def is_disabled(self, workspace_id: str) -> bool:
+        return workspace_id in self._disabled
+
+    def disable(self, workspace_id: str) -> None:
+        self._disabled.add(workspace_id)
 
 
 class FieldEncryptor:
@@ -353,6 +524,58 @@ def build_kek_provider() -> KekProvider | None:
     raise ValueError(f"unknown HIMMY_KEK_PROVIDER: {mode!r}")
 
 
+def build_workspace_kek_provider(
+    *, disabled: _DisabledWorkspaces | None = None
+) -> WorkspaceKekProvider | None:
+    """Build a :class:`WorkspaceKekProvider` from env, or ``None`` (single process KEK).
+
+    Selected by ``HIMMY_WORKSPACE_KEK_PROVIDER`` (unset ⇒ ``None`` — the historical single
+    process-wide meta-KEK, no per-tenant shred, byte-for-byte unchanged):
+
+    * ``local`` — :class:`HkdfWorkspaceKekProvider` over a master from
+      ``HIMMY_WORKSPACE_KEK_MASTER`` (base64; falls back to ``HIMMY_ENCRYPTION_KEY``). The
+      portable path: each workspace KEK is ``HKDF(master, salt=workspace_id)``, and a
+      durable disabled-set (injected via ``disabled``) gates derivation for the shred.
+    * ``aws-kms`` — :class:`~himmy.services.storage.kms_providers.AwsKmsWorkspaceKekProvider`
+      with one CMK per workspace from ``HIMMY_AWS_KMS_KEY_ID_TEMPLATE`` (must contain
+      ``{workspace_id}``). AWS is the only working cloud KMS (GCP/Azure are seams), so the
+      cloud per-tenant shred is AWS-only by design; the local HKDF path is portable.
+
+    ``disabled`` injects the durable disabled-workspaces set (the keyvault persists it); when
+    ``None`` an ephemeral in-process set is used (offline/test default).
+    """
+    from himmy.config.secrets import get_secret
+
+    mode = (os.environ.get("HIMMY_WORKSPACE_KEK_PROVIDER") or "").strip().lower()
+    if mode in ("", "none"):
+        return None
+    if mode == "local":
+        master_b64 = get_secret("HIMMY_WORKSPACE_KEK_MASTER") or get_secret(
+            "HIMMY_ENCRYPTION_KEY"
+        )
+        if not master_b64:
+            raise ValueError(
+                "local workspace KEK provider needs HIMMY_WORKSPACE_KEK_MASTER "
+                "(or HIMMY_ENCRYPTION_KEY) as a base64 master key"
+            )
+        return HkdfWorkspaceKekProvider.from_key_b64(master_b64, disabled=disabled)
+    if mode == "aws-kms":
+        from himmy.services.storage.kms_providers import AwsKmsWorkspaceKekProvider
+
+        template = get_secret("HIMMY_AWS_KMS_KEY_ID_TEMPLATE")
+        if not template:
+            raise ValueError(
+                "aws-kms workspace KEK provider needs HIMMY_AWS_KMS_KEY_ID_TEMPLATE "
+                "(e.g. 'alias/himmy-ws-{workspace_id}')"
+            )
+        return AwsKmsWorkspaceKekProvider(
+            key_id_template=template,
+            region=get_secret("AWS_REGION"),
+            disabled=disabled,
+        )
+    raise ValueError(f"unknown HIMMY_WORKSPACE_KEK_PROVIDER: {mode!r}")
+
+
 def _require_extra(module: str, extra: str, provider_name: str) -> None:
     """Raise a clear error if ``module`` (the extra's SDK) is not importable."""
     import importlib.util
@@ -380,8 +603,12 @@ __all__ = [
     "RecordCipher",
     "KekProvider",
     "LocalKekProvider",
+    "WorkspaceKekProvider",
+    "HkdfWorkspaceKekProvider",
+    "WorkspaceShredded",
     "build_field_encryptor",
     "build_kek_provider",
+    "build_workspace_kek_provider",
     "ENC_PREFIX",
     "LOCAL_VERSION",
 ]

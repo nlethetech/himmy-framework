@@ -32,6 +32,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.storage.encryption import (
         FieldEncryptor,
         KekProvider,
+        WorkspaceKekProvider,
     )
 
 #: EntityRecord kind for an erasure tombstone (the immutable proof of erasure).
@@ -53,16 +54,31 @@ _RAW_KEY_VERSION = "RAW"
 #: ``key_version`` records the meta-KEK version (or :data:`_RAW_KEY_VERSION`). A row's
 #: ``shredded_at`` is set (and ``wrapped_dek`` nulled) by :meth:`SubjectKeyVault.destroy` so
 #: the destruction is durable + auditable; an erased subject's row is retained as a tombstone
-#: of WHEN the key was destroyed.
+#: of WHEN the key was destroyed. ``workspace_id`` (S5) records the tenant a subject's key
+#: belongs to so a per-workspace KEK can wrap it and a single-tenant crypto-shred can null
+#: every key in one workspace (NULL ⇒ the legacy single-process-KEK path, unchanged).
+#: Base DDL. ``CREATE TABLE IF NOT EXISTS`` lays down the full table for a FRESH db (with the
+#: S5 ``workspace_id`` column) but is a no-op on a legacy table that lacks the column — the
+#: ``workspace_id`` index is therefore created in :meth:`_migrate_legacy_schema_locked` AFTER
+#: the column is ensured, never here, so it cannot reference a missing column on a legacy file.
 _KEYVAULT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS subject_keys (
-    subject_id  TEXT PRIMARY KEY,
-    wrapped_dek BLOB,
-    key_version TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    shredded_at TEXT
+    subject_id   TEXT PRIMARY KEY,
+    wrapped_dek  BLOB,
+    key_version  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    shredded_at  TEXT,
+    workspace_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS disabled_workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    disabled_at  TEXT NOT NULL
 );
 """
+
+#: Durable disabled-workspaces record name used in operator messaging.
+_WORKSPACE_DISABLED_TOMBSTONE = "disabled_workspaces"
 
 
 class _Unset:
@@ -71,6 +87,42 @@ class _Unset:
 
 #: Module-level singleton sentinel (so the default arg is a stable identity).
 _UNSET = _Unset()
+
+
+class _DbDisabledWorkspaces:
+    """A durable disabled-workspaces set backed by a :class:`SubjectKeyVault`'s db (S5).
+
+    Implements the :class:`~himmy.services.storage.encryption._DisabledWorkspaces` protocol so
+    a :class:`WorkspaceKekProvider`'s per-tenant shred survives a restart: ``disable`` inserts
+    a row into ``disabled_workspaces`` and ``is_disabled`` reads it back. The provider consults
+    this on EVERY :meth:`for_workspace`, so a shredded tenant's KEK can never be re-derived even
+    after the process restarts.
+    """
+
+    def __init__(self, vault: SubjectKeyVault) -> None:
+        self._vault = vault
+
+    def is_disabled(self, workspace_id: str) -> bool:
+        return self._vault._is_workspace_disabled(workspace_id)
+
+    def disable(self, workspace_id: str) -> None:
+        self._vault._mark_workspace_disabled(workspace_id)
+
+
+def _rebind_disabled_set(
+    provider: WorkspaceKekProvider, disabled: _DbDisabledWorkspaces
+) -> WorkspaceKekProvider:
+    """Re-point an injected workspace provider's disabled-set at the durable db one.
+
+    A caller may inject a workspace provider built with an ephemeral in-memory disabled-set
+    (the offline default of :func:`build_workspace_kek_provider`). To make a per-tenant shred
+    durable, swap its ``_disabled`` to the db-backed set. Implementations keep the set on a
+    ``_disabled`` attribute; if a custom provider does not, it is left untouched (its own
+    disabled-set is then authoritative).
+    """
+    if hasattr(provider, "_disabled"):
+        provider._disabled = disabled  # type: ignore[attr-defined]
+    return provider
 
 
 class SubjectKeyVault:
@@ -108,13 +160,23 @@ class SubjectKeyVault:
         path: str = ":memory:",
         *,
         meta_kek: KekProvider | None | _Unset = _UNSET,
+        workspace_kek: WorkspaceKekProvider | None | _Unset = _UNSET,
     ) -> None:
         """Open (or create) the keyvault DB at ``path`` and apply the schema.
 
         ``meta_kek`` wraps each persisted subject key (the envelope around the KEK). By
         default it is resolved from :func:`build_kek_provider` (``None`` ⇒ raw-on-disk, the
-        offline path); pass an explicit provider (or ``None``) to override. The parent dir
-        of a file path is created on first use, like the other durable stores.
+        offline path); pass an explicit provider (or ``None``) to override.
+
+        ``workspace_kek`` (S5) selects a PER-WORKSPACE KEK so a single tenant is independently
+        crypto-shreddable. When set, a subject registered with a ``workspace_id`` has its key
+        wrapped under that workspace's KEK (not the single process meta-KEK), and
+        :meth:`shred_workspace` disables the workspace KEK + nulls every key in it — rendering
+        only that tenant's ciphertext undecryptable. Default (``_UNSET`` ⇒ resolved from
+        :func:`build_workspace_kek_provider`, normally ``None``) keeps the single process KEK
+        with NO behavior change. The durable disabled-workspaces set is backed by THIS db so a
+        per-tenant shred survives a restart. The parent dir of a file path is created on first
+        use, like the other durable stores.
         """
         self._path = str(path)
         if self._path != ":memory:":
@@ -124,9 +186,14 @@ class SubjectKeyVault:
                 parents=True, exist_ok=True
             )
         self._conn = connect_hardened(self._path)
-        self._lock = threading.Lock()
+        # Re-entrant: the wrap/unwrap path (inside the held lock) calls back into the workspace
+        # KEK provider, whose durable disabled-set adapter re-enters the vault on the SAME
+        # thread. A plain Lock would self-deadlock; RLock keeps the single-connection
+        # serialisation across threads while allowing this same-thread re-entry (S5).
+        self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(_KEYVAULT_SCHEMA)
+            self._migrate_legacy_schema_locked()
             self._conn.commit()
         if isinstance(meta_kek, _Unset):
             from himmy.services.storage.encryption import build_kek_provider
@@ -134,28 +201,86 @@ class SubjectKeyVault:
             self._meta_kek = build_kek_provider()
         else:
             self._meta_kek = meta_kek
+        if isinstance(workspace_kek, _Unset):
+            from himmy.services.storage.encryption import (
+                build_workspace_kek_provider,
+            )
+
+            # Back the provider's disabled-set with THIS db so a tenant shred is durable.
+            self._workspace_kek = build_workspace_kek_provider(
+                disabled=_DbDisabledWorkspaces(self)
+            )
+        elif workspace_kek is None:
+            self._workspace_kek = None
+        else:
+            self._workspace_kek = _rebind_disabled_set(
+                workspace_kek, _DbDisabledWorkspaces(self)
+            )
         #: Per-process cache of unwrapped subject keys (avoids a KMS round-trip per call).
         #: Authoritative state is the DB row; the cache is invalidated on destroy.
         self._cache: dict[str, bytes] = {}
 
+    def _migrate_legacy_schema_locked(self) -> None:
+        """Forward-migrate a pre-S5 keyvault.db in place (caller holds the lock).
+
+        A keyvault.db written before S5 has a ``subject_keys`` table WITHOUT the
+        ``workspace_id`` column (and no ``disabled_workspaces`` table — that one is created by
+        the idempotent base DDL above). ``CREATE TABLE IF NOT EXISTS`` never adds a column to
+        an existing table, so add it here when absent. Legacy rows get ``workspace_id`` NULL,
+        i.e. the single-process-KEK path — exactly their original behavior.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(subject_keys)").fetchall()
+        }
+        if "workspace_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subject_keys ADD COLUMN workspace_id TEXT"
+            )
+        # The index is created here (not in the base DDL) so it always runs AFTER the column
+        # exists — on a fresh db the column came from the base DDL, on a legacy db from the
+        # ALTER above. Idempotent either way.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS subject_keys_workspace_idx "
+            "ON subject_keys (workspace_id)"
+        )
+
     # ----------------------------------------------------------------- wrapping
-    def _wrap(self, key: bytes) -> tuple[bytes, str]:
-        """Wrap a raw subject key under the meta-KEK (or pass through raw)."""
+    def _wrap(self, key: bytes, *, workspace_id: str | None) -> tuple[bytes, str]:
+        """Wrap a raw subject key under the right KEK; return ``(wrapped, key_version)``.
+
+        Selection order: (1) when a per-workspace KEK provider is configured AND the subject
+        carries a ``workspace_id``, wrap under that workspace's KEK (so the tenant is
+        independently shreddable — S5); (2) else the single process meta-KEK; (3) else raw
+        (the offline default). The returned ``key_version`` records WHICH KEK wrapped it so the
+        matching one is located on read.
+        """
+        provider = self._workspace_kek_for(workspace_id)
+        if provider is not None:
+            return provider.wrap_dek(key)
         if self._meta_kek is None:
             return key, _RAW_KEY_VERSION
-        wrapped, version = self._meta_kek.wrap_dek(key)
-        return wrapped, version
+        return self._meta_kek.wrap_dek(key)
 
-    def _unwrap(self, wrapped: bytes, key_version: str) -> bytes:
+    def _unwrap(
+        self, wrapped: bytes, key_version: str, *, workspace_id: str | None
+    ) -> bytes:
         """Unwrap a stored subject key (raw pass-through when stored raw).
 
-        A row stored RAW is returned verbatim. A row stored under a meta-KEK requires the
-        meta-KEK to be present: if it was removed after the key was wrapped, fail loud rather
-        than silently hand back the wrapped bytes as if they were the key (which would
-        produce wrong-key ciphertext, not a clean error).
+        A row stored RAW is returned verbatim. A workspace-scoped row (the subject carries a
+        ``workspace_id`` and a workspace KEK provider is configured) is unwrapped under that
+        workspace's KEK — which RAISES :class:`WorkspaceShredded` when the workspace has been
+        disabled (the per-tenant crypto-shred). Otherwise the single process meta-KEK is
+        required: if it was removed after the key was wrapped, fail loud rather than silently
+        hand back the wrapped bytes as if they were the key.
         """
         if key_version == _RAW_KEY_VERSION:
             return bytes(wrapped)
+        provider = self._workspace_kek_for(workspace_id)
+        if provider is not None:
+            # for_workspace already raised if the workspace is shredded; the derived/selected
+            # provider unwraps under the workspace KEK.
+            return provider.unwrap_dek(bytes(wrapped), key_version)
         if self._meta_kek is None:
             raise HimmyError(
                 f"subject key was wrapped under meta-KEK version {key_version!r} but no "
@@ -164,9 +289,61 @@ class SubjectKeyVault:
             )
         return self._meta_kek.unwrap_dek(bytes(wrapped), key_version)
 
+    def _workspace_kek_for(self, workspace_id: str | None) -> KekProvider | None:
+        """The per-workspace KEK for ``workspace_id`` (``None`` ⇒ fall back to meta-KEK).
+
+        Returns ``None`` when no workspace KEK provider is configured OR the subject has no
+        ``workspace_id`` (the legacy single-process-KEK path, unchanged). When a provider IS
+        configured and the workspace is disabled, :meth:`WorkspaceKekProvider.for_workspace`
+        raises :class:`WorkspaceShredded` — that is the tenant shred surfacing on any read.
+        """
+        if self._workspace_kek is None or workspace_id is None:
+            return None
+        return self._workspace_kek.for_workspace(workspace_id)
+
+    def _workspace_of(self, subject_id: str) -> str | None:
+        """The stored ``workspace_id`` of a subject's row (caller holds the lock)."""
+        row = self._conn.execute(
+            "SELECT workspace_id FROM subject_keys WHERE subject_id = ?",
+            (subject_id,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def _is_workspace_disabled(self, workspace_id: str) -> bool:
+        """Whether ``workspace_id`` is durably recorded as shredded.
+
+        The lock is re-entrant (:class:`threading.RLock`), so this is safe both standalone
+        (the :class:`_DbDisabledWorkspaces` adapter calls it outside the vault's other work)
+        and re-entered from the wrap/unwrap path that already holds the lock.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM disabled_workspaces WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+        return row is not None
+
+    def _mark_workspace_disabled(self, workspace_id: str) -> None:
+        """Durably record ``workspace_id`` as shredded (idempotent; acquires the lock)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO disabled_workspaces (workspace_id, disabled_at) "
+                "VALUES (?, ?) ON CONFLICT(workspace_id) DO NOTHING",
+                (workspace_id, utc_now_iso()),
+            )
+            self._conn.commit()
+
     # -------------------------------------------------------------------- reads
-    def key_for(self, subject_id: str) -> bytes:
+    def key_for(self, subject_id: str, *, workspace_id: str | None = None) -> bytes:
         """Return (creating + persisting if needed) the subject's 32-byte key.
+
+        ``workspace_id`` (S5) binds a FIRST-SEEN subject to a tenant so its key is wrapped
+        under that workspace's KEK (and the tenant becomes independently shreddable). It is
+        recorded once on creation; passing a DIFFERENT ``workspace_id`` for an existing
+        subject raises (a subject must not silently jump tenants — that would mis-target a
+        per-workspace shred). Omitting it for an existing subject reuses the stored linkage.
+        When no workspace KEK provider is configured, ``workspace_id`` is still recorded for
+        the reach-map linkage but wrapping stays under the single process KEK (unchanged).
 
         If the subject was previously erased (its row exists with a nulled key), a FRESH
         key is minted and the row is re-activated (``shredded_at`` cleared, a new
@@ -178,61 +355,93 @@ class SubjectKeyVault:
         """
         cached = self._cache.get(subject_id)
         if cached is not None:
+            # Guard the cache hit too: a caller passing a DIFFERENT workspace for a known
+            # subject must still be rejected (the cache must not bypass the tenant binding).
+            if workspace_id is not None:
+                with self._lock:
+                    self._assert_same_workspace(
+                        subject_id, self._workspace_of(subject_id), workspace_id
+                    )
             return cached
         with self._lock:
             row = self._conn.execute(
-                "SELECT wrapped_dek, key_version, shredded_at "
+                "SELECT wrapped_dek, key_version, shredded_at, workspace_id "
                 "FROM subject_keys WHERE subject_id = ?",
                 (subject_id,),
             ).fetchone()
             if row is not None:
-                wrapped, key_version, shredded_at = row
+                wrapped, key_version, shredded_at, stored_ws = row
+                self._assert_same_workspace(subject_id, stored_ws, workspace_id)
                 if shredded_at is not None or wrapped is None:
                     # Erased subject re-onboarding: re-mint under a fresh key + re-activate
                     # the row in place. The prior key bytes are gone (nulled on destroy),
                     # so the shred remains irrecoverable for pre-erasure ciphertext.
-                    return self._remint_locked(subject_id)
-                key = self._unwrap(wrapped, key_version)
+                    return self._remint_locked(
+                        subject_id, workspace_id=workspace_id or stored_ws
+                    )
+                key = self._unwrap(wrapped, key_version, workspace_id=stored_ws)
                 self._cache[subject_id] = key
                 return key
             # First sight: generate, wrap, persist atomically.
             key = os.urandom(32)
-            wrapped, key_version = self._wrap(key)
+            wrapped, key_version = self._wrap(key, workspace_id=workspace_id)
             self._conn.execute(
                 "INSERT INTO subject_keys "
-                "(subject_id, wrapped_dek, key_version, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (subject_id, wrapped, key_version, utc_now_iso()),
+                "(subject_id, wrapped_dek, key_version, created_at, workspace_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (subject_id, wrapped, key_version, utc_now_iso(), workspace_id),
             )
             self._conn.commit()
             self._cache[subject_id] = key
             return key
 
-    def _remint_locked(self, subject_id: str) -> bytes:
+    @staticmethod
+    def _assert_same_workspace(
+        subject_id: str, stored: str | None, requested: str | None
+    ) -> None:
+        """Refuse a subject silently changing tenants (would mis-target a per-tenant shred)."""
+        if requested is not None and stored is not None and requested != stored:
+            raise HimmyError(
+                f"subject {subject_id!r} is bound to workspace {stored!r} but was "
+                f"requested under {requested!r}; a subject cannot move between tenants "
+                "(this would mis-target a per-workspace crypto-shred)."
+            )
+
+    def _remint_locked(
+        self, subject_id: str, *, workspace_id: str | None = None
+    ) -> bytes:
         """Mint a fresh key for an erased subject and re-activate its row in place.
 
         Caller must hold ``self._lock``. The old (nulled) key bytes are unrecoverable, so
         re-minting cannot un-shred prior ciphertext — it only provisions a NEW key for data
         written after re-consent. ``shredded_at`` is cleared and ``created_at`` restamped so
-        the row reflects the active re-onboarded key.
+        the row reflects the active re-onboarded key. ``workspace_id`` re-binds the tenant
+        (defaults to the row's existing one).
         """
         key = os.urandom(32)
-        wrapped, key_version = self._wrap(key)
+        wrapped, key_version = self._wrap(key, workspace_id=workspace_id)
         self._conn.execute(
             "UPDATE subject_keys "
-            "SET wrapped_dek = ?, key_version = ?, created_at = ?, shredded_at = NULL "
+            "SET wrapped_dek = ?, key_version = ?, created_at = ?, shredded_at = NULL, "
+            "    workspace_id = ? "
             "WHERE subject_id = ?",
-            (wrapped, key_version, utc_now_iso(), subject_id),
+            (wrapped, key_version, utc_now_iso(), workspace_id, subject_id),
         )
         self._conn.commit()
         self._cache[subject_id] = key
         return key
 
-    def encryptor_for(self, subject_id: str) -> FieldEncryptor:
-        """A :class:`FieldEncryptor` bound to the subject's key (subject-key-as-KEK)."""
+    def encryptor_for(
+        self, subject_id: str, *, workspace_id: str | None = None
+    ) -> FieldEncryptor:
+        """A :class:`FieldEncryptor` bound to the subject's key (subject-key-as-KEK).
+
+        ``workspace_id`` (S5) binds a first-seen subject to a tenant (see :meth:`key_for`); it
+        is recorded once and reused thereafter, so existing callers that omit it are unchanged.
+        """
         from himmy.services.storage.encryption import FieldEncryptor
 
-        return FieldEncryptor(self.key_for(subject_id))
+        return FieldEncryptor(self.key_for(subject_id, workspace_id=workspace_id))
 
     def rotate_subject_key(
         self, subject_id: str, new_provider: KekProvider, tokens: Iterable[str]
@@ -305,6 +514,80 @@ class SubjectKeyVault:
             )
             self._conn.commit()
         return True
+
+    # --------------------------------------------------------- workspace (S5)
+    @property
+    def supports_workspace_shred(self) -> bool:
+        """Whether a per-workspace KEK is configured (so a single tenant is shreddable)."""
+        return self._workspace_kek is not None
+
+    def workspace_of(self, subject_id: str) -> str | None:
+        """The ``workspace_id`` a subject is bound to (``None`` if unbound/unknown).
+
+        Used by the reach-map to assert subject→workspace linkage so a per-workspace shred
+        neither misses a subject (wrong tenant) nor over-deletes (a shared subject).
+        """
+        with self._lock:
+            return self._workspace_of(subject_id)
+
+    def subjects_in_workspace(self, workspace_id: str) -> list[str]:
+        """Every LIVE (non-shredded) subject bound to ``workspace_id``."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT subject_id FROM subject_keys "
+                "WHERE workspace_id = ? AND shredded_at IS NULL AND wrapped_dek IS NOT NULL",
+                (workspace_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def is_workspace_shredded(self, workspace_id: str) -> bool:
+        """Whether ``workspace_id`` has been cryptographically shredded (its KEK disabled)."""
+        return self._is_workspace_disabled(workspace_id)
+
+    def shred_workspace(self, workspace_id: str) -> int:
+        """Cryptographically shred ONE tenant: disable its KEK + null every key in it (S5).
+
+        This is the single per-tenant erasure operation: it (1) disables the workspace KEK
+        durably (via the configured :class:`WorkspaceKekProvider` — the local HKDF path marks
+        the durable disabled-set so the KEK can no longer be DERIVED; the AWS path ALSO disables
+        the real CMK), and (2) nulls + tombstones every live ``subject_keys`` row in the
+        workspace (so the subject keys are gone even crypto-shredded). After this, ALL of the
+        workspace's subject ciphertext is permanently undecryptable while every OTHER workspace
+        still decrypts. Returns the number of subject keys destroyed.
+
+        Requires a workspace KEK provider (otherwise there is nothing tenant-scoped to disable);
+        raises :class:`HimmyError` when none is configured. Idempotent: a second call disables
+        an already-disabled workspace and destroys any remaining keys (returns the new count,
+        usually 0).
+        """
+        if self._workspace_kek is None:
+            raise HimmyError(
+                "shred_workspace requires a per-workspace KEK provider "
+                "(set HIMMY_WORKSPACE_KEK_PROVIDER); the single process KEK cannot erase "
+                "one tenant without shredding everyone."
+            )
+        # Disable the workspace KEK FIRST (durable + HSM-side), so even a concurrent reader
+        # that races the row-null below cannot unwrap under the now-disabled KEK.
+        self._workspace_kek.disable_workspace(workspace_id)
+        destroyed = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT subject_id FROM subject_keys "
+                "WHERE workspace_id = ? AND shredded_at IS NULL "
+                "AND wrapped_dek IS NOT NULL",
+                (workspace_id,),
+            ).fetchall()
+            now = utc_now_iso()
+            for (subject_id,) in rows:
+                self._cache.pop(subject_id, None)
+                self._conn.execute(
+                    "UPDATE subject_keys SET wrapped_dek = NULL, shredded_at = ? "
+                    "WHERE subject_id = ?",
+                    (now, subject_id),
+                )
+                destroyed += 1
+            self._conn.commit()
+        return destroyed
 
     def close(self) -> None:
         """Close the backing connection (idempotent)."""

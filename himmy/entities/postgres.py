@@ -93,6 +93,19 @@ SPINE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "base_schema",
         [ENTITY_REGISTRY_DDL],
     ),
+    (
+        # v2 mirrors the SQLite spine's migration 2: the OPT-IN, DB-resident hash-chain
+        # column ``prev_hash`` (S6). NULL until the chain is explicitly enabled, so a default
+        # deployment is unaffected beyond the column existing. ``ADD COLUMN IF NOT EXISTS`` is
+        # idempotent so a re-run (or a partially-migrated db) is safe.
+        2,
+        "db_resident_hash_chain",
+        [
+            "ALTER TABLE entity_records ADD COLUMN IF NOT EXISTS prev_hash TEXT",
+            "CREATE INDEX IF NOT EXISTS entity_records_prev_hash_idx "
+            "ON entity_records (prev_hash)",
+        ],
+    ),
 ]
 
 #: Migration-tracking table for the spine, namespaced DISTINCTLY from the storage migrator's

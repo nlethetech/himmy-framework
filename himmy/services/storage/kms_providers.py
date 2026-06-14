@@ -17,7 +17,13 @@ The provider's ``key_version`` embeds a stable, *non-secret* fingerprint of the 
 from __future__ import annotations
 
 import hashlib
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.services.storage.encryption import (
+        KekProvider,
+        _DisabledWorkspaces,
+    )
 
 
 class AwsKmsKekProvider:
@@ -76,6 +82,107 @@ class AwsKmsKekProvider:
         """Unwrap the DEK via KMS ``decrypt`` (``key_version`` is informational)."""
         resp = self._ensure().decrypt(CiphertextBlob=wrapped_dek)
         return cast(bytes, resp["Plaintext"])
+
+
+class AwsKmsWorkspaceKekProvider:
+    """One AWS-KMS CMK per workspace — the cloud per-tenant crypto-shred (AWS-only).
+
+    :meth:`for_workspace` builds an :class:`AwsKmsKekProvider` keyed by a per-workspace CMK
+    id derived from a ``key_id_template`` (a Python ``str.format`` template that must contain
+    ``{workspace_id}`` — e.g. ``"alias/himmy-ws-{workspace_id}"``). Each workspace's subject
+    DEKs are wrapped under its OWN CMK, so disabling that CMK in KMS makes every subject
+    ciphertext in the workspace permanently undecryptable while other workspaces are
+    untouched — a genuine single-tenant shred at the HSM.
+
+    :meth:`disable_workspace` does TWO things: it records the shred in the injected durable
+    ``disabled`` set (so :meth:`for_workspace` refuses locally even before KMS propagates /
+    when offline) AND, when a real client is available, calls KMS ``disable_key`` /
+    ``schedule_key_deletion`` on the workspace CMK. The local disabled-set is authoritative
+    for the refusal so the shred is enforced deterministically and is restart-durable; the
+    KMS call is the irreversible HSM-side guarantee.
+
+    ``schedule_deletion_days`` (when set) escalates the KMS action from a reversible
+    ``disable_key`` to ``schedule_key_deletion`` (irreversible after the window). ``client``
+    is injectable so the whole flow is offline-testable.
+    """
+
+    def __init__(
+        self,
+        *,
+        key_id_template: str,
+        client: Any | None = None,
+        region: str | None = None,
+        disabled: _DisabledWorkspaces | None = None,
+        schedule_deletion_days: int | None = None,
+    ) -> None:
+        if "{workspace_id}" not in key_id_template:
+            raise ValueError(
+                "key_id_template must contain '{workspace_id}' "
+                "(e.g. 'alias/himmy-ws-{workspace_id}')"
+            )
+        self._template = key_id_template
+        self._client = client
+        self._region = region
+        from himmy.services.storage.encryption import _InMemoryDisabledWorkspaces
+
+        self._disabled: _DisabledWorkspaces = (
+            disabled if disabled is not None else _InMemoryDisabledWorkspaces()
+        )
+        self._schedule_deletion_days = schedule_deletion_days
+
+    def _key_id_for(self, workspace_id: str) -> str:
+        return self._template.format(workspace_id=workspace_id)
+
+    def for_workspace(self, workspace_id: str) -> KekProvider:
+        """Return the per-workspace :class:`AwsKmsKekProvider` (raises if shredded)."""
+        if self._disabled.is_disabled(workspace_id):
+            from himmy.services.storage.encryption import WorkspaceShredded
+
+            raise WorkspaceShredded(
+                f"workspace {workspace_id!r} has been cryptographically shredded "
+                "(its KMS CMK is disabled)"
+            )
+        return AwsKmsKekProvider(
+            key_id=self._key_id_for(workspace_id),
+            client=self._client,
+            region=self._region,
+        )
+
+    def disable_workspace(self, workspace_id: str) -> None:
+        """Shred the workspace: record it durably + disable/schedule-delete the KMS CMK."""
+        self._disabled.disable(workspace_id)
+        if self._client is None:
+            # No injected client and boto3 not required to be present in every env: the
+            # durable disabled-set still enforces the shred. A real deployment passes a
+            # client (or one is lazily built) so the HSM-side disable also fires.
+            try:
+                self._ensure_client()
+            except RuntimeError:
+                return
+        key_id = self._key_id_for(workspace_id)
+        client = self._ensure_client()
+        if self._schedule_deletion_days is not None:
+            client.schedule_key_deletion(
+                KeyId=key_id, PendingWindowInDays=self._schedule_deletion_days
+            )
+        else:
+            client.disable_key(KeyId=key_id)
+
+    def is_disabled(self, workspace_id: str) -> bool:
+        return self._disabled.is_disabled(workspace_id)
+
+    def _ensure_client(self) -> Any:
+        if self._client is None:
+            try:
+                import boto3
+            except ImportError as exc:  # pragma: no cover - only without boto3
+                raise RuntimeError(
+                    "the AWS workspace KEK provider needs the 'kms-aws' extra "
+                    "(install it: pip install 'himmy[kms-aws]')"
+                ) from exc
+
+            self._client = boto3.client("kms", region_name=self._region)
+        return self._client
 
 
 class GcpKmsKekProvider:
@@ -150,6 +257,7 @@ class AzureKeyVaultKekProvider:
 
 __all__ = [
     "AwsKmsKekProvider",
+    "AwsKmsWorkspaceKekProvider",
     "GcpKmsKekProvider",
     "AzureKeyVaultKekProvider",
 ]

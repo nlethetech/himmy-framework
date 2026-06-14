@@ -61,13 +61,27 @@ def test_reopening_spine_keeps_version_and_records(tmp_path: Path) -> None:
     second.close()
 
 
-def test_default_install_schema_is_byte_identical_to_legacy_base(tmp_path: Path) -> None:
-    """With zero migrations, the governed path lays down the exact frozen base DDL."""
+def test_default_install_schema_is_frozen_base_plus_forward_migrations(
+    tmp_path: Path,
+) -> None:
+    """The governed install lays down the frozen base then runs every forward migration.
+
+    Before S6 the spine had zero migrations, so a default install was byte-identical to the
+    bare base DDL. S6 adds the v2 ``prev_hash`` chain column via a forward migration, so the
+    governed install now equals (frozen base + every migration) — deterministically. A legacy
+    file that applies the SAME base then the SAME migrations converges to the identical schema,
+    which is the real invariant: fresh==legacy by either path.
+    """
     governed = str(tmp_path / "governed.db")
     SqliteEntityRegistry(governed).close()
+
+    # Reconstruct the expected schema by hand: frozen base DDL, then each migration's DDL.
     legacy = str(tmp_path / "legacy.db")
     raw = sqlite3.connect(legacy)
     raw.executescript(spine_mod._SCHEMA)
+    for _version, statements in sorted(spine_mod._MIGRATIONS):
+        for statement in statements:
+            raw.execute(statement)
     raw.commit()
     raw.close()
 
@@ -250,7 +264,9 @@ def test_pg_spine_create_schema_applies_base_via_migrate() -> None:
         db = _FakeSpineDatabase()
         reg = PostgresEntityRegistry(pool=_FakePool(db))
         await reg.create_schema()
-        assert db.migrations == {1: "base_schema"}
+        # The base DDL is version 1; subsequent forward migrations (e.g. the S6 prev_hash
+        # chain column at v2) are applied too — every declared SPINE_MIGRATIONS entry lands.
+        assert db.migrations == {v: n for v, n, _s in SPINE_MIGRATIONS}
         assert db.applied_statements.count(ENTITY_REGISTRY_DDL) == 1
         assert db.lock_acquires == db.lock_releases == 1
         assert not db.advisory_lock.locked()
@@ -392,6 +408,16 @@ def _pg_spine_objects() -> tuple[set[str], dict[str, set[str]], set[str]]:
                 continue
             cols.add(line.split()[0])
         columns[table] = cols
+    # Pick up columns added by forward migrations (ALTER TABLE ... ADD COLUMN [IF NOT EXISTS]),
+    # so a column introduced after the base DDL (e.g. the S6 prev_hash chain column) counts
+    # toward parity exactly like a SQLite migration column does.
+    for match in re.finditer(
+        r"ALTER TABLE\s+(\w+)\s+ADD COLUMN\s+(?:IF NOT EXISTS\s+)?(\w+)",
+        ddl,
+        re.IGNORECASE,
+    ):
+        table, col = match.group(1), match.group(2)
+        columns.setdefault(table, set()).add(col)
     return tables, columns, indexes
 
 
