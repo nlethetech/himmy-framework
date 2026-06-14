@@ -66,6 +66,12 @@ from himmy.api.routers import (
 from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.core.errors import HimmyError
 from himmy.services.audit import SecurityAuditLog
+from himmy.services.observability.logging import (
+    bind_request_id,
+    configure_logging,
+    reset_request_id,
+)
+from himmy.services.observability.metrics import install_metrics
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
@@ -774,6 +780,13 @@ def create_app(
     _install_security_headers(app)
     _install_studio_guard(app)
     _install_request_context(app)
+    # Production observability: in-process Prometheus metrics + GET /metrics, and
+    # the optional JSON log format (HIMMY_LOG_FORMAT=json). Both are no-ops on the
+    # zero-config/offline path (collecting counters is free; JSON logging stays off
+    # by default). Metrics is installed AFTER request-context so its middleware is
+    # outermost and observes every request, including inner short-circuits.
+    configure_logging()
+    install_metrics(app)
     _install_openapi_security(app, authenticator)
     # Mount the built Studio SPA last so its catch-all never shadows an API route.
     _mount_studio(app)
@@ -953,6 +966,9 @@ def _install_request_context(app: FastAPI) -> None:
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        # Bind the id into context so structured (JSON) log lines emitted anywhere
+        # during this request carry the same request_id echoed back to the client.
+        token = bind_request_id(rid)
         try:
             response = await call_next(request)
         except Exception:  # noqa: BLE001 - log + clean 500, never leak a traceback
@@ -966,6 +982,8 @@ def _install_request_context(app: FastAPI) -> None:
                 status_code=500,
                 content={"detail": "internal server error", "request_id": rid},
             )
+        finally:
+            reset_request_id(token)
         response.headers["X-Request-ID"] = rid
         return response
 
