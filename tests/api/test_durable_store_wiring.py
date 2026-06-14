@@ -104,6 +104,91 @@ def test_durable_run_survives_restart(tmp_path: Any, monkeypatch: Any) -> None:
         assert run_id in ids
 
 
+# ----------------------------------------------------------------- Q3: dispatcher wiring
+def test_q3_dispatcher_executes_a_run_under_durable_store(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Under a durable store the leased dispatcher claims + drives a created run to terminal.
+
+    A ``POST /v1/runs`` enqueues a QUEUED run (Q3 dispatch mode); the in-lifespan dispatcher
+    claims and executes it from its persisted input, reaching SUCCEEDED with no inline task.
+    """
+    import time as _time
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.setenv("HIMMY_DURABLE_STORAGE", "1")
+    # Force the local-provider probe ON so the default-lane run is claimable in the test env.
+    monkeypatch.setattr(
+        "himmy.application.dispatcher.LocalProviderProbe._do_probe",
+        lambda self: _async_true(),
+    )
+    body = {
+        "workspace_id": "w1",
+        "subject_id": "s1",
+        "persona": {"name": "p", "description": "d", "instructions": ["i"]},
+        "task": {"title": "t", "prompt": "do the thing"},
+    }
+    with TestClient(create_app()) as client:
+        created = client.post("/v1/runs", json=body)
+        assert created.status_code == 200
+        run_id = created.json()["run_id"]
+        # Poll until the dispatcher drives it terminal.
+        deadline = _time.time() + 8.0
+        status = None
+        while _time.time() < deadline:
+            got = client.get(f"/v1/runs/{run_id}", params={"workspace_id": "w1"})
+            status = got.json().get("status")
+            if status in ("SUCCEEDED", "FAILED", "PARKED"):
+                break
+            _time.sleep(0.05)
+        assert status == "SUCCEEDED", f"dispatcher did not complete the run: {status}"
+
+
+async def _async_true() -> bool:
+    """A trivially-available local probe (the test has no Ollama/claude CLI)."""
+    return True
+
+
+def test_q3_in_memory_default_stays_inline_no_dispatcher(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """The zero-config in-memory default runs INLINE (no dispatcher) — the run still completes.
+
+    The run service must NOT be flipped into dispatch mode on the in-memory path, so a run
+    created against a bare ``create_app()`` is executed by its inline background task (never
+    left stuck QUEUED waiting for a dispatcher that was never started).
+    """
+    import time as _time
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.delenv("HIMMY_DURABLE_STORAGE", raising=False)
+    body = {
+        "workspace_id": "w1",
+        "subject_id": "s1",
+        "persona": {"name": "p", "description": "d", "instructions": ["i"]},
+        "task": {"title": "t", "prompt": "hello"},
+    }
+    with TestClient(create_app()) as client:
+        # The run service is in inline mode (the durable store / dispatcher were not wired).
+        assert client.app.state.container.run_app.dispatch_enabled is False
+        created = client.post("/v1/runs", json=body)
+        run_id = created.json()["run_id"]
+        deadline = _time.time() + 8.0
+        status = None
+        while _time.time() < deadline:
+            status = (
+                client.get(f"/v1/runs/{run_id}", params={"workspace_id": "w1"})
+                .json()
+                .get("status")
+            )
+            if status in ("SUCCEEDED", "FAILED"):
+                break
+            _time.sleep(0.05)
+        assert status == "SUCCEEDED"
+
+
 # ----------------------------------------------------------------- K1: split-brain fix
 def test_k1_publishes_durable_storage_in_built_branch(
     tmp_path: Any, monkeypatch: Any

@@ -95,6 +95,29 @@ DEFAULT_WORKSPACE_MAX_OUTSTANDING = 64
 #: value is treated as "caller did not pick a model" so task.context can win.
 _DEFAULT_MODEL_KEY = "default"
 
+#: Default retry ceiling for a leased-dispatch run (Q3): the number of CLAIM attempts a
+#: transient-failed run gets before it is PARKED. ``1`` would mean no retry; ``3`` gives two
+#: re-queues with exponential backoff, which absorbs the common laptop transient (provider
+#: blip / model still loading) without churning on a permanently-broken run.
+DEFAULT_QUEUE_MAX_ATTEMPTS = 3
+
+#: Margin (seconds) added to ``run_timeout_seconds`` to form the lease TTL (Q3). A run holds
+#: its lease for slightly longer than its own execution budget so the terminal-state write
+#: lands before the reaper could consider the lease expired.
+_LEASE_MARGIN_SECONDS = 30.0
+
+#: Backoff schedule for a transient-failed run's re-queue (Q3): ``base * 2**(attempt-1)``
+#: seconds, capped at ``max``. Mirrors the :class:`~himmy.connectors.sdk.RetryPolicy`
+#: exponential discipline, but expressed as a DB ``next_attempt_at`` delay so the backoff
+#: survives a process restart (it is the gate the claim CAS already honours).
+_QUEUE_BACKOFF_BASE_SECONDS = 2.0
+_QUEUE_BACKOFF_MAX_SECONDS = 300.0
+
+#: Hard age ceiling (seconds) for a run in the leased queue (Q3): once a run has been in
+#: flight (created_at -> now) longer than this it is PARKED even if attempts remain, so a
+#: run can't be re-queued forever on a persistently-flapping backend.
+DEFAULT_QUEUE_MAX_AGE_SECONDS = 3600.0
+
 
 class WorkspaceRunQuotaExceeded(Exception):
     """A workspace exceeded its outstanding-run cap (T0.4 — surfaces as HTTP 429).
@@ -156,6 +179,49 @@ def _now() -> str:
     from himmy.core.ids import utc_now_iso
 
     return utc_now_iso()
+
+
+def _iso_plus_seconds(base_iso: str, seconds: float) -> str:
+    """ISO instant advanced by ``seconds`` (kept local to avoid a top-level import cycle)."""
+    from himmy.core.ids import iso_plus_seconds
+
+    return iso_plus_seconds(base_iso, seconds)
+
+
+#: Substrings that mark a run failure as TRANSIENT (worth a re-queue), matched case-
+#: insensitively against the recorded ``error`` (Q3). These are the recoverable conditions a
+#: laptop/offline deployment hits — the provider was briefly unreachable, a request timed out,
+#: the local model was still loading. Everything NOT matching is treated as PERMANENT (a
+#: validation/build/tool error that re-running cannot fix), so the dispatcher does not churn on
+#: a genuinely-broken run. Conservative on purpose: it is safe to leave an ambiguous failure
+#: PERMANENT (the operator can redrive) — re-queuing a truly-permanent one wastes attempts.
+_TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
+    "timeout",
+    "timed out",
+    "connection",
+    "connect error",
+    "temporarily unavailable",
+    "unreachable",
+    "rate limit",
+    "429",
+    "503",
+    "502",
+    "504",
+    "overloaded",
+    "provider",
+    "econnreset",
+    "broken pipe",
+    "model not found",  # ollama: the model is not (yet) pulled/loaded
+    "no route to host",
+)
+
+
+def _is_transient_run_error(error: str) -> bool:
+    """Whether a recorded run ``error`` looks TRANSIENT (re-queuable) vs PERMANENT (Q3)."""
+    if not error:
+        return False
+    low = error.lower()
+    return any(marker in low for marker in _TRANSIENT_ERROR_MARKERS)
 
 
 def _is_resume_claim_loss(exc: BaseException) -> bool:
@@ -675,6 +741,52 @@ class RunAppService:
         self._workspace_max_outstanding = max(0, int(workspace_max_outstanding))
         self._ws_semaphores: dict[str, asyncio.Semaphore] = {}
         self._ws_outstanding: dict[str, int] = {}
+        # Q3 leased-dispatch mode. DEFAULT False = the inline fire-and-forget behaviour
+        # (today's ``asyncio.create_task`` per run) — preserving the offline single-box +
+        # bare-TestClient path byte-for-byte. A :class:`~himmy.application.dispatcher.
+        # RunDispatcher`, started in the server lifespan ONLY when the durable run store is
+        # active, flips this on via :meth:`enable_dispatch`: from then on
+        # ``create_run``/``continue_thread``/``create_orchestration_run`` persist a QUEUED run
+        # carrying its recoverable input (Q0) and return WITHOUT a background task — the
+        # dispatcher claims + executes it, so a crash between enqueue and execution leaves the
+        # run QUEUED (recoverable), never FAILED. The lease TTL is derived from
+        # ``run_timeout_seconds`` (a run can't outlive its own timeout), with a safety margin.
+        self._dispatch_enabled = False
+        # The retry ceiling stamped on every enqueued run (the dispatcher's backoff budget).
+        self._default_max_attempts = DEFAULT_QUEUE_MAX_ATTEMPTS
+
+    def enable_dispatch(self, *, max_attempts: int | None = None) -> None:
+        """Switch this service into leased-dispatch mode (the Q3 dispatcher owns execution).
+
+        Called by the :class:`~himmy.application.dispatcher.RunDispatcher` at server startup
+        once it has confirmed the durable run store is active. From this point new runs are
+        ENQUEUED (persisted QUEUED with recoverable input) instead of fire-and-forgotten, and
+        the dispatcher claims them. Idempotent.
+        """
+        self._dispatch_enabled = True
+        if max_attempts is not None:
+            self._default_max_attempts = max(1, int(max_attempts))
+
+    @property
+    def dispatch_enabled(self) -> bool:
+        """Whether the leased dispatcher owns execution (vs. inline fire-and-forget)."""
+        return self._dispatch_enabled
+
+    @property
+    def lease_seconds(self) -> float:
+        """The lease TTL a claim should hold, derived from the run timeout (Q3).
+
+        A run can't legitimately run longer than its own wall-clock timeout, so the lease is
+        the timeout plus a margin for the terminal-state write — long enough that a live
+        worker's heartbeat keeps it, short enough that a crashed worker's run is re-queued
+        soon after it would have finished.
+        """
+        return self._run_timeout_seconds + _LEASE_MARGIN_SECONDS
+
+    @property
+    def storage(self) -> StorageService:
+        """The backing run/thread/event store (the dispatcher claims runs through it, Q3)."""
+        return self._storage
 
     async def create_run(
         self,
@@ -797,15 +909,29 @@ class RunAppService:
             metadata["operator_provisioned"] = bool(operator_provisioned)
         if plan:
             metadata["plan_mode"] = True
+        model_key = _resolve_model_key(llm_config, task)
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
             task_id=task.task_id,
             persona_name=persona.name,
-            model_key=_resolve_model_key(llm_config, task),
+            model_key=model_key,
             idempotency_key=idempotency_key,
             status=RunStatus.QUEUED,
             metadata=metadata,
+        )
+        # Q3: in leased-dispatch mode the run carries its lane (provider health gate) + retry
+        # ceiling + recoverable input so the dispatcher (possibly in a FRESH process after a
+        # crash) can claim and re-execute it. A no-op on the inline path (fields stay default).
+        self._stamp_queue_fields(
+            run,
+            model_key=model_key,
+            persona=persona,
+            task=task,
+            llm_config=llm_config,
+            agent_spec=agent_spec,
+            hitl=hitl,
+            plan=plan,
         )
         # Atomic idempotent insert FIRST (the race-safe primitive), so an idempotent
         # re-submit (created=False) returns the prior run without ever touching the
@@ -815,38 +941,17 @@ class RunAppService:
         if not created:
             return stored
 
-        # T0.4 admission: a workspace already at its outstanding-run cap cannot launch
-        # another background task. The record exists (atomicity is preserved), so it is
-        # immediately marked FAILED rather than left as an orphaned QUEUED row, and the
-        # quota error propagates to the caller (HTTP 429).
-        try:
-            self._admit_workspace_run(workspace_id)
-        except WorkspaceRunQuotaExceeded:
-            stored.status = RunStatus.FAILED
-            stored.error = "rejected: workspace run-concurrency quota exceeded"
-            stored.updated_at = _now()
-            try:
-                await self._storage.save_run(stored)
-            except Exception:  # pragma: no cover - best-effort terminal mark
-                logger.warning("failed to mark quota-rejected run %s", stored.run_id)
-            raise
-
-        bg = asyncio.create_task(
-            self._execute_run(
-                stored.run_id,
-                workspace_id=workspace_id,
-                persona=persona,
-                task=task,
-                llm_config=llm_config,
-                agent_spec=agent_spec,
-                agent_def=agent_def,
-                hitl=hitl,
-                plan=plan,
-            )
+        return await self._launch_or_enqueue(
+            stored,
+            workspace_id=workspace_id,
+            persona=persona,
+            task=task,
+            llm_config=llm_config,
+            agent_spec=agent_spec,
+            agent_def=agent_def,
+            hitl=hitl,
+            plan=plan,
         )
-        self._tasks.add(bg)
-        bg.add_done_callback(self._tasks.discard)
-        return stored
 
     async def continue_thread(
         self,
@@ -930,21 +1035,119 @@ class RunAppService:
         if plan:
             metadata["plan_mode"] = True
 
+        model_key = _resolve_model_key(llm_config, task)
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
             task_id=task.task_id,
             persona_name=persona.name,
-            model_key=_resolve_model_key(llm_config, task),
+            model_key=model_key,
             idempotency_key=idempotency_key,
             status=RunStatus.QUEUED,
             thread_id=conversation_id,
             metadata=metadata,
         )
+        # Q3: stamp lane/retry/recoverable-input so a continuation can be claimed + re-run by
+        # the dispatcher (a no-op on the inline path). The recovered run carries thread_id =
+        # conversation_id, so the rebuilt task continues the SAME conversation.
+        self._stamp_queue_fields(
+            run,
+            model_key=model_key,
+            persona=persona,
+            task=task,
+            llm_config=llm_config,
+            agent_spec=agent_spec,
+            hitl=hitl,
+            plan=plan,
+        )
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:
             return stored
 
+        return await self._launch_or_enqueue(
+            stored,
+            workspace_id=workspace_id,
+            persona=persona,
+            task=task,
+            llm_config=llm_config,
+            agent_spec=agent_spec,
+            agent_def=agent_def,
+            hitl=hitl,
+            plan=plan,
+            thread=thread,
+        )
+
+    # --------------------------------------------------------- Q3 enqueue/dispatch
+    def _stamp_queue_fields(
+        self,
+        run: RunRecord,
+        *,
+        model_key: str | None,
+        persona: Persona,
+        task: Task,
+        llm_config: LLMConfig | None,
+        agent_spec: AgentSpec | None,
+        hitl: bool,
+        plan: bool,
+    ) -> None:
+        """Populate the leased-queue fields on a single-agent run when dispatch is on (Q3).
+
+        A no-op on the inline path (the fields keep their RunRecord defaults). In dispatch
+        mode it stamps: ``lane_key`` (the provider health-gate lane derived from the model
+        key), ``max_attempts`` (the retry ceiling), and ``input_blob`` — the Q0 recoverable
+        launch input serialized so a dispatcher in a FRESH process can rehydrate the exact
+        persona/task/spec and re-execute. The blob is stored PLAINTEXT here; the durable run
+        store encrypts it at rest (bound to run_id) on write, exactly like chat content.
+        """
+        if not self._dispatch_enabled:
+            return
+        from himmy.services.storage.run_input import encode_run_input
+        from himmy.services.storage.run_lane import lane_for_model_key
+
+        run.lane_key = lane_for_model_key(model_key)
+        run.max_attempts = self._default_max_attempts
+        run.input_blob = encode_run_input(
+            persona=persona,
+            task=task,
+            llm_config=llm_config,
+            agent_spec=agent_spec,
+            hitl=hitl,
+            plan=plan,
+            run_id=run.run_id,
+        )
+
+    async def _launch_or_enqueue(
+        self,
+        stored: RunRecord,
+        *,
+        workspace_id: str,
+        persona: Persona,
+        task: Task,
+        llm_config: LLMConfig | None,
+        agent_spec: AgentSpec | None,
+        agent_def: AgentDefRecord | None,
+        hitl: bool,
+        plan: bool,
+        thread: ChatThread | None = None,
+    ) -> RunRecord:
+        """Admit + (inline) launch OR (dispatch) leave QUEUED for the dispatcher (Q3).
+
+        INLINE mode (default, offline single-box + bare TestClient): admits the run against
+        the per-workspace outstanding cap and launches today's fire-and-forget background
+        task — byte-identical to the pre-Q3 behaviour. DISPATCH mode (durable store + the
+        lifespan dispatcher): the run is left QUEUED for the dispatcher to claim, so a crash
+        between enqueue and execution leaves it recoverable (not FAILED). Admission/concurrency
+        in dispatch mode is the dispatcher's job (its bounded claim loop + the per-workspace
+        execution semaphore at run time), so the in-memory outstanding counter — which a
+        cross-process claim could never release — is NOT taken here.
+        """
+        if self._dispatch_enabled:
+            # Recoverable QUEUED state; the dispatcher claims + executes it.
+            return stored
+
+        # T0.4 admission (inline only): a workspace already at its outstanding-run cap cannot
+        # launch another background task. The record exists (atomicity preserved), so it is
+        # marked FAILED rather than orphaned QUEUED, and the quota error propagates (HTTP 429).
         try:
             self._admit_workspace_run(workspace_id)
         except WorkspaceRunQuotaExceeded:
@@ -1095,6 +1298,201 @@ class RunAppService:
                 )
         finally:
             self._release_workspace_run(workspace_id)
+
+    async def dispatch_claimed_run(self, run: RunRecord) -> None:
+        """Execute a leased-queue run the dispatcher just CLAIMED, with retry/backoff (Q3).
+
+        The dispatcher hands this a run already flipped to RUNNING with a fresh lease (the Q2
+        ``claim_next_queued_run`` CAS) and ``attempt`` incremented. This:
+
+        1. REHYDRATES the recoverable launch input from ``run.input_blob`` (the Q0 blob the
+           enqueue persisted). A run with no blob (legacy / non-recoverable) cannot be
+           re-executed from a fresh process, so it is failed with a clear reason rather than
+           silently dropped.
+        2. RE-RESOLVES the stored ``agent_def`` from ``metadata['agent_id']`` (for the
+           run<->agent lineage edge) via the same resolver the resume path uses.
+        3. Drives :meth:`_execute_on_runtime` under the per-workspace concurrency semaphore.
+        4. On a TRANSIENT failure (provider blip, timeout, model-not-loaded) RE-QUEUES the run
+           with exponential backoff while attempts + age remain; once the budget is exhausted
+           (or the failure is PERMANENT) it leaves the terminal FAILED set by the runtime,
+           or PARKS it so an operator can ``redrive``. A SUCCEEDED / AWAITING_APPROVAL /
+           RESOLVING outcome is left as-is (a paused HITL run is NOT a dispatcher failure).
+
+        The lease-renewal heartbeat is run by the dispatcher as a sibling sub-task, not here.
+        """
+        run_id = run.run_id
+        workspace_id = run.workspace_id
+        # Orchestration (team/workflow/graph) runs reconstruct from member_agent_ids + the
+        # persisted prompt, not a single-agent input_blob — route them to their own driver.
+        if (run.metadata or {}).get("orchestration"):
+            await self._dispatch_orchestration_run(run)
+            await self._apply_retry_policy(run_id)
+            return
+        # 1. rehydrate the recoverable input.
+        if not run.input_blob:
+            run.status = RunStatus.FAILED
+            run.error = (
+                "run has no recoverable input (input_blob missing); cannot be "
+                "re-executed by the dispatcher"
+            )
+            run.last_error = run.error
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+        from himmy.services.storage.run_input import RunInputError, decode_run_input
+
+        try:
+            rinput = decode_run_input(run.input_blob, run_id=run_id)
+        except RunInputError as exc:
+            run.status = RunStatus.FAILED
+            run.error = f"run input could not be rehydrated: {exc}"
+            run.last_error = run.error
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+
+        # 2. re-resolve the stored agent_def (lineage edge) — best-effort; a removed agent
+        # just means no run<->agent link, not a failure.
+        agent_def: AgentDefRecord | None = None
+        agent_id = (run.metadata or {}).get("agent_id")
+        if agent_id and self._agent_resolver is not None:
+            try:
+                agent_def = await _maybe_await(
+                    self._agent_resolver(agent_id, workspace_id=workspace_id)
+                )
+            except Exception:  # noqa: BLE001 - resolver failure must not crash the worker
+                agent_def = None
+
+        # 3. execute under the per-workspace concurrency semaphore (same back-pressure as the
+        # inline path). A continuation carries thread_id == its conversation id, so reload the
+        # prior thread to continue it; a fresh run starts a new thread.
+        thread: ChatThread | None = None
+        if run.thread_id:
+            try:
+                thread = await self._storage.load_thread(run.thread_id)
+            except Exception:  # noqa: BLE001 - a missing thread just starts fresh
+                thread = None
+
+        semaphore = self._workspace_semaphore(workspace_id)
+        async with semaphore:
+            await self._execute_on_runtime(
+                run,
+                persona=rinput.persona,
+                task=rinput.task,
+                llm_config=rinput.llm_config,
+                agent_spec=rinput.agent_spec,
+                agent_def=agent_def,
+                hitl=rinput.hitl,
+                plan=rinput.plan,
+                thread=thread,
+            )
+
+        # 4. retry/backoff/PARK on a transient failure.
+        await self._apply_retry_policy(run_id)
+
+    async def _apply_retry_policy(self, run_id: str) -> None:
+        """Re-queue a transient-failed run with backoff, else PARK it (Q3).
+
+        Reads the run's terminal state after :meth:`_execute_on_runtime`. Only a FAILED run is
+        considered — SUCCEEDED is done; AWAITING_APPROVAL/RESOLVING are paused (NOT failures).
+        A FAILED run is classified transient (provider/timeout/connection blip) vs permanent
+        (validation, build, unknown-tool). A transient failure with attempts AND age remaining
+        is RE-QUEUED with exponential backoff (``next_attempt_at`` in the future, so the claim
+        CAS leaves it until then — the backoff survives a restart); otherwise it is PARKED
+        (terminal-but-redrivable) so an operator can intervene, distinct from a clean FAILED.
+        A permanent failure is left FAILED untouched.
+        """
+        run = await self._storage.get_run(run_id)
+        if run is None or run.status != RunStatus.FAILED:
+            return
+        error = run.error or ""
+        if not _is_transient_run_error(error):
+            return  # permanent failure: leave it FAILED for the operator/caller.
+        age = time.time() - _parse_iso_epoch(run.created_at)
+        attempts_left = run.attempt < max(1, run.max_attempts)
+        if attempts_left and age < DEFAULT_QUEUE_MAX_AGE_SECONDS:
+            delay = min(
+                _QUEUE_BACKOFF_BASE_SECONDS * (2.0 ** max(0, run.attempt - 1)),
+                _QUEUE_BACKOFF_MAX_SECONDS,
+            )
+            now_iso = _now()
+            run.status = RunStatus.QUEUED
+            run.owner_id = None
+            run.lease_expires_at = None
+            run.last_error = error
+            run.error = None
+            run.next_attempt_at = _iso_plus_seconds(now_iso, delay)
+            run.updated_at = now_iso
+            await self._storage.save_run(run)
+            logger.info(
+                "re-queued transient-failed run %s (attempt %d/%d) in %.0fs",
+                run_id,
+                run.attempt,
+                run.max_attempts,
+                delay,
+            )
+            return
+        # Budget exhausted: PARK (terminal-but-redrivable), preserving the last error.
+        run.status = RunStatus.PARKED
+        run.last_error = error
+        run.owner_id = None
+        run.lease_expires_at = None
+        run.updated_at = _now()
+        await self._storage.save_run(run)
+        logger.info(
+            "parked run %s after %d attempt(s) of transient failure", run_id, run.attempt
+        )
+
+    async def _dispatch_orchestration_run(self, run: RunRecord) -> None:
+        """Reconstruct + drive a CLAIMED orchestration run from a fresh process (Q3).
+
+        The team/workflow/graph run carries its member ids + the persisted prompt in metadata
+        (not a single-agent input_blob), so recovery re-resolves the members via the same
+        resolver the resume path uses and rebuilds the graph checkpoint store from the
+        provider. A member that has since been removed fails the run with a clear reason
+        (the retry policy then classifies it permanent). Delegates the actual orchestration to
+        :meth:`_execute_orchestration_run`, which sets the terminal/AWAITING state.
+        """
+        meta = run.metadata or {}
+        member_agent_ids = list(meta.get("member_agent_ids") or [])
+        prompt = meta.get("orchestration_prompt", "")
+        kind = meta.get("orchestration_kind", "graph")
+        resource_kind = meta.get("orchestration", "workflow")
+        operator_provisioned = bool(meta.get("operator_provisioned", False))
+        graph_resume_id = meta.get("graph_resume_id")
+
+        if not member_agent_ids or self._agent_resolver is None:
+            run.status = RunStatus.FAILED
+            run.error = "orchestration run cannot be recovered: no resolvable members"
+            run.last_error = run.error
+            run.updated_at = _now()
+            await self._storage.save_run(run)
+            return
+        members: list[AgentDefRecord] = []
+        for agent_id in member_agent_ids:
+            rec = await _maybe_await(
+                self._agent_resolver(agent_id, workspace_id=run.workspace_id)
+            )
+            if rec is None:
+                run.status = RunStatus.FAILED
+                run.error = f"orchestration recovery failed: member agent {agent_id} removed"
+                run.last_error = run.error
+                run.updated_at = _now()
+                await self._storage.save_run(run)
+                return
+            members.append(rec)
+
+        await self._execute_orchestration_run(
+            run.run_id,
+            workspace_id=run.workspace_id,
+            kind=kind,
+            members=members,
+            prompt=prompt,
+            resource_kind=resource_kind,
+            operator_provisioned=operator_provisioned,
+            graph_checkpoint_store=self._resolve_graph_checkpoint_store(),
+            graph_resume_id=graph_resume_id,
+        )
 
     async def _execute_on_runtime(
         self,
@@ -1596,25 +1994,40 @@ class RunAppService:
             )
 
     async def sweep_stuck_runs(self, *, ttl_seconds: float = 0.0) -> list[str]:
-        """Mark non-terminal runs older than ``ttl_seconds`` as FAILED (AAEO-1).
+        """Recover runs left non-terminal by a dead process (AAEO-1; Q3 rewrite).
 
-        Intended for startup: runs left in QUEUED/RUNNING when the process died
-        cannot complete (their background task is gone), so they are transitioned
-        to FAILED with a recovery error. ``ttl_seconds=0`` sweeps all non-terminal
-        runs. Returns the swept run ids.
+        Intended for startup. The behaviour now depends on whether the leased dispatcher owns
+        execution:
 
-        AWAITING_APPROVAL is DELIBERATELY not swept (T2.2 precondition for T2f): an
-        HITL-paused run is intentionally idle pending a human approve/reject and must
-        never be reaped to FAILED — only QUEUED/RUNNING are recoverable-abandoned.
-        RESOLVING is likewise NOT swept here: a resume that crashed mid-flight is
-        RE-DRIVABLE exactly-once (the member checkpoint claim + idempotency ledger), so it
-        is recovered by :meth:`reconcile_resolving_runs`, not reaped to FAILED.
+        * DISPATCH mode (the durable store + lifespan dispatcher): a crashed worker's RUNNING
+          run holds an EXPIRED lease, so it is RE-QUEUED (not failed) via the Q2 reaper
+          ``requeue_expired_leases`` — the dispatcher then re-claims and re-executes it from
+          its recoverable input. A QUEUED run is NOT touched (it is already recoverable — the
+          dispatcher will claim it); a LIVE peer's RUNNING run (lease not yet expired) is NEVER
+          re-queued; AWAITING_APPROVAL / RESOLVING are preserved (HITL pauses + re-drivable
+          resumes). This is the fix for the old "crash -> mass-FAIL" and "reap a live peer"
+          behaviours. Returns the re-queued run ids.
+
+        * INLINE mode (no dispatcher — a bare ``create_app`` / CLI / TestClient): there is
+          nothing to re-claim a QUEUED/RUNNING run, so the old fail-loud sweep is preserved
+          byte-for-byte — those runs are transitioned to FAILED so they do not hang forever.
+          ``ttl_seconds=0`` sweeps all; AWAITING_APPROVAL / RESOLVING are still excluded.
         """
+        if self._dispatch_enabled:
+            # Re-queue ONLY lease-expired RUNNING runs; a live peer (future lease) and every
+            # QUEUED/AWAITING/RESOLVING run is left untouched by the lease predicate.
+            requeued = await self._storage.requeue_expired_leases()
+            if requeued:
+                logger.info(
+                    "re-queued %d lease-expired run(s) on startup", len(requeued)
+                )
+            return requeued
+
         swept: list[str] = []
         runs = await self._storage.list_runs()
         now = time.time()
         for run in runs:
-            # Only QUEUED/RUNNING are "abandoned"; SUCCEEDED/FAILED are terminal,
+            # Only QUEUED/RUNNING are "abandoned"; SUCCEEDED/FAILED/PARKED are terminal,
             # AWAITING_APPROVAL is intentionally paused, and RESOLVING is a re-drivable
             # crashed resume (reconcile_resolving_runs) — never sweep any of those.
             if run.status not in (RunStatus.QUEUED, RunStatus.RUNNING):
@@ -2320,6 +2733,11 @@ class RunAppService:
             metadata["actor"] = actor
         if graph_resume_id:
             metadata["graph_resume_id"] = graph_resume_id
+        # Q3: persist the launch PROMPT so the dispatcher can reconstruct the orchestration
+        # run from a fresh process (the members are re-resolved from ``member_agent_ids`` and
+        # the graph checkpoint store is rebuilt from the provider — both already crash-safe).
+        if self._dispatch_enabled:
+            metadata["orchestration_prompt"] = prompt
         run = RunRecord(
             workspace_id=workspace_id,
             subject_id=subject_id,
@@ -2330,8 +2748,18 @@ class RunAppService:
             status=RunStatus.QUEUED,
             metadata=metadata,
         )
+        if self._dispatch_enabled:
+            # The orchestration run has no single-agent input_blob; its lane is the neutral
+            # default (members may target mixed providers) + its retry ceiling is stamped so
+            # the dispatcher claims + drives it via the orchestration reconstruction path.
+            run.lane_key = None
+            run.max_attempts = self._default_max_attempts
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:
+            return stored
+
+        # Q3 dispatch mode: leave QUEUED for the dispatcher to claim (recoverable on crash).
+        if self._dispatch_enabled:
             return stored
 
         try:

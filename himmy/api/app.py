@@ -170,6 +170,26 @@ def _wants_durable_store() -> bool:
     return os.environ.get("HIMMY_DURABLE_STORAGE", "").lower() in ("1", "true", "yes")
 
 
+def _run_store_is_durable(container: ApiContainer) -> bool:
+    """True when the container's run store is a DURABLE backend (SQLite/Postgres) (Q3).
+
+    The leased dispatcher's whole value is recovering runs across a restart, which only a
+    durable run store provides — the in-memory ``StorageService`` (the zero-config default and
+    the degraded in-memory fallback) loses every run on exit, so a dispatcher there would
+    leave runs stuck QUEUED with nothing to recover them. Gating the dispatcher on a durable
+    store keeps the offline default in INLINE fire-and-forget mode (byte-unchanged) and only
+    engages the queue for the deployments (``HIMMY_DATABASE_URL`` / ``HIMMY_DURABLE_STORAGE``
+    or an injected durable container) where it is meaningful and safe.
+    """
+    storage = getattr(container, "storage", None)
+    if storage is None:
+        return False
+    from himmy.services.storage.postgres import PostgresStorageService
+    from himmy.services.storage.sqlite import SqliteStorageService
+
+    return isinstance(storage, (SqliteStorageService, PostgresStorageService))
+
+
 def _rebind_container(app: FastAPI, container: ApiContainer) -> None:
     """Point ``app.state`` at a (re)built container's services.
 
@@ -285,12 +305,26 @@ def _build_lifespan(
         # Startup: sweep runs left non-terminal by a previous process so they
         # reach a terminal state instead of hanging in QUEUED/RUNNING forever.
         run_app = getattr(active, "run_app", None)
+        # Q3: the leased dispatcher owns execution ONLY when the run store is DURABLE (the
+        # queue's value requires durability — an in-memory store loses everything on exit, so
+        # there is nothing to recover). When durable, enable dispatch BEFORE the sweep so the
+        # sweep re-queues lease-expired runs instead of mass-failing them; then start the
+        # claim/reaper loops AFTER recovery. The in-memory default + the zero-DSN spine-rebind
+        # keep INLINE fire-and-forget, so a no-dispatcher deployment is byte-unchanged.
+        dispatcher = None
+        if run_app is not None and _run_store_is_durable(active):
+            from himmy.application.dispatcher import RunDispatcher
+
+            dispatcher = RunDispatcher(run_app)
+            run_app.enable_dispatch()
         if run_app is not None:
             try:
                 swept = await run_app.sweep_stuck_runs()
                 if swept:
                     logger.info(
-                        "swept %d stuck run(s) to FAILED on startup", len(swept)
+                        "recovered %d stuck run(s) on startup "
+                        "(re-queued under dispatch, else failed)",
+                        len(swept),
                     )
             except Exception:  # pragma: no cover - startup sweep is best-effort
                 logger.warning("startup run sweep failed", exc_info=True)
@@ -305,6 +339,16 @@ def _build_lifespan(
                     )
             except Exception:  # pragma: no cover - startup reconcile is best-effort
                 logger.warning("startup resume reconcile failed", exc_info=True)
+            # Launch the dispatcher's claim + reaper loops now that recovery has run.
+            if dispatcher is not None:
+                try:
+                    dispatcher.start()
+                    logger.info(
+                        "leased run dispatcher started (owner=%s)", dispatcher.owner_id
+                    )
+                except Exception:  # pragma: no cover - dispatcher start is best-effort
+                    logger.warning("run dispatcher failed to start", exc_info=True)
+                    dispatcher = None
         # Materialize Studio "connection" non-secret fields (SMTP host, search
         # backend, …) from the writable secrets backend into the process env so
         # tool config picks them up without a restart.
@@ -317,8 +361,13 @@ def _build_lifespan(
         try:
             yield
         finally:
-            # Shutdown: cancel + await in-flight background runs (drain), then
-            # release container resources (e.g. a Postgres pool).
+            # Shutdown: stop the dispatcher (drains in-flight claimed runs) THEN drain any
+            # inline background tasks, then release container resources (e.g. a Postgres pool).
+            if dispatcher is not None:
+                try:
+                    await dispatcher.stop()
+                except Exception:  # pragma: no cover - shutdown best-effort
+                    logger.warning("run dispatcher stop failed", exc_info=True)
             if run_app is not None:
                 try:
                     await run_app.drain()
