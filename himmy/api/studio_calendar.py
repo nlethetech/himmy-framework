@@ -95,12 +95,17 @@ def get_calendar_store() -> CalendarStore:
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        # K2: route the backend choice through the one aux-store selector. The Postgres
-        # mirror lands in K5; until then the Postgres builder is None, so this resolves to
-        # the durable SQLite store byte-for-byte as before while the choke point is wired.
+        # K2 + K5: route the backend choice through the one aux-store selector. With a
+        # Postgres DSN this resolves the K5 Postgres mirror (no .himmy/calendar.db sidecar);
+        # otherwise the durable SQLite store byte-for-byte as before.
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _STORE = select_aux_store(lambda: CalendarStore(path))
+        def _pg() -> CalendarStore:
+            from himmy.services.storage.postgres_aux import PostgresCalendarStore
+
+            return PostgresCalendarStore(tenant="local")  # type: ignore[return-value]
+
+        _STORE = select_aux_store(lambda: CalendarStore(path), _pg)
         _PATH = path
     return _STORE
 

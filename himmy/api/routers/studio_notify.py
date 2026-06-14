@@ -74,6 +74,14 @@ _DB_FAILED_PATH: str | None = None  # don't retry a broken path on every write
 _HYDRATED = False  # the deque was seeded from disk (or there was nothing to seed)
 _FORWARD_TELEGRAM = False  # the one notify setting, mirrored to the DB
 
+# K5: under a Postgres DSN the durable mirror lives in Postgres (no .himmy/notify.db
+# sidecar). The in-memory deque stays the live read truth exactly as on the SQLite path;
+# this holder is the K5 PostgresNotifyStore the durability helpers route to instead of
+# SQLite. ``None`` until first resolved; ``_PG_FAILED`` mirrors ``_DB_FAILED_PATH`` so a
+# transient pool failure degrades to memory-only and is not retried every write.
+_PG_STORE: object | None = None
+_PG_FAILED = False
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notifications (
     id         INTEGER PRIMARY KEY,
@@ -116,13 +124,63 @@ def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _pg_enabled() -> bool:
+    """True when the notify mirror should route to Postgres (``HIMMY_DATABASE_URL`` is PG)."""
+    try:
+        from himmy.services.storage.aux_store_factory import aux_postgres_enabled
+
+        return aux_postgres_enabled()
+    except Exception:  # noqa: BLE001 - never let backend selection break recording
+        return False
+
+
+def _pg_store_locked() -> object | None:
+    """Resolve (once) the Postgres notify mirror; ``None`` on any failure (lock held).
+
+    The first touch hydrates the deque + the forward setting + the id counter from
+    Postgres so the bell survives a restart, mirroring ``_ensure_db_locked``'s SQLite
+    hydration. Best-effort: a pool failure marks the mirror broken and degrades to
+    memory-only, never raising into the caller.
+    """
+    global _PG_STORE, _PG_FAILED, _HYDRATED, _NEXT_ID, _FORWARD_TELEGRAM
+    if _PG_FAILED:
+        return None
+    if _PG_STORE is not None:
+        return _PG_STORE
+    try:
+        from himmy.services.storage.postgres_aux import PostgresNotifyStore
+
+        store = PostgresNotifyStore(tenant="local")
+        _NEXT_ID = max(_NEXT_ID, store.max_id())
+        if not _HYDRATED:
+            items, forward = store.hydrate(RING_SIZE)
+            _NOTIFICATIONS.clear()
+            for item in items:
+                _NOTIFICATIONS.append(item)
+            _FORWARD_TELEGRAM = forward
+        _HYDRATED = True
+        _PG_STORE = store
+        return store
+    except Exception:  # noqa: BLE001 - storage is optional; memory-only is fine
+        _PG_FAILED = True
+        _HYDRATED = True  # the open was attempted; memory is the only truth from here
+        return None
+
+
 def _ensure_db_locked(*, create: bool) -> sqlite3.Connection | None:
     """Open (and once per process, hydrate from) the durable mirror.
 
     Caller holds ``_LOCK``. Never raises — any failure marks the path broken
     and falls back to memory-only. With ``create=False`` a missing DB file is
     left uncreated (reads/marks never conjure a database into existence).
+
+    Under a Postgres DSN (K5) this delegates to :func:`_pg_store_locked` and returns
+    ``None`` for the SQLite handle — so NO ``.himmy/notify.db`` sidecar is created — while
+    still seeding the deque from Postgres.
     """
+    if _pg_enabled():
+        _pg_store_locked()
+        return None
     global _CONN, _CONN_PATH, _DB_FAILED_PATH, _HYDRATED, _NEXT_ID
     global _FORWARD_TELEGRAM
     path = notify_db_path()
@@ -177,7 +235,16 @@ def _ensure_db_locked(*, create: bool) -> sqlite3.Connection | None:
 
 
 def _persist_item_locked(item: dict[str, Any]) -> None:
-    """Mirror one freshly recorded item to disk (best-effort, lock held)."""
+    """Mirror one freshly recorded item to the durable store (best-effort, lock held)."""
+    if _pg_enabled():
+        store = _pg_store_locked()
+        if store is None:
+            return
+        try:
+            store.persist_item(item, RING_SIZE)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - never let the mirror break recording
+            pass
+        return
     conn = _ensure_db_locked(create=True)
     if conn is None:
         return
@@ -206,7 +273,16 @@ def _persist_item_locked(item: dict[str, Any]) -> None:
 
 
 def _persist_read_locked(ids: list[int] | None) -> None:
-    """Mirror read-state to disk; ``None`` marks everything read (lock held)."""
+    """Mirror read-state to the durable store; ``None`` marks everything read (lock held)."""
+    if _pg_enabled():
+        store = _pg_store_locked()
+        if store is None:
+            return
+        try:
+            store.mark_read(ids)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        return
     conn = _ensure_db_locked(create=False)
     if conn is None:
         return
@@ -226,14 +302,20 @@ def _persist_read_locked(ids: list[int] | None) -> None:
 def reset_notify_state() -> None:
     """Drop every in-process handle/cache (tests change cwd between cases)."""
     global _CONN, _CONN_PATH, _DB_FAILED_PATH, _HYDRATED, _NEXT_ID
-    global _FORWARD_TELEGRAM
+    global _FORWARD_TELEGRAM, _PG_STORE, _PG_FAILED
     with _LOCK:
         if _CONN is not None:
             try:
                 _CONN.close()
             except Exception:  # noqa: BLE001
                 pass
+        if _PG_STORE is not None:
+            try:
+                _PG_STORE.close()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
         _CONN, _CONN_PATH, _DB_FAILED_PATH = None, None, None
+        _PG_STORE, _PG_FAILED = None, False
         _HYDRATED = False
         _NEXT_ID = 0
         _FORWARD_TELEGRAM = False
@@ -391,12 +473,20 @@ async def set_settings(settings: NotifySettings) -> dict[str, Any]:
     with _LOCK:
         conn = _ensure_db_locked(create=True)  # hydrate first, then overwrite
         _FORWARD_TELEGRAM = settings.forward_telegram
-        if conn is not None:
+        value = "1" if settings.forward_telegram else "0"
+        if _pg_enabled():
+            store = _pg_store_locked()
+            if store is not None:
+                try:
+                    store.set_setting("forward_telegram", value)  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 - setting still applies in-memory
+                    pass
+        elif conn is not None:
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO notify_settings (key, value) "
                     "VALUES ('forward_telegram', ?)",
-                    ("1" if settings.forward_telegram else "0",),
+                    (value,),
                 )
                 conn.commit()
             except Exception:  # noqa: BLE001 - setting still applies in-memory

@@ -1380,6 +1380,732 @@ class PostgresWorkflowsStore(_PostgresBindingStore):
         )
 
 
+# ============================================================ K5: Studio CRUD sidecars
+
+
+class _AsyncCalendarStore:
+    """Async body of the Postgres Studio-calendar mirror (tenant-scoped)."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def add(self, ev: Any) -> Any:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_calendar_events "
+                "(tenant, id, date, time, title, notes, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                "ON CONFLICT (tenant, id) DO UPDATE SET "
+                "date = EXCLUDED.date, time = EXCLUDED.time, title = EXCLUDED.title, "
+                "notes = EXCLUDED.notes",
+                self._tenant,
+                ev.id,
+                ev.date,
+                ev.time,
+                ev.title,
+                ev.notes,
+                ev.created_at,
+            )
+        return ev
+
+    async def list(self, month: str | None) -> list[Any]:
+        from himmy.api.studio_calendar import CalendarEvent
+
+        # Mirror the SQLite ``ORDER BY date, time IS NULL, time`` (all-day events last
+        # within a day): a NULL time sorts AFTER a present one.
+        order = "ORDER BY date, (time IS NULL), time"
+        async with self._pool.acquire() as conn:
+            if month:
+                rows = await conn.fetch(
+                    f"SELECT * FROM aux_calendar_events "  # noqa: S608
+                    f"WHERE tenant = $1 AND date LIKE $2 {order}",
+                    self._tenant,
+                    f"{month}-%",
+                )
+            else:
+                rows = await conn.fetch(
+                    f"SELECT * FROM aux_calendar_events WHERE tenant = $1 {order}",  # noqa: S608
+                    self._tenant,
+                )
+        return [
+            CalendarEvent(
+                id=r["id"],
+                date=r["date"],
+                time=r["time"],
+                title=r["title"],
+                notes=r["notes"],
+                created_at=_norm_ts(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    async def delete(self, event_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM aux_calendar_events WHERE tenant = $1 AND id = $2",
+                self._tenant,
+                event_id,
+            )
+        return _rowcount(result) > 0
+
+
+class PostgresCalendarStore:
+    """Synchronous, tenant-scoped Postgres mirror of :class:`CalendarStore` (K5)."""
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncCalendarStore(self._pool, tenant)
+
+    def add(self, ev: Any) -> Any:
+        return self._pool.run(self._async.add(ev))
+
+    def list(self, *, month: str | None = None) -> list[Any]:
+        return self._pool.run(self._async.list(month))  # type: ignore[no-any-return]
+
+    def delete(self, event_id: str) -> bool:
+        return bool(self._pool.run(self._async.delete(event_id)))
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+class _AsyncCookbookStore:
+    """Async body of the Postgres Studio-cookbook mirror (tenant-scoped)."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def list(self) -> list[Any]:
+        from himmy.api.studio_cookbook import Recipe
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM aux_recipes WHERE tenant = $1 ORDER BY created_at DESC",
+                self._tenant,
+            )
+        return [
+            Recipe(
+                id=r["id"],
+                name=r["name"],
+                agent_path=r["agent_path"],
+                prompt=r["prompt"],
+                notes=r["notes"],
+                created_at=_norm_ts(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    async def upsert(self, r: Any) -> Any:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_recipes "
+                "(tenant, id, name, agent_path, prompt, notes, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                "ON CONFLICT (tenant, id) DO UPDATE SET "
+                "name = EXCLUDED.name, agent_path = EXCLUDED.agent_path, "
+                "prompt = EXCLUDED.prompt, notes = EXCLUDED.notes",
+                self._tenant,
+                r.id,
+                r.name,
+                r.agent_path,
+                r.prompt,
+                r.notes,
+                r.created_at,
+            )
+        return r
+
+    async def delete(self, recipe_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM aux_recipes WHERE tenant = $1 AND id = $2",
+                self._tenant,
+                recipe_id,
+            )
+        return _rowcount(result) > 0
+
+
+class PostgresCookbookStore:
+    """Synchronous, tenant-scoped Postgres mirror of :class:`CookbookStore` (K5)."""
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncCookbookStore(self._pool, tenant)
+
+    def list(self) -> list[Any]:
+        return self._pool.run(self._async.list())  # type: ignore[no-any-return]
+
+    def upsert(self, r: Any) -> Any:
+        return self._pool.run(self._async.upsert(r))
+
+    def delete(self, recipe_id: str) -> bool:
+        return bool(self._pool.run(self._async.delete(recipe_id)))
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+class _AsyncNotesStore:
+    """Async body of the Postgres Studio-notes mirror (tenant-scoped)."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    def _to_note(self, row: Any) -> Any:
+        from himmy.api.studio_notes import Note
+
+        return Note(
+            id=row["id"],
+            title=row["title"],
+            body=row["body"],
+            updated_at=_norm_ts(row["updated_at"]),
+        )
+
+    async def list(self) -> list[Any]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM aux_notes WHERE tenant = $1 ORDER BY updated_at DESC",
+                self._tenant,
+            )
+        return [self._to_note(r) for r in rows]
+
+    async def get(self, note_id: str) -> Any | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM aux_notes WHERE tenant = $1 AND id = $2",
+                self._tenant,
+                note_id,
+            )
+        return self._to_note(row) if row else None
+
+    async def find_by_title(self, title: str) -> Any | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM aux_notes WHERE tenant = $1 AND title = $2 "
+                "ORDER BY updated_at DESC LIMIT 1",
+                self._tenant,
+                title,
+            )
+        return self._to_note(row) if row else None
+
+    async def upsert(self, note: Any) -> Any:
+        note.updated_at = utc_now_iso()
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_notes (tenant, id, title, body, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (tenant, id) DO UPDATE SET "
+                "title = EXCLUDED.title, body = EXCLUDED.body, "
+                "updated_at = EXCLUDED.updated_at",
+                self._tenant,
+                note.id,
+                note.title,
+                note.body,
+                note.updated_at,
+            )
+        return note
+
+    async def delete(self, note_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM aux_notes WHERE tenant = $1 AND id = $2",
+                self._tenant,
+                note_id,
+            )
+        return _rowcount(result) > 0
+
+
+class PostgresNotesStore:
+    """Synchronous, tenant-scoped Postgres mirror of :class:`NotesStore` (K5)."""
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncNotesStore(self._pool, tenant)
+
+    def list(self) -> list[Any]:
+        return self._pool.run(self._async.list())  # type: ignore[no-any-return]
+
+    def get(self, note_id: str) -> Any | None:
+        return self._pool.run(self._async.get(note_id))
+
+    def find_by_title(self, title: str) -> Any | None:
+        return self._pool.run(self._async.find_by_title(title))
+
+    def upsert(self, note: Any) -> Any:
+        return self._pool.run(self._async.upsert(note))
+
+    def delete(self, note_id: str) -> bool:
+        return bool(self._pool.run(self._async.delete(note_id)))
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+class _AsyncTasksStore:
+    """Async body of the Postgres Studio-tasks mirror (tenant-scoped)."""
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def list(self) -> list[Any]:
+        from himmy.api.studio_tasks import Task
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM aux_tasks WHERE tenant = $1 "
+                "ORDER BY done, created_at DESC",
+                self._tenant,
+            )
+        return [
+            Task(
+                id=r["id"],
+                title=r["title"],
+                done=bool(r["done"]),
+                due=r["due"],
+                created_at=_norm_ts(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    async def add(self, title: str, due: str | None) -> Any:
+        from himmy.api.studio_tasks import Task
+
+        t = Task(title=title, due=due)
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_tasks (tenant, id, title, done, due, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                self._tenant,
+                t.id,
+                t.title,
+                t.done,
+                t.due,
+                t.created_at,
+            )
+        return t
+
+    async def set_done(self, task_id: str, done: bool) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE aux_tasks SET done = $1 WHERE tenant = $2 AND id = $3",
+                done,
+                self._tenant,
+                task_id,
+            )
+        return _rowcount(result) > 0
+
+    async def complete_by_title(self, title: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE aux_tasks SET done = TRUE "
+                "WHERE tenant = $1 AND title = $2 AND done = FALSE",
+                self._tenant,
+                title,
+            )
+        return _rowcount(result) > 0
+
+    async def delete(self, task_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM aux_tasks WHERE tenant = $1 AND id = $2",
+                self._tenant,
+                task_id,
+            )
+        return _rowcount(result) > 0
+
+
+class PostgresTasksStore:
+    """Synchronous, tenant-scoped Postgres mirror of :class:`TasksStore` (K5)."""
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncTasksStore(self._pool, tenant)
+
+    def list(self) -> list[Any]:
+        return self._pool.run(self._async.list())  # type: ignore[no-any-return]
+
+    def add(self, title: str, *, due: str | None = None) -> Any:
+        return self._pool.run(self._async.add(title, due))
+
+    def set_done(self, task_id: str, done: bool) -> bool:
+        return bool(self._pool.run(self._async.set_done(task_id, done)))
+
+    def complete_by_title(self, title: str) -> bool:
+        return bool(self._pool.run(self._async.complete_by_title(title)))
+
+    def delete(self, task_id: str) -> bool:
+        return bool(self._pool.run(self._async.delete(task_id)))
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+# ============================================================ K5: notifications mirror
+
+
+class _AsyncNotifyStore:
+    """Async body of the Postgres notifications mirror (tenant-scoped).
+
+    Backs the durable bell the :mod:`himmy.api.routers.studio_notify` sink keeps. The
+    in-process deque stays the live read truth within a process exactly as on the SQLite
+    path; this mirror's job is the SAME best-effort durability — seed the deque on the first
+    touch (``hydrate``) and persist each item (``persist_item``) so the bell survives a
+    restart, with the same ring-bound (``id <= max_id - RING_SIZE`` is pruned).
+    """
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def max_id(self) -> int:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COALESCE(MAX(id), 0) AS m FROM aux_notifications "
+                "WHERE tenant = $1",
+                self._tenant,
+            )
+        return int(row["m"]) if row else 0
+
+    async def hydrate(self, ring_size: int) -> tuple[list[dict[str, Any]], bool]:
+        """Return ``(items oldest-first, forward_telegram)`` for the deque seed."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM aux_notifications WHERE tenant = $1 "
+                "ORDER BY id DESC LIMIT $2",
+                self._tenant,
+                ring_size,
+            )
+            srow = await conn.fetchrow(
+                "SELECT value FROM aux_notify_settings "
+                "WHERE tenant = $1 AND key = 'forward_telegram'",
+                self._tenant,
+            )
+        items = [_notify_row_to_item(r) for r in reversed(rows)]
+        forward = bool(srow) and srow["value"] == "1"
+        return items, forward
+
+    async def persist_item(self, item: dict[str, Any], ring_size: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_notifications "
+                "(tenant, id, kind, title, body, link, created_at, read) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+                "ON CONFLICT (tenant, id) DO UPDATE SET "
+                "kind = EXCLUDED.kind, title = EXCLUDED.title, body = EXCLUDED.body, "
+                "link = EXCLUDED.link, created_at = EXCLUDED.created_at, "
+                "read = EXCLUDED.read",
+                self._tenant,
+                int(item["id"]),
+                item["kind"],
+                item["title"],
+                item["body"],
+                item["link"],
+                item["created_at"],
+                bool(item["read"]),
+            )
+            await conn.execute(
+                "DELETE FROM aux_notifications WHERE tenant = $1 AND id <= $2",
+                self._tenant,
+                int(item["id"]) - ring_size,
+            )
+
+    async def mark_read(self, ids: list[int] | None) -> None:
+        async with self._pool.acquire() as conn:
+            if ids is None:
+                await conn.execute(
+                    "UPDATE aux_notifications SET read = TRUE WHERE tenant = $1",
+                    self._tenant,
+                )
+            else:
+                await conn.executemany(
+                    "UPDATE aux_notifications SET read = TRUE "
+                    "WHERE tenant = $1 AND id = $2",
+                    [(self._tenant, i) for i in ids],
+                )
+
+    async def set_setting(self, key: str, value: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_notify_settings (tenant, key, value) "
+                "VALUES ($1, $2, $3) "
+                "ON CONFLICT (tenant, key) DO UPDATE SET value = EXCLUDED.value",
+                self._tenant,
+                key,
+                value,
+            )
+
+
+class PostgresNotifyStore:
+    """Synchronous, tenant-scoped Postgres mirror of the notify sink's durable store (K5).
+
+    Unlike the other CRUD mirrors this is NOT a drop-in for a ``*Store`` class — the notify
+    sink (:mod:`himmy.api.routers.studio_notify`) is a module-level deque + best-effort SQL
+    mirror, so this exposes the small set of operations that sink performs (hydrate / persist
+    / mark-read / set-setting), driven on the shared aux loop.
+    """
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncNotifyStore(self._pool, tenant)
+
+    def max_id(self) -> int:
+        return int(self._pool.run(self._async.max_id()))
+
+    def hydrate(self, ring_size: int) -> tuple[list[dict[str, Any]], bool]:
+        return self._pool.run(self._async.hydrate(ring_size))  # type: ignore[no-any-return]
+
+    def persist_item(self, item: dict[str, Any], ring_size: int) -> None:
+        self._pool.run(self._async.persist_item(item, ring_size))
+
+    def mark_read(self, ids: list[int] | None) -> None:
+        self._pool.run(self._async.mark_read(ids))
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._pool.run(self._async.set_setting(key, value))
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+def _notify_row_to_item(row: Any) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "kind": row["kind"],
+        "title": row["title"],
+        "body": row["body"],
+        "link": row["link"],
+        "created_at": _norm_ts(row["created_at"]),
+        "read": bool(row["read"]),
+    }
+
+
+# ============================================================ K5: long-term memory mirror
+
+
+#: Column order shared by the memory INSERT and SELECT (matches the SQLite store's set).
+_MEMORY_COLS = (
+    "memory_id, subject_id, kind, text, metadata, created_at, tier, valid_from, "
+    "valid_to, superseded_by, confidence, source, stable_key"
+)
+
+
+class _AsyncMemoryStore:
+    """Async body of the Postgres long-term-memory mirror (tenant-scoped).
+
+    Mirrors :class:`SqliteMemoryStore` 1:1 — facts in ``aux_memories`` (typed columns so
+    ``subject_id`` / ``valid_to`` / ``tier`` stay indexable filters, NOT a JSON blob) and the
+    typed graph links in ``aux_memory_links``. Durability routing ONLY: the O(N) recall +
+    pgvector ANN index is a separate roadmap line (per the K5 spec).
+    """
+
+    def __init__(self, pool: _AuxPgPool, tenant: str) -> None:
+        self._pool = pool
+        self._tenant = tenant
+
+    async def save(self, record: Any) -> Any:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO aux_memories (tenant, {_MEMORY_COLS}) "  # noqa: S608
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) "
+                "ON CONFLICT (tenant, memory_id) DO UPDATE SET "
+                "subject_id = EXCLUDED.subject_id, kind = EXCLUDED.kind, "
+                "text = EXCLUDED.text, metadata = EXCLUDED.metadata, "
+                "created_at = EXCLUDED.created_at, tier = EXCLUDED.tier, "
+                "valid_from = EXCLUDED.valid_from, valid_to = EXCLUDED.valid_to, "
+                "superseded_by = EXCLUDED.superseded_by, "
+                "confidence = EXCLUDED.confidence, source = EXCLUDED.source, "
+                "stable_key = EXCLUDED.stable_key",
+                self._tenant,
+                record.memory_id,
+                record.subject_id,
+                record.kind,
+                record.text,
+                dict(record.metadata),
+                record.created_at,
+                record.tier,
+                record.valid_from,
+                record.valid_to,
+                record.superseded_by,
+                record.confidence,
+                record.source,
+                record.stable_key,
+            )
+        return record
+
+    async def list(
+        self, subject_id: str | None, active_only: bool, tier: str | None
+    ) -> list[Any]:
+        clauses = ["tenant = $1"]
+        params: list[Any] = [self._tenant]
+        if subject_id is not None:
+            params.append(subject_id)
+            clauses.append(f"subject_id = ${len(params)}")
+        if active_only:
+            clauses.append("valid_to IS NULL")
+        if tier is not None:
+            params.append(tier)
+            clauses.append(f"tier = ${len(params)}")
+        where = " AND ".join(clauses)
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {_MEMORY_COLS} FROM aux_memories "  # noqa: S608
+                f"WHERE {where} ORDER BY created_at",
+                *params,
+            )
+        return [_memory_row_to_record(r) for r in rows]
+
+    async def get(self, memory_id: str) -> Any | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {_MEMORY_COLS} FROM aux_memories "  # noqa: S608
+                "WHERE tenant = $1 AND memory_id = $2",
+                self._tenant,
+                memory_id,
+            )
+        return _memory_row_to_record(row) if row else None
+
+    async def delete(self, memory_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM aux_memories WHERE tenant = $1 AND memory_id = $2",
+                self._tenant,
+                memory_id,
+            )
+        return _rowcount(result) > 0
+
+    async def save_link(self, link: Any) -> Any:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO aux_memory_links "
+                "(tenant, link_id, from_memory_id, to_memory_id, relation, metadata, "
+                "created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                "ON CONFLICT (tenant, link_id) DO UPDATE SET "
+                "from_memory_id = EXCLUDED.from_memory_id, "
+                "to_memory_id = EXCLUDED.to_memory_id, relation = EXCLUDED.relation, "
+                "metadata = EXCLUDED.metadata, created_at = EXCLUDED.created_at",
+                self._tenant,
+                link.link_id,
+                link.from_memory_id,
+                link.to_memory_id,
+                link.relation,
+                dict(link.metadata),
+                link.created_at,
+            )
+        return link
+
+    async def links_from(self, memory_id: str) -> _list[Any]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM aux_memory_links "
+                "WHERE tenant = $1 AND from_memory_id = $2",
+                self._tenant,
+                memory_id,
+            )
+        return [_memory_row_to_link(r) for r in rows]
+
+    async def links_to(self, memory_id: str) -> _list[Any]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM aux_memory_links "
+                "WHERE tenant = $1 AND to_memory_id = $2",
+                self._tenant,
+                memory_id,
+            )
+        return [_memory_row_to_link(r) for r in rows]
+
+
+class PostgresMemoryStore:
+    """Synchronous, tenant-scoped Postgres mirror of :class:`SqliteMemoryStore` (K5).
+
+    Satisfies the :class:`~himmy.services.memory.store.MemoryStore` protocol, so it drops
+    into :class:`~himmy.services.memory.service.MemoryService` unchanged.
+    """
+
+    def __init__(self, *, tenant: str = "local", dsn: str | None = None) -> None:
+        self._tenant = tenant
+        self._pool = _new_aux_pool(dsn)
+        self._async = _AsyncMemoryStore(self._pool, tenant)
+
+    def save(self, record: Any) -> Any:
+        return self._pool.run(self._async.save(record))
+
+    def list(
+        self,
+        subject_id: str | None = None,
+        *,
+        active_only: bool = False,
+        tier: str | None = None,
+    ) -> list[Any]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.list(subject_id, active_only, tier)
+        )
+
+    def get(self, memory_id: str) -> Any | None:
+        return self._pool.run(self._async.get(memory_id))
+
+    def delete(self, memory_id: str) -> bool:
+        return bool(self._pool.run(self._async.delete(memory_id)))
+
+    def save_link(self, link: Any) -> Any:
+        return self._pool.run(self._async.save_link(link))
+
+    def links_from(self, memory_id: str) -> _list[Any]:
+        return self._pool.run(self._async.links_from(memory_id))  # type: ignore[no-any-return]
+
+    def links_to(self, memory_id: str) -> _list[Any]:
+        return self._pool.run(self._async.links_to(memory_id))  # type: ignore[no-any-return]
+
+    def close(self) -> None:
+        self._pool.close()
+
+
+def _memory_row_to_record(row: Any) -> Any:
+    from himmy.services.memory.store import MemoryRecord
+
+    metadata = row["metadata"]
+    if isinstance(metadata, str):  # defensive: a non-JSONB codec round-trip
+        metadata = json.loads(metadata)
+    return MemoryRecord(
+        memory_id=row["memory_id"],
+        subject_id=row["subject_id"],
+        kind=row["kind"],
+        text=row["text"],
+        metadata=dict(metadata or {}),
+        created_at=_norm_ts(row["created_at"]),
+        tier=row["tier"],
+        valid_from=row["valid_from"] or _norm_ts(row["created_at"]),
+        valid_to=row["valid_to"],
+        superseded_by=row["superseded_by"],
+        confidence=row["confidence"],
+        source=row["source"],
+        stable_key=row["stable_key"],
+    )
+
+
+def _memory_row_to_link(row: Any) -> Any:
+    from himmy.services.memory.store import MemoryLink
+
+    metadata = row["metadata"]
+    if isinstance(metadata, str):  # defensive
+        metadata = json.loads(metadata)
+    return MemoryLink(
+        link_id=row["link_id"],
+        from_memory_id=row["from_memory_id"],
+        to_memory_id=row["to_memory_id"],
+        relation=row["relation"],
+        metadata=dict(metadata or {}),
+        created_at=_norm_ts(row["created_at"]),
+    )
+
+
 # --------------------------------------------------------------------------- helpers
 
 
@@ -1403,10 +2129,16 @@ def _norm_ts(value: Any) -> str:
 
 
 __all__ = [
+    "PostgresCalendarStore",
     "PostgresCheckpointStore",
     "PostgresConversationStore",
+    "PostgresCookbookStore",
     "PostgresGraphCheckpointStore",
+    "PostgresMemoryStore",
+    "PostgresNotesStore",
+    "PostgresNotifyStore",
     "PostgresRoutinesStore",
+    "PostgresTasksStore",
     "PostgresTeamsStore",
     "PostgresWorkflowsStore",
 ]

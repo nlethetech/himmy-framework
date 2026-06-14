@@ -468,6 +468,116 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ON aux_workflows (tenant, workspace_id)",
         ],
     ),
+    # v5 (K5): the remaining auxiliary stores' Postgres mirrors — the Studio CRUD sidecars
+    # (calendar / cookbook / notes / tasks / notify) plus the long-term memory store. With
+    # this migration a ``postgres://`` deployment routes EVERY durable write to Postgres:
+    # none of these fork to a local ``.himmy/*.db`` sidecar anymore. Each table carries the
+    # ``tenant`` discriminator the rest of the aux surface uses (``"local"`` for these shared,
+    # single-surface singletons), so the schema is uniform with K3/K4 and a future per-tenant
+    # split is a column change, not a table change. Bodies mirror the SQLite stores 1:1
+    # (durability routing only; per-subject envelope-encryption is the later S3 phase). The
+    # ``memory`` mirror is durability-routing ONLY — its O(N) recall + pgvector ANN index is a
+    # separate roadmap line, NOT in this item.
+    (
+        5,
+        "aux_store_mirrors_k5",
+        [
+            # --- K5: Studio Calendar (dated events) ---
+            "CREATE TABLE IF NOT EXISTS aux_calendar_events ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "date TEXT NOT NULL, "
+            "time TEXT, "
+            "title TEXT NOT NULL, "
+            "notes TEXT NOT NULL DEFAULT '', "
+            "created_at TEXT NOT NULL, "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE INDEX IF NOT EXISTS aux_calendar_events_date_idx "
+            "ON aux_calendar_events (tenant, date)",
+            # --- K5: Studio Cookbook (saved agent+prompt recipes) ---
+            "CREATE TABLE IF NOT EXISTS aux_recipes ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "name TEXT NOT NULL, "
+            "agent_path TEXT NOT NULL DEFAULT '', "
+            "prompt TEXT NOT NULL DEFAULT '', "
+            "notes TEXT NOT NULL DEFAULT '', "
+            "created_at TEXT NOT NULL, "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE INDEX IF NOT EXISTS aux_recipes_created_idx "
+            "ON aux_recipes (tenant, created_at DESC)",
+            # --- K5: Studio Notes (durable markdown, shared with the notes tool pack) ---
+            "CREATE TABLE IF NOT EXISTS aux_notes ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "title TEXT NOT NULL DEFAULT '', "
+            "body TEXT NOT NULL DEFAULT '', "
+            "updated_at TEXT NOT NULL, "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE INDEX IF NOT EXISTS aux_notes_updated_idx "
+            "ON aux_notes (tenant, updated_at DESC)",
+            # --- K5: Studio Tasks (shared with the tasks tool pack) ---
+            "CREATE TABLE IF NOT EXISTS aux_tasks ("
+            "tenant TEXT NOT NULL, "
+            "id TEXT NOT NULL, "
+            "title TEXT NOT NULL, "
+            "done BOOLEAN NOT NULL DEFAULT FALSE, "
+            "due TEXT, "
+            "created_at TEXT NOT NULL, "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE INDEX IF NOT EXISTS aux_tasks_order_idx "
+            "ON aux_tasks (tenant, done, created_at DESC)",
+            # --- K5: Studio Notifications (the durable bell mirror + its one setting) ---
+            # ``id`` is a per-tenant monotonic integer matching the SQLite mirror's ring id.
+            "CREATE TABLE IF NOT EXISTS aux_notifications ("
+            "tenant TEXT NOT NULL, "
+            "id BIGINT NOT NULL, "
+            "kind TEXT NOT NULL, "
+            "title TEXT NOT NULL, "
+            "body TEXT NOT NULL DEFAULT '', "
+            "link TEXT NOT NULL DEFAULT '', "
+            "created_at TEXT NOT NULL, "
+            "read BOOLEAN NOT NULL DEFAULT FALSE, "
+            "PRIMARY KEY (tenant, id))",
+            "CREATE TABLE IF NOT EXISTS aux_notify_settings ("
+            "tenant TEXT NOT NULL, "
+            "key TEXT NOT NULL, "
+            "value TEXT NOT NULL, "
+            "PRIMARY KEY (tenant, key))",
+            # --- K5: long-term memory facts + typed graph links ---
+            "CREATE TABLE IF NOT EXISTS aux_memories ("
+            "tenant TEXT NOT NULL, "
+            "memory_id TEXT NOT NULL, "
+            "subject_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL, "
+            "text TEXT NOT NULL, "
+            "metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "created_at TEXT NOT NULL, "
+            "tier TEXT NOT NULL DEFAULT 'recall', "
+            "valid_from TEXT NOT NULL DEFAULT '', "
+            "valid_to TEXT, "
+            "superseded_by TEXT, "
+            "confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0, "
+            "source TEXT NOT NULL DEFAULT 'user', "
+            "stable_key TEXT, "
+            "PRIMARY KEY (tenant, memory_id))",
+            "CREATE INDEX IF NOT EXISTS aux_memories_subject_idx "
+            "ON aux_memories (tenant, subject_id)",
+            "CREATE TABLE IF NOT EXISTS aux_memory_links ("
+            "tenant TEXT NOT NULL, "
+            "link_id TEXT NOT NULL, "
+            "from_memory_id TEXT NOT NULL, "
+            "to_memory_id TEXT NOT NULL, "
+            "relation TEXT NOT NULL DEFAULT 'relates_to', "
+            "metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "created_at TEXT NOT NULL, "
+            "PRIMARY KEY (tenant, link_id))",
+            "CREATE INDEX IF NOT EXISTS aux_memory_links_from_idx "
+            "ON aux_memory_links (tenant, from_memory_id)",
+            "CREATE INDEX IF NOT EXISTS aux_memory_links_to_idx "
+            "ON aux_memory_links (tenant, to_memory_id)",
+        ],
+    ),
 ]
 
 

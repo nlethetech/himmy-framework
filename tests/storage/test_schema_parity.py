@@ -90,6 +90,15 @@ _AUX_POSTGRES_TABLES = frozenset(
         "aux_routines",
         "aux_teams",
         "aux_workflows",
+        # K5: the Studio CRUD sidecars (calendar/cookbook/notes/tasks/notify) + memory.
+        "aux_calendar_events",
+        "aux_recipes",
+        "aux_notes",
+        "aux_tasks",
+        "aux_notifications",
+        "aux_notify_settings",
+        "aux_memories",
+        "aux_memory_links",
     }
 )
 
@@ -310,13 +319,20 @@ _AUX_PG_MIRROR: dict[str, set[str] | None] = {
     "routines": {"aux_routines"},
     "teams": {"aux_teams"},
     "workflows": {"aux_workflows"},
-    # K5 (not in this unit): no Postgres mirror yet.
-    "calendar": None,
-    "cookbook": None,
-    "notes": None,
-    "tasks": None,
-    "memory": None,
+    # K5: the Studio CRUD sidecars + memory now have their Postgres mirrors.
+    "calendar": {"aux_calendar_events"},
+    "cookbook": {"aux_recipes"},
+    "notes": {"aux_notes"},
+    "tasks": {"aux_tasks"},
+    "memory": {"aux_memories", "aux_memory_links"},
 }
+
+#: The K5 notify mirror is NOT a ``select_aux_store``-routed ``*Store`` class — the notify
+#: sink (:mod:`himmy.api.routers.studio_notify`) is a module-level deque + best-effort SQL
+#: mirror, routed by ``aux_postgres_enabled()`` directly. Its Postgres mirror tables are
+#: therefore declared here (not in the per-store ``_AUX_PG_MIRROR`` map) and folded into the
+#: documented Postgres-only set below.
+_NOTIFY_PG_MIRROR = frozenset({"aux_notifications", "aux_notify_settings"})
 
 
 def test_aux_pg_mirror_map_enumerates_every_aux_store() -> None:
@@ -343,14 +359,24 @@ def test_aux_postgres_mirror_tables_present() -> None:
 
 
 def test_aux_pg_mirror_tables_match_documented_pg_only_set() -> None:
-    """The union of K3/K4 mirror tables equals the documented ``aux_*`` Postgres-only set.
+    """The union of all aux mirror tables equals the documented ``aux_*`` Postgres-only set.
 
     Keeps :data:`_AUX_POSTGRES_TABLES` honest: if a mirror table is added to the map but not
     the documented set (or vice-versa) this reds, so the core-table divergence allowlist and
-    the per-store mirror map can never drift apart.
+    the per-store mirror map can never drift apart. The notify mirror (not a per-store
+    ``select_aux_store`` class) is folded in via :data:`_NOTIFY_PG_MIRROR`.
     """
-    declared: set[str] = set()
+    declared: set[str] = set(_NOTIFY_PG_MIRROR)
     for mirror in _AUX_PG_MIRROR.values():
         if mirror is not None:
             declared |= mirror
     assert declared == set(_AUX_POSTGRES_TABLES)
+
+
+def test_notify_pg_mirror_tables_present() -> None:
+    """The K5 notify Postgres mirror tables are declared in the committed migrations."""
+    postgres_tables = _postgres_core_tables()
+    missing = set(_NOTIFY_PG_MIRROR) - postgres_tables
+    assert not missing, (
+        f"notify Postgres mirror tables absent from STORAGE_MIGRATIONS: {sorted(missing)}"
+    )

@@ -84,10 +84,16 @@ def get_cookbook_store() -> CookbookStore:
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        # K2: route through the one aux-store selector (Postgres mirror = K5; None today).
+        # K2 + K5: route through the one aux-store selector. Postgres DSN -> the K5 mirror
+        # (no .himmy/cookbook.db sidecar); else the durable SQLite store as before.
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _STORE = select_aux_store(lambda: CookbookStore(path))
+        def _pg() -> CookbookStore:
+            from himmy.services.storage.postgres_aux import PostgresCookbookStore
+
+            return PostgresCookbookStore(tenant="local")  # type: ignore[return-value]
+
+        _STORE = select_aux_store(lambda: CookbookStore(path), _pg)
         _PATH = path
     return _STORE
 

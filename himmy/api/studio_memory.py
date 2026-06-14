@@ -13,7 +13,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from himmy.services.memory.service import MemoryService
-from himmy.services.memory.store import SqliteMemoryStore
+from himmy.services.memory.store import MemoryStore, SqliteMemoryStore
 
 
 class MemoryItem(BaseModel):
@@ -31,7 +31,11 @@ class MemoryHitItem(BaseModel):
 
 
 _SERVICE: MemoryService | None = None
-_STORE: SqliteMemoryStore | None = None
+#: The durable memory store backing the Studio memory service. Typed as the ``MemoryStore``
+#: protocol (not the concrete SQLite class) because under a Postgres DSN this is the K5
+#: :class:`~himmy.services.storage.postgres_aux.PostgresMemoryStore` mirror — both satisfy
+#: the protocol and drop into :class:`MemoryService` unchanged.
+_STORE: MemoryStore | None = None
 _PATH: str | None = None
 
 
@@ -55,11 +59,21 @@ def get_memory_service() -> MemoryService:
         from himmy.toolkit.config import ToolkitConfig
 
         if _STORE is not None:
-            _STORE.close()
-        # K2: route through the one aux-store selector (Postgres mirror = K5; None today).
+            close = getattr(_STORE, "close", None)
+            if callable(close):
+                close()
+        # K2 + K5: route through the one aux-store selector. Postgres DSN -> the K5
+        # PostgresMemoryStore mirror (no .himmy/memory.db sidecar); else the durable SQLite
+        # store. Both satisfy the MemoryStore protocol. memory is durability-routing ONLY
+        # here; the O(N) recall + pgvector ANN index is a separate roadmap line.
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _STORE = select_aux_store(lambda: SqliteMemoryStore(path))
+        def _pg() -> MemoryStore:
+            from himmy.services.storage.postgres_aux import PostgresMemoryStore
+
+            return PostgresMemoryStore(tenant="local")
+
+        _STORE = select_aux_store(lambda: SqliteMemoryStore(path), _pg)
         embedder, _dim = ToolkitConfig.from_env().build_embedder_and_dim()
         # P0-C: project every memory mutation onto the durable Studio entity spine
         # (memory_fact records + MEMORY_* audit events) — the dormant audit path,
@@ -77,13 +91,15 @@ def get_memory_service() -> MemoryService:
 def reset_memory_service() -> None:
     global _SERVICE, _STORE, _PATH
     if _STORE is not None:
-        _STORE.close()
+        close = getattr(_STORE, "close", None)
+        if callable(close):
+            close()
     _SERVICE = None
     _STORE = None
     _PATH = None
 
 
-def _store() -> SqliteMemoryStore:
+def _store() -> MemoryStore:
     get_memory_service()
     assert _STORE is not None
     return _STORE

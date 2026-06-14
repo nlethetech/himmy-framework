@@ -100,10 +100,17 @@ def get_notes_store() -> NotesStore:
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        # K2: route through the one aux-store selector (Postgres mirror = K5; None today).
+        # K2 + K5: route through the one aux-store selector. Postgres DSN -> the K5 mirror
+        # (no .himmy/notes.db sidecar); else the durable SQLite store as before. The mirror
+        # backs the ``notes`` tool pack identically (find_by_title/upsert/get/list/delete).
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _STORE = select_aux_store(lambda: NotesStore(path))
+        def _pg() -> NotesStore:
+            from himmy.services.storage.postgres_aux import PostgresNotesStore
+
+            return PostgresNotesStore(tenant="local")  # type: ignore[return-value]
+
+        _STORE = select_aux_store(lambda: NotesStore(path), _pg)
         _PATH = path
     return _STORE
 

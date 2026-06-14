@@ -110,10 +110,17 @@ def get_tasks_store() -> TasksStore:
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        # K2: route through the one aux-store selector (Postgres mirror = K5; None today).
+        # K2 + K5: route through the one aux-store selector. Postgres DSN -> the K5 mirror
+        # (no .himmy/tasks.db sidecar); else the durable SQLite store as before. The mirror
+        # backs the ``tasks`` tool pack identically (add/complete_by_title/list/...).
         from himmy.services.storage.aux_store_factory import select_aux_store
 
-        _STORE = select_aux_store(lambda: TasksStore(path))
+        def _pg() -> TasksStore:
+            from himmy.services.storage.postgres_aux import PostgresTasksStore
+
+            return PostgresTasksStore(tenant="local")  # type: ignore[return-value]
+
+        _STORE = select_aux_store(lambda: TasksStore(path), _pg)
         _PATH = path
     return _STORE
 
