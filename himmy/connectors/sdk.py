@@ -305,10 +305,47 @@ class IdempotencyStore:
             self._done[key] = result
         return result
 
+    async def run_once_async(
+        self, key: str, call: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        """Async ``run_once``: run the async ``call`` once per ``key``, mark-after-success.
+
+        The async analog of :meth:`run_once` used by the (async) webhook handler so the
+        dedup MARK lands only AFTER the agent turn succeeds — never the mark-before-run
+        order that, made durable, would turn a crash into a permanently-dropped delivery. A
+        concurrent duplicate (key already in flight) raises :class:`ConnectorError`; a key
+        that already completed returns the cached result without re-running; a failure
+        releases the in-flight reservation so a redelivery re-runs. The durable
+        :class:`~himmy.services.storage.trigger_dedup.DurableIdempotencyStore` overrides this
+        to persist the same protocol across restarts.
+        """
+        with self._lock:
+            if key in self._done:
+                return self._done[key]
+            if key in self._inflight:
+                raise ConnectorError(
+                    f"idempotency key {key!r} is already in flight (duplicate request)"
+                )
+            self._inflight.add(key)
+        try:
+            result = await call()
+        except BaseException:
+            with self._lock:
+                self._inflight.discard(key)
+            raise
+        with self._lock:
+            self._inflight.discard(key)
+            self._done[key] = result
+        return result
+
     def seen(self, key: str) -> bool:
         """Whether ``key`` has already completed (used by webhook de-duplication)."""
         with self._lock:
             return key in self._done
+
+    async def seen_async(self, key: str) -> bool:
+        """Async ``seen`` (the durable store overrides to hit storage)."""
+        return self.seen(key)
 
 
 # ------------------------------------------------------------- capability detection

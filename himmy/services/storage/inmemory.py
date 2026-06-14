@@ -677,6 +677,97 @@ class InMemoryOrchestrationStore:
         ]
 
 
+class InMemoryTriggerDedupStore:
+    """Process-local TTL-CAS dedup ledger (the in-memory analog of ``trigger_dedup``, Q4).
+
+    Mirrors the SQLite/Postgres durable dedup exactly so the
+    :class:`~himmy.services.storage.trigger_dedup.DurableIdempotencyStore` behaves the same
+    on the zero-config default — minus durability across a process exit (the dict is gone on
+    restart, which is precisely the in-memory contract). A row is keyed by ``(scope, key)``;
+    ``result is None`` marks an in-flight lease, a string marks a COMPLETED entry. The
+    mutation methods have NO ``await`` between read and write, so two concurrent callers on
+    one loop cannot both win a claim.
+    """
+
+    def __init__(self) -> None:
+        # (scope, key) -> {"result": str | None, "expires_at": str | None}
+        self._rows: dict[tuple[str, str], dict[str, str | None]] = {}
+
+    async def dedup_try_claim(
+        self,
+        scope: str,
+        key: str,
+        *,
+        lease_seconds: float,
+        now: str | None = None,
+    ) -> DedupClaim:
+        """Claim ``(scope, key)`` for execution, or report a COMPLETED/in-flight duplicate."""
+        from himmy.services.storage.trigger_dedup import (
+            CLAIM_DONE,
+            CLAIM_IN_FLIGHT,
+            CLAIM_WON,
+            DedupClaim,
+        )
+
+        now_iso = now or utc_now_iso()
+        row = self._rows.get((scope, key))
+        if row is not None:
+            expires = row.get("expires_at")
+            live = expires is None or expires > now_iso
+            if live:
+                if row.get("result") is not None:
+                    return DedupClaim(CLAIM_DONE, result=row.get("result"))
+                return DedupClaim(CLAIM_IN_FLIGHT)
+            # Expired (in-flight lease from a crashed worker OR a lapsed COMPLETED row):
+            # fall through and reclaim it as a fresh in-flight lease.
+        self._rows[(scope, key)] = {
+            "result": None,
+            "expires_at": _iso_plus_seconds(now_iso, lease_seconds),
+        }
+        return DedupClaim(CLAIM_WON)
+
+    async def dedup_complete(
+        self,
+        scope: str,
+        key: str,
+        *,
+        result: str,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> None:
+        """Upgrade the in-flight row to COMPLETED with ``result`` + the real TTL."""
+        now_iso = now or utc_now_iso()
+        self._rows[(scope, key)] = {
+            "result": result,
+            "expires_at": _iso_plus_seconds(now_iso, ttl_seconds),
+        }
+
+    async def dedup_release(
+        self, scope: str, key: str, *, now: str | None = None
+    ) -> None:
+        """Drop a won-but-failed in-flight row so a redelivery re-runs (only if in-flight)."""
+        row = self._rows.get((scope, key))
+        if row is not None and row.get("result") is None:
+            self._rows.pop((scope, key), None)
+
+    async def dedup_sweep(self, *, now: str | None = None) -> int:
+        """Delete expired rows; return the count removed."""
+        now_iso = now or utc_now_iso()
+        doomed = [
+            k
+            for k, row in self._rows.items()
+            if row.get("expires_at") is not None
+            and str(row.get("expires_at")) <= now_iso
+        ]
+        for k in doomed:
+            self._rows.pop(k, None)
+        return len(doomed)
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.services.storage.trigger_dedup import DedupClaim
+
+
 __all__ = [
     "InMemoryAgentDefStore",
     "InMemoryContextStore",
@@ -686,4 +777,5 @@ __all__ = [
     "InMemoryRecommendationStore",
     "InMemoryRunStore",
     "InMemoryThreadStore",
+    "InMemoryTriggerDedupStore",
 ]

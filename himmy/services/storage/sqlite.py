@@ -49,6 +49,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context 
     from himmy.agents.base_agent.thread import ChatThread
     from himmy.services.context.models import ContextField, ContextSnapshot
     from himmy.services.evaluation.models import EvaluationRun
+    from himmy.services.storage.trigger_dedup import DedupClaim
 
 #: Idempotent schema for the full storage surface. Each concern table stores the full
 #: record JSON in ``payload`` plus the indexed filter columns the list queries need —
@@ -1182,6 +1183,152 @@ class SqliteStorageService:
                 won = cur.rowcount == 1
                 self._conn.commit()
                 return won
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    # -------------------------------------------------- durable inbound dedup (Q4)
+    async def dedup_try_claim(
+        self,
+        scope: str,
+        key: str,
+        *,
+        lease_seconds: float,
+        now: str | None = None,
+    ) -> DedupClaim:
+        """Atomically claim ``(scope, key)`` for execution, or report a duplicate (Q4).
+
+        The durable TTL-CAS backing :class:`DurableIdempotencyStore`. Under ``BEGIN
+        IMMEDIATE`` (write lock up front) it reads the existing row: a LIVE COMPLETED row
+        (``result`` set, ``expires_at`` in the future) returns :data:`CLAIM_DONE` with the
+        stored result; a LIVE in-flight row (``result`` NULL) returns :data:`CLAIM_IN_FLIGHT`;
+        an absent or EXPIRED row (a crashed worker's lapsed lease, or a stale COMPLETED entry)
+        is (re)claimed as a fresh in-flight lease and returns :data:`CLAIM_WON`. Two workers
+        racing serialize on the write lock, so exactly one wins the claim.
+        """
+        return await asyncio.to_thread(
+            self._dedup_try_claim_sync, scope, key, lease_seconds, now
+        )
+
+    def _dedup_try_claim_sync(
+        self, scope: str, key: str, lease_seconds: float, now: str | None
+    ) -> DedupClaim:
+        """The locked TTL-CAS claim for the durable dedup ledger."""
+        from himmy.services.storage.trigger_dedup import (
+            CLAIM_DONE,
+            CLAIM_IN_FLIGHT,
+            CLAIM_WON,
+            DedupClaim,
+        )
+
+        now_iso = now or utc_now_iso()
+        lease_until = _iso_plus_seconds(now_iso, lease_seconds)
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT result, expires_at FROM trigger_dedup "
+                    "WHERE scope = ? AND key = ?",
+                    (scope, key),
+                ).fetchone()
+                if row is not None:
+                    expires = row["expires_at"]
+                    live = expires is None or expires > now_iso
+                    if live:
+                        if row["result"] is not None:
+                            self._conn.commit()
+                            return DedupClaim(CLAIM_DONE, result=row["result"])
+                        self._conn.commit()
+                        return DedupClaim(CLAIM_IN_FLIGHT)
+                # Absent or expired: (re)claim a fresh in-flight lease. INSERT OR REPLACE so a
+                # lapsed row is overwritten under the same PK.
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO trigger_dedup "
+                    "(scope, key, result, expires_at, created_at) "
+                    "VALUES (?, ?, NULL, ?, ?)",
+                    (scope, key, lease_until, now_iso),
+                )
+                self._conn.commit()
+                return DedupClaim(CLAIM_WON)
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    async def dedup_complete(
+        self,
+        scope: str,
+        key: str,
+        *,
+        result: str,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> None:
+        """Upgrade a won in-flight dedup row to COMPLETED with ``result`` + the real TTL."""
+        await asyncio.to_thread(
+            self._dedup_complete_sync, scope, key, result, ttl_seconds, now
+        )
+
+    def _dedup_complete_sync(
+        self, scope: str, key: str, result: str, ttl_seconds: float, now: str | None
+    ) -> None:
+        """The locked in-flight -> COMPLETED upgrade."""
+        now_iso = now or utc_now_iso()
+        expires_at = _iso_plus_seconds(now_iso, ttl_seconds)
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO trigger_dedup "
+                    "(scope, key, result, expires_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (scope, key, result, expires_at, now_iso),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    async def dedup_release(
+        self, scope: str, key: str, *, now: str | None = None
+    ) -> None:
+        """Drop a won-but-failed in-flight dedup row so a redelivery re-runs (if in-flight)."""
+        await asyncio.to_thread(self._dedup_release_sync, scope, key)
+
+    def _dedup_release_sync(self, scope: str, key: str) -> None:
+        """The locked release of an in-flight (not COMPLETED) dedup row."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                # Only delete an in-flight row (result IS NULL) — never a COMPLETED one, so a
+                # release that races a completion can't erase a real dedup mark.
+                self._conn.execute(
+                    "DELETE FROM trigger_dedup "
+                    "WHERE scope = ? AND key = ? AND result IS NULL",
+                    (scope, key),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    async def dedup_sweep(self, *, now: str | None = None) -> int:
+        """Delete expired dedup rows (lazy GC); return the count removed."""
+        return await asyncio.to_thread(self._dedup_sweep_sync, now)
+
+    def _dedup_sweep_sync(self, now: str | None) -> int:
+        """The locked expired-row prune."""
+        now_iso = now or utc_now_iso()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cur = self._conn.execute(
+                    "DELETE FROM trigger_dedup "
+                    "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                    (now_iso,),
+                )
+                removed = cur.rowcount
+                self._conn.commit()
+                return int(removed)
             except BaseException:
                 self._rollback_quietly()
                 raise

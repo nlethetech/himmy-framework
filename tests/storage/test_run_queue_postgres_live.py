@@ -147,3 +147,65 @@ def test_lane_keying_live() -> None:
             await storage.close()
 
     run_async(scenario())
+
+
+def test_trigger_dedup_ttl_cas_live() -> None:
+    """Q4: the durable dedup TTL-CAS on a real Postgres (ON CONFLICT take-over + completion)."""
+    from himmy.services.storage.trigger_dedup import (
+        CLAIM_DONE,
+        CLAIM_IN_FLIGHT,
+        CLAIM_WON,
+    )
+
+    async def scenario() -> None:
+        storage = await _fresh_storage()
+        try:
+            key = _uid("evt")
+            won = await storage.dedup_try_claim("webhook", key, lease_seconds=300)
+            assert won.outcome is CLAIM_WON
+            # Concurrent duplicate while in-flight is refused.
+            again = await storage.dedup_try_claim("webhook", key, lease_seconds=300)
+            assert again.outcome is CLAIM_IN_FLIGHT
+            # Complete -> a later claim returns the stored result.
+            await storage.dedup_complete(
+                "webhook", key, result="reply", ttl_seconds=86400
+            )
+            done = await storage.dedup_try_claim("webhook", key, lease_seconds=300)
+            assert done.outcome is CLAIM_DONE and done.result == "reply"
+            # An expired in-flight lease is reclaimable (crash recovery): far-future now.
+            key2 = _uid("evt")
+            await storage.dedup_try_claim(
+                "webhook", key2, lease_seconds=1, now="2020-01-01T00:00:00+00:00"
+            )
+            reclaim = await storage.dedup_try_claim(
+                "webhook", key2, lease_seconds=300, now="2099-01-01T00:00:00+00:00"
+            )
+            assert reclaim.outcome is CLAIM_WON
+            swept = await storage.dedup_sweep(now="2099-06-01T00:00:00+00:00")
+            assert swept >= 1
+        finally:
+            await storage.close()
+
+    run_async(scenario())
+
+
+def test_concurrent_dedup_claims_are_at_most_once_live() -> None:
+    """N concurrent claimers on ONE delivery id: exactly one WINS, the rest are duplicates."""
+    from himmy.services.storage.trigger_dedup import CLAIM_WON
+
+    async def scenario() -> None:
+        storage = await _fresh_storage()
+        try:
+            key = _uid("evt")
+            results = await asyncio.gather(
+                *(
+                    storage.dedup_try_claim("webhook", key, lease_seconds=300)
+                    for _ in range(8)
+                )
+            )
+            wins = [r for r in results if r.outcome is CLAIM_WON]
+            assert len(wins) == 1  # at-most-once claim across concurrent webhook replicas
+        finally:
+            await storage.close()
+
+    run_async(scenario())

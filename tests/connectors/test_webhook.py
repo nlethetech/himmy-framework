@@ -291,6 +291,77 @@ def test_duplicate_delivery_id_is_not_run_twice() -> None:
     assert seen == ["ci:build 1234 passed"]  # ran exactly once
 
 
+def test_handler_failure_does_not_permanently_drop_a_redelivery() -> None:
+    """Mark-AFTER-success (Q4): a failed agent turn releases the mark so a redelivery re-runs.
+
+    With the prior mark-BEFORE-run order, an agent failure on the first delivery would have
+    left the id marked consumed and silently dropped every redelivery. The new protocol marks
+    only after success, so the redelivery actually re-runs.
+    """
+    attempts: list[str] = []
+
+    async def flaky(sender_id: str, text: str) -> str:
+        attempts.append(text)
+        if len(attempts) == 1:
+            raise RuntimeError("transient agent failure")
+        return f"recovered: {text}"
+
+    conn = WebhookInboundConnector(
+        flaky, signing_secret=_SECRET, allowed_sources=["ci"]
+    )
+    body = _payload(id="evt-retry")
+    sig = _sign(_SECRET, body)
+
+    with pytest.raises(RuntimeError):
+        run_async(conn.handle_webhook(body, {DEFAULT_SIGNATURE_HEADER: sig}))
+    # The redelivery is NOT deduped away — it re-runs and succeeds.
+    second = run_async(conn.handle_webhook(body, {DEFAULT_SIGNATURE_HEADER: sig}))
+    assert second["handled"] is True
+    assert attempts == ["build 1234 passed", "build 1234 passed"]
+
+
+def test_durable_dedup_survives_a_restart() -> None:
+    """Q4 acceptance: a delivery id seen before a "restart" is still deduped after it.
+
+    The webhook is built with a DurableIdempotencyStore over a file-backed SQLite store; a
+    fresh connector + fresh store on the SAME file (the restart) still de-duplicates the id,
+    where an in-RAM store would have forgotten it and re-fired the agent.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from himmy.services.storage.sqlite import SqliteStorageService
+    from himmy.services.storage.trigger_dedup import DurableIdempotencyStore
+
+    db = str(Path(tempfile.mkdtemp()) / "dedup.db")
+    body = _payload(id="evt-durable")
+    sig = _sign(_SECRET, body)
+
+    runs: list[str] = []
+
+    async def handler(sender_id: str, text: str) -> str:
+        runs.append(text)
+        return f"ran: {text}"
+
+    # First process: deliver once (the agent runs).
+    store1 = DurableIdempotencyStore(SqliteStorageService(db), scope="webhook")
+    conn1 = WebhookInboundConnector(
+        handler, signing_secret=_SECRET, allowed_sources=["ci"], idempotency=store1
+    )
+    first = run_async(conn1.handle_webhook(body, {DEFAULT_SIGNATURE_HEADER: sig}))
+    assert first["handled"] is True
+    assert runs == ["build 1234 passed"]
+
+    # Restart: a brand-new connector + store on the SAME database file.
+    store2 = DurableIdempotencyStore(SqliteStorageService(db), scope="webhook")
+    conn2 = WebhookInboundConnector(
+        handler, signing_secret=_SECRET, allowed_sources=["ci"], idempotency=store2
+    )
+    second = run_async(conn2.handle_webhook(body, {DEFAULT_SIGNATURE_HEADER: sig}))
+    assert second == {"ok": True, "handled": False, "deduplicated": True}
+    assert runs == ["build 1234 passed"]  # the agent did NOT fire again after restart
+
+
 # ------------------------------------------------------------------ capability + secrets
 def test_capability_is_unavailable_without_a_secret() -> None:
     async def handler(sender_id: str, text: str) -> str:  # pragma: no cover - not run

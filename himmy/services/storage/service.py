@@ -29,6 +29,7 @@ from himmy.services.storage.inmemory import (
     InMemoryRecommendationStore,
     InMemoryRunStore,
     InMemoryThreadStore,
+    InMemoryTriggerDedupStore,
 )
 from himmy.services.storage.models import (
     ActionRecord,
@@ -48,6 +49,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context 
     from himmy.agents.base_agent.thread import ChatThread
     from himmy.services.context.models import ContextField, ContextSnapshot
     from himmy.services.evaluation.models import EvaluationRun
+    from himmy.services.storage.trigger_dedup import DedupClaim
 
 
 class StorageService:
@@ -71,6 +73,7 @@ class StorageService:
         self._recommendation_store = InMemoryRecommendationStore()
         self._evaluation_store = InMemoryEvaluationStore()
         self._orchestration_store = InMemoryOrchestrationStore()
+        self._trigger_dedup_store = InMemoryTriggerDedupStore()
 
     # ------------------------------------------------------------------ threads
     async def save_thread(self, thread: ChatThread) -> ChatThread:
@@ -194,6 +197,44 @@ class StorageService:
         return await self._run_store.redrive_run(
             run_id, workspace_id=workspace_id, now=now
         )
+
+    # ------------------------------------------------------ inbound dedup (Q4)
+    async def dedup_try_claim(
+        self,
+        scope: str,
+        key: str,
+        *,
+        lease_seconds: float,
+        now: str | None = None,
+    ) -> DedupClaim:
+        """Atomically claim ``(scope, key)`` for execution, or report a duplicate (Q4)."""
+        return await self._trigger_dedup_store.dedup_try_claim(
+            scope, key, lease_seconds=lease_seconds, now=now
+        )
+
+    async def dedup_complete(
+        self,
+        scope: str,
+        key: str,
+        *,
+        result: str,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> None:
+        """Upgrade a won in-flight dedup claim to COMPLETED with ``result`` + TTL (Q4)."""
+        await self._trigger_dedup_store.dedup_complete(
+            scope, key, result=result, ttl_seconds=ttl_seconds, now=now
+        )
+
+    async def dedup_release(
+        self, scope: str, key: str, *, now: str | None = None
+    ) -> None:
+        """Drop a won-but-failed in-flight dedup claim so a redelivery re-runs (Q4)."""
+        await self._trigger_dedup_store.dedup_release(scope, key, now=now)
+
+    async def dedup_sweep(self, *, now: str | None = None) -> int:
+        """Delete expired dedup rows (lazy GC); return the count removed (Q4)."""
+        return await self._trigger_dedup_store.dedup_sweep(now=now)
 
     async def get_run(self, run_id: str) -> RunRecord | None:
         """Return a run record by id, or None."""

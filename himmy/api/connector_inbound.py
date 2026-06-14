@@ -101,6 +101,36 @@ def _build_inbound_handler(agent_path: str) -> Any:
     return handle
 
 
+def _durable_idempotency_store(app: FastAPI) -> Any:
+    """Build a durable inbound-dedup store when the app has durable storage, else None (Q4).
+
+    Returns a :class:`~himmy.services.storage.trigger_dedup.DurableIdempotencyStore` backed by
+    the active container's storage when that storage exposes the ``trigger_dedup`` TTL-CAS
+    surface (a durable SQLite/Postgres deployment), so a webhook delivery id seen before a
+    restart is still deduped after it. Returns ``None`` for the zero-config offline default
+    (the in-memory ``StorageService`` DOES implement the surface, but its dedup is process-
+    local and lost on exit just like the connector's built-in in-RAM store — so there is no
+    durability to gain and we keep the lighter built-in path). The check is therefore "is the
+    storage a DURABLE backend?", not merely "does it have the methods?".
+    """
+    container = getattr(app.state, "container", None)
+    storage = getattr(container, "storage", None)
+    if storage is None:
+        return None
+    # Only a durable backend (file SQLite / Postgres) gains anything; the in-memory facade's
+    # dedup dies with the process exactly like the connector's built-in store.
+    from himmy.services.storage.postgres import PostgresStorageService
+    from himmy.services.storage.sqlite import SqliteStorageService
+
+    if not isinstance(storage, (SqliteStorageService, PostgresStorageService)):
+        return None
+    if not hasattr(storage, "dedup_try_claim"):  # defensive: surface must be present
+        return None
+    from himmy.services.storage.trigger_dedup import DurableIdempotencyStore
+
+    return DurableIdempotencyStore(storage, scope="webhook")
+
+
 def mount_inbound_connectors(app: FastAPI) -> list[str]:
     """Mount a router for each ENABLED + capability-OK inbound connector. Returns the names.
 
@@ -110,6 +140,12 @@ def mount_inbound_connectors(app: FastAPI) -> list[str]:
     present (capability OK); a disabled or unconfigured connector is skipped, preserving
     default-deny. Mounting is best-effort per connector: one connector that fails to build
     is logged and skipped, never aborting the app startup.
+
+    When the app runs on DURABLE storage (a SQLite/Postgres deployment), inbound
+    de-duplication is backed by the durable ``trigger_dedup`` ledger (Q4) so a re-delivered
+    id stays deduped across a restart; the zero-config offline default keeps the connector's
+    process-local in-RAM dedup (nothing durable to gain). The store is injected through the
+    verified ``build_inbound(**kwargs) -> idempotency=`` seam.
     """
     from himmy.connectors.manage import ConnectorService
     from himmy.connectors.router import build_connector_router
@@ -120,6 +156,7 @@ def mount_inbound_connectors(app: FastAPI) -> list[str]:
         return []
 
     service = ConnectorService()
+    idempotency = _durable_idempotency_store(app)
     mounted: list[str] = []
     handler: Any = None
     for name in service.names():
@@ -135,11 +172,22 @@ def mount_inbound_connectors(app: FastAPI) -> list[str]:
             if handler is None:
                 # Build the agent handler lazily, once, only when something will mount.
                 handler = _build_inbound_handler(agent_path)
-            connector = service.build_inbound(name, handler)
+            # Pass the durable dedup store via the **kwargs seam ONLY to connectors that
+            # accept it (the webhook connector does). ``None`` leaves the built-in in-RAM
+            # store, preserving the offline default byte-for-byte.
+            build_kwargs: dict[str, Any] = {}
+            if idempotency is not None and name == "webhook":
+                build_kwargs["idempotency"] = idempotency
+            connector = service.build_inbound(name, handler, **build_kwargs)
             path = _INBOUND_PATHS.get(name, f"/v1/connectors/{name}")
             app.include_router(build_connector_router(connector, path=path))
             mounted.append(name)
-            logger.info("mounted inbound connector %r at %s", name, path)
+            logger.info(
+                "mounted inbound connector %r at %s%s",
+                name,
+                path,
+                " (durable dedup)" if build_kwargs.get("idempotency") else "",
+            )
         except Exception:  # noqa: BLE001 - one bad connector must not abort startup
             logger.warning(
                 "failed to mount inbound connector %r; skipping", name, exc_info=True

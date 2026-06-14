@@ -360,6 +360,15 @@ class WebhookInboundConnector(InboundChannelConnector):
         the decoder. An over-large body, a bad signature, an unlisted source, or a malformed
         payload is audited as a deny and returns ``ok=False`` WITHOUT running the agent. A
         re-delivered ``id`` is acknowledged (``deduplicated=True``) without re-running.
+
+        De-duplication is mark-AFTER-success with an in-flight lease (Q4): the delivery id is
+        recorded as consumed only once the agent turn COMPLETES, not before it starts. This
+        closes two holes the prior seen()/run_once() split had — (1) a TOCTOU between the
+        pre-check and the run, and (2) with a DURABLE store, a crash AFTER a mark-before-run
+        would have permanently dropped the redelivery. Now a crash mid-run leaves only an
+        expiring in-flight lease, so the redelivery cleanly re-runs; a genuine duplicate (a
+        completed delivery within its TTL) is acknowledged without re-running; a CONCURRENT
+        duplicate (a live in-flight lease) is acknowledged without firing a second agent turn.
         """
         if len(body) > self._max_body_bytes:
             self._audit("webhook", "deny", detail="body exceeds size cap")
@@ -374,9 +383,41 @@ class WebhookInboundConnector(InboundChannelConnector):
         if not self._authorize(msg):  # source allowlist gate (audits the deny)
             return {"ok": False, "reason": "source not allowed"}
 
-        # De-duplicate a re-delivery: the same id never fires the agent twice.
         delivery_id = str(msg.raw.get(self._id_field) or "")
-        if delivery_id and self._dedupe.seen(delivery_id):
+        # No delivery id ⇒ no dedup key; run unconditionally (the prior behaviour).
+        if not delivery_id:
+            self._throttle(msg.sender_id)
+            reply = await self._handler(msg.sender_id, msg.text)
+            self._audit(
+                "inbound_message",
+                "allow",
+                actor={"subject": msg.sender_id},
+                detail="handled",
+            )
+            return await self._deliver(msg, reply)
+
+        # Dedup AROUND the agent turn: ``run_once_async`` runs the handler at most once per
+        # id and records the consumed mark only AFTER it succeeds. A duplicate (completed) or
+        # concurrent duplicate (in flight) is recognised by the store and never re-fires.
+        # The closure flips ``ran`` only when the handler ACTUALLY executes, so a cached
+        # replay (same id, already completed) is distinguishable from a fresh run.
+        ran = False
+
+        async def _run() -> str:
+            nonlocal ran
+            ran = True
+            self._throttle(msg.sender_id)
+            return await self._handler(msg.sender_id, msg.text)
+
+        try:
+            reply = await self._dedupe.run_once_async(delivery_id, _run)
+        except ConnectorError:
+            # A concurrent duplicate (another in-flight delivery of the same id): treat as a
+            # de-duplicated ack rather than firing a second agent turn.
+            ran = False
+            reply = ""
+
+        if not ran:
             self._audit(
                 "webhook",
                 "allow",
@@ -385,8 +426,6 @@ class WebhookInboundConnector(InboundChannelConnector):
             )
             return {"ok": True, "handled": False, "deduplicated": True}
 
-        self._throttle(msg.sender_id)
-        reply = await self._run_handler(msg, delivery_id)
         self._audit(
             "inbound_message",
             "allow",
@@ -394,19 +433,6 @@ class WebhookInboundConnector(InboundChannelConnector):
             detail="handled",
         )
         return await self._deliver(msg, reply)
-
-    async def _run_handler(self, msg: InboundMessage, delivery_id: str) -> str:
-        """Run the agent for ``msg`` exactly once per delivery id.
-
-        When the payload carries an ``id``, it is recorded as consumed in the
-        :class:`IdempotencyStore` BEFORE the agent runs: a concurrent duplicate that slips
-        past the earlier :meth:`IdempotencyStore.seen` check raises ``in flight`` from
-        ``run_once`` rather than firing the agent a second time. The store can't await a
-        coroutine, so it caches a marker and the actual (async) agent turn runs after.
-        """
-        if delivery_id:
-            self._dedupe.run_once(delivery_id, lambda: delivery_id)
-        return await self._handler(msg.sender_id, msg.text)
 
     async def _deliver(self, msg: InboundMessage, reply: str) -> dict[str, Any]:
         """Return the reply inline, or POST it to the result callback (async-ack mode)."""

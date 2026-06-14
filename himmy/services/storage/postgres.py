@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from himmy.core.errors import HimmyError
 from himmy.core.events import RunEvent
@@ -47,6 +47,9 @@ from himmy.services.storage.models import (
     RunRecord,
     RunStatus,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.services.storage.trigger_dedup import DedupClaim
 
 
 class _Unset:
@@ -1985,6 +1988,126 @@ class PostgresOrchestrationStore(_PgStoreBase):
         return [EnvironmentStateRecord.model_validate(r["payload"]) for r in rows]
 
 
+class PostgresTriggerDedupStore(_PgStoreBase):
+    """Postgres-backed durable inbound-trigger dedup (the ``trigger_dedup`` TTL-CAS, Q4).
+
+    The cluster-scalable twin of the SQLite/in-memory dedup: the atomic claim rides
+    ``INSERT … ON CONFLICT DO UPDATE … WHERE`` so the CAS is decided server-side under the
+    primary-key lock — N webhook replicas racing the same delivery id produce exactly one
+    :data:`CLAIM_WON`. ``result IS NULL`` marks an in-flight lease; a string marks a
+    COMPLETED row. Timestamps are bound as ISO strings via the text codec the pool installs
+    (see :func:`_register_codecs`).
+    """
+
+    async def dedup_try_claim(
+        self,
+        scope: str,
+        key: str,
+        *,
+        lease_seconds: float,
+        now: str | None = None,
+    ) -> DedupClaim:
+        """Atomically claim ``(scope, key)`` for execution, or report a duplicate (Q4)."""
+        from himmy.services.storage.trigger_dedup import (
+            CLAIM_DONE,
+            CLAIM_IN_FLIGHT,
+            CLAIM_WON,
+            DedupClaim,
+        )
+
+        now_iso = now or _utc_now()
+        lease_until = _iso_plus_seconds(now_iso, lease_seconds)
+        pool = self._require_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            # CAS: insert a fresh in-flight lease, but if a row already exists, only TAKE it
+            # OVER when it is EXPIRED (a crashed worker's lapsed lease or a stale COMPLETED
+            # row). A live row is left untouched and the RETURNING clause is empty.
+            won = await conn.fetchrow(
+                """
+                INSERT INTO trigger_dedup (scope, key, result, expires_at, created_at)
+                VALUES ($1, $2, NULL, $3, $4)
+                ON CONFLICT (scope, key) DO UPDATE
+                    SET result = NULL, expires_at = EXCLUDED.expires_at,
+                        created_at = EXCLUDED.created_at
+                    WHERE trigger_dedup.expires_at IS NOT NULL
+                      AND trigger_dedup.expires_at <= $4
+                RETURNING scope
+                """,
+                scope,
+                key,
+                lease_until,
+                now_iso,
+            )
+            if won is not None:
+                return DedupClaim(CLAIM_WON)
+            # The CONFLICT predicate failed -> a LIVE row exists; read it to classify.
+            existing = await conn.fetchrow(
+                "SELECT result FROM trigger_dedup WHERE scope = $1 AND key = $2",
+                scope,
+                key,
+            )
+        if existing is not None and existing["result"] is not None:
+            return DedupClaim(CLAIM_DONE, result=existing["result"])
+        return DedupClaim(CLAIM_IN_FLIGHT)
+
+    async def dedup_complete(
+        self,
+        scope: str,
+        key: str,
+        *,
+        result: str,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> None:
+        """Upgrade the in-flight row to COMPLETED with ``result`` + the real TTL."""
+        now_iso = now or _utc_now()
+        expires_at = _iso_plus_seconds(now_iso, ttl_seconds)
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO trigger_dedup (scope, key, result, expires_at, created_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (scope, key) DO UPDATE
+                    SET result = EXCLUDED.result, expires_at = EXCLUDED.expires_at
+                """,
+                scope,
+                key,
+                result,
+                expires_at,
+                now_iso,
+            )
+
+    async def dedup_release(
+        self, scope: str, key: str, *, now: str | None = None
+    ) -> None:
+        """Drop a won-but-failed in-flight row so a redelivery re-runs (only if in-flight)."""
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM trigger_dedup "
+                "WHERE scope = $1 AND key = $2 AND result IS NULL",
+                scope,
+                key,
+            )
+
+    async def dedup_sweep(self, *, now: str | None = None) -> int:
+        """Delete expired dedup rows (lazy GC); return the count removed."""
+        now_iso = now or _utc_now()
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            status = await conn.execute(
+                "DELETE FROM trigger_dedup "
+                "WHERE expires_at IS NOT NULL AND expires_at <= $1",
+                now_iso,
+            )
+        # asyncpg returns a status like "DELETE 3"; parse the trailing count.
+        try:
+            return int(str(status).rsplit(" ", 1)[-1])
+        except (ValueError, IndexError):  # pragma: no cover - defensive
+            return 0
+
+
 class PostgresStorageService:
     """Postgres-backed storage mirroring :class:`StorageService` 1:1.
 
@@ -2025,6 +2148,7 @@ class PostgresStorageService:
         self._recommendation_store = PostgresRecommendationStore(self._require_pool)
         self._evaluation_store = PostgresEvaluationStore(self._require_pool)
         self._orchestration_store = PostgresOrchestrationStore(self._require_pool)
+        self._trigger_dedup_store = PostgresTriggerDedupStore(self._require_pool)
 
     @classmethod
     async def connect(
@@ -2318,6 +2442,44 @@ class PostgresStorageService:
         return await self._run_store.redrive_run(
             run_id, workspace_id=workspace_id, now=now
         )
+
+    # ------------------------------------------------------ inbound dedup (Q4)
+    async def dedup_try_claim(
+        self,
+        scope: str,
+        key: str,
+        *,
+        lease_seconds: float,
+        now: str | None = None,
+    ) -> DedupClaim:
+        """Atomically claim ``(scope, key)`` for execution, or report a duplicate (Q4)."""
+        return await self._trigger_dedup_store.dedup_try_claim(
+            scope, key, lease_seconds=lease_seconds, now=now
+        )
+
+    async def dedup_complete(
+        self,
+        scope: str,
+        key: str,
+        *,
+        result: str,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> None:
+        """Upgrade a won in-flight dedup claim to COMPLETED with ``result`` + TTL (Q4)."""
+        await self._trigger_dedup_store.dedup_complete(
+            scope, key, result=result, ttl_seconds=ttl_seconds, now=now
+        )
+
+    async def dedup_release(
+        self, scope: str, key: str, *, now: str | None = None
+    ) -> None:
+        """Drop a won-but-failed in-flight dedup claim so a redelivery re-runs (Q4)."""
+        await self._trigger_dedup_store.dedup_release(scope, key, now=now)
+
+    async def dedup_sweep(self, *, now: str | None = None) -> int:
+        """Delete expired dedup rows (lazy GC); return the count removed (Q4)."""
+        return await self._trigger_dedup_store.dedup_sweep(now=now)
 
     async def get_run(self, run_id: str) -> RunRecord | None:
         """Return a run record by id, or None."""

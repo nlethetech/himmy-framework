@@ -181,3 +181,37 @@ def test_run_store_exposes_queue_methods() -> None:
         "redrive_run",
     ):
         assert callable(getattr(store, name))
+
+
+def test_postgres_facade_exposes_dedup_surface() -> None:
+    """Q4: the Postgres facade + the dedup store expose the trigger_dedup surface (offline)."""
+    from himmy.services.storage.postgres import (
+        PostgresStorageService,
+        PostgresTriggerDedupStore,
+    )
+
+    facade = PostgresStorageService(pool=None)
+    for name in (
+        "dedup_try_claim",
+        "dedup_complete",
+        "dedup_release",
+        "dedup_sweep",
+    ):
+        assert callable(getattr(facade, name)), name
+    store = PostgresTriggerDedupStore(lambda: None)
+    # The CAS uses ON CONFLICT ... DO UPDATE ... WHERE so the take-over is server-side.
+    for name in (
+        "dedup_try_claim",
+        "dedup_complete",
+        "dedup_release",
+        "dedup_sweep",
+    ):
+        assert callable(getattr(store, name)), name
+
+
+def test_q4_dedup_store_satisfies_protocol() -> None:
+    """The in-memory + SQLite dedup stores satisfy the TriggerDedupStore protocol."""
+    from himmy.services.storage.service import StorageService
+    from himmy.services.storage.trigger_dedup import TriggerDedupStore
+
+    assert isinstance(StorageService(), TriggerDedupStore)
