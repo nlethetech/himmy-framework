@@ -32,6 +32,10 @@ from himmy.services.inference.models import (
     InferenceResponse,
     InferenceStatus,
 )
+from himmy.services.inference.prompt_cache import (
+    CacheCapability,
+    resolve_cache_capability,
+)
 
 #: Failure codes that justify trying a *different* provider. ``INVALID_REQUEST``
 #: (the request itself is bad) and ``UNKNOWN`` (unclassified) are excluded — a
@@ -111,6 +115,20 @@ class RoutingClientManager:
         """Resolve via the primary route (the model that would serve by default)."""
         primary = self._routes[0]
         return primary.manager.resolve(primary.model_key or model_key)
+
+    def cache_capability_for(self, model_key: str) -> CacheCapability:
+        """The prompt-cache capability of the PRIMARY route's manager.
+
+        A request is served by the primary route unless it fails over, so the primary
+        manager's capability is the one the runtime keys its policy decision on. (A
+        request that does fail over to a different backend is still safe: each concrete
+        adapter independently gates on its own ``cache_capability``, so a policy that
+        was a no-op for the primary stays a no-op — or is honored — at the fallback.)
+        """
+        primary = self._routes[0]
+        return resolve_cache_capability(
+            primary.manager, primary.model_key or model_key
+        )
 
     async def generate(self, request: InferenceRequest) -> InferenceResponse:
         """Dispatch through the routes, failing over on eligible failures.

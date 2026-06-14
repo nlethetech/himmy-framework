@@ -35,6 +35,11 @@ from himmy.services.inference.models import (
     InferenceResponse,
     InferenceStatus,
 )
+from himmy.services.inference.prompt_cache import (
+    CacheCapability,
+    cache_metrics_payload,
+    resolve_cache_capability,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.core.events import EventSink
@@ -146,6 +151,18 @@ class InferenceService:
         """True when the request opted into the response cache."""
         return bool(request.generation_params.get("use_cache"))
 
+    def cache_capability_for(self, model_key: str = "default") -> CacheCapability:
+        """The wrapped client manager's prompt-cache capability for ``model_key``.
+
+        The runtime consults this BEFORE attaching a
+        :class:`~himmy.services.inference.models.CachePolicy` so it only opts in when
+        the underlying backend could actually honor it; a non-supporting manager
+        resolves to :attr:`CacheCapability.NONE` (the policy would be a harmless no-op).
+        This is purely a read of the manager's declared capability — distinct from the
+        *response* cache (``use_cache``) this service also owns.
+        """
+        return resolve_cache_capability(self._client_manager, model_key)
+
     async def run(self, request: InferenceRequest) -> InferenceResponse:
         """Run a single request with a timeout ceiling and bounded retries.
 
@@ -182,6 +199,7 @@ class InferenceService:
                         "input_tokens": hit.input_tokens,
                         "output_tokens": hit.output_tokens,
                         "cache_hit": True,
+                        **cache_metrics_payload(request, hit),
                     },
                 )
                 return hit
@@ -225,6 +243,7 @@ class InferenceService:
                     payload={
                         "input_tokens": response.input_tokens,
                         "output_tokens": response.output_tokens,
+                        **cache_metrics_payload(request, response),
                     },
                 )
                 return response

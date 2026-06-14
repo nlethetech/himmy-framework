@@ -215,6 +215,39 @@ def should_cache_prefix(
     return estimate >= floor
 
 
+def resolve_cache_capability(
+    manager: Any, model_key: str = "default"
+) -> CacheCapability:
+    """Resolve a client manager's prompt-cache capability at the call site.
+
+    This is the single resolution rule the runtime uses to decide whether attaching a
+    :class:`~himmy.services.inference.models.CachePolicy` to a request could ever take
+    effect. It is deliberately ``getattr``-based (a :class:`Protocol` cannot carry a
+    runtime-default attribute) so EVERY manager — including custom/legacy ones and the
+    local no-op managers (Stub/Ollama/ClaudeCli/Himalaya/PydanticAI/Gateway/Replaying)
+    that never set the attribute — fails safe to :attr:`CacheCapability.NONE`.
+
+    Wrapping managers (multi-provider/routing) dispatch a given ``model_key`` to a
+    concrete sub-manager whose capability is the one that matters; they expose a
+    ``cache_capability_for(model_key)`` method which, when present, is consulted first
+    so the runtime sees the capability of the backend that will actually serve the key.
+    A wrapper without that method (or any error during resolution) degrades to ``NONE``.
+    """
+    resolver = getattr(manager, "cache_capability_for", None)
+    if callable(resolver):
+        try:
+            resolved = resolver(model_key)
+        except Exception:  # noqa: BLE001 - capability resolution never breaks a run
+            return CacheCapability.NONE
+        if isinstance(resolved, CacheCapability):
+            return resolved
+        return CacheCapability.NONE
+    capability = getattr(manager, "cache_capability", CacheCapability.NONE)
+    if isinstance(capability, CacheCapability):
+        return capability
+    return CacheCapability.NONE
+
+
 def _parse_version(version: str | None) -> tuple[int, int, int] | None:
     """Parse a ``major.minor.patch`` SDK version string, tolerating extra suffixes."""
     if not version:
@@ -468,6 +501,60 @@ def compute_cached_cost(
     return base + cache_cost
 
 
+def cache_metrics_payload(
+    request: InferenceRequest, response: Any
+) -> dict[str, Any]:
+    """The shared cache observability payload for an ``INFERENCE_SUCCEEDED`` event.
+
+    This is the SINGLE function both emit sites (``InferenceService`` and
+    ``SingleAgentRuntime``) call so the event schema stays identical. It reads the
+    additive cache keys an adapter stamped onto ``response.metadata``
+    (``cache_read_tokens`` / ``cache_creation_tokens`` / ``cache_savings_usd``) and adds
+    the standard caching AUDIT signal:
+
+    * ``prefix_cache_requested`` — whether the request actually opted into caching
+      (a non-``None``, ``enabled`` :class:`CachePolicy`). Present only when ``True``.
+    * ``prefix_cache_miss`` — ``True`` when caching was requested, the stable prefix was
+      over the per-model floor (so the adapter SHOULD have marked it), yet the provider
+      reported zero cache activity (no read AND no creation). That is the standard
+      busted-prefix audit signal — a silently-rewritten prefix or a marker the provider
+      ignored — so it's caught instead of paying write premiums forever. A legitimately
+      SUB-threshold prefix (never markable) is NOT flagged, and a warm response-cache
+      hit (``cache_hit``) is never flagged because no real provider prefix call was made.
+
+    When caching was NOT requested the payload is empty (byte-identical to the
+    pre-cache event), so no-cache runs are unaffected.
+    """
+    metadata = getattr(response, "metadata", None) or {}
+    payload: dict[str, Any] = {}
+    cache_read = int(metadata.get("cache_read_tokens", 0) or 0)
+    cache_creation = int(metadata.get("cache_creation_tokens", 0) or 0)
+    if cache_read or cache_creation:
+        payload["cache_read_tokens"] = cache_read
+        payload["cache_creation_tokens"] = cache_creation
+        savings = metadata.get("cache_savings_usd")
+        if savings is not None:
+            payload["cache_savings_usd"] = float(savings)
+    if cache_policy_active(request):
+        payload["prefix_cache_requested"] = True
+        # Only flag a miss when the prefix was actually worth caching (over the
+        # per-model floor) so a sub-threshold prefix isn't noise. A warm response-cache
+        # hit (cache_hit) never touched a provider prefix cache, so it's not a bust.
+        policy = request.cache_policy
+        floor = min_cacheable_tokens(
+            request.model_key, policy.min_prefix_tokens if policy else None
+        )
+        over_threshold = stable_prefix_estimate_tokens(request) >= floor
+        if (
+            over_threshold
+            and not metadata.get("cache_hit")
+            and cache_read == 0
+            and cache_creation == 0
+        ):
+            payload["prefix_cache_miss"] = True
+    return payload
+
+
 def cache_savings_usd(
     price: ModelPrice,
     breakdown: UsageBreakdown,
@@ -498,6 +585,7 @@ __all__ = [
     "UsageBreakdown",
     "anthropic_system_blocks",
     "anthropic_ttl_supported",
+    "cache_metrics_payload",
     "cache_policy_active",
     "cache_savings_usd",
     "compute_cached_cost",
@@ -506,6 +594,7 @@ __all__ = [
     "openrouter_passthrough_backend",
     "read_anthropic_usage",
     "read_openai_usage",
+    "resolve_cache_capability",
     "resolve_cache_rates",
     "should_cache_prefix",
     "stable_prefix_estimate_tokens",

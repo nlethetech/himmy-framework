@@ -13,6 +13,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from himmy.core import HimmyError
+from himmy.services.inference.prompt_cache import (
+    CacheCapability,
+    resolve_cache_capability,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.client_manager import ClientManager
@@ -45,6 +49,15 @@ class MultiProviderClientManager:
     def resolve(self, model_key: str) -> str:
         """Resolve to ``<key>:<backend-model>`` for traceability."""
         return f"{model_key}:{self._pick(model_key).resolve('default')}"
+
+    def cache_capability_for(self, model_key: str) -> CacheCapability:
+        """The prompt-cache capability of the manager that serves ``model_key``.
+
+        Dispatch picks a concrete sub-manager per key, so the capability that matters
+        is that backend's — resolved via the same call-site rule (``getattr`` default
+        :attr:`CacheCapability.NONE`) so a non-caching backend no-ops the policy.
+        """
+        return resolve_cache_capability(self._pick(model_key), "default")
 
     async def generate(self, request: InferenceRequest) -> InferenceResponse:
         """Delegate to the picked manager (reset model_key so it uses its own model)."""

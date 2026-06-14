@@ -42,6 +42,7 @@ from himmy.runtime.checkpoint import (
 from himmy.runtime.termination import final_answer_text, is_no_progress
 from himmy.services.inference.models import (
     BoundTool,
+    CachePolicy,
     InferenceMessage,
     InferenceRequest,
     InferenceResponse,
@@ -51,6 +52,10 @@ from himmy.services.inference.models import (
     ToolCallRecord,
     ToolExecutor,
     ToolReturnRecord,
+)
+from himmy.services.inference.prompt_cache import (
+    CacheCapability,
+    cache_metrics_payload,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
@@ -555,6 +560,7 @@ class SingleAgentRuntime:
         output_guardrail: GuardrailPipeline | None = None,
         capture_io: bool | None = None,
         consent_decider: ConsentDecider | None = None,
+        enable_prompt_cache: bool | None = None,
     ) -> None:
         """Wire the runtime; auto-create prompt manager/mapper when omitted.
 
@@ -570,7 +576,11 @@ class SingleAgentRuntime:
         deployments only) a participating human subject lacking TRAIN consent has
         raw-I/O capture forced off and ``rendered_prompt`` stripped from the
         ``INFERENCE_REQUESTED`` event; ``None`` (the default) leaves capture
-        byte-identical to a pre-WS4.6 runtime.
+        byte-identical to a pre-WS4.6 runtime. ``enable_prompt_cache`` (C5) toggles
+        universal provider prompt caching: ``None`` (default) reads the env
+        ``HIMMY_PROMPT_CACHE`` (default ON, ``0``/``false`` to opt out); an explicit
+        bool wins. When ON, a per-turn request opting into caching only marks the
+        prefix on a manager that supports it — a no-op for every local/offline backend.
         """
         self.inference_service = inference_service
         self.memory_store = memory_store
@@ -602,6 +612,18 @@ class SingleAgentRuntime:
         # subject (ctx['context_subject_id']) lacking TRAIN consent suppresses raw-I/O
         # capture AND the persisted ``rendered_prompt`` for that run. ``None`` ⇒ unchanged.
         self._consent_decider = consent_decider
+        # C5: universal prompt caching is default-ON in the agent loop. When enabled AND
+        # the underlying manager declares a non-NONE cache capability, the per-turn request
+        # carries a CachePolicy() so the adapter can mark the stable system+tools prefix.
+        # Opt out per-runtime (enable_prompt_cache=False) or process-wide (HIMMY_PROMPT_CACHE=0).
+        # A NONE-capability manager makes the policy a harmless no-op, so this never changes
+        # the offline/local default's payloads. Explicit constructor arg wins over the env.
+        self._enable_prompt_cache = (
+            enable_prompt_cache
+            if enable_prompt_cache is not None
+            else os.environ.get("HIMMY_PROMPT_CACHE", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+        )
         self._on_event: list[OnEvent] = self._coerce_callbacks(on_event)
 
         # Auto-create the prompt primitives when available; they have no required
@@ -2113,17 +2135,23 @@ class SingleAgentRuntime:
         ctx: dict[str, Any],
         trace_id: str,
         llm_config: LLMConfig | None,
-    ) -> None:
+    ) -> bool:
         """Summarize old turns in-place when the thread outgrows its token budget.
 
         Opt-in via ``ctx['compaction_spec']``. Keeps the system head + recent tail,
         replaces the middle with one model-written summary message, and emits a
         ``CONTEXT_COMPACTED`` event (the audit trail of what was condensed). A no-op
         when not configured or under budget.
+
+        Returns ``True`` iff compaction actually rewrote the thread this turn. The
+        caller (C5) uses that to BUST the prompt cache for the very next request:
+        compaction inserts a new ``[Summary …]`` SYSTEM message, which changes the
+        joined system prefix and would otherwise pay a write premium on a stale-cache
+        miss. Skipping the breakpoint that one turn lets the prefix re-stabilize.
         """
         spec = ctx.get("compaction_spec")
         if not spec:
-            return
+            return False
         from himmy.agents.base_agent.thread import Message, MessageRole
         from himmy.runtime.compaction import (
             SUMMARY_INSTRUCTION,
@@ -2137,7 +2165,7 @@ class SingleAgentRuntime:
         )
         plan = compactor.plan(thread.messages)
         if not plan.should_compact:
-            return
+            return False
 
         span_text = compactor.render_span(plan.summarize)
         model_key = str(ctx.get("model_key") or self.default_model_key)
@@ -2153,7 +2181,7 @@ class SingleAgentRuntime:
         summary_resp = await self.inference_service.run(summary_req)
         summary_text = (summary_resp.output_text or "").strip()
         if not summary_text:
-            return  # summarization failed/empty — leave history intact (safe)
+            return False  # summarization failed/empty — leave history intact (safe)
 
         summary_msg = Message(
             role=MessageRole.SYSTEM,
@@ -2163,7 +2191,7 @@ class SingleAgentRuntime:
         # Only apply if the summary is actually smaller than what it replaces — a verbose
         # summary of a tiny span would otherwise grow the context, not shrink it.
         if estimate_tokens(summary_msg.content) >= compactor.estimate(plan.summarize):
-            return
+            return False
         head = list(thread.messages[: plan.head_count])
         tail = list(thread.messages[plan.tail_start :])
         compacted_count = len(plan.summarize)
@@ -2212,6 +2240,7 @@ class SingleAgentRuntime:
                         },
                     )
                 )
+        return True
 
     async def _continue_turn(
         self,
@@ -2233,9 +2262,11 @@ class SingleAgentRuntime:
 
         # WS4.6: a TRAIN-denied subject forces raw-I/O capture OFF for this turn.
         capture_io = self._capture_io and not self._train_suppressed(ctx)
-        await self._maybe_compact(persona, thread, ctx, trace_id, llm_config)
+        # C5: compaction rewrites the system prefix; bust the prompt cache for THIS turn
+        # so the adapter doesn't mark a now-stale prefix and pay a write-premium miss.
+        compacted = await self._maybe_compact(persona, thread, ctx, trace_id, llm_config)
         request, tool_names = self._build_request(
-            thread, ctx, llm_config, trace_id=trace_id
+            thread, ctx, llm_config, trace_id=trace_id, cache_busted=compacted
         )
         await self._emit(
             RunEvent(
@@ -2265,6 +2296,11 @@ class SingleAgentRuntime:
                 payload={
                     "input_tokens": response.input_tokens,
                     "output_tokens": response.output_tokens,
+                    **(
+                        cache_metrics_payload(request, response)
+                        if response.status == InferenceStatus.SUCCESS
+                        else {}
+                    ),
                     **(
                         {"io": build_io_capture(request, response)}
                         if capture_io
@@ -2519,6 +2555,7 @@ class SingleAgentRuntime:
                         "output_tokens": response.output_tokens,
                         "model_path": response.model_path,
                         "provider_name": response.provider_name,
+                        **cache_metrics_payload(request, response),
                         **(
                             {"io": build_io_capture(request, response)}
                             if capture_io
@@ -3002,6 +3039,35 @@ class SingleAgentRuntime:
             return llm_config.model_key
         return ctx.get("model_key") or self.default_model_key
 
+    def _prompt_cache_policy(
+        self, model_key: str, *, cache_busted: bool
+    ) -> CachePolicy | None:
+        """The per-turn :class:`CachePolicy` (or ``None`` to leave the request unmarked).
+
+        Returns a default ``CachePolicy()`` only when ALL hold:
+
+        * prompt caching is enabled on this runtime (``enable_prompt_cache`` /
+          ``HIMMY_PROMPT_CACHE``);
+        * compaction did NOT just rewrite the system prefix this turn
+          (``cache_busted`` — skip the breakpoint so we don't mark a stale prefix);
+        * the underlying manager for ``model_key`` declares a non-NONE cache capability
+          (resolved at the call site via the inference service, ``getattr`` default
+          NONE) — so every local/offline backend keeps ``None`` and a byte-identical
+          payload.
+
+        Returning ``None`` is the byte-identical no-cache path; the system prefix being
+        stable WITHIN a run is guaranteed by the runtime (the SYSTEM message — with its
+        baked datetime/recalled-memory/KB snapshot — is appended once on the first turn
+        and never re-rendered on continuation turns), so the only intra-run buster is
+        compaction, which ``cache_busted`` handles.
+        """
+        if cache_busted or not self._enable_prompt_cache:
+            return None
+        capability = self.inference_service.cache_capability_for(model_key)
+        if capability is CacheCapability.NONE:
+            return None
+        return CachePolicy()
+
     def _build_request(
         self,
         thread: Any,
@@ -3009,12 +3075,15 @@ class SingleAgentRuntime:
         llm_config: LLMConfig | None,
         *,
         trace_id: str | None = None,
+        cache_busted: bool = False,
     ) -> tuple[InferenceRequest, list[str] | None]:
         """Build the typed InferenceRequest with llm_config-over-context precedence.
 
         ``trace_id`` (optional) threads onto the transient-retry events the
         wrapped tool executor emits, so retries link to the run like every
-        other emission.
+        other emission. ``cache_busted`` (C5) suppresses the prompt-cache opt-in for
+        this one turn — set when compaction just rewrote the system prefix, so the
+        adapter doesn't mark a now-stale prefix and pay a write premium on the miss.
         """
         from himmy.agents.base_agent.thread import MessageRole
 
@@ -3111,6 +3180,7 @@ class SingleAgentRuntime:
             generation_params=generation_params,
             route_override=route_override,
             metadata=_cache_scope_metadata(ctx),
+            cache_policy=self._prompt_cache_policy(model_key, cache_busted=cache_busted),
             bound_tools=bound_tools,
             # The single execution seam for the bound tools (see ToolExecutor),
             # wrapped with bounded turn-level retry for transient failures.
