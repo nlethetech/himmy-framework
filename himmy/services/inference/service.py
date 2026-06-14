@@ -382,25 +382,56 @@ class InferenceService:
         """
         manager_stream = getattr(self._client_manager, "generate_stream", None)
         if manager_stream is not None:
+            # Audit parity with run() (INF-12): a streamed inference is an inference.
+            # The provider path used to emit NO lifecycle events, so a consumer that
+            # disconnected mid-stream left the usage entirely unaudited/unbilled. We
+            # now emit REQUESTED up front and guarantee exactly one terminal event
+            # via a finally — even on early aclose() (GeneratorExit) — so partial
+            # streams are always accounted for.
+            await self._emit(
+                EventType.INFERENCE_REQUESTED,
+                request_id=request.request_id,
+                payload={"model_key": request.model_key, "streamed": True},
+            )
+            started = time.perf_counter()
             index = 0
             final: InferenceResponse | None = None
-            async for piece in manager_stream(request):
-                if isinstance(piece, InferenceResponse):
-                    final = piece
-                    continue
+            terminal_emitted = False
+            try:
+                async for piece in manager_stream(request):
+                    if isinstance(piece, InferenceResponse):
+                        final = piece
+                        continue
+                    delta_index = index
+                    index += 1  # count deltas DELIVERED, before the yield suspends us
+                    yield StreamDelta(
+                        request_id=request.request_id,
+                        delta=str(piece),
+                        index=delta_index,
+                    )
+                if final is None:
+                    # The provider never surfaced a final response object; materialize
+                    # one via run(), which emits its own REQUESTED/terminal pair — so
+                    # we must not double-emit a terminal for this sub-case.
+                    final = await self.run(request)
+                    terminal_emitted = True
+                if not terminal_emitted:
+                    await self._emit_stream_terminal(request, final, started)
+                    terminal_emitted = True
                 yield StreamDelta(
-                    request_id=request.request_id, delta=str(piece), index=index
+                    request_id=request.request_id,
+                    delta="",
+                    index=index,
+                    done=True,
+                    response=final,
                 )
-                index += 1
-            if final is None:
-                final = await self.run(request)
-            yield StreamDelta(
-                request_id=request.request_id,
-                delta="",
-                index=index,
-                done=True,
-                response=final,
-            )
+            finally:
+                if not terminal_emitted:
+                    # Consumer disconnected before the stream completed. Record the
+                    # terminal event so the (possibly billed) partial run is audited.
+                    await self._emit_stream_terminal(
+                        request, final, started, cancelled=True, deltas=index
+                    )
             return
 
         # Offline fallback: buffer via run(), then emit deterministic chunks.
@@ -423,6 +454,51 @@ class InferenceService:
         """Exponential backoff with jitter for retry attempt ``attempt`` (0-based)."""
         base: float = self._retry_base_delay_seconds * (2**attempt)
         return base + random.uniform(0.0, self._retry_jitter_seconds)
+
+    async def _emit_stream_terminal(
+        self,
+        request: InferenceRequest,
+        final: InferenceResponse | None,
+        started: float,
+        *,
+        cancelled: bool = False,
+        deltas: int = 0,
+    ) -> None:
+        """Emit the terminal lifecycle event for a provider-streamed inference.
+
+        Mirrors run()'s SUCCEEDED/FAILED accounting so a streamed run carries the
+        same usage audit. ``cancelled`` marks an early consumer disconnect: if the
+        provider had already surfaced ``final`` we still record its real usage;
+        otherwise we have no token counts, so we emit a FAILED terminal recording
+        how many deltas reached the consumer rather than silently dropping the run.
+        """
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        if final is not None and final.status == InferenceStatus.SUCCESS:
+            await self._emit(
+                EventType.INFERENCE_SUCCEEDED,
+                request_id=request.request_id,
+                latency_ms=latency_ms,
+                cost=final.cost,
+                payload={
+                    "input_tokens": final.input_tokens,
+                    "output_tokens": final.output_tokens,
+                    "streamed": True,
+                    "cancelled": cancelled,
+                    **cache_metrics_payload(request, final),
+                },
+            )
+            return
+        await self._emit(
+            EventType.INFERENCE_FAILED,
+            request_id=request.request_id,
+            latency_ms=latency_ms,
+            error=(
+                "stream cancelled before completion"
+                if cancelled
+                else (final.error.message if final and final.error else "unknown")
+            ),
+            payload={"streamed": True, "cancelled": cancelled, "partial_deltas": deltas},
+        )
 
     async def _emit(self, event_type: EventType, **kwargs: object) -> None:
         """Emit a lifecycle event to the sink if one is configured (best-effort)."""

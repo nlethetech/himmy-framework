@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from himmy.core.events import EventType
 from himmy.services.inference import (
     BatchInferenceRequest,
     BoundTool,
@@ -590,6 +591,96 @@ def test_run_stream_uses_manager_stream_when_present() -> None:
     assert deltas[-1].done is True
     text = deltas[-1].response.output_text or ""
     assert "".join(d.delta for d in deltas) == text
+
+
+# ---------------------------------------------- INF-12 streamed-audit parity
+class _RecordingSink:
+    """Captures lifecycle events emitted during a (streamed) inference."""
+
+    def __init__(self) -> None:
+        self.events: list = []
+
+    async def append_event(self, event: object) -> None:
+        self.events.append(event)
+
+
+class _ProviderStreamManager:
+    """A manager exposing generate_stream like the real pydantic-ai provider path.
+
+    It yields ``len(deltas)`` text pieces, then a terminal InferenceResponse that
+    carries the usage — exactly the shape that previously left run_stream emitting
+    no lifecycle events at all.
+    """
+
+    def __init__(self, deltas: list[str]) -> None:
+        self._deltas = deltas
+
+    async def generate_stream(self, request: InferenceRequest):
+        for piece in self._deltas:
+            yield piece
+        yield InferenceResponse(
+            request_id=request.request_id,
+            status=InferenceStatus.SUCCESS,
+            output_text="".join(self._deltas),
+            input_tokens=11,
+            output_tokens=7,
+            cost=0.0,
+        )
+
+
+def test_streamed_run_emits_usage_audit_on_full_consumption() -> None:
+    """A fully-consumed provider stream emits exactly one SUCCEEDED with usage."""
+    sink = _RecordingSink()
+    svc = InferenceService(_ProviderStreamManager(["Red", "Blue"]), event_sink=sink)
+    req = InferenceRequest(messages=[InferenceMessage(role="user", content="colors")])
+
+    async def _drain() -> None:
+        async for _ in svc.run_stream(req):
+            pass
+
+    run_async(_drain())
+    types = [e.event_type for e in sink.events]
+    assert types.count(EventType.INFERENCE_REQUESTED) == 1
+    succeeded = [e for e in sink.events if e.event_type == EventType.INFERENCE_SUCCEEDED]
+    assert len(succeeded) == 1  # exactly once — no double-count
+    assert not [e for e in sink.events if e.event_type == EventType.INFERENCE_FAILED]
+    assert succeeded[0].payload["streamed"] is True
+    assert succeeded[0].payload["input_tokens"] == 11
+    assert succeeded[0].payload["output_tokens"] == 7
+
+
+def test_streamed_run_emits_terminal_audit_on_early_disconnect() -> None:
+    """A consumer that disconnects mid-stream still gets exactly one terminal event.
+
+    Before INF-12 the provider path emitted nothing, so an early aclose() left the
+    (billable) partial run entirely unaudited. Now the finally emits a cancelled
+    terminal recording how many deltas reached the consumer.
+    """
+    sink = _RecordingSink()
+    svc = InferenceService(
+        _ProviderStreamManager(["Red", "Blue", "Green", "Gold"]), event_sink=sink
+    )
+    req = InferenceRequest(messages=[InferenceMessage(role="user", content="colors")])
+
+    async def _read_one_then_close() -> None:
+        gen = svc.run_stream(req)
+        first = await gen.__anext__()  # consume only the first delta
+        assert first.delta == "Red"
+        await gen.aclose()  # consumer disconnects before the stream completes
+
+    run_async(_read_one_then_close())
+    assert [e.event_type for e in sink.events].count(EventType.INFERENCE_REQUESTED) == 1
+    terminals = [
+        e
+        for e in sink.events
+        if e.event_type in (EventType.INFERENCE_SUCCEEDED, EventType.INFERENCE_FAILED)
+    ]
+    assert len(terminals) == 1  # exactly one terminal, never zero, never double
+    term = terminals[0]
+    assert term.event_type == EventType.INFERENCE_FAILED  # no final usage was reached
+    assert term.payload["cancelled"] is True
+    assert term.payload["streamed"] is True
+    assert term.payload["partial_deltas"] == 1
 
 
 # --------------------------------------------------------- INF-3 stub accounting
