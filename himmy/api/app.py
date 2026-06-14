@@ -117,6 +117,69 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
+    """Fail closed under the multi-tenant posture (G2), BEFORE the loopback shortcut.
+
+    A multi-tenant deployment (``HIMMY_MULTI_TENANT`` truthy, or any non-empty
+    ``HIMMY_AUTH_MODE``) MUST NOT run on an authenticator that mints every caller an
+    all-tenants admin. This check runs ahead of the off-loopback shortcut in
+    :func:`_enforce_auth_posture` precisely because a shared-key-only deploy
+    (``authenticator is not None``) would otherwise take the early return and skip
+    every guard — the named footgun would NOT be fixed.
+
+    When multi-tenant we require an authenticator that BINDS callers to tenants
+    (OIDC, or tenant-mapped API keys), read via ``getattr(..., "binds_tenants",
+    False)`` so a custom/legacy authenticator lacking the member fails CLOSED rather
+    than ``AttributeError``. We additionally HARD-REJECT the two unsafe escape hatches:
+    ``HIMMY_ALLOW_UNAUTHENTICATED`` (would re-open the ANONYMOUS all-tenants surface)
+    and a truthy ``HIMMY_ALLOW_OPERATOR_SPEC_TOOLS`` (would un-fail-close the RCE/SSRF
+    spec sanitizer for tenant-submitted specs). RBAC is on-by-construction once an
+    authenticator exists, but we also require ``build_access_policy()`` to resolve a
+    non-None policy so a broken ``HIMMY_RBAC_FILE`` can't silently disarm authz.
+
+    Note: ANY non-empty ``HIMMY_AUTH_MODE`` (incl. the ``apikey`` example in
+    values.yaml) now engages strictness — a previously-working shared-key-ONLY deploy
+    that also sets an auth mode will be refused until it configures tenant-binding auth
+    (a mapped-keys file or OIDC).
+    """
+    import os
+
+    from himmy.api.auth import build_access_policy, is_multi_tenant
+
+    if not is_multi_tenant():
+        return
+    if not getattr(authenticator, "binds_tenants", False):
+        raise HimmyError(
+            "refusing to start: a multi-tenant posture is configured "
+            "(HIMMY_MULTI_TENANT / HIMMY_AUTH_MODE) but the authenticator does not "
+            "bind callers to tenants — a shared-key-only or unauthenticated build "
+            "would run every caller as an all-tenants admin. Configure tenant-binding "
+            "auth (HIMMY_API_KEYS_FILE with per-tenant keys, or HIMMY_AUTH_MODE=oidc)."
+        )
+    truthy = ("1", "true", "yes")
+    if os.environ.get("HIMMY_ALLOW_UNAUTHENTICATED", "").lower() in truthy:
+        raise HimmyError(
+            "refusing to start: HIMMY_ALLOW_UNAUTHENTICATED is set under a "
+            "multi-tenant posture — that override would re-expose the ANONYMOUS "
+            "all-tenants admin surface. Remove it for a multi-tenant deployment."
+        )
+    if os.environ.get("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "").lower() in truthy:
+        raise HimmyError(
+            "refusing to start: HIMMY_ALLOW_OPERATOR_SPEC_TOOLS is set under a "
+            "multi-tenant posture — that override un-fail-closes the RCE/SSRF spec "
+            "sanitizer (tools_module/http_tools/mcp_servers) for tenant-submitted "
+            "specs. Remove it for a multi-tenant deployment."
+        )
+    # RBAC must resolve a usable policy (a broken HIMMY_RBAC_FILE would otherwise raise
+    # later or — worse — leave authz mis-wired). build_access_policy() returns the
+    # built-in DEFAULT_POLICY or a loaded file; a None here means authz is disarmed.
+    if build_access_policy() is None:  # pragma: no cover - defensive: build never None
+        raise HimmyError(
+            "refusing to start: no RBAC policy resolved under a multi-tenant posture "
+            "(check HIMMY_RBAC_FILE)."
+        )
+
+
 def _enforce_auth_posture(authenticator: object | None, bind_host: str) -> None:
     """Refuse to start an unauthenticated admin surface on a non-loopback bind.
 
@@ -125,8 +188,14 @@ def _enforce_auth_posture(authenticator: object | None, bind_host: str) -> None:
     with no authenticator would expose that admin surface to the network. We fail
     closed: such a combination raises unless the operator explicitly opts in via
     ``HIMMY_ALLOW_UNAUTHENTICATED=1`` (e.g. auth is terminated at a trusted proxy).
+
+    The multi-tenant fail-closed posture (G2) is checked FIRST — before the
+    off-loopback shortcut below — so a shared-key-only deploy (which would otherwise
+    satisfy ``authenticator is not None`` and return early) is still refused.
     """
     import os
+
+    _enforce_multi_tenant_posture(authenticator)
 
     if authenticator is not None or _is_loopback_host(bind_host):
         return
@@ -188,6 +257,47 @@ def _run_store_is_durable(container: ApiContainer) -> bool:
     from himmy.services.storage.sqlite import SqliteStorageService
 
     return isinstance(storage, (SqliteStorageService, PostgresStorageService))
+
+
+def _active_backend_name(container: ApiContainer) -> str:
+    """Name the container's storage backend for the readiness truth (G3): one of
+    ``postgres`` / ``sqlite`` / ``memory`` / ``none``.
+
+    Read by ``/readyz`` (G4): a ``postgres`` backend triggers the live ``SELECT 1`` +
+    applied-migration check; ``sqlite``/``memory`` are file-local/ephemeral and need no
+    network probe. Cheap ``isinstance`` so it is safe to call in the create_app body.
+    """
+    storage = getattr(container, "storage", None)
+    if storage is None:
+        return "none"
+    from himmy.services.storage.postgres import PostgresStorageService
+    from himmy.services.storage.sqlite import SqliteStorageService
+
+    if isinstance(storage, PostgresStorageService):
+        return "postgres"
+    if isinstance(storage, SqliteStorageService):
+        return "sqlite"
+    return "memory"
+
+
+def _record_durability_truth(
+    app: FastAPI,
+    container: ApiContainer,
+    *,
+    durable_requested: bool,
+    built_durable: bool,
+) -> None:
+    """Stamp the durability truth onto ``app.state`` for ``/readyz`` (G3).
+
+    Sets ``durable_requested`` (was a durable backend asked for), ``built_durable``
+    (did it actually wire), and ``active_backend`` (the resolved backend name). Called
+    in every lifespan branch — including the except-fallback that silently degrades to
+    in-memory — AND in the create_app body so a bare ``TestClient(create_app())`` (which
+    never enters the lifespan) does not ``AttributeError`` on ``/readyz``.
+    """
+    app.state.durable_requested = durable_requested
+    app.state.built_durable = built_durable
+    app.state.active_backend = _active_backend_name(container)
 
 
 def _rebind_container(app: FastAPI, container: ApiContainer) -> None:
@@ -285,6 +395,29 @@ def _build_lifespan(
                     exc_info=True,
                 )
                 active = container
+
+        # G3: record the durability truth on app.state for /readyz (G4), covering ALL
+        # branches — the self-built durable success (built_durable), its silent
+        # except-fallback to in-memory (durable WAS requested but NOT built → /readyz must
+        # report not-ready), the zero-DSN spine-rebind (no durable RUN store requested),
+        # AND the injected-container path (durability = whatever the injected container
+        # actually is, inferred from its resolved backend). A degraded-ephemeral pod is
+        # thus visible to the readiness probe instead of silently serving data-losing
+        # traffic under a 200 /health.
+        if upgrade_to_durable:
+            durable_requested = _wants_durable_store()
+            durable_built = built_durable
+        else:
+            # Injected container (the prod recipe): the operator already chose backends.
+            # Treat a durable resolved backend as both requested and built.
+            durable_requested = _active_backend_name(active) in ("postgres", "sqlite")
+            durable_built = durable_requested
+        _record_durability_truth(
+            app,
+            active,
+            durable_requested=durable_requested,
+            built_durable=durable_built,
+        )
 
         # K1: publish the RESOLVED durable storage process-wide so the synchronous
         # ``build_runtime_for_spec`` wiring (``StoreFactory.for_context(server=True)``)
@@ -483,6 +616,27 @@ def create_app(
     )
     app.state.container = container
 
+    # G3: stamp a SAFE-DEFAULT durability truth on app.state in the create_app BODY so a
+    # bare ``TestClient(create_app())`` WITHOUT a ``with`` block (a real test pattern that
+    # never enters the lifespan) does not AttributeError on /readyz. The truth is finalized
+    # by the lifespan when it actually wires the backend; here we report:
+    #   * NOT-ready (built_durable=False) when a durable backend was requested/injected but
+    #     not yet initialized — an uninitialized durable pod must not be marked ready;
+    #   * READY (durable_requested=False) when nothing durable was asked for (the zero-config
+    #     in-memory default and the loopback CLI/test path), so the offline surface is
+    #     byte-unchanged and /readyz returns 200 with no DB call.
+    _body_durable_requested = (
+        _wants_durable_store()
+        if container_was_none
+        else _active_backend_name(container) in ("postgres", "sqlite")
+    )
+    _record_durability_truth(
+        app,
+        container,
+        durable_requested=_body_durable_requested,
+        built_durable=False,
+    )
+
     # T2.2/T3c: point the routine scheduler at the SAME canonical run store the Studio
     # runs reader uses (``app.state.container.storage``), resolved dynamically so a
     # lifespan rebind to the durable store is reflected without re-wiring. Set in
@@ -597,8 +751,25 @@ def create_app(
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
-        """Liveness probe."""
+        """Liveness probe (process up). Stays 200 even when the pod is NOT ready."""
         return {"status": "ok"}
+
+    @app.get("/readyz", tags=["health"])
+    async def readyz(response: Response) -> dict[str, Any]:
+        """Readiness probe (can serve durable traffic) — distinct from /health (G4).
+
+        Returns 503 (with a JSON reason) when the pod cannot serve durable traffic:
+        a durable backend was requested but is NOT wired (degraded-ephemeral fallback);
+        OR the active backend is Postgres and a timeboxed ``SELECT 1`` fails (DB down);
+        OR the applied ``schema_migrations`` version is behind the code's max (pending
+        migration). The pure-SQLite / no-durable-requested path returns 200 with NO DB
+        call, preserving the offline-first default. K8s pulls a 503 pod from the Service
+        endpoints (it is NOT crash-looped — that's what the /health liveness probe is for).
+        """
+        ready, payload = await _readiness(app)
+        if not ready:
+            response.status_code = 503
+        return payload
 
     _install_security_headers(app)
     _install_studio_guard(app)
@@ -607,6 +778,65 @@ def create_app(
     # Mount the built Studio SPA last so its catch-all never shadows an API route.
     _mount_studio(app)
     return app
+
+
+async def _readiness(app: FastAPI) -> tuple[bool, dict[str, Any]]:
+    """Compute the readiness verdict + a JSON payload for ``/readyz`` (G4).
+
+    Reads the durability truth stamped on ``app.state`` (G3) and, for a Postgres backend,
+    probes the live pool via the PUBLIC :meth:`PostgresStorageService.ping` /
+    :meth:`applied_migration_versions` accessors (never the private pool, never a fresh
+    connection). Pure-SQLite / no-durable-requested short-circuits to ready with no DB call.
+    """
+    durable_requested = bool(getattr(app.state, "durable_requested", False))
+    built_durable = bool(getattr(app.state, "built_durable", False))
+    backend = str(getattr(app.state, "active_backend", "none"))
+
+    # Durable was asked for but never wired (the degraded in-memory fallback): not ready.
+    if durable_requested and not built_durable:
+        return False, {
+            "status": "not_ready",
+            "reason": "durable storage requested but not initialized",
+            "backend": backend,
+        }
+
+    # SQLite / in-memory / nothing durable: file-local or ephemeral, no network probe.
+    if backend != "postgres":
+        return True, {"status": "ready", "backend": backend}
+
+    # Postgres: it must answer + be at (or ahead of) the code's migration version.
+    storage = getattr(getattr(app.state, "container", None), "storage", None)
+    from himmy.services.storage.postgres import PostgresStorageService
+
+    if not isinstance(storage, PostgresStorageService):  # pragma: no cover - defensive
+        return False, {
+            "status": "not_ready",
+            "reason": "postgres backend recorded but storage handle missing",
+            "backend": backend,
+        }
+    if not await storage.ping():
+        return False, {
+            "status": "not_ready",
+            "reason": "postgres unreachable",
+            "backend": backend,
+        }
+    applied = await storage.applied_migration_versions()
+    code_max = PostgresStorageService.code_migration_version()
+    applied_max = max(applied) if applied else 0
+    if applied_max < code_max:
+        return False, {
+            "status": "not_ready",
+            "reason": "schema migrations behind code",
+            "backend": backend,
+            "applied_version": applied_max,
+            "code_version": code_max,
+        }
+    return True, {
+        "status": "ready",
+        "backend": backend,
+        "applied_version": applied_max,
+        "code_version": code_max,
+    }
 
 
 def _mount_inbound_connectors(app: FastAPI) -> None:
@@ -643,7 +873,15 @@ def studio_is_built() -> bool:
 
 # Path prefixes that must always resolve as API (never fall back to the SPA shell),
 # so an unknown API route still returns a real JSON 404.
-_STUDIO_API_PREFIXES = ("api/", "v1/", "health", "docs", "redoc", "openapi.json")
+_STUDIO_API_PREFIXES = (
+    "api/",
+    "v1/",
+    "health",
+    "readyz",
+    "docs",
+    "redoc",
+    "openapi.json",
+)
 
 
 def _mount_studio(app: FastAPI) -> None:

@@ -14,6 +14,7 @@ from himmy.api.auth.base import Authenticator, AuthError
 from himmy.api.auth.context import (
     build_authenticator,
     get_principal,
+    is_multi_tenant,
     principal_dependency,
     require_workspace,
     resolve_workspace,
@@ -32,6 +33,7 @@ __all__ = [
     "Principal",
     "ANONYMOUS",
     "build_authenticator",
+    "is_multi_tenant",
     "principal_dependency",
     "get_principal",
     "resolve_workspace",

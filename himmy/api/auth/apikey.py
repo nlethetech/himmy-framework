@@ -28,6 +28,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 DEFAULT_HEADER = "x-himmy-internal-key"
 
 
+#: Default roles a DEMOTED shared key receives under the multi-tenant posture (G1).
+#: ``operator`` reads + writes the operational surface (run/agent/knowledge/model/…)
+#: but holds NO tenant_ids and is ``all_tenants=False``, so ``resolve_workspace``
+#: 403s it off any tenant's data — it is useful for ops/diagnostics, not a tenant
+#: super-user. (Verified against ``DEFAULT_RBAC``: ``operator`` grants run/agent/
+#: knowledge/model/diagnostics read+write, so the demoted key is NOT 403-everywhere.)
+DEMOTED_SHARED_KEY_ROLES: tuple[str, ...] = ("operator",)
+
+
 class ApiKeyAuthenticator:
     """Authenticate a request by a header API key (shared or tenant-mapped)."""
 
@@ -37,13 +46,42 @@ class ApiKeyAuthenticator:
         shared_keys: set[str] | None = None,
         key_principals: dict[str, Principal] | None = None,
         header_name: str = DEFAULT_HEADER,
+        shared_key_roles: tuple[str, ...] | None = None,
     ) -> None:
-        """Wire shared keys (→ all-tenants) and/or mapped keys (→ bound principals)."""
+        """Wire shared keys (→ all-tenants) and/or mapped keys (→ bound principals).
+
+        ``shared_key_roles`` controls the posture of a *shared* (unmapped) key match:
+
+        * ``None`` (default) keeps the historical single-box behavior — a shared key
+          maps to an unrestricted ``all_tenants`` ``admin`` principal (the "internal
+          trusted boundary").
+        * A concrete role tuple (e.g. :data:`DEMOTED_SHARED_KEY_ROLES`) DEMOTES the
+          shared key to a tenant-bound-by-absence principal: ``all_tenants=False``,
+          no ``tenant_ids``, and exactly those roles. The multi-tenant fail-closed
+          posture (G2) passes this so a shared-key match can no longer act as a
+          cross-tenant admin, while remaining useful for ops/diagnostics routes.
+
+        Mapped keys (``key_principals``) are unaffected by this — they always bind to
+        their declared tenants.
+        """
         self._shared = set(shared_keys or set())
         self._mapped = dict(key_principals or {})
         self._header = header_name
+        self._shared_key_roles = shared_key_roles
         if not self._shared and not self._mapped:
             raise AuthError("ApiKeyAuthenticator needs at least one configured key")
+
+    @property
+    def binds_tenants(self) -> bool:
+        """Whether this authenticator binds callers to concrete tenants (G1).
+
+        True iff at least one tenant-mapped key is configured — those principals
+        carry ``tenant_ids`` and close the cross-tenant hole. A shared-key-ONLY
+        authenticator binds nobody (every shared match is all-tenants or, when
+        demoted, tenant-LESS), so it returns ``False`` and the multi-tenant posture
+        (G2) refuses to start on it.
+        """
+        return bool(self._mapped)
 
     def openapi_security_scheme(self) -> dict[str, dict[str, object]]:
         """Advertise the API-key header as an OpenAPI security scheme (for docs)."""
@@ -67,10 +105,16 @@ class ApiKeyAuthenticator:
                 return _with_ip(principal, ip)
         for key in self._shared:
             if hmac.compare_digest(provided, key):
+                # Default (shared_key_roles is None): the historical unrestricted
+                # all-tenants admin. Demoted (a role tuple supplied, e.g. under the
+                # G2 multi-tenant posture): NO tenant_ids, all_tenants=False, only the
+                # given roles — so resolve_workspace 403s it off any tenant's data.
+                roles = self._shared_key_roles
+                demoted = roles is not None
                 return Principal.build(
                     subject=f"apikey:{_fingerprint(key)}",
-                    all_tenants=True,
-                    roles=("admin",),
+                    all_tenants=not demoted,
+                    roles=roles if roles is not None else ("admin",),
                     auth_method="apikey",
                     source_ip=ip,
                 )
@@ -123,4 +167,9 @@ def load_key_principals(path: str | Path) -> dict[str, Principal]:
     return out
 
 
-__all__ = ["ApiKeyAuthenticator", "load_key_principals", "DEFAULT_HEADER"]
+__all__ = [
+    "ApiKeyAuthenticator",
+    "load_key_principals",
+    "DEFAULT_HEADER",
+    "DEMOTED_SHARED_KEY_ROLES",
+]

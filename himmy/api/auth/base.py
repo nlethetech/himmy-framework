@@ -32,6 +32,23 @@ class AuthError(HimmyError):
 class Authenticator(Protocol):
     """Resolves a request into a verified :class:`Principal` (or raises AuthError)."""
 
+    @property
+    def binds_tenants(self) -> bool:
+        """Whether this authenticator binds callers to specific tenants (G1).
+
+        ``True`` means a verified principal carries concrete ``tenant_ids`` (OIDC, or
+        tenant-mapped API keys) — the signal the multi-tenant fail-closed posture (G2)
+        keys on to refuse the two all-tenants-admin footguns (a shared-key-only deploy
+        that mints every caller an unrestricted admin, or an ANONYMOUS all-tenants
+        default). A shared-key-ONLY API-key authenticator binds nobody (``False``).
+
+        Declared read-only so a computed ``@property`` implementation satisfies the
+        Protocol. The posture check reads it via ``getattr(authenticator,
+        "binds_tenants", False)`` so a custom/legacy authenticator lacking the member
+        fails CLOSED (rejected), never ``AttributeError``.
+        """
+        ...
+
     async def authenticate(self, request: Request) -> Principal:
         """Return the verified principal, or raise :class:`AuthError` on failure."""
         ...

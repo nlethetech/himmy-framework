@@ -73,9 +73,16 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
-          # Probes hit the UNGUARDED /health endpoint. The Host: localhost
-          # header is sent defensively in case a future build extends the guard
-          # to /health — localhost is always allowed by the guard.
+          # Probes hit UNGUARDED health endpoints. The Host: localhost header is
+          # sent defensively in case a future build extends the guard to them —
+          # localhost is always allowed by the guard.
+          #
+          # Liveness uses /health (G5): it reports only that the PROCESS is up, so a
+          # pod that is alive-but-degraded (durable storage requested but not wired,
+          # or Postgres briefly unreachable) is NOT crash-looped — restarting it would
+          # not fix a database outage. Readiness uses /readyz, which returns 503 in
+          # exactly those degraded states, so K8s pulls the pod from the Service
+          # endpoints (stops routing traffic) while leaving it running to recover.
           livenessProbe:
             httpGet:
               path: /health
@@ -89,7 +96,7 @@ spec:
             failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           readinessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: http
               httpHeaders:
                 - name: Host

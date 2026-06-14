@@ -26,12 +26,32 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.api.auth.base import Authenticator
 
 
+def is_multi_tenant() -> bool:
+    """Whether the deployment has declared a multi-tenant fail-closed posture (G2).
+
+    The single source of truth both :func:`build_authenticator` (to DEMOTE a shared
+    key) and the startup posture check (to REFUSE a non-tenant-binding authenticator)
+    read, so the two never disagree. Truthy when ``HIMMY_MULTI_TENANT`` is set OR an
+    explicit ``HIMMY_AUTH_MODE`` (anything but empty/``none``) is configured — i.e.
+    ANY non-empty auth mode (incl. the ``apikey`` example in values.yaml) engages
+    strictness. Default (no env) is single-box, byte-unchanged.
+    """
+    if os.environ.get("HIMMY_MULTI_TENANT", "").lower() in ("1", "true", "yes"):
+        return True
+    return os.environ.get("HIMMY_AUTH_MODE", "").lower() not in ("", "none")
+
+
 def build_authenticator() -> Authenticator | None:
     """Select an authenticator from env, or ``None`` for the offline (no-auth) default.
 
     Precedence: OIDC (``HIMMY_AUTH_MODE=oidc``) ▸ API keys (mapped file and/or shared
     ``HIMMY_INTERNAL_API_KEY``) ▸ none. Mapped keys (``HIMMY_API_KEYS_FILE``) and a
     shared key can coexist.
+
+    Under the multi-tenant posture (:func:`is_multi_tenant`) a *shared* key is built
+    DEMOTED to operator-only (no tenant reach) so a shared-key match can no longer act
+    as a cross-tenant admin (G1); a shared-key-ONLY deploy is then additionally refused
+    at startup because it still binds nobody.
     """
     mode = os.environ.get("HIMMY_AUTH_MODE", "").lower()
     if mode == "oidc":
@@ -41,6 +61,7 @@ def build_authenticator() -> Authenticator | None:
 
     from himmy.api.auth.apikey import (
         DEFAULT_HEADER,
+        DEMOTED_SHARED_KEY_ROLES,
         ApiKeyAuthenticator,
         load_key_principals,
     )
@@ -58,7 +79,12 @@ def build_authenticator() -> Authenticator | None:
         mapped = load_key_principals(keys_file)
     if shared or mapped:
         return ApiKeyAuthenticator(
-            shared_keys=shared, key_principals=mapped, header_name=header
+            shared_keys=shared,
+            key_principals=mapped,
+            header_name=header,
+            shared_key_roles=(
+                DEMOTED_SHARED_KEY_ROLES if is_multi_tenant() else None
+            ),
         )
     return None
 
@@ -129,6 +155,7 @@ def require_workspace(request: Request, requested: str) -> str:
 
 __all__ = [
     "build_authenticator",
+    "is_multi_tenant",
     "principal_dependency",
     "get_principal",
     "resolve_workspace",

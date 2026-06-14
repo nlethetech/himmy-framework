@@ -104,6 +104,10 @@ def _as_ids(value: Any) -> list[str]:
 class OidcAuthenticator:
     """Authenticate a request by a verified OIDC Bearer JWT."""
 
+    #: OIDC always projects a verified subject (+ tenants/roles) from the token, so it
+    #: binds callers to an identity the multi-tenant posture (G2) can trust (G1).
+    binds_tenants: bool = True
+
     def __init__(
         self,
         *,

@@ -94,6 +94,23 @@ services:
       - himmy_state:/app/.himmy
       # App-managed secrets, read-only. Operator-provided files; never written.
       - ./secrets:/run/himmy-secrets:ro
+    # G5: gate on /readyz (not /health) — readiness flips to 503 until the Postgres
+    # backend is wired + migrated, so a dependent service waiting on
+    # `condition: service_healthy` only proceeds once Studio can actually serve durable
+    # traffic. start_period covers durable-backend wiring on first boot. Host=localhost
+    # passes the Studio loopback guard. (curl ships in the image — see Dockerfile.)
+    healthcheck:
+      test:
+        - "CMD"
+        - "curl"
+        - "-fsS"
+        - "-H"
+        - "Host: localhost"
+        - "http://127.0.0.1:8765/readyz"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     depends_on:
       postgres:
         condition: service_healthy

@@ -2291,6 +2291,54 @@ class PostgresStorageService:
                 )
         return applied
 
+    async def ping(self, *, timeout: float = 2.0) -> bool:
+        """Timeboxed ``SELECT 1`` over the pool — True iff the database is reachable (G4).
+
+        A PUBLIC accessor reusing the service's own pool (no fresh ``asyncpg.connect``,
+        no reach into the private ``_require_pool``) so ``/readyz`` can probe liveness of
+        the durable backend on every readiness check. Any failure (pool closed, DB down,
+        timeout) returns ``False`` rather than raising, so the caller maps it to a 503.
+        """
+        import asyncio
+
+        pool = self._pool
+        if pool is None:
+            return False
+        try:
+            async with pool.acquire() as conn:
+                await asyncio.wait_for(conn.execute("SELECT 1"), timeout=timeout)
+            return True
+        except Exception:  # noqa: BLE001 - readiness probe: never raise, report down
+            return False
+
+    async def applied_migration_versions(self, *, timeout: float = 2.0) -> list[int]:
+        """The migration versions recorded in ``schema_migrations`` (G4).
+
+        PUBLIC, pool-backed (reuses the :meth:`migrate` / ``commands.py`` query shape
+        ``SELECT version FROM schema_migrations``) so ``/readyz`` can compare the
+        APPLIED schema against the code's ``max(STORAGE_MIGRATIONS)`` and refuse readiness
+        when a pod is running ahead of its database (pending migrations). Returns ``[]``
+        on any error so the caller can treat "can't read migrations" as not-ready.
+        """
+        import asyncio
+
+        pool = self._pool
+        if pool is None:
+            return []
+        try:
+            async with pool.acquire() as conn:
+                rows = await asyncio.wait_for(
+                    conn.fetch("SELECT version FROM schema_migrations"), timeout=timeout
+                )
+            return sorted(int(row["version"]) for row in rows)
+        except Exception:  # noqa: BLE001 - readiness probe: never raise, report empty
+            return []
+
+    @staticmethod
+    def code_migration_version() -> int:
+        """The highest migration version shipped in this code (``max`` of the chain) (G4)."""
+        return max(version for version, _, _ in STORAGE_MIGRATIONS)
+
     def _require_pool(self) -> Any:
         """Return the live pool or raise a clear HimmyError."""
         if self._pool is None:

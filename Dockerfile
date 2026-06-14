@@ -47,7 +47,13 @@ RUN mkdir -p /app/.himmy && chown himmy /app/.himmy
 USER himmy
 
 EXPOSE 8765
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8765/health || exit 1
+# Probe /readyz (G5): unlike /health (liveness, process-up), /readyz returns 503 when
+# the pod cannot serve durable traffic (durable storage requested-but-unwired, Postgres
+# unreachable, or migrations behind code). Caveat: a Docker HEALTHCHECK marks the
+# CONTAINER unhealthy (it does not pull it from a load balancer the way a K8s readiness
+# probe removes a Service endpoint) — under an orchestrator, prefer the Helm readiness
+# probe for traffic removal. The longer start-period covers durable-backend wiring.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8765/readyz || exit 1
 
 CMD ["himmy", "studio", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]
