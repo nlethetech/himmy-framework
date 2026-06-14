@@ -259,6 +259,28 @@ class InferenceService:
                 continue
             break
 
+        # Cache-degradation (robustness): prompt caching is a pure optimization that
+        # must NEVER break a request. A cache-enabled request that FAILED with a client
+        # INVALID_REQUEST is almost always the cache hint hitting a route that does not
+        # support prompt caching — e.g. OpenRouter routing an ``anthropic/*`` model to
+        # Amazon Bedrock, which rejects the ``cache_control`` block with a 400
+        # ("...did not allow prompt caching"). Fake clients can't reproduce this, so it
+        # only surfaces live. Retry ONCE through the full pipeline with the cache hint
+        # stripped; the re-run carries ``cache_policy=None`` so it can never re-degrade
+        # (no loop). If it also fails, the real error is surfaced.
+        if (
+            last_response is not None
+            and last_response.status != InferenceStatus.SUCCESS
+            and request.cache_policy is not None
+            and request.cache_policy.enabled
+            and last_response.error is not None
+            and last_response.error.code == InferenceErrorCode.INVALID_REQUEST
+        ):
+            degraded = await self.run(request.model_copy(update={"cache_policy": None}))
+            if degraded.status == InferenceStatus.SUCCESS:
+                degraded.metadata = {**(degraded.metadata or {}), "cache_degraded": True}
+            return degraded
+
         # Exhausted: stamp latency and emit the failure.
         assert last_response is not None
         last_response.latency_ms = (time.perf_counter() - started) * 1000.0

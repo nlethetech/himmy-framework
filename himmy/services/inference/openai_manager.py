@@ -276,6 +276,7 @@ class OpenAIClientManager:
         if rf is not None:
             payload["response_format"] = rf
         self._apply_prompt_cache_key(request, model, payload)
+        self._apply_usage_accounting(payload)
         if self._default_headers:
             payload["extra_headers"] = dict(self._default_headers)
 
@@ -361,6 +362,24 @@ class OpenAIClientManager:
         assert policy is not None  # narrowed by cache_policy_active
         if policy.cache_key and is_openai_family_model(model):
             payload["prompt_cache_key"] = policy.cache_key
+
+    def _apply_usage_accounting(self, payload: dict[str, Any]) -> None:
+        """Opt OpenRouter into detailed usage accounting (``usage: {include: true}``).
+
+        Direct OpenAI/Groq/Together return ``prompt_tokens_details.cached_tokens`` in the
+        usage object automatically, so :func:`read_openai_usage` already sees cache reads.
+        OpenRouter, however, OMITS ``prompt_tokens_details`` (and upstream cost) UNLESS the
+        request opts in with ``usage: {"include": true}``. Without it, the provider still
+        serves the cache upstream — the cost is just invisible to our accounting, so
+        ``cache_read_tokens`` / ``cache_savings_usd`` would read zero on a real hit. Gated on
+        ``provider_name == "openrouter"`` so the direct-OpenAI contract surface is untouched.
+        Passed via ``extra_body`` (a non-standard field the SDK forwards verbatim).
+        """
+        if self.provider_name != "openrouter":
+            return
+        extra = dict(payload.get("extra_body") or {})
+        extra.setdefault("usage", {"include": True})
+        payload["extra_body"] = extra
 
     async def _map_completion(
         self,
@@ -451,6 +470,7 @@ class OpenAIClientManager:
         if params.get("max_tokens") is not None:
             payload["max_tokens"] = params["max_tokens"]
         self._apply_prompt_cache_key(request, model, payload)
+        self._apply_usage_accounting(payload)
         if self._default_headers:
             payload["extra_headers"] = dict(self._default_headers)
 

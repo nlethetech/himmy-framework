@@ -10,6 +10,7 @@ import pytest
 from himmy.services.inference import (
     BatchInferenceRequest,
     BoundTool,
+    CachePolicy,
     InferenceError,
     InferenceErrorCode,
     InferenceMessage,
@@ -216,6 +217,91 @@ def test_service_retries_only_retryable_failures() -> None:
     resp2 = run_async(svc2.run(InferenceRequest()))
     assert resp2.status == InferenceStatus.FAILED
     assert auth.calls == 1
+
+
+def test_cache_active_invalid_request_degrades_to_uncached_success() -> None:
+    """A cache-active request that 400s (route can't cache) retries ONCE uncached.
+
+    Live regression: OpenRouter routing ``anthropic/claude-3-haiku`` to Amazon Bedrock
+    rejects the ``cache_control`` block with an INVALID_REQUEST 400. Prompt caching is a
+    pure optimization and must never break a request — so the service re-runs once with
+    the cache hint stripped and surfaces the working answer, stamping ``cache_degraded``.
+    """
+
+    class _BedrockLikeManager:
+        """FAILS INVALID_REQUEST while a cache policy is active; SUCCEEDS without one."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.saw_policies: list[CachePolicy | None] = []
+
+        def resolve(self, model_key: str) -> str:
+            return "anthropic/claude-3-haiku"
+
+        async def generate(self, request: InferenceRequest) -> InferenceResponse:
+            self.calls += 1
+            self.saw_policies.append(request.cache_policy)
+            if request.cache_policy is not None and request.cache_policy.enabled:
+                return InferenceResponse(
+                    request_id=request.request_id,
+                    status=InferenceStatus.FAILED,
+                    error=InferenceError(
+                        code=InferenceErrorCode.INVALID_REQUEST,
+                        message="this model did not allow prompt caching",
+                        retryable=False,
+                    ),
+                )
+            return InferenceResponse(
+                request_id=request.request_id,
+                status=InferenceStatus.SUCCESS,
+                output_text="alpha",
+            )
+
+    mgr = _BedrockLikeManager()
+    svc = InferenceService(mgr, retry_base_delay_seconds=0.0, retry_jitter_seconds=0.0)
+    resp = run_async(
+        svc.run(InferenceRequest(cache_policy=CachePolicy(enabled=True)))
+    )
+    assert resp.status == InferenceStatus.SUCCESS
+    assert resp.output_text == "alpha"
+    assert (resp.metadata or {}).get("cache_degraded") is True
+    # The degraded re-run carried cache_policy=None, so it cannot re-degrade (no loop).
+    assert mgr.saw_policies[-1] is None
+
+
+def test_cache_active_non_invalid_failure_is_not_degraded() -> None:
+    """A cache-active request that fails for a DIFFERENT reason is NOT silently retried.
+
+    Degradation only fires for INVALID_REQUEST (the caching-not-supported signal). An AUTH
+    failure must surface as-is, with no ``cache_degraded`` stamp and no second uncached run.
+    """
+
+    class _AuthManager:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(self, model_key: str) -> str:
+            return "auth"
+
+        async def generate(self, request: InferenceRequest) -> InferenceResponse:
+            self.calls += 1
+            return InferenceResponse(
+                request_id=request.request_id,
+                status=InferenceStatus.FAILED,
+                error=InferenceError(
+                    code=InferenceErrorCode.AUTH, message="bad key", retryable=False
+                ),
+            )
+
+    mgr = _AuthManager()
+    svc = InferenceService(mgr, retry_base_delay_seconds=0.0, retry_jitter_seconds=0.0)
+    resp = run_async(
+        svc.run(InferenceRequest(cache_policy=CachePolicy(enabled=True)))
+    )
+    assert resp.status == InferenceStatus.FAILED
+    assert resp.error is not None and resp.error.code == InferenceErrorCode.AUTH
+    assert (resp.metadata or {}).get("cache_degraded") is None
+    assert mgr.calls == 1  # no uncached retry for a non-caching failure
 
 
 def test_llmconfig_conflicting_format_raises() -> None:

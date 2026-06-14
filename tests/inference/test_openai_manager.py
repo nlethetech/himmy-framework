@@ -228,6 +228,35 @@ def test_model_passes_through_verbatim_to_create() -> None:
     assert resp.provider_name == "openrouter"
 
 
+def test_openrouter_opts_into_detailed_usage_accounting() -> None:
+    """An OpenRouter request carries ``extra_body={'usage': {'include': True}}``.
+
+    OpenRouter omits ``prompt_tokens_details.cached_tokens`` (and upstream cost) UNLESS the
+    request opts in. Without it a real cache hit serves upstream but reads zero in our
+    accounting. Gated on the openrouter provider so the direct-OpenAI surface is untouched.
+    """
+    client = _FakeClient(_completion(content="ok"))
+    mgr = OpenAIClientManager(
+        model="openai/gpt-4o-mini",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-unit",
+        client=client,
+        provider_name="openrouter",
+    )
+    run_async(mgr.generate(_req(model_key="openai/gpt-4o-mini")))
+
+    assert client.chat.completions.seen["extra_body"] == {"usage": {"include": True}}
+
+
+def test_direct_openai_does_not_send_usage_include() -> None:
+    """A direct (non-OpenRouter) OpenAI request keeps the lean surface — no ``extra_body``."""
+    client = _FakeClient(_completion(content="ok"))
+    mgr = OpenAIClientManager(model=PRICED_MODEL, client=client)  # provider_name="openai"
+    run_async(mgr.generate(_req()))
+
+    assert "extra_body" not in client.chat.completions.seen
+
+
 def test_default_headers_reach_client_and_each_request() -> None:
     """OpenRouter attribution headers reach the SDK client AND ride each create() call."""
     client = _FakeClient(_completion(content="hi"))
