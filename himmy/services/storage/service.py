@@ -151,6 +151,50 @@ class StorageService:
             run_id, workspace_id=workspace_id
         )
 
+    async def claim_next_queued_run(
+        self,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        lanes: list[str] | None = None,
+        now: str | None = None,
+    ) -> RunRecord | None:
+        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (Q2; or None)."""
+        return await self._run_store.claim_next_queued_run(
+            owner_id, lease_seconds, lanes=lanes, now=now
+        )
+
+    async def renew_lease(
+        self,
+        run_id: str,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        now: str | None = None,
+    ) -> bool:
+        """Extend a RUNNING run's lease iff ``owner_id`` still holds it (Q2)."""
+        return await self._run_store.renew_lease(
+            run_id, owner_id, lease_seconds, now=now
+        )
+
+    async def requeue_expired_leases(
+        self, *, now: str | None = None, lanes: list[str] | None = None
+    ) -> list[str]:
+        """Re-queue RUNNING runs whose lease expired; return the re-queued ids (Q2)."""
+        return await self._run_store.requeue_expired_leases(now=now, lanes=lanes)
+
+    async def redrive_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: str | None = None,
+        now: str | None = None,
+    ) -> bool:
+        """Reset a PARKED/FAILED run back to QUEUED for another attempt (Q2)."""
+        return await self._run_store.redrive_run(
+            run_id, workspace_id=workspace_id, now=now
+        )
+
     async def get_run(self, run_id: str) -> RunRecord | None:
         """Return a run record by id, or None."""
         return await self._run_store.get_run(run_id)

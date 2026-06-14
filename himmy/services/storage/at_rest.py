@@ -36,6 +36,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: dict is left untouched (legacy/plaintext rows).
 _ENC_PAYLOAD_FIELD = "__himmy_enc_payload__"
 
+#: Prefix marking an encrypted run-input blob (Q0). The blob is a single opaque STRING (the
+#: encrypted run-input JSON), not a dict envelope like the event payload, so a sentinel prefix
+#: is what distinguishes a ciphertext blob from a legacy/plaintext one on the decrypt path.
+_RUN_INPUT_ENC_PREFIX = "enc1:"
+
 
 class StorePayloadCipher:
     """Encrypt/decrypt the sensitive fields of durable storage payloads (at rest).
@@ -133,6 +138,30 @@ class StorePayloadCipher:
             return payload
         decoded = json.loads(self._enc.decrypt(token, aad=event_id.encode("utf-8")))
         return decoded if isinstance(decoded, dict) else payload
+
+    # ------------------------------------------------------------------- run input (Q0)
+    def encrypt_run_input(self, blob_json: str, *, run_id: str) -> str:
+        """Encrypt a serialized run-input JSON string, bound to ``run_id`` as AAD.
+
+        Returns a single opaque string carrying the :data:`_RUN_INPUT_ENC_PREFIX` sentinel.
+        Idempotent: an already-encrypted blob (one already carrying the prefix) is returned
+        untouched so re-saving a run never double-encrypts.
+        """
+        if blob_json.startswith(_RUN_INPUT_ENC_PREFIX):
+            return blob_json
+        token = self._enc.encrypt(blob_json, aad=run_id.encode("utf-8"))
+        return _RUN_INPUT_ENC_PREFIX + token
+
+    def decrypt_run_input(self, blob: str, *, run_id: str) -> str:
+        """Return the cleartext run-input JSON from an encrypted blob (or as-is).
+
+        A plaintext blob (a run persisted with encryption off, then read after a key was
+        configured, or vice-versa) lacks the sentinel prefix and is returned unchanged.
+        """
+        if not blob.startswith(_RUN_INPUT_ENC_PREFIX):
+            return blob
+        token = blob[len(_RUN_INPUT_ENC_PREFIX) :]
+        return self._enc.decrypt(token, aad=run_id.encode("utf-8"))
 
 
 def build_store_cipher() -> StorePayloadCipher | None:

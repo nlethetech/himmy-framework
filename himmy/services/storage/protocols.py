@@ -111,6 +111,36 @@ class RunStore(Protocol):
         self, run_id: str, *, workspace_id: str
     ) -> bool: ...
 
+    async def claim_next_queued_run(
+        self,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        lanes: list[str] | None = None,
+        now: str | None = None,
+    ) -> RunRecord | None: ...
+
+    async def renew_lease(
+        self,
+        run_id: str,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        now: str | None = None,
+    ) -> bool: ...
+
+    async def requeue_expired_leases(
+        self, *, now: str | None = None, lanes: list[str] | None = None
+    ) -> list[str]: ...
+
+    async def redrive_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: str | None = None,
+        now: str | None = None,
+    ) -> bool: ...
+
     async def get_run(self, run_id: str) -> RunRecord | None: ...
 
     async def list_runs(

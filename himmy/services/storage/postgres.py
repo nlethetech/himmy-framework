@@ -32,6 +32,8 @@ from typing import Any, cast
 
 from himmy.core.errors import HimmyError
 from himmy.core.events import RunEvent
+from himmy.core.ids import iso_plus_seconds as _iso_plus_seconds
+from himmy.core.ids import utc_now_iso
 from himmy.services.storage.at_rest import StorePayloadCipher, build_store_cipher
 from himmy.services.storage.models import (
     ActionRecord,
@@ -593,6 +595,47 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ON aux_conversations (tenant, subject_id)",
         ],
     ),
+    # v7 (Q1): the leased run work-queue surface on ``runs`` + the durable inbound
+    # ``trigger_dedup`` table — the Postgres lockstep of the SQLite v5 migration (the K2
+    # parity guard enforces it). The eight queue columns are explicit TYPED columns (the
+    # Postgres ``runs`` table is column-exploded, not a JSON blob), so the hand-written
+    # ``_RUN_UPSERT_BY_ID`` + ``_row_to_run`` are extended to round-trip them. ``input_blob``
+    # is the Q0 recoverable launch-input envelope (TEXT; encrypted at rest when a cipher is
+    # configured). Backfill keeps every legacy QUEUED row immediately claimable (attempt 0,
+    # ready at created_at). The two partial-ordered indexes give the Q2 claim CAS its
+    # (status, next_attempt_at) seek and the reaper its (status, lease_expires_at) seek;
+    # ``SKIP LOCKED`` rides the same index. ``IF NOT EXISTS`` makes fresh-vs-legacy converge.
+    (
+        7,
+        "run_queue_and_trigger_dedup",
+        [
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS owner_id TEXT",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL "
+            "DEFAULT 1",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS last_error TEXT",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS lane_key TEXT",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS input_blob TEXT",
+            "UPDATE runs SET next_attempt_at = created_at WHERE next_attempt_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS runs_status_next_attempt_idx "
+            "ON runs (status, next_attempt_at)",
+            "CREATE INDEX IF NOT EXISTS runs_status_lease_idx "
+            "ON runs (status, lease_expires_at)",
+            "CREATE INDEX IF NOT EXISTS runs_lane_key_idx ON runs (lane_key)",
+            "CREATE TABLE IF NOT EXISTS trigger_dedup ("
+            "scope TEXT NOT NULL, "
+            "key TEXT NOT NULL, "
+            "result TEXT, "
+            "expires_at TIMESTAMPTZ, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+            "PRIMARY KEY (scope, key))",
+            "CREATE INDEX IF NOT EXISTS trigger_dedup_expires_idx "
+            "ON trigger_dedup (expires_at)",
+        ],
+    ),
 ]
 
 
@@ -703,15 +746,29 @@ def _row_to_event(row: Any, *, cipher: StorePayloadCipher | None = None) -> RunE
     return RunEvent.model_validate(data)
 
 
-def _row_to_run(row: Any) -> RunRecord:
-    """Map a runs row to a RunRecord (timestamps normalised to ISO)."""
+def _row_to_run(row: Any, *, cipher: StorePayloadCipher | None = None) -> RunRecord:
+    """Map a runs row to a RunRecord (timestamps normalised to ISO).
+
+    The Q1 leased-queue TIMESTAMPTZ columns (lease_expires_at / heartbeat_at /
+    next_attempt_at) are normalised to ISO strings exactly like created_at/updated_at. When a
+    cipher is configured the Q0 ``input_blob`` envelope is decrypted back to cleartext
+    (idempotent on plaintext / legacy rows).
+    """
     data = dict(row)
     data["created_at"] = _iso(data.get("created_at"))
     data["updated_at"] = _iso(data.get("updated_at"))
+    for _ts_col in ("lease_expires_at", "heartbeat_at", "next_attempt_at"):
+        if _ts_col in data:
+            data[_ts_col] = _iso(data.get(_ts_col))
     data["metadata"] = data.get("metadata") or {}
     structured = data.get("output_structured")
     if isinstance(structured, dict) and set(structured.keys()) == {"value"}:
         data["output_structured"] = structured["value"]
+    blob = data.get("input_blob")
+    if cipher is not None and isinstance(blob, str) and blob:
+        data["input_blob"] = cipher.decrypt_run_input(
+            blob, run_id=str(data.get("run_id", ""))
+        )
     return RunRecord.model_validate(data)
 
 
@@ -1110,9 +1167,12 @@ class PostgresRunStore(_PgStoreBase):
                     (run_id, workspace_id, subject_id, task_id, thread_id,
                      snapshot_id, persona_name, model_key, idempotency_key, status,
                      output_text, output_structured, error, trace_id, metadata,
-                     created_at, updated_at)
+                     created_at, updated_at, owner_id, lease_expires_at, heartbeat_at,
+                     attempt, max_attempts, next_attempt_at, last_error, lane_key,
+                     input_blob)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                        $14, $15, $16, $17)
+                        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
+                        $26)
                 ON CONFLICT (workspace_id, idempotency_key)
                     WHERE idempotency_key IS NOT NULL
                     DO NOTHING
@@ -1130,7 +1190,7 @@ class PostgresRunStore(_PgStoreBase):
                 run.workspace_id,
                 run.idempotency_key,
             )
-        return _row_to_run(existing), False
+        return _row_to_run(existing, cipher=self._cipher), False
 
     async def claim_run_for_resume(
         self, run_id: str, *, workspace_id: str
@@ -1166,13 +1226,171 @@ class PostgresRunStore(_PgStoreBase):
             )
         return row is not None
 
+    # ----------------------------------------------------- leased work-queue (Q2)
+    async def claim_next_queued_run(
+        self,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        lanes: list[str] | None = None,
+        now: str | None = None,
+    ) -> RunRecord | None:
+        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (or None).
+
+        The structural twin of :meth:`claim_run_for_resume`, scaled to many concurrent
+        workers: ``SELECT … FOR UPDATE SKIP LOCKED`` grabs the oldest READY row (``QUEUED`` and
+        ``next_attempt_at <= now``) WITHOUT blocking on a row another worker already locked, so
+        N workers each claim a DISTINCT run with no contention — the Postgres-native at-most-
+        once dispatch. The selected row is flipped to ``RUNNING`` with owner/lease/heartbeat
+        stamped and ``attempt`` incremented, in the SAME transaction. ``lanes`` filters on
+        ``lane_key`` (Q2 lane keying) so a dispatcher whose LOCAL probe is down passes only the
+        cloud/default lanes and never blocks claiming cloud runs.
+        """
+        now_iso = now or utc_now_iso()
+        lease_until = _iso_plus_seconds(now_iso, lease_seconds)
+        if lanes is not None and not lanes:
+            return None
+        lane_clause = ""
+        params: list[Any] = [RunStatus.QUEUED.value, now_iso]
+        if lanes is not None:
+            params.append(list(lanes))
+            lane_clause = f" AND lane_key = ANY(${len(params)}::text[])"
+        pool = self._require_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            target = await conn.fetchrow(
+                "SELECT run_id FROM runs "
+                "WHERE status = $1 AND (next_attempt_at IS NULL OR next_attempt_at <= $2)"
+                f"{lane_clause} "
+                "ORDER BY next_attempt_at ASC NULLS FIRST, created_at ASC "
+                "FOR UPDATE SKIP LOCKED LIMIT 1",
+                *params,
+            )
+            if target is None:
+                return None
+            row = await conn.fetchrow(
+                """
+                UPDATE runs
+                SET status = $2, owner_id = $3, lease_expires_at = $4,
+                    heartbeat_at = $5, attempt = attempt + 1, updated_at = $5
+                WHERE run_id = $1
+                RETURNING *
+                """,
+                target["run_id"],
+                RunStatus.RUNNING.value,
+                owner_id,
+                lease_until,
+                now_iso,
+            )
+        return _row_to_run(row, cipher=self._cipher) if row is not None else None
+
+    async def renew_lease(
+        self,
+        run_id: str,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        now: str | None = None,
+    ) -> bool:
+        """Extend a RUNNING run's lease iff ``owner_id`` still holds it (True iff renewed)."""
+        now_iso = now or utc_now_iso()
+        lease_until = _iso_plus_seconds(now_iso, lease_seconds)
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE runs
+                SET lease_expires_at = $3, heartbeat_at = $4, updated_at = $4
+                WHERE run_id = $1 AND owner_id = $2 AND status = $5
+                RETURNING run_id
+                """,
+                run_id,
+                owner_id,
+                lease_until,
+                now_iso,
+                RunStatus.RUNNING.value,
+            )
+        return row is not None
+
+    async def requeue_expired_leases(
+        self, *, now: str | None = None, lanes: list[str] | None = None
+    ) -> list[str]:
+        """Re-queue RUNNING runs whose lease expired; return the re-queued run_ids.
+
+        ONLY ``status=RUNNING`` runs with ``lease_expires_at <= now`` are touched: a live peer
+        renewing its lease has a future deadline and is NEVER reaped, and AWAITING_APPROVAL/
+        RESOLVING/QUEUED/terminal runs are excluded by the status predicate (the HITL
+        exclusions). Each resets to ``QUEUED`` with owner/lease cleared and ``next_attempt_at``
+        set to ``now`` so it is immediately claimable. ``attempt`` is left as-is.
+        """
+        now_iso = now or utc_now_iso()
+        if lanes is not None and not lanes:
+            return []
+        lane_clause = ""
+        params: list[Any] = [
+            RunStatus.QUEUED.value,
+            now_iso,
+            RunStatus.RUNNING.value,
+        ]
+        if lanes is not None:
+            params.append(list(lanes))
+            lane_clause = f" AND lane_key = ANY(${len(params)}::text[])"
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "UPDATE runs SET status = $1, owner_id = NULL, lease_expires_at = NULL, "
+                "next_attempt_at = $2, updated_at = $2 "
+                "WHERE status = $3 AND lease_expires_at IS NOT NULL "
+                f"AND lease_expires_at <= $2{lane_clause} "
+                "RETURNING run_id",
+                *params,
+            )
+        return [r["run_id"] for r in rows]
+
+    async def redrive_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: str | None = None,
+        now: str | None = None,
+    ) -> bool:
+        """Reset a PARKED/FAILED run back to QUEUED for another attempt (True iff redriven).
+
+        Zeros ``attempt`` and clears ``last_error``/``error``/``owner_id``/``lease_expires_at``,
+        setting ``next_attempt_at`` to ``now`` so it is immediately claimable. Only ``PARKED``
+        and ``FAILED`` are redrivable; ``workspace_id`` scopes it (tenant safety).
+        """
+        now_iso = now or utc_now_iso()
+        ws_clause = ""
+        params: list[Any] = [run_id, RunStatus.QUEUED.value, now_iso]
+        if workspace_id is not None:
+            params.append(workspace_id)
+            ws_clause = f" AND workspace_id = ${len(params)}"
+        params.extend([RunStatus.PARKED.value, RunStatus.FAILED.value])
+        status_clause = f"status IN (${len(params) - 1}, ${len(params)})"
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE runs SET status = $2, attempt = 0, owner_id = NULL, "
+                "lease_expires_at = NULL, last_error = NULL, error = NULL, "
+                "next_attempt_at = $3, updated_at = $3 "
+                f"WHERE run_id = $1{ws_clause} AND {status_clause} "
+                "RETURNING run_id",
+                *params,
+            )
+        return row is not None
+
+    #: The 17 base columns + the 9 Q0/Q1 queue columns (owner_id … input_blob), so a run
+    #: upsert round-trips the full leased-queue surface. The base columns keep their original
+    #: positions ($1..$17) for an unchanged read; the queue columns are appended ($18..$26).
     _RUN_UPSERT_BY_ID = """
         INSERT INTO runs
             (run_id, workspace_id, subject_id, task_id, thread_id, snapshot_id,
              persona_name, model_key, idempotency_key, status, output_text,
-             output_structured, error, trace_id, metadata, created_at, updated_at)
+             output_structured, error, trace_id, metadata, created_at, updated_at,
+             owner_id, lease_expires_at, heartbeat_at, attempt, max_attempts,
+             next_attempt_at, last_error, lane_key, input_blob)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                $16, $17)
+                $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
         ON CONFLICT (run_id) DO UPDATE SET
             workspace_id = EXCLUDED.workspace_id,
             subject_id = EXCLUDED.subject_id,
@@ -1188,17 +1406,33 @@ class PostgresRunStore(_PgStoreBase):
             error = EXCLUDED.error,
             trace_id = EXCLUDED.trace_id,
             metadata = EXCLUDED.metadata,
-            updated_at = EXCLUDED.updated_at
+            updated_at = EXCLUDED.updated_at,
+            owner_id = EXCLUDED.owner_id,
+            lease_expires_at = EXCLUDED.lease_expires_at,
+            heartbeat_at = EXCLUDED.heartbeat_at,
+            attempt = EXCLUDED.attempt,
+            max_attempts = EXCLUDED.max_attempts,
+            next_attempt_at = EXCLUDED.next_attempt_at,
+            last_error = EXCLUDED.last_error,
+            lane_key = EXCLUDED.lane_key,
+            input_blob = EXCLUDED.input_blob
     """
 
-    @staticmethod
-    def _run_params(run: RunRecord) -> list[Any]:
-        """Positional params for the runs upsert (output_structured as jsonb)."""
+    def _run_params(self, run: RunRecord) -> list[Any]:
+        """Positional params for the runs upsert (output_structured as jsonb).
+
+        The Q0 ``input_blob`` is encrypted at rest (when a cipher is configured) bound to the
+        ``run_id`` as AAD — the recoverable launch input carries the prompt and gets the same
+        envelope as chat content / event payloads on this backend.
+        """
         structured = run.output_structured
         # output_structured is a jsonb column: the codec encodes dict/list; wrap
         # scalars/None so the bind type is unambiguous.
         if structured is not None and not isinstance(structured, (dict, list)):
             structured = {"value": structured}
+        input_blob = run.input_blob
+        if self._cipher is not None and input_blob:
+            input_blob = self._cipher.encrypt_run_input(input_blob, run_id=run.run_id)
         return [
             run.run_id,
             run.workspace_id,
@@ -1217,6 +1451,15 @@ class PostgresRunStore(_PgStoreBase):
             dict(run.metadata or {}),
             run.created_at,
             run.updated_at,
+            run.owner_id,
+            run.lease_expires_at,
+            run.heartbeat_at,
+            run.attempt,
+            run.max_attempts,
+            run.next_attempt_at or run.created_at,
+            run.last_error,
+            run.lane_key,
+            input_blob,
         ]
 
     async def get_run(self, run_id: str) -> RunRecord | None:
@@ -1224,7 +1467,7 @@ class PostgresRunStore(_PgStoreBase):
         pool = self._require_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM runs WHERE run_id = $1", run_id)
-        return _row_to_run(row) if row else None
+        return _row_to_run(row, cipher=self._cipher) if row else None
 
     async def list_runs(
         self,
@@ -1250,7 +1493,7 @@ class PostgresRunStore(_PgStoreBase):
             rows = await conn.fetch(
                 f"SELECT * FROM runs{where} ORDER BY created_at ASC", *params
             )
-        return [_row_to_run(r) for r in rows]
+        return [_row_to_run(r, cipher=self._cipher) for r in rows]
 
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str
@@ -1263,7 +1506,7 @@ class PostgresRunStore(_PgStoreBase):
                 workspace_id,
                 idempotency_key,
             )
-        return _row_to_run(row) if row else None
+        return _row_to_run(row, cipher=self._cipher) if row else None
 
 
 class PostgresAgentDefStore(_PgStoreBase):
@@ -1777,7 +2020,7 @@ class PostgresStorageService:
         )
         self._event_log = PostgresEventLog(self._require_pool, cipher=self._cipher)
         self._context_store = PostgresContextStore(self._require_pool)
-        self._run_store = PostgresRunStore(self._require_pool)
+        self._run_store = PostgresRunStore(self._require_pool, cipher=self._cipher)
         self._agent_def_store = PostgresAgentDefStore(self._require_pool)
         self._recommendation_store = PostgresRecommendationStore(self._require_pool)
         self._evaluation_store = PostgresEvaluationStore(self._require_pool)
@@ -2030,6 +2273,50 @@ class PostgresStorageService:
         """Atomically claim an AWAITING_APPROVAL run for resume (True iff we won)."""
         return await self._run_store.claim_run_for_resume(
             run_id, workspace_id=workspace_id
+        )
+
+    async def claim_next_queued_run(
+        self,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        lanes: list[str] | None = None,
+        now: str | None = None,
+    ) -> RunRecord | None:
+        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (Q2; or None)."""
+        return await self._run_store.claim_next_queued_run(
+            owner_id, lease_seconds, lanes=lanes, now=now
+        )
+
+    async def renew_lease(
+        self,
+        run_id: str,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        now: str | None = None,
+    ) -> bool:
+        """Extend a RUNNING run's lease iff ``owner_id`` still holds it (Q2)."""
+        return await self._run_store.renew_lease(
+            run_id, owner_id, lease_seconds, now=now
+        )
+
+    async def requeue_expired_leases(
+        self, *, now: str | None = None, lanes: list[str] | None = None
+    ) -> list[str]:
+        """Re-queue RUNNING runs whose lease expired; return the re-queued ids (Q2)."""
+        return await self._run_store.requeue_expired_leases(now=now, lanes=lanes)
+
+    async def redrive_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: str | None = None,
+        now: str | None = None,
+    ) -> bool:
+        """Reset a PARKED/FAILED run back to QUEUED for another attempt (Q2)."""
+        return await self._run_store.redrive_run(
+            run_id, workspace_id=workspace_id, now=now
         )
 
     async def get_run(self, run_id: str) -> RunRecord | None:

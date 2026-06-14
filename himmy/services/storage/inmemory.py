@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 from himmy.core.events import RunEvent
+from himmy.core.ids import iso_plus_seconds as _iso_plus_seconds
 from himmy.core.ids import utc_now_iso
 from himmy.services.storage.models import (
     ActionRecord,
@@ -208,6 +209,121 @@ class InMemoryRunStore:
             return False
         run.status = RunStatus.RESOLVING
         run.updated_at = utc_now_iso()
+        return True
+
+    async def claim_next_queued_run(
+        self,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        lanes: list[str] | None = None,
+        now: str | None = None,
+    ) -> RunRecord | None:
+        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (or None).
+
+        The in-memory analog of the SQLite/Postgres claim CAS: with NO ``await`` between the
+        scan and the mutation, two concurrent claims on one event loop cannot both win a run.
+        The oldest READY (``QUEUED`` and ``next_attempt_at <= now``) run is selected by
+        ``created_at`` order; ``lanes`` restricts it to the given ``lane_key`` set (Q2 lane
+        keying). The winner flips to ``RUNNING`` with owner/lease/heartbeat stamped and
+        ``attempt`` incremented.
+        """
+        now_iso = now or utc_now_iso()
+        if lanes is not None and not lanes:
+            return None
+        lane_set = set(lanes) if lanes is not None else None
+        ready = [
+            r
+            for r in self._runs.values()
+            if r.status == RunStatus.QUEUED
+            and (r.next_attempt_at is None or r.next_attempt_at <= now_iso)
+            and (lane_set is None or r.lane_key in lane_set)
+        ]
+        if not ready:
+            return None
+        # Oldest by next_attempt_at then created_at (insertion-order proxy), stable.
+        ready.sort(key=lambda r: (r.next_attempt_at or r.created_at, r.created_at))
+        run = ready[0]
+        run.status = RunStatus.RUNNING
+        run.owner_id = owner_id
+        run.lease_expires_at = _iso_plus_seconds(now_iso, lease_seconds)
+        run.heartbeat_at = now_iso
+        run.attempt = int(run.attempt or 0) + 1
+        run.updated_at = now_iso
+        return run
+
+    async def renew_lease(
+        self,
+        run_id: str,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        now: str | None = None,
+    ) -> bool:
+        """Extend a RUNNING run's lease iff ``owner_id`` still holds it (True iff renewed)."""
+        now_iso = now or utc_now_iso()
+        run = self._runs.get(run_id)
+        if run is None or run.owner_id != owner_id or run.status != RunStatus.RUNNING:
+            return False
+        run.lease_expires_at = _iso_plus_seconds(now_iso, lease_seconds)
+        run.heartbeat_at = now_iso
+        run.updated_at = now_iso
+        return True
+
+    async def requeue_expired_leases(
+        self, *, now: str | None = None, lanes: list[str] | None = None
+    ) -> list[str]:
+        """Re-queue RUNNING runs whose lease expired; return the re-queued run_ids.
+
+        Only ``RUNNING`` runs with ``lease_expires_at <= now`` are touched (a renewing peer
+        has a future deadline and is never reaped; HITL/terminal/QUEUED states are excluded by
+        the status predicate). Each resets to ``QUEUED`` with owner/lease cleared and
+        ``next_attempt_at`` set to ``now``.
+        """
+        now_iso = now or utc_now_iso()
+        if lanes is not None and not lanes:
+            return []
+        lane_set = set(lanes) if lanes is not None else None
+        requeued: list[str] = []
+        for run in self._runs.values():
+            if (
+                run.status == RunStatus.RUNNING
+                and run.lease_expires_at is not None
+                and run.lease_expires_at <= now_iso
+                and (lane_set is None or run.lane_key in lane_set)
+            ):
+                run.status = RunStatus.QUEUED
+                run.owner_id = None
+                run.lease_expires_at = None
+                run.next_attempt_at = now_iso
+                run.updated_at = now_iso
+                requeued.append(run.run_id)
+        return requeued
+
+    async def redrive_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: str | None = None,
+        now: str | None = None,
+    ) -> bool:
+        """Reset a PARKED/FAILED run back to QUEUED for another attempt (True iff redriven)."""
+        now_iso = now or utc_now_iso()
+        run = self._runs.get(run_id)
+        if (
+            run is None
+            or (workspace_id is not None and run.workspace_id != workspace_id)
+            or run.status not in (RunStatus.PARKED, RunStatus.FAILED)
+        ):
+            return False
+        run.status = RunStatus.QUEUED
+        run.attempt = 0
+        run.owner_id = None
+        run.lease_expires_at = None
+        run.last_error = None
+        run.error = None
+        run.next_attempt_at = now_iso
+        run.updated_at = now_iso
         return True
 
     def _index_idempotency(self, run: RunRecord) -> None:

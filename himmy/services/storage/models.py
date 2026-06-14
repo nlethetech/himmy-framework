@@ -51,6 +51,13 @@ class RunStatus(str, Enum):
     RESOLVING = "RESOLVING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    #: A run the leased queue gave up on after exhausting its retry budget (Q1/Q3): a
+    #: terminal-but-recoverable parking state, distinct from ``FAILED`` so an operator
+    #: can ``redrive`` it (reset attempt/next_attempt_at -> QUEUED) instead of the run
+    #: being indistinguishable from a clean application failure. Additive: nothing emits
+    #: it yet (the dispatcher in Q3 does), and the existing terminal-state checks treat it
+    #: like any non-active status.
+    PARKED = "PARKED"
 
 
 class RecommendationStatus(str, Enum):
@@ -63,7 +70,15 @@ class RecommendationStatus(str, Enum):
 
 
 class RunRecord(BaseModel):
-    """The operational unit of work: an async run's lifecycle, output, and lineage."""
+    """The operational unit of work: an async run's lifecycle, output, and lineage.
+
+    The trailing block of fields (``owner_id`` … ``lane_key`` + ``input_blob``) is the
+    Q0/Q1 *leased work-queue* surface. It is fully additive and dormant on the zero-config
+    offline path: a run created the old way leaves them at their defaults (``attempt=0``,
+    ``next_attempt_at`` stamped to ``created_at`` on first save, everything else ``None``),
+    so nothing changes until the leased dispatcher (Q3) starts claiming. They exist on the
+    record now so the Q1 migration that adds the matching DB columns has somewhere to map.
+    """
 
     run_id: str = Field(default_factory=new_uuid)
     workspace_id: str
@@ -82,6 +97,41 @@ class RunRecord(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
+
+    # ----------------------------------------------------- leased work-queue (Q0/Q1)
+    #: The worker/process that currently holds this run's lease (``claim_next_queued_run``
+    #: stamps it). ``None`` when unclaimed. NOT an ownership/authorization field — purely
+    #: the at-most-once dispatch lock holder.
+    owner_id: str | None = None
+    #: ISO-8601 instant after which an unrenewed RUNNING lease is considered expired and the
+    #: run is re-queuable by the reaper. ``None`` for a never-claimed / terminal run.
+    lease_expires_at: str | None = None
+    #: ISO-8601 instant of the last lease heartbeat from the owning worker (liveness telemetry
+    #: distinct from the hard ``lease_expires_at`` deadline).
+    heartbeat_at: str | None = None
+    #: How many times this run has been dispatched (incremented each claim). Drives the
+    #: retry/backoff budget; ``0`` for a freshly enqueued run.
+    attempt: int = 0
+    #: The retry ceiling: once ``attempt`` reaches it a transient-failed run is PARKED rather
+    #: than re-queued. The dispatcher (Q3) owns the policy; storage only persists the value.
+    max_attempts: int = 1
+    #: ISO-8601 earliest instant this run may be claimed (the backoff gate). Backfilled to
+    #: ``created_at`` so legacy/never-delayed runs are immediately claimable.
+    next_attempt_at: str | None = None
+    #: The most recent transient error that caused a re-queue (operator-facing; the terminal
+    #: error stays in ``error``).
+    last_error: str | None = None
+    #: The provider/probe LANE this run is claimed under (see
+    #: :func:`himmy.services.storage.run_lane.lane_for_model_key`). The claim predicate filters
+    #: on it so a stalled LOCAL-model probe cannot block claiming CLOUD-provider runs (Q2).
+    lane_key: str | None = None
+    #: The encrypted, recoverable run-input envelope (Q0): the serialized persona/task/
+    #: llm_config/agent_spec/flags a fresh process needs to RE-EXECUTE a crashed QUEUED run,
+    #: not merely re-record it. Built by :func:`himmy.services.storage.run_input.encode_run_input`
+    #: and routed through the StorePayloadCipher at-rest seam (prompts are sensitive). ``None``
+    #: for runs created without the recoverable-input path (back-compat / in-process-only
+    #: recovery).
+    input_blob: str | None = None
 
 
 class RecommendationItem(BaseModel):

@@ -2621,8 +2621,13 @@
         "type": "object"
       },
       "RunRecord": {
-        "description": "The operational unit of work: an async run's lifecycle, output, and lineage.",
+        "description": "The operational unit of work: an async run's lifecycle, output, and lineage.\n\nThe trailing block of fields (``owner_id`` \u2026 ``lane_key`` + ``input_blob``) is the\nQ0/Q1 *leased work-queue* surface. It is fully additive and dormant on the zero-config\noffline path: a run created the old way leaves them at their defaults (``attempt=0``,\n``next_attempt_at`` stamped to ``created_at`` on first save, everything else ``None``),\nso nothing changes until the leased dispatcher (Q3) starts claiming. They exist on the\nrecord now so the Q1 migration that adds the matching DB columns has somewhere to map.",
         "properties": {
+          "attempt": {
+            "default": 0,
+            "title": "Attempt",
+            "type": "integer"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -2638,6 +2643,17 @@
             ],
             "title": "Error"
           },
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          },
           "idempotency_key": {
             "anyOf": [
               {
@@ -2648,6 +2664,55 @@
               }
             ],
             "title": "Idempotency Key"
+          },
+          "input_blob": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Blob"
+          },
+          "lane_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lane Key"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "max_attempts": {
+            "default": 1,
+            "title": "Max Attempts",
+            "type": "integer"
           },
           "metadata": {
             "additionalProperties": true,
@@ -2665,6 +2730,17 @@
             ],
             "title": "Model Key"
           },
+          "next_attempt_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Attempt At"
+          },
           "output_structured": {
             "title": "Output Structured"
           },
@@ -2678,6 +2754,17 @@
               }
             ],
             "title": "Output Text"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Id"
           },
           "persona_name": {
             "anyOf": [
@@ -2770,7 +2857,8 @@
           "AWAITING_APPROVAL",
           "RESOLVING",
           "SUCCEEDED",
-          "FAILED"
+          "FAILED",
+          "PARKED"
         ],
         "title": "RunStatus",
         "type": "string"

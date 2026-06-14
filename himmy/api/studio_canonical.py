@@ -119,6 +119,11 @@ _RUN_STATUS_TO_STUDIO: dict[RunStatus, str] = {
     RunStatus.RESOLVING: "ok",
     RunStatus.SUCCEEDED: "ok",
     RunStatus.FAILED: "error",
+    # PARKED is the leased-queue give-up state (Q1): terminal-but-redrivable. It renders as
+    # "error" in the Studio GUI (the run did not complete) and MUST live here for the same
+    # reason RESOLVING does — this map is subscripted unguarded over every canonical run, so a
+    # missing key would KeyError-crash the Studio runs screen the moment any run is PARKED.
+    RunStatus.PARKED: "error",
 }
 
 #: Status ordering for the last-write-wins guard. A higher rank is "more advanced": a
@@ -134,6 +139,9 @@ _STATUS_RANK: dict[RunStatus, int] = {
     RunStatus.AWAITING_APPROVAL: 2,
     RunStatus.SUCCEEDED: 3,
     RunStatus.FAILED: 3,
+    # PARKED ranks terminal (like FAILED): the queue gave up, so a re-projected non-terminal
+    # row must never roll it back.
+    RunStatus.PARKED: 3,
 }
 
 

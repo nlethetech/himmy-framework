@@ -382,6 +382,73 @@ def test_notify_pg_mirror_tables_present() -> None:
     )
 
 
+#: The Q1 leased-queue columns promoted to REAL indexed columns on BOTH backends (SQLite v5 /
+#: Postgres v7) — these drive the claim CAS seek (status, next_attempt_at), the reaper seek
+#: (status, lease_expires_at), and the lane filter, so they MUST be queryable columns, not JSON.
+_RUN_QUEUE_COLUMNS = (
+    "owner_id",
+    "lease_expires_at",
+    "heartbeat_at",
+    "attempt",
+    "max_attempts",
+    "next_attempt_at",
+    "last_error",
+    "lane_key",
+)
+
+#: ``input_blob`` (Q0) is a DELIBERATE divergence in the same spirit as the whole ``runs`` row:
+#: a TYPED column on Postgres but a JSON-``payload`` field on SQLite (it is only ever read by
+#: run_id, never filtered, so SQLite does not need a column for it). Asserted explicitly so the
+#: divergence is documented, not accidental.
+_RUN_INPUT_BLOB_COLUMN = "input_blob"
+
+
+def _postgres_migration_text() -> str:
+    return "\n".join(stmt for _v, _n, stmts in STORAGE_MIGRATIONS for stmt in stmts)
+
+
+def test_q1_run_queue_columns_in_lockstep() -> None:
+    """Q1: the leased-queue columns exist on the live SQLite ``runs`` AND in the PG migration.
+
+    The ``runs`` table is the deliberately-divergent one (SQLite JSON blob vs Postgres typed
+    columns), so the table-presence guard above does not cover these columns; this asserts the
+    specific Q1 columns were added to BOTH chains in lockstep (the K2 must_fix for a new column).
+    """
+    import sqlite3
+    import tempfile
+    from pathlib import Path as _Path
+
+    with tempfile.TemporaryDirectory() as d:
+        path = str(_Path(d) / "storage.db")
+        SqliteStorageService(path)
+        conn = sqlite3.connect(path)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        finally:
+            conn.close()
+    for col in _RUN_QUEUE_COLUMNS:
+        assert col in cols, f"SQLite runs missing Q1 queue column {col!r}"
+    # input_blob is the documented divergence: NOT a SQLite column (it rides the JSON payload),
+    # but a typed column on Postgres.
+    assert _RUN_INPUT_BLOB_COLUMN not in cols
+
+    pg_text = _postgres_migration_text()
+    for col in (*_RUN_QUEUE_COLUMNS, _RUN_INPUT_BLOB_COLUMN):
+        assert f"ADD COLUMN IF NOT EXISTS {col}" in pg_text, (
+            f"Postgres runs migration missing Q1 queue column {col!r}"
+        )
+
+
+def test_q1_trigger_dedup_table_in_lockstep() -> None:
+    """Q1: ``trigger_dedup`` exists on the live SQLite schema AND in the Postgres migrations."""
+    assert "trigger_dedup" in _live_sqlite_core_tables()
+    assert "trigger_dedup" in _postgres_core_tables()
+    # It is a CORE table on both (not aux, not Postgres-only) — keep it out of the divergence
+    # allowlists so a future drop on one side reds the presence guard above.
+    assert "trigger_dedup" not in _POSTGRES_ONLY_TABLES
+    assert "trigger_dedup" not in _AUX_POSTGRES_TABLES
+
+
 def test_s3_conversation_subject_id_column_in_lockstep() -> None:
     """S3: the conversation ``subject_id`` linkage column exists on BOTH backends.
 
