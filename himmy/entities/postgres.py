@@ -80,13 +80,13 @@ CREATE INDEX IF NOT EXISTS entity_links_to_idx
 #: Ordered forward migrations for the Postgres audit spine, mirroring the SQLite spine's
 #: :data:`himmy.entities.sqlite_registry._MIGRATIONS` and copying the proven storage
 #: migrator (:data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`). Each entry is
-#: ``(version, name, [statements...])`` and is applied at most once, tracked in a
-#: ``schema_migrations`` table under a session-level ``pg_advisory_lock`` so two booting
-#: processes serialise. Migration 1 is the frozen base DDL (``CREATE ... IF NOT EXISTS``),
-#: so it is safe on a fresh or partially-migrated database. Append new entries here (never
-#: edit a shipped one) to evolve the spine beyond the version-1 shape in lock-step with the
-#: SQLite spine — the CI parity guard fails if one chain gains a table/column without the
-#: other.
+#: ``(version, name, [statements...])`` and is applied at most once, tracked in the
+#: :data:`SPINE_MIGRATIONS_TABLE` ledger under a session-level ``pg_advisory_lock`` so two
+#: booting processes serialise. Migration 1 is the frozen base DDL (``CREATE ... IF NOT
+#: EXISTS``), so it is safe on a fresh or partially-migrated database. Append new entries
+#: here (never edit a shipped one) to evolve the spine beyond the version-1 shape in
+#: lock-step with the SQLite spine — the CI parity guard fails if one chain gains a
+#: table/column without the other.
 SPINE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (
         1,
@@ -94,6 +94,16 @@ SPINE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
         [ENTITY_REGISTRY_DDL],
     ),
 ]
+
+#: Migration-tracking table for the spine, namespaced DISTINCTLY from the storage migrator's
+#: ``schema_migrations`` (:data:`himmy.services.storage.postgres.PostgresStorageService`).
+#: The advisory-lock keys already differ so the two runners never deadlock, but if an
+#: operator co-locates ``HIMMY_SPINE_DATABASE_URL`` and ``HIMMY_DATABASE_URL`` in the SAME
+#: Postgres database/schema, a SHARED ledger table would let whichever migrator ran first
+#: insert ``version=1`` and make the other's ``migrate()`` see ``{1}`` as done and SKIP its
+#: own base DDL (so the second store's tables would never be created). Owning a distinct
+#: table makes the two ledgers structurally incapable of colliding even when co-located.
+SPINE_MIGRATIONS_TABLE = "spine_schema_migrations"
 
 
 def _spine_migration_advisory_lock_key() -> int:
@@ -243,17 +253,22 @@ class PostgresEntityRegistry:
         """Run pending forward spine migrations; return the versions newly applied.
 
         Each migration in :data:`SPINE_MIGRATIONS` is applied at most once, tracked in the
-        ``schema_migrations`` table, inside a transaction. Migration 1 is the frozen base
-        DDL (``CREATE ... IF NOT EXISTS``), so this is safe on a fresh or partially-migrated
-        database. Concurrent migrators (two processes booting simultaneously) are serialised
-        by a session-level ``pg_advisory_lock`` on :data:`SPINE_MIGRATION_ADVISORY_LOCK_KEY`
-        (distinct from the storage migrator's key) held for the duration of the run: the
-        loser blocks until the winner finishes, re-reads ``schema_migrations`` and applies
-        nothing. This is a near-verbatim copy of
+        :data:`SPINE_MIGRATIONS_TABLE` (``spine_schema_migrations``) ledger inside a
+        transaction. The table is namespaced DISTINCTLY from the storage migrator's
+        ``schema_migrations`` so the two ledgers cannot collide even when an operator
+        co-locates the spine and storage in one Postgres database. Migration 1 is the frozen
+        base DDL (``CREATE ... IF NOT EXISTS``), so this is safe on a fresh or
+        partially-migrated database. Concurrent migrators (two processes booting
+        simultaneously) are serialised by a session-level ``pg_advisory_lock`` on
+        :data:`SPINE_MIGRATION_ADVISORY_LOCK_KEY` (distinct from the storage migrator's key)
+        held for the duration of the run: the loser blocks until the winner finishes,
+        re-reads the ledger and applies nothing. This is a near-verbatim copy of
         :meth:`himmy.services.storage.postgres.PostgresStorageService.migrate`.
         """
         pool = self._require_pool()
         applied: list[int] = []
+        # SPINE_MIGRATIONS_TABLE is a trusted module constant (never user input), so
+        # interpolating it into the DDL/DML below is not an injection surface.
         async with pool.acquire() as conn:
             await conn.execute(
                 "SELECT pg_advisory_lock($1)", SPINE_MIGRATION_ADVISORY_LOCK_KEY
@@ -261,15 +276,17 @@ class PostgresEntityRegistry:
             try:
                 # Bootstrap the tracking table so the first migration can record itself.
                 await conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {SPINE_MIGRATIONS_TABLE} (
                         version    INTEGER PRIMARY KEY,
                         name       TEXT NOT NULL,
                         applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
                     )
                     """
                 )
-                rows = await conn.fetch("SELECT version FROM schema_migrations")
+                rows = await conn.fetch(
+                    f"SELECT version FROM {SPINE_MIGRATIONS_TABLE}"
+                )
                 done = {r["version"] for r in rows}
                 for version, name, statements in sorted(SPINE_MIGRATIONS):
                     if version in done:
@@ -278,7 +295,7 @@ class PostgresEntityRegistry:
                         for statement in statements:
                             await conn.execute(statement)
                         await conn.execute(
-                            "INSERT INTO schema_migrations (version, name) "
+                            f"INSERT INTO {SPINE_MIGRATIONS_TABLE} (version, name) "
                             "VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
                             version,
                             name,
@@ -721,6 +738,7 @@ __all__ = [
     "PostgresEntityRegistry",
     "ENTITY_REGISTRY_DDL",
     "SPINE_MIGRATIONS",
+    "SPINE_MIGRATIONS_TABLE",
     "SPINE_MIGRATION_ADVISORY_LOCK_KEY",
     "record_id_for",
 ]

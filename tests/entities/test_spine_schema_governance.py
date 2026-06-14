@@ -8,8 +8,10 @@ that. This module pins the copied storage-migrator pattern on BOTH spines:
 * SQLite — ``PRAGMA user_version`` + frozen base + ordered :data:`_MIGRATIONS` under the
   write lock, so a legacy ``.himmy/spine.db`` steps forward and a fresh db converges to the
   same schema by either path.
-* Postgres — a ``schema_migrations`` ledger + ``pg_advisory_lock`` (driven against a fake
-  asyncpg-shaped pool offline; the live DB exercise belongs in the Postgres CI lane).
+* Postgres — a ``spine_schema_migrations`` ledger (namespaced DISTINCTLY from the storage
+  migrator's ``schema_migrations`` so the two cannot collide when co-located in one PG
+  database) + ``pg_advisory_lock`` (driven against a fake asyncpg-shaped pool offline; the
+  live DB exercise belongs in the Postgres CI lane).
 * A parity guard asserting the two spines declare identical tables/columns/indexes modulo a
   single, frozen, documented allowlist of deliberate dialect divergences.
 """
@@ -29,6 +31,7 @@ from himmy.entities import sqlite_registry as spine_mod
 from himmy.entities.postgres import (
     ENTITY_REGISTRY_DDL,
     SPINE_MIGRATIONS,
+    SPINE_MIGRATIONS_TABLE,
     PostgresEntityRegistry,
 )
 from himmy.entities.records import EntityRecord
@@ -175,6 +178,7 @@ class _FakeSpineDatabase:
     def __init__(self) -> None:
         self.migrations: dict[int, str] = {}
         self.applied_statements: list[str] = []
+        self.all_queries: list[str] = []  # every SQL the runner executed (verbatim)
         self.advisory_lock = asyncio.Lock()
         self.lock_acquires = 0
         self.lock_releases = 0
@@ -197,13 +201,14 @@ class _FakeConn:
 
     async def execute(self, query: str, *args: Any) -> str:
         await asyncio.sleep(0)  # yield so concurrent migrators interleave
+        self._db.all_queries.append(query)
         if "pg_advisory_lock" in query:
             await self._db.advisory_lock.acquire()
             self._db.lock_acquires += 1
         elif "pg_advisory_unlock" in query:
             self._db.advisory_lock.release()
             self._db.lock_releases += 1
-        elif "INSERT INTO schema_migrations" in query:
+        elif f"INSERT INTO {SPINE_MIGRATIONS_TABLE}" in query:
             version, name = args
             self._db.migrations.setdefault(version, name)
         elif query in _SPINE_MIGRATION_STATEMENTS:
@@ -212,6 +217,7 @@ class _FakeConn:
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         await asyncio.sleep(0)
+        self._db.all_queries.append(query)
         return [{"version": v} for v in self._db.migrations]
 
     def transaction(self) -> _FakeTxn:
@@ -268,6 +274,46 @@ def test_pg_spine_concurrent_migrate_applies_each_once() -> None:
         assert not db.advisory_lock.locked()
 
     run_async(scenario())
+
+
+def test_pg_spine_ledger_table_is_namespaced_distinctly_from_storage() -> None:
+    """The spine ledger table is ``spine_schema_migrations``, never the storage migrator's.
+
+    Co-locating ``HIMMY_SPINE_DATABASE_URL`` and ``HIMMY_DATABASE_URL`` in one Postgres
+    database must NOT let one migrator's ``version=1`` row make the other skip its own base
+    DDL. A distinct ledger table name is the structural guarantee against that collision.
+    """
+    db = _FakeSpineDatabase()
+
+    async def scenario() -> None:
+        reg = PostgresEntityRegistry(pool=_FakePool(db))
+        await reg.migrate()
+
+    # The spine owns a distinctly-named ledger constant.
+    assert SPINE_MIGRATIONS_TABLE == "spine_schema_migrations"
+    assert SPINE_MIGRATIONS_TABLE != "schema_migrations"
+
+    run_async(scenario())
+
+    # Every ledger statement the runner actually executed (CREATE / SELECT / INSERT) names
+    # the NAMESPACED table; NONE touches the bare ``schema_migrations`` the storage migrator
+    # owns. Asserting against the emitted SQL (not source strings) is robust to comments.
+    ledger_stmts = [
+        q
+        for q in db.all_queries
+        if SPINE_MIGRATIONS_TABLE in q or re.search(r"\bschema_migrations\b", q)
+    ]
+    assert ledger_stmts, "migrate() must touch its ledger table"
+    for stmt in ledger_stmts:
+        assert SPINE_MIGRATIONS_TABLE in stmt
+        # No statement references the bare storage ledger name on its own.
+        assert re.search(r"(?<!spine_)\bschema_migrations\b", stmt) is None
+    # Concretely: the CREATE and the INSERT both target the namespaced table.
+    assert any(
+        f"CREATE TABLE IF NOT EXISTS {SPINE_MIGRATIONS_TABLE}" in q
+        for q in db.all_queries
+    )
+    assert any(f"INSERT INTO {SPINE_MIGRATIONS_TABLE}" in q for q in db.all_queries)
 
 
 def test_pg_spine_migrate_uses_distinct_advisory_key_from_storage() -> None:

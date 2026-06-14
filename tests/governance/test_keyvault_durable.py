@@ -49,7 +49,7 @@ def test_destroy_is_durable_and_irrecoverable(tmp_path: Path) -> None:
     """
     path = str(tmp_path / "keyvault.db")
     v1 = SubjectKeyVault(path, meta_kek=None)
-    v1.key_for("alice")
+    alice_token = v1.encryptor_for("alice").encrypt("alice's record", aad=b"alice")
     v1.key_for("bob")  # control subject
     v1.close()
 
@@ -59,14 +59,54 @@ def test_destroy_is_durable_and_irrecoverable(tmp_path: Path) -> None:
     assert v2.destroy("alice") is True
     v2.close()
 
-    # Restart again: alice is irrecoverable, bob still decrypts.
+    # Restart again: alice's PRE-ERASURE ciphertext is irrecoverable, bob still decrypts.
     v3 = SubjectKeyVault(path, meta_kek=None)
-    assert v3.has("alice") is False
-    with pytest.raises(KeyError, match="alice"):
-        v3.encryptor_for("alice")  # refuses to re-mint (would silently un-shred)
+    assert v3.has("alice") is False  # the erased key is gone
+    # Re-accessing alice mints a FRESH key (re-onboarding); it CANNOT decrypt the old
+    # ciphertext — the shred is irrecoverable even though re-onboarding is allowed.
+    reminted = v3.encryptor_for("alice")
+    with pytest.raises(Exception):  # noqa: B017,PT011 - wrong key never decrypts old token
+        reminted.decrypt(alice_token, aad=b"alice")
     assert v3.has("bob") is True
     v3.encryptor_for("bob")  # control subject still works
     v3.close()
+
+
+def test_reonboard_after_erasure_mints_fresh_key_without_unshredding(
+    tmp_path: Path,
+) -> None:
+    """An erased subject that re-consents gets a FRESH key; the old shred is preserved.
+
+    Regression for the re-consent-after-erasure crash: ``key_for``/``encryptor_for`` must
+    NOT raise forever for a shredded subject (that hard-crashes a legitimate
+    erase-then-re-onboard flow), but the new key must NOT recover pre-erasure ciphertext.
+    """
+    path = str(tmp_path / "keyvault.db")
+    vault = SubjectKeyVault(path, meta_kek=None)
+    old_token = vault.encryptor_for("alice").encrypt("old secret", aad=b"alice")
+    old_key = vault.key_for("alice")
+
+    assert vault.destroy("alice") is True
+    assert vault.has("alice") is False
+
+    # Re-onboard: key_for now mints a fresh key + re-activates the row (no crash).
+    new_key = vault.key_for("alice")
+    assert new_key != old_key  # genuinely fresh material
+    assert vault.has("alice") is True  # row re-activated
+
+    # The fresh key cannot decrypt the pre-erasure ciphertext (shred preserved)...
+    with pytest.raises(Exception):  # noqa: B017,PT011
+        vault.encryptor_for("alice").decrypt(old_token, aad=b"alice")
+    # ...but DOES protect new data symmetrically.
+    new_token = vault.encryptor_for("alice").encrypt("new secret", aad=b"alice")
+    assert vault.encryptor_for("alice").decrypt(new_token, aad=b"alice") == "new secret"
+
+    # The re-activated row is live (cleared shredded_at, new key bytes) and survives restart.
+    vault.close()
+    restarted = SubjectKeyVault(path, meta_kek=None)
+    assert restarted.has("alice") is True
+    assert restarted.key_for("alice") == new_key
+    restarted.close()
 
 
 def test_destroy_returns_false_for_unknown_or_already_shredded(tmp_path: Path) -> None:

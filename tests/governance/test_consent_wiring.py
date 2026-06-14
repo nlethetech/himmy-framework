@@ -480,11 +480,11 @@ async def test_governed_chat_thread_carries_no_plaintext_conversation_on_spine(
     assert enc_contents and all(c.startswith(ENC_PREFIX) for c in enc_contents)
 
     # Erase the subject: the nested thread ciphertext is now permanently unrecoverable.
-    # The durable vault refuses to re-mint a key for the erased subject (which would
-    # silently un-shred), so re-access raises rather than returning a fresh (wrong) key.
+    # A later re-onboarding of the same subject mints a FRESH key (so re-consent doesn't
+    # crash), but that new key CANNOT decrypt the pre-erasure ciphertext — the shred holds.
     vault = container.retention_service._keys
     token = enc_contents[0]
     assert token  # ciphertext exists pre-erase
     ledger.withdraw("teacher_a")
-    with pytest.raises(KeyError, match="teacher_a"):
-        vault.encryptor_for("teacher_a")
+    with pytest.raises(Exception):  # noqa: B017,PT011 - re-minted key never decrypts old token
+        vault.encryptor_for("teacher_a").decrypt(token, aad=b"teacher_a")

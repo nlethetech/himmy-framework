@@ -84,6 +84,13 @@ class SubjectKeyVault:
     (the offline default), the raw key lives in the file, so **keyvault.db itself is the
     secret** and MUST share ``spine.db``'s backup/residency posture.
 
+    **Re-onboarding after erasure.** Erasing a subject (:meth:`destroy`) nulls the key
+    durably and irrecoverably. If the SAME external ``subject_id`` later re-consents and
+    needs a key again, :meth:`key_for` mints a FRESH key and re-activates the row in place
+    rather than refusing — the prior key bytes are already gone, so any pre-erasure
+    ciphertext stays permanently unrecoverable, while new data is protected under the new
+    key. This keeps an erase-then-re-onboard flow working without ever un-shredding the past.
+
     ``path`` defaults to ``:memory:`` so the zero-config CLI/eval path keeps the old ephemeral
     behavior byte-for-byte; the durable wiring (``api/deps.py``) passes the canonical
     ``.himmy/keyvault.db``.
@@ -154,8 +161,13 @@ class SubjectKeyVault:
     def key_for(self, subject_id: str) -> bytes:
         """Return (creating + persisting if needed) the subject's 32-byte key.
 
-        Raises :class:`KeyError` if the subject was already erased (its row exists with a
-        nulled key) — re-creating a key for an erased subject would silently undo the shred.
+        If the subject was previously erased (its row exists with a nulled key), a FRESH
+        key is minted and the row is re-activated (``shredded_at`` cleared, a new
+        ``wrapped_dek`` + ``key_version`` written, ``created_at`` restamped). This restores
+        a legitimate erase-then-re-onboard flow (same external ``subject_id`` re-grants
+        consent) WITHOUT undoing the original shred: the old key bytes were already nulled
+        on :meth:`destroy`, so any ciphertext written under the previous key stays
+        permanently unrecoverable. The new key only protects data written AFTER re-consent.
         """
         cached = self._cache.get(subject_id)
         if cached is not None:
@@ -169,9 +181,10 @@ class SubjectKeyVault:
             if row is not None:
                 wrapped, key_version, shredded_at = row
                 if shredded_at is not None or wrapped is None:
-                    raise KeyError(
-                        f"subject {subject_id!r} was erased; its key is destroyed."
-                    )
+                    # Erased subject re-onboarding: re-mint under a fresh key + re-activate
+                    # the row in place. The prior key bytes are gone (nulled on destroy),
+                    # so the shred remains irrecoverable for pre-erasure ciphertext.
+                    return self._remint_locked(subject_id)
                 key = self._unwrap(wrapped, key_version)
                 self._cache[subject_id] = key
                 return key
@@ -187,6 +200,26 @@ class SubjectKeyVault:
             self._conn.commit()
             self._cache[subject_id] = key
             return key
+
+    def _remint_locked(self, subject_id: str) -> bytes:
+        """Mint a fresh key for an erased subject and re-activate its row in place.
+
+        Caller must hold ``self._lock``. The old (nulled) key bytes are unrecoverable, so
+        re-minting cannot un-shred prior ciphertext — it only provisions a NEW key for data
+        written after re-consent. ``shredded_at`` is cleared and ``created_at`` restamped so
+        the row reflects the active re-onboarded key.
+        """
+        key = os.urandom(32)
+        wrapped, key_version = self._wrap(key)
+        self._conn.execute(
+            "UPDATE subject_keys "
+            "SET wrapped_dek = ?, key_version = ?, created_at = ?, shredded_at = NULL "
+            "WHERE subject_id = ?",
+            (wrapped, key_version, utc_now_iso(), subject_id),
+        )
+        self._conn.commit()
+        self._cache[subject_id] = key
+        return key
 
     def encryptor_for(self, subject_id: str) -> FieldEncryptor:
         """A :class:`FieldEncryptor` bound to the subject's key (subject-key-as-KEK)."""

@@ -30,12 +30,12 @@ def test_erase_subject_crypto_shreds_and_tombstones() -> None:
 
     tombstone = service.erase_subject("alice", reason="GDPR request #42")
 
-    # Crypto-shredded: the key is gone, so the ciphertext is unrecoverable. The durable
-    # vault refuses to re-mint a key for an erased subject (which would silently un-shred),
-    # so re-access raises rather than handing back a fresh (wrong) key.
+    # Crypto-shredded: the key is gone, so the ciphertext is unrecoverable. A later
+    # re-onboarding of the same subject mints a FRESH key (so re-consent doesn't crash), but
+    # that new key CANNOT decrypt the pre-erasure ciphertext — the shred is irrecoverable.
     assert vault.has("alice") is False
-    with pytest.raises(KeyError, match="alice"):
-        vault.encryptor_for("alice")
+    with pytest.raises(Exception):  # noqa: B017,PT011 - re-minted key never decrypts old token
+        vault.encryptor_for("alice").decrypt(token)
 
     # The tombstone is an immutable, audit-covered proof of erasure.
     assert tombstone.kind == ERASURE_KIND
