@@ -212,7 +212,9 @@ def _build_lifespan(
         # later in-process CLI/test run reverts to the in-memory default.
         from himmy.services.storage.factory import (
             reset_server_context,
+            reset_server_storage,
             set_server_context,
+            set_server_storage,
         )
 
         server_ctx_token = set_server_context(True)
@@ -262,6 +264,18 @@ def _build_lifespan(
                     exc_info=True,
                 )
                 active = container
+
+        # K1: publish the RESOLVED durable storage process-wide so the synchronous
+        # ``build_runtime_for_spec`` wiring (``StoreFactory.for_context(server=True)``)
+        # hands an in-server agent THIS backend — the actual Postgres/SQLite store the
+        # rest of the server uses — instead of silently opening a second local
+        # ``.himmy/storage.db`` under a ``postgres://`` DSN. ``active`` is the one resolved
+        # container in EVERY branch: the self-built durable path (built_durable), the
+        # zero-DSN spine-rebind path (rebuilt_for_spine), AND the injected-container path
+        # (``upgrade_to_durable=False`` — the documented prod recipe — where neither branch
+        # ran and ``active is container``). Resolving off ``active.storage`` therefore
+        # covers all three lifespan branches the reviewer required, with no second pool.
+        set_server_storage(getattr(active, "storage", None))
 
         # The routine canonical-storage provider is wired in ``create_app`` to read
         # ``app.state.container.storage`` dynamically, so the rebind above (to the
@@ -334,6 +348,23 @@ def _build_lifespan(
                 from himmy.api.routines import set_routine_container_provider
 
                 set_routine_container_provider(None)
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
+            # Tear down the shared aux-store background loop (K2) so a later in-process
+            # run does not inherit a loop bound to this (now-closed) deployment's pool.
+            try:
+                from himmy.services.storage.aux_store_factory import (
+                    reset_aux_store_factory,
+                )
+
+                reset_aux_store_factory()
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
+            # Clear the published server storage (K1) so a later in-process CLI/test run
+            # does not route through this (now-closed) container's store. Done before the
+            # context flag is reset so no window leaves the flag set with stale storage.
+            try:
+                reset_server_storage()
             except Exception:  # pragma: no cover - shutdown best-effort
                 pass
             # Clear the server-context flag so a subsequent in-process CLI/test run

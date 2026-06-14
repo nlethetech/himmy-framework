@@ -100,7 +100,10 @@ def get_notes_store() -> NotesStore:
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        _STORE = NotesStore(path)
+        # K2: route through the one aux-store selector (Postgres mirror = K5; None today).
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _STORE = select_aux_store(lambda: NotesStore(path))
         _PATH = path
     return _STORE
 

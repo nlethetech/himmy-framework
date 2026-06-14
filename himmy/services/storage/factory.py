@@ -42,6 +42,19 @@ HIMMY_STORE_PATH = ".himmy/storage.db"
 #: in-memory behaviour unchanged.
 _SERVER_CONTEXT: ContextVar[bool] = ContextVar("himmy_server_context", default=False)
 
+#: Process-wide holder for the RESOLVED durable storage the server lifespan wired (K1).
+#: The shared, *synchronous* ``build_runtime_for_spec`` wiring cannot ``await`` a Postgres
+#: pool, so :meth:`StoreFactory.for_context` historically returned the file-backed SQLite
+#: store even under a ``postgres://`` DSN — a silent split-brain where an agent wired
+#: INSIDE the server wrote its runs/threads/events to ``.himmy/storage.db`` while the rest
+#: of the server wrote to Postgres. The app lifespan now PUBLISHES the storage it actually
+#: resolved (Postgres or SQLite) here, so ``for_context(server=True)`` returns that one
+#: instance instead of opening a second backend. A plain module global (not a contextvar):
+#: the published instance must be visible across every task/thread the server spawns,
+#: which a contextvar — copied per task — cannot guarantee. ``None`` outside a server
+#: lifespan, so the CLI/offline/test paths are byte-identical to before.
+_SERVER_STORAGE: object | None = None
+
 
 def set_server_context(active: bool) -> object:
     """Set the server-context flag; returns a token to restore it later.
@@ -61,6 +74,32 @@ def reset_server_context(token: object) -> None:
 def in_server_context() -> bool:
     """True when the current process is running inside a server entrypoint."""
     return _SERVER_CONTEXT.get()
+
+
+def set_server_storage(storage: object | None) -> None:
+    """Publish the resolved durable storage for the process (K1).
+
+    Called by the FastAPI app lifespan AFTER it has resolved the storage backend
+    (Postgres under a DSN, or durable SQLite otherwise) in EVERY branch — the self-built
+    durable path, the zero-DSN spine-rebind path, and the injected-container path. Once
+    set, :meth:`StoreFactory.for_context` (server) hands this exact instance to the
+    synchronous spec wiring instead of opening a second SQLite store, closing the
+    Postgres split-brain. ``None`` clears it (the lifespan's ``finally``). Idempotent and
+    null-safe.
+    """
+    global _SERVER_STORAGE
+    _SERVER_STORAGE = storage
+
+
+def reset_server_storage() -> None:
+    """Clear the published server storage (lifespan shutdown). Idempotent."""
+    global _SERVER_STORAGE
+    _SERVER_STORAGE = None
+
+
+def server_storage() -> object | None:
+    """Return the published durable storage, or ``None`` outside a server lifespan."""
+    return _SERVER_STORAGE
 
 
 def _is_postgres_dsn(dsn: str | None) -> bool:
@@ -118,12 +157,20 @@ class StoreFactory:
         callers that KNOW they are the server pass ``True``).
 
         Used by the shared ``build_runtime_for_spec`` wiring, which is synchronous and so
-        cannot ``await`` a Postgres pool. In a server context it returns the file-backed
-        SQLite store at :data:`HIMMY_STORE_PATH` (durable, no event loop required); on the
-        CLI path it returns the in-memory store. The async, Postgres-capable
-        :meth:`for_server` is used by the API container where an event loop is available.
+        cannot ``await`` a Postgres pool. In a server context it returns the storage the
+        lifespan PUBLISHED via :func:`set_server_storage` (the resolved Postgres or durable
+        SQLite backend) — this closes the K1 split-brain where an agent wired inside a
+        Postgres-DSN server silently wrote to local ``.himmy/storage.db``. If nothing was
+        published (a zero-DSN server before the lifespan ran, or a path that never set it),
+        it falls back to the file-backed durable SQLite store at :data:`HIMMY_STORE_PATH`
+        exactly as before. On the CLI path it returns the in-memory store. The async,
+        Postgres-capable :meth:`for_server` is used by the API container where an event
+        loop is available.
         """
         if server if server is not None else in_server_context():
+            published = server_storage()
+            if published is not None:
+                return published
             cls._enforce_residency()
             return cls._sqlite_store()
         return cls.for_cli()
@@ -156,4 +203,7 @@ __all__ = [
     "set_server_context",
     "reset_server_context",
     "in_server_context",
+    "set_server_storage",
+    "reset_server_storage",
+    "server_storage",
 ]

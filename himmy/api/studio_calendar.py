@@ -95,7 +95,12 @@ def get_calendar_store() -> CalendarStore:
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        _STORE = CalendarStore(path)
+        # K2: route the backend choice through the one aux-store selector. The Postgres
+        # mirror lands in K5; until then the Postgres builder is None, so this resolves to
+        # the durable SQLite store byte-for-byte as before while the choke point is wired.
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _STORE = select_aux_store(lambda: CalendarStore(path))
         _PATH = path
     return _STORE
 

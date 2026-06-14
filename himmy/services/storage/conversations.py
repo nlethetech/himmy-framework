@@ -827,7 +827,10 @@ def get_conversation_store() -> ConversationStore:
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        _STORE = ConversationStore(path)
+        # K2: route through the one aux-store selector (Postgres mirror = K4; None today).
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _STORE = select_aux_store(lambda: ConversationStore(path))
         _PATH = path
         _maybe_import_legacy(_STORE, path)
     return _STORE

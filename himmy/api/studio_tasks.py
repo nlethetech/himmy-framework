@@ -110,7 +110,10 @@ def get_tasks_store() -> TasksStore:
     if _STORE is None or _PATH != path:
         if _STORE is not None:
             _STORE.close()
-        _STORE = TasksStore(path)
+        # K2: route through the one aux-store selector (Postgres mirror = K5; None today).
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _STORE = select_aux_store(lambda: TasksStore(path))
         _PATH = path
     return _STORE
 

@@ -37,13 +37,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 class _LoopThread:
-    """A dedicated daemon thread running one asyncio event loop for blocking calls."""
+    """A dedicated daemon thread running one asyncio event loop for blocking calls.
 
-    def __init__(self) -> None:
+    ``name`` labels the thread (default the spine loop) so a second, distinct loop —
+    e.g. the shared aux-store loop in
+    :mod:`himmy.services.storage.aux_store_factory` — is distinguishable in a stack
+    dump without forking this class.
+    """
+
+    def __init__(self, name: str = "himmy-spine-loop") -> None:
         self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._run, name="himmy-spine-loop", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
@@ -209,4 +213,4 @@ class SyncPostgresEntityRegistry:
         )
 
 
-__all__ = ["SyncPostgresEntityRegistry"]
+__all__ = ["SyncPostgresEntityRegistry", "_LoopThread"]

@@ -260,7 +260,13 @@ def test_evidence_memory_orchestration_crud() -> None:
 
 
 def test_postgres_scaffold_imports_and_exposes_ddl() -> None:
-    """The Postgres scaffold imports offline and ships an inspectable DDL string."""
+    """The Postgres scaffold imports offline and ships an inspectable DDL string.
+
+    NOTE: this is an import/offline smoke check only. The real SQLite<->Postgres schema
+    *parity* guard (which fails when a table/object is added to one chain but not the
+    other) lives in ``tests/storage/test_schema_parity.py`` (K2) — these string-contents
+    assertions deliberately stay as a cheap offline tripwire that the DDL is well-formed.
+    """
     from himmy.services.storage.postgres import STORAGE_DDL, STORAGE_MIGRATIONS
 
     assert "CREATE TABLE IF NOT EXISTS" in STORAGE_DDL

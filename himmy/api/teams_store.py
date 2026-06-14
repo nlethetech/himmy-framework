@@ -432,7 +432,10 @@ def get_teams_store() -> TeamsStore:
     if _TEAMS_STORE is None or _TEAMS_PATH != path:
         if _TEAMS_STORE is not None:
             _TEAMS_STORE.close()
-        _TEAMS_STORE = TeamsStore(path)
+        # K2: route through the one aux-store selector (Postgres mirror = K4; None today).
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _TEAMS_STORE = select_aux_store(lambda: TeamsStore(path))
         _TEAMS_PATH = path
     return _TEAMS_STORE
 
@@ -444,7 +447,10 @@ def get_workflows_store() -> WorkflowsStore:
     if _WORKFLOWS_STORE is None or _WORKFLOWS_PATH != path:
         if _WORKFLOWS_STORE is not None:
             _WORKFLOWS_STORE.close()
-        _WORKFLOWS_STORE = WorkflowsStore(path)
+        # K2: route through the one aux-store selector (Postgres mirror = K4; None today).
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _WORKFLOWS_STORE = select_aux_store(lambda: WorkflowsStore(path))
         _WORKFLOWS_PATH = path
     return _WORKFLOWS_STORE
 
@@ -500,7 +506,11 @@ def get_graph_checkpoint_store() -> object:
 
     path = graph_checkpoints_db_path()
     if not isinstance(_GRAPH_CP_STORE, SqliteGraphCheckpointStore) or _GRAPH_CP_PATH != path:
-        _GRAPH_CP_STORE = SqliteGraphCheckpointStore(path)
+        # K2: in a server context the durable backend choice routes through the one
+        # aux-store selector (tenant-scoped Postgres mirror = K3; None today → SQLite).
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _GRAPH_CP_STORE = select_aux_store(lambda: SqliteGraphCheckpointStore(path))
         _GRAPH_CP_PATH = path
     return _GRAPH_CP_STORE
 

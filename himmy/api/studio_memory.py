@@ -56,7 +56,10 @@ def get_memory_service() -> MemoryService:
 
         if _STORE is not None:
             _STORE.close()
-        _STORE = SqliteMemoryStore(path)
+        # K2: route through the one aux-store selector (Postgres mirror = K5; None today).
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _STORE = select_aux_store(lambda: SqliteMemoryStore(path))
         embedder, _dim = ToolkitConfig.from_env().build_embedder_and_dim()
         # P0-C: project every memory mutation onto the durable Studio entity spine
         # (memory_fact records + MEMORY_* audit events) — the dormant audit path,

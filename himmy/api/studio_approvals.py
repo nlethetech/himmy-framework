@@ -58,7 +58,12 @@ def get_checkpoint_store() -> SqliteCheckpointStore:
     if _STORE is None or _STORE_PATH != path:
         if _STORE is not None:
             _STORE.close()
-        _STORE = SqliteCheckpointStore(path)
+        # K2: route through the one aux-store selector. The tenant-scoped Postgres mirror
+        # for HITL checkpoints lands in K3; until then the Postgres builder is None and
+        # this resolves to the durable SQLite checkpoint store byte-for-byte.
+        from himmy.services.storage.aux_store_factory import select_aux_store
+
+        _STORE = select_aux_store(lambda: SqliteCheckpointStore(path))
         _STORE_PATH = path
     return _STORE
 
