@@ -137,7 +137,7 @@ gating, the pre/post hooks, timeout/retry, events, and entity lineage. See
 
 - `MCPServerSpec(command, args=[], env={}, cwd=None)` — `env` overlays the parent
   environment.
-- `MCPClient.connect(..., client_name="himmy", client_version="0.1.0", protocol_version=DEFAULT_PROTOCOL_VERSION, request_timeout=30.0)`.
+- `MCPClient.connect(..., client_name="himmy", client_version=None, protocol_version=DEFAULT_PROTOCOL_VERSION, request_timeout=30.0)`. A `None` `client_version` defaults to the installed himmy `__version__` (currently `0.2.0`).
 - `register_mcp_tools(..., prefix=, requires_approval=, names=)`.
 
 At the agent-spec layer, MCP servers are declared via `mcp_servers` on the

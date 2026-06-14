@@ -14,7 +14,7 @@ events can be projected to immutable, versioned `EntityRecord`s with typed links
 **append-only audit log + versioned `EntityRecord` snapshots + content-hashed record/replay**
 spine. State is reconstructed from the latest versioned snapshot (not by folding events).
 
-> **Pre-1.0, source-available, single-maintainer.** Version `0.1.0`. The offline build is
+> **Pre-1.0, source-available, single-maintainer.** Version `0.2.0`. The offline build is
 > reproducible and the bulk of the framework runs with no keys/network. There are **no**
 > third-party certifications (no SOC2, etc.). This is **not** an autonomous coding agent —
 > it does not edit your repo or run SWE-agent-style loops.
@@ -508,8 +508,23 @@ The audit/lineage spine is the `EntityRecord` model plus a registry of typed lin
   (FIFO), returning recorded responses **verbatim with the provider off** — **tools are not
   re-executed**, so replay is side-effect-free and deterministic. Matching excludes the
   `request_id`. CLI: `himmy run --record FILE` / `--replay FILE` (mutually exclusive).
-- **Trace.** `himmy run --trace` writes events to `.himmy/trace.db`; `himmy trace [thread]`
-  shows a thread's timeline or lists recent runs.
+- **Observability — three signals, all honest about what's on by default.**
+  - **Run-event tracing (durable, opt-in).** `himmy run --trace` writes the
+    `RunEvent` stream to `.himmy/trace.db`; `himmy trace [thread]` shows a thread's
+    timeline or lists recent runs. An optional Logfire/OpenTelemetry bridge mirrors
+    the same stream into a real OTel trace tree and is a **complete no-op unless
+    `HIMMY_LOGFIRE_ENABLED`** is truthy (it never imports `logfire` otherwise).
+  - **Prometheus metrics (`GET /metrics`).** The FastAPI app (`himmy serve` /
+    `himmy studio`) exposes request count, latency histogram, and in-flight gauge in
+    the Prometheus **text exposition format** at `GET /metrics` — labels are bounded
+    to method, the route *template* (e.g. `/v1/runs/{run_id}`, never the filled-in
+    path), and status class (`2xx`/`4xx`/…). It is **dependency-free and in-process**
+    (no new hard dep, no network), and the endpoint exposes no secrets.
+  - **Structured JSON logs (`HIMMY_LOG_FORMAT=json`).** Off by default (human-readable
+    output unchanged). Set `HIMMY_LOG_FORMAT=json` and each log line becomes one JSON
+    object (`timestamp`, `level`, `logger`, `message`, plus `request_id` when present —
+    the same id echoed in the `X-Request-ID` response header), ready for a log shipper.
+  - See [`docs/services/observability.md`](docs/services/observability.md) for the full picture.
 
 ---
 
@@ -560,7 +575,10 @@ all offline-capable, secrets file-delivered, single-writer-honest:
 
 The full runbook — configuration reference, reverse-proxy/TLS and the loopback-guard
 interplay, WAL-safe backup/restore, and the upgrade procedure — is in
-[`docs/enterprise/deployment.md`](docs/enterprise/deployment.md).
+[`docs/enterprise/deployment.md`](docs/enterprise/deployment.md). Backup and
+disaster recovery (SQLite + Postgres backup/restore, encryption-key escrow, and
+RPO/RTO guidance) have a dedicated runbook in
+[`docs/enterprise/backup-recovery.md`](docs/enterprise/backup-recovery.md).
 
 ---
 
@@ -591,7 +609,7 @@ base install pulls only `pydantic`, `pyyaml`, `httpx`.
 | `providers` | pydantic-ai | cloud/gateway model providers |
 | `postgres` | asyncpg | Postgres registry / storage / SQL |
 | `knowledge` | pgvector, openai, pypdf | pgvector KB + OpenAI embedder + PDF reading |
-| `observability` | logfire | tracing/metrics |
+| `observability` | logfire | the opt-in Logfire/OTel trace bridge (the `GET /metrics` Prometheus endpoint and JSON logs are dependency-free, no extra needed) |
 | `connectors` | feedparser, openpyxl | Nepali-news RSS + NRB Excel |
 | `nepal` | nepali-datetime | Bikram Sambat calendar |
 | `validation` | jsonschema | full JSON-Schema (offline falls back to a built-in subset) |
@@ -780,7 +798,7 @@ runtime (exit 2) rather than by argparse — e.g. `run`/`team` `--prompt`, `tele
 
 # Maturity & status
 
-- **Version `0.1.0`, pre-1.0, single-maintainer, source-available** (MIT). APIs may change.
+- **Version `0.2.0`, pre-1.0, single-maintainer, source-available** (MIT). APIs may change.
 - The **offline build is reproducible**: a bare install (3 deps) runs the core framework with
   no keys/network.
 - **No third-party certifications** (no SOC2 or equivalent). The security controls above are

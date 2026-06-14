@@ -62,7 +62,7 @@ himmy --version
 Expected output:
 
 ```
-himmy 0.1.0
+himmy 0.2.0
 ```
 
 If `himmy` isn't found, your Python scripts folder may not be on your `PATH`; you can

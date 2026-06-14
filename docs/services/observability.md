@@ -1,6 +1,24 @@
 # Observability
 
-> The run-event model (`RunEvent` + `EventType` + `EventSink`) and the sinks it flows to — a durable SQLite trace store plus opt-in, off-by-default Logfire/OpenTelemetry wiring.
+> The run-event model (`RunEvent` + `EventType` + `EventSink`) and the sinks it flows to — a durable SQLite trace store plus opt-in, off-by-default Logfire/OpenTelemetry wiring — alongside two operational signals on the FastAPI app: a `GET /metrics` Prometheus endpoint and an optional `HIMMY_LOG_FORMAT=json` structured-log toggle.
+
+## Three signals at a glance
+
+himmy exposes three independent observability signals. Be precise about what is
+on by default:
+
+| Signal | Surface | Default | Toggle |
+| --- | --- | --- | --- |
+| **Run-event tracing** | `RunEvent` stream → `.himmy/trace.db` (`himmy trace`) and an optional Logfire/OTel trace tree | trace.db on with `--trace`; Logfire bridge **off** | `himmy run --trace`; `HIMMY_LOGFIRE_ENABLED` for the bridge |
+| **Prometheus metrics** | `GET /metrics` text exposition on the FastAPI app | **on** when the API/Studio app is served (in-process, dependency-free) | none — always exposed by the served app |
+| **Structured JSON logs** | one JSON object per log line on the root logger | **off** (human-readable output unchanged) | `HIMMY_LOG_FORMAT=json` |
+
+The Prometheus endpoint and JSON logging live in
+`himmy/services/observability/metrics.py` and
+`himmy/services/observability/logging.py` and are wired onto the app in
+`himmy/api/app.py` (via `install_metrics(app)` and `configure_logging()`). Both
+are **no-ops on the zero-config/offline path** — collecting a few in-process
+counters costs nothing, and JSON logging stays off until the env toggle is set.
 
 ## Overview
 
@@ -119,6 +137,54 @@ misconfiguration: the switch is on but the `logfire` package is missing
 `retrieval_ctx`) are dropped from span attributes unless
 `HIMMY_LOGFIRE_INCLUDE_CONTENT` is truthy.
 
+### Prometheus metrics — `GET /metrics` (`metrics.py`)
+
+`himmy/services/observability/metrics.py` exposes the served FastAPI app
+(`himmy serve` / `himmy studio`) in the **Prometheus text exposition format** at
+`GET /metrics`. `install_metrics(app)` (called from `himmy/api/app.py`) adds a
+lightweight ASGI middleware plus the endpoint. It is **dependency-free** — the
+`Counter`/`Histogram`/`Gauge` primitives are hand-rolled and accumulate in
+plain in-process dicts, so there is **no new hard dependency and no network**;
+if `prometheus_client` (from the `observability` extra) happens to be installed,
+nothing changes, since himmy keeps its own in-process registry.
+
+Instruments (process-wide, cumulative across requests, as a scrape target
+expects):
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `http_requests_total` | counter | `method`, `route`, `status` |
+| `http_request_duration_seconds` | histogram | `method`, `route` |
+| `http_requests_in_flight` | gauge | (none) |
+
+**Cardinality is bounded by construction:** `method` is clamped to a fixed verb
+allow-list (anything else → `OTHER`); `route` is the matched **route template**
+(`/v1/runs/{run_id}`, never the filled-in path — unmatched paths collapse to
+`<unmatched>`); `status` is the status *class* (`2xx`/`4xx`/…). No secret,
+header, query string, or raw path parameter is ever used as a label. The
+endpoint is excluded from the OpenAPI schema and exposes no secrets. The
+middleware is registered **after** request-context so it is the outermost layer
+and observes every request (including ones short-circuited by inner guards).
+
+### Structured JSON logs — `HIMMY_LOG_FORMAT=json` (`logging.py`)
+
+`himmy/services/observability/logging.py` adds an **opt-in** JSON log format,
+wired via `configure_logging()` in `himmy/api/app.py`. Default behavior is
+unchanged: with `HIMMY_LOG_FORMAT` unset (or anything other than `json`), this
+installs nothing and the existing human-readable output is preserved
+byte-for-byte. When `HIMMY_LOG_FORMAT=json`, the root logger's handlers are
+switched to `JsonLogFormatter`, which emits **one JSON object per line** — no new
+dependency, friendly to log shippers (Loki / CloudWatch / ELK).
+
+Each line carries at least `timestamp` (ISO-8601, UTC), `level`, `logger`, and
+`message`. When a request/trace id is bound to the current context (set by the
+API's request-context middleware), it is included as `request_id` — the **same
+id echoed to clients in the `X-Request-ID` response header** — so a log line
+correlates to a request without inventing a new mechanism. `exc_info`/`stack_info`
+become `exception`/`stack`, and JSON-serializable `extra=` fields are surfaced
+without clobbering the core keys. `configure_logging()` is idempotent and a no-op
+when the toggle is unset.
+
 ## Configuration
 
 | Mechanism | Effect |
@@ -128,7 +194,9 @@ misconfiguration: the switch is on but the `logfire` package is missing
 | `HIMMY_LOGFIRE_SERVICE_NAME` | OTel service name (default `himmy`) |
 | `HIMMY_LOGFIRE_INCLUDE_CONTENT` | Allow prompt/completion content onto spans (default off) |
 | `SqliteEventStore(path)` | Durable trace.db for `himmy trace` |
-| `[observability]` extra | Installs `logfire` (and its `[fastapi]`/`[asyncpg]` transports) |
+| `GET /metrics` (served app) | Prometheus text exposition — always on for `himmy serve`/`himmy studio`, in-process and dependency-free |
+| `HIMMY_LOG_FORMAT=json` | Switch root-logger output to one-JSON-object-per-line structured logs (default: human-readable) |
+| `[observability]` extra | Installs `logfire` (and its `[fastapi]`/`[asyncpg]` transports) for the OTel bridge — **not** required for `/metrics` or JSON logs |
 
 ## Extension points
 

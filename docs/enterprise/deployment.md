@@ -307,7 +307,29 @@ Three layers, all hitting the **unguarded** `/health`:
 non-200, SQLite `quick_check` failure, Postgres unreachable. **Warn (ticket, not
 page):** free disk below ~1 GiB, pending Postgres migrations after a deploy.
 
+### Metrics & structured logs
+
+Beyond liveness, the served app exposes two operational signals (both honest
+about their defaults):
+
+- **`GET /metrics`** — Prometheus **text exposition** with request count
+  (`http_requests_total`), latency histogram (`http_request_duration_seconds`),
+  and in-flight gauge (`http_requests_in_flight`). Labels are bounded to method,
+  the route *template* (never the filled-in path), and status class, so series
+  can't explode. It is in-process and dependency-free (no extra needed) and
+  exposes no secrets — point a Prometheus scrape at it. The endpoint is unguarded
+  for scraping but reveals only these aggregate counters.
+- **`HIMMY_LOG_FORMAT=json`** — off by default (human-readable logs unchanged).
+  Set it to emit one JSON object per log line (`timestamp`, `level`, `logger`,
+  `message`, plus `request_id` matching the `X-Request-ID` response header) for a
+  log shipper. See [observability.md](../services/observability.md) for both.
+
 ## Backup / restore & DR
+
+> The dedicated **[backup & disaster-recovery runbook](backup-recovery.md)** has
+> the full procedures — `ops_backup.py` flag reference, Postgres WAL archiving /
+> volume snapshots, step-by-step restore, KEK escrow, and RPO/RTO guidance. The
+> summary below is the quick path.
 
 > **NEVER `cp` (or `tar`/`rsync`) a live `.himmy/*.db` file.** A WAL-mode SQLite
 > database has uncommitted pages in a `-wal` side file; a byte copy captures a
@@ -482,6 +504,7 @@ from the Dockerfile and push to your own registry. Lint with `make helm-lint`.
 
 ## Related docs
 
+- [backup-recovery.md](backup-recovery.md) — backup & disaster-recovery runbook (SQLite + Postgres backup/restore, KEK escrow, RPO/RTO)
 - [HARDENING_PLAN.md](HARDENING_PLAN.md) — security hardening roadmap and threat model
 - [upgrades.md](upgrades.md) — schema migrations and version upgrades
 - [airgap.md](airgap.md) — offline / air-gapped installs and the `himmy_ollama` contract
