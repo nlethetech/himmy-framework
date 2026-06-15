@@ -218,6 +218,52 @@ class ChatRepl:
 
         return _model_label(self.spec, self.args)
 
+    def _active_provider_model(self) -> tuple[str | None, str | None]:
+        """The (provider, model) the REPL is currently running.
+
+        ``--provider``/``--model`` win; otherwise fall back to the spec's. A
+        ``"default"`` model sentinel means "no explicit model" → ``None``. When no
+        provider is set the framework auto-selects (claude-cli on a signed-in box) —
+        we surface ``None`` here and the picker labels it ``auto``/local rather than
+        guessing wrong.
+        """
+        model = getattr(self.args, "model", None) or self.spec.model
+        provider = getattr(self.args, "provider", None) or self.spec.provider
+        if model == "default":
+            model = None
+        return provider, model
+
+    def _render_model_picker(self) -> str:
+        """Build inputs for and render the ``/model`` (no-args) picker string.
+
+        Pulls the LOCAL provider catalog (best-effort; a failure degrades to the cloud
+        + curated lists rather than crashing the REPL), detects cloud-key availability
+        the same way ``himmy doctor`` does, and delegates all formatting to the pure
+        :func:`himmy.cli.model_picker.render_model_picker` helper.
+        """
+        from himmy.cli.model_picker import (
+            cloud_key_env,
+            provider_aware_price_for,
+            render_model_picker,
+        )
+        from himmy.services.inference.compare import build_model_catalog
+
+        try:
+            catalog = asyncio.run(build_model_catalog())
+        except Exception:  # noqa: BLE001 - never let catalog probing crash the REPL
+            catalog = []
+        active_provider, active_model = self._active_provider_model()
+        return render_model_picker(
+            catalog,
+            active_provider=active_provider,
+            active_model=active_model,
+            color=self._c,
+            # OpenRouter models resolve LIVE (then static fallback); everything else
+            # uses the existing static table. The live fetch is lazy + offline-safe.
+            price_for=provider_aware_price_for(),
+            cloud_available=cloud_key_env(),
+        )
+
     # ------------------------------------------------------------------ a turn
 
     async def _answer_turn(self, thread: Any, text: str) -> Any:
@@ -939,10 +985,21 @@ class ChatRepl:
                 if len(rest) > 1:
                     self.args.provider = rest[1]
                 self.rebuild()
-            self._eprint(
-                f"{c['dim']}model: {_model_label(self.spec, self.args) or 'auto'}"
-                f"{c['reset']}"
-            )
+                self._eprint(
+                    f"{c['dim']}model: {_model_label(self.spec, self.args) or 'auto'}"
+                    f"{c['reset']}"
+                )
+            else:
+                try:
+                    self._eprint(self._render_model_picker())
+                except Exception:  # noqa: BLE001 - never let the picker crash the REPL
+                    # Degrade to the short active-model label (or a dim one-line note)
+                    # rather than killing the session over a render/pricing hiccup.
+                    label = _model_label(self.spec, self.args) or "auto"
+                    self._eprint(
+                        f"{c['dim']}model: {label} "
+                        f"(couldn't render model list){c['reset']}"
+                    )
         elif cmd == "/tools":
             reg = self.rt["registry"]
             names = sorted(d.name for d in reg.list()) if reg is not None else []

@@ -81,3 +81,137 @@ def test_litellm_per_token_is_converted_to_per_1k() -> None:
     )
     assert table["m"].input_per_1k == pytest.approx(2.0e-3)
     assert table["m"].output_per_1k == pytest.approx(8.0e-3)
+
+
+# ---------------------------------------------------- live OpenRouter pricing (no net)
+
+#: A fake OpenRouter ``/models`` payload (real shape: per-token USD strings).
+_OR_PAYLOAD = {
+    "data": [
+        {
+            "id": "openai/gpt-4o-mini",
+            "pricing": {"prompt": "0.00000015", "completion": "0.0000006"},
+        },
+        {
+            "id": "anthropic/claude-sonnet-4.5",
+            "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+        },
+        {"id": "junk/no-pricing"},  # malformed row must be skipped, not crash
+    ]
+}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_openrouter(monkeypatch):
+    # Force the live fetch off by default + reset the live cache; keep the suite offline.
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    pricing.reload_openrouter()
+    yield
+    pricing.reload_openrouter()
+
+
+def test_openrouter_payload_parses_into_per_1k_modelprice() -> None:
+    table = pricing._prices_from_openrouter(_OR_PAYLOAD)
+    # per-token * 1000 = per-1K.
+    assert table["openai/gpt-4o-mini"].input_per_1k == pytest.approx(1.5e-4)
+    assert table["openai/gpt-4o-mini"].output_per_1k == pytest.approx(6.0e-4)
+    assert table["anthropic/claude-sonnet-4.5"].input_per_1k == pytest.approx(3.0e-3)
+    # The malformed (no-pricing) row is silently skipped, not present, no crash.
+    assert "junk/no-pricing" not in table
+
+
+def test_openrouter_live_prices_uses_injected_fetch_no_network() -> None:
+    calls: list[tuple[str, dict[str, str], float]] = []
+
+    def fake_fetch(url: str, headers: dict[str, str], timeout: float) -> dict:
+        calls.append((url, headers, timeout))
+        return _OR_PAYLOAD
+
+    table = pricing.openrouter_live_prices(fetch=fake_fetch, now=lambda: 0.0)
+    assert table["openai/gpt-4o-mini"].input_per_1k == pytest.approx(1.5e-4)
+    # The injected fetch was called with the OpenRouter URL and a bounded timeout.
+    assert calls and calls[0][0] == pricing.OPENROUTER_MODELS_URL
+    assert calls[0][2] == pricing.OPENROUTER_TIMEOUT_SECONDS
+
+
+def test_openrouter_live_prices_falls_back_to_empty_when_fetch_raises() -> None:
+    def boom(url: str, headers: dict[str, str], timeout: float) -> dict:
+        raise RuntimeError("offline / timeout")
+
+    # Any failure → empty table, never raises (offline-first invariant).
+    assert pricing.openrouter_live_prices(fetch=boom, now=lambda: 0.0) == {}
+
+
+def test_openrouter_live_prices_tolerates_junk_payload() -> None:
+    def junk(url: str, headers: dict[str, str], timeout: float) -> dict:
+        return {"not": "the expected shape"}
+
+    assert pricing.openrouter_live_prices(fetch=junk, now=lambda: 0.0) == {}
+
+
+def test_openrouter_live_prices_ttl_cache_does_not_refetch() -> None:
+    count = {"n": 0}
+
+    def counting_fetch(url: str, headers: dict[str, str], timeout: float) -> dict:
+        count["n"] += 1
+        return _OR_PAYLOAD
+
+    clock = {"t": 0.0}
+
+    def now() -> float:
+        return clock["t"]
+
+    first = pricing.openrouter_live_prices(fetch=counting_fetch, now=now)
+    assert count["n"] == 1 and first  # fetched once
+    # A second call within the TTL must NOT refetch.
+    clock["t"] = pricing.OPENROUTER_TTL_SECONDS - 1.0
+    pricing.openrouter_live_prices(fetch=counting_fetch, now=now)
+    assert count["n"] == 1
+    # Past the TTL it refetches.
+    clock["t"] = pricing.OPENROUTER_TTL_SECONDS + 1.0
+    pricing.openrouter_live_prices(fetch=counting_fetch, now=now)
+    assert count["n"] == 2
+
+
+def test_openrouter_live_prices_sends_bearer_only_when_key_present(monkeypatch) -> None:
+    seen: list[dict[str, str]] = []
+
+    def capture(url: str, headers: dict[str, str], timeout: float) -> dict:
+        seen.append(dict(headers))
+        return _OR_PAYLOAD
+
+    # No key → no Authorization header.
+    pricing.openrouter_live_prices(fetch=capture, now=lambda: 0.0)
+    assert "Authorization" not in seen[-1]
+    # Key present → bearer header carries it.
+    pricing.reload_openrouter()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-secret")
+    pricing.openrouter_live_prices(fetch=capture, now=lambda: 1.0)
+    assert seen[-1]["Authorization"] == "Bearer sk-or-secret"
+
+
+def test_openrouter_live_prices_respects_offline_flag(monkeypatch) -> None:
+    monkeypatch.setenv("HIMMY_OFFLINE", "1")
+
+    def should_not_run(url: str, headers: dict[str, str], timeout: float) -> dict:
+        raise AssertionError("fetch must be skipped when an injected fetch is absent")
+
+    # With no injected fetch + offline flag set, the real fetch is skipped → empty.
+    assert pricing.openrouter_live_prices(now=lambda: 0.0) == {}
+
+
+def test_openrouter_price_for_prefers_live_then_static_fallback() -> None:
+    def fetch(url: str, headers: dict[str, str], timeout: float) -> dict:
+        return _OR_PAYLOAD
+
+    live = pricing.openrouter_price_for(
+        "anthropic/claude-sonnet-4.5", fetch=fetch, now=lambda: 0.0
+    )
+    assert live.input_per_1k == pytest.approx(3.0e-3)  # from the live payload
+    # A model the live source doesn't list falls back to the static table (gpt-4o-mini
+    # is in the bundled snapshot), never crashing.
+    pricing.reload_openrouter()
+    fallback = pricing.openrouter_price_for(
+        "totally-unknown/model-x", fetch=fetch, now=lambda: 0.0
+    )
+    assert fallback.input_per_1k == 0.0  # unknown everywhere → zero, not a guess

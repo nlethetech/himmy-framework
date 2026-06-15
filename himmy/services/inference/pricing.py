@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,14 @@ LITELLM_PRICES_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/"
     "model_prices_and_context_window.json"
 )
+
+#: OpenRouter's live model catalog (includes per-token USD pricing for every model).
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+#: A fetch seam: ``(url, headers, timeout) -> parsed JSON dict``. The real default hits
+#: the network with httpx; tests inject a fake that returns a synthetic payload so the
+#: offline-first suite never touches the network.
+Fetch = Callable[[str, dict[str, str], float], dict[str, Any]]
 
 #: Where ``himmy prices sync`` writes the downloaded table.
 SYNCED_PRICES_PATH = Path.home() / ".himmy" / "model_prices.json"
@@ -106,6 +116,137 @@ def reload() -> None:
     """Drop the cached table (call after ``sync``/config changes)."""
     global _CACHE
     _CACHE = None
+    reload_openrouter()
+
+
+# --------------------------------------------------------------- live OpenRouter
+
+#: How long a live OpenRouter price fetch is trusted before a refetch (seconds).
+OPENROUTER_TTL_SECONDS = 3600.0
+
+#: Timeout for the live fetch — small, so a hung endpoint never blocks the REPL.
+OPENROUTER_TIMEOUT_SECONDS = 3.0
+
+#: Process cache of the live OpenRouter table: (fetched_at_monotonic, table).
+_OR_CACHE: tuple[float, dict[str, ModelPrice]] | None = None
+
+
+def _network_disabled() -> bool:
+    """True when an env flag asks himmy to stay fully offline (skip the live fetch)."""
+    for var in ("HIMMY_OFFLINE", "HIMMY_NO_NETWORK"):
+        val = os.environ.get(var, "").strip().lower()
+        if val and val not in ("0", "false", "no", "off"):
+            return True
+    return False
+
+
+def _default_fetch(url: str, headers: dict[str, str], timeout: float) -> dict[str, Any]:
+    """Real network fetch (httpx); only used in live/interactive runs, never in tests."""
+    import httpx
+
+    resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def _prices_from_openrouter(data: dict[str, Any]) -> dict[str, ModelPrice]:
+    """Parse the OpenRouter ``/models`` payload into a ``{model_id: ModelPrice}`` map.
+
+    Shape: ``{"data": [{"id": "openai/gpt-4o-mini", "pricing": {"prompt": "0.00000015",
+    "completion": "0.0000006"}}, ...]}`` — ``prompt``/``completion`` are USD PER TOKEN
+    (strings). ModelPrice is per-1K, so multiply by 1000. Malformed rows are skipped.
+    """
+    table: dict[str, ModelPrice] = {}
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return table
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_id = row.get("id")
+        pricing = row.get("pricing")
+        if not isinstance(model_id, str) or not isinstance(pricing, dict):
+            continue
+        try:
+            in_tok = float(pricing.get("prompt", 0.0) or 0.0)
+            out_tok = float(pricing.get("completion", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        table[model_id] = ModelPrice(
+            input_per_1k=in_tok * 1000.0,
+            output_per_1k=out_tok * 1000.0,
+        )
+    return table
+
+
+def reload_openrouter() -> None:
+    """Drop the cached live OpenRouter table (forces a refetch on next access)."""
+    global _OR_CACHE
+    _OR_CACHE = None
+
+
+def openrouter_live_prices(
+    *,
+    fetch: Fetch | None = None,
+    now: Callable[[], float] | None = None,
+    refresh: bool = False,
+) -> dict[str, ModelPrice]:
+    """Live OpenRouter ``{model_id: ModelPrice}``, cached in-process for ~1 hour.
+
+    Offline-first is a hard invariant: the fetch is lazy, timeout-bounded, and on ANY
+    failure (offline, timeout, non-200, parse error) returns an EMPTY table silently —
+    it never raises and never blocks. ``fetch`` is injectable so tests pass a fake JSON
+    payload and never touch the network; the default real fetch only runs in live use.
+    The ``OPENROUTER_API_KEY`` env var (if present) is sent as a bearer token but never
+    logged. Respects ``HIMMY_OFFLINE`` / ``HIMMY_NO_NETWORK`` by skipping the fetch.
+    """
+    global _OR_CACHE
+    clock = now or time.monotonic
+    if not refresh and _OR_CACHE is not None:
+        fetched_at, cached = _OR_CACHE
+        if clock() - fetched_at < OPENROUTER_TTL_SECONDS:
+            return cached
+
+    # An injected fetch (tests) overrides the offline flag; the real default respects it.
+    if fetch is None and _network_disabled():
+        _OR_CACHE = (clock(), {})
+        return {}
+
+    do_fetch = fetch or _default_fetch
+    headers = {"Accept": "application/json"}
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        data = do_fetch(OPENROUTER_MODELS_URL, headers, OPENROUTER_TIMEOUT_SECONDS)
+        table = _prices_from_openrouter(data if isinstance(data, dict) else {})
+    except Exception:  # noqa: BLE001 - offline-first: any failure → empty, never raise
+        table = {}
+    _OR_CACHE = (clock(), table)
+    return table
+
+
+def openrouter_price_for(
+    model: str,
+    *,
+    fetch: Fetch | None = None,
+    now: Callable[[], float] | None = None,
+) -> ModelPrice:
+    """Resolve an OpenRouter model's price: LIVE table first, static table fallback.
+
+    The OpenRouter ids are slash-qualified (``openai/gpt-4o-mini``); the live table is
+    keyed by exactly that id, with an optional ``openrouter:`` prefix stripped. Anything
+    the live source doesn't know falls back to the forgiving static :func:`price_for`.
+    """
+    live = openrouter_live_prices(fetch=fetch, now=now)
+    raw = (model or "").strip()
+    key = raw.split(":", 1)[1] if raw.startswith("openrouter:") else raw
+    hit = live.get(key)
+    if hit is not None and (hit.input_per_1k > 0 or hit.output_per_1k > 0):
+        return hit
+    return price_for(model)
 
 
 def _candidates(model: str) -> list[str]:
@@ -174,10 +315,15 @@ def sync_prices(
 
 __all__ = [
     "LITELLM_PRICES_URL",
+    "OPENROUTER_MODELS_URL",
     "SYNCED_PRICES_PATH",
+    "Fetch",
     "load_price_table",
     "reload",
+    "reload_openrouter",
     "price_for",
+    "openrouter_live_prices",
+    "openrouter_price_for",
     "is_priced",
     "sync_prices",
 ]
