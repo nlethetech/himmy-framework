@@ -233,19 +233,15 @@ class ChatRepl:
             model = None
         return provider, model
 
-    def _render_model_picker(self) -> str:
-        """Build inputs for and render the ``/model`` (no-args) picker string.
+    def _model_picker_inputs(self) -> tuple[Any, str | None, str | None, Any]:
+        """Shared inputs for the ``/model`` picker — catalog, active pair, price_for.
 
         Pulls the LOCAL provider catalog (best-effort; a failure degrades to the cloud
-        + curated lists rather than crashing the REPL), detects cloud-key availability
-        the same way ``himmy doctor`` does, and delegates all formatting to the pure
-        :func:`himmy.cli.model_picker.render_model_picker` helper.
+        + curated lists rather than crashing the REPL) and the active provider/model,
+        and builds the live+offline-safe ``price_for``. Used by BOTH the static string
+        renderer and the interactive menu so they share one data source.
         """
-        from himmy.cli.model_picker import (
-            cloud_key_env,
-            provider_aware_price_for,
-            render_model_picker,
-        )
+        from himmy.cli.model_picker import provider_aware_price_for
         from himmy.services.inference.compare import build_model_catalog
 
         try:
@@ -253,15 +249,61 @@ class ChatRepl:
         except Exception:  # noqa: BLE001 - never let catalog probing crash the REPL
             catalog = []
         active_provider, active_model = self._active_provider_model()
+        # OpenRouter models resolve LIVE (then static fallback); everything else uses
+        # the existing static table. The live fetch is lazy + offline-safe.
+        return catalog, active_provider, active_model, provider_aware_price_for()
+
+    def _render_model_picker(self) -> str:
+        """Build inputs for and render the ``/model`` (no-args) picker string.
+
+        Detects cloud-key availability the same way ``himmy doctor`` does and delegates
+        all formatting to the pure :func:`himmy.cli.model_picker.render_model_picker`
+        helper, over the shared :meth:`_model_picker_inputs`.
+        """
+        from himmy.cli.model_picker import cloud_key_env, render_model_picker
+
+        catalog, active_provider, active_model, price_for = self._model_picker_inputs()
         return render_model_picker(
             catalog,
             active_provider=active_provider,
             active_model=active_model,
             color=self._c,
-            # OpenRouter models resolve LIVE (then static fallback); everything else
-            # uses the existing static table. The live fetch is lazy + offline-safe.
-            price_for=provider_aware_price_for(),
+            price_for=price_for,
             cloud_available=cloud_key_env(),
+        )
+
+    def _interactive_model_menu(self) -> tuple[str, str] | None:
+        """Run the arrow-key ``/model`` menu; return the chosen (provider, model).
+
+        Builds the SAME structured entries the static picker uses (via the shared
+        :meth:`_model_picker_inputs`) and drives
+        :func:`himmy.cli.select_menu.select_model` over stderr. Returns the user's
+        pick, or ``None`` on cancel / non-tty / unavailable terminal — in which case
+        the caller falls back to the printed static list. Pre-selects the active row.
+        """
+        import sys
+
+        from himmy.cli.model_picker import build_picker_entries, cloud_key_env
+        from himmy.cli.select_menu import select_model
+
+        catalog, active_provider, active_model, price_for = self._model_picker_inputs()
+        entries = build_picker_entries(
+            catalog,
+            active_provider=active_provider,
+            active_model=active_model,
+            price_for=price_for,
+            cloud_available=cloud_key_env(),
+        )
+        active_index = next(
+            (i for i, e in enumerate(entries) if e["kind"] == "model" and e["is_active"]),
+            None,
+        )
+        return select_model(
+            entries,
+            active_index=active_index,
+            palette=styles(sys.stderr),
+            stream=sys.stderr,
+            isatty=self.interactive,
         )
 
     # ------------------------------------------------------------------ a turn
@@ -990,16 +1032,38 @@ class ChatRepl:
                     f"{c['reset']}"
                 )
             else:
-                try:
-                    self._eprint(self._render_model_picker())
-                except Exception:  # noqa: BLE001 - never let the picker crash the REPL
-                    # Degrade to the short active-model label (or a dim one-line note)
-                    # rather than killing the session over a render/pricing hiccup.
-                    label = _model_label(self.spec, self.args) or "auto"
+                # On a real TTY: an INTERACTIVE arrow-key menu (scroll + Enter to
+                # switch). Anything else — a pick, a cancel, a non-tty, or the menu
+                # being unavailable — falls through to the printed static list, which
+                # is the original behavior. The whole menu attempt is guarded so it can
+                # NEVER crash or wedge the REPL (raw mode is always restored; on any
+                # failure we degrade to the printed picker).
+                picked: tuple[str, str] | None = None
+                if self.interactive:
+                    try:
+                        picked = self._interactive_model_menu()
+                    except (Exception, KeyboardInterrupt):  # noqa: BLE001 - Ctrl-C cancels the menu, not the whole REPL (raw mode already restored)
+                        picked = None
+                if picked is not None:
+                    provider, model = picked
+                    self.args.model = model
+                    self.args.provider = provider
+                    self.rebuild()
                     self._eprint(
-                        f"{c['dim']}model: {label} "
-                        f"(couldn't render model list){c['reset']}"
+                        f"{c['dim']}model: "
+                        f"{_model_label(self.spec, self.args) or 'auto'}{c['reset']}"
                     )
+                else:
+                    try:
+                        self._eprint(self._render_model_picker())
+                    except Exception:  # noqa: BLE001 - never let the picker crash REPL
+                        # Degrade to the short active-model label (or a dim one-line
+                        # note) rather than killing the session over a render hiccup.
+                        label = _model_label(self.spec, self.args) or "auto"
+                        self._eprint(
+                            f"{c['dim']}model: {label} "
+                            f"(couldn't render model list){c['reset']}"
+                        )
         elif cmd == "/tools":
             reg = self.rt["registry"]
             names = sorted(d.name for d in reg.list()) if reg is not None else []

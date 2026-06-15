@@ -21,9 +21,27 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, TypedDict
 
 from himmy.services.inference.models import ModelPrice
+
+
+class PickerEntry(TypedDict):
+    """One row in the model picker — a provider HEADER or a selectable MODEL row.
+
+    Built once by :func:`build_picker_entries` and consumed by BOTH the static
+    string renderer (:func:`render_model_picker`) and the interactive arrow-key
+    menu (:func:`himmy.cli.select_menu.select_model`), so cost/active logic lives
+    in exactly one place. ``kind == "header"`` rows are NOT selectable (the menu
+    skips them); ``kind == "model"`` rows carry ``provider``/``model``/``label``
+    (the cost tag) and ``is_active``.
+    """
+
+    kind: str  # "header" | "model"
+    provider: str
+    model: str
+    label: str  # cost/label string for model rows; provider name for headers
+    is_active: bool
 
 #: Cloud providers gated by an env key, in the order ``himmy doctor`` / the wizard
 #: check them. The env var both signals availability AND (for openrouter) names a
@@ -150,6 +168,80 @@ def _is_active(
     return provider == active_provider and model == active_model
 
 
+def build_picker_entries(
+    catalog: Sequence[Mapping[str, Any]],
+    *,
+    active_provider: str | None,
+    active_model: str | None,
+    price_for: Callable[[str], ModelPrice],
+    cloud_available: Mapping[str, bool],
+    environ: Mapping[str, str] | None = None,
+) -> list[PickerEntry]:
+    """The picker's rows as STRUCTURED entries — the single source of truth.
+
+    Walks the SAME local catalog + cloud providers as the renderer used to, in the
+    SAME order, but emits :class:`PickerEntry` dicts (provider headers + model rows)
+    instead of pre-formatted strings. Both :func:`render_model_picker` (static text)
+    and the interactive menu consume this, so cost (:func:`_cost_label`) and
+    active-marker (:func:`_is_active`) logic is defined exactly once. Pure — no I/O,
+    no network (``price_for`` may itself be live, but that is the caller's choice).
+    """
+    env = environ if environ is not None else os.environ
+    entries: list[PickerEntry] = []
+
+    def _model_entry(provider: str, model: str) -> PickerEntry:
+        return PickerEntry(
+            kind="model",
+            provider=provider,
+            model=model,
+            label=_cost_label(provider, model, price_for),
+            is_active=_is_active(provider, model, active_provider, active_model),
+        )
+
+    # Local providers from the catalog (ollama, claude-cli).
+    for entry in catalog:
+        provider = str(entry.get("provider", ""))
+        available = bool(entry.get("available"))
+        models = entry.get("models") or []
+        if not available or not models:
+            continue
+        header_added = False
+        for m in models:
+            name = str(m.get("name") or m.get("model") or "")
+            if not name:
+                continue
+            if not header_added:
+                entries.append(
+                    PickerEntry(
+                        kind="header", provider=provider, model="",
+                        label=provider, is_active=False,
+                    )
+                )
+                header_added = True
+            entries.append(_model_entry(provider, name))
+
+    # Available cloud providers (key present): default model + curated set.
+    for provider, _key in CLOUD_KEY_ENV:
+        if not cloud_available.get(provider):
+            continue
+        default_model = _provider_default_model(provider, env)
+        curated = list(CURATED_CLOUD_MODELS.get(provider, ()))
+        ordered = ([default_model] if default_model else []) + curated
+        deduped = list(dict.fromkeys(ordered))  # order-preserving de-dup
+        if not deduped:
+            continue
+        entries.append(
+            PickerEntry(
+                kind="header", provider=provider, model="",
+                label=provider, is_active=False,
+            )
+        )
+        for name in deduped:
+            entries.append(_model_entry(provider, name))
+
+    return entries
+
+
 def render_model_picker(
     catalog: Sequence[Mapping[str, Any]],
     *,
@@ -169,8 +261,10 @@ def render_model_picker(
     ``green``/``reset`` …); pass an empty-string palette for plain output. ``price_for``
     resolves a :class:`ModelPrice`; ``environ`` (default ``os.environ``) supplies the
     per-provider default-model env vars. Returns the text the handler prints.
+
+    Formats the SHARED :func:`build_picker_entries` rows — the static and interactive
+    views never diverge in cost/active logic.
     """
-    env = environ if environ is not None else os.environ
     c = {k: color.get(k, "") for k in ("dim", "snow", "gold", "faint", "green", "reset")}
     lines: list[str] = []
 
@@ -182,52 +276,29 @@ def render_model_picker(
         f"{c['faint']}({active_cost}){c['reset']}"
     )
 
-    # 2) AVAILABLE providers & models.
+    # 2) AVAILABLE providers & models (from the shared structured entries).
     lines.append(f"{c['snow']}available:{c['reset']}")
 
-    def _model_line(provider: str, model: str) -> str:
-        cost = _cost_label(provider, model, price_for)
-        active = _is_active(provider, model, active_provider, active_model)
-        marker = f"{c['green']} (active){c['reset']}" if active else ""
-        hint = f"/model {model} {provider}"
-        return (
-            f"  {c['dim']}{hint}{c['reset']}  "
-            f"{c['faint']}{cost}{c['reset']}{marker}"
-        )
-
+    entries = build_picker_entries(
+        catalog,
+        active_provider=active_provider,
+        active_model=active_model,
+        price_for=price_for,
+        cloud_available=cloud_available,
+        environ=environ,
+    )
     rendered_any = False
-
-    # 2a) Local providers from the catalog (ollama, claude-cli).
-    for entry in catalog:
-        provider = str(entry.get("provider", ""))
-        available = bool(entry.get("available"))
-        models = entry.get("models") or []
-        if not available:
+    for e in entries:
+        if e["kind"] == "header":
+            lines.append(f"  {c['snow']}{e['provider']}{c['reset']}")
             continue
-        if not models:
-            continue
-        lines.append(f"  {c['snow']}{provider}{c['reset']}")
-        for m in models:
-            name = str(m.get("name") or m.get("model") or "")
-            if not name:
-                continue
-            lines.append(_model_line(provider, name))
-            rendered_any = True
-
-    # 2b) Available cloud providers (key present): default model + curated set.
-    for provider, _key in CLOUD_KEY_ENV:
-        if not cloud_available.get(provider):
-            continue
-        default_model = _provider_default_model(provider, env)
-        curated = list(CURATED_CLOUD_MODELS.get(provider, ()))
-        ordered = ([default_model] if default_model else []) + curated
-        deduped = list(dict.fromkeys(ordered))  # order-preserving de-dup
-        if not deduped:
-            continue
-        lines.append(f"  {c['snow']}{provider}{c['reset']}")
-        for name in deduped:
-            lines.append(_model_line(provider, name))
-            rendered_any = True
+        marker = f"{c['green']} (active){c['reset']}" if e["is_active"] else ""
+        hint = f"/model {e['model']} {e['provider']}"
+        lines.append(
+            f"  {c['dim']}{hint}{c['reset']}  "
+            f"{c['faint']}{e['label']}{c['reset']}{marker}"
+        )
+        rendered_any = True
 
     if not rendered_any:
         lines.append(
@@ -254,6 +325,8 @@ def render_model_picker(
 __all__ = [
     "CLOUD_KEY_ENV",
     "CURATED_CLOUD_MODELS",
+    "PickerEntry",
+    "build_picker_entries",
     "cloud_key_env",
     "provider_aware_price_for",
     "render_model_picker",
