@@ -319,6 +319,44 @@ def test_sensitive_args_redacted_in_events() -> None:
     assert "hunter2" not in str(called.payload)
 
 
+def test_nested_secret_redacted_in_events() -> None:
+    """A secret nested inside a json_body arg never reaches the audit spine in plaintext.
+
+    Regression: TOOL_CALLED redaction once scanned only top-level keys, so a credential
+    buried inside a nested request body was written verbatim into the append-only audit
+    spine. Redaction now recurses, so the nested secret is masked before emit.
+    """
+    registry = ToolRegistry()
+    register_local_tool(
+        registry,
+        name="call_api",
+        handler=lambda a: {"ok": True},
+        args_json_schema={
+            "type": "object",
+            "properties": {"json_body": {"type": "object"}},
+        },
+    )
+    sink = StorageService()
+    svc = ToolService(registry, event_sink=sink)
+    run_async(
+        svc.execute(
+            ToolInvocation(
+                tool_name="call_api",
+                args={"json_body": {"user": "bob", "config": {"api_key": "sk-DEEP"}}},
+            )
+        )
+    )
+    events = run_async(sink.list_events())
+    called = next(e for e in events if e.event_type == EventType.TOOL_CALLED)
+    args = called.payload["args"]
+    assert args["json_body"]["user"] == "bob"  # benign nested value kept
+    # The credential sits two levels deep under a BENIGN container key, so only a
+    # recursive walk reaches it — top-level-only redaction would leak it in plaintext.
+    assert args["json_body"]["config"]["api_key"] == REDACTED  # nested secret masked
+    # The raw secret never reaches the emitted (spine-bound) payload.
+    assert "sk-DEEP" not in str(called.payload)
+
+
 # ----------------------------------------------------------------- HTTP connector
 def _http_service(transport: httpx.MockTransport) -> ToolService:
     client = httpx.AsyncClient(transport=transport, follow_redirects=False)

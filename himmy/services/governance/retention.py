@@ -15,6 +15,7 @@ still verifies and you can prove the subject existed and was erased.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -490,13 +491,31 @@ class SubjectKeyVault:
             return None
         return str(row[1])
 
+    def _checkpoint_locked(self) -> None:
+        """Force the WAL into the main DB + fsync after a crypto-shred (caller holds ``_lock``).
+
+        The vault opens with ``synchronous=NORMAL``, so a plain commit only appends to the WAL
+        and a power-cut before the next checkpoint can lose the shred — RESURRECTING a key the
+        deletion certificate already swore was destroyed. ``wal_checkpoint(TRUNCATE)`` merges
+        the WAL into the main file and fsyncs it, so the destruction is durable before
+        :meth:`RetentionService.erase_subject` signs the certificate. Best-effort: a memory DB
+        has no WAL, and a checkpoint blocked by a concurrent reader is a transient durability
+        delay, not a correctness break (the commit itself already landed).
+        """
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:  # pragma: no cover - checkpoint is best-effort
+            pass
+
     def destroy(self, subject_id: str) -> bool:
         """Crypto-shred durably: null the stored key + stamp ``shredded_at``.
 
         Returns ``True`` if a live key existed (and was destroyed), ``False`` if the subject
         was unknown or already shredded. The row is RETAINED (with a nulled ``wrapped_dek``)
         as a durable tombstone of WHEN the key was destroyed — the destruction survives a
-        restart and is irrecoverable.
+        restart and is irrecoverable. After committing the null, the WAL is checkpoint-truncated
+        (:meth:`_checkpoint_locked`) so the shred is fsynced to the main DB and cannot be lost
+        to a power-cut before the deletion certificate is written.
         """
         self._cache.pop(subject_id, None)
         with self._lock:
@@ -513,6 +532,7 @@ class SubjectKeyVault:
                 (utc_now_iso(), subject_id),
             )
             self._conn.commit()
+            self._checkpoint_locked()
         return True
 
     # --------------------------------------------------------- workspace (S5)
@@ -587,6 +607,7 @@ class SubjectKeyVault:
                 )
                 destroyed += 1
             self._conn.commit()
+            self._checkpoint_locked()
         return destroyed
 
     def close(self) -> None:

@@ -20,10 +20,13 @@ zero-config path keeps the bare ``StorageService`` and is byte-for-byte unchange
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, cast
 
 from himmy.services.governance.consent import Effect, Purpose
 from himmy.services.governance.consent_resolver import SubjectResolver
+
+logger = logging.getLogger("himmy.services.governance")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable
@@ -86,7 +89,16 @@ class ConsentGatedStorage:
         return False
 
     def _audit_deny(self, subject: str, resource: str, reason: str) -> None:
-        """Record a ``consent_denied_persist`` security event (no-op without a log)."""
+        """Record a ``consent_denied_persist`` security event + structured warning.
+
+        The security-event log is opt-in (``self._audit`` is often ``None`` off the
+        governed API path); the WARNING ensures a consent denial is never wholly
+        silent. ``subject`` is intentionally omitted from the log to avoid leaking a
+        subject identifier into operational logs.
+        """
+        logger.warning(
+            "consent denied persist for resource=%s: %s", resource, reason
+        )
         if self._audit is None:
             return
         from himmy.services.audit.models import SecurityEvent

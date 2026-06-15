@@ -165,3 +165,33 @@ def test_redact_mapping_returns_a_copy() -> None:
     out = redact_mapping(original)
     assert original["password"] == "hunter2"
     assert out is not original
+
+
+def test_redact_mapping_recurses_into_nested_dict() -> None:
+    """A secret buried inside a benign container key is masked, not just top-level."""
+    args = {
+        "method": "POST",
+        "json_body": {"user": "bob", "config": {"api_key": "sk-live-DEEP"}},
+    }
+    out = redact_mapping(args)
+    # The deeply nested credential is redacted; benign siblings pass through.
+    assert out["json_body"]["config"]["api_key"] == REDACTED
+    assert out["json_body"]["user"] == "bob"
+    # And the caller's nested dict is untouched (deep, not shallow, copy).
+    assert args["json_body"]["config"]["api_key"] == "sk-live-DEEP"
+
+
+def test_redact_mapping_recurses_into_lists() -> None:
+    """Secrets inside list elements (and lists nested in dicts) are masked."""
+    args = {"json_body": {"items": [{"password": "p1"}, {"plain": "keep"}]}}
+    out = redact_mapping(args)
+    assert out["json_body"]["items"][0]["password"] == REDACTED
+    assert out["json_body"]["items"][1]["plain"] == "keep"
+
+
+def test_redact_mapping_honors_custom_placeholder() -> None:
+    """The placeholder override (e.g. the approvals UI's marker) flows through nesting."""
+    out = redact_mapping(
+        {"body": {"token": "abc"}}, placeholder="••••"
+    )
+    assert out["body"]["token"] == "••••"

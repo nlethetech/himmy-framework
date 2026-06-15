@@ -42,6 +42,7 @@ from pathlib import Path
 import pytest
 
 from himmy.api.app import create_app
+from himmy.api.route_introspection import collect_route_paths
 from himmy.cli.__main__ import _command_names, build_parser
 
 # --------------------------------------------------------------------------- #
@@ -56,9 +57,7 @@ _STUDIO_MAIN = _STUDIO_SRC / "main.tsx"
 def _registered_paths() -> frozenset[str]:
     """Every route path registered in the FastAPI app (templated form, e.g. ``{id}``)."""
     app = create_app()
-    return frozenset(
-        getattr(route, "path", "") for route in app.routes if getattr(route, "path", "")
-    )
+    return frozenset(p for p in collect_route_paths(app) if p)
 
 
 def _cli_command_names() -> frozenset[str]:

@@ -37,6 +37,7 @@ import hmac
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -181,6 +182,13 @@ class RateLimiter:
     upstream and trip *its* rate limit / ban the credential.
     """
 
+    #: Cap on the number of distinct keys held in ``_buckets`` so a connector facing
+    #: unbounded key cardinality (e.g. one bucket per sender id on a webhook flood) can't
+    #: grow the map without limit. Eviction is LOSSLESS for a refilled bucket (an absent
+    #: key defaults to a full bucket), so we drop those first; only when every held bucket
+    #: is still draining do we LRU-evict, which at worst grants one extra burst.
+    _MAX_KEYS = 4096
+
     def __init__(
         self,
         *,
@@ -188,6 +196,7 @@ class RateLimiter:
         capacity: float | None = None,
         window: float = 1.0,
         clock: Callable[[], float] | None = None,
+        max_keys: int | None = None,
     ) -> None:
         if rate <= 0 or window <= 0:
             raise ValueError("rate and window must be positive")
@@ -195,9 +204,13 @@ class RateLimiter:
         self._capacity = capacity if capacity is not None else rate
         if self._capacity <= 0:
             raise ValueError("capacity must be positive")
+        self._max_keys = max_keys if max_keys is not None else self._MAX_KEYS
+        if self._max_keys <= 0:
+            raise ValueError("max_keys must be positive")
         self._clock = clock or time.monotonic
         self._lock = threading.Lock()
-        self._buckets: dict[str, tuple[float, float]] = {}
+        # Ordered by recency so an over-cap eviction can drop the least-recently-used key.
+        self._buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
 
     def check(self, key: str = "default") -> None:
         """Consume one token for ``key``; raise :class:`ConnectorError` when empty."""
@@ -209,11 +222,33 @@ class RateLimiter:
             )
             if tokens < 1.0:
                 self._buckets[key] = (tokens, now)
+                self._buckets.move_to_end(key)
+                self._evict_locked()
                 retry = max(1, int((1.0 - tokens) / self._refill_per_sec + 0.999))
                 raise ConnectorError(
                     f"rate limit exceeded for {key!r}; retry in ~{retry}s"
                 )
             self._buckets[key] = (tokens - 1.0, now)
+            self._buckets.move_to_end(key)
+            self._evict_locked()
+
+    def _evict_locked(self) -> None:
+        """Trim ``_buckets`` back to ``_max_keys`` (caller holds ``_lock``).
+
+        A bucket that has refilled to ``_capacity`` is indistinguishable from an
+        absent key, so dropping it is lossless; we evict those first. If the map is
+        still over-cap (every bucket is mid-drain), LRU-evict the front, which only
+        forgives a partial drain — never tightens the limit on an active key.
+        """
+        if len(self._buckets) <= self._max_keys:
+            return
+        full = [k for k, (tokens, _) in self._buckets.items() if tokens >= self._capacity]
+        for k in full:
+            if len(self._buckets) <= self._max_keys:
+                return
+            del self._buckets[k]
+        while len(self._buckets) > self._max_keys:
+            self._buckets.popitem(last=False)
 
 
 # -------------------------------------------------------------------- retries
@@ -277,10 +312,26 @@ class IdempotencyStore:
     (fits a single connector instance); inject a shared store for multi-replica.
     """
 
-    def __init__(self) -> None:
+    #: Cap on remembered completed keys so the dedup memory of a long-lived connector
+    #: (one entry per delivery id) can't grow without bound. LRU-evicting the oldest key
+    #: only forgets that a very old delivery already ran — a re-delivery that ancient is
+    #: re-executed, which is the same at-least-once floor as having no cache at all.
+    _MAX_DONE = 8192
+
+    def __init__(self, *, max_done: int | None = None) -> None:
         self._lock = threading.Lock()
-        self._done: dict[str, Any] = {}
+        self._max_done = max_done if max_done is not None else self._MAX_DONE
+        if self._max_done <= 0:
+            raise ValueError("max_done must be positive")
+        self._done: OrderedDict[str, Any] = OrderedDict()
         self._inflight: set[str] = set()
+
+    def _remember_locked(self, key: str, result: Any) -> None:
+        """Cache ``result`` for ``key`` + LRU-trim ``_done`` (caller holds ``_lock``)."""
+        self._done[key] = result
+        self._done.move_to_end(key)
+        while len(self._done) > self._max_done:
+            self._done.popitem(last=False)
 
     def run_once(self, key: str, call: Callable[[], Any]) -> Any:
         """Run ``call`` once for ``key``; return the cached result on a repeat.
@@ -302,7 +353,7 @@ class IdempotencyStore:
             with self._lock:
                 self._inflight.discard(key)
         with self._lock:
-            self._done[key] = result
+            self._remember_locked(key, result)
         return result
 
     async def run_once_async(
@@ -335,7 +386,7 @@ class IdempotencyStore:
             raise
         with self._lock:
             self._inflight.discard(key)
-            self._done[key] = result
+            self._remember_locked(key, result)
         return result
 
     def seen(self, key: str) -> bool:

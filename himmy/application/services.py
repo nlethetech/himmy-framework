@@ -755,22 +755,43 @@ class RunAppService:
         # The retry ceiling stamped on every enqueued run (the dispatcher's backoff budget).
         self._default_max_attempts = DEFAULT_QUEUE_MAX_ATTEMPTS
 
-    def enable_dispatch(self, *, max_attempts: int | None = None) -> None:
+    def enable_dispatch(
+        self,
+        *,
+        max_attempts: int | None = None,
+        run_timeout_seconds: float | None = None,
+    ) -> None:
         """Switch this service into leased-dispatch mode (the Q3 dispatcher owns execution).
 
         Called by the :class:`~himmy.application.dispatcher.RunDispatcher` at server startup
         once it has confirmed the durable run store is active. From this point new runs are
         ENQUEUED (persisted QUEUED with recoverable input) instead of fire-and-forgotten, and
         the dispatcher claims them. Idempotent.
+
+        ``max_attempts`` (the enqueue retry ceiling) and ``run_timeout_seconds`` (each run's
+        wall clock, which also bases the lease TTL) are optional operator overrides; ``None``
+        leaves the construction-time value untouched. A non-positive value is clamped up.
         """
         self._dispatch_enabled = True
         if max_attempts is not None:
             self._default_max_attempts = max(1, int(max_attempts))
+        if run_timeout_seconds is not None:
+            self._run_timeout_seconds = max(1.0, float(run_timeout_seconds))
 
     @property
     def dispatch_enabled(self) -> bool:
         """Whether the leased dispatcher owns execution (vs. inline fire-and-forget)."""
         return self._dispatch_enabled
+
+    @property
+    def run_timeout_seconds(self) -> float:
+        """Each background run's wall-clock timeout (AAEO-1); also the lease TTL basis."""
+        return self._run_timeout_seconds
+
+    @property
+    def default_max_attempts(self) -> int:
+        """The retry ceiling stamped on every enqueued run (the dispatcher's backoff budget)."""
+        return self._default_max_attempts
 
     @property
     def lease_seconds(self) -> float:

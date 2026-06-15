@@ -136,6 +136,7 @@ def test_contract_verified_against_installed_sdk_major() -> None:
 def test_generate_kwargs_validate_against_sdk_request_typeddicts() -> None:
     """Every kwarg/shape the adapter sends exists in the SDK's request schema."""
     from openai.types.chat import (
+        ChatCompletionAssistantMessageParam,
         ChatCompletionFunctionToolParam,
         ChatCompletionToolMessageParam,
         completion_create_params,
@@ -151,7 +152,13 @@ def test_generate_kwargs_validate_against_sdk_request_typeddicts() -> None:
                     InferenceMessage(role="system", content="be brief"),
                     InferenceMessage(role="user", content="rates?"),
                     InferenceMessage(role="assistant", content="checking"),
-                    InferenceMessage(role="tool", content="5%", tool_call_id="call_1"),
+                    InferenceMessage(
+                        role="tool",
+                        content="5%",
+                        tool_call_id="call_1",
+                        name="lookup",
+                        metadata={"tool_name": "lookup", "tool_args": {"q": "rates"}},
+                    ),
                 ],
                 response_format=ResponseFormat.AUTO_TOOLS,
                 bound_tools=[
@@ -176,6 +183,18 @@ def test_generate_kwargs_validate_against_sdk_request_typeddicts() -> None:
     (tool_msg,) = [m for m in seen["messages"] if m["role"] == "tool"]
     assert set(tool_msg) <= tool_msg_keys
     assert tool_msg["tool_call_id"] == "call_1"
+    # The preceding assistant message carries the reconstructed tool_calls array;
+    # both the message and its tool_calls entries must satisfy the SDK param shapes.
+    assistant_keys = _typed_dict_keys(ChatCompletionAssistantMessageParam)
+    (assistant_msg,) = [
+        m for m in seen["messages"] if m["role"] == "assistant" and "tool_calls" in m
+    ]
+    assert set(assistant_msg) <= assistant_keys
+    (call,) = assistant_msg["tool_calls"]
+    assert call["id"] == "call_1"
+    assert call["type"] == "function"
+    assert call["function"]["name"] == "lookup"
+    assert call["function"]["arguments"] == '{"q": "rates"}'
     # Tool definitions must satisfy the SDK's function-tool param shape.
     tool_keys = _typed_dict_keys(ChatCompletionFunctionToolParam)
     fn_keys = _typed_dict_keys(FunctionDefinition)
@@ -226,6 +245,136 @@ def test_stream_kwargs_validate_against_sdk_request_typeddicts() -> None:
     assert set(seen) <= create_keys, f"unknown create kwargs: {set(seen) - create_keys}"
     assert seen["stream"] is True
     assert seen["stream_options"] == {"include_usage": True}
+
+
+def _real_tool_chunk(
+    *,
+    index: int,
+    id: str | None = None,  # noqa: A002 - mirrors the SDK attribute name
+    name: str | None = None,
+    arguments: str | None = None,
+) -> Any:
+    """Build a REAL ``ChatCompletionChunk`` carrying one streamed tool-call fragment."""
+    from openai.types.chat import ChatCompletionChunk
+    from openai.types.chat.chat_completion_chunk import (
+        Choice,
+        ChoiceDelta,
+        ChoiceDeltaToolCall,
+        ChoiceDeltaToolCallFunction,
+    )
+
+    return ChatCompletionChunk(
+        id="chatcmpl-stream",
+        created=1,
+        model=MODEL,
+        object="chat.completion.chunk",
+        choices=[
+            Choice(
+                index=0,
+                delta=ChoiceDelta(
+                    tool_calls=[
+                        ChoiceDeltaToolCall(
+                            index=index,
+                            id=id,
+                            type="function",
+                            function=ChoiceDeltaToolCallFunction(
+                                name=name, arguments=arguments
+                            ),
+                        )
+                    ]
+                ),
+            )
+        ],
+    )
+
+
+def _real_usage_chunk(*, prompt_tokens: int, completion_tokens: int) -> Any:
+    """Build a REAL final ``ChatCompletionChunk`` carrying only ``usage``."""
+    from openai.types import CompletionUsage
+    from openai.types.chat import ChatCompletionChunk
+
+    return ChatCompletionChunk(
+        id="chatcmpl-stream",
+        created=1,
+        model=MODEL,
+        object="chat.completion.chunk",
+        choices=[],
+        usage=CompletionUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+
+
+def test_real_stream_tool_call_deltas_reassemble_and_execute() -> None:
+    """REAL streamed ``delta.tool_calls`` fragments reassemble + execute on stream end.
+
+    The SDK streams a tool call across chunks (id+name first, then the ``arguments``
+    JSON in pieces). Through REAL ``ChatCompletionChunk`` / ``ChoiceDeltaToolCall``
+    types, the adapter must send the bound ``tools``, reassemble the fragments by
+    ``index`` and execute the completed call — the streaming-tools blocker fix.
+    """
+    executed: list[tuple[str, dict[str, Any]]] = []
+
+    async def executor(name: str, args: dict[str, Any]) -> ToolReturnRecord:
+        executed.append((name, args))
+        return ToolReturnRecord(
+            tool_call_id="x", tool_name=name, content="18C and clear"
+        )
+
+    chunks = [
+        _real_tool_chunk(index=0, id="call_w", name="get_weather"),
+        _real_tool_chunk(index=0, arguments='{"city"'),
+        _real_tool_chunk(index=0, arguments=': "Paris"}'),
+        _real_usage_chunk(prompt_tokens=20, completion_tokens=6),
+    ]
+
+    class _StreamTransport:
+        class _Completions:
+            def __init__(self) -> None:
+                self.seen: dict[str, Any] = {}
+
+            async def create(self, **kwargs: Any) -> Any:
+                self.seen.update(kwargs)
+
+                async def _gen() -> Any:
+                    for chunk in chunks:
+                        yield chunk
+
+                return _gen()
+
+        def __init__(self) -> None:
+            self.chat = type(
+                "c", (), {"completions": _StreamTransport._Completions()}
+            )()
+
+    transport = _StreamTransport()
+    mgr = OpenAIClientManager(model=MODEL, client=transport)
+    req = _req(
+        response_format=ResponseFormat.AUTO_TOOLS,
+        bound_tools=[BoundTool(name="get_weather", description="weather")],
+        tool_executor=executor,
+    )
+
+    async def _collect() -> list[Any]:
+        return [piece async for piece in mgr.generate_stream(req)]
+
+    pieces = run_async(_collect())
+
+    # Bound tools ride on the stream request (the blocker).
+    seen = transport.chat.completions.seen
+    assert [t["function"]["name"] for t in seen["tools"]] == ["get_weather"]
+    # Only the final response is yielded (a tool turn has no text deltas).
+    (final,) = pieces
+    assert final.status == InferenceStatus.SUCCESS
+    assert [c.tool_name for c in final.tool_calls] == ["get_weather"]
+    assert final.tool_calls[0].tool_call_id == "call_w"
+    assert final.tool_calls[0].args == {"city": "Paris"}
+    assert executed == [("get_weather", {"city": "Paris"})]
+    assert final.tool_returns[0].content == "18C and clear"
+    assert final.output_text is None
+    assert final.input_tokens == 20 and final.output_tokens == 6
 
 
 # --------------------------------------------------- SDK response -> normalized

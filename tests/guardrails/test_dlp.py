@@ -171,3 +171,16 @@ def test_dlp_registered_as_named_guardrail() -> None:
     pipe = build_guardrail_pipeline(["dlp"])  # default policy = redact
     v = pipe.inspect("reach me at a@b.com")
     assert "a@b.com" not in v.text
+
+
+def test_named_dlp_guardrail_honors_block_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The spec/CLI path must resolve ``dlp`` via ``build_dlp_guardrail`` so
+    # HIMMY_DLP_* policy config takes effect — a *:block policy BLOCKS, it does
+    # not merely redact (the bare DlpGuardrail() default would redact-all).
+    monkeypatch.setenv("HIMMY_DLP_POLICY", "*:block")
+    pipe = build_guardrail_pipeline(["dlp"])
+    v = pipe.inspect("reach me at a@b.com")
+    assert v.allowed is False
+    assert any("email" in r for r in v.reasons)

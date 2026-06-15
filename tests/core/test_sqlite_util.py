@@ -23,3 +23,15 @@ def test_memory_db_skips_wal(tmp_path: Path) -> None:
         assert mode in ("memory", "delete")
     finally:
         conn.close()
+
+
+def test_synchronous_defaults_normal_and_full_is_honored(tmp_path: Path) -> None:
+    """Default is NORMAL (=1); durability-critical stores opt into FULL (=2)."""
+    normal = connect_hardened(str(tmp_path / "n.db"))
+    full = connect_hardened(str(tmp_path / "f.db"), synchronous="FULL")
+    try:
+        assert normal.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+        assert full.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+    finally:
+        normal.close()
+        full.close()

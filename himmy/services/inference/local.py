@@ -20,6 +20,7 @@ import json
 import os
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any, cast
 
 from himmy.core.ids import new_uuid
@@ -532,9 +533,25 @@ class ClaudeCliClientManager:
             stderr=asyncio.subprocess.PIPE,
             env=child_env,
         )
-        out, err = await asyncio.wait_for(
-            proc.communicate(stdin.encode("utf-8")), timeout=timeout or self._timeout
-        )
+        try:
+            out, err = await asyncio.wait_for(
+                proc.communicate(stdin.encode("utf-8")),
+                timeout=timeout or self._timeout,
+            )
+        finally:
+            # On timeout/cancel, ``communicate`` is cancelled but the detached
+            # ``claude`` subprocess keeps running. Reap it so we never leak a
+            # long-lived process (mirrors the MCP client's terminate->kill ladder).
+            if proc.returncode is None:
+                with suppress(ProcessLookupError, Exception):
+                    proc.terminate()
+                with suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                with suppress(ProcessLookupError, Exception):
+                    if proc.returncode is None:
+                        proc.kill()
+                with suppress(Exception):
+                    await proc.wait()
         if proc.returncode != 0:
             raise RuntimeError(
                 err.decode("utf-8", "replace").strip() or "claude CLI nonzero exit"

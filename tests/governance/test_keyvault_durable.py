@@ -140,6 +140,60 @@ def test_shred_retains_tombstone_row(tmp_path: Path) -> None:
     assert row[1] is not None  # shredded_at stamped
 
 
+def test_destroy_checkpoints_wal_so_shred_survives_power_cut(tmp_path: Path) -> None:
+    """``destroy`` must ``wal_checkpoint(TRUNCATE)`` so the shred is fsynced to the main DB.
+
+    The vault opens with ``synchronous=NORMAL``, so a plain commit only appends to the WAL;
+    a power-cut before the next checkpoint could lose the shred and RESURRECT a key the
+    deletion certificate already swore was destroyed. We (1) assert the checkpoint pragma is
+    actually issued during ``destroy``, and (2) prove its effect: after the shred the WAL
+    sidecar is empty (truncated), so the nulled key already lives in the main db file.
+    """
+    path = str(tmp_path / "keyvault.db")
+    vault = SubjectKeyVault(path, meta_kek=None)
+    vault.key_for("mallory")
+
+    # sqlite3.Connection.execute is read-only, so spy via a thin delegating proxy.
+    issued: list[str] = []
+
+    class _SpyConn:
+        def __init__(self, real: sqlite3.Connection) -> None:
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):  # type: ignore[no-untyped-def]
+            issued.append(sql)
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):  # type: ignore[no-untyped-def]
+            return getattr(self._real, name)
+
+    real_conn = vault._conn
+    vault._conn = _SpyConn(real_conn)  # type: ignore[assignment]
+    assert vault.destroy("mallory") is True
+    vault._conn = real_conn
+
+    assert any("wal_checkpoint(TRUNCATE)" in sql for sql in issued)
+
+    # The TRUNCATE checkpoint flushed the WAL into the main db: the sidecar is now empty,
+    # so the shred is durable even if the process dies before any further write.
+    wal = Path(path + "-wal")
+    assert (not wal.exists()) or wal.stat().st_size == 0
+    vault.close()
+
+    # And the main db file alone (no WAL) carries the shred.
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT wrapped_dek, shredded_at FROM subject_keys WHERE subject_id = ?",
+            ("mallory",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] is None  # key bytes nulled, durably
+    assert row[1] is not None  # shredded_at stamped, durably
+
+
 def test_meta_kek_wraps_key_on_disk_and_unwraps_stably(tmp_path: Path) -> None:
     """With a meta-KEK provider the on-disk key is WRAPPED (not raw) yet unwraps stably.
 

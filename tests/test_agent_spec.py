@@ -6,8 +6,11 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
+from pydantic import ValidationError
 
 from himmy.config import AgentSpec, load_agent_spec
+from himmy.core.errors import HimmyError
 from himmy.services.inference.models import ResponseFormat
 
 
@@ -39,6 +42,13 @@ def test_to_llm_config_derives_structured_output() -> None:
     assert cfg.model_key == "haiku"
     assert cfg.temperature == 0.2
     assert cfg.response_format == ResponseFormat.STRUCTURED_OUTPUT
+
+
+def test_typod_field_is_rejected_loudly() -> None:
+    """extra='forbid': a typo'd top-level field fails with the bad key named,
+    instead of being silently dropped (which would run the agent unconfigured)."""
+    with pytest.raises(ValidationError, match="gaurdrails"):
+        AgentSpec(name="a", gaurdrails=["pii"])  # type: ignore[call-arg]
 
 
 def test_to_llm_config_text_default_without_schema() -> None:
@@ -80,5 +90,28 @@ def test_load_agent_spec_resolves_schema_path(tmp_path: Path) -> None:
 def test_load_agent_spec_rejects_non_mapping(tmp_path: Path) -> None:
     """A non-mapping YAML document is a clear error, not a cryptic crash."""
     (tmp_path / "bad.yaml").write_text("- just\n- a\n- list\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(HimmyError):
         load_agent_spec(tmp_path / "bad.yaml")
+
+
+def test_load_agent_spec_malformed_yaml_names_file(tmp_path: Path) -> None:
+    """Malformed YAML raises a clean HimmyError naming the file, not a raw
+    yaml.parser.ParserError traceback with no filename."""
+    bad = tmp_path / "broken.yaml"
+    bad.write_text("name: a\ntools: [unclosed\n")  # unterminated flow sequence
+    with pytest.raises(HimmyError) as excinfo:
+        load_agent_spec(bad)
+    assert "broken.yaml" in str(excinfo.value)
+    # The leaked parser type must NOT be what surfaces.
+    assert not isinstance(excinfo.value, yaml.YAMLError)
+
+
+def test_load_agent_spec_schema_error_names_file(tmp_path: Path) -> None:
+    """A pydantic validation failure is wrapped as a HimmyError naming the file,
+    not a raw multi-line ValidationError dump."""
+    bad = tmp_path / "agent.yaml"
+    bad.write_text("description: missing required name\n")  # 'name' is required
+    with pytest.raises(HimmyError) as excinfo:
+        load_agent_spec(bad)
+    assert "agent.yaml" in str(excinfo.value)
+    assert not isinstance(excinfo.value, ValidationError)

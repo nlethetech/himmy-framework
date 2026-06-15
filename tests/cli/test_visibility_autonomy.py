@@ -158,9 +158,19 @@ def test_budget_flag_parses_and_wins_over_toml(
 
 
 def test_budget_toml_loader(tmp_path: Path) -> None:
-    (tmp_path / "himmy.toml").write_text("[limits]\nsession_budget = 1.25\n")
-    assert permissions.load_session_budget(tmp_path) == 1.25
-    assert permissions.load_session_budget(tmp_path / "nope") is None
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "himmy.toml").write_text("[limits]\nsession_budget = 1.25\n")
+    assert permissions.load_session_budget(proj) == 1.25
+    # A subdirectory still inherits the project-root cap (resolved via the project
+    # root, not the literal cwd) — a run from 'cd subdir' must keep the budget.
+    sub = proj / "pkg"
+    sub.mkdir()
+    assert permissions.load_session_budget(sub) == 1.25
+    # A sibling tree with no himmy.toml up the chain genuinely has no budget.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert permissions.load_session_budget(empty) is None
 
 
 def test_budget_warns_once_at_80pct() -> None:

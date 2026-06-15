@@ -246,13 +246,18 @@ async def save_team(body: SaveTeamRequest) -> studio_service.TeamSummary:
     merged = dict(existing)
     merged.update(_spec_payload(body))
 
-    # Round-trip the exact artifact through the real loader path before any
-    # write hits disk (yaml.safe_load + TeamSpec is what load_team_spec does).
+    # Round-trip the artifact through the real loader path before any write hits
+    # disk (yaml.safe_load + TeamSpec is what load_team_spec does). TeamSpec now
+    # forbids extras, so validate only the spec-defined keys here: opaque advanced/
+    # forward-compat keys carried over from an existing file (e.g. ``x_custom``) are
+    # preserved on disk but not fed to the strict model.
     from himmy.config.team_spec import TeamSpec
 
     text = yaml.safe_dump(merged, sort_keys=False, allow_unicode=True)
+    spec_keys = set(TeamSpec.model_fields)
+    to_validate = {k: v for k, v in yaml.safe_load(text).items() if k in spec_keys}
     try:
-        TeamSpec.model_validate(yaml.safe_load(text))
+        TeamSpec.model_validate(to_validate)
     except Exception as exc:  # noqa: BLE001 - surface as a validation failure
         raise HTTPException(status_code=422, detail=f"Spec error: {exc}") from exc
 

@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 from himmy.api import ApiContainer, create_app
 from himmy.api.connector_inbound import INBOUND_AGENT_PATH_ENV
+from himmy.api.route_introspection import collect_route_paths
 from himmy.config.secrets import (
     ChainSecretProvider,
     EnvSecrets,
@@ -66,7 +67,7 @@ def env(tmp_path: Path):
 
 
 def _mounted_paths(app: object) -> set[str]:
-    return {getattr(r, "path", "") for r in app.routes}
+    return collect_route_paths(app)
 
 
 def _app() -> object:

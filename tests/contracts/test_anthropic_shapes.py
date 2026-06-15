@@ -139,7 +139,13 @@ def test_request_projection_full_envelope() -> None:
             InferenceMessage(role="system", content="answer in english"),
             InferenceMessage(role="user", content="what are the rates?"),
             InferenceMessage(role="assistant", content="let me check"),
-            InferenceMessage(role="tool", content='{"rate": 5}', tool_call_id="tc_1"),
+            InferenceMessage(
+                role="tool",
+                content='{"rate": 5}',
+                tool_call_id="tc_1",
+                name="lookup",
+                metadata={"tool_name": "lookup", "tool_args": {"q": "rates"}},
+            ),
         ],
         response_format=ResponseFormat.AUTO_TOOLS,
         bound_tools=[
@@ -174,10 +180,24 @@ def test_request_projection_full_envelope() -> None:
     assert seen["top_p"] == 0.9
     # System turns are split out of messages and joined with a blank line.
     assert seen["system"] == "be brief\n\nanswer in english"
-    # Tool-role turns become a tool_result content block on a USER turn.
+    # Tool-role turns become a tool_result content block on a USER turn, and the
+    # preceding assistant turn is lifted to block form carrying the originating
+    # tool_use block (reconstructed from the tool turn's metadata) so Anthropic accepts
+    # the tool_result reference.
     assert seen["messages"] == [
         {"role": "user", "content": "what are the rates?"},
-        {"role": "assistant", "content": "let me check"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "let me check"},
+                {
+                    "type": "tool_use",
+                    "id": "tc_1",
+                    "name": "lookup",
+                    "input": {"q": "rates"},
+                },
+            ],
+        },
         {
             "role": "user",
             "content": [

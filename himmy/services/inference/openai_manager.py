@@ -36,6 +36,7 @@ from himmy.services.inference.models import (
     BoundTool,
     InferenceError,
     InferenceErrorCode,
+    InferenceMessage,
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
@@ -121,10 +122,46 @@ def _openai_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
     ]
 
 
+def _tool_call_block(m: InferenceMessage) -> dict[str, Any] | None:
+    """Reconstruct the OpenAI assistant ``tool_calls`` entry that a tool turn answers.
+
+    OpenAI strictly requires every ``role="tool"`` message to be preceded by an
+    assistant message bearing a ``tool_calls`` array that includes the SAME
+    ``tool_call_id`` — otherwise the request is rejected with a 400 (the multi-turn
+    tool blocker). The runtime's tool-role message carries the originating call's
+    ``tool_call_id``, tool name (``name`` / ``metadata['tool_name']``) and arguments
+    (``metadata['tool_args']``), so the assistant call block is fully reconstructable
+    here. Returns ``None`` when there is no ``tool_call_id`` to anchor the pair.
+    """
+    call_id = m.tool_call_id or m.metadata.get("tool_call_id")
+    if not call_id:
+        return None
+    name = m.name or m.metadata.get("tool_name") or ""
+    args = m.metadata.get("tool_args")
+    try:
+        arguments = json.dumps(args if isinstance(args, dict) else {})
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        arguments = "{}"
+    return {
+        "id": str(call_id),
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
 def _openai_messages(
     request: InferenceRequest, *, cache_system: bool = False
 ) -> list[dict[str, Any]]:
     """Project the request into OpenAI chat ``messages`` (role-preserving).
+
+    A ``role="tool"`` turn projects to a ``role="tool"`` message, but OpenAI rejects a
+    tool message that is not preceded by an assistant message carrying a matching
+    ``tool_calls`` array. So before each run of tool messages this back-fills the
+    originating assistant ``tool_calls`` (reconstructed from the tool turns' metadata):
+    if the message just before the run is already an assistant message it gains the
+    ``tool_calls`` array, otherwise a synthetic assistant message is inserted to anchor
+    the pair. This is the symmetric round-trip of the non-streaming tool-call extraction
+    and makes a multi-turn tool run (streaming or not) valid against OpenAI/OpenRouter.
 
     With ``cache_system=True`` the LAST system message's content is rewritten from a
     plain string into a single-block array carrying ``cache_control`` — the shape
@@ -135,9 +172,25 @@ def _openai_messages(
     """
     messages: list[dict[str, Any]] = []
     last_system_idx = -1
+    # Tracks the assistant message that the CURRENT contiguous run of tool messages must
+    # be anchored to; reset whenever a non-tool message breaks the run.
+    tool_anchor: dict[str, Any] | None = None
     for m in request.messages:
         role = (m.role or "user").lower()
         if role == "tool":
+            block = _tool_call_block(m)
+            if block is not None:
+                if tool_anchor is None:
+                    # No assistant message precedes this tool turn (e.g. the runtime
+                    # appends the tool result before the assistant text): insert a
+                    # synthetic assistant message to carry the originating tool_calls.
+                    tool_anchor = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [],
+                    }
+                    messages.append(tool_anchor)
+                tool_anchor.setdefault("tool_calls", []).append(block)
             messages.append(
                 {
                     "role": "tool",
@@ -146,11 +199,15 @@ def _openai_messages(
                 }
             )
         elif role in ("system", "assistant", "user"):
-            messages.append({"role": role, "content": m.content})
+            entry: dict[str, Any] = {"role": role, "content": m.content}
+            messages.append(entry)
+            # An assistant message can anchor the tool messages that follow it.
+            tool_anchor = entry if role == "assistant" else None
             if role == "system":
                 last_system_idx = len(messages) - 1
         else:
             messages.append({"role": "user", "content": m.content})
+            tool_anchor = None
     if cache_system and last_system_idx >= 0:
         text = messages[last_system_idx]["content"]
         messages[last_system_idx]["content"] = [
@@ -451,7 +508,10 @@ class OpenAIClientManager:
 
         Accumulates ``choices[0].delta.content`` deltas and rebuilds a final
         :class:`InferenceResponse` from the streamed text + any ``usage`` on the last
-        chunk (``stream_options={"include_usage": True}``). Any failure degrades to a
+        chunk (``stream_options={"include_usage": True}``). ``bound_tools`` are sent on
+        the stream request and the model's ``delta.tool_calls`` are reassembled by index
+        across chunks, then EXECUTED on stream end exactly like :meth:`generate` — so a
+        streamed tool turn is no longer silently dropped. Any failure degrades to a
         single buffered :meth:`generate` so the delta-then-final contract always holds.
         """
         model = self.resolve(request.model_key)
@@ -469,6 +529,8 @@ class OpenAIClientManager:
             payload["temperature"] = params["temperature"]
         if params.get("max_tokens") is not None:
             payload["max_tokens"] = params["max_tokens"]
+        if request.bound_tools:
+            payload["tools"] = self._tools_payload(request)
         self._apply_prompt_cache_key(request, model, payload)
         self._apply_usage_accounting(payload)
         if self._default_headers:
@@ -478,6 +540,7 @@ class OpenAIClientManager:
             client = self._build_client()
             stream = await client.chat.completions.create(**payload)
             chunks: list[str] = []
+            tool_fragments: dict[int, dict[str, Any]] = {}
             breakdown = UsageBreakdown()
             async for chunk in stream:
                 choices = getattr(chunk, "choices", None) or []
@@ -487,6 +550,7 @@ class OpenAIClientManager:
                     if piece:
                         chunks.append(str(piece))
                         yield str(piece)
+                    _accumulate_tool_deltas(delta, tool_fragments)
                 usage = getattr(chunk, "usage", None)
                 if usage is not None:
                     breakdown = read_openai_usage(usage)
@@ -494,7 +558,16 @@ class OpenAIClientManager:
             yield await self.generate(request)
             return
 
-        text = "".join(chunks)
+        raw_calls = _tool_calls_from_fragments(tool_fragments)
+        tool_returns: list[Any] = []
+        if raw_calls:
+            tool_returns = await _execute_tool_calls(
+                request.bound_tools, raw_calls, request.tool_executor
+            )
+
+        text: str | None = "".join(chunks)
+        if raw_calls:
+            text = None  # the reply was a tool call, not a final answer
         price = pricing.price_for(model_path)
         if price.input_per_1k == 0.0 and price.output_per_1k == 0.0:
             price = pricing.price_for(request.model_key)
@@ -508,6 +581,8 @@ class OpenAIClientManager:
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,
             output_text=text,
+            tool_calls=raw_calls,
+            tool_returns=tool_returns,
             input_tokens=breakdown.total_input,
             output_tokens=breakdown.output,
             cost=compute_cached_cost(
@@ -518,6 +593,66 @@ class OpenAIClientManager:
             latency_ms=(time.perf_counter() - started) * 1000.0,
             metadata=_cache_metadata(price, breakdown, read_rate, write_mult),
         )
+
+
+def _accumulate_tool_deltas(
+    delta: Any, fragments: dict[int, dict[str, Any]]
+) -> None:
+    """Fold a streamed ``delta.tool_calls`` slice into per-index fragment buffers.
+
+    OpenAI streams a tool call across many chunks: the first delta for an ``index``
+    carries the ``id`` (and the function ``name``), and later deltas append more of the
+    JSON ``arguments`` string. This reassembles them by ``index`` so the completed call
+    can be parsed like the non-streaming ``message.tool_calls`` shape.
+    """
+    if delta is None:
+        return
+    for tc in getattr(delta, "tool_calls", None) or []:
+        idx = getattr(tc, "index", None)
+        if idx is None:
+            continue
+        slot = fragments.setdefault(idx, {"id": None, "name": "", "arguments": ""})
+        tc_id = getattr(tc, "id", None)
+        if tc_id:
+            slot["id"] = tc_id
+        fn = getattr(tc, "function", None)
+        if fn is not None:
+            name = getattr(fn, "name", None)
+            if name:
+                slot["name"] = name
+            args = getattr(fn, "arguments", None)
+            if args:
+                slot["arguments"] += str(args)
+
+
+def _tool_calls_from_fragments(
+    fragments: dict[int, dict[str, Any]],
+) -> list[ToolCallRecord]:
+    """Parse reassembled streamed tool-call fragments into typed :class:`ToolCallRecord`.
+
+    Ordered by stream ``index``; the accumulated ``arguments`` JSON string is decoded
+    (an empty / malformed buffer degrades to ``{}``), mirroring the non-streaming
+    :func:`_parse_openai_tool_calls` shape.
+    """
+    calls: list[ToolCallRecord] = []
+    for idx in sorted(fragments):
+        slot = fragments[idx]
+        name = slot.get("name") or ""
+        if not name:
+            continue
+        raw_args = slot.get("arguments") or ""
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError:
+            args = {}
+        calls.append(
+            ToolCallRecord(
+                tool_call_id=slot.get("id") or new_uuid(),
+                tool_name=name,
+                args=args if isinstance(args, dict) else {},
+            )
+        )
+    return calls
 
 
 def _parse_openai_tool_calls(message: Any) -> list[ToolCallRecord]:

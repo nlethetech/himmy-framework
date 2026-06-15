@@ -15,6 +15,7 @@ single bad request can never kill a batch.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
 from collections.abc import AsyncGenerator
@@ -46,6 +47,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.client_manager import ClientManager
 
 from himmy.core.events import EventType, RunEvent
+
+logger = logging.getLogger("himmy.services.inference")
 
 
 class StreamDelta(BaseModel):
@@ -255,6 +258,17 @@ class InferenceService:
                 and response.error.retryable
                 and response.error.code in RETRYABLE_ERROR_CODES
             ):
+                logger.warning(
+                    "inference retry %d/%d for model_key=%s after %s: %s",
+                    attempt + 1,
+                    self._max_retries,
+                    request.model_key,
+                    response.error.code.value,
+                    response.error.message,
+                )
+                from himmy.services.observability.metrics import get_registry
+
+                get_registry().inference_retries_total.inc()
                 await asyncio.sleep(self._backoff_delay(attempt))
                 continue
             break
@@ -284,11 +298,19 @@ class InferenceService:
         # Exhausted: stamp latency and emit the failure.
         assert last_response is not None
         last_response.latency_ms = (time.perf_counter() - started) * 1000.0
+        err = last_response.error
+        logger.warning(
+            "inference FAILED for model_key=%s after %d attempt(s): %s (%s)",
+            request.model_key,
+            self._max_retries + 1,
+            err.message if err else "unknown",
+            err.code.value if err else "unknown",
+        )
         await self._emit(
             EventType.INFERENCE_FAILED,
             request_id=request.request_id,
             latency_ms=last_response.latency_ms,
-            error=(last_response.error.message if last_response.error else "unknown"),
+            error=(err.message if err else "unknown"),
         )
         return last_response
 
@@ -509,4 +531,6 @@ class InferenceService:
                 RunEvent(event_type=event_type, **kwargs)  # type: ignore[arg-type]
             )
         except Exception:  # noqa: BLE001 - observability must never break inference
-            pass
+            logger.warning(
+                "failed to emit %s lifecycle event", event_type.value, exc_info=True
+            )

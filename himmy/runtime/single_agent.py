@@ -3553,6 +3553,13 @@ class SingleAgentRuntime:
             emit_event_span(event)
         except Exception:  # pragma: no cover - defensive
             pass
+        # Prometheus metrics: translate the event into bounded-cardinality counters.
+        try:
+            from himmy.services.observability.metrics import get_metrics_sink
+
+            await get_metrics_sink().append_event(event)
+        except Exception:  # pragma: no cover - defensive
+            pass
         # RO-6: stream incremental progress to caller-supplied callbacks.
         for callback in self._on_event:
             try:

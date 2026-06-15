@@ -6,6 +6,9 @@ import os
 import sys
 from typing import Any
 
+import pytest
+from pydantic import ValidationError
+
 from himmy.config.agent_spec import AgentSpec
 from himmy.config.mcp_spec import (
     MCPServerConfig,
@@ -25,6 +28,12 @@ _MOCK_SERVER = os.path.join(
 
 def _config(**over: Any) -> MCPServerConfig:
     return MCPServerConfig(command=sys.executable, args=[_MOCK_SERVER], **over)
+
+
+def test_typod_mcp_field_is_rejected_loudly() -> None:
+    """extra='forbid': a typo'd MCP server field fails with the bad key named."""
+    with pytest.raises(ValidationError, match="comand"):
+        MCPServerConfig(comand="npx")  # type: ignore[call-arg]  # typo'd "command"
 
 
 def test_to_server_spec_projects_launch_fields() -> None:

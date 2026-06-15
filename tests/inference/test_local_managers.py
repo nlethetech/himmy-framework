@@ -175,6 +175,57 @@ def test_claude_cli_failure_is_normalized() -> None:
     assert resp.status == InferenceStatus.FAILED
 
 
+def test_claude_cli_kills_subprocess_on_timeout(monkeypatch: Any) -> None:
+    """On a per-call timeout the spawned ``claude`` process is reaped (no orphan)."""
+    import asyncio
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminated = False
+            self.killed = False
+            self.stdin = None
+
+        async def communicate(self, _data: bytes) -> tuple[bytes, bytes]:
+            # Hang forever so ``asyncio.wait_for`` raises TimeoutError.
+            await asyncio.sleep(3600)
+            raise AssertionError("communicate should have been cancelled")
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode if self.returncode is not None else 0
+
+    proc = _FakeProc()
+
+    async def _fake_create_subprocess_exec(*_a: Any, **_k: Any) -> _FakeProc:
+        return proc
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _fake_create_subprocess_exec
+    )
+
+    mgr = ClaudeCliClientManager(model="haiku")
+
+    async def _drive() -> None:
+        try:
+            await mgr._run(["claude"], "hello", timeout=0.05)
+        except TimeoutError:
+            return
+        raise AssertionError("expected a timeout")
+
+    run_async(_drive())
+    # The orphaned subprocess was reaped (terminate ran; process is no longer alive).
+    assert proc.terminated is True
+    assert proc.returncode is not None
+
+
 # ----------------------------------------------------------------- HimalayaGPT
 def test_himalayagpt_uses_injected_generate_fn() -> None:
     """HimalayaGPT routes generation through the injected function (no model load)."""

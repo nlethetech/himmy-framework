@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from himmy.api.app import _readiness, create_app
+from himmy.api.route_introspection import collect_route_paths
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +57,7 @@ def test_durable_requested_recorded_in_body(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_health_and_readyz_are_distinct_routes() -> None:
     app = create_app()
-    paths = {route.path for route in app.routes}  # type: ignore[attr-defined]
+    paths = collect_route_paths(app)
     assert "/health" in paths
     assert "/readyz" in paths
 

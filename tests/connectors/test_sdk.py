@@ -335,6 +335,18 @@ def test_call_idempotent_dedupes_a_retry() -> None:
     assert fired["n"] == 1
 
 
+def test_idempotency_store_done_map_is_bounded() -> None:
+    """The completed-key cache LRU-evicts so a long-lived connector can't grow unbounded."""
+    store = IdempotencyStore(max_done=3)
+    for i in range(100):
+        store.run_once(f"k{i}", lambda i=i: i)
+    # The map never exceeds the cap no matter how many distinct keys completed.
+    assert len(store._done) == 3
+    # The most-recent keys are retained; the oldest were evicted.
+    assert store.seen("k99") is True
+    assert store.seen("k0") is False
+
+
 # --------------------------------------------------------------- retry policy
 
 
@@ -412,6 +424,37 @@ def test_rate_limiter_is_per_key() -> None:
     limiter.check("b")  # separate bucket, not throttled by 'a'
     with pytest.raises(ConnectorError):
         limiter.check("a")
+
+
+def test_rate_limiter_bucket_map_is_bounded() -> None:
+    """A flood of distinct keys can't grow ``_buckets`` past the cap.
+
+    A bucket that has refilled back to capacity is lossless to drop, so the high-rate
+    limiter here (every key is full on its single check) stays capped without throttling.
+    """
+    clock = {"t": 0.0}
+    limiter = RateLimiter(
+        rate=10, capacity=10, window=1.0, clock=lambda: clock["t"], max_keys=4
+    )
+    for i in range(1000):
+        clock["t"] += 1.0  # let every bucket refill to full before the next key
+        limiter.check(f"sender-{i}")
+    assert len(limiter._buckets) <= 4
+
+
+def test_rate_limiter_lru_evicts_when_all_buckets_draining() -> None:
+    """Even when no bucket is refilled, the map is bounded via LRU eviction."""
+    clock = {"t": 0.0}
+    limiter = RateLimiter(
+        rate=1, capacity=2, window=1.0, clock=lambda: clock["t"], max_keys=4
+    )
+    # Drain each key to below capacity (two checks) so none is fully refilled; the clock
+    # never advances, so no refill happens — eviction must fall back to LRU.
+    for i in range(50):
+        key = f"sender-{i}"
+        limiter.check(key)
+        limiter.check(key)
+    assert len(limiter._buckets) <= 4
 
 
 # --------------------------------------------------------------- capability

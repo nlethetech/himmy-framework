@@ -38,10 +38,10 @@ REJECTED = "rejected"
 CHECKPOINT_SCHEMA_VERSION = 3
 
 
-#: Arg-key substrings whose values are masked before a pending tool call is shown to a
-#: human (so an approvals inbox never surfaces a credential). The canonical home for the
-#: redaction, shared by every surface's approvals view (Studio + /v1).
-_SECRETY_ARG_KEYS = ("token", "password", "secret", "key", "authorization", "auth")
+#: The placeholder an approvals UI shows in place of a redacted secret value. Distinct
+#: from the audit-spine marker (``***REDACTED***``) only cosmetically; the SAME canonical
+#: hint list and recursive walk back both.
+_APPROVAL_REDACTION_PLACEHOLDER = "••••"
 
 
 def redact_tool_args(args: dict[str, Any]) -> dict[str, Any]:
@@ -49,12 +49,16 @@ def redact_tool_args(args: dict[str, Any]) -> dict[str, Any]:
 
     The single, surface-neutral redaction for HITL pending-tool views: both the Studio
     approvals inbox and the ``/v1`` ``GET /runs/{id}/pending-approvals`` endpoint reuse it,
-    so the two surfaces redact identically.
+    so the two surfaces redact identically. Delegates to the one canonical redactor in
+    :mod:`himmy.services.tools.security` (same hint list, same recursion into nested
+    dicts/lists) so the approver never sees MORE secrets than the audit spine masks; only
+    the cosmetic placeholder differs.
     """
-    out: dict[str, Any] = {}
-    for k, v in (args or {}).items():
-        out[k] = "••••" if any(s in k.lower() for s in _SECRETY_ARG_KEYS) else v
-    return out
+    from himmy.services.tools.security import redact_mapping
+
+    return redact_mapping(
+        args or {}, placeholder=_APPROVAL_REDACTION_PLACEHOLDER
+    )
 
 
 class PendingToolCall(BaseModel):

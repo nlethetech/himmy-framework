@@ -50,6 +50,7 @@ from typing import Any
 from himmy.api.auth.principal import Principal
 from himmy.api.auth.rbac import AccessPolicy, build_access_policy
 from himmy.cli.ui import styles
+from himmy.config.project import find_project_root
 
 #: The CLI role catalogue, expressed as DATA over ``(resource, action)`` perms.
 #:
@@ -94,12 +95,15 @@ DEFAULT_ROLE = "admin"
 
 
 def _toml_role(start: str | Path | None = None) -> str | None:
-    """The ``[rbac] role`` from the project's ``himmy.toml`` (cwd), or ``None``.
+    """The ``[rbac] role`` from the project's ``himmy.toml`` (project root), or ``None``.
 
     Mirrors :func:`himmy.cli.permissions.load_auto_approve`: reads only the local
-    ``himmy.toml`` and never crashes on a missing/odd file.
+    ``himmy.toml`` and never crashes on a missing/odd file. Resolves the file via
+    :func:`~himmy.config.project.find_project_root` so a run launched from a
+    SUBDIRECTORY still enforces the project's configured role instead of silently
+    falling back to ``admin``.
     """
-    path = Path(start or Path.cwd()) / "himmy.toml"
+    path = find_project_root(start) / "himmy.toml"
     if not path.is_file():
         return None
     try:

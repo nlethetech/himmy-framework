@@ -17,6 +17,7 @@ this one was renamed to reflect what it actually stores.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from himmy.core.events import RunEvent
@@ -44,6 +45,8 @@ from himmy.services.storage.models import (
     RunStatus,
 )
 from himmy.services.storage.protocols import ThreadEventStore
+
+logger = logging.getLogger("himmy.services.storage")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context cycle
     from himmy.agents.base_agent.thread import ChatThread

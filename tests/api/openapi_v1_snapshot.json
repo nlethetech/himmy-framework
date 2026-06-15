@@ -80,7 +80,8 @@
         "type": "object"
       },
       "AgentSpec": {
-        "description": "A declarative description of an agent, loadable from YAML.\n\nMaps cleanly onto the runtime primitives: :meth:`to_persona` builds the identity,\n:meth:`make_task` builds a unit of work, and :meth:`to_llm_config` packs the model\nknobs. ``provider``/``model`` steer the inference backend the CLI selects.",
+        "additionalProperties": false,
+        "description": "A declarative description of an agent, loadable from YAML.\n\nMaps cleanly onto the runtime primitives: :meth:`to_persona` builds the identity,\n:meth:`make_task` builds a unit of work, and :meth:`to_llm_config` packs the model\nknobs. ``provider``/``model`` steer the inference backend the CLI selects.\n\n``extra=\"forbid\"`` so a typo'd top-level field (e.g. ``gaurdrails:``) fails loudly\ninstead of being silently dropped \u2014 leaving the agent running without its config.\nThe open ``metadata`` dict stays for forward-compat / free-form keys.",
         "properties": {
           "allow_skill_dispatch": {
             "default": false,
@@ -1726,17 +1727,7 @@
         "type": "object"
       },
       "HTTPValidationError": {
-        "properties": {
-          "detail": {
-            "items": {
-              "$ref": "#/components/schemas/ValidationError"
-            },
-            "title": "Detail",
-            "type": "array"
-          }
-        },
-        "title": "HTTPValidationError",
-        "type": "object"
+        "x-framework-generated": "validation-error-envelope"
       },
       "HttpToolSpec": {
         "additionalProperties": false,
@@ -1998,7 +1989,8 @@
         "type": "object"
       },
       "MCPServerConfig": {
-        "description": "Declarative launch + binding config for one stdio MCP server.",
+        "additionalProperties": false,
+        "description": "Declarative launch + binding config for one stdio MCP server.\n\n``extra=\"forbid\"`` so a typo'd field fails loudly rather than being silently dropped.",
         "properties": {
           "args": {
             "items": {
@@ -3668,44 +3660,7 @@
         "type": "object"
       },
       "ValidationError": {
-        "properties": {
-          "ctx": {
-            "title": "Context",
-            "type": "object"
-          },
-          "input": {
-            "title": "Input"
-          },
-          "loc": {
-            "items": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "integer"
-                }
-              ]
-            },
-            "title": "Location",
-            "type": "array"
-          },
-          "msg": {
-            "title": "Message",
-            "type": "string"
-          },
-          "type": {
-            "title": "Error Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "loc",
-          "msg",
-          "type"
-        ],
-        "title": "ValidationError",
-        "type": "object"
+        "x-framework-generated": "validation-error-envelope"
       },
       "WithdrawRequest": {
         "description": "A withdrawal payload; ``purpose`` omitted withdraws every recorded purpose.",

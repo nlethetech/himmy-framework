@@ -58,6 +58,28 @@ def test_detail_redacts_secret_args(fresh_stores: None) -> None:
     assert detail.thread_preview[-1]["content"] == "email bob"
 
 
+def test_detail_redacts_secret_nested_in_json_body(fresh_stores: None) -> None:
+    """A secret buried inside a nested json_body is masked in the approver-facing view.
+
+    Regression: the approver inbox once redacted only top-level keys, so a credential
+    nested one level deep leaked in plaintext to the human (and diverged from the audit
+    spine's mask). The shared canonical redactor recurses, so it is masked here too.
+    """
+    cp = _save_pending(
+        args={
+            "method": "POST",
+            "json_body": {"user": "bob", "config": {"api_key": "sk-live-DEEP"}},
+        }
+    )
+    detail = sa.get_detail(cp.checkpoint_id)
+    assert detail is not None
+    call = detail.pending_tool_calls[0]
+    assert call.args["json_body"]["user"] == "bob"  # benign nested value kept
+    # The credential sits two levels deep under a BENIGN container key, so only a
+    # recursive walk reaches it — top-level-only redaction would leak it in plaintext.
+    assert call.args["json_body"]["config"]["api_key"] == "••••"  # nested secret masked
+
+
 def test_detail_unknown_returns_none(fresh_stores: None) -> None:
     assert sa.get_detail("nope") is None
 

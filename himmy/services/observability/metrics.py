@@ -26,10 +26,18 @@ Labels are bounded by construction. HTTP request labels are
 cannot explode series), and ``status`` (the status *class*: ``2xx``/``4xx``/...).
 Unmatched paths collapse to the literal ``<unmatched>`` template. No secret,
 header, query string, or raw path parameter is ever used as a label.
+
+The service-layer instruments (inference / tokens / cost / tools / guardrails /
+run outcomes, plus the dispatcher gauges) are fed by :class:`MetricsEventSink`,
+which subscribes to the existing ``RunEvent`` stream. Those instruments are
+label-FREE or carry only tiny closed enumerations (``stage`` ∈ {input,output},
+``status`` ∈ a fixed lifecycle set) — **never** a run id, request id, tool name,
+user id, or any free-form string — so they can never explode the series space.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from typing import TYPE_CHECKING
@@ -40,6 +48,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from fastapi import FastAPI
     from starlette.requests import Request
     from starlette.responses import Response
+
+    from himmy.core.events import RunEvent
+
+logger = logging.getLogger("himmy.observability.metrics")
 
 # Histogram buckets (seconds), Prometheus client defaults — covers sub-ms tool
 # calls through multi-second agent turns. ``+Inf`` is appended at render time.
@@ -55,6 +67,27 @@ _DEFAULT_BUCKETS: tuple[float, ...] = (
     2.5,
     5.0,
     10.0,
+)
+
+# Token-count histogram buckets: a single prompt/completion spans roughly 1 token
+# to a few hundred thousand, so use a coarse log-ish ladder rather than the
+# seconds-oriented latency buckets. ``+Inf`` is appended at render time.
+_TOKEN_BUCKETS: tuple[float, ...] = (
+    16.0,
+    64.0,
+    256.0,
+    1024.0,
+    4096.0,
+    16384.0,
+    65536.0,
+    262144.0,
+)
+
+# Closed lifecycle statuses an agent run can finish with. A status outside this
+# frozen set collapses to ``other`` so a forged/garbage payload value cannot
+# create an unbounded ``status`` label space.
+_KNOWN_RUN_STATUSES = frozenset(
+    {"success", "failed", "cancelled", "parked", "awaiting_approval", "resolving"}
 )
 
 # A frozen allow-list of HTTP methods so a forged/garbage verb cannot create an
@@ -260,12 +293,108 @@ class MetricsRegistry:
             "Number of HTTP requests currently being served.",
         )
 
+        # --- service-layer instruments (fed by MetricsEventSink) --------------
+        # Inference: calls, failures, retries (label-free; bounded by construction).
+        self.inference_requests_total = Counter(
+            "himmy_inference_requests_total",
+            "Total inference requests started, by streamed/non-streamed.",
+            ("streamed",),
+        )
+        self.inference_failures_total = Counter(
+            "himmy_inference_failures_total",
+            "Total inference requests that ended FAILED.",
+        )
+        self.inference_retries_total = Counter(
+            "himmy_inference_retries_total",
+            "Total inference attempts retried after a transient failure.",
+        )
+        self.inference_duration_seconds = Histogram(
+            "himmy_inference_duration_seconds",
+            "Inference latency in seconds (terminal events only).",
+        )
+        # Token burn + estimated cost (counters; no per-run/user labels).
+        self.inference_input_tokens_total = Counter(
+            "himmy_inference_input_tokens_total",
+            "Cumulative prompt (input) tokens consumed across inferences.",
+        )
+        self.inference_output_tokens_total = Counter(
+            "himmy_inference_output_tokens_total",
+            "Cumulative completion (output) tokens produced across inferences.",
+        )
+        self.inference_cost_usd_total = Counter(
+            "himmy_inference_cost_usd_total",
+            "Cumulative estimated inference cost in USD.",
+        )
+        self.inference_tokens = Histogram(
+            "himmy_inference_tokens",
+            "Distribution of total tokens (input+output) per inference.",
+            buckets=_TOKEN_BUCKETS,
+        )
+        # Tools + guardrails.
+        self.tool_calls_total = Counter(
+            "himmy_tool_calls_total",
+            "Total tool invocations, by outcome (called/completed/failed).",
+            ("outcome",),
+        )
+        self.guardrail_blocks_total = Counter(
+            "himmy_guardrail_blocks_total",
+            "Total guardrail applications, by stage and action (blocked/redacted).",
+            ("stage", "action"),
+        )
+        # Run outcomes (status is clamped to a closed lifecycle set).
+        self.agent_runs_total = Counter(
+            "himmy_agent_runs_total",
+            "Total agent runs started.",
+        )
+        self.agent_run_outcomes_total = Counter(
+            "himmy_agent_run_outcomes_total",
+            "Total agent runs finished, by terminal status.",
+            ("status",),
+        )
+
+        # --- dispatcher instruments (set directly by the dispatcher loop) -----
+        self.dispatcher_in_flight = Gauge(
+            "himmy_dispatcher_in_flight_runs",
+            "Number of claimed runs currently executing on dispatcher workers.",
+        )
+        self.dispatcher_claims_total = Counter(
+            "himmy_dispatcher_claims_total",
+            "Total runs claimed off the leased queue by this dispatcher.",
+        )
+        self.dispatcher_reaps_total = Counter(
+            "himmy_dispatcher_reaps_total",
+            "Total expired-lease runs re-queued by the reaper (crashed-worker recovery).",
+        )
+        self.dispatcher_run_duration_seconds = Histogram(
+            "himmy_dispatcher_run_duration_seconds",
+            "Wall-clock latency of a dispatched run on its worker, in seconds.",
+        )
+
     def render(self) -> str:
         """Render the whole registry as a Prometheus exposition document."""
         lines: list[str] = []
-        lines.extend(self.http_requests_total.render())
-        lines.extend(self.http_request_duration_seconds.render())
-        lines.extend(self.http_requests_in_flight.render())
+        for instrument in (
+            self.http_requests_total,
+            self.http_request_duration_seconds,
+            self.http_requests_in_flight,
+            self.inference_requests_total,
+            self.inference_failures_total,
+            self.inference_retries_total,
+            self.inference_duration_seconds,
+            self.inference_input_tokens_total,
+            self.inference_output_tokens_total,
+            self.inference_cost_usd_total,
+            self.inference_tokens,
+            self.tool_calls_total,
+            self.guardrail_blocks_total,
+            self.agent_runs_total,
+            self.agent_run_outcomes_total,
+            self.dispatcher_in_flight,
+            self.dispatcher_claims_total,
+            self.dispatcher_reaps_total,
+            self.dispatcher_run_duration_seconds,
+        ):
+            lines.extend(instrument.render())
         # The exposition format requires a trailing newline.
         return "\n".join(lines) + "\n"
 
@@ -278,6 +407,11 @@ _REGISTRY = MetricsRegistry()
 def get_registry() -> MetricsRegistry:
     """Return the process-wide metrics registry."""
     return _REGISTRY
+
+
+def get_metrics_sink() -> MetricsEventSink:
+    """Return the process-wide :class:`MetricsEventSink` (resolves the live registry)."""
+    return _METRICS_SINK
 
 
 CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
@@ -364,12 +498,116 @@ def reset_registry() -> None:
     _REGISTRY = MetricsRegistry()
 
 
+def _clamp_run_status(status: object) -> str:
+    """Clamp a run terminal status to the closed lifecycle set (bound cardinality)."""
+    text = str(status or "").strip().lower()
+    return text if text in _KNOWN_RUN_STATUSES else "other"
+
+
+def _as_float(value: object) -> float:
+    """Best-effort numeric coercion of a payload value (0.0 on non-numeric/None)."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+class MetricsEventSink:
+    """An :class:`~himmy.core.events.EventSink` that fans the run-event stream into
+    bounded-cardinality Prometheus instruments.
+
+    This is the bridge between the lifecycle events the framework already emits
+    (inference, tools, guardrails, run outcomes) and the operator-facing
+    ``/metrics`` scrape. It is composed alongside the durable/trace sinks (it does
+    not replace them), translates each event into counter/histogram updates on the
+    process-wide :class:`MetricsRegistry`, and — crucially — uses **no per-run-id,
+    per-user, or free-form labels**, so the series space stays bounded no matter how
+    many runs flow through. It never raises: observability must never break a run.
+    """
+
+    def __init__(self, registry: MetricsRegistry | None = None) -> None:
+        """Bind to ``registry`` (defaults to the process-wide one at call time)."""
+        self._registry = registry
+
+    @property
+    def registry(self) -> MetricsRegistry:
+        """The registry this sink writes to (resolved lazily so test resets apply)."""
+        return self._registry or get_registry()
+
+    async def append_event(self, event: RunEvent) -> None:
+        """Translate one :class:`RunEvent` into metric updates (best-effort)."""
+        try:
+            self._record(event)
+        except Exception:  # noqa: BLE001 - metrics must never break a run
+            logger.warning("metrics event sink failed to record event", exc_info=True)
+
+    def _record(self, event: RunEvent) -> None:
+        reg = self.registry
+        name = event.event_type.value
+        payload = event.payload or {}
+        if name == "INFERENCE_REQUESTED":
+            streamed = "true" if payload.get("streamed") else "false"
+            reg.inference_requests_total.inc((streamed,))
+        elif name == "INFERENCE_SUCCEEDED":
+            self._record_inference_usage(reg, event, payload)
+        elif name == "INFERENCE_FAILED":
+            reg.inference_failures_total.inc()
+            if event.latency_ms is not None:
+                reg.inference_duration_seconds.observe(event.latency_ms / 1000.0)
+        elif name == "TOOL_CALLED":
+            reg.tool_calls_total.inc(("called",))
+        elif name == "TOOL_COMPLETED":
+            reg.tool_calls_total.inc(("completed",))
+        elif name == "TOOL_FAILED":
+            reg.tool_calls_total.inc(("failed",))
+        elif name == "GUARDRAIL_APPLIED":
+            self._record_guardrail(reg, payload)
+        elif name == "AGENT_RUN_STARTED":
+            reg.agent_runs_total.inc()
+        elif name == "AGENT_RUN_FINISHED":
+            reg.agent_run_outcomes_total.inc((_clamp_run_status(payload.get("status")),))
+
+    @staticmethod
+    def _record_inference_usage(
+        reg: MetricsRegistry, event: RunEvent, payload: dict[str, object]
+    ) -> None:
+        if event.latency_ms is not None:
+            reg.inference_duration_seconds.observe(event.latency_ms / 1000.0)
+        if event.cost:
+            reg.inference_cost_usd_total.inc((), float(event.cost))
+        input_tokens = _as_float(payload.get("input_tokens"))
+        output_tokens = _as_float(payload.get("output_tokens"))
+        if input_tokens:
+            reg.inference_input_tokens_total.inc((), input_tokens)
+        if output_tokens:
+            reg.inference_output_tokens_total.inc((), output_tokens)
+        reg.inference_tokens.observe(input_tokens + output_tokens)
+
+    @staticmethod
+    def _record_guardrail(reg: MetricsRegistry, payload: dict[str, object]) -> None:
+        stage = "input" if payload.get("stage") == "input" else "output"
+        if payload.get("blocked"):
+            reg.guardrail_blocks_total.inc((stage, "blocked"))
+        if payload.get("redacted"):
+            reg.guardrail_blocks_total.inc((stage, "redacted"))
+
+
+# Process-wide sink. It holds no registry of its own (``registry`` resolves the
+# live process-wide one each call), so ``reset_registry()`` in tests is honored
+# without re-creating the sink.
+_METRICS_SINK = MetricsEventSink()
+
+
 __all__ = [
     "CONTENT_TYPE_LATEST",
     "Counter",
     "Gauge",
     "Histogram",
+    "MetricsEventSink",
     "MetricsRegistry",
+    "get_metrics_sink",
     "get_registry",
     "install_metrics",
     "reset_registry",

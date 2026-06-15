@@ -37,6 +37,7 @@ from himmy.services.inference.models import (
     BoundTool,
     InferenceError,
     InferenceErrorCode,
+    InferenceMessage,
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
@@ -115,18 +116,65 @@ def _anthropic_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
     ]
 
 
+def _tool_use_block(m: InferenceMessage) -> dict[str, Any] | None:
+    """Reconstruct the Anthropic assistant ``tool_use`` block a tool result answers.
+
+    Anthropic requires every ``tool_result`` block to reference a ``tool_use_id`` that
+    appeared in a PRECEDING assistant ``tool_use`` block, or the request is rejected.
+    The runtime's tool-role message carries the originating call's ``tool_call_id``,
+    tool name (``name`` / ``metadata['tool_name']``) and arguments
+    (``metadata['tool_args']``), so the assistant ``tool_use`` block is reconstructable
+    here. Returns ``None`` when there is no ``tool_call_id`` to anchor the pair.
+    """
+    call_id = m.tool_call_id or m.metadata.get("tool_call_id")
+    if not call_id:
+        return None
+    name = m.name or m.metadata.get("tool_name") or ""
+    args = m.metadata.get("tool_args")
+    return {
+        "type": "tool_use",
+        "id": str(call_id),
+        "name": name,
+        "input": args if isinstance(args, dict) else {},
+    }
+
+
 def _anthropic_messages(request: InferenceRequest) -> list[dict[str, Any]]:
     """Project the request into Anthropic ``messages`` (system handled separately).
 
     ``tool``-role messages are rebuilt as a ``tool_result`` content block on a user
     turn (Anthropic's required shape); plain user/assistant turns pass through as text.
+    Anthropic also requires each ``tool_result`` to reference a ``tool_use`` block in a
+    preceding assistant turn, so before each run of tool results this back-fills the
+    originating assistant ``tool_use`` blocks (reconstructed from the tool turns'
+    metadata) — inserting a synthetic assistant turn when none precedes — which makes a
+    multi-turn tool run valid against Anthropic.
     """
     messages: list[dict[str, Any]] = []
+    # The assistant turn whose ``tool_use`` blocks the current run of tool results
+    # references; reset whenever a non-tool message breaks the run.
+    tool_anchor: dict[str, Any] | None = None
     for m in request.messages:
         role = (m.role or "user").lower()
         if role == "system":
             continue
         if role == "tool":
+            block = _tool_use_block(m)
+            if block is not None:
+                if tool_anchor is None:
+                    # No assistant turn precedes this tool result: insert a synthetic
+                    # assistant turn to carry the originating tool_use block.
+                    tool_anchor = {"role": "assistant", "content": []}
+                    messages.append(tool_anchor)
+                content = tool_anchor["content"]
+                if isinstance(content, str):
+                    # Lift a plain-string assistant turn into block form so the
+                    # tool_use block can ride alongside the original text.
+                    content = (
+                        [{"type": "text", "text": content}] if content else []
+                    )
+                    tool_anchor["content"] = content
+                content.append(block)
             messages.append(
                 {
                     "role": "user",
@@ -139,10 +187,15 @@ def _anthropic_messages(request: InferenceRequest) -> list[dict[str, Any]]:
                     ],
                 }
             )
+            # A user (tool_result) turn breaks the assistant anchor.
+            tool_anchor = None
         elif role == "assistant":
-            messages.append({"role": "assistant", "content": m.content})
+            entry: dict[str, Any] = {"role": "assistant", "content": m.content}
+            messages.append(entry)
+            tool_anchor = entry
         else:
             messages.append({"role": "user", "content": m.content})
+            tool_anchor = None
     return messages
 
 

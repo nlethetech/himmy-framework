@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -46,6 +47,8 @@ from himmy.services.tools.security import (
     redact_mapping,
 )
 from himmy.services.tools.validation import validate_against_schema
+
+logger = logging.getLogger("himmy.services.tools")
 
 #: Methods that are safe to repeat (read-only): a blind retry of these can't mutate
 #: state. Anything else is non-idempotent — never retried unless an idempotency key is
@@ -273,7 +276,9 @@ class ToolService:
         try:
             await self.event_sink.append_event(event)
         except Exception:  # pragma: no cover - defensive
-            pass
+            logger.warning(
+                "failed to emit %s tool event", event.event_type.value, exc_info=True
+            )
 
     async def _get_http_client(
         self,

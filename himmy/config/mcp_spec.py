@@ -26,7 +26,7 @@ from __future__ import annotations
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from himmy.services.mcp.models import MCPServerSpec
 
@@ -36,7 +36,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 class MCPServerConfig(BaseModel):
-    """Declarative launch + binding config for one stdio MCP server."""
+    """Declarative launch + binding config for one stdio MCP server.
+
+    ``extra="forbid"`` so a typo'd field fails loudly rather than being silently dropped.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     command: str
     args: list[str] = Field(default_factory=list)

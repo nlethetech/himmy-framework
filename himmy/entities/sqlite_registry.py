@@ -138,9 +138,10 @@ class SqliteEntityRegistry:
         """Open (or create) the SQLite database at ``path`` (``:memory:`` default).
 
         The connection is opened via :func:`connect_hardened` (WAL + busy timeout +
-        ``synchronous=NORMAL``) so concurrent connections coordinate instead of
-        raising ``database is locked`` immediately. A process-level write lock
-        serialises writers sharing this connection across threads.
+        ``synchronous=FULL``) so concurrent connections coordinate instead of
+        raising ``database is locked`` immediately, while every commit is fsynced so
+        the audit-of-record survives a power-cut (its contract). A process-level write
+        lock serialises writers sharing this connection across threads.
 
         ``register_buffer`` (default ``1`` = commit every :meth:`register`) trades a
         little durability for throughput on a write-heavy hot path: a multi-tool agent
@@ -164,7 +165,10 @@ class SqliteEntityRegistry:
         chain REUSES :mod:`himmy.entities.integrity` (``content_hash`` + ``_chain_step``); it is
         NOT a second mechanism.
         """
-        self._conn = connect_hardened(path)
+        # ``synchronous=FULL``: the spine is the audit-of-record and its docstring claims
+        # power-cut durability, so every commit must be fsynced (not just at WAL checkpoint)
+        # — under NORMAL a power-cut can lose the last commits.
+        self._conn = connect_hardened(path, synchronous="FULL")
         self._write_lock = threading.Lock()
         self._register_buffer = max(1, int(register_buffer))
         self._pending = 0

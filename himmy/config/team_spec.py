@@ -26,10 +26,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from himmy.agents.personas.persona import Persona
+from himmy.config.agent_spec import parse_spec_yaml, validate_spec
 from himmy.config.mcp_spec import MCPServerConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -39,6 +39,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 class TeamMemberSpec(BaseModel):
     """Declarative description of one team member."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     description: str = ""
@@ -71,7 +73,13 @@ def _dispatch_key(member: TeamMemberSpec) -> str:
 
 
 class TeamSpec(BaseModel):
-    """Declarative description of a team: members + the entry member."""
+    """Declarative description of a team: members + the entry member.
+
+    ``extra="forbid"`` so a typo'd top-level field fails loudly rather than being
+    silently dropped (see :class:`AgentSpec`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     members: list[TeamMemberSpec]
     entry: str
@@ -79,11 +87,14 @@ class TeamSpec(BaseModel):
 
 
 def load_team_spec(path: str | Path) -> TeamSpec:
-    """Load a :class:`TeamSpec` from a YAML file."""
-    raw = yaml.safe_load(Path(path).expanduser().read_text()) or {}
-    if not isinstance(raw, dict):
-        raise ValueError(f"team spec {path} must be a YAML mapping")
-    return TeamSpec.model_validate(raw)
+    """Load a :class:`TeamSpec` from a YAML file.
+
+    Malformed YAML or a schema error is re-raised as a :class:`HimmyError` naming
+    the file, not a raw parser/pydantic traceback.
+    """
+    spec_path = Path(path).expanduser()
+    raw = parse_spec_yaml(spec_path, kind="team spec")
+    return validate_spec(TeamSpec, raw, spec_path, kind="team spec")
 
 
 def _persona_for(member: TeamMemberSpec) -> Persona:

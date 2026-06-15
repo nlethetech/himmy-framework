@@ -159,7 +159,13 @@ def test_request_projection_full_envelope() -> None:
             InferenceMessage(role="system", content="be brief"),
             InferenceMessage(role="user", content="what are the rates?"),
             InferenceMessage(role="assistant", content="let me check"),
-            InferenceMessage(role="tool", content='{"rate": 5}', tool_call_id="call_9"),
+            InferenceMessage(
+                role="tool",
+                content='{"rate": 5}',
+                tool_call_id="call_9",
+                name="lookup",
+                metadata={"tool_name": "lookup", "tool_args": {"q": "rates"}},
+            ),
         ],
         response_format=ResponseFormat.AUTO_TOOLS,
         bound_tools=[
@@ -191,11 +197,26 @@ def test_request_projection_full_envelope() -> None:
     assert seen["temperature"] == 0.2
     assert seen["top_p"] == 0.9
     assert seen["max_tokens"] == 77
-    # Roles are preserved; tool turns keep role="tool" + tool_call_id.
+    # Roles are preserved; the tool turn keeps role="tool" + tool_call_id, and the
+    # preceding assistant message is back-filled with the originating tool_calls array
+    # (reconstructed from the tool turn's metadata) so OpenAI accepts the tool message.
     assert seen["messages"] == [
         {"role": "system", "content": "be brief"},
         {"role": "user", "content": "what are the rates?"},
-        {"role": "assistant", "content": "let me check"},
+        {
+            "role": "assistant",
+            "content": "let me check",
+            "tool_calls": [
+                {
+                    "id": "call_9",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": '{"q": "rates"}',
+                    },
+                }
+            ],
+        },
         {"role": "tool", "content": '{"rate": 5}', "tool_call_id": "call_9"},
     ]
     # Bound tools project to OpenAI's function-tool shape.
@@ -312,11 +333,41 @@ def test_non_json_text_under_json_format_yields_no_structured() -> None:
 
 
 # ----------------------------------------------------------------- streaming
-class _ChunkDelta:
-    """Mirrors ``ChoiceDelta`` (``content``)."""
+class _ChunkToolCallFunction:
+    """Mirrors ``ChoiceDeltaToolCallFunction`` (a streamed ``name``/``arguments`` slice)."""
 
-    def __init__(self, content: str | None) -> None:
+    def __init__(self, name: str | None = None, arguments: str | None = None) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _ChunkToolCall:
+    """Mirrors ``ChoiceDeltaToolCall`` (a per-``index`` streamed tool-call fragment)."""
+
+    type = "function"
+
+    def __init__(
+        self,
+        index: int,
+        *,
+        id: str | None = None,  # noqa: A002 - mirrors the SDK attribute name
+        function: _ChunkToolCallFunction | None = None,
+    ) -> None:
+        self.index = index
+        self.id = id
+        self.function = function
+
+
+class _ChunkDelta:
+    """Mirrors ``ChoiceDelta`` (``content`` + streamed ``tool_calls`` fragments)."""
+
+    def __init__(
+        self,
+        content: str | None,
+        tool_calls: list[_ChunkToolCall] | None = None,
+    ) -> None:
         self.content = content
+        self.tool_calls = tool_calls
 
 
 class _ChunkChoice:
@@ -388,6 +439,143 @@ def test_stream_chunk_sequence_yields_deltas_then_final_with_usage() -> None:
     seen = client.chat.completions.seen
     assert seen["stream"] is True
     assert seen["stream_options"] == {"include_usage": True}
+
+
+def test_stream_with_tools_sends_tools_reassembles_deltas_and_executes() -> None:
+    """A streamed tool turn: tools are sent, fragmented deltas reassemble + execute.
+
+    Mirrors the real provider's behavior: the model emits a tool call FRAGMENTED across
+    several SSE chunks (id+name first, then the ``arguments`` JSON in pieces). The
+    adapter must (a) include ``tools`` on the stream request, (b) reassemble the
+    fragments by ``index``, and (c) execute the completed call on stream end exactly
+    like the non-streaming path — so a streamed tool turn is no longer dropped.
+    """
+    executed: list[tuple[str, dict[str, Any]]] = []
+
+    async def executor(name: str, args: dict[str, Any]) -> ToolReturnRecord:
+        executed.append((name, args))
+        return ToolReturnRecord(
+            tool_call_id="ignored", tool_name=name, content="18C and clear"
+        )
+
+    # Two tool-call fragments for index 0 + one for index 1, interleaved across chunks.
+    chunks = [
+        _Chunk(
+            [
+                _ChunkChoice(
+                    _ChunkDelta(
+                        None,
+                        tool_calls=[
+                            _ChunkToolCall(
+                                0,
+                                id="call_w",
+                                function=_ChunkToolCallFunction(name="get_weather"),
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+        _Chunk(
+            [
+                _ChunkChoice(
+                    _ChunkDelta(
+                        None,
+                        tool_calls=[
+                            _ChunkToolCall(
+                                0, function=_ChunkToolCallFunction(arguments='{"city"')
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+        _Chunk(
+            [
+                _ChunkChoice(
+                    _ChunkDelta(
+                        None,
+                        tool_calls=[
+                            _ChunkToolCall(
+                                0,
+                                function=_ChunkToolCallFunction(arguments=': "Paris"}'),
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+        _Chunk(
+            [
+                _ChunkChoice(
+                    _ChunkDelta(
+                        None,
+                        tool_calls=[
+                            _ChunkToolCall(
+                                1,
+                                id="call_t",
+                                function=_ChunkToolCallFunction(
+                                    name="get_time", arguments="{}"
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+        _Chunk([], usage=_ChunkUsage(20, 6)),  # final include_usage chunk
+    ]
+
+    class _StreamCompletions:
+        def __init__(self) -> None:
+            self.seen: dict[str, Any] = {}
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.seen.update(kwargs)
+            return _aiter(chunks)
+
+    class _StreamClient:
+        def __init__(self) -> None:
+            self.chat = type("c", (), {"completions": _StreamCompletions()})()
+
+    client = _StreamClient()
+    mgr = OpenAIClientManager(model=PRICED_MODEL, client=client)
+    req = _req(
+        response_format=ResponseFormat.AUTO_TOOLS,
+        bound_tools=[
+            BoundTool(name="get_weather", description="weather"),
+            BoundTool(name="get_time", description="time"),
+        ],
+        tool_executor=executor,
+    )
+
+    async def _collect() -> list[Any]:
+        return [piece async for piece in mgr.generate_stream(req)]
+
+    pieces = run_async(_collect())
+
+    # (a) The stream request carries the bound tools (the streaming-tools blocker).
+    seen = client.chat.completions.seen
+    assert seen["stream"] is True
+    assert [t["function"]["name"] for t in seen["tools"]] == ["get_weather", "get_time"]
+
+    # No text deltas (this turn was a tool call), so only the final response is yielded.
+    assert all(isinstance(p, InferenceResponse) for p in pieces)
+    (final,) = pieces
+    assert final.status == InferenceStatus.SUCCESS
+    # (b) Fragments reassembled by index: id/name kept, arguments concatenated + parsed.
+    assert [c.tool_name for c in final.tool_calls] == ["get_weather", "get_time"]
+    assert final.tool_calls[0].tool_call_id == "call_w"
+    assert final.tool_calls[0].args == {"city": "Paris"}
+    assert final.tool_calls[1].tool_call_id == "call_t"
+    assert final.tool_calls[1].args == {}
+    # (c) The completed calls EXECUTED on stream end, like the non-streaming path.
+    assert executed == [("get_weather", {"city": "Paris"}), ("get_time", {})]
+    assert [r.tool_call_id for r in final.tool_returns] == ["call_w", "call_t"]
+    assert final.tool_returns[0].content == "18C and clear"
+    # A tool-calling turn is not a final answer; usage still maps from the last chunk.
+    assert final.output_text is None
+    assert final.input_tokens == 20 and final.output_tokens == 6
 
 
 def test_stream_failure_degrades_to_buffered_generate() -> None:

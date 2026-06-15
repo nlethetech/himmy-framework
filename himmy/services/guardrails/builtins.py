@@ -364,8 +364,9 @@ class GroundingGuardrail:
 
 
 #: Built-in guardrails resolvable by name (for specs/CLI). ``dlp`` is appended below
-#: (after ``_PII_RULES`` is defined) to avoid a circular import.
-BUILTIN_GUARDRAILS: dict[str, type[Guardrail]] = {
+#: (after ``_PII_RULES`` is defined) to avoid a circular import. Each entry is a
+#: no-arg factory (``factory()`` builds the guardrail in :func:`build_guardrail_pipeline`).
+BUILTIN_GUARDRAILS: dict[str, Callable[[], Guardrail]] = {
     "pii": PIIGuardrail,
     "injection": InjectionGuardrail,
     "nepal_pii": NepalPIIGuardrail,
@@ -389,10 +390,12 @@ def build_guardrail_pipeline(names: list[str]) -> GuardrailPipeline:
 
 
 # Registered here, after _PII_RULES exists, so dlp.py can import the rule set without
-# a circular import. DlpGuardrail() with no args defaults to redact-all (PII-like).
-from himmy.services.guardrails.dlp import DlpGuardrail as _DlpGuardrail  # noqa: E402
+# a circular import. ``build_dlp_guardrail`` (not the bare ``DlpGuardrail`` class) is the
+# factory so the spec/CLI/runtime path honors HIMMY_DLP_* policy config (e.g. a *:block
+# policy) instead of silently defaulting to redact-all.
+from himmy.services.guardrails.dlp import build_dlp_guardrail  # noqa: E402
 
-BUILTIN_GUARDRAILS["dlp"] = _DlpGuardrail
+BUILTIN_GUARDRAILS["dlp"] = build_dlp_guardrail
 
 
 __all__ = [

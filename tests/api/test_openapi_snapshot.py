@@ -81,6 +81,36 @@ def _reachable_schemas(
     return {name: schemas[name] for name in sorted(seen)}
 
 
+# FastAPI auto-generates the request-validation error envelope schemas
+# (``ValidationError`` and its ``HTTPValidationError`` wrapper) for every
+# operation that has validated parameters/body. The EXACT body of these two
+# schemas is framework-owned and has drifted across FastAPI 0.116–0.137+ (e.g.
+# 0.137 added ``ctx``/``input`` properties to ``ValidationError``), so a single
+# committed snapshot cannot byte-match every supported FastAPI version. These are
+# NOT our schemas — our /v1 contract is the paths and OUR own request/response
+# models. We therefore replace ONLY these two auto-generated error-envelope
+# schema bodies with a stable placeholder on BOTH the current and committed
+# documents before diffing: the test still pins our /v1 paths and our schemas
+# exactly, but tolerates the framework's error-schema rendering drift.
+_FRAMEWORK_ERROR_SCHEMAS = ("ValidationError", "HTTPValidationError")
+_ERROR_SCHEMA_PLACEHOLDER = {"x-framework-generated": "validation-error-envelope"}
+
+
+def _normalize_framework_error_schemas(doc: dict[str, Any]) -> dict[str, Any]:
+    """Replace the framework-auto-generated validation-error schema bodies.
+
+    Operates on a copy: the placeholder is substituted in
+    ``components.schemas`` for ``ValidationError``/``HTTPValidationError`` when
+    present, leaving every other schema (and all paths) untouched.
+    """
+    out = json.loads(json.dumps(doc))  # deep copy
+    schemas = out.get("components", {}).get("schemas", {})
+    for name in _FRAMEWORK_ERROR_SCHEMAS:
+        if name in schemas:
+            schemas[name] = dict(_ERROR_SCHEMA_PLACEHOLDER)
+    return out
+
+
 def _build_v1_openapi() -> dict[str, Any]:
     """Build the app's OpenAPI doc, scoped to ``/v1`` and made deterministic.
 
@@ -112,7 +142,11 @@ def _neutralize_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_v1_openapi_matches_snapshot() -> None:
-    current = _build_v1_openapi()
+    # Normalize the framework-auto-generated error-envelope schemas (whose body
+    # drifts across FastAPI versions) on BOTH sides so the committed snapshot is
+    # version-independent for those two schemas while still pinning everything
+    # else exactly.
+    current = _normalize_framework_error_schemas(_build_v1_openapi())
 
     if os.environ.get("UPDATE_OPENAPI_SNAPSHOT") == "1":
         SNAPSHOT_PATH.write_text(
@@ -124,7 +158,9 @@ def test_v1_openapi_matches_snapshot() -> None:
         "missing tests/api/openapi_v1_snapshot.json — regenerate with "
         "UPDATE_OPENAPI_SNAPSHOT=1"
     )
-    committed = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    committed = _normalize_framework_error_schemas(
+        json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    )
 
     if current != committed:
         cur_paths = set(current["paths"])

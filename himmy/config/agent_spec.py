@@ -25,10 +25,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from himmy.agents.base_agent.task import Task
 from himmy.agents.personas.persona import Persona
@@ -40,6 +40,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.models import LLMConfig
     from himmy.skills import SkillRegistry
 
+#: A pydantic model type the shared spec validator returns (preserves the concrete type).
+_SpecModelT = TypeVar("_SpecModelT", bound=BaseModel)
+
 
 class AgentSpec(BaseModel):
     """A declarative description of an agent, loadable from YAML.
@@ -47,7 +50,13 @@ class AgentSpec(BaseModel):
     Maps cleanly onto the runtime primitives: :meth:`to_persona` builds the identity,
     :meth:`make_task` builds a unit of work, and :meth:`to_llm_config` packs the model
     knobs. ``provider``/``model`` steer the inference backend the CLI selects.
+
+    ``extra="forbid"`` so a typo'd top-level field (e.g. ``gaurdrails:``) fails loudly
+    instead of being silently dropped — leaving the agent running without its config.
+    The open ``metadata`` dict stays for forward-compat / free-form keys.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     description: str = ""
@@ -237,24 +246,80 @@ def apply_skills(spec: AgentSpec, registry: SkillRegistry) -> AgentSpec:
     )
 
 
+#: Top-level keys owned by a SIBLING schema that may legitimately share one YAML file
+#: with an agent spec. A ``workflow.yaml`` is loaded both as a :class:`AgentSpec` (for
+#: name/model/provider/tools the steps run under) and as a workflow ``steps`` list, so
+#: ``steps`` is a known cross-schema field — not a typo — and is dropped here before the
+#: strict (``extra="forbid"``) validation rather than rejected.
+_SIBLING_SCHEMA_KEYS = frozenset({"steps"})
+
+
+def parse_spec_yaml(path: Path, *, kind: str = "spec") -> dict[str, Any]:
+    """Read + YAML-parse ``path`` into a mapping, naming the file on any failure.
+
+    A raw ``yaml.YAMLError`` is a multi-line parser dump with no filename — useless
+    in a CLI traceback and an opaque 500 in Studio. We catch it and re-raise a clean
+    :class:`HimmyError` that leads with the offending file (and the parser's first
+    line), so the user knows *which* file to fix. ``kind`` labels the spec in the
+    message (e.g. ``"agent spec"``).
+    """
+    try:
+        raw = yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError as exc:
+        detail = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        raise HimmyError(f"{kind} {path}: invalid YAML — {detail}") from exc
+    if not isinstance(raw, dict):
+        raise HimmyError(f"{kind} {path} must be a YAML mapping")
+    return raw
+
+
+def validate_spec(
+    model: type[_SpecModelT], raw: dict[str, Any], path: Path, *, kind: str = "spec"
+) -> _SpecModelT:
+    """Validate ``raw`` against ``model``, naming the file on a schema error.
+
+    A raw pydantic ``ValidationError`` escapes as a multi-line dump with no filename;
+    we re-raise a :class:`HimmyError` that leads with the file and keeps the field-level
+    error lines (dropping pydantic's "For further information…" footer), mirroring the
+    one-liner findings that ``himmy validate`` shows.
+    """
+    from pydantic import ValidationError
+
+    try:
+        return model.model_validate(raw)
+    except ValidationError as exc:
+        lines = [
+            line.strip()
+            for line in str(exc).splitlines()
+            if line.strip() and not line.strip().startswith(("For further", "Traceback"))
+        ]
+        detail = "; ".join(lines) if lines else str(exc)
+        raise HimmyError(f"{kind} {path} is invalid: {detail}") from exc
+
+
 def load_agent_spec(path: str | Path) -> AgentSpec:
     """Load an :class:`AgentSpec` from a YAML file.
 
     A string ``output_schema`` is treated as a path to a JSON Schema file, resolved
     relative to the YAML file's directory, and inlined into the returned spec.
+
+    ``AgentSpec`` forbids unknown fields so a typo'd key fails loudly; known
+    sibling-schema keys (see ``_SIBLING_SCHEMA_KEYS``) are dropped first so a
+    dual-purpose file (e.g. ``workflow.yaml``) still loads. Malformed YAML or a
+    schema error is re-raised as a :class:`HimmyError` naming the file, not a raw
+    parser/pydantic traceback.
     """
     spec_path = Path(path).expanduser()
     if not spec_path.is_file():
         raise HimmyError(
             f"agent spec not found: {spec_path} (create one with `himmy init`)"
         )
-    raw = yaml.safe_load(spec_path.read_text()) or {}
-    if not isinstance(raw, dict):
-        raise ValueError(f"agent spec {spec_path} must be a YAML mapping")
+    raw = parse_spec_yaml(spec_path, kind="agent spec")
+    raw = {k: v for k, v in raw.items() if k not in _SIBLING_SCHEMA_KEYS}
 
     schema = raw.get("output_schema")
     if isinstance(schema, str):
         schema_path = (spec_path.parent / schema).expanduser()
         raw["output_schema"] = json.loads(schema_path.read_text())
 
-    return AgentSpec.model_validate(raw)
+    return validate_spec(AgentSpec, raw, spec_path, kind="agent spec")

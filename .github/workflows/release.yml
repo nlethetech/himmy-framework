@@ -50,7 +50,10 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      # Pinned by SHA (WS5.5) — this id-token:write publish job is the highest
+      # supply-chain blast radius; a retagged action could exfiltrate the OIDC
+      # token. Tracked by Dependabot (github-actions). Mirror security.yml's trivy.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up Node 20
         uses: actions/setup-node@v4
@@ -60,7 +63,7 @@ jobs:
           cache-dependency-path: studio/package-lock.json
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
           cache: pip
@@ -114,7 +117,7 @@ jobs:
           /tmp/himmy_audit_venv/bin/pip-audit --desc
 
       - name: Publish to PyPI via Trusted Publishing (OIDC)
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           # No `password:` — OIDC id-token authenticates this workflow to PyPI.
           packages-dir: dist/

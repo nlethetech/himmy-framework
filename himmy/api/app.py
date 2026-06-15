@@ -10,6 +10,7 @@ runs on shutdown (AAEO-1). It is a thin transport layer: behavior lives below it
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -245,6 +246,87 @@ def _wants_durable_store() -> bool:
     return os.environ.get("HIMMY_DURABLE_STORAGE", "").lower() in ("1", "true", "yes")
 
 
+def _dispatch_env_overrides(
+    *,
+    default_concurrency: int,
+    default_timeout_seconds: float,
+    default_max_attempts: int,
+) -> tuple[int, float, int]:
+    """Resolve the dispatcher's tunable knobs from the environment (dx).
+
+    The leased run dispatcher otherwise pins ``max_concurrency=8``, the run wall-clock
+    timeout, and the per-run retry ceiling to hard-coded defaults. An operator sizing a
+    deployment to its hardware/provider quota can override them without a code change via
+    ``HIMMY_DISPATCH_CONCURRENCY`` (worker fan-out), ``HIMMY_RUN_TIMEOUT_SECONDS`` (each
+    run's wall clock — also the lease TTL basis), and ``HIMMY_DISPATCH_MAX_ATTEMPTS`` (the
+    enqueue retry budget). Each defaults to the value passed in, and an unparseable or
+    non-positive value falls back to that default so a typo never breaks startup.
+    """
+    import os
+
+    def _positive_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            return default
+        return value if value > 0 else default
+
+    def _positive_float(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            return default
+        return value if value > 0 else default
+
+    return (
+        _positive_int("HIMMY_DISPATCH_CONCURRENCY", default_concurrency),
+        _positive_float("HIMMY_RUN_TIMEOUT_SECONDS", default_timeout_seconds),
+        _positive_int("HIMMY_DISPATCH_MAX_ATTEMPTS", default_max_attempts),
+    )
+
+
+#: How often the lifespan maintenance loop GC's the durable trigger-dedup ledger (s).
+#: ``storage.dedup_sweep`` deletes only EXPIRED rows (those past their delivery-dedup
+#: TTL), so without this loop the table accrues one permanent row per delivery id forever
+#: on a busy webhook/Slack/Discord deployment. Hourly is ample — the rows it removes are
+#: already past their dedup window, so a slightly late sweep is harmless.
+_DEDUP_SWEEP_INTERVAL_SECONDS = 3600.0
+
+
+async def _dedup_sweep_loop(
+    storage: Any,
+    *,
+    interval: float = _DEDUP_SWEEP_INTERVAL_SECONDS,
+    stop: asyncio.Event | None = None,
+) -> None:
+    """Periodically GC the durable trigger-dedup ledger until cancelled/``stop`` is set.
+
+    Wired into the lifespan only when the run store is DURABLE (the in-memory store keeps a
+    bounded dedup map that vanishes on exit, so it has nothing to sweep). A sweep error must
+    not kill the loop — the next tick retries. Returns promptly when ``stop`` is signalled so
+    shutdown does not wait a full interval.
+    """
+    stop = stop or asyncio.Event()
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        try:
+            removed = await storage.dedup_sweep()
+            if removed:
+                logger.info("swept %d expired dedup row(s)", removed)
+        except Exception:  # noqa: BLE001 - a sweep error must not kill the loop
+            logger.warning("dedup sweep cycle failed", exc_info=True)
+
+
 def _run_store_is_durable(container: ApiContainer) -> bool:
     """True when the container's run store is a DURABLE backend (SQLite/Postgres) (Q3).
 
@@ -451,11 +533,24 @@ def _build_lifespan(
         # claim/reaper loops AFTER recovery. The in-memory default + the zero-DSN spine-rebind
         # keep INLINE fire-and-forget, so a no-dispatcher deployment is byte-unchanged.
         dispatcher = None
+        dedup_sweep_task: asyncio.Task[None] | None = None
+        dedup_sweep_stop: asyncio.Event | None = None
         if run_app is not None and _run_store_is_durable(active):
             from himmy.application.dispatcher import RunDispatcher
 
-            dispatcher = RunDispatcher(run_app)
-            run_app.enable_dispatch()
+            # dx: let an operator size the dispatcher to its hardware/provider quota via
+            # env, defaulting to the current pinned values (concurrency 8, the service's
+            # constructed run timeout, and its enqueue retry ceiling).
+            concurrency, run_timeout_seconds, max_attempts = _dispatch_env_overrides(
+                default_concurrency=8,
+                default_timeout_seconds=run_app.run_timeout_seconds,
+                default_max_attempts=run_app.default_max_attempts,
+            )
+            dispatcher = RunDispatcher(run_app, max_concurrency=concurrency)
+            run_app.enable_dispatch(
+                max_attempts=max_attempts,
+                run_timeout_seconds=run_timeout_seconds,
+            )
         if run_app is not None:
             try:
                 swept = await run_app.sweep_stuck_runs()
@@ -488,6 +583,27 @@ def _build_lifespan(
                 except Exception:  # pragma: no cover - dispatcher start is best-effort
                     logger.warning("run dispatcher failed to start", exc_info=True)
                     dispatcher = None
+            # Start the durable trigger-dedup GC loop (gated on a durable backend, same as
+            # the dispatcher): ``storage.dedup_sweep`` has no other caller, so without this
+            # the dedup ledger grows one permanent row per delivery id forever on a busy
+            # webhook/Slack/Discord deployment.
+            storage = getattr(active, "storage", None)
+            if storage is not None and _run_store_is_durable(active):
+                try:
+                    dedup_sweep_stop = asyncio.Event()
+                    dedup_sweep_task = asyncio.create_task(
+                        _dedup_sweep_loop(
+                            storage,
+                            interval=_DEDUP_SWEEP_INTERVAL_SECONDS,
+                            stop=dedup_sweep_stop,
+                        ),
+                        name="himmy-dedup-sweep",
+                    )
+                    logger.info("durable dedup-ledger sweep loop started")
+                except Exception:  # pragma: no cover - sweep start is best-effort
+                    logger.warning("dedup sweep loop failed to start", exc_info=True)
+                    dedup_sweep_task = None
+                    dedup_sweep_stop = None
         # Materialize Studio "connection" non-secret fields (SMTP host, search
         # backend, …) from the writable secrets backend into the process env so
         # tool config picks them up without a restart.
@@ -507,6 +623,15 @@ def _build_lifespan(
                     await dispatcher.stop()
                 except Exception:  # pragma: no cover - shutdown best-effort
                     logger.warning("run dispatcher stop failed", exc_info=True)
+            # Stop the dedup-ledger sweep loop before the store closes under it.
+            if dedup_sweep_task is not None:
+                if dedup_sweep_stop is not None:
+                    dedup_sweep_stop.set()
+                dedup_sweep_task.cancel()
+                try:
+                    await dedup_sweep_task
+                except (asyncio.CancelledError, Exception):  # pragma: no cover
+                    pass
             if run_app is not None:
                 try:
                     await run_app.drain()

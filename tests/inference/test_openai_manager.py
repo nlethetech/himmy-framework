@@ -362,6 +362,96 @@ def test_generate_stream_yields_deltas_then_response() -> None:
     assert final.input_tokens == 5 and final.output_tokens == 2
 
 
+def test_generate_stream_carries_and_executes_tool_calls() -> None:
+    """Streaming binds ``tools`` and reassembles fragmented tool_call deltas + executes.
+
+    The primary live provider (OpenRouter) streams tool calls split across chunks: the
+    first delta for an index carries the id + function name, later deltas append the JSON
+    ``arguments``. generate_stream must (a) send ``tools`` like the non-streaming path,
+    (b) reassemble the fragments by index, and (c) execute them on stream end.
+    """
+
+    def _tc(index: int, *, id: str | None = None, name: str | None = None, args: str = "") -> _Obj:
+        return _Obj(index=index, id=id, function=_Obj(name=name, arguments=args))
+
+    # One tool call fragmented across three deltas (id+name first, then two arg pieces).
+    chunks = [
+        _Obj(
+            choices=[_Obj(delta=_Obj(content=None, tool_calls=[_tc(0, id="call_1", name="lookup", args='{"q":')]))],
+            usage=None,
+        ),
+        _Obj(
+            choices=[_Obj(delta=_Obj(content=None, tool_calls=[_tc(0, args=' "rate')]))],
+            usage=None,
+        ),
+        _Obj(
+            choices=[_Obj(delta=_Obj(content=None, tool_calls=[_tc(0, args='s"}')]))],
+            usage=None,
+        ),
+        _Obj(choices=[], usage=_Obj(prompt_tokens=8, completion_tokens=3)),
+    ]
+
+    captured: dict[str, Any] = {}
+
+    class _StreamCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+
+            async def _gen() -> Any:
+                for c in chunks:
+                    yield c
+
+            return _gen()
+
+    class _StreamChat:
+        def __init__(self) -> None:
+            self.completions = _StreamCompletions()
+
+    class _StreamClient:
+        def __init__(self) -> None:
+            self.chat = _StreamChat()
+
+    ran: list[tuple[str, dict[str, Any]]] = []
+
+    async def executor(name: str, args: dict[str, Any]) -> ToolReturnRecord:
+        ran.append((name, args))
+        return ToolReturnRecord(tool_call_id="x", tool_name=name, content="done")
+
+    mgr = OpenAIClientManager(model=PRICED_MODEL, client=_StreamClient())
+    req = _req(
+        response_format=ResponseFormat.AUTO_TOOLS,
+        bound_tools=[BoundTool(name="lookup", description="look up", read_only=True)],
+        tool_executor=executor,
+    )
+
+    async def _collect() -> tuple[list[str], Any]:
+        deltas: list[str] = []
+        final: Any = None
+        async for piece in mgr.generate_stream(req):
+            if isinstance(piece, str):
+                deltas.append(piece)
+            else:
+                final = piece
+        return deltas, final
+
+    deltas, final = run_async(_collect())
+
+    # (a) the stream request advertised the bound tool.
+    assert captured["tools"][0]["function"]["name"] == "lookup"
+    # No text deltas — the reply was a tool call.
+    assert deltas == []
+    assert final is not None
+    assert final.status == InferenceStatus.SUCCESS
+    # (b) the fragmented deltas reassembled into one fully-formed call.
+    assert [c.tool_name for c in final.tool_calls] == ["lookup"]
+    assert final.tool_calls[0].args == {"q": "rates"}
+    assert final.tool_calls[0].tool_call_id == "call_1"
+    # (c) the tool was executed and the reply is not a final text answer.
+    assert ran == [("lookup", {"q": "rates"})]
+    assert final.tool_returns[0].content == "done"
+    assert final.output_text is None
+
+
 # ------------------------------------------------------- error normalization
 def test_sdk_error_is_normalized_to_failed_never_raises() -> None:
     """An exception from chat.completions.create becomes a FAILED response."""

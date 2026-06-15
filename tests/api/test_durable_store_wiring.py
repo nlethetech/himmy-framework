@@ -189,6 +189,74 @@ def test_q3_in_memory_default_stays_inline_no_dispatcher(
         assert status == "SUCCEEDED"
 
 
+# ------------------------------------------------------- dx: dispatcher env-configurable
+def test_dispatch_env_overrides_apply_under_durable_store(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """``HIMMY_DISPATCH_*`` / ``HIMMY_RUN_TIMEOUT_SECONDS`` retune the leased dispatcher.
+
+    The dispatcher otherwise pins ``max_concurrency=8`` and the run service its constructed
+    timeout / retry ceiling. The env overrides must flow through at the lifespan call site:
+    the constructed dispatcher's concurrency, and the run service's run timeout + retry
+    budget, reflect the env values.
+    """
+    from himmy.application.dispatcher import RunDispatcher
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.setenv("HIMMY_DURABLE_STORAGE", "1")
+    monkeypatch.setenv("HIMMY_DISPATCH_CONCURRENCY", "3")
+    monkeypatch.setenv("HIMMY_RUN_TIMEOUT_SECONDS", "42")
+    monkeypatch.setenv("HIMMY_DISPATCH_MAX_ATTEMPTS", "7")
+
+    captured: dict[str, Any] = {}
+    real_init = RunDispatcher.__init__
+
+    def _spy_init(self: Any, run_app: Any, **kwargs: Any) -> None:
+        captured["max_concurrency"] = kwargs.get("max_concurrency")
+        real_init(self, run_app, **kwargs)
+
+    monkeypatch.setattr(RunDispatcher, "__init__", _spy_init)
+
+    with TestClient(create_app()) as client:
+        run_app = client.app.state.container.run_app
+        assert run_app.dispatch_enabled is True
+        # The non-default values prove the env was read (not the 8/300/3 defaults).
+        assert captured["max_concurrency"] == 3
+        assert run_app.run_timeout_seconds == 42.0
+        assert run_app.default_max_attempts == 7
+
+
+def test_dispatch_defaults_apply_without_env(tmp_path: Any, monkeypatch: Any) -> None:
+    """Absent the env vars the dispatcher keeps its pinned defaults (8 / 300s / 3)."""
+    from himmy.application.dispatcher import RunDispatcher
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.setenv("HIMMY_DURABLE_STORAGE", "1")
+    for name in (
+        "HIMMY_DISPATCH_CONCURRENCY",
+        "HIMMY_RUN_TIMEOUT_SECONDS",
+        "HIMMY_DISPATCH_MAX_ATTEMPTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    captured: dict[str, Any] = {}
+    real_init = RunDispatcher.__init__
+
+    def _spy_init(self: Any, run_app: Any, **kwargs: Any) -> None:
+        captured["max_concurrency"] = kwargs.get("max_concurrency")
+        real_init(self, run_app, **kwargs)
+
+    monkeypatch.setattr(RunDispatcher, "__init__", _spy_init)
+
+    with TestClient(create_app()) as client:
+        run_app = client.app.state.container.run_app
+        assert captured["max_concurrency"] == 8
+        assert run_app.run_timeout_seconds == 300.0
+        assert run_app.default_max_attempts == 3
+
+
 # ----------------------------------------------------------------- K1: split-brain fix
 def test_k1_publishes_durable_storage_in_built_branch(
     tmp_path: Any, monkeypatch: Any
@@ -322,3 +390,120 @@ def test_k1_postgres_dsn_publishes_pg_store_no_sqlite(
         assert StoreFactory.for_context(server=True) is published
     # No silent local SQLite fork was created under the postgres DSN.
     assert not (tmp_path / ".himmy" / "storage.db").exists()
+
+
+# ----------------------------------------------------- dedup-ledger GC (maintenance loop)
+def test_dedup_sweep_loop_calls_storage_dedup_sweep() -> None:
+    """The maintenance loop GC's the dedup ledger by calling ``storage.dedup_sweep``.
+
+    A short interval + a stop event after the first sweep proves the loop actually invokes
+    the otherwise-unused ``dedup_sweep`` (the bug: the durable dedup table grew forever).
+    """
+    import asyncio
+
+    from himmy.api.app import _dedup_sweep_loop
+    from tests.conftest import run_async
+
+    calls = {"n": 0}
+    stop = asyncio.Event()
+
+    class _Storage:
+        async def dedup_sweep(self, *, now: Any = None) -> int:
+            calls["n"] += 1
+            stop.set()  # one sweep is enough to prove the loop fires it
+            return 3
+
+    run_async(
+        asyncio.wait_for(
+            _dedup_sweep_loop(_Storage(), interval=0.01, stop=stop), timeout=2.0
+        )
+    )
+    assert calls["n"] >= 1
+
+
+def test_dedup_sweep_loop_survives_a_sweep_error() -> None:
+    """A failing sweep must not kill the loop — it retries on the next tick."""
+    import asyncio
+
+    from himmy.api.app import _dedup_sweep_loop
+    from tests.conftest import run_async
+
+    calls = {"n": 0}
+    stop = asyncio.Event()
+
+    class _FlakyStorage:
+        async def dedup_sweep(self, *, now: Any = None) -> int:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient db error")
+            stop.set()
+            return 0
+
+    run_async(
+        asyncio.wait_for(
+            _dedup_sweep_loop(_FlakyStorage(), interval=0.01, stop=stop), timeout=2.0
+        )
+    )
+    assert calls["n"] >= 2  # the loop kept going after the first cycle raised
+
+
+def test_durable_lifespan_invokes_dedup_sweep(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Under a durable store the lifespan starts the dedup-sweep loop and it runs.
+
+    With a tiny interval the loop should fire ``dedup_sweep`` at least once while the
+    TestClient context is open, proving the maintenance loop is wired in app.py.
+    """
+    import time as _time
+
+    import himmy.api.app as app_mod
+    from himmy.services.storage.sqlite import SqliteStorageService
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.setenv("HIMMY_DURABLE_STORAGE", "1")
+    monkeypatch.setattr(app_mod, "_DEDUP_SWEEP_INTERVAL_SECONDS", 0.02)
+
+    calls = {"n": 0}
+    real_sweep = SqliteStorageService.dedup_sweep
+
+    async def _counting_sweep(self: Any, *, now: Any = None) -> int:
+        calls["n"] += 1
+        return await real_sweep(self, now=now)
+
+    monkeypatch.setattr(SqliteStorageService, "dedup_sweep", _counting_sweep)
+
+    with TestClient(create_app()):
+        deadline = _time.time() + 4.0
+        while _time.time() < deadline and calls["n"] == 0:
+            _time.sleep(0.02)
+    assert calls["n"] >= 1, "durable lifespan never swept the dedup ledger"
+
+
+def test_in_memory_default_does_not_start_dedup_sweep(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """The zero-config in-memory default must NOT start the durable-gated sweep loop.
+
+    The in-memory dedup map is bounded + vanishes on exit, so there is nothing to GC; the
+    loop is durable-gated exactly like the dispatcher, leaving the offline path unchanged.
+    """
+    import himmy.api.app as app_mod
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.delenv("HIMMY_DURABLE_STORAGE", raising=False)
+
+    started = {"n": 0}
+    real_loop = app_mod._dedup_sweep_loop
+
+    async def _spy_loop(*args: Any, **kwargs: Any) -> None:
+        started["n"] += 1
+        return await real_loop(*args, **kwargs)
+
+    monkeypatch.setattr(app_mod, "_dedup_sweep_loop", _spy_loop)
+
+    with TestClient(create_app()) as client:
+        assert client.app.state.container.run_app.dispatch_enabled is False
+    assert started["n"] == 0

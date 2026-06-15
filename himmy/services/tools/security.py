@@ -121,15 +121,48 @@ def is_sensitive_key(key: str, extra: Iterable[str] = ()) -> bool:
     return any(hint in lowered for hint in _SENSITIVE_KEY_HINTS)
 
 
+def _redact_value(value: Any, extra: tuple[str, ...], placeholder: str) -> Any:
+    """Recurse into a non-sensitive value, redacting any nested sensitive keys.
+
+    A dict is walked key-by-key (a sensitive key's value is fully replaced); a list
+    or tuple has each element recursed into; any other value is returned unchanged.
+    This is what makes :func:`redact_mapping` reach secrets nested at any depth — a
+    credential inside a ``json_body`` arg never reaches the audit spine in plaintext.
+    """
+    if isinstance(value, dict):
+        return {
+            k: (
+                placeholder
+                if is_sensitive_key(str(k), extra)
+                else _redact_value(v, extra, placeholder)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item, extra, placeholder) for item in value]
+    return value
+
+
 def redact_mapping(
-    data: dict[str, Any], *, extra_keys: Iterable[str] = ()
+    data: dict[str, Any],
+    *,
+    extra_keys: Iterable[str] = (),
+    placeholder: str = REDACTED,
 ) -> dict[str, Any]:
-    """Return a shallow copy of ``data`` with sensitive values replaced.
+    """Return a deep copy of ``data`` with sensitive values replaced, recursively.
 
     Used before emitting argument/header dicts onto events so secrets never reach
     the audit trail. ``extra_keys`` names tool-specific sensitive arguments.
+    Redaction RECURSES into nested dicts and lists at any depth, so a secret buried
+    inside a ``json_body`` (or any nested structure) is masked too. ``placeholder``
+    overrides the substituted marker (e.g. the approvals UI's ``••••``).
     """
     extra = tuple(extra_keys)
     return {
-        k: (REDACTED if is_sensitive_key(str(k), extra) else v) for k, v in data.items()
+        k: (
+            placeholder
+            if is_sensitive_key(str(k), extra)
+            else _redact_value(v, extra, placeholder)
+        )
+        for k, v in data.items()
     }

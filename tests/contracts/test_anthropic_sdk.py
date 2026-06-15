@@ -129,6 +129,7 @@ def test_generate_kwargs_validate_against_sdk_request_typeddicts() -> None:
         MessageParam,
         ToolParam,
         ToolResultBlockParam,
+        ToolUseBlockParam,
         message_create_params,
     )
 
@@ -141,7 +142,13 @@ def test_generate_kwargs_validate_against_sdk_request_typeddicts() -> None:
                     InferenceMessage(role="system", content="be brief"),
                     InferenceMessage(role="user", content="rates?"),
                     InferenceMessage(role="assistant", content="checking"),
-                    InferenceMessage(role="tool", content="5%", tool_call_id="tc_1"),
+                    InferenceMessage(
+                        role="tool",
+                        content="5%",
+                        tool_call_id="tc_1",
+                        name="lookup",
+                        metadata={"tool_name": "lookup", "tool_args": {"q": "rates"}},
+                    ),
                 ],
                 response_format=ResponseFormat.AUTO_TOOLS,
                 bound_tools=[
@@ -167,16 +174,23 @@ def test_generate_kwargs_validate_against_sdk_request_typeddicts() -> None:
     tool_keys = _typed_dict_keys(ToolParam)
     for tool in seen["tools"]:
         assert set(tool) <= tool_keys, f"unknown tool keys: {set(tool) - tool_keys}"
-    # The tool-role turn was projected into a tool_result block: validate it too.
-    block_keys = _typed_dict_keys(ToolResultBlockParam)
-    (tool_result_turn,) = [
-        m for m in seen["messages"] if isinstance(m["content"], list)
-    ]
-    for block in tool_result_turn["content"]:
-        assert block["type"] == "tool_result"
-        assert set(block) <= block_keys, (
-            f"unknown block keys: {set(block) - block_keys}"
-        )
+    # The tool-role turn was projected into a tool_result block on a user turn, and
+    # the preceding assistant turn carries the reconstructed tool_use block; validate
+    # both block shapes against the SDK TypedDicts.
+    result_keys = _typed_dict_keys(ToolResultBlockParam)
+    use_keys = _typed_dict_keys(ToolUseBlockParam)
+    block_turns = [m for m in seen["messages"] if isinstance(m["content"], list)]
+    assert len(block_turns) == 2
+    for turn in block_turns:
+        for block in turn["content"]:
+            if block["type"] == "tool_result":
+                assert set(block) <= result_keys, (
+                    f"unknown tool_result keys: {set(block) - result_keys}"
+                )
+            elif block["type"] == "tool_use":
+                assert set(block) <= use_keys, (
+                    f"unknown tool_use keys: {set(block) - use_keys}"
+                )
 
 
 def test_structured_tool_choice_validates_against_sdk_typeddict() -> None:

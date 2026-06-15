@@ -48,6 +48,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger("himmy.application.dispatcher")
 
+
+def _metrics_registry() -> Any:
+    """The process-wide metrics registry (resolved per call so test resets apply)."""
+    from himmy.services.observability.metrics import get_registry
+
+    return get_registry()
+
 #: How long a cached local-provider liveness result is trusted before the next probe (s).
 #: Short enough that "the model finished loading" is noticed within a claim cycle, long
 #: enough that the probe is not hammered on every poll.
@@ -247,6 +254,7 @@ class RunDispatcher:
                 self._sem.release()
                 break
             claimed_any = True
+            _metrics_registry().dispatcher_claims_total.inc()
             worker = asyncio.create_task(self._run_worker(run))
             self._workers.add(worker)
             worker.add_done_callback(self._on_worker_done)
@@ -261,6 +269,9 @@ class RunDispatcher:
         """Execute one claimed run while a sibling heartbeat renews its lease."""
         run_id = run.run_id
         heartbeat = asyncio.create_task(self._heartbeat(run_id))
+        registry = _metrics_registry()
+        registry.dispatcher_in_flight.inc()
+        started = time.monotonic()
         try:
             await self._run_app.dispatch_claimed_run(run)
         except asyncio.CancelledError:
@@ -268,6 +279,8 @@ class RunDispatcher:
         except Exception:  # noqa: BLE001 - a worker crash must not kill the dispatcher
             logger.warning("dispatched run %s crashed", run_id, exc_info=True)
         finally:
+            registry.dispatcher_in_flight.dec()
+            registry.dispatcher_run_duration_seconds.observe(time.monotonic() - started)
             heartbeat.cancel()
             try:
                 await heartbeat
@@ -309,6 +322,9 @@ class RunDispatcher:
             try:
                 requeued = await self._run_app.storage.requeue_expired_leases()
                 if requeued:
+                    _metrics_registry().dispatcher_reaps_total.inc(
+                        (), float(len(requeued))
+                    )
                     logger.info(
                         "reaper re-queued %d expired-lease run(s)", len(requeued)
                     )

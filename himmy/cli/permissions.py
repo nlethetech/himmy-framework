@@ -18,16 +18,21 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from himmy.config.project import find_project_root
+
 
 def load_auto_approve(start: str | Path | None = None) -> list[str]:
-    """The ``[permissions] auto_approve`` tool names from ``himmy.toml`` (cwd).
+    """The ``[permissions] auto_approve`` tool names from ``himmy.toml`` (project root).
 
     Reads the project's local ``himmy.toml`` only (not the home fallback — an
-    allowlist is a per-project trust decision). Returns ``[]`` when the file or
-    the table/key is absent or malformed, so a missing/odd config never crashes
-    a run.
+    allowlist is a per-project trust decision). Resolves the file via
+    :func:`~himmy.config.project.find_project_root` so a run launched from a
+    SUBDIRECTORY still finds the project's ``himmy.toml`` (the same root mechanism
+    ``spine.db`` / ``agent.yaml`` use), rather than silently dropping the allowlist.
+    Returns ``[]`` when the file or the table/key is absent or malformed, so a
+    missing/odd config never crashes a run.
     """
-    path = Path(start or Path.cwd()) / "himmy.toml"
+    path = find_project_root(start) / "himmy.toml"
     if not path.is_file():
         return []
     try:
@@ -45,13 +50,16 @@ def load_auto_approve(start: str | Path | None = None) -> list[str]:
 
 
 def load_session_budget(start: str | Path | None = None) -> float | None:
-    """The ``[limits] session_budget`` dollar cap from ``himmy.toml`` (cwd), or None.
+    """The ``[limits] session_budget`` dollar cap from ``himmy.toml`` (project root), or None.
 
     Same per-project read as :func:`load_auto_approve`: reads only the local
-    ``himmy.toml``. Returns ``None`` when the file/table/key is absent or the value
-    is not a positive number, so a missing/odd config simply means "no budget".
+    ``himmy.toml``, resolved via :func:`~himmy.config.project.find_project_root` so a
+    run launched from a SUBDIRECTORY still enforces the project's budget cap instead
+    of silently falling back to unrestricted. Returns ``None`` when the file/table/key
+    is absent or the value is not a positive number, so a missing/odd config simply
+    means "no budget".
     """
-    path = Path(start or Path.cwd()) / "himmy.toml"
+    path = find_project_root(start) / "himmy.toml"
     if not path.is_file():
         return None
     try:
@@ -116,8 +124,12 @@ def persist_auto_approve(tool_name: str, *, start: str | Path | None = None) -> 
     The strategy is line-oriented rather than a full TOML re-serialization so a
     hand-authored ``himmy.toml`` (comments, ordering, other tables) is not
     flattened by a round-trip — only the one array is touched.
+
+    Resolves the file via :func:`~himmy.config.project.find_project_root` so an
+    ``always`` answer given from a SUBDIRECTORY persists into the SAME
+    ``himmy.toml`` :func:`load_auto_approve` later reads, not a stray one in the cwd.
     """
-    path = Path(start or Path.cwd()) / "himmy.toml"
+    path = find_project_root(start) / "himmy.toml"
     existing = load_auto_approve(path.parent)
     if tool_name in existing:
         return False
