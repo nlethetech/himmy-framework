@@ -371,3 +371,53 @@ def test_repl_model_menu_ctrl_c_cancels_without_exiting_repl(
     repl._slash("/model", thread=object())
     err = capsys.readouterr().err
     assert "active:" in err
+
+
+def test_model_switch_without_provider_infers_cloud_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/model <cloud-id>` with NO provider must route to the right provider
+    (openai/gpt-4o -> openrouter), not stay pinned to the current one and fail."""
+    from himmy.cli.repl import ChatRepl
+    from himmy.config.agent_spec import AgentSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    spec = AgentSpec(name="t", description="d", provider="claude-cli")
+    repl = ChatRepl(
+        spec, _args(provider="claude-cli", model="sonnet"), input_fn=lambda _p: ""
+    )
+    monkeypatch.setattr(repl, "rebuild", lambda: None)
+
+    repl._slash("/model openai/gpt-4o", thread=object())
+    assert repl.args.provider == "openrouter"
+    assert repl.args.model == "openai/gpt-4o"
+
+    # A claude-cli tier (no "/" id) with no provider stays on claude-cli.
+    repl.args.provider = "claude-cli"
+    repl._slash("/model haiku", thread=object())
+    assert repl.args.provider == "claude-cli"
+
+    # An explicit provider is always respected.
+    repl._slash("/model sonnet claude-cli", thread=object())
+    assert repl.args.provider == "claude-cli"
+
+
+def test_model_switch_without_provider_keeps_current_when_uninferable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no OpenRouter key the cloud id can't be inferred -> keep the current
+    provider (never guess wrong), but still set the model."""
+    from himmy.cli.repl import ChatRepl
+    from himmy.config.agent_spec import AgentSpec
+
+    for _var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(_var, raising=False)
+    spec = AgentSpec(name="t", description="d", provider="claude-cli")
+    repl = ChatRepl(
+        spec, _args(provider="claude-cli", model="sonnet"), input_fn=lambda _p: ""
+    )
+    monkeypatch.setattr(repl, "rebuild", lambda: None)
+
+    repl._slash("/model openai/gpt-4o", thread=object())
+    assert repl.args.provider == "claude-cli"  # couldn't infer; left unchanged
+    assert repl.args.model == "openai/gpt-4o"

@@ -272,6 +272,38 @@ class ChatRepl:
             cloud_available=cloud_key_env(),
         )
 
+    def _infer_provider_for_model(self, model: str) -> str | None:
+        """Infer which provider a model belongs to, for ``/model <name>`` given with
+        NO explicit provider. Prevents pairing e.g. ``openai/gpt-4o`` with the current
+        ``claude-cli`` (which then fails as PROVIDER_UNAVAILABLE). Returns ``None`` when
+        it can't tell — the caller then keeps the current provider.
+        """
+        from himmy.cli.model_picker import build_picker_entries, cloud_key_env
+        from himmy.services.inference.models import ModelPrice
+
+        name = (model or "").strip()
+        if not name:
+            return None
+        cloud = cloud_key_env()
+        try:
+            catalog, _ap, _am, _pf = self._model_picker_inputs()
+            entries = build_picker_entries(
+                catalog,
+                active_provider=None,
+                active_model=None,
+                price_for=lambda _m: ModelPrice(),  # provider lookup only — no prices/network
+                cloud_available=cloud,
+            )
+            for entry in entries:
+                if entry["kind"] == "model" and entry["model"] == name:
+                    return entry["provider"]
+        except Exception:  # noqa: BLE001 - inference is best-effort, never break the switch
+            pass
+        # Cloud model ids are "vendor/model"; route them to OpenRouter when available.
+        if "/" in name and cloud.get("openrouter"):
+            return "openrouter"
+        return None
+
     def _interactive_model_menu(self) -> tuple[str, str] | None:
         """Run the arrow-key ``/model`` menu; return the chosen (provider, model).
 
@@ -1026,6 +1058,13 @@ class ChatRepl:
                 self.args.model = rest[0]
                 if len(rest) > 1:
                     self.args.provider = rest[1]
+                else:
+                    # No provider given: infer it from the model so a cloud id like
+                    # "openai/gpt-4o" doesn't stay pinned to the current (e.g.
+                    # claude-cli) provider and fail as PROVIDER_UNAVAILABLE.
+                    inferred = self._infer_provider_for_model(rest[0])
+                    if inferred:
+                        self.args.provider = inferred
                 self.rebuild()
                 self._eprint(
                     f"{c['dim']}model: {_model_label(self.spec, self.args) or 'auto'}"
