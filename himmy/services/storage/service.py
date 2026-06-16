@@ -18,7 +18,7 @@ this one was renamed to reflect what it actually stores.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from himmy.core.events import RunEvent
 from himmy.services.storage.inmemory import (
@@ -93,10 +93,32 @@ class StorageService:
         await self._event_log.append_event(event)
 
     async def list_events(
-        self, thread_id: str | None = None, trace_id: str | None = None
+        self,
+        thread_id: str | None = None,
+        trace_id: str | None = None,
+        *,
+        event_type: Any = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[RunEvent]:
-        """List events, optionally filtered by ``thread_id`` and/or ``trace_id``."""
-        return await self._event_log.list_events(thread_id, trace_id)
+        """List events filtered by thread/trace/event_type/tool_name (insertion order)."""
+        return await self._event_log.list_events(
+            thread_id,
+            trace_id,
+            event_type=event_type,
+            tool_name=tool_name,
+            limit=limit,
+            newest_first=newest_first,
+        )
+
+    async def count_events(
+        self, *, event_type: Any = None, tool_name: str | None = None
+    ) -> int:
+        """Count events matching ``event_type``/``tool_name`` (no thread/trace scope)."""
+        return await self._event_log.count_events(
+            event_type=event_type, tool_name=tool_name
+        )
 
     def delete_by_subject(self, subject_id: str) -> int:
         """Hard-DELETE a subject's chat_threads + run_events (S4 right-to-erasure).

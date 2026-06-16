@@ -44,6 +44,7 @@ from himmy.services.storage.models import (
     RunRecord,
     RunStatus,
 )
+from himmy.services.storage.protocols import normalize_event_type
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context cycle
     from himmy.agents.base_agent.thread import ChatThread
@@ -196,7 +197,7 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
 #: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
 #: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
 #: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
-SQLITE_SCHEMA_VERSION = 5
+SQLITE_SCHEMA_VERSION = 6
 
 #: Ordered forward migrations applied after the base DDL, mirroring the Postgres
 #: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
@@ -315,6 +316,19 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "PRIMARY KEY (scope, key))",
             "CREATE INDEX IF NOT EXISTS trigger_dedup_expires_idx "
             "ON trigger_dedup (expires_at)",
+        ),
+    ),
+    # v6 (P1): a composite (event_type, tool_name) index on run_events so the
+    # self-learning reputation miner's hot-path read — "the last N TOOL_FAILED /
+    # TOOL_COMPLETED rows for tool X" (WHERE event_type=? AND tool_name=?) — is a
+    # single index seek instead of two single-column seeks intersected, even as the
+    # audit stream grows. The v2 single-column indexes stay (other readers filter on
+    # event_type alone); this just covers the conjunction the per-run read uses.
+    (
+        6,
+        (
+            "CREATE INDEX IF NOT EXISTS run_events_type_tool_idx "
+            "ON run_events (event_type, tool_name)",
         ),
     ),
 )
@@ -558,9 +572,23 @@ class SqliteStorageService:
         )
 
     async def list_events(
-        self, thread_id: str | None = None, trace_id: str | None = None
+        self,
+        thread_id: str | None = None,
+        trace_id: str | None = None,
+        *,
+        event_type: Any = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[RunEvent]:
-        """List events, optionally filtered by ``thread_id`` and/or ``trace_id``."""
+        """List events filtered by thread/trace/event_type/tool_name (insertion order).
+
+        ``event_type``/``tool_name`` seek the P0-B indexed columns (``WHERE
+        event_type=? AND tool_name=?``) so the learning miners avoid a full-table
+        json_extract scan. ``limit`` bounds the result set and ``newest_first`` flips
+        the ``seq`` order to take the most recent N — insertion-order deterministic
+        either way (``seq`` is the autoincrement primary key, never a clock).
+        """
         clauses: list[str] = []
         params: list[Any] = []
         if thread_id is not None:
@@ -569,13 +597,44 @@ class SqliteStorageService:
         if trace_id is not None:
             clauses.append("trace_id = ?")
             params.append(trace_id)
+        want_type = normalize_event_type(event_type)
+        if want_type is not None:
+            clauses.append("event_type = ?")
+            params.append(want_type)
+        if tool_name is not None:
+            clauses.append("tool_name = ?")
+            params.append(tool_name)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        order = "DESC" if newest_first else "ASC"
+        tail = f" LIMIT {int(limit)}" if limit is not None else ""
         rows = await asyncio.to_thread(
             self._fetchall,
-            f"SELECT payload FROM run_events{where} ORDER BY seq ASC",  # noqa: S608
+            f"SELECT payload FROM run_events{where} "  # noqa: S608
+            f"ORDER BY seq {order}{tail}",
             tuple(params),
         )
         return [self._row_to_event(json.loads(r["payload"])) for r in rows]
+
+    async def count_events(
+        self, *, event_type: Any = None, tool_name: str | None = None
+    ) -> int:
+        """Count events matching ``event_type``/``tool_name`` via the indexed columns."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        want_type = normalize_event_type(event_type)
+        if want_type is not None:
+            clauses.append("event_type = ?")
+            params.append(want_type)
+        if tool_name is not None:
+            clauses.append("tool_name = ?")
+            params.append(tool_name)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        row = await asyncio.to_thread(
+            self._fetchone,
+            f"SELECT COUNT(*) AS n FROM run_events{where}",  # noqa: S608
+            tuple(params),
+        )
+        return int(row["n"]) if row is not None else 0
 
     async def prune_events(
         self, *, older_than_days: float | None = None, keep_last: int | None = None

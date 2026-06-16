@@ -39,6 +39,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context 
     from himmy.services.evaluation.models import EvaluationRun
 
 
+def normalize_event_type(event_type: Any) -> str | None:
+    """Coerce an ``event_type`` filter to its stored string value (or ``None``).
+
+    The ``list_events``/``count_events`` filters accept an
+    :class:`~himmy.core.events.EventType` or its raw string value; both backends store
+    the enum's ``.value`` in the denormalised ``event_type`` column. This mirrors the
+    ``getattr(et, "value", str(et))`` coercion ``append_event`` uses on write so a read
+    filter matches what was written, regardless of which form the caller passes.
+    """
+    if event_type is None:
+        return None
+    return str(getattr(event_type, "value", event_type))
+
+
 @runtime_checkable
 class ThreadStore(Protocol):
     """Persistence for chat threads, keyed by ``thread_id``."""
@@ -50,13 +64,33 @@ class ThreadStore(Protocol):
 
 @runtime_checkable
 class EventLog(Protocol):
-    """Append-only run-event audit stream (also the EventSink surface)."""
+    """Append-only run-event audit stream (also the EventSink surface).
+
+    ``list_events`` carries keyword-only ``event_type``/``tool_name``/``limit``/
+    ``newest_first`` filters on top of the historical positional ``thread_id``/
+    ``trace_id`` scope so the self-learning miners can answer "which tools fail most"
+    with an index seek over the P0-B indexed columns rather than scanning the whole
+    audit stream. ``count_events`` is the bounded aggregate companion for the same
+    columns. ``event_type`` accepts an :class:`~himmy.core.events.EventType` or its
+    string value (normalised exactly as ``append_event`` denormalises it).
+    """
 
     async def append_event(self, event: RunEvent) -> None: ...
 
     async def list_events(
-        self, thread_id: str | None = None, trace_id: str | None = None
+        self,
+        thread_id: str | None = None,
+        trace_id: str | None = None,
+        *,
+        event_type: Any = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[RunEvent]: ...
+
+    async def count_events(
+        self, *, event_type: Any = None, tool_name: str | None = None
+    ) -> int: ...
 
 
 @runtime_checkable
@@ -74,8 +108,19 @@ class ThreadEventStore(Protocol):
     async def append_event(self, event: RunEvent) -> None: ...
 
     async def list_events(
-        self, thread_id: str | None = None, trace_id: str | None = None
+        self,
+        thread_id: str | None = None,
+        trace_id: str | None = None,
+        *,
+        event_type: Any = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[RunEvent]: ...
+
+    async def count_events(
+        self, *, event_type: Any = None, tool_name: str | None = None
+    ) -> int: ...
 
 
 @runtime_checkable
@@ -296,4 +341,5 @@ __all__ = [
     "RunStore",
     "ThreadEventStore",
     "ThreadStore",
+    "normalize_event_type",
 ]

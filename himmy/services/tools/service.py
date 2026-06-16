@@ -100,6 +100,25 @@ class ToolIdempotencyStore(Protocol):
         ...
 
 
+@runtime_checkable
+class ToolReputationLike(Protocol):
+    """The minimal sync reputation surface ``bound_tools`` reorders against (P1).
+
+    Anything exposing a synchronous ``score_for(name) -> float`` (a cached snapshot, so
+    the per-turn binding pays no I/O) and ``is_unreliable(name) -> bool`` satisfies the
+    reorder hook. ``himmy.services.learning.ToolReputationProvider`` conforms structurally
+    without an import dependency (keeping the tools kernel independent of learning).
+    """
+
+    def score_for(self, tool_name: str) -> float:  # pragma: no cover - structural typing
+        ...
+
+    def is_unreliable(
+        self, tool_name: str
+    ) -> bool:  # pragma: no cover - structural typing
+        ...
+
+
 def _validate_against_schema(value: Any, schema: dict[str, Any]) -> str | None:
     """Backwards-compatible alias delegating to the validation module.
 
@@ -242,12 +261,18 @@ class ToolService:
         http_max_connections: int = 100,
         http_max_keepalive_connections: int = 20,
         lenient_args: bool = True,
+        reputation_provider: ToolReputationLike | None = None,
     ) -> None:
         self._registry = registry
         self._pre_hook = pre_execution_hook
         self._post_hook = post_execution_hook
         self.event_sink = event_sink
         self._default_timeout_seconds = default_timeout_seconds
+        # P1 self-learning (opt-in): a sync reputation snapshot used to STABLE-sort flaky
+        # tools after reliable ones in ``bound_tools`` (and annotate the worst). ``None``
+        # (the default) makes ``bound_tools`` byte-for-byte identical to before — no
+        # reordering, no annotation. Injected only for ``self_learning`` specs.
+        self._reputation_provider = reputation_provider
         # Tolerate small-model arg fuzz: drop hallucinated unknown keys (when the
         # schema forbids extras) and null-valued optionals (treated as omitted) BEFORE
         # validation. Keeps required/typed checks strict; off → strict pass-through.
@@ -973,6 +998,13 @@ class ToolService:
         runtime attaches to the request. Keeping execution out of ``BoundTool`` is
         what decouples the inference layer from the tool layer. The inference kernel
         is imported lazily so this module imports without it.
+
+        P1 self-learning: when a ``reputation_provider`` is injected, the selected tools
+        are STABLE-sorted by recent reputation (best first) before binding — ties keep
+        insertion order, so the result is deterministic — and a tool below the provider's
+        unreliable floor gets a short caution APPENDED to its description (annotate, never
+        drop, so the model can still use it if truly needed). With no provider this is
+        byte-for-byte the historical behaviour.
         """
         # Imported lazily: the inference kernel may be built in parallel and is
         # not on the core import path for this kernel.
@@ -984,16 +1016,34 @@ class ToolService:
             else [d for n in names if (d := self._registry.get(n)) is not None]
         )
 
+        provider = self._reputation_provider
+        if provider is not None:
+            # ``sorted`` is stable: equal scores keep registry/insertion order. Sort by
+            # NEGATED score so higher reputation comes first without reversing ties.
+            selected = sorted(selected, key=lambda d: -provider.score_for(d.name))
+
         return [
             BoundTool(
                 name=definition.name,
-                description=definition.description,
+                description=self._annotated_description(definition, provider),
                 args_json_schema=definition.args_json_schema,
                 output_json_schema=definition.output_json_schema,
                 read_only=definition.read_only,
             )
             for definition in selected
         ]
+
+    @staticmethod
+    def _annotated_description(
+        definition: ToolDefinition, provider: ToolReputationLike | None
+    ) -> str:
+        """Append a flaky-tool caution to the description when the tool is unreliable."""
+        if provider is not None and provider.is_unreliable(definition.name):
+            return (
+                f"{definition.description} "
+                "(note: this tool has failed frequently recently)"
+            )
+        return definition.description
 
     def tool_executor(self) -> ToolExecutor:
         """Return the single callback a client manager uses to execute tools by name.

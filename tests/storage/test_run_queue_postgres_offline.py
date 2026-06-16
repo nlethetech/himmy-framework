@@ -56,7 +56,9 @@ def test_queue_migration_is_a_new_version_not_an_edit() -> None:
     """The queue columns ride a NEW migration version (v7), never an edit of a shipped one."""
     versions = [v for v, _n, _s in STORAGE_MIGRATIONS]
     assert versions == sorted(versions)
-    assert versions[-1] == 7
+    # v7 is the queue migration; later migrations (e.g. v8 run_events parity) may follow,
+    # so assert v7 is present rather than pinning it as the highest version forever.
+    assert 7 in versions
     v7 = next(stmts for v, _n, stmts in STORAGE_MIGRATIONS if v == 7)
     joined = "\n".join(v7)
     assert "trigger_dedup" in joined

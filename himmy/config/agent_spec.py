@@ -92,6 +92,11 @@ class AgentSpec(BaseModel):
     guardrails: list[str] = []
     memory: bool = False  # auto-recall long-term memory into the prompt each run
     memory_top_k: int = 5
+    # Self-learning (P1, opt-in): mine recorded TOOL_FAILED/TOOL_COMPLETED signals into a
+    # per-tool reputation that (a) stable-sorts flaky tools after reliable ones in the
+    # bound toolset and (b) injects a short reliability hint into the prompt. Default
+    # False → zero behaviour change. Needs a runtime wired with the learning service.
+    self_learning: bool = False
     # Files/dirs to auto-ingest into the agent's knowledge base at startup (no driver
     # code). The agent gains kb_search and can answer grounded in these docs.
     knowledge: list[str] = []
@@ -155,20 +160,38 @@ class AgentSpec(BaseModel):
             }
         if self.output_schema is not None:
             context["output_schema"] = self.output_schema
+        # Memory + self-learning both inject a system-prompt context block, with no tool
+        # call, via a context adapter. They COMPOSE: each appends its key rather than
+        # replacing the whole spec, so turning on both wires both blocks (a naive
+        # re-assignment would silently clobber the other). Needs a runtime wired with the
+        # matching ContextAdapter(s).
+        build_keys: list[dict[str, Any]] = []
+        system_keys: list[str] = []
         if self.memory:
-            # Recall relevant long-term memory and inject it into the system prompt,
-            # with no tool call. Needs a runtime wired with a memory ContextAdapter.
-            context["context_build_spec"] = {
-                "keys": [
-                    {
-                        "key": "agent_memory",
-                        "adapter_name": "memory",
-                        "source_preference": "tool_only",
-                        "metadata": {"query": prompt},
-                    }
-                ]
-            }
-            context["context_prompt_map_spec"] = {"system_keys": ["agent_memory"]}
+            # Recall relevant long-term memory and inject it into the system prompt.
+            build_keys.append(
+                {
+                    "key": "agent_memory",
+                    "adapter_name": "memory",
+                    "source_preference": "tool_only",
+                    "metadata": {"query": prompt},
+                }
+            )
+            system_keys.append("agent_memory")
+        if self.self_learning:
+            # Inject a short reliability note about recently-flaky tools.
+            build_keys.append(
+                {
+                    "key": "learned_hints",
+                    "adapter_name": "learned_hints",
+                    "source_preference": "tool_only",
+                    "metadata": {"query": prompt},
+                }
+            )
+            system_keys.append("learned_hints")
+        if build_keys:
+            context["context_build_spec"] = {"keys": build_keys}
+            context["context_prompt_map_spec"] = {"system_keys": system_keys}
         return Task(
             title=title or f"{self.name}-task",
             prompt=prompt,

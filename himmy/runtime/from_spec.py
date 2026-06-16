@@ -283,8 +283,11 @@ def build_runtime_for_spec(
     entity_registry = SpineFactory.for_context(server=server)
     overrides["registry"] = entity_registry
 
+    # Context adapters that inject a system-prompt block with no tool call. Memory and
+    # self-learning each contribute one; they COMPOSE onto the single ContextService
+    # built below so turning on both wires both (neither clobbers the other).
+    context_adapters: list[Any] = []
     if spec.memory:
-        from himmy.services.context.service import ContextService
         from himmy.services.memory import (
             InMemoryMemoryStore,
             MemoryContextAdapter,
@@ -304,16 +307,41 @@ def build_runtime_for_spec(
             registry=entity_registry,
             event_sink=storage,
         )
-        adapter = MemoryContextAdapter(
-            memory,
-            top_k=spec.memory_top_k,
-            subject_id=tk.memory_subject,
-            similarity_threshold=tk.memory_min_similarity,
+        context_adapters.append(
+            MemoryContextAdapter(
+                memory,
+                top_k=spec.memory_top_k,
+                subject_id=tk.memory_subject,
+                similarity_threshold=tk.memory_min_similarity,
+            )
         )
+
+    # Self-learning (P1): build the learning service over the SAME ``storage`` handle the
+    # runtime uses, plus a sync reputation snapshot for the bound-tools reorder. The
+    # learned-hints adapter is added to the composed ContextService below; the provider is
+    # injected into the ToolService below. ``reputation_provider`` stays None when the flag
+    # is off, so both hooks are exact no-ops by default.
+    reputation_provider: Any = None
+    if spec.self_learning:
+        from himmy.services.learning import (
+            LearnedHintsContextAdapter,
+            LearningService,
+            ToolReputationProvider,
+        )
+
+        learning = LearningService(storage)
+        reputation_provider = ToolReputationProvider(learning, event_sink=storage)
+        context_adapters.append(
+            LearnedHintsContextAdapter(learning, event_sink=storage)
+        )
+
+    if context_adapters:
+        from himmy.services.context.service import ContextService
+
         # Reuse the context-selected ``storage`` (durable on a server, in-memory on the
-        # CLI) so the runtime and the memory ContextService share one backend.
+        # CLI) so the runtime and the ContextService share one backend.
         overrides["context_service"] = ContextService(
-            storage_service=storage, adapters=[adapter]
+            storage_service=storage, adapters=context_adapters
         )
 
     registry = None
@@ -363,6 +391,14 @@ def build_runtime_for_spec(
             register_skill_dispatch_tool(
                 registry, inference=inference, skill_registry=build_skill_registry()
             )
+        if reputation_provider is not None:
+            # Prime the sync reputation snapshot from history ONCE, here at build time
+            # (not on the per-turn hot path), so the sync ``bound_tools`` reorder reads a
+            # ready snapshot with no I/O. Best-effort: ``refresh`` swallows any error.
+            asyncio.run(
+                reputation_provider.refresh([d.name for d in registry.list()])
+            )
+
         if pipeline is not None:
             # Guard tool arguments (pre) AND tool return content (post). The pre-hook
             # stops PII/blocked args reaching the tool; the post-hook stops a tool
@@ -370,7 +406,8 @@ def build_runtime_for_spec(
             # thread + next-turn context + final answer unfiltered. The post-hook uses
             # the OUTPUT pipeline (redact/tokenize per DLP policy; BLOCK-class →
             # withheld placeholder). Both are wired ONLY when guardrails are
-            # configured, so the zero-config path stays untouched.
+            # configured, so the zero-config path stays untouched. The reputation
+            # provider (P1) rides along when self-learning is on.
             from himmy.services.guardrails import (
                 build_guardrail_post_hook,
                 build_guardrail_pre_hook,
@@ -381,6 +418,19 @@ def build_runtime_for_spec(
                 registry,
                 pre_execution_hook=build_guardrail_pre_hook(pipeline),
                 post_execution_hook=build_guardrail_post_hook(output_guardrail),
+                reputation_provider=reputation_provider,
+            )
+        elif reputation_provider is not None:
+            # No guardrails, but self-learning is on: build the ToolService here (instead
+            # of leaving ``build_runtime`` to make a bare one from the registry) so the
+            # reputation provider actually reaches the bound-tools reorder. ``event_sink``
+            # mirrors ``build_runtime``'s default so tool events still flow to storage.
+            from himmy.services.tools.service import ToolService
+
+            overrides["tool_service"] = ToolService(
+                registry,
+                event_sink=storage,
+                reputation_provider=reputation_provider,
             )
         else:
             overrides["tool_registry"] = registry

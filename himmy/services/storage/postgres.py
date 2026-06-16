@@ -47,6 +47,7 @@ from himmy.services.storage.models import (
     RunRecord,
     RunStatus,
 )
+from himmy.services.storage.protocols import normalize_event_type
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.storage.trigger_dedup import DedupClaim
@@ -86,6 +87,7 @@ CREATE TABLE IF NOT EXISTS chat_threads (
 CREATE INDEX IF NOT EXISTS chat_threads_updated_at_idx ON chat_threads (updated_at);
 
 CREATE TABLE IF NOT EXISTS run_events (
+    seq          BIGSERIAL,
     event_id     TEXT PRIMARY KEY,
     event_type   TEXT NOT NULL,
     trace_id     TEXT,
@@ -93,6 +95,7 @@ CREATE TABLE IF NOT EXISTS run_events (
     agent_id     TEXT,
     request_id   TEXT,
     tool_call_id TEXT,
+    tool_name    TEXT,
     latency_ms   DOUBLE PRECISION,
     cost         DOUBLE PRECISION,
     payload      JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -103,6 +106,8 @@ CREATE INDEX IF NOT EXISTS run_events_thread_id_idx ON run_events (thread_id);
 CREATE INDEX IF NOT EXISTS run_events_trace_id_idx ON run_events (trace_id);
 CREATE INDEX IF NOT EXISTS run_events_request_id_idx ON run_events (request_id);
 CREATE INDEX IF NOT EXISTS run_events_timestamp_idx ON run_events (timestamp);
+CREATE INDEX IF NOT EXISTS run_events_seq_idx ON run_events (seq);
+CREATE INDEX IF NOT EXISTS run_events_type_tool_idx ON run_events (event_type, tool_name);
 
 CREATE TABLE IF NOT EXISTS context_fields (
     subject_id TEXT NOT NULL,
@@ -639,6 +644,31 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ON trigger_dedup (expires_at)",
         ],
     ),
+    # v8 (P1): bring run_events to parity with the SQLite backend for the
+    # self-learning reputation miner. Two gaps are closed: (1) a denormalised
+    # ``tool_name`` column captured pre-encryption on append (mirroring SQLite's
+    # sqlite.py:543-544) so a ``WHERE tool_name=?`` filter works even when payloads are
+    # encrypted at rest, with a composite ``(event_type, tool_name)`` index for the
+    # hot-path conjunction read; and (2) a ``seq BIGSERIAL`` insertion-order column so
+    # ``ORDER BY seq`` is deterministic — Postgres previously ordered by ``timestamp``,
+    # which ties ambiguously for sub-ms tool events on one run. Adding a BIGSERIAL
+    # column backfills existing rows in physical (insertion) order. Existing rows'
+    # ``tool_name`` backfills best-effort from the JSONB payload (plaintext only; an
+    # encrypted payload's nested tool_name is unrecoverable, exactly as SQLite's v2
+    # backfill is bounded to unencrypted databases).
+    (
+        8,
+        "run_events_tool_name_and_seq",
+        [
+            "ALTER TABLE run_events ADD COLUMN IF NOT EXISTS tool_name TEXT",
+            "ALTER TABLE run_events ADD COLUMN IF NOT EXISTS seq BIGSERIAL",
+            "CREATE INDEX IF NOT EXISTS run_events_seq_idx ON run_events (seq)",
+            "CREATE INDEX IF NOT EXISTS run_events_type_tool_idx "
+            "ON run_events (event_type, tool_name)",
+            "UPDATE run_events SET tool_name = payload->>'tool_name' "
+            "WHERE tool_name IS NULL AND payload ? 'tool_name'",
+        ],
+    ),
 ]
 
 
@@ -944,21 +974,29 @@ class PostgresEventLog(_PgStoreBase):
     """Postgres-backed append-only run-event stream (EventSink surface)."""
 
     async def append_event(self, event: RunEvent) -> None:
-        """Append a run event (EventSink role); the payload is encrypted at rest."""
+        """Append a run event (EventSink role); the payload is encrypted at rest.
+
+        ``tool_name`` is denormalised into an indexed column captured from the live
+        event BEFORE encryption (mirroring the SQLite backend), so the learning
+        reputation miner's ``WHERE tool_name=?`` filter works at parity even when the
+        payload is encrypted at rest.
+        """
         pool = self._require_pool()
-        payload = dict(event.payload or {})
+        plain = dict(event.payload or {})
+        tool_name = plain.get("tool_name")
+        payload = plain
         if self._cipher is not None:
             payload = self._cipher.encrypt_event_payload(
-                payload, event_id=event.event_id
+                plain, event_id=event.event_id
             )
         async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO run_events
                     (event_id, event_type, trace_id, thread_id, agent_id,
-                     request_id, tool_call_id, latency_ms, cost, payload, error,
-                     timestamp)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     request_id, tool_call_id, tool_name, latency_ms, cost, payload,
+                     error, timestamp)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT (event_id) DO NOTHING
                 """,
                 event.event_id,
@@ -968,6 +1006,7 @@ class PostgresEventLog(_PgStoreBase):
                 event.agent_id,
                 event.request_id,
                 event.tool_call_id,
+                tool_name,
                 event.latency_ms,
                 event.cost,
                 payload,
@@ -976,9 +1015,22 @@ class PostgresEventLog(_PgStoreBase):
             )
 
     async def list_events(
-        self, thread_id: str | None = None, trace_id: str | None = None
+        self,
+        thread_id: str | None = None,
+        trace_id: str | None = None,
+        *,
+        event_type: Any = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[RunEvent]:
-        """List events, optionally filtered by thread/trace id (insertion order)."""
+        """List events filtered by thread/trace/event_type/tool_name (insertion order).
+
+        Orders by the ``seq`` BIGSERIAL insertion-order column (not ``timestamp``) so
+        the result is deterministic even for sub-ms ties — at parity with the SQLite
+        backend's ``ORDER BY seq``. ``limit`` bounds the set and ``newest_first`` flips
+        the order so the learning miner takes the most recent N.
+        """
         pool = self._require_pool()
         clauses: list[str] = []
         params: list[Any] = []
@@ -988,12 +1040,45 @@ class PostgresEventLog(_PgStoreBase):
         if trace_id is not None:
             params.append(trace_id)
             clauses.append(f"trace_id = ${len(params)}")
+        want_type = normalize_event_type(event_type)
+        if want_type is not None:
+            params.append(want_type)
+            clauses.append(f"event_type = ${len(params)}")
+        if tool_name is not None:
+            params.append(tool_name)
+            clauses.append(f"tool_name = ${len(params)}")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        order = "DESC" if newest_first else "ASC"
+        tail = ""
+        if limit is not None:
+            params.append(int(limit))
+            tail = f" LIMIT ${len(params)}"
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                f"SELECT * FROM run_events{where} ORDER BY timestamp ASC", *params
+                f"SELECT * FROM run_events{where} ORDER BY seq {order}{tail}", *params
             )
         return [_row_to_event(r, cipher=self._cipher) for r in rows]
+
+    async def count_events(
+        self, *, event_type: Any = None, tool_name: str | None = None
+    ) -> int:
+        """Count events matching ``event_type``/``tool_name`` via the indexed columns."""
+        pool = self._require_pool()
+        clauses: list[str] = []
+        params: list[Any] = []
+        want_type = normalize_event_type(event_type)
+        if want_type is not None:
+            params.append(want_type)
+            clauses.append(f"event_type = ${len(params)}")
+        if tool_name is not None:
+            params.append(tool_name)
+            clauses.append(f"tool_name = ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT COUNT(*) AS n FROM run_events{where}", *params
+            )
+        return int(row["n"]) if row is not None else 0
 
 
 class PostgresContextStore(_PgStoreBase):
@@ -2363,10 +2448,32 @@ class PostgresStorageService:
         await self._event_log.append_event(event)
 
     async def list_events(
-        self, thread_id: str | None = None, trace_id: str | None = None
+        self,
+        thread_id: str | None = None,
+        trace_id: str | None = None,
+        *,
+        event_type: Any = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[RunEvent]:
-        """List events, optionally filtered by thread/trace id (insertion order)."""
-        return await self._event_log.list_events(thread_id, trace_id)
+        """List events filtered by thread/trace/event_type/tool_name (insertion order)."""
+        return await self._event_log.list_events(
+            thread_id,
+            trace_id,
+            event_type=event_type,
+            tool_name=tool_name,
+            limit=limit,
+            newest_first=newest_first,
+        )
+
+    async def count_events(
+        self, *, event_type: Any = None, tool_name: str | None = None
+    ) -> int:
+        """Count events matching ``event_type``/``tool_name`` (no thread/trace scope)."""
+        return await self._event_log.count_events(
+            event_type=event_type, tool_name=tool_name
+        )
 
     async def delete_by_subject(self, subject_id: str) -> int:
         """Hard-DELETE a subject's chat_threads + run_events (S4 right-to-erasure).

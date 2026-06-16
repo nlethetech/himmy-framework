@@ -144,6 +144,10 @@ def test_legacy_pre_v4_db_gets_agent_defs_via_migration(tmp_path: Path) -> None:
     path = str(tmp_path / "legacy.db")
     raw = sqlite3.connect(path)
     raw.executescript(sqlite_mod._SCHEMA)
+    # A real v3 db has already been through v2 (run_events.event_type/tool_name columns);
+    # add them so this fixture is a faithful v3 shape, not a v1 base mis-stamped at v3.
+    raw.execute("ALTER TABLE run_events ADD COLUMN event_type TEXT")
+    raw.execute("ALTER TABLE run_events ADD COLUMN tool_name TEXT")
     # Simulate a db provisioned BEFORE v4 (agent_defs did not exist; stamped at v3).
     raw.execute("PRAGMA user_version = 3")
     raw.commit()

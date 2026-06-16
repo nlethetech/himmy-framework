@@ -29,6 +29,7 @@ from himmy.services.storage.models import (
     RunRecord,
     RunStatus,
 )
+from himmy.services.storage.protocols import normalize_event_type
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context cycle
     from himmy.agents.base_agent.thread import ChatThread
@@ -71,15 +72,54 @@ class InMemoryEventLog:
         self._events.append(event)
 
     async def list_events(
-        self, thread_id: str | None = None, trace_id: str | None = None
+        self,
+        thread_id: str | None = None,
+        trace_id: str | None = None,
+        *,
+        event_type: Any = None,
+        tool_name: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
     ) -> list[RunEvent]:
-        """List events, optionally filtered by ``thread_id`` and/or ``trace_id``."""
-        return [
+        """List events filtered by thread/trace/event_type/tool_name (insertion order).
+
+        ``event_type`` matches an :class:`EventType` or its string value; ``tool_name``
+        matches the denormalised ``payload['tool_name']`` (the in-memory analog of the
+        durable backends' indexed columns). ``limit`` bounds the result and
+        ``newest_first`` flips the order — the learning miners take the most recent N.
+        """
+        want_type = normalize_event_type(event_type)
+        matches = [
             e
             for e in self._events
             if (thread_id is None or e.thread_id == thread_id)
             and (trace_id is None or e.trace_id == trace_id)
+            and (
+                want_type is None
+                or getattr(e.event_type, "value", str(e.event_type)) == want_type
+            )
+            and (tool_name is None or (e.payload or {}).get("tool_name") == tool_name)
         ]
+        if newest_first:
+            matches = list(reversed(matches))
+        if limit is not None:
+            matches = matches[: max(0, limit)]
+        return matches
+
+    async def count_events(
+        self, *, event_type: Any = None, tool_name: str | None = None
+    ) -> int:
+        """Count events matching ``event_type``/``tool_name`` (no thread/trace scope)."""
+        want_type = normalize_event_type(event_type)
+        return sum(
+            1
+            for e in self._events
+            if (
+                want_type is None
+                or getattr(e.event_type, "value", str(e.event_type)) == want_type
+            )
+            and (tool_name is None or (e.payload or {}).get("tool_name") == tool_name)
+        )
 
     def delete_events(self, thread_ids: set[str], trace_ids: set[str]) -> int:
         """Drop events whose thread_id OR trace_id is named; return count (S4 erasure)."""

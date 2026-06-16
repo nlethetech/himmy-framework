@@ -66,6 +66,14 @@ def test_legacy_db_backfills_attempt_and_next_attempt(tmp_path: Path) -> None:
         "payload TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, "
         "updated_at TEXT NOT NULL)"
     )
+    # A real v4 db also carries run_events with the v2-promoted event_type/tool_name
+    # columns; include it so this fixture is a faithful v4 shape (later migrations index
+    # run_events, which a real v4 db always has).
+    raw.execute(
+        "CREATE TABLE run_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "event_id TEXT NOT NULL UNIQUE, thread_id TEXT, trace_id TEXT, "
+        "event_type TEXT, tool_name TEXT, payload TEXT NOT NULL DEFAULT '{}')"
+    )
     raw.execute(
         "INSERT INTO runs (run_id, workspace_id, subject_id, status, payload, "
         "created_at, updated_at) VALUES "
