@@ -1559,7 +1559,10 @@ class RunAppService:
 
         try:
             runtime = await self._resolve_runtime(
-                agent_spec, checkpoint_store=checkpoint_store, plan_mode=plan
+                agent_spec,
+                checkpoint_store=checkpoint_store,
+                plan_mode=plan,
+                workspace_id=run.workspace_id,
             )
         except Exception as exc:  # noqa: BLE001 - spec wiring failure is terminal
             run.status = RunStatus.FAILED
@@ -1869,6 +1872,7 @@ class RunAppService:
         *,
         checkpoint_store: Any = None,
         plan_mode: bool = False,
+        workspace_id: str | None = None,
     ) -> SingleAgentRuntime:
         """Pick the runtime for a run: shared tool-less, or a per-run tool-bearing one.
 
@@ -1895,6 +1899,11 @@ class RunAppService:
         per-run registry so a plan-first run pauses at PLAN-READY through the SAME
         approval machinery (it MUST be registered on the resume runtime too, hence this
         flag is threaded both on the initial drive and on resume).
+
+        ``workspace_id`` (P1 tenancy) is the run's owning tenant, threaded into
+        ``build_runtime_for_spec(subject=...)`` so a ``self_learning`` agent's tool-
+        reputation mining is scoped to this tenant on the SHARED ``/v1`` event store
+        instead of aggregating every tenant's tool failures.
         """
         if agent_spec is None:
             return self._runtime
@@ -1913,6 +1922,7 @@ class RunAppService:
             inference=shared_inference,
             storage=self._storage,
             checkpoint_store=checkpoint_store,
+            subject=workspace_id,
         )
         runtime = cast("SingleAgentRuntime", runtime)
         if plan_mode:
@@ -2301,6 +2311,7 @@ class RunAppService:
                     spec,
                     checkpoint_store=self._checkpoint_store,
                     plan_mode=plan_mode,
+                    workspace_id=run.workspace_id,
                 )
             except Exception as exc:  # noqa: BLE001 - spec rebuild failure is terminal
                 run.status = RunStatus.FAILED

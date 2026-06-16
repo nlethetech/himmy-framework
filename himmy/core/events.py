@@ -74,6 +74,14 @@ class RunEvent(BaseModel):
     trace_id: str | None = None
     thread_id: str | None = None
     agent_id: str | None = None
+    #: The owning tenant of the run that emitted this event. Stamped only when a run is
+    #: wired with a workspace scope (the per-run server path); ``None`` on the one-shot
+    #: CLI / offline path, which uses an isolated in-memory store per process and needs no
+    #: tenant dimension. It is denormalised into an indexed ``workspace_id`` column on the
+    #: durable backends (mirroring ``tool_name``) so the self-learning reputation miner can
+    #: scope its read to ONE tenant on a shared event store instead of aggregating every
+    #: tenant's tool failures. ``None`` keeps the unscoped historical read byte-identical.
+    workspace_id: str | None = None
     request_id: str | None = None
     tool_call_id: str | None = None
     latency_ms: float | None = None

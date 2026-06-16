@@ -262,12 +262,20 @@ class ToolService:
         http_max_keepalive_connections: int = 20,
         lenient_args: bool = True,
         reputation_provider: ToolReputationLike | None = None,
+        event_workspace_id: str | None = None,
     ) -> None:
         self._registry = registry
         self._pre_hook = pre_execution_hook
         self._post_hook = post_execution_hook
         self.event_sink = event_sink
         self._default_timeout_seconds = default_timeout_seconds
+        # P1 tenancy: the owning workspace stamped onto every tool event this service
+        # emits, so the self-learning reputation miner can scope its read to ONE tenant
+        # on a shared event store (``list_events(workspace_id=...)``). ``None`` (the
+        # default, and every non-self-learning / CLI path) leaves events unscoped —
+        # byte-identical to before. Set only on the per-run server wiring that knows the
+        # run's workspace (``build_runtime_for_spec(subject=...)``).
+        self._event_workspace_id = event_workspace_id
         # P1 self-learning (opt-in): a sync reputation snapshot used to STABLE-sort flaky
         # tools after reliable ones in ``bound_tools`` (and annotate the worst). ``None``
         # (the default) makes ``bound_tools`` byte-for-byte identical to before — no
@@ -295,9 +303,17 @@ class ToolService:
         return self._registry
 
     async def _emit(self, event: RunEvent) -> None:
-        """Best-effort emit; a broken sink must never fail a tool call."""
+        """Best-effort emit; a broken sink must never fail a tool call.
+
+        Stamps the owning ``workspace_id`` (P1 tenancy) onto the event when the service
+        is workspace-scoped and the event does not already carry one, so the durable
+        backends denormalise it and the self-learning reputation miner can read it back
+        scoped to ONE tenant. A no-op when ``event_workspace_id`` is None (the default).
+        """
         if self.event_sink is None:
             return
+        if self._event_workspace_id is not None and event.workspace_id is None:
+            event.workspace_id = self._event_workspace_id
         try:
             await self.event_sink.append_event(event)
         except Exception:  # pragma: no cover - defensive

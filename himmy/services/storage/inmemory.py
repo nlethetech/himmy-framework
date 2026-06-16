@@ -78,6 +78,7 @@ class InMemoryEventLog:
         *,
         event_type: Any = None,
         tool_name: str | None = None,
+        workspace_id: str | None = None,
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]:
@@ -85,7 +86,8 @@ class InMemoryEventLog:
 
         ``event_type`` matches an :class:`EventType` or its string value; ``tool_name``
         matches the denormalised ``payload['tool_name']`` (the in-memory analog of the
-        durable backends' indexed columns). ``limit`` bounds the result and
+        durable backends' indexed columns). ``workspace_id`` scopes the read to one
+        tenant's events (``None`` = unscoped). ``limit`` bounds the result and
         ``newest_first`` flips the order — the learning miners take the most recent N.
         """
         want_type = normalize_event_type(event_type)
@@ -99,6 +101,7 @@ class InMemoryEventLog:
                 or getattr(e.event_type, "value", str(e.event_type)) == want_type
             )
             and (tool_name is None or (e.payload or {}).get("tool_name") == tool_name)
+            and (workspace_id is None or e.workspace_id == workspace_id)
         ]
         if newest_first:
             matches = list(reversed(matches))

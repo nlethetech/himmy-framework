@@ -197,7 +197,7 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
 #: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
 #: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
 #: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
-SQLITE_SCHEMA_VERSION = 6
+SQLITE_SCHEMA_VERSION = 7
 
 #: Ordered forward migrations applied after the base DDL, mirroring the Postgres
 #: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
@@ -329,6 +329,27 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         (
             "CREATE INDEX IF NOT EXISTS run_events_type_tool_idx "
             "ON run_events (event_type, tool_name)",
+        ),
+    ),
+    # v7 (P1 tenancy): denormalise the owning ``workspace_id`` onto run_events so the
+    # self-learning reputation miner can scope its read to ONE tenant on a SHARED event
+    # store instead of aggregating every tenant's tool failures. Captured from the live
+    # event BEFORE encryption (exactly like ``tool_name``), so a ``WHERE workspace_id=?``
+    # filter works even with payload encryption at rest. A composite
+    # ``(workspace_id, event_type, tool_name)`` index covers the scoped hot-path read
+    # (the per-tenant "last N TOOL_FAILED/COMPLETED for tool X"). Existing rows backfill
+    # from the plaintext JSON payload best-effort (unencrypted databases only); a NULL
+    # ``workspace_id`` is the unscoped historical event and only ever matches an unscoped
+    # (workspace_id=None) read, so the default path is byte-identical.
+    (
+        7,
+        (
+            "ALTER TABLE run_events ADD COLUMN workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS run_events_ws_type_tool_idx "
+            "ON run_events (workspace_id, event_type, tool_name)",
+            "UPDATE run_events SET workspace_id = "
+            "json_extract(payload, '$.workspace_id') "
+            "WHERE workspace_id IS NULL AND json_valid(payload)",
         ),
     ),
 )
@@ -551,22 +572,24 @@ class SqliteStorageService:
             record["payload"] = self._cipher.encrypt_event_payload(
                 record.get("payload") or {}, event_id=event.event_id
             )
-        # P0-B: denormalise event_type + tool_name into indexed columns so the
-        # learning miners query by index. Captured from the live event BEFORE
-        # encryption, so tool_name survives even with payload encryption at rest.
+        # P0-B/P1: denormalise event_type + tool_name + workspace_id into indexed columns
+        # so the learning miners query (and tenant-scope) by index. Captured from the live
+        # event BEFORE encryption, so they survive even with payload encryption at rest.
         event_type = getattr(event.event_type, "value", str(event.event_type))
         tool_name = (event.payload or {}).get("tool_name")
         await asyncio.to_thread(
             self._write,
             "INSERT INTO run_events "
-            "(event_id, thread_id, trace_id, event_type, tool_name, payload) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING",
+            "(event_id, thread_id, trace_id, event_type, tool_name, workspace_id, "
+            "payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (event_id) DO NOTHING",
             (
                 event.event_id,
                 event.thread_id,
                 event.trace_id,
                 event_type,
                 tool_name,
+                event.workspace_id,
                 json.dumps(record),
             ),
         )
@@ -578,16 +601,18 @@ class SqliteStorageService:
         *,
         event_type: Any = None,
         tool_name: str | None = None,
+        workspace_id: str | None = None,
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]:
         """List events filtered by thread/trace/event_type/tool_name (insertion order).
 
-        ``event_type``/``tool_name`` seek the P0-B indexed columns (``WHERE
-        event_type=? AND tool_name=?``) so the learning miners avoid a full-table
-        json_extract scan. ``limit`` bounds the result set and ``newest_first`` flips
-        the ``seq`` order to take the most recent N — insertion-order deterministic
-        either way (``seq`` is the autoincrement primary key, never a clock).
+        ``event_type``/``tool_name``/``workspace_id`` seek the indexed columns (``WHERE
+        event_type=? AND tool_name=? AND workspace_id=?``) so the learning miners avoid a
+        full-table json_extract scan and tenant-scope on a shared store. ``limit`` bounds
+        the result set and ``newest_first`` flips the ``seq`` order to take the most recent
+        N — insertion-order deterministic either way (``seq`` is the autoincrement primary
+        key, never a clock).
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -604,6 +629,9 @@ class SqliteStorageService:
         if tool_name is not None:
             clauses.append("tool_name = ?")
             params.append(tool_name)
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            params.append(workspace_id)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         order = "DESC" if newest_first else "ASC"
         tail = f" LIMIT {int(limit)}" if limit is not None else ""

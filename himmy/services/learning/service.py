@@ -19,15 +19,18 @@ Every public method is 100% best-effort: any exception (store unavailable, malfo
 rows) is swallowed and returns the neutral / empty result, logged at ``debug`` — learning
 must never break or noticeably slow a run.
 
-TENANCY: the reputation read is scoped ONLY by ``event_type`` / ``tool_name`` — there is
-no workspace/subject predicate, because ``run_events`` carries no tenant column (only
-``thread_id`` / ``trace_id``). On a shared server store (``StoreFactory.for_context``
-returns ONE backend for every tenant) a tool's reputation is therefore an aggregate
-across all tenants that used a same-named tool. Only tool names + integer counts ever
-cross that boundary (never prompts/args/PII — see the adapter's PRIVACY note), so this is
-an aggregate-signal property, not a content leak. It is opt-in (``self_learning`` defaults
-False) and documented for multi-tenant operators in ``docs/enterprise/upgrades.md``; a
-per-tenant variant would need a tenant predicate threaded into ``list_events``.
+TENANCY: the reputation read is scoped by ``event_type`` / ``tool_name`` AND, when the
+service is built with a ``workspace_id``, by that owning tenant — so on a SHARED server
+store (``StoreFactory.for_context`` returns ONE backend for every tenant) a tool's
+reputation reflects ONLY the run's own workspace, never an aggregate across tenants. The
+scope is threaded from the run's ``workspace_id`` (``build_runtime_for_spec(subject=...)``)
+into both the async reputation read and the events the run emits: ``run_events`` carries a
+denormalised ``workspace_id`` column (captured pre-encryption like ``tool_name``, at parity
+across the in-memory / SQLite / Postgres backends) that ``list_events(workspace_id=...)``
+filters on. ``workspace_id=None`` (the one-shot CLI / offline path, which already uses an
+isolated in-memory store per process, and every pre-existing caller) reads the whole stream
+unscoped — byte-identical to before. The feature stays opt-in (``self_learning`` defaults
+False).
 """
 
 from __future__ import annotations
@@ -91,10 +94,17 @@ class LearningService:
         *,
         window: int = DEFAULT_WINDOW,
         min_samples: int = DEFAULT_MIN_SAMPLES,
+        workspace_id: str | None = None,
     ) -> None:
         self._events = event_log
         self._window = max(1, int(window))
         self._min_samples = max(1, int(min_samples))
+        # TENANCY: when set, every reputation read is scoped to this workspace so a
+        # tool's score reflects ONLY this tenant's recent calls on a SHARED event store
+        # (one tenant's failures never pollute another's reputation). ``None`` reads the
+        # whole stream unscoped — the historical behaviour and the byte-identical default
+        # for the isolated-per-process CLI store.
+        self._workspace_id = workspace_id
 
     async def get_tool_reputation(
         self, tool_names: list[str]
@@ -102,11 +112,11 @@ class LearningService:
         """Return a :class:`ToolReputation` for each named tool (best-effort).
 
         For every tool we read up to ``window`` of its most-recent ``TOOL_COMPLETED`` and
-        ``TOOL_FAILED`` events and compute ``completed / (completed + failed)``. An unseen
-        tool — or one with fewer than ``min_samples`` scored calls — is reported at the
-        neutral prior (``1.0``) so brand-new tools are never punished. Any error returns
-        the neutral result for the affected tool and is logged at ``debug``; the call
-        never raises.
+        ``TOOL_FAILED`` events (scoped to this service's ``workspace_id`` when set) and
+        compute ``completed / (completed + failed)``. An unseen tool — or one with fewer
+        than ``min_samples`` scored calls — is reported at the neutral prior (``1.0``) so
+        brand-new tools are never punished. Any error returns the neutral result for the
+        affected tool and is logged at ``debug``; the call never raises.
         """
         result: dict[str, ToolReputation] = {}
         for name in tool_names:
@@ -156,12 +166,14 @@ class LearningService:
         completed = await self._events.list_events(
             event_type=EventType.TOOL_COMPLETED,
             tool_name=tool_name,
+            workspace_id=self._workspace_id,
             limit=self._window,
             newest_first=True,
         )
         failed = await self._events.list_events(
             event_type=EventType.TOOL_FAILED,
             tool_name=tool_name,
+            workspace_id=self._workspace_id,
             limit=self._window,
             newest_first=True,
         )

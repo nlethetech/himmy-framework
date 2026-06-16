@@ -122,6 +122,66 @@ def test_self_learning_on_no_tools_still_wires_adapter() -> None:
     assert "learned_hints" in _adapter_names(runtime)
 
 
+def test_subject_scopes_learning_and_stamps_tool_events() -> None:
+    """``subject`` threads the run's workspace into BOTH halves of the loop (P1 tenancy).
+
+    The LearningService is built workspace-scoped (so its reputation read filters on the
+    tenant) AND the ToolService stamps that workspace onto the tool events it emits (so the
+    read has something tenant-tagged to find). ``subject=None`` leaves both unscoped.
+    """
+    spec = AgentSpec(name="t", self_learning=True, tools_module=_TOOLS_MODULE)
+    runtime, _registry = build_runtime_for_spec(spec, subject="tenant-A")
+    provider = runtime.tool_service._reputation_provider  # type: ignore[union-attr]
+    # The provider's LearningService carries the workspace scope...
+    assert provider._learning._workspace_id == "tenant-A"  # type: ignore[attr-defined]
+    # ...and the ToolService stamps emitted tool events with it.
+    assert runtime.tool_service._event_workspace_id == "tenant-A"  # type: ignore[union-attr]
+
+    # Default (no subject) stays unscoped — byte-identical to the pre-tenancy wiring.
+    runtime2, _ = build_runtime_for_spec(spec)
+    provider2 = runtime2.tool_service._reputation_provider  # type: ignore[union-attr]
+    assert provider2._learning._workspace_id is None  # type: ignore[attr-defined]
+    assert runtime2.tool_service._event_workspace_id is None  # type: ignore[union-attr]
+
+
+def test_cross_tenant_isolation_end_to_end_through_shared_store() -> None:
+    """Two specs sharing ONE store: tenant A's tool failures don't reach tenant B's hints.
+
+    Seed 9 TOOL_FAILED for ``ping`` under workspace A on the shared store (stamped exactly
+    as the ToolService would). A self-learning runtime built with ``subject='A'`` injects a
+    learned hint about ``ping``; one built with ``subject='B'`` injects none — proving the
+    end-to-end per-tenant scoping the from_spec wiring threads.
+    """
+    from himmy.core.events import EventType, RunEvent
+    from himmy.services.context.models import ContextField
+    from himmy.services.storage.service import StorageService
+
+    store = StorageService()
+    for _ in range(9):
+        asyncio.run(
+            store.append_event(
+                RunEvent(
+                    event_type=EventType.TOOL_FAILED,
+                    payload={"tool_name": "ping"},
+                    workspace_id="A",
+                )
+            )
+        )
+
+    spec = AgentSpec(name="t", self_learning=True, tools_module=_TOOLS_MODULE, tools=["ping"])
+
+    def _hint_for(subject: str) -> ContextField | None:
+        runtime, _ = build_runtime_for_spec(spec, storage=store, subject=subject)
+        ctx = runtime.context_service  # type: ignore[attr-defined]
+        adapter = getattr(ctx, "_adapters", {})["learned_hints"]
+        return asyncio.run(adapter.fetch("learned_hints", {}))
+
+    field_a = _hint_for("A")
+    field_b = _hint_for("B")
+    assert field_a is not None and 'tool "ping"' in str(field_a.value)  # A sees the warning
+    assert field_b is None  # B sees ping as clean — A's failures never crossed over
+
+
 def test_reprime_picks_up_late_registered_mcp_tools() -> None:
     """The re-prime hook re-reads the registry so MCP tools (registered AFTER build) are
     covered by BOTH halves of the loop — the reputation snapshot and the hint candidates.

@@ -77,6 +77,89 @@ def test_all_success_tool_scores_high() -> None:
     assert rep["search"].has_min_samples is True
 
 
+def _store_with_scoped(
+    events: list[tuple[EventType, str, str | None]],
+) -> StorageService:
+    """Seed a store with ``(event_type, tool_name, workspace_id)`` events.
+
+    ``workspace_id`` is stamped on the event so the durable backends denormalise it and a
+    ``LearningService(workspace_id=...)`` reads only its own tenant's events back.
+    """
+    store = StorageService()
+    for event_type, tool_name, workspace_id in events:
+        run_async(
+            store.append_event(
+                RunEvent(
+                    event_type=event_type,
+                    payload={"tool_name": tool_name},
+                    workspace_id=workspace_id,
+                )
+            )
+        )
+    return store
+
+
+# ---------------------------------------------------------------- per-tenant scoping
+def test_reputation_scoped_to_workspace_isolates_tenants() -> None:
+    """Tool failures under tenant A do NOT drag down the SAME tool's score for tenant B.
+
+    Seed 5 failures of ``wire`` under workspace ``A`` and 5 completions under ``B`` on ONE
+    shared store. A LearningService scoped to A sees a low (all-failure) score; one scoped
+    to B sees a perfect score — proving the per-tenant ``list_events(workspace_id=...)``
+    filter, not a global aggregate.
+    """
+    store = _store_with_scoped(
+        [(EventType.TOOL_FAILED, "wire", "A")] * 5
+        + [(EventType.TOOL_COMPLETED, "wire", "B")] * 5
+    )
+    rep_a = run_async(
+        LearningService(store, workspace_id="A").get_tool_reputation(["wire"])
+    )
+    rep_b = run_async(
+        LearningService(store, workspace_id="B").get_tool_reputation(["wire"])
+    )
+    assert rep_a["wire"].has_min_samples is True
+    assert rep_a["wire"].score == 0.0  # only A's 5 failures are in scope
+    assert rep_a["wire"].failed == 5
+    assert rep_b["wire"].score == 1.0  # only B's 5 completions are in scope
+    assert rep_b["wire"].failed == 0
+
+
+def test_tenant_b_run_does_not_see_tenant_a_failing_tool_as_unreliable() -> None:
+    """A run under tenant B never inflicts tenant A's failures as a B-side unreliable hint.
+
+    Step 3 of the task: seed TOOL_FAILED for tool X under subject A; prove a run under
+    subject B does NOT see X as unreliable, while a run under A does.
+    """
+    store = _store_with_scoped([(EventType.TOOL_FAILED, "x", "A")] * 9)
+    adapter_a = LearnedHintsContextAdapter(
+        LearningService(store, workspace_id="A"), tool_names=["x"]
+    )
+    adapter_b = LearnedHintsContextAdapter(
+        LearningService(store, workspace_id="B"), tool_names=["x"]
+    )
+    field_a = run_async(adapter_a.fetch("learned_hints", {}))
+    field_b = run_async(adapter_b.fetch("learned_hints", {}))
+    assert field_a is not None and 'tool "x"' in str(field_a.value)  # A sees the warning
+    assert field_b is None  # B sees a clean tool — A's failures never crossed the boundary
+
+
+def test_unscoped_reputation_reads_all_tenants_back_compat() -> None:
+    """``workspace_id=None`` reads the whole stream — the historical (pre-tenancy) behaviour.
+
+    Locks in that the scoping is opt-in: an unscoped service still aggregates across the
+    workspace-stamped events exactly as it did before the column existed.
+    """
+    store = _store_with_scoped(
+        [(EventType.TOOL_FAILED, "wire", "A")] * 4
+        + [(EventType.TOOL_COMPLETED, "wire", "B")] * 1
+    )
+    rep = run_async(LearningService(store).get_tool_reputation(["wire"]))  # unscoped
+    assert rep["wire"].failed == 4  # both tenants' events counted
+    assert rep["wire"].completed == 1
+    assert rep["wire"].score == 1 / 5
+
+
 def _store_with_timestamps(
     events: list[tuple[EventType, str, str]],
 ) -> StorageService:

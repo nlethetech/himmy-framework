@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS run_events (
     request_id   TEXT,
     tool_call_id TEXT,
     tool_name    TEXT,
+    workspace_id TEXT,
     latency_ms   DOUBLE PRECISION,
     cost         DOUBLE PRECISION,
     payload      JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -108,6 +109,8 @@ CREATE INDEX IF NOT EXISTS run_events_request_id_idx ON run_events (request_id);
 CREATE INDEX IF NOT EXISTS run_events_timestamp_idx ON run_events (timestamp);
 CREATE INDEX IF NOT EXISTS run_events_seq_idx ON run_events (seq);
 CREATE INDEX IF NOT EXISTS run_events_type_tool_idx ON run_events (event_type, tool_name);
+CREATE INDEX IF NOT EXISTS run_events_ws_type_tool_idx
+    ON run_events (workspace_id, event_type, tool_name);
 
 CREATE TABLE IF NOT EXISTS context_fields (
     subject_id TEXT NOT NULL,
@@ -676,6 +679,32 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "WHERE tool_name IS NULL AND payload ? 'tool_name'",
         ],
     ),
+    # v9 (P1 tenancy): denormalise the owning ``workspace_id`` onto run_events so the
+    # self-learning reputation miner can scope its read to ONE tenant on a SHARED event
+    # store instead of aggregating every tenant's tool failures — at parity with the
+    # SQLite v7 migration. Captured pre-encryption on append (like ``tool_name``) so a
+    # ``WHERE workspace_id=?`` filter works even with payload encryption at rest; a
+    # composite ``(workspace_id, event_type, tool_name)`` index covers the scoped hot-path
+    # read. Existing rows backfill best-effort from the plaintext JSONB payload
+    # (unencrypted only); a NULL ``workspace_id`` only matches an unscoped read, so the
+    # default path is byte-identical.
+    #
+    # OPERATIONAL NOTE (unlike v8's BIGSERIAL): ``ADD COLUMN workspace_id TEXT`` is
+    # nullable with NO default, so it is a fast catalog-only change (no ACCESS EXCLUSIVE
+    # table rewrite). The backfill UPDATE still touches every row once; for a large
+    # long-lived stream run it in batches (or skip it — only history predating the column
+    # lacks the scope, and unscoped history is correctly invisible to a scoped read).
+    (
+        9,
+        "run_events_workspace_id",
+        [
+            "ALTER TABLE run_events ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS run_events_ws_type_tool_idx "
+            "ON run_events (workspace_id, event_type, tool_name)",
+            "UPDATE run_events SET workspace_id = payload->>'workspace_id' "
+            "WHERE workspace_id IS NULL AND payload ? 'workspace_id'",
+        ],
+    ),
 ]
 
 
@@ -983,10 +1012,10 @@ class PostgresEventLog(_PgStoreBase):
     async def append_event(self, event: RunEvent) -> None:
         """Append a run event (EventSink role); the payload is encrypted at rest.
 
-        ``tool_name`` is denormalised into an indexed column captured from the live
-        event BEFORE encryption (mirroring the SQLite backend), so the learning
-        reputation miner's ``WHERE tool_name=?`` filter works at parity even when the
-        payload is encrypted at rest.
+        ``tool_name`` (and the owning ``workspace_id``) are denormalised into indexed
+        columns captured from the live event BEFORE encryption (mirroring the SQLite
+        backend), so the learning reputation miner's ``WHERE tool_name=? AND
+        workspace_id=?`` filter works at parity even when the payload is encrypted at rest.
         """
         pool = self._require_pool()
         plain = dict(event.payload or {})
@@ -1001,9 +1030,9 @@ class PostgresEventLog(_PgStoreBase):
                 """
                 INSERT INTO run_events
                     (event_id, event_type, trace_id, thread_id, agent_id,
-                     request_id, tool_call_id, tool_name, latency_ms, cost, payload,
-                     error, timestamp)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     request_id, tool_call_id, tool_name, workspace_id, latency_ms,
+                     cost, payload, error, timestamp)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT (event_id) DO NOTHING
                 """,
                 event.event_id,
@@ -1014,6 +1043,7 @@ class PostgresEventLog(_PgStoreBase):
                 event.request_id,
                 event.tool_call_id,
                 tool_name,
+                event.workspace_id,
                 event.latency_ms,
                 event.cost,
                 payload,
@@ -1028,6 +1058,7 @@ class PostgresEventLog(_PgStoreBase):
         *,
         event_type: Any = None,
         tool_name: str | None = None,
+        workspace_id: str | None = None,
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]:
@@ -1035,8 +1066,9 @@ class PostgresEventLog(_PgStoreBase):
 
         Orders by the ``seq`` BIGSERIAL insertion-order column (not ``timestamp``) so
         the result is deterministic even for sub-ms ties — at parity with the SQLite
-        backend's ``ORDER BY seq``. ``limit`` bounds the set and ``newest_first`` flips
-        the order so the learning miner takes the most recent N.
+        backend's ``ORDER BY seq``. ``workspace_id`` scopes the read to one tenant on a
+        shared store (``None`` = unscoped). ``limit`` bounds the set and ``newest_first``
+        flips the order so the learning miner takes the most recent N.
         """
         pool = self._require_pool()
         clauses: list[str] = []
@@ -1054,6 +1086,9 @@ class PostgresEventLog(_PgStoreBase):
         if tool_name is not None:
             params.append(tool_name)
             clauses.append(f"tool_name = ${len(params)}")
+        if workspace_id is not None:
+            params.append(workspace_id)
+            clauses.append(f"workspace_id = ${len(params)}")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         order = "DESC" if newest_first else "ASC"
         tail = ""
@@ -2440,6 +2475,7 @@ class PostgresStorageService:
         *,
         event_type: Any = None,
         tool_name: str | None = None,
+        workspace_id: str | None = None,
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]:
@@ -2449,6 +2485,7 @@ class PostgresStorageService:
             trace_id,
             event_type=event_type,
             tool_name=tool_name,
+            workspace_id=workspace_id,
             limit=limit,
             newest_first=newest_first,
         )

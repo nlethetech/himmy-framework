@@ -210,6 +210,7 @@ def build_runtime_for_spec(
     checkpoint_store: Any = None,
     durable_defaults: bool | None = None,
     storage: Any = None,
+    subject: str | None = None,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring provider/model overrides + tools.
 
@@ -233,6 +234,14 @@ def build_runtime_for_spec(
     backend the run record lives in so the per-run runtime's thread/events/memory
     land in the one store the application layer reads. When ``None`` the legacy
     factory selection (by ``durable_defaults``/server-context) is used unchanged.
+
+    ``subject`` (P1 tenancy) is the run's owning ``workspace_id``. On a SHARED event store
+    (the server path, where every tenant's runs land in ONE backend) it scopes the
+    self-learning reputation read to this tenant's events and stamps that ``workspace_id``
+    onto the tool events the run emits, so one tenant's tool failures never pollute
+    another's learned reputation. ``None`` (the one-shot CLI / offline path, which already
+    uses an isolated in-memory store per process, and every pre-existing caller) leaves
+    learning unscoped — byte-identical to before. Inert unless ``spec.self_learning``.
     """
     from himmy import build_runtime
     from himmy.cli.provider import build_inference_for
@@ -355,7 +364,9 @@ def build_runtime_for_spec(
             ToolReputationProvider,
         )
 
-        learning = LearningService(storage)
+        # ``subject`` (the run's workspace_id) scopes the reputation read to this tenant on
+        # a shared event store; ``None`` reads unscoped (CLI/offline, byte-identical).
+        learning = LearningService(storage, workspace_id=subject)
         reputation_provider = ToolReputationProvider(learning, event_sink=storage)
         # The adapter's candidate tools are the run's bound tools, but the registry is
         # built below, so we hold a reference and pin ``tool_names`` once it exists (the
@@ -468,6 +479,9 @@ def build_runtime_for_spec(
                 pre_execution_hook=build_guardrail_pre_hook(pipeline),
                 post_execution_hook=build_guardrail_post_hook(output_guardrail),
                 reputation_provider=reputation_provider,
+                # Stamp the run's workspace onto emitted tool events so the reputation
+                # miner reads them back tenant-scoped (P1). None when self-learning is off.
+                event_workspace_id=subject if reputation_provider is not None else None,
             )
         elif reputation_provider is not None:
             # No guardrails, but self-learning is on: build the ToolService here (instead
@@ -480,6 +494,9 @@ def build_runtime_for_spec(
                 registry,
                 event_sink=storage,
                 reputation_provider=reputation_provider,
+                # Stamp the run's workspace onto emitted tool events so the reputation
+                # miner reads them back tenant-scoped (P1).
+                event_workspace_id=subject,
             )
         else:
             overrides["tool_registry"] = registry

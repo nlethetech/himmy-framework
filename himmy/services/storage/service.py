@@ -99,6 +99,7 @@ class StorageService:
         *,
         event_type: Any = None,
         tool_name: str | None = None,
+        workspace_id: str | None = None,
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]:
@@ -108,6 +109,7 @@ class StorageService:
             trace_id,
             event_type=event_type,
             tool_name=tool_name,
+            workspace_id=workspace_id,
             limit=limit,
             newest_first=newest_first,
         )

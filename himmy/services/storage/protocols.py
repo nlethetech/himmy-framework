@@ -66,13 +66,15 @@ class ThreadStore(Protocol):
 class EventLog(Protocol):
     """Append-only run-event audit stream (also the EventSink surface).
 
-    ``list_events`` carries keyword-only ``event_type``/``tool_name``/``limit``/
-    ``newest_first`` filters on top of the historical positional ``thread_id``/
+    ``list_events`` carries keyword-only ``event_type``/``tool_name``/``workspace_id``/
+    ``limit``/``newest_first`` filters on top of the historical positional ``thread_id``/
     ``trace_id`` scope so the self-learning miners can answer "which tools fail most"
     with a bounded (``limit``) index seek over the P0-B indexed columns rather than
     scanning the whole audit stream. ``event_type`` accepts an
     :class:`~himmy.core.events.EventType` or its string value (normalised exactly as
-    ``append_event`` denormalises it).
+    ``append_event`` denormalises it). ``workspace_id`` scopes the read to one tenant's
+    events on a shared store (``None`` = unscoped, the historical behaviour) so a tenant's
+    tool-reputation mining never aggregates another tenant's failures.
     """
 
     async def append_event(self, event: RunEvent) -> None: ...
@@ -84,6 +86,7 @@ class EventLog(Protocol):
         *,
         event_type: Any = None,
         tool_name: str | None = None,
+        workspace_id: str | None = None,
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]: ...
@@ -110,6 +113,7 @@ class ThreadEventStore(Protocol):
         *,
         event_type: Any = None,
         tool_name: str | None = None,
+        workspace_id: str | None = None,
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]: ...
