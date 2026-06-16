@@ -24,6 +24,7 @@ import pytest
 
 from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
 from himmy.core.events import EventType, RunEvent
+from himmy.services.learning.service import LearningService
 from himmy.services.storage import (
     MemoryObject,
     RecommendationItem,
@@ -409,5 +410,57 @@ def test_async_context_manager_closes_pool() -> None:
             await storage.get_run("nope")
         # After exit the pool is closed; a fresh op must re-require a pool.
         assert storage._pool._closed  # type: ignore[attr-defined]
+
+    run_async(scenario())
+
+
+def test_reputation_scoped_to_workspace_isolates_tenants() -> None:
+    """P1: per-tenant reputation isolation holds on the real SHARED Postgres event store.
+
+    The /v1 path resolves ONE backend for every tenant, so the denormalised ``workspace_id``
+    column (captured pre-encryption) is the cross-tenant boundary. Seed the SAME tool failing
+    under workspace A and succeeding under B on one store, then prove a ``LearningService``
+    scoped to A sees only A's failures, one scoped to B sees only B's completions, and an
+    unscoped read aggregates both — the durable mirror of the in-memory learning test.
+    """
+
+    async def scenario() -> None:
+        storage = await _fresh_storage()
+        try:
+            ws_a = _uid("wsA")
+            ws_b = _uid("wsB")
+            tool = _uid("tool")  # unique so the shared table needs no truncation
+            for _ in range(5):
+                await storage.append_event(
+                    RunEvent(
+                        event_type=EventType.TOOL_FAILED,
+                        workspace_id=ws_a,
+                        payload={"tool_name": tool, "tool_outcome": "error"},
+                    )
+                )
+            for _ in range(5):
+                await storage.append_event(
+                    RunEvent(
+                        event_type=EventType.TOOL_COMPLETED,
+                        workspace_id=ws_b,
+                        payload={"tool_name": tool, "tool_outcome": "success"},
+                    )
+                )
+
+            rep_a = await LearningService(
+                storage, workspace_id=ws_a
+            ).get_tool_reputation([tool])
+            rep_b = await LearningService(
+                storage, workspace_id=ws_b
+            ).get_tool_reputation([tool])
+            assert rep_a[tool].failed == 5 and rep_a[tool].completed == 0
+            assert rep_a[tool].score == 0.0  # only A's failures are in scope
+            assert rep_b[tool].failed == 0 and rep_b[tool].completed == 5
+            assert rep_b[tool].score == 1.0  # only B's completions are in scope
+            # Unscoped aggregates both tenants — the historical (pre-tenancy) behaviour.
+            rep_all = await LearningService(storage).get_tool_reputation([tool])
+            assert rep_all[tool].failed == 5 and rep_all[tool].completed == 5
+        finally:
+            await storage.close()
 
     run_async(scenario())
