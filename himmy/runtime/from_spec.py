@@ -322,6 +322,7 @@ def build_runtime_for_spec(
     # injected into the ToolService below. ``reputation_provider`` stays None when the flag
     # is off, so both hooks are exact no-ops by default.
     reputation_provider: Any = None
+    learned_hints_adapter: Any = None
     if spec.self_learning:
         from himmy.services.learning import (
             LearnedHintsContextAdapter,
@@ -331,9 +332,12 @@ def build_runtime_for_spec(
 
         learning = LearningService(storage)
         reputation_provider = ToolReputationProvider(learning, event_sink=storage)
-        context_adapters.append(
-            LearnedHintsContextAdapter(learning, event_sink=storage)
-        )
+        # The adapter's candidate tools are the run's bound tools, but the registry is
+        # built below, so we hold a reference and pin ``tool_names`` once it exists (the
+        # snapshot scope never carries the run's tool list — see the priming next to the
+        # reputation refresh). Without this the hint half of the loop is a silent no-op.
+        learned_hints_adapter = LearnedHintsContextAdapter(learning, event_sink=storage)
+        context_adapters.append(learned_hints_adapter)
 
     if context_adapters:
         from himmy.services.context.service import ContextService
@@ -395,9 +399,13 @@ def build_runtime_for_spec(
             # Prime the sync reputation snapshot from history ONCE, here at build time
             # (not on the per-turn hot path), so the sync ``bound_tools`` reorder reads a
             # ready snapshot with no I/O. Best-effort: ``refresh`` swallows any error.
-            asyncio.run(
-                reputation_provider.refresh([d.name for d in registry.list()])
-            )
+            tool_names = [d.name for d in registry.list()]
+            asyncio.run(reputation_provider.refresh(tool_names))
+            # Pin the same bound tools onto the hint adapter — the snapshot scope never
+            # carries the run's tool list, so without this the learned-hints block can
+            # never resolve and the prompt-hint half of the loop is dead.
+            if learned_hints_adapter is not None:
+                learned_hints_adapter.bind_tools(tool_names)
 
         if pipeline is not None:
             # Guard tool arguments (pre) AND tool return content (post). The pre-hook

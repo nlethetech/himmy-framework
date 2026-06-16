@@ -167,13 +167,12 @@ class ToolReputationProvider:
     ``ToolService.bound_tools`` is synchronous and on the per-turn inference hot path, so
     it cannot ``await`` the async :class:`LearningService`. This provider bridges the gap:
     :meth:`refresh` (async, driven out-of-band when the runtime is built) populates an
-    in-memory snapshot, and :meth:`reputation_for` (sync) reads it with no I/O. An empty /
-    un-refreshed snapshot reports every tool as neutral, so the reorder is a no-op until
-    real history exists — exactly the zero-behaviour-change default.
+    in-memory snapshot, and :meth:`score_for` / :meth:`is_unreliable` (sync) read it with
+    no I/O. An empty / un-refreshed snapshot reports every tool as neutral, so the reorder
+    is a no-op until real history exists — exactly the zero-behaviour-change default.
 
     ``floor`` is the score below which a sufficiently-sampled tool is considered
-    *unreliable* (eligible for an annotated caution); ``reputation`` exposes the full
-    :class:`ToolReputation` so the reorder hook can phrase that caution.
+    *unreliable* (eligible for an annotated caution).
     """
 
     def __init__(
@@ -230,10 +229,6 @@ class ToolReputationProvider:
     def floor(self) -> float:
         """The unreliable-score floor used to annotate (not drop) flaky tools."""
         return self._floor
-
-    def reputation_for(self, tool_name: str) -> ToolReputation | None:
-        """Return the cached reputation for a tool, or ``None`` when not in the snapshot."""
-        return self._snapshot.get(tool_name)
 
     def score_for(self, tool_name: str) -> float:
         """The cached score for a tool (neutral when unseen) — the sort key."""

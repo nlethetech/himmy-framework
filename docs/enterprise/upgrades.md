@@ -105,6 +105,11 @@ There is **no schema rollback**. To revert to a prior version:
 - **Additive only.** Don't author destructive DDL (dropping/renaming columns) as a
   migration — it breaks the "older binary can still read" property and makes
   partial-rollout rollbacks unrecoverable without downtime.
+- **Table-rewriting columns lock the table.** Schema v8 adds a `BIGSERIAL` `seq` column
+  to `run_events`; because a serial default is non-constant, Postgres takes an `ACCESS
+  EXCLUSIVE` lock and rewrites the whole table, blocking reads/writes for the duration.
+  On a large, long-lived `run_events` audit stream, run this upgrade in a **maintenance
+  window** (the rewrite is proportional to row count). Fresh installs are unaffected.
 
 ## Related docs
 

@@ -656,6 +656,13 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
     # ``tool_name`` backfills best-effort from the JSONB payload (plaintext only; an
     # encrypted payload's nested tool_name is unrecoverable, exactly as SQLite's v2
     # backfill is bounded to unencrypted databases).
+    #
+    # OPERATIONAL NOTE: ``ADD COLUMN ... BIGSERIAL`` has a non-constant (sequence) default,
+    # so Postgres takes an ACCESS EXCLUSIVE lock and rewrites the whole table — on a large
+    # long-lived ``run_events`` audit stream this blocks reads/writes for the duration.
+    # Run this upgrade in a maintenance window for large tables. For a true online upgrade,
+    # prefer: ADD COLUMN seq BIGINT (nullable, fast) → backfill in batches → attach an
+    # identity/sequence → CREATE INDEX CONCURRENTLY, rather than one BIGSERIAL statement.
     (
         8,
         "run_events_tool_name_and_seq",

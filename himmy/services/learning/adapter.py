@@ -57,6 +57,15 @@ class LearnedHintsContextAdapter(ContextAdapter):
         self._max_hints = max_hints
         self._event_sink = event_sink
 
+    def bind_tools(self, tool_names: list[str]) -> None:
+        """Pin the candidate tools to assess (the run's bound tools).
+
+        The snapshot ``scope`` never carries the run's tool list, so the wiring primes the
+        adapter here once the tool registry exists (mirroring the reputation snapshot
+        refresh). Without it ``fetch`` has no candidates and silently injects nothing.
+        """
+        self._tool_names = tool_names
+
     async def fetch(self, key: str, scope: dict[str, Any]) -> ContextField | None:
         """Render a reliability note for the run's unreliable tools, or ``None``.
 

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from himmy.config.agent_spec import AgentSpec
 from himmy.core.events import EventType, RunEvent
+from himmy.services.context.service import ContextService
 from himmy.services.learning.adapter import LearnedHintsContextAdapter
 from himmy.services.learning.service import (
     NEUTRAL_SCORE,
@@ -244,3 +246,57 @@ def test_reputation_dataclass_total() -> None:
         tool_name="t", completed=2, failed=3, score=0.4, has_min_samples=True
     )
     assert rep.total == 5
+
+
+# ----------------------------------------------- end-to-end: real build_snapshot path
+def test_bound_adapter_emits_hint_through_real_build_snapshot() -> None:
+    """A bound adapter renders a hint when driven via make_task's real build spec.
+
+    Regression for the dead hint half of the loop: the snapshot ``scope`` never carries
+    the run's tool list (build_snapshot's scope = subject_id/task_id/metadata only), so the
+    adapter must be PINNED with the run's bound tools (as the from_spec wiring now does via
+    ``bind_tools``). We drive the exact build spec ``make_task`` emits — not a hand-built
+    ``{"tool_names": [...]}`` scope — through a real ContextService.build_snapshot.
+    """
+    events = [(EventType.TOOL_FAILED, "wire")] * 9 + [(EventType.TOOL_COMPLETED, "wire")]
+    store = _store_with(events)
+    adapter = LearnedHintsContextAdapter(LearningService(store))
+    adapter.bind_tools(["wire"])  # mirrors from_spec priming once the registry exists
+    service = ContextService(storage_service=store, adapters=[adapter])
+
+    spec = AgentSpec(name="x", self_learning=True, tools=["wire"])
+    task = spec.make_task("do the thing")
+    snapshot = run_async(
+        service.build_snapshot(
+            subject_id="x",
+            build_spec=task.context["context_build_spec"],
+            metadata=None,  # the real runtime passes ctx['context_metadata'] (no tool list)
+        )
+    )
+    field = snapshot.fields.get("learned_hints")
+    assert field is not None
+    assert isinstance(field.value, str)
+    assert 'tool "wire"' in field.value
+
+
+def test_unbound_adapter_injects_nothing_through_real_build_snapshot() -> None:
+    """An UN-bound adapter produces no field via the real path (the bug being fixed).
+
+    Locks in WHY ``bind_tools`` is required: with no pinned tools and a scope that lacks
+    ``tool_names`` (the real build_snapshot scope), the hint half resolves to nothing.
+    """
+    events = [(EventType.TOOL_FAILED, "wire")] * 9 + [(EventType.TOOL_COMPLETED, "wire")]
+    store = _store_with(events)
+    adapter = LearnedHintsContextAdapter(LearningService(store))  # NOT bound
+    service = ContextService(storage_service=store, adapters=[adapter])
+
+    spec = AgentSpec(name="x", self_learning=True, tools=["wire"])
+    task = spec.make_task("do the thing")
+    snapshot = run_async(
+        service.build_snapshot(
+            subject_id="x",
+            build_spec=task.context["context_build_spec"],
+            metadata=None,
+        )
+    )
+    assert snapshot.fields.get("learned_hints") is None

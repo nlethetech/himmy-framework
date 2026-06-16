@@ -62,6 +62,11 @@ def _adapter_names(runtime: object) -> set[str]:
     return {getattr(a, "name", "") for a in getattr(ctx, "_adapters", {}).values()}
 
 
+def _learned_hints_adapter(runtime: object) -> object:
+    ctx = runtime.context_service  # type: ignore[attr-defined]
+    return getattr(ctx, "_adapters", {})["learned_hints"]
+
+
 def test_self_learning_off_no_reputation_provider() -> None:
     """Off → the ToolService has no reputation provider (bound_tools unchanged)."""
     spec = AgentSpec(name="t", tools_module=_TOOLS_MODULE)
@@ -79,6 +84,10 @@ def test_self_learning_on_wires_adapter_and_provider() -> None:
     runtime, _registry = build_runtime_for_spec(spec)
     assert "learned_hints" in _adapter_names(runtime)
     assert runtime.tool_service._reputation_provider is not None  # type: ignore[union-attr]
+    # The adapter must be PINNED with the registry's bound tools — the snapshot scope never
+    # carries the run's tool list, so without this the hint half of the loop is a no-op.
+    adapter = _learned_hints_adapter(runtime)
+    assert set(adapter._tool_names or []) == {"ping", "wire_money"}  # type: ignore[attr-defined]
 
 
 def test_self_learning_on_no_tools_still_wires_adapter() -> None:
