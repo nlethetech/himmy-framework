@@ -246,11 +246,17 @@ def _spec_from_args_inner(args: argparse.Namespace) -> AgentSpec:
     return spec
 
 
-def _exec_with_mcp(factory: Any, registry: Any, mcp_servers: Any) -> Any:
+def _exec_with_mcp(
+    factory: Any, registry: Any, mcp_servers: Any, *, runtime: Any = None
+) -> Any:
     """Run ``factory()`` in one event loop, with MCP servers attached for its duration.
 
     MCP clients bind their reader task to the running loop, so connect + run + close
     must share a single ``asyncio.run``. With no MCP servers this is a plain run.
+
+    ``runtime`` (when self-learning is on) is re-primed after the MCP tools are
+    registered, so the reputation snapshot + hint candidates include them — the
+    build-time priming ran before those async tools existed.
     """
     if not mcp_servers:
         return asyncio.run(factory())
@@ -258,7 +264,7 @@ def _exec_with_mcp(factory: Any, registry: Any, mcp_servers: Any) -> Any:
     from himmy.config.mcp_spec import attach_mcp_servers, close_mcp_clients
 
     async def _outer() -> Any:
-        clients = await attach_mcp_servers(registry, list(mcp_servers))
+        clients = await attach_mcp_servers(registry, list(mcp_servers), runtime=runtime)
         try:
             return await factory()
         finally:
@@ -595,7 +601,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     sys.stdout.flush()
             sys.stdout.write("\n")
 
-        _exec_with_mcp(_stream, registry, spec.mcp_servers)
+        _exec_with_mcp(_stream, registry, spec.mcp_servers, runtime=runtime)
         _print_trace()
         return 0
 
@@ -607,7 +613,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 args.prompt, spec.to_persona(), tool_names=spec.tools or None
             )
 
-        result = _exec_with_mcp(_plan, registry, spec.mcp_servers)
+        result = _exec_with_mcp(_plan, registry, spec.mcp_servers, runtime=runtime)
         _eprint(f"plan: {len(result.plan)} step(s)")
         for i, step in enumerate(result.plan, start=1):
             _eprint(f"  {i}. {step}")
@@ -644,7 +650,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 on_stop=stop_reason.append,
             )
 
-    result = _exec_with_mcp(_go, registry, spec.mcp_servers)
+    result = _exec_with_mcp(_go, registry, spec.mcp_servers, runtime=runtime)
     if live is not None:
         live.finish()
     if cost_budget is not None and stop_reason and stop_reason[0] == "budget":
@@ -762,6 +768,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             ),
             registry,
             spec.mcp_servers,
+            runtime=runtime,
         )
         if store is not None and session_id:
             store.save(session_id, result.thread)
@@ -862,7 +869,7 @@ def cmd_telegram(args: argparse.Namespace) -> int:
 
     try:
         # MCP servers (if any) stay connected for the whole session.
-        _exec_with_mcp(_serve, registry, spec.mcp_servers)
+        _exec_with_mcp(_serve, registry, spec.mcp_servers, runtime=runtime)
     except KeyboardInterrupt:  # pragma: no cover - interactive
         _eprint("\n(stopped)")
     finally:
@@ -967,6 +974,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
             ),
             registry,
             spec.mcp_servers,
+            runtime=runtime,
         )
 
     if args.json:

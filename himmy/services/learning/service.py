@@ -106,8 +106,7 @@ class LearningService:
     async def _reputation_for_tool(self, tool_name: str) -> ToolReputation:
         """Compute one tool's reputation, swallowing any storage/data error to neutral."""
         try:
-            completed = await self._count_recent(tool_name, EventType.TOOL_COMPLETED)
-            failed = await self._count_recent(tool_name, EventType.TOOL_FAILED)
+            completed, failed = await self._recent_counts(tool_name)
         except Exception:  # pragma: no cover - defensive: learning never breaks a run
             logger.debug(
                 "reputation read failed for tool %r; using neutral", tool_name,
@@ -134,20 +133,39 @@ class LearningService:
             has_min_samples=True,
         )
 
-    async def _count_recent(self, tool_name: str, event_type: EventType) -> int:
-        """Count a tool's recent events of one type, bounded by ``window``.
+    async def _recent_counts(self, tool_name: str) -> tuple[int, int]:
+        """Return ``(completed, failed)`` over a SINGLE combined most-recent-N window.
 
-        Uses the windowed ``list_events`` read (most-recent N) rather than an unbounded
-        ``count_events`` so the per-tool reputation reflects only recent behaviour and
-        the read stays bounded regardless of total history.
+        Reads up to ``window`` of each outcome type (a bounded index seek per type),
+        merges them into one stream ordered newest-first, and keeps only the most-recent
+        ``window`` across BOTH types before counting. Windowing the combined stream (not
+        each type independently) is what makes the score reflect *recent* behaviour: a
+        long history of completions can no longer dilute a recent burst of failures, since
+        only the freshest ``window`` events of either kind survive the cut.
         """
-        events = await self._events.list_events(
-            event_type=event_type,
+        completed = await self._events.list_events(
+            event_type=EventType.TOOL_COMPLETED,
             tool_name=tool_name,
             limit=self._window,
             newest_first=True,
         )
-        return len(events)
+        failed = await self._events.list_events(
+            event_type=EventType.TOOL_FAILED,
+            tool_name=tool_name,
+            limit=self._window,
+            newest_first=True,
+        )
+        # Merge both newest-first reads and keep only the most-recent ``window`` events
+        # across the two types (ordered by recorded timestamp, which is monotonic with
+        # insertion order). Counting within that combined slice is the recency cut.
+        merged = sorted(
+            [(e.timestamp, EventType.TOOL_COMPLETED) for e in completed]
+            + [(e.timestamp, EventType.TOOL_FAILED) for e in failed],
+            key=lambda pair: pair[0],
+            reverse=True,
+        )[: self._window]
+        n_completed = sum(1 for _, et in merged if et is EventType.TOOL_COMPLETED)
+        return n_completed, len(merged) - n_completed
 
     @staticmethod
     def _neutral(tool_name: str) -> ToolReputation:
@@ -190,25 +208,37 @@ class ToolReputationProvider:
     async def refresh(self, tool_names: list[str]) -> dict[str, ToolReputation]:
         """Recompute and cache the reputation snapshot for ``tool_names`` (best-effort).
 
-        When the fresh snapshot would actually change the bound-tool order (some tool
-        scores below another, i.e. the scores are not all equal), a best-effort
-        ``LEARNING_APPLIED`` event is emitted so the behavioural change is auditable.
+        When the fresh snapshot would actually MOVE a tool in the bound-tool order (the
+        same stable score-sort :meth:`~himmy.services.tools.service.ToolService.bound_tools`
+        applies produces a different sequence), a best-effort ``LEARNING_APPLIED`` event is
+        emitted so the reorder is auditable. The event is emitted at snapshot-refresh time
+        (once per runtime build), so it carries no per-run trace context; the per-turn hint
+        adapter emits its own ``LEARNING_APPLIED`` inside the run when a hint is injected.
         """
         try:
             self._snapshot = await self._learning.get_tool_reputation(tool_names)
         except Exception:  # pragma: no cover - defensive: learning never breaks a run
             logger.debug("reputation snapshot refresh failed", exc_info=True)
             self._snapshot = {}
-        await self._emit_if_reordering()
+        await self._emit_if_reordering(tool_names)
         return dict(self._snapshot)
 
-    async def _emit_if_reordering(self) -> None:
-        """Emit ``LEARNING_APPLIED`` when the snapshot would reorder tools (best-effort)."""
+    async def _emit_if_reordering(self, tool_names: list[str]) -> None:
+        """Emit ``LEARNING_APPLIED`` only when the stable sort actually moves a tool.
+
+        Mirrors ``ToolService.bound_tools``: stable-sort the candidate order by negated
+        score and compare it to the original order. An emit fires only on a genuine
+        difference, so a snapshot whose sub-1.0 tools are already last (or where a single
+        tool dips) does not falsely claim a reorder.
+        """
         if self._event_sink is None:
             return
-        scores = [rep.score for rep in self._snapshot.values()]
-        if len(set(scores)) <= 1:
-            return  # all-equal scores → stable sort is a no-op → nothing to audit
+        ordered = [n for n in tool_names if n in self._snapshot]
+        # ``sorted`` is stable — equal scores keep their original position, exactly as
+        # ``bound_tools`` binds them, so a difference here means a real visible move.
+        reordered = sorted(ordered, key=lambda n: -self._snapshot[n].score)
+        if reordered == ordered:
+            return  # stable sort is a no-op → nothing observable to audit
         deprioritised = sorted(
             rep.tool_name for rep in self._snapshot.values() if rep.score < 1.0
         )

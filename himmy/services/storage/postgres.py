@@ -1066,27 +1066,6 @@ class PostgresEventLog(_PgStoreBase):
             )
         return [_row_to_event(r, cipher=self._cipher) for r in rows]
 
-    async def count_events(
-        self, *, event_type: Any = None, tool_name: str | None = None
-    ) -> int:
-        """Count events matching ``event_type``/``tool_name`` via the indexed columns."""
-        pool = self._require_pool()
-        clauses: list[str] = []
-        params: list[Any] = []
-        want_type = normalize_event_type(event_type)
-        if want_type is not None:
-            params.append(want_type)
-            clauses.append(f"event_type = ${len(params)}")
-        if tool_name is not None:
-            params.append(tool_name)
-            clauses.append(f"tool_name = ${len(params)}")
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"SELECT COUNT(*) AS n FROM run_events{where}", *params
-            )
-        return int(row["n"]) if row is not None else 0
-
 
 class PostgresContextStore(_PgStoreBase):
     """Postgres-backed context fields, snapshots, and evidence."""
@@ -2472,14 +2451,6 @@ class PostgresStorageService:
             tool_name=tool_name,
             limit=limit,
             newest_first=newest_first,
-        )
-
-    async def count_events(
-        self, *, event_type: Any = None, tool_name: str | None = None
-    ) -> int:
-        """Count events matching ``event_type``/``tool_name`` (no thread/trace scope)."""
-        return await self._event_log.count_events(
-            event_type=event_type, tool_name=tool_name
         )
 
     async def delete_by_subject(self, subject_id: str) -> int:

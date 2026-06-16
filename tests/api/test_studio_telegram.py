@@ -257,7 +257,9 @@ def test_start_endpoint_409_when_cli_telegram_holds_the_lock(
     holding = threading.Event()
     release = threading.Event()
 
-    def _fake_exec(factory: Any, registry: Any, mcp_servers: Any) -> Any:
+    def _fake_exec(
+        factory: Any, registry: Any, mcp_servers: Any, **_kwargs: Any
+    ) -> Any:
         # The CLI now holds the per-token flock (acquired before this call); signal the
         # test and block here (standing in for the long-poll) until told to release.
         holding.set()

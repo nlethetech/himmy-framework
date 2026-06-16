@@ -1295,7 +1295,11 @@ class ChatRepl:
             from himmy.config.mcp_spec import attach_mcp_servers
 
             mcp_clients = self.loop.run_until_complete(
-                attach_mcp_servers(self.rt["registry"], list(self.spec.mcp_servers))
+                attach_mcp_servers(
+                    self.rt["registry"],
+                    list(self.spec.mcp_servers),
+                    runtime=self.rt["runtime"],
+                )
             )
 
         try:  # arrow-key history + line editing, when the platform has it

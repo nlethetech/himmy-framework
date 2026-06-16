@@ -615,27 +615,6 @@ class SqliteStorageService:
         )
         return [self._row_to_event(json.loads(r["payload"])) for r in rows]
 
-    async def count_events(
-        self, *, event_type: Any = None, tool_name: str | None = None
-    ) -> int:
-        """Count events matching ``event_type``/``tool_name`` via the indexed columns."""
-        clauses: list[str] = []
-        params: list[Any] = []
-        want_type = normalize_event_type(event_type)
-        if want_type is not None:
-            clauses.append("event_type = ?")
-            params.append(want_type)
-        if tool_name is not None:
-            clauses.append("tool_name = ?")
-            params.append(tool_name)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        row = await asyncio.to_thread(
-            self._fetchone,
-            f"SELECT COUNT(*) AS n FROM run_events{where}",  # noqa: S608
-            tuple(params),
-        )
-        return int(row["n"]) if row is not None else 0
-
     async def prune_events(
         self, *, older_than_days: float | None = None, keep_last: int | None = None
     ) -> int:

@@ -55,9 +55,10 @@ class EventType(str, Enum):
     GRAPH_FINISHED = "GRAPH_FINISHED"
     TYPED_OUTPUT_VALIDATED = "TYPED_OUTPUT_VALIDATED"
     TYPED_OUTPUT_REPAIRED = "TYPED_OUTPUT_REPAIRED"
-    # Self-learning (P1): a learned signal changed behaviour this run — tool reputation
-    # reordered the bound tools and/or a learned reliability hint was injected. Emitted
-    # best-effort so the behavioural change is auditable in the same run-event stream.
+    # Self-learning (P1): a learned signal changed behaviour — tool reputation reordered
+    # the bound tools (emitted once at snapshot-refresh time, when the runtime is built)
+    # and/or a learned reliability hint was injected (emitted per-run, with the run's
+    # trace context). Emitted best-effort so the behavioural change is auditable.
     LEARNING_APPLIED = "LEARNING_APPLIED"
 
 

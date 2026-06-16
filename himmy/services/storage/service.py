@@ -112,14 +112,6 @@ class StorageService:
             newest_first=newest_first,
         )
 
-    async def count_events(
-        self, *, event_type: Any = None, tool_name: str | None = None
-    ) -> int:
-        """Count events matching ``event_type``/``tool_name`` (no thread/trace scope)."""
-        return await self._event_log.count_events(
-            event_type=event_type, tool_name=tool_name
-        )
-
     def delete_by_subject(self, subject_id: str) -> int:
         """Hard-DELETE a subject's chat_threads + run_events (S4 right-to-erasure).
 

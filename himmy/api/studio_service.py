@@ -802,7 +802,9 @@ async def stream_agent_run(
     if spec.mcp_servers:
         from himmy.config.mcp_spec import attach_mcp_servers
 
-        mcp_clients = await attach_mcp_servers(registry, list(spec.mcp_servers))
+        mcp_clients = await attach_mcp_servers(
+            registry, list(spec.mcp_servers), runtime=runtime
+        )
 
     run_id = new_uuid()
     started = time.monotonic()

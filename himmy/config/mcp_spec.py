@@ -59,13 +59,23 @@ class MCPServerConfig(BaseModel):
 
 
 async def attach_mcp_servers(
-    registry: ToolRegistry, configs: list[MCPServerConfig]
+    registry: ToolRegistry,
+    configs: list[MCPServerConfig],
+    *,
+    runtime: object | None = None,
 ) -> list[MCPClient]:
     """Connect each configured MCP server and register its tools onto ``registry``.
 
     Returns the live clients so the caller can close them when the run finishes. The
     clients' reader tasks are bound to the *current* event loop — connect, run, and
     close must all happen inside one ``asyncio.run`` so the loop stays alive.
+
+    When ``runtime`` exposes a ``reprime_self_learning`` hook (set by
+    :func:`~himmy.runtime.from_spec.build_runtime_for_spec` for a self-learning agent),
+    it is awaited AFTER the MCP tools are registered. The build-time priming ran before
+    these (async, late) tools existed, so without this re-prime self-learning would
+    silently miss every MCP tool — exactly the remote/network tools most likely to be
+    flaky. A non-self-learning agent passes ``None`` and pays nothing.
     """
     from himmy.services.mcp.client import MCPClient
     from himmy.services.mcp.connector import register_mcp_tools
@@ -85,6 +95,9 @@ async def attach_mcp_servers(
     except Exception:
         await close_mcp_clients(clients)
         raise
+    reprime = getattr(runtime, "reprime_self_learning", None)
+    if reprime is not None:
+        await reprime()
     return clients
 
 

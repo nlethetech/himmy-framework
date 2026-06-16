@@ -236,6 +236,11 @@
             ],
             "title": "Role"
           },
+          "self_learning": {
+            "default": false,
+            "title": "Self Learning",
+            "type": "boolean"
+          },
           "skills": {
             "default": [],
             "items": {

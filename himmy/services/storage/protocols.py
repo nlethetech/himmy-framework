@@ -42,7 +42,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context 
 def normalize_event_type(event_type: Any) -> str | None:
     """Coerce an ``event_type`` filter to its stored string value (or ``None``).
 
-    The ``list_events``/``count_events`` filters accept an
+    The ``list_events`` filters accept an
     :class:`~himmy.core.events.EventType` or its raw string value; both backends store
     the enum's ``.value`` in the denormalised ``event_type`` column. This mirrors the
     ``getattr(et, "value", str(et))`` coercion ``append_event`` uses on write so a read
@@ -69,10 +69,10 @@ class EventLog(Protocol):
     ``list_events`` carries keyword-only ``event_type``/``tool_name``/``limit``/
     ``newest_first`` filters on top of the historical positional ``thread_id``/
     ``trace_id`` scope so the self-learning miners can answer "which tools fail most"
-    with an index seek over the P0-B indexed columns rather than scanning the whole
-    audit stream. ``count_events`` is the bounded aggregate companion for the same
-    columns. ``event_type`` accepts an :class:`~himmy.core.events.EventType` or its
-    string value (normalised exactly as ``append_event`` denormalises it).
+    with a bounded (``limit``) index seek over the P0-B indexed columns rather than
+    scanning the whole audit stream. ``event_type`` accepts an
+    :class:`~himmy.core.events.EventType` or its string value (normalised exactly as
+    ``append_event`` denormalises it).
     """
 
     async def append_event(self, event: RunEvent) -> None: ...
@@ -87,10 +87,6 @@ class EventLog(Protocol):
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]: ...
-
-    async def count_events(
-        self, *, event_type: Any = None, tool_name: str | None = None
-    ) -> int: ...
 
 
 @runtime_checkable
@@ -117,10 +113,6 @@ class ThreadEventStore(Protocol):
         limit: int | None = None,
         newest_first: bool = False,
     ) -> list[RunEvent]: ...
-
-    async def count_events(
-        self, *, event_type: Any = None, tool_name: str | None = None
-    ) -> int: ...
 
 
 @runtime_checkable

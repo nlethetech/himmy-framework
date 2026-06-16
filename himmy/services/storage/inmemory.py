@@ -106,21 +106,6 @@ class InMemoryEventLog:
             matches = matches[: max(0, limit)]
         return matches
 
-    async def count_events(
-        self, *, event_type: Any = None, tool_name: str | None = None
-    ) -> int:
-        """Count events matching ``event_type``/``tool_name`` (no thread/trace scope)."""
-        want_type = normalize_event_type(event_type)
-        return sum(
-            1
-            for e in self._events
-            if (
-                want_type is None
-                or getattr(e.event_type, "value", str(e.event_type)) == want_type
-            )
-            and (tool_name is None or (e.payload or {}).get("tool_name") == tool_name)
-        )
-
     def delete_events(self, thread_ids: set[str], trace_ids: set[str]) -> int:
         """Drop events whose thread_id OR trace_id is named; return count (S4 erasure)."""
         before = len(self._events)

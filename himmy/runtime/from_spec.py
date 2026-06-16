@@ -176,6 +176,28 @@ def load_spec_file(
     return spec
 
 
+def _make_reprime(
+    registry: Any, reputation_provider: Any, learned_hints_adapter: Any
+) -> Callable[[], Any]:
+    """Build an async re-prime closure over the run's self-learning hooks.
+
+    The build-time priming reads ``registry.list()`` BEFORE the (async) MCP tools are
+    attached, so it misses them. The MCP attach path awaits this closure once those tools
+    are registered: it re-reads the now-complete registry and re-primes both halves of the
+    loop — the reputation snapshot (for the ``bound_tools`` reorder) and the hint adapter's
+    candidate tools — so self-learning covers MCP tools too. Best-effort: ``refresh``
+    swallows any error and ``bind_tools`` is a plain assignment.
+    """
+
+    async def _reprime() -> None:
+        tool_names = [d.name for d in registry.list()]
+        await reputation_provider.refresh(tool_names)
+        if learned_hints_adapter is not None:
+            learned_hints_adapter.bind_tools(tool_names)
+
+    return _reprime
+
+
 def build_runtime_for_spec(
     spec: AgentSpec,
     *,
@@ -323,6 +345,9 @@ def build_runtime_for_spec(
     # is off, so both hooks are exact no-ops by default.
     reputation_provider: Any = None
     learned_hints_adapter: Any = None
+    # Async re-prime the MCP attach path runs once the (late, async) MCP tools land in the
+    # registry; stays None unless self-learning + a registry exist (see the priming block).
+    _reprime: Any = None
     if spec.self_learning:
         from himmy.services.learning import (
             LearnedHintsContextAdapter,
@@ -406,6 +431,13 @@ def build_runtime_for_spec(
             # never resolve and the prompt-hint half of the loop is dead.
             if learned_hints_adapter is not None:
                 learned_hints_adapter.bind_tools(tool_names)
+            # MCP tools are registered into ``registry`` LATER (async, after this returns —
+            # see the docstring), so the priming above misses them. Hand the attach path an
+            # async re-prime it runs once the MCP tools exist, so self-learning covers the
+            # remote/network tools most likely to be flaky instead of degrading to neutral.
+            _reprime = _make_reprime(
+                registry, reputation_provider, learned_hints_adapter
+            )
 
         if pipeline is not None:
             # Guard tool arguments (pre) AND tool return content (post). The pre-hook
@@ -459,6 +491,11 @@ def build_runtime_for_spec(
             )
 
     runtime, _inference, _tools = build_runtime(**overrides)
+    # Expose the self-learning re-prime so the (async) MCP attach path can refresh the
+    # reputation snapshot + hint candidates once the MCP tools are registered — the
+    # build-time priming above ran before those tools existed. ``None`` when self-learning
+    # is off or no registry was built, so ``attach_mcp_servers`` treats it as a no-op.
+    runtime.reprime_self_learning = _reprime  # type: ignore[attr-defined]
     return runtime, registry
 
 

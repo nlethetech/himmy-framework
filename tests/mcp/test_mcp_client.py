@@ -77,6 +77,26 @@ def test_unknown_tool_is_reported_as_error_result() -> None:
     assert result.is_error is True
 
 
+def test_attach_mcp_servers_reprimes_self_learning_runtime() -> None:
+    """attach_mcp_servers awaits a runtime's reprime hook AFTER registering tools, so a
+    self-learning agent's snapshot + hint candidates pick up the late MCP tools.
+    """
+    from himmy.config.mcp_spec import attach_mcp_servers
+
+    called: list[bool] = []
+
+    class _Runtime:
+        async def reprime_self_learning(self) -> None:
+            called.append(True)
+
+    registry = ToolRegistry()
+    # No configs: the loop is a no-op, but the re-prime must still fire (the integration
+    # point we care about here). A non-self-learning runtime exposes no hook and is skipped.
+    run_async(attach_mcp_servers(registry, [], runtime=_Runtime()))
+    assert called == [True]
+    run_async(attach_mcp_servers(registry, [], runtime=object()))  # no hook → no error
+
+
 def test_jsonrpc_error_raises_mcp_error() -> None:
     """A JSON-RPC error response is raised as an MCPError with its code."""
 

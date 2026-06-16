@@ -1,11 +1,10 @@
-"""P1: the filtered ``list_events`` / ``count_events`` query API across backends.
+"""P1: the filtered ``list_events`` query API across backends.
 
 The self-learning miners read recorded TOOL_FAILED/TOOL_COMPLETED signals by index:
-``list_events(event_type=..., tool_name=..., limit=..., newest_first=...)`` and
-``count_events(event_type=..., tool_name=...)``. This asserts the new filters return
-the correct rows at parity on the in-memory facade and the durable SQLite backend
-(including the encryption-aware tool_name path). Postgres parity is covered by the live
-PG lane; here we assert the offline backends.
+``list_events(event_type=..., tool_name=..., limit=..., newest_first=...)``. This asserts
+the new filters return the correct rows at parity on the in-memory facade and the durable
+SQLite backend (including the encryption-aware tool_name path). Postgres parity is covered
+by the live PG lane; here we assert the offline backends.
 """
 
 from __future__ import annotations
@@ -74,13 +73,11 @@ def test_inmemory_filtered_list_and_count() -> None:
     )
     assert len(search_done) == 2
 
-    assert run_async(store.count_events(event_type=EventType.TOOL_FAILED)) == 2
-    assert (
-        run_async(
-            store.count_events(event_type=EventType.TOOL_FAILED, tool_name="search")
-        )
-        == 0
+    # A filter that matches nothing returns an empty list (not an error).
+    none_match = run_async(
+        store.list_events(event_type=EventType.TOOL_FAILED, tool_name="search")
     )
+    assert none_match == []
 
 
 def test_inmemory_limit_and_newest_first() -> None:
@@ -116,13 +113,10 @@ def test_sqlite_filtered_list_and_count(tmp_path: Path) -> None:
         store.list_events(event_type=EventType.TOOL_FAILED, tool_name="wire_money")
     )
     assert len(wire) == 2
-    assert run_async(store.count_events(tool_name="search")) == 2
-    assert (
-        run_async(
-            store.count_events(event_type=EventType.TOOL_COMPLETED, tool_name="search")
-        )
-        == 2
+    search = run_async(
+        store.list_events(event_type=EventType.TOOL_COMPLETED, tool_name="search")
     )
+    assert len(search) == 2
     # Limit + newest_first bound and order by the insertion-order seq column.
     one = run_async(
         store.list_events(
@@ -153,4 +147,3 @@ def test_sqlite_tool_name_filter_with_encryption(tmp_path: Path) -> None:
     assert len(wire) == 2
     # The decrypted payload still round-trips (the filter rode the plaintext column).
     assert all(e.payload["tool_name"] == "wire_money" for e in wire)
-    assert run_async(store.count_events(tool_name="wire_money")) == 2

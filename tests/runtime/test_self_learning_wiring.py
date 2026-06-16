@@ -8,12 +8,14 @@ reputation provider into the ToolService so ``bound_tools`` reordering is active
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from himmy.config.agent_spec import AgentSpec
 from himmy.runtime.from_spec import build_runtime_for_spec
+from himmy.services.tools.registry import register_local_tool
 
 _TOOLS_MODULE = "tests.application._per_run_tools"
 
@@ -95,3 +97,35 @@ def test_self_learning_on_no_tools_still_wires_adapter() -> None:
     spec = AgentSpec(name="t", self_learning=True)
     runtime, _registry = build_runtime_for_spec(spec)
     assert "learned_hints" in _adapter_names(runtime)
+
+
+def test_reprime_picks_up_late_registered_mcp_tools() -> None:
+    """The re-prime hook re-reads the registry so MCP tools (registered AFTER build) are
+    covered by BOTH halves of the loop — the reputation snapshot and the hint candidates.
+    """
+    spec = AgentSpec(name="t", self_learning=True, tools_module=_TOOLS_MODULE)
+    runtime, registry = build_runtime_for_spec(spec)
+
+    # Build-time priming only saw the tools_module tools, never the (async, late) MCP ones.
+    provider = runtime.tool_service._reputation_provider  # type: ignore[union-attr]
+    adapter = _learned_hints_adapter(runtime)
+    assert "mcp_remote" not in provider._snapshot  # type: ignore[attr-defined]
+    assert "mcp_remote" not in (adapter._tool_names or [])  # type: ignore[attr-defined]
+
+    # Simulate attach_mcp_servers registering a tool, then driving the re-prime hook.
+    async def _mcp_remote(args: dict[str, object]) -> dict[str, object]:
+        return {"ok": True}
+
+    register_local_tool(
+        registry,
+        name="mcp_remote",
+        handler=_mcp_remote,
+        description="A late-registered (MCP-like) tool.",
+        args_json_schema={"type": "object", "properties": {}},
+    )
+    assert runtime.reprime_self_learning is not None  # type: ignore[attr-defined]
+    asyncio.run(runtime.reprime_self_learning())  # type: ignore[attr-defined]
+
+    # After the re-prime both halves now include the MCP tool (snapshot + hint candidates).
+    assert "mcp_remote" in provider._snapshot  # type: ignore[attr-defined]
+    assert "mcp_remote" in (adapter._tool_names or [])  # type: ignore[attr-defined]

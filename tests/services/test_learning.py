@@ -84,9 +84,6 @@ def test_best_effort_swallow_on_broken_store() -> None:
         async def list_events(self, *a: Any, **k: Any) -> list[RunEvent]:
             raise RuntimeError("store down")
 
-        async def count_events(self, *a: Any, **k: Any) -> int:
-            raise RuntimeError("store down")
-
         async def append_event(self, event: RunEvent) -> None:  # pragma: no cover
             raise RuntimeError("store down")
 
@@ -180,6 +177,17 @@ def test_reputation_provider_emits_learning_applied_on_reorder() -> None:
     assert len(applied) == 1
     assert applied[0].payload["tools_reordered"] == 1
     assert applied[0].payload["deprioritised_tools"] == ["wire"]
+
+
+def test_reputation_provider_no_emit_when_flaky_already_last() -> None:
+    """No reorder (the sub-1.0 tool is already last) → no LEARNING_APPLIED event fires."""
+    events = [(EventType.TOOL_FAILED, "wire")] * 9 + [(EventType.TOOL_COMPLETED, "wire")]
+    store = _store_with(events)
+    provider = ToolReputationProvider(LearningService(store), event_sink=store)
+    # search (neutral 1.0) is already before wire (0.1) → the stable sort is a no-op.
+    run_async(provider.refresh(["search", "wire"]))
+    applied = run_async(store.list_events(event_type=EventType.LEARNING_APPLIED))
+    assert applied == []
 
 
 # ----------------------------------------------------------------- learned-hints adapter
