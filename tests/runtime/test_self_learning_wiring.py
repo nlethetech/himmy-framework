@@ -92,6 +92,29 @@ def test_self_learning_on_wires_adapter_and_provider() -> None:
     assert set(adapter._tool_names or []) == {"ping", "wire_money"}  # type: ignore[attr-defined]
 
 
+def test_hint_adapter_pinned_to_bound_subset_not_full_registry() -> None:
+    """When the spec pins a tool subset, the hint adapter assesses ONLY that subset.
+
+    The registry holds every registered tool (``ping`` AND ``wire_money``) regardless of
+    ``spec.tools``, but the model is only advertised the bound subset — so the hint adapter
+    must not reference a tool outside it. The reputation snapshot (for the ``bound_tools``
+    reorder) still covers the full registry, since the runtime keys it by the tools it
+    actually advertises and an unseen tool reads as neutral.
+    """
+    spec = AgentSpec(
+        name="t",
+        self_learning=True,
+        tools_module=_TOOLS_MODULE,
+        tools=["ping"],
+    )
+    runtime, _registry = build_runtime_for_spec(spec)
+    adapter = _learned_hints_adapter(runtime)
+    assert set(adapter._tool_names or []) == {"ping"}  # type: ignore[attr-defined]
+    # The reputation snapshot is unaffected — it still covers the full registry.
+    provider = runtime.tool_service._reputation_provider  # type: ignore[union-attr]
+    assert set(provider._snapshot) == {"ping", "wire_money"}  # type: ignore[attr-defined]
+
+
 def test_self_learning_on_no_tools_still_wires_adapter() -> None:
     """On with no tool registry → the adapter is still wired (hints from scope tools)."""
     spec = AgentSpec(name="t", self_learning=True)

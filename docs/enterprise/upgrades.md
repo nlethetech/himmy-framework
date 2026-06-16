@@ -111,6 +111,29 @@ There is **no schema rollback**. To revert to a prior version:
   On a large, long-lived `run_events` audit stream, run this upgrade in a **maintenance
   window** (the rewrite is proportional to row count). Fresh installs are unaffected.
 
+## Self-learning is a cross-tenant aggregate signal (multi-tenant deployments)
+
+The opt-in **self-learning** feature (`self_learning: true` on an agent) mines the
+`TOOL_FAILED` / `TOOL_COMPLETED` audit stream into a per-tool reliability score that
+reorders the bound toolset and injects a short reliability hint into the prompt.
+
+On a shared server store — which is what `StoreFactory.for_context(server=True)` returns:
+**one** SQLite file or **one** Postgres pool for every workspace — the `run_events` audit
+stream is process-wide, and the reputation read is scoped only by tool name (the
+`run_events` table has no workspace/subject column, only `thread_id` / `trace_id`). So a
+tool's reputation is an **aggregate across all tenants** that used a same-named tool: a
+built-in pack tool (`kb_search`, `web_fetch`, …) collides by name across workspaces, so
+one workspace's flaky usage can nudge another workspace's tool ordering and reliability
+hint.
+
+What does **not** cross the boundary: only tool names and integer counts are ever read or
+rendered — never prompts, tool arguments, error text, or PII. So this is an aggregate
+reliability *signal* shared across tenants, not a content leak.
+
+If your deployment requires strict per-tenant isolation of this signal, **leave
+`self_learning` off** (it defaults off) until a tenant-scoped reputation read is available;
+turning it on is a deliberate decision to share that aggregate signal across workspaces.
+
 ## Related docs
 
 - [Deployment runbook](deployment.md) — the compose / Helm topologies these commands

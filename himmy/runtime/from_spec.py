@@ -426,17 +426,26 @@ def build_runtime_for_spec(
             # ready snapshot with no I/O. Best-effort: ``refresh`` swallows any error.
             tool_names = [d.name for d in registry.list()]
             asyncio.run(reputation_provider.refresh(tool_names))
-            # Pin the same bound tools onto the hint adapter — the snapshot scope never
-            # carries the run's tool list, so without this the learned-hints block can
-            # never resolve and the prompt-hint half of the loop is dead.
+            # Pin the hint adapter to the run's BOUND subset (``spec.tools``) when one is
+            # declared, not the full registry — the registry holds every registered pack/
+            # module/http tool regardless of ``spec.tools``, but the model is only advertised
+            # the bound subset, so hinting about a tool outside it just confuses the model
+            # about something it can't call. ``spec.tools or tool_names`` keeps the full set
+            # when no subset is pinned (the snapshot scope never carries the run's tool list,
+            # so without this the learned-hints block can never resolve).
+            hint_tool_names = list(spec.tools) or tool_names
             if learned_hints_adapter is not None:
-                learned_hints_adapter.bind_tools(tool_names)
+                learned_hints_adapter.bind_tools(hint_tool_names)
             # MCP tools are registered into ``registry`` LATER (async, after this returns —
             # see the docstring), so the priming above misses them. Hand the attach path an
             # async re-prime it runs once the MCP tools exist, so self-learning covers the
             # remote/network tools most likely to be flaky instead of degrading to neutral.
+            # The hint adapter only re-binds when no explicit subset pins it (else the late
+            # MCP tools would widen the hint scope past the declared ``spec.tools``).
             _reprime = _make_reprime(
-                registry, reputation_provider, learned_hints_adapter
+                registry,
+                reputation_provider,
+                learned_hints_adapter if not spec.tools else None,
             )
 
         if pipeline is not None:

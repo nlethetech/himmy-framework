@@ -77,6 +77,58 @@ def test_all_success_tool_scores_high() -> None:
     assert rep["search"].has_min_samples is True
 
 
+def _store_with_timestamps(
+    events: list[tuple[EventType, str, str]],
+) -> StorageService:
+    """Seed a store with explicit ``(event_type, tool_name, timestamp)`` events.
+
+    Pinning the timestamp makes the recency-window merge/cut in ``_recent_counts``
+    deterministic regardless of clock resolution: the merge orders by the recorded
+    timestamp, so the test controls exactly which events fall inside the window.
+    """
+    store = StorageService()
+    for event_type, tool_name, timestamp in events:
+        run_async(
+            store.append_event(
+                RunEvent(
+                    event_type=event_type,
+                    payload={"tool_name": tool_name},
+                    timestamp=timestamp,
+                )
+            )
+        )
+    return store
+
+
+def test_recency_window_recent_failures_not_diluted_by_old_completions() -> None:
+    """The combined most-recent-``window`` cut means a long completion history can't bury
+    a recent burst of failures — the core value of the recency window (round-2 fix).
+
+    Seed >``window`` OLD completions then a small burst of NEWER failures and assert the
+    score reflects only the recent window (here all-failures), exercising the merge-and-cut
+    slice ``[: window]`` that the <=10-event reputation tests never reach.
+    """
+    window = 10
+    old_completions = [
+        (EventType.TOOL_COMPLETED, "wire", f"2026-06-15T00:00:{i:02d}.000000+00:00")
+        for i in range(20)  # 20 old completions, well past the window
+    ]
+    recent_failures = [
+        (EventType.TOOL_FAILED, "wire", f"2026-06-15T01:00:{i:02d}.000000+00:00")
+        for i in range(window)  # window newer failures, all inside the cut
+    ]
+    svc = LearningService(
+        _store_with_timestamps(old_completions + recent_failures), window=window
+    )
+    rep = run_async(svc.get_tool_reputation(["wire"]))
+    # Only the most-recent ``window`` events survive the cut — all failures — so the old
+    # completions are fully cut out and the score collapses to 0.0 (not diluted to ~0.67).
+    assert rep["wire"].has_min_samples is True
+    assert rep["wire"].failed == window
+    assert rep["wire"].completed == 0
+    assert rep["wire"].score == 0.0
+
+
 def test_best_effort_swallow_on_broken_store() -> None:
     """A store that raises on every read degrades to the neutral result, never raising."""
 

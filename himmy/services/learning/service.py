@@ -18,6 +18,16 @@ Two consumers sit on top of the service:
 Every public method is 100% best-effort: any exception (store unavailable, malformed
 rows) is swallowed and returns the neutral / empty result, logged at ``debug`` — learning
 must never break or noticeably slow a run.
+
+TENANCY: the reputation read is scoped ONLY by ``event_type`` / ``tool_name`` — there is
+no workspace/subject predicate, because ``run_events`` carries no tenant column (only
+``thread_id`` / ``trace_id``). On a shared server store (``StoreFactory.for_context``
+returns ONE backend for every tenant) a tool's reputation is therefore an aggregate
+across all tenants that used a same-named tool. Only tool names + integer counts ever
+cross that boundary (never prompts/args/PII — see the adapter's PRIVACY note), so this is
+an aggregate-signal property, not a content leak. It is opt-in (``self_learning`` defaults
+False) and documented for multi-tenant operators in ``docs/enterprise/upgrades.md``; a
+per-tenant variant would need a tenant predicate threaded into ``list_events``.
 """
 
 from __future__ import annotations
@@ -158,6 +168,16 @@ class LearningService:
         # Merge both newest-first reads and keep only the most-recent ``window`` events
         # across the two types (ordered by recorded timestamp, which is monotonic with
         # insertion order). Counting within that combined slice is the recency cut.
+        #
+        # NOTE: we merge on ``timestamp`` (a microsecond ISO string), not the storage
+        # layer's ``seq``. The Postgres backend deliberately orders its OWN read by ``seq``
+        # because timestamps can tie for sub-ms tool events on one run; ``list_events`` does
+        # not surface ``seq`` on ``RunEvent``, so the cross-type merge here falls back to
+        # timestamp. At an exact-microsecond tie straddling the ``window`` boundary the
+        # stable sort keeps concatenation order (completed before failed), so the count can
+        # be off by at most ±1 event. That residual boundary ambiguity is accepted: the
+        # window is large (200 by default), microsecond collisions across the two reads are
+        # rare, and a one-event skew cannot move a score across the min-sample / floor gates.
         merged = sorted(
             [(e.timestamp, EventType.TOOL_COMPLETED) for e in completed]
             + [(e.timestamp, EventType.TOOL_FAILED) for e in failed],
