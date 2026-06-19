@@ -64,3 +64,8 @@ deploy/compose/secrets/*
 !deploy/compose/secrets/.gitkeep
 deploy/compose/.env
 benchmarks/results/*.log
+
+# Reconciliation reports (ephemeral working output; findings persist in
+# docs/services/*.md + agent guidance, not in the report files).
+docs/inference-reconciliation-reports/
+docs/tools-reconciliation-reports/

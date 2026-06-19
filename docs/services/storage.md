@@ -173,6 +173,12 @@ no key is configured and storage stays plaintext (unchanged). Requires the
 - `workspace_id` is a first-class column on `runs`/`recommendations` (multi-tenant
   scoping flows through the records).
 
+## Recently added (modules post-dating this doc — 2026-06-08)
+
+- **Leased run work-queue (Q2)** — `run_lane.py`: provider-lane keying for the durable run queue (enqueue → claim → lease/recover → retry). The Postgres claim is an atomic `SELECT … FOR UPDATE SKIP LOCKED` + guarded status update, with a reaper requeuing expired leases — multi-worker-safe, crash-recoverable.
+- **Durable inbound dedup (Q4)** — `trigger_dedup.py`: a `trigger_dedup` table (TTL-CAS, mark-after-success) so a redelivered webhook/trigger fires the agent **at-most-once**.
+- **Field encryption at rest (WS4.4)** — `at_rest.py`: wires per-field encryption into the SQLite/Postgres durable stores (the durable side of the governance sidecar-encryption work).
+
 ## Related docs
 
 - [Observability](observability.md) — `RunEvent`/`EventType`/`EventSink`; `StorageService` *is* an `EventSink`.

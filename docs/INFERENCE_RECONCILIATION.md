@@ -6,13 +6,15 @@ This document is the canonical reference. The runnable workflow is at `.agents/s
 
 > **Why himmy fans out wider than a typical pydantic-ai app.** himmy does **not** route everything through pydantic-ai. It ships **direct** provider managers — `AnthropicClientManager` talks to the `anthropic` SDK's Messages API; `OpenAIClientManager` talks to the `openai` SDK's `chat.completions`; `PydanticAIClientManager` is only the *optional* path. It also serves open-weight routes via **OpenRouter** and self-hosted models via **Ollama** / Claude CLI / HimalayaGPT (`local.py`). Each of those is an independently-evolving surface. So reconciliation surveys **five external sources**, and — crucially — tracks the **SDK** surface (`anthropic`, `openai`), not only the HTTP API docs, because the direct managers bind to the SDK.
 
-## Paper trail (differs from a memory-backed repo)
+## Paper trail
 
-himmy has no per-source memory store, so the **reports are the durable paper trail** — they are **checked in** under `docs/inference-reconciliation-reports/` (not gitignored). Each run also applies:
+Reports are **ephemeral** — `docs/inference-reconciliation-reports/` is **gitignored**; a report is the working output of one run, not a committed artifact. himmy has no per-source memory store, so the **persistent** artifacts of each run are:
 
 1. Targeted updates to `docs/services/inference.md` when a finding shifts a documented behavior (e.g. the dedicated managers / prompt-cache mechanics the doc currently lags).
 2. Updates to the repo's agent guidance (`CLAUDE.md` / `AGENTS.md`) when a finding changes an architectural assumption (e.g. a cache-minimum bump, an SDK breaking change).
 3. The triaged P0/P1/P2 actions, which become issues the team actions over time.
+
+Apply the report's "Notes for the docs" section to (1)/(2) before the report is discarded — that is where the durable signal lives, not in the gitignored report.
 
 ## Why this exists
 
@@ -128,7 +130,7 @@ For ADOPT / EXPOSE / ALIGN, assign a priority:
 
 ## Output: the report
 
-A single markdown file at `docs/inference-reconciliation-reports/YYYY-MM-DD.md` (**checked in** — it is himmy's paper trail):
+A single markdown file at `docs/inference-reconciliation-reports/YYYY-MM-DD.md` (**gitignored — ephemeral working output**; persist findings via the "Notes for the docs" section below):
 
 ```markdown
 # Inference Reconciliation — YYYY-MM-DD
@@ -175,8 +177,12 @@ A tools report flagging drift on either is a signal to run an inference reconcil
 
 ## Sources surveyed (canonical URLs)
 
-- pydantic-ai — https://ai.pydantic.dev/
-- OpenAI — https://platform.openai.com/docs/ + the `openai` Python SDK
+*Host note (2026-06-19): several doc sites moved — follow the 301s and prefer the new hosts.*
+
+- pydantic-ai — **https://pydantic.dev/docs/ai/** (301 from `ai.pydantic.dev`)
+- OpenAI — **https://developers.openai.com/api/docs/** (301 from `platform.openai.com/docs/`) + the `openai` Python SDK
 - Anthropic — https://platform.claude.com/docs/en/ + the `anthropic` Python SDK
-- OpenRouter — https://openrouter.ai/docs
+- OpenRouter — https://openrouter.ai/docs (tree restructured to `/docs/api/reference/*` + `/docs/guides/*`)
 - Ollama — https://github.com/ollama/ollama/blob/main/docs/api.md
+
+**WebFetch permission (operational):** WebFetch is gated **per domain**, and background survey subagents **cannot answer an interactive permission prompt** — so any host not already allow-listed hard-denies. Pre-allow the survey hosts before a run: add `WebFetch(domain:platform.openai.com)`, `WebFetch(domain:openrouter.ai)`, `WebFetch(domain:developers.openai.com)` (and `raw.githubusercontent.com` for SDK source) to your Claude Code permissions.

@@ -138,6 +138,14 @@ wired by a deployment:
   not survive a process restart unless a persistent backend is wired.
 - `expired` is a selector only — it does not delete anything.
 
+## Recently added (modules post-dating this doc — 2026-06-08)
+
+Governance grew from retention/erasure (WS4.2) into a full **consent + at-rest** stack:
+
+- **Consent (WS4.6)** — `consent.py` (the purpose-limitation policy-decision point), `consent_ledger.py` (consent recorded as immutable `EntityRecord`s), `consent_registry.py` (`ConsentAwareRegistry` — the gate on the audit spine), `consent_resolver.py` (resolve the data subject + its encryptable fields), `consent_storage.py` (`ConsentGatedStorage` — enforces `purpose=RETAIN` at the persistence boundary), `training_export.py` (`ConsentFilteredExporter` — the single `TRAIN`-purpose export funnel).
+- **Sidecar encryption (S3)** — `sidecar_storage.py`: per-subject envelope-encryption of the content-bearing *sidecar* stores on an ALLOW consent decision.
+- `retention.py` (WS4.2 retention + right-to-erasure on the append-only spine) remains the base layer.
+
 ## Related docs
 
 - [Audit](audit.md) — the append-only spine + signed bundles the tombstones reconcile with.

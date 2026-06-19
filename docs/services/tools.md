@@ -248,6 +248,18 @@ Base URL comes from `base_url_env_var` (preferred) else the literal `base_url`.
   `PROVIDER_UNAVAILABLE`); everything else fails on the first attempt.
 - **A broken `event_sink` never fails a tool call** (`_emit` swallows sink errors).
 
+## Recently added (modules post-dating this doc — 2026-06-08)
+
+- **MCP is its own service** — `himmy/services/mcp/` (see [`mcp.md`](./mcp.md)); MCP tools register as LOCAL `ToolDefinition`s through this service.
+- **`repair.py`** — small-model tool-call recovery: `resolve_tool_name` fuzzy-matches a near-miss (≥0.82 auto-correct, ≤3 suggestions); only remaps the name, never invents args.
+- **`access.py`** — read-vs-change intent (`classify_read_only` verb heuristic; `describe_for_model` tags the description) to steer small models away from wrong-tool selection.
+- **`security.py`** — HTTP-connector guards: path-encoding + base-host re-pinning (SSRF / path-traversal), cross-host pagination-`Link` rejection, recursive secret redaction.
+- **`validation.py`** — input **and** output JSON-Schema validation (`jsonschema` when present, offline subset otherwise); output validated *after* the post-hook.
+
+These small-model surfaces feed the [learning service](./learning.md) (tool reputation from `TOOL_*` events).
+
+> Open P0 (latest tools-reconciliation report): MCP tool-input-schema normalization is absent — `services/mcp/` passes `inputSchema` as-is; provider rejections (Gemini inline-vs-Kimi-`$defs`, null-unions, strict keyword strip) need a per-target normalizer.
+
 ## Related docs
 
 - [mcp](./mcp.md) — MCP servers as a tool source.
