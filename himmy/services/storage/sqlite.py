@@ -479,6 +479,28 @@ class SqliteStorageService:
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
 
+    # ----------------------------------------------------------- knowledge / sqlite
+    def knowledge_backend(self, *, enable_lexical: bool = True) -> Any:
+        """Return a durable SQLite knowledge backend sharing THIS service's database.
+
+        The offline twin of
+        :meth:`himmy.services.storage.postgres.PostgresStorageService.knowledge_backend`:
+        wire it into a ``KnowledgeBase`` via
+        ``KnowledgeBase(..., backend=storage.knowledge_backend())`` to persist the
+        embeddings + chunks + embedder fingerprint to disk, so an app restart LOADS the
+        index instead of re-embedding the corpus. The knowledge tables coexist with the
+        storage tables in the same ``.db`` file (the backend reuses this connection + write
+        lock, so the two surfaces serialize their writes together). Import is lazy so this
+        module stays import-safe without the knowledge package.
+        """
+        from himmy.services.knowledge.sqlite_backend import SqliteKnowledgeBackend
+
+        return SqliteKnowledgeBackend(
+            connection=self._conn,
+            lock=self._lock,
+            enable_lexical=enable_lexical,
+        )
+
     # ------------------------------------------------------------- sync primitives
     def _rollback_quietly(self) -> None:
         """Roll back the shared connection, swallowing rollback-time errors.

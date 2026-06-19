@@ -289,8 +289,12 @@ class KnowledgeBase:
         (the reused document for unchanged inputs).
         """
         kb = await self._resolve_kb_record(kb_id)
-        # Existing-content lookups for dedup (in-memory path only; a backend manages
-        # its own upsert in persist_documents).
+        # Existing-content lookups for dedup. In-memory: walk the kb's document dicts.
+        # Backend: a backend MAY expose `list_document_identities` (the SQLite disk
+        # backend does) so a re-ingest of an unchanged corpus — e.g. the same files on
+        # the next app launch — skips re-embedding and loads from disk instead. A
+        # backend without the hook (e.g. pgvector) reports no identities and keeps its
+        # own replace-by-source upsert in persist_documents (prior behaviour unchanged).
         existing = (
             list(self._documents.get(kb_id, {}).values())
             if self._backend is None
@@ -302,6 +306,7 @@ class KnowledgeBase:
         by_source: dict[str, KnowledgeDocument] = {
             d.source_uri: d for d in existing if d.source_uri is not None
         }
+        backend_identities = await self._backend_document_identities(kb_id)
 
         skipped: list[str] = []
         replaced_ids: list[str] = []
@@ -322,6 +327,16 @@ class KnowledgeBase:
                 # Unchanged content — reuse the stored document, skip re-embedding.
                 slots[idx] = reuse
                 continue
+            if identity in backend_identities:
+                # Unchanged content already persisted by a disk-backed backend — load
+                # the existing document (skip re-embedding) and reuse it for this slot.
+                reuse = await self._backend_get_document(kb_id, source_uri, content_hash)
+                if reuse is not None:
+                    slots[idx] = reuse
+                    by_identity[identity] = reuse
+                    if source_uri is not None:
+                        by_source[source_uri] = reuse
+                    continue
 
             # Treat whitespace-only content (incl. from a file the DocumentInput
             # validator can't see into) as empty: skip rather than persist a no-op.
@@ -814,6 +829,37 @@ class KnowledgeBase:
                 raise HimmyError(f"KnowledgeBase {kb_id!r} not found.")
             return kb
         return self._require_kb(kb_id)
+
+    async def _backend_document_identities(
+        self, kb_id: str
+    ) -> set[tuple[str | None, str]]:
+        """Persisted ``(source_uri, content_hash)`` identities a backend already holds.
+
+        Empty unless the backend opts in by exposing ``list_document_identities`` (the
+        SQLite disk backend does; pgvector does not). When present, these identities let
+        ``ingest_documents`` skip re-embedding inputs whose content is unchanged from a
+        prior run — the load-from-disk path that makes an app restart cheap. A backend
+        without the hook returns an empty set, preserving its always-persist behaviour.
+        """
+        if self._backend is None:
+            return set()
+        lister = getattr(self._backend, "list_document_identities", None)
+        if lister is None:
+            return set()
+        identities = await lister(kb_id)
+        return {(src, chash) for (src, chash) in identities}
+
+    async def _backend_get_document(
+        self, kb_id: str, source_uri: str | None, content_hash: str
+    ) -> KnowledgeDocument | None:
+        """Re-hydrate a persisted document by identity from a disk-backed backend."""
+        if self._backend is None:
+            return None
+        getter = getattr(self._backend, "get_document", None)
+        if getter is None:
+            return None
+        doc: KnowledgeDocument | None = await getter(kb_id, source_uri, content_hash)
+        return doc
 
     async def _authorize_kb(
         self,

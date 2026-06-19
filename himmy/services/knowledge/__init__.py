@@ -69,6 +69,7 @@ from himmy.services.knowledge.service import (
     KnowledgeBaseAdapter,
     build_kb_context_field,
 )
+from himmy.services.knowledge.sqlite_backend import SqliteKnowledgeBackend
 from himmy.services.knowledge.tools import (
     KB_SEARCH_ARGS_SCHEMA,
     register_kb_search_tool,
@@ -98,6 +99,8 @@ __all__ = [
     "CsvReader",
     "ExcelReader",
     "DocumentReaderFactory",
+    # durable disk-backed backend (stdlib sqlite3 — desktop/offline persistence)
+    "SqliteKnowledgeBackend",
     # pgvector backend (requires [postgres,knowledge] + a live DB)
     "PgVectorKnowledgeBackend",
     "KnowledgeBackendProtocol",
