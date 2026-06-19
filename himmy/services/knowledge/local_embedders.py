@@ -27,6 +27,7 @@ All embedders satisfy :class:`~himmy.services.knowledge.embedder.EmbedderProtoco
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 from collections.abc import Awaitable, Callable
@@ -100,7 +101,15 @@ class OllamaEmbedder:
 
 
 class FastEmbedEmbedder:
-    """Embed text with a local ONNX model via ``fastembed`` (the [embeddings] extra)."""
+    """Embed text with a local ONNX model via ``fastembed`` (the [embeddings] extra).
+
+    Both the one-time model load and every inference call are CPU-bound ONNX work.
+    fastembed/onnxruntime release the GIL while running inference (and during the
+    native model load), so running them in a worker thread via ``asyncio.to_thread``
+    genuinely frees the caller's event loop — a host async server (FastAPI/uvicorn)
+    that builds a KnowledgeBase from inside its running loop stays responsive instead
+    of freezing for the duration of the build. This mirrors :class:`FastEmbedReranker`.
+    """
 
     supports_images: bool = False
 
@@ -113,7 +122,12 @@ class FastEmbedEmbedder:
         self._impl: Any = None
 
     def _model_impl(self) -> Any:
-        """Lazily construct the fastembed model, raising a clear error if absent."""
+        """Lazily construct the fastembed model, raising a clear error if absent.
+
+        The native ``TextEmbedding`` constructor downloads (first time) and
+        initialises an ONNX session — heavy, GIL-releasing work — so callers run
+        this inside ``asyncio.to_thread`` to avoid blocking the event loop.
+        """
         if self._impl is None:
             try:
                 from fastembed import TextEmbedding  # type: ignore
@@ -126,14 +140,25 @@ class FastEmbedEmbedder:
         return self._impl
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Embed documents (fastembed is sync; vectors are numpy arrays)."""
-        impl = self._model_impl()
-        return [list(map(float, vec)) for vec in impl.embed(texts)]
+        """Embed documents (fastembed is sync; vectors are numpy arrays).
+
+        Model load + inference are GIL-releasing ONNX work, run off the event loop.
+        """
+
+        def _embed() -> list[list[float]]:
+            impl = self._model_impl()
+            return [list(map(float, vec)) for vec in impl.embed(texts)]
+
+        return await asyncio.to_thread(_embed)
 
     async def embed_query(self, text: str) -> list[float]:
-        """Embed a single query string."""
-        impl = self._model_impl()
-        return [float(x) for x in next(iter(impl.query_embed([text])))]
+        """Embed a single query string (off the event loop; see :meth:`embed_documents`)."""
+
+        def _embed() -> list[float]:
+            impl = self._model_impl()
+            return [float(x) for x in next(iter(impl.query_embed([text])))]
+
+        return await asyncio.to_thread(_embed)
 
 
 #: Default embedding dimension per backend (used when a dim is not configured).

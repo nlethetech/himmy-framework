@@ -87,10 +87,13 @@ class FastEmbedReranker:
         """Cross-encode ``(query, text)`` for each candidate and rank by score."""
         if not candidates:
             return []
-        impl = self._model_impl()
         texts = [text for (_, text) in candidates]
 
         def _score() -> list[float]:
+            # Load the cross-encoder (first use) AND score inside the worker thread:
+            # both the native model load and rerank() are GIL-releasing ONNX work, so
+            # keeping them off the event loop preserves host-loop responsiveness.
+            impl = self._model_impl()
             # fastembed's rerank() yields one score per document, in input order.
             return [float(s) for s in impl.rerank(query, texts)]
 
