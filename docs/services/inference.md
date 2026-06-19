@@ -275,6 +275,18 @@ miss. `PydanticAIClientManager._compute_cost` prefers an explicit
 - The stub's token counts are length-based estimates (~4 chars/token), not real
   tokenizer counts.
 
+## Recently added (modules post-dating this doc — 2026-06-08)
+
+The inference kernel grew modules this doc predates; authoritative inventory comes from a periodic pass via `docs/INFERENCE_RECONCILIATION.md`.
+
+- **Direct provider managers** — `anthropic_manager.py` (`AnthropicClientManager`, the `anthropic` SDK Messages API directly) + `openai_manager.py` (`OpenAIClientManager`, the `openai` SDK `chat.completions`) sit *alongside* `pydantic_ai_manager.py`. pydantic-ai is the optional path, not the only one.
+- **Local / self-hosted** — `local.py`: `OllamaClientManager`, `ClaudeCliClientManager`, `HimalayaGptClientManager`.
+- **Routing & multi-provider** — `routing.py` (`RoutingClientManager`, `DEFAULT_FAILOVER_CODES`, cost-ordered fallback, `fallback_chain` metadata) + `multi_provider.py` (per-`model_key` dispatch).
+- **Prompt caching** — `prompt_cache.py`: the universal prefix-cache contract — `CacheCapability` (`NONE`/`ANTHROPIC_EXPLICIT`/`OPENAI_AUTOMATIC`/`OPENROUTER_PASSTHROUGH`), `MIN_CACHEABLE_TOKENS`, `compute_cached_cost`. Distinct from `cache.py` (the tenant-scoped *response* cache).
+- **Pricing / replay / compare** — `pricing.py` (model→USD; LiteLLM + OpenRouter sources), `replay.py` (record/replay cassettes), `compare.py` (model catalog + side-by-side).
+
+> Known drift (latest inference-reconciliation report): add Anthropic 4.x rows to `MIN_CACHEABLE_TOKENS` (Haiku-4.5 / Opus-4.5/4.6 = 4096); pin the `pydantic-ai`/`openai`/`anthropic` floors; gate the Anthropic `thinking` payload by model family.
+
 ## Related docs
 
 - [Storage Service](storage.md) — where threads, runs, events, and recommendations persist.
