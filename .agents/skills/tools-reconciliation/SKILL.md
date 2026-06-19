@@ -19,7 +19,7 @@ Use this skill when the user asks to reconcile himmy's tool surface against its 
 
 2. **Snapshot BOTH `himmy/services/tools/` AND `himmy/services/mcp/`.** MCP is its own service in himmy (not a backend under tools) — a snapshot that misses `services/mcp/` misses the entire lifecycle/transport surface.
 
-3. **Reports are the paper trail — check them in.** himmy has no per-source memory store, so write the report to `docs/tools-reconciliation-reports/YYYY-MM-DD.md` and **commit it**. Other persistent artifacts: updates to `docs/services/tools.md`, `docs/services/mcp.md`, and agent guidance (`CLAUDE.md` / `AGENTS.md`).
+3. **Reports are ephemeral — do NOT commit them.** `docs/tools-reconciliation-reports/` is gitignored; the report is one run's working output. The persistent artifacts (no per-source memory store) are the "Notes for the docs" applied to `docs/services/tools.md`, `docs/services/mcp.md`, and agent guidance (`CLAUDE.md` / `AGENTS.md`). Apply those before discarding the report.
 
 4. **Fail loudly, don't silently substitute.** If a subagent reports `WebFetch` denied, surface it and ask for the permission once. Don't fall back to surveying from the orchestrator.
 
@@ -57,7 +57,7 @@ ADOPT / EXPOSE / NORMALIZE / ALIGN / IGNORE / DOC + P0/P1/P2. himmy P0 classes: 
 
 ## Output
 
-Write the report to `docs/tools-reconciliation-reports/YYYY-MM-DD.md` and **commit it**. Header MUST cite: pydantic-ai + `mcp` SDK pinned-vs-installed; MCP spec revision date; OpenAI/Anthropic fetch dates; himmy HEAD; implementation state; outstanding tools/mcp TODOs. Then findings summary, inference cross-references, surface-area tables, per-row findings, prioritized next-actions, and "Notes for the docs" (one-liners for `docs/services/tools.md`, `docs/services/mcp.md`, agent guidance).
+Write the report to `docs/tools-reconciliation-reports/YYYY-MM-DD.md` (**gitignored — do not commit**). Header MUST cite: pydantic-ai + `mcp` SDK pinned-vs-installed; MCP spec revision date; OpenAI/Anthropic fetch dates; himmy HEAD; implementation state; outstanding tools/mcp TODOs. Then findings summary, inference cross-references, surface-area tables, per-row findings, prioritized next-actions, and "Notes for the docs" (one-liners for `docs/services/tools.md`, `docs/services/mcp.md`, agent guidance).
 
 ## After writing the report
 
@@ -68,7 +68,8 @@ Write the report to `docs/tools-reconciliation-reports/YYYY-MM-DD.md` and **comm
 ## Common gotchas
 
 - **MCP is its own service** — snapshot `services/mcp/`, not just `services/tools/`.
-- **MCP spec is versioned** — `modelcontextprotocol.io/specification/` redirects to a dated revision; capture it; a new revision since last report is itself a finding.
+- **MCP spec is versioned** — `modelcontextprotocol.io/specification/` redirects to a dated revision (**current: `2025-11-25`**); capture it; a new revision since last report is itself a finding.
+- **WebFetch is per-domain + background subagents can't be prompted** — a denied host hard-fails (`WEBFETCH_DENIED`); pre-allow the hosts before the run: `WebFetch(domain:platform.openai.com)`, `WebFetch(domain:developers.openai.com)`, `WebFetch(domain:modelcontextprotocol.io)`. Surface a denial and re-fire after the grant — don't survey from memory. (`pydantic.dev`, `platform.claude.com`, `github.com` were already allowed in the 2026-06-19 run.)
 - **Transport name drift** — "HTTP+SSE" → "Streamable HTTP"; reconcile which pydantic-ai supports vs what himmy mounts.
 - **Small-model surfaces are himmy-owned for a reason** — `repair.py`/`access.py` exist because local models misfire; only ADOPT-away when upstream genuinely subsumes them, else IGNORE with a documented rationale.
 - **Overlap with inference** — cross-reference, don't re-survey, `tool_choice` + structured-output wire format. If no recent inference report exists, flag (DOC) that inference reconciliation should run first.

@@ -15,7 +15,7 @@ Use this skill when the user asks to reconcile himmy's inference kernel against 
 
 1. **Run five subagents — one per external source.** Non-negotiable. The orchestrator (you) does **not** survey the docs directly; you spawn one subagent each for **pydantic-ai**, **OpenAI (API + `openai` SDK)**, **Anthropic (API + `anthropic` SDK)**, **OpenRouter**, and **Ollama**, fired in the **same tool-use block** so they run concurrently. The orchestrator owns Phase 1 (Snapshot via `Explore`), Phase 3 (Diff synthesis), and Phase 4 (Triage). *(himmy talks to the OpenAI/Anthropic SDKs directly, so those surveys cover the SDK surface, not just the HTTP API.)*
 
-2. **Reports are the paper trail — check them in.** himmy has no per-source memory store, so unlike a memory-backed repo the report is **not** ephemeral: write it to `docs/inference-reconciliation-reports/YYYY-MM-DD.md` and commit it. The other persistent artifacts are updates to `docs/services/inference.md` and the repo's agent guidance (`CLAUDE.md` / `AGENTS.md`).
+2. **Reports are ephemeral — do NOT commit them.** `docs/inference-reconciliation-reports/` is gitignored; the report is one run's working output. The persistent artifacts (himmy has no per-source memory store) are the "Notes for the docs" applied to `docs/services/inference.md` + agent guidance (`CLAUDE.md` / `AGENTS.md`). Apply those before discarding the report.
 
 3. **Fail loudly, don't silently substitute.** If a subagent reports `WebFetch` permission denied, surface it and ask the user to grant the permission once. Do not fall back to surveying from the orchestrator — that defeats the fan-out and produces thinner inventories.
 
@@ -58,7 +58,7 @@ Classify each row — ADOPT / EXPOSE / NORMALIZE / ALIGN / IGNORE / DOC — and 
 
 ## Output
 
-Write the report to `docs/inference-reconciliation-reports/YYYY-MM-DD.md` and **commit it**. Header MUST cite: pydantic-ai / `openai` / `anthropic` pinned-vs-installed versions, OpenAI/Anthropic/OpenRouter/Ollama doc fetch dates, himmy HEAD, and outstanding inference TODOs.
+Write the report to `docs/inference-reconciliation-reports/YYYY-MM-DD.md` (**gitignored — do not commit**). Header MUST cite: pydantic-ai / `openai` / `anthropic` pinned-vs-installed versions, OpenAI/Anthropic/OpenRouter/Ollama doc fetch dates, himmy HEAD, and outstanding inference TODOs.
 
 Then: findings summary, the 15 surface-area tables, per-row findings table, prioritized next-actions, and a "Notes for the docs" section (one-line updates for `docs/services/inference.md` + agent guidance).
 
@@ -73,5 +73,6 @@ Then: findings summary, the 15 surface-area tables, per-row findings table, prio
 - **Five sources, not three** — a pydantic-ai-centric reconciliation misses himmy's direct SDK managers, OpenRouter, and Ollama. All five run.
 - **SDK ≠ API** — survey the `openai` / `anthropic` **Python SDK** surface (the managers bind it), not just the HTTP API docs.
 - **OpenRouter cache telemetry is unreliable** — free/some routes report constant `cached_tokens`; never read it as real provider cache accounting.
-- **Anthropic doc host** — migrated `docs.anthropic.com` → `platform.claude.com`; follow redirects.
+- **WebFetch is per-domain + background subagents can't be prompted** — a denied host hard-fails (returns `WEBFETCH_DENIED`) because background surveys can't answer an interactive permission prompt. **Pre-allow the hosts before the run**: `WebFetch(domain:platform.openai.com)`, `WebFetch(domain:developers.openai.com)`, `WebFetch(domain:openrouter.ai)`, `WebFetch(domain:raw.githubusercontent.com)`. If a survey returns `WEBFETCH_DENIED`, surface it and re-fire after the grant — don't substitute from memory.
+- **Doc-host migrations** — `ai.pydantic.dev` → `pydantic.dev/docs/ai/`; `platform.openai.com/docs` → `developers.openai.com/api/docs`; `docs.anthropic.com` → `platform.claude.com`; OpenRouter tree restructured to `/docs/api/reference/*` + `/docs/guides/*`. Follow redirects.
 - **Version drift** — installed `pydantic-ai`/`openai`/`anthropic` older than the lockfile pin is a P0 NORMALIZE finding; surface first.

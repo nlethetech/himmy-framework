@@ -6,13 +6,15 @@ This document is the canonical reference. The runnable workflow is at `.agents/s
 
 > **himmy specifics to keep in view.** (1) **MCP is its own service** (`himmy/services/mcp/`, e.g. `connector.py` + `config/mcp_spec.py` + `api/routers/studio_mcp.py`), not a backend under `tools/` — the snapshot covers both. (2) himmy carries tool surfaces a cloud-only harness doesn't, because **Nepal teams run small local models** (Ollama / Claude CLI / HimalayaGPT): `repair.py` (recover a small model's near-miss tool call), `access.py` (read-vs-change intent to catch wrong-tool selection), `security.py` (SSRF / path-traversal / secret redaction on the HTTP connector), `validation.py` (input **and** output schema validation). These get their own diff rows and their own "is there an upstream equivalent?" question.
 
-## Paper trail (differs from a memory-backed repo)
+## Paper trail
 
-himmy has no per-source memory store, so the **reports are the durable paper trail** — **checked in** under `docs/tools-reconciliation-reports/` (not gitignored). Each run also applies:
+Reports are **ephemeral** — `docs/tools-reconciliation-reports/` is **gitignored**; a report is one run's working output, not a committed artifact. himmy has no per-source memory store, so the **persistent** artifacts of each run are:
 
 1. Targeted updates to `docs/services/tools.md` and `docs/services/mcp.md` when a finding shifts documented behavior.
 2. Updates to agent guidance (`CLAUDE.md` / `AGENTS.md`) when a finding changes an architectural assumption (e.g. a provider rejecting a previously-accepted JSON Schema shape, or pydantic-ai shipping a lifecycle hook we should adopt and delete our copy of).
 3. The triaged P0/P1/P2 actions, which become issues the team actions over time.
+
+Apply the report's "Notes for the docs" to (1)/(2) before discarding the report — the durable signal lives there, not in the gitignored file.
 
 ## Why this is separate from inference reconciliation
 
@@ -109,7 +111,7 @@ Buckets: ADOPT / EXPOSE / NORMALIZE / ALIGN / IGNORE / DOC. Priority P0/P1/P2 fo
 
 ## Output: the report
 
-`docs/tools-reconciliation-reports/YYYY-MM-DD.md` (**checked in**). Header MUST cite: pydantic-ai + `mcp` SDK pinned-vs-installed; MCP spec revision date; OpenAI/Anthropic doc fetch dates; himmy HEAD; implementation state; outstanding tools/mcp TODOs. Then: findings summary, cross-references to the latest inference report, the surface-area tables, per-row findings table, prioritized next-actions, and "Notes for the docs" (one-liners for `docs/services/tools.md`, `docs/services/mcp.md`, agent guidance).
+`docs/tools-reconciliation-reports/YYYY-MM-DD.md` (**gitignored — ephemeral**; persist findings via "Notes for the docs"). Header MUST cite: pydantic-ai + `mcp` SDK pinned-vs-installed; MCP spec revision date; OpenAI/Anthropic doc fetch dates; himmy HEAD; implementation state; outstanding tools/mcp TODOs. Then: findings summary, cross-references to the latest inference report, the surface-area tables, per-row findings table, prioritized next-actions, and "Notes for the docs" (one-liners for `docs/services/tools.md`, `docs/services/mcp.md`, agent guidance).
 
 ## Anti-patterns this guards against
 
@@ -128,7 +130,9 @@ Buckets: ADOPT / EXPOSE / NORMALIZE / ALIGN / IGNORE / DOC. Priority P0/P1/P2 fo
 
 ## Sources surveyed (canonical URLs)
 
-- pydantic-ai (Toolset / MCP) — https://ai.pydantic.dev/
-- MCP specification — https://modelcontextprotocol.io/specification/
-- OpenAI (tool-schema constraints only) — https://platform.openai.com/docs/
+- pydantic-ai (Toolset / MCP) — **https://pydantic.dev/docs/ai/** (301 from `ai.pydantic.dev`)
+- MCP specification — https://modelcontextprotocol.io/specification/ — **current revision `2025-11-25`** (capture the dated revision each run; it supersedes `2025-06-18`/`2025-03-26`)
+- OpenAI (tool-schema constraints only) — **https://developers.openai.com/api/docs/** (301 from `platform.openai.com/docs/`)
 - Anthropic (tool-schema constraints only) — https://platform.claude.com/docs/en/
+
+**WebFetch permission (operational):** per-domain, and background survey subagents can't answer interactive prompts — pre-allow the survey hosts (`WebFetch(domain:platform.openai.com)`, `WebFetch(domain:developers.openai.com)`, `WebFetch(domain:modelcontextprotocol.io)`) before a run, or they hard-deny.
