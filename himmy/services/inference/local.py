@@ -36,6 +36,7 @@ from himmy.services.inference.models import (
     ToolExecutor,
     ToolReturnRecord,
 )
+from himmy.services.inference.tool_formats import format_for
 from himmy.services.inference.tool_protocol import (
     _iter_json_objects,
     parse_text_tool_calls,
@@ -256,18 +257,24 @@ class OllamaClientManager:
         transport: Callable[[str, dict[str, Any]], Any] | None = None,
         timeout: float | None = None,
         provider_name: str = "ollama",
+        tool_call_format: str | None = None,
     ) -> None:
         """Configure the default model, server URL, and (test) transport.
 
         ``timeout`` defaults to the ``HIMMY_OLLAMA_TIMEOUT`` env var when unset
         (else 120s) — an operational knob for slow hosts (CPU-only CI runners,
         small boards) where generation legitimately exceeds the default budget.
+
+        ``tool_call_format`` pins the tool-call grammar for this manager; ``None``
+        auto-selects by resolved model tag and falls back to the GENERIC format
+        (today's behavior). See :mod:`himmy.services.inference.tool_formats`.
         """
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._registry = dict(model_registry or {})
         self._transport = transport
         self._timeout = timeout if timeout is not None else _default_ollama_timeout()
+        self._tool_call_format = tool_call_format
         #: Slow-local-provider floor (INF): the framework's 30s default request
         #: timeout kills legitimate CPU generations; the service's proportional
         #: ceiling honors this declared minimum (see InferenceService.run).
@@ -283,6 +290,7 @@ class OllamaClientManager:
     async def generate(self, request: InferenceRequest) -> InferenceResponse:
         """Call Ollama ``/api/chat`` and map the reply onto an InferenceResponse."""
         model = self.resolve(request.model_key)
+        tool_format = format_for(model, self._tool_call_format)
         started = time.perf_counter()
         params = request.generation_params or {}
         options: dict[str, Any] = {}
@@ -292,14 +300,24 @@ class OllamaClientManager:
             options["num_predict"] = params["max_tokens"]
         if request.seed is not None:
             options["seed"] = request.seed
+        messages = _chat_messages(request)
+        # Text-path formats (e.g. Hermes/Qwen ChatML-XML) drive tools through the
+        # prompt: suppress Ollama's native ``tools=`` field and inject the rendered
+        # manifest as a leading system message, so the FORMAT is the only variable.
+        use_text_path = bool(request.bound_tools) and tool_format.flags.use_text_tool_path
+        if use_text_path:
+            manifest = tool_format.render_system_manifest(
+                request.bound_tools, self.provider_name
+            )
+            messages = [{"role": "system", "content": manifest}, *messages]
         payload: dict[str, Any] = {
             "model": model,
-            "messages": _chat_messages(request),
+            "messages": messages,
             "stream": False,
         }
         if options:
             payload["options"] = options
-        if request.bound_tools:
+        if request.bound_tools and not use_text_path:
             payload["tools"] = _ollama_tools(
                 request.bound_tools, provider=self.provider_name
             )
@@ -329,7 +347,7 @@ class OllamaClientManager:
         # using Ollama's native tool field would otherwise be missed entirely.
         if not tool_calls and request.bound_tools and text:
             known = {t.name for t in request.bound_tools}
-            tool_calls = parse_text_tool_calls(text, known)
+            tool_calls = tool_format.parse(text, known)
             if tool_calls:
                 text = ""  # the reply was a tool call, not a final answer
         tool_returns = await _execute_tool_calls(
@@ -434,14 +452,21 @@ class ClaudeCliClientManager:
         runner: Callable[[list[str], str], Any] | None = None,
         timeout: float = 120.0,
         provider_name: str = "claude-cli",
+        tool_call_format: str | None = None,
     ) -> None:
-        """Configure the CLI executable, default model, and (test) runner."""
+        """Configure the CLI executable, default model, and (test) runner.
+
+        ``tool_call_format`` pins the tool-call grammar for this manager; ``None``
+        auto-selects by resolved model tag and falls back to the GENERIC format
+        (today's behavior). See :mod:`himmy.services.inference.tool_formats`.
+        """
         self._executable = executable
         self._model = model
         self._registry = dict(model_registry or {})
         self._extra_args = list(extra_args or [])
         self._runner = runner
         self._timeout = timeout
+        self._tool_call_format = tool_call_format
         #: Slow-local-provider floor: mirrors the effective_timeout floor below.
         self.min_timeout_seconds = _CLI_MIN_TIMEOUT
         self.provider_name = provider_name
@@ -460,6 +485,7 @@ class ClaudeCliClientManager:
         test runner, or an older CLI) is still accepted via :func:`_parse_cli_output`.
         """
         model = self.resolve(request.model_key)
+        tool_format = format_for(model, self._tool_call_format)
         started = time.perf_counter()
         argv = [self._executable, "-p", "--model", model]
         if not any("--output-format" in a for a in self._extra_args):
@@ -478,7 +504,7 @@ class ClaudeCliClientManager:
             # Text-only CLI: a best-effort ReAct protocol the runtime loop drives.
             prompt = (
                 f"{prompt}\n\n"
-                f"{_react_tool_manifest(request.bound_tools, provider=self.provider_name)}"
+                f"{tool_format.render_system_manifest(request.bound_tools, self.provider_name)}"
             )
         structured_requested = (
             request.response_format == ResponseFormat.STRUCTURED_OUTPUT
@@ -507,7 +533,7 @@ class ClaudeCliClientManager:
             )
         text, in_tok, out_tok, cli_cost = _parse_cli_output(out)
         tool_calls = (
-            parse_text_tool_calls(text, {t.name for t in request.bound_tools})
+            tool_format.parse(text, {t.name for t in request.bound_tools})
             if request.bound_tools
             else []
         )
@@ -592,12 +618,19 @@ class HimalayaGptClientManager:
         generate_fn: Callable[[str], str] | None = None,
         max_new_tokens: int = 256,
         provider_name: str = "himalayagpt",
+        tool_call_format: str | None = None,
     ) -> None:
-        """Configure the model id and (test) generate function."""
+        """Configure the model id and (test) generate function.
+
+        ``tool_call_format`` pins the tool-call grammar for this manager; ``None``
+        auto-selects by resolved model tag and falls back to the GENERIC format
+        (today's behavior). See :mod:`himmy.services.inference.tool_formats`.
+        """
         self._model_name = model_name
         self._generate_fn = generate_fn
         self._max_new_tokens = max_new_tokens
         self.provider_name = provider_name
+        self._tool_call_format = tool_call_format
         self._pipe: Any = None
 
     def resolve(self, model_key: str) -> str:
