@@ -125,7 +125,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
 
       - name: Verify the dependency lock is in sync with pyproject
         # The lock is the reproducible-install anchor for both the air-gap
