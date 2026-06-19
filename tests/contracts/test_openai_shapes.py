@@ -219,12 +219,20 @@ def test_request_projection_full_envelope() -> None:
         },
         {"role": "tool", "content": '{"rate": 5}', "tool_call_id": "call_9"},
     ]
-    # Bound tools project to OpenAI's function-tool shape.
+    # Bound tools project to OpenAI's function-tool shape. gpt-4o-mini is OpenAI-family,
+    # so strict tool args are declared (strict:true + tightened parameters).
     (tool,) = seen["tools"]
     assert tool["type"] == "function"
-    assert set(tool["function"]) == {"name", "description", "parameters"}
+    assert set(tool["function"]) == {"name", "description", "parameters", "strict"}
     assert tool["function"]["name"] == "lookup"
-    assert tool["function"]["parameters"]["properties"]["q"] == {"type": "string"}
+    assert tool["function"]["strict"] is True
+    # ``q`` is OPTIONAL in the source schema (absent from ``required``). Strict mode
+    # has no optional properties, so it is added to ``required`` but made NULLABLE
+    # (the model may emit null) rather than force-required to a real value.
+    params = tool["function"]["parameters"]
+    assert params["required"] == ["q"]
+    assert params["additionalProperties"] is False
+    assert set(params["properties"]["q"]["type"]) == {"string", "null"}
 
 
 def test_json_object_and_structured_response_format_kwargs() -> None:
@@ -249,10 +257,17 @@ def test_json_object_and_structured_response_format_kwargs() -> None:
             )
         )
     )
-    assert client.chat.completions.seen["response_format"] == {
-        "type": "json_schema",
-        "json_schema": {"name": "structured_output", "schema": schema},
-    }
+    # gpt-4o-mini is OpenAI-family -> strict structured output: the schema is the
+    # strict-tightened form (additionalProperties:false + full required) and
+    # json_schema.strict is declared. The single required field is unchanged.
+    rf = client.chat.completions.seen["response_format"]
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["name"] == "structured_output"
+    assert rf["json_schema"]["strict"] is True
+    out_schema = rf["json_schema"]["schema"]
+    assert out_schema["properties"] == schema["properties"]
+    assert out_schema["required"] == ["city"]
+    assert out_schema["additionalProperties"] is False
     assert resp.output_structured == {"city": "Pokhara"}
 
 

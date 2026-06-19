@@ -57,6 +57,7 @@ from himmy.services.inference.prompt_cache import (
     should_cache_prefix,
 )
 from himmy.services.tools.access import describe_for_model
+from himmy.services.tools.schema_normalize import normalize_tool_schema
 
 #: A default Claude model used when the caller doesn't name one (cheap + current).
 DEFAULT_ANTHROPIC_MODEL = "claude-3-5-haiku-latest"
@@ -102,15 +103,26 @@ def _normalize_anthropic_error(exc: BaseException) -> InferenceError:
     return InferenceError(code=code, message=str(exc) or name, retryable=retryable)
 
 
-def _anthropic_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
-    """Project bound tools into Anthropic's ``tools`` schema (name/description/input)."""
+def _anthropic_tools(
+    bound_tools: list[BoundTool], *, provider: str = "anthropic"
+) -> list[dict[str, Any]]:
+    """Project bound tools into Anthropic's ``tools`` schema (name/description/input).
+
+    Each tool's ``args_json_schema`` is run through the cross-provider
+    :func:`normalize_tool_schema` (``$ref`` inlining, nullable-union collapse, …)
+    so a schema another provider tolerates does not break Anthropic tool calling.
+    Normalization is fail-safe (widen-only), so an already-valid schema is
+    unchanged in meaning.
+    """
     return [
         {
             "name": tool.name,
             "description": describe_for_model(
                 tool.name, tool.description, tool.read_only
             ),
-            "input_schema": tool.args_json_schema or {"type": "object"},
+            "input_schema": normalize_tool_schema(
+                tool.args_json_schema or {"type": "object"}, provider
+            ),
         }
         for tool in bound_tools
     ]
@@ -310,6 +322,10 @@ class AnthropicClientManager:
             payload["tools"] = tools
             if wants_structured:
                 payload["tool_choice"] = {"type": "tool", "name": _STRUCTURED_TOOL}
+            else:
+                tool_choice = self._tool_choice(request)
+                if tool_choice is not None:
+                    payload["tool_choice"] = tool_choice
 
         try:
             client = self._build_client()
@@ -326,6 +342,23 @@ class AnthropicClientManager:
 
         return await self._map_message(request, message, model, model_path, started)
 
+    @staticmethod
+    def _tool_choice(request: InferenceRequest) -> dict[str, Any] | None:
+        """Provider-native ``tool_choice`` for a forced tool, else ``None``.
+
+        ``normalize_forced_tool`` (the service boundary) stamps
+        ``metadata['forced_tool']`` with the forced tool's name; we surface that as
+        Anthropic's native ``{"type": "tool", "name": ...}`` so forcing no longer
+        relies on the prompt nudge alone. Returns ``None`` when no tool is forced so
+        the default payload is byte-identical to before.
+        """
+        forced = request.metadata.get("forced_tool")
+        if not isinstance(forced, str) or not forced:
+            return None
+        if not any(t.name == forced for t in request.bound_tools):
+            return None
+        return {"type": "tool", "name": forced}
+
     def _payload_tools(
         self, request: InferenceRequest, wants_structured: bool
     ) -> list[dict[str, Any]]:
@@ -335,11 +368,15 @@ class AnthropicClientManager:
                 {
                     "name": _STRUCTURED_TOOL,
                     "description": "Return the structured result for this request.",
-                    "input_schema": _structured_schema(request),
+                    "input_schema": normalize_tool_schema(
+                        _structured_schema(request), self.provider_name
+                    ),
                 }
             ]
         if request.bound_tools:
-            return _anthropic_tools(request.bound_tools)
+            return _anthropic_tools(
+                request.bound_tools, provider=self.provider_name
+            )
         return []
 
     def _apply_system(
@@ -488,7 +525,12 @@ class AnthropicClientManager:
         if params.get("temperature") is not None:
             payload["temperature"] = params["temperature"]
         if request.bound_tools:
-            payload["tools"] = _anthropic_tools(request.bound_tools)
+            payload["tools"] = _anthropic_tools(
+                request.bound_tools, provider=self.provider_name
+            )
+            tool_choice = self._tool_choice(request)
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
 
         try:
             client = self._build_client()

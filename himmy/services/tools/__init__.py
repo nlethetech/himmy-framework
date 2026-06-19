@@ -21,6 +21,12 @@ from himmy.services.tools.registry import (
     register_local_tool,
 )
 from himmy.services.tools.runtime_adapter import ToolServiceToolset, build_arg_model
+from himmy.services.tools.schema_normalize import (
+    ProviderProfile,
+    normalize_tool_schema,
+    profile_for,
+    strict_output_schema,
+)
 from himmy.services.tools.service import ToolService
 from himmy.services.tools.validation import validate_against_schema
 
@@ -43,4 +49,8 @@ __all__ = [
     "register_http_tool",
     "validate_against_schema",
     "build_arg_model",
+    "normalize_tool_schema",
+    "strict_output_schema",
+    "profile_for",
+    "ProviderProfile",
 ]

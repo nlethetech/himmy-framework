@@ -17,6 +17,7 @@ from pydantic import create_model
 
 from himmy.core.errors import HimmyError
 from himmy.services.tools.models import ToolInvocation
+from himmy.services.tools.schema_normalize import normalize_tool_schema
 from himmy.services.tools.service import ToolService
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -51,12 +52,18 @@ def build_arg_model(name: str, args_json_schema: dict[str, Any]) -> type:
     Each declared property becomes a field; properties in ``required`` are
     required, the rest default to ``None``. Tools with no object schema get an
     empty model. Exposed (not gated) so it is unit-testable without pydantic-ai.
+
+    The schema is first run through the provider-agnostic normalizer (``$ref`` /
+    ``$defs`` inlining, nullable-union collapse) so a property whose type is hidden
+    behind a local ``$ref`` resolves to a real field type instead of falling
+    through to ``Any``; the transform is widen-only so the generated model never
+    becomes stricter than the declared schema.
     """
     model_name = f"{name.title().replace('_', '')}Args"
-    if (
-        not isinstance(args_json_schema, dict)
-        or args_json_schema.get("type") != "object"
-    ):
+    if not isinstance(args_json_schema, dict):
+        return cast(type, create_model(model_name))  # type: ignore[call-overload]
+    args_json_schema = normalize_tool_schema(args_json_schema, None)
+    if args_json_schema.get("type") != "object":
         return cast(type, create_model(model_name))  # type: ignore[call-overload]
 
     properties = args_json_schema.get("properties", {}) or {}

@@ -35,6 +35,7 @@ from himmy.services.inference.models import (
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
+    ResponseFormat,
 )
 from himmy.services.inference.prompt_cache import (
     CacheCapability,
@@ -154,6 +155,82 @@ class InferenceService:
         """True when the request opted into the response cache."""
         return bool(request.generation_params.get("use_cache"))
 
+    @staticmethod
+    def _requested_payload(
+        request: InferenceRequest, *, streamed: bool = False
+    ) -> dict[str, Any]:
+        """The INFERENCE_REQUESTED payload, carrying ``seed`` for reproducibility.
+
+        ``seed`` is OMITTED (not ``None``-stamped) when unset so the default-path
+        event payload is byte-identical to before; it is recorded only when the
+        caller asked for a reproducible run.
+        """
+        payload: dict[str, Any] = {"model_key": request.model_key}
+        if streamed:
+            payload["streamed"] = True
+        if request.seed is not None:
+            payload["seed"] = request.seed
+        return payload
+
+    @staticmethod
+    def _validate_structured_reply(
+        request: InferenceRequest, response: InferenceResponse
+    ) -> InferenceResponse:
+        """Validate a structured reply against the requested ``output_json_schema``.
+
+        Runs for every provider at the single service boundary so each caller benefits
+        without per-manager wiring. A no-op (returns the response unchanged, hence
+        byte-identical) unless ALL hold: the request asked for a structured reply
+        (``STRUCTURED_OUTPUT`` / ``JSON_OBJECT``) with an ``output_json_schema``,
+        ``validate_structured_output`` is set, and the manager actually parsed an
+        ``output_structured`` payload. On a schema violation the SUCCESS response is
+        rewritten to FAILED(``OUTPUT_VALIDATION``) — non-retryable — so a parseable but
+        non-conforming reply never silently ships as SUCCESS.
+
+        ``TypedAgent`` (and any caller running its own richer validation) opts out via
+        ``validate_structured_output=False``, so its pydantic validation + repair loop
+        is never pre-empted or double-run here.
+
+        BEHAVIOR CHANGE (back-compat note): for every non-``TypedAgent`` caller this
+        flag now defaults to ON, so a structured request whose reply parses but does
+        NOT conform to ``output_json_schema`` — which previously returned SUCCESS — now
+        returns FAILED(``OUTPUT_VALIDATION``). A caller that wants the old lenient
+        behavior can set ``validate_structured_output=False`` on the request/llm_config.
+        When ``jsonschema`` is absent the offline-validator subset is used (lower
+        fidelity), which can in rare cases reject a payload a full validator would pass.
+        """
+        if not request.validate_structured_output:
+            return response
+        if request.response_format not in (
+            ResponseFormat.STRUCTURED_OUTPUT,
+            ResponseFormat.JSON_OBJECT,
+        ):
+            return response
+        schema = request.output_json_schema
+        if not isinstance(schema, dict) or not schema:
+            return response
+        if response.output_structured is None:
+            # No structured payload to validate (e.g. a tool-call turn, or a provider
+            # that returned only text). Leave the reply untouched — the absence of a
+            # structured payload is a separate concern owned by the caller.
+            return response
+
+        from himmy.services.tools.validation import validate_against_schema
+
+        error = validate_against_schema(response.output_structured, schema)
+        if error is None:
+            return response
+        return response.model_copy(
+            update={
+                "status": InferenceStatus.FAILED,
+                "error": InferenceError(
+                    code=InferenceErrorCode.OUTPUT_VALIDATION,
+                    message=f"structured output failed schema validation: {error}",
+                    retryable=False,
+                ),
+            }
+        )
+
     def cache_capability_for(self, model_key: str = "default") -> CacheCapability:
         """The wrapped client manager's prompt-cache capability for ``model_key``.
 
@@ -177,7 +254,7 @@ class InferenceService:
         await self._emit(
             EventType.INFERENCE_REQUESTED,
             request_id=request.request_id,
-            payload={"model_key": request.model_key},
+            payload=self._requested_payload(request),
         )
         started = time.perf_counter()
 
@@ -232,6 +309,14 @@ class InferenceService:
                         retryable=True,
                     ),
                 )
+
+            # Validate a structured reply against the requested schema BEFORE it is
+            # treated as a success (so a schema-violating-but-parseable reply is never
+            # cached or reported as SUCCESS). A violation rewrites the response to
+            # FAILED(OUTPUT_VALIDATION) in place, which then flows through the normal
+            # failure path below (non-retryable, surfaced as a FAILED event).
+            if response.status == InferenceStatus.SUCCESS:
+                response = self._validate_structured_reply(request, response)
 
             last_response = response
             if response.status == InferenceStatus.SUCCESS:
@@ -402,6 +487,46 @@ class InferenceService:
         the buffered ``run`` output. The terminal chunk has ``done=True`` and
         carries the fully-materialized :class:`InferenceResponse`.
         """
+        # Forced-tool normalization parity with run() (INF): a streamed
+        # ``ResponseFormat.TOOL`` request used to bypass ``normalize_forced_tool``
+        # entirely, silently dropping the forcing on the stream path. Normalize here
+        # so a streamed forced-tool request drives the same single-tool binding +
+        # native ``tool_choice`` + nudge as the sync path. A HimmyError (e.g. TOOL with
+        # no bound tool) is surfaced as a FAILED terminal rather than escaping.
+        from himmy.services.inference.client_manager import normalize_forced_tool
+
+        try:
+            request = normalize_forced_tool(request)
+        except HimmyError as exc:
+            await self._emit(
+                EventType.INFERENCE_REQUESTED,
+                request_id=request.request_id,
+                payload=self._requested_payload(request, streamed=True),
+            )
+            failed = InferenceResponse(
+                request_id=request.request_id,
+                status=InferenceStatus.FAILED,
+                error=InferenceError(
+                    code=InferenceErrorCode.INVALID_REQUEST,
+                    message=str(exc),
+                    retryable=False,
+                ),
+            )
+            await self._emit(
+                EventType.INFERENCE_FAILED,
+                request_id=request.request_id,
+                error=str(exc),
+                payload={"streamed": True},
+            )
+            yield StreamDelta(
+                request_id=request.request_id,
+                delta="",
+                index=0,
+                done=True,
+                response=failed,
+            )
+            return
+
         manager_stream = getattr(self._client_manager, "generate_stream", None)
         if manager_stream is not None:
             # Audit parity with run() (INF-12): a streamed inference is an inference.
@@ -413,7 +538,7 @@ class InferenceService:
             await self._emit(
                 EventType.INFERENCE_REQUESTED,
                 request_id=request.request_id,
-                payload={"model_key": request.model_key, "streamed": True},
+                payload=self._requested_payload(request, streamed=True),
             )
             started = time.perf_counter()
             index = 0
@@ -433,10 +558,15 @@ class InferenceService:
                     )
                 if final is None:
                     # The provider never surfaced a final response object; materialize
-                    # one via run(), which emits its own REQUESTED/terminal pair — so
-                    # we must not double-emit a terminal for this sub-case.
+                    # one via run(), which emits its own REQUESTED/terminal pair (and
+                    # runs structured-reply validation) — so we must not double-emit a
+                    # terminal for this sub-case.
                     final = await self.run(request)
                     terminal_emitted = True
+                elif final.status == InferenceStatus.SUCCESS:
+                    # Manager-surfaced final: validate the structured reply here too, so
+                    # a streamed structured run gets the same schema guarantee as run().
+                    final = self._validate_structured_reply(request, final)
                 if not terminal_emitted:
                     await self._emit_stream_terminal(request, final, started)
                     terminal_emitted = True

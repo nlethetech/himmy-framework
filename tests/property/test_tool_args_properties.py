@@ -143,10 +143,13 @@ def test_valid_args_round_trip_through_lenient_coercion(
     # Sanity: the generated args really are valid under both validator paths.
     assert validate_against_schema(args, schema, use_jsonschema=False) is None
     assert validate_against_schema(args, schema, use_jsonschema=True) is None
-    coerced = _coerce_lenient_args(args, schema)
+    coerced, coerced_keys = _coerce_lenient_args(args, schema)
     assert validate_against_schema(coerced, schema, use_jsonschema=False) is None
     # Never invents: every coerced entry existed identically in the input.
     assert set(coerced) <= set(args)
+    # Already-valid, correctly-typed args never trigger scalar coercion (a string
+    # field stays a string; an int stays an int), so values pass through unchanged.
+    assert coerced_keys == []
     assert all(coerced[key] == args[key] for key in coerced)
     # Required keys are never stripped.
     assert set(schema["required"]) <= set(coerced)
@@ -164,12 +167,31 @@ def test_valid_args_round_trip_through_lenient_coercion(
 def test_coercion_is_total_subsetting_and_idempotent(
     args: dict[str, Any], schema: dict[str, Any]
 ) -> None:
-    """Arbitrary args never crash coercion; output ⊆ input; fixed point reached."""
-    coerced = _coerce_lenient_args(args, schema)
+    """Arbitrary args never crash coercion; keys ⊆ input; fixed point reached."""
+    coerced, coerced_keys = _coerce_lenient_args(args, schema)
     assert isinstance(coerced, dict)
+    assert isinstance(coerced_keys, list)
+    # Keys are only ever a subset of the input (coercion never invents a key).
     assert set(coerced) <= set(args)
-    assert all(coerced[key] == args[key] for key in coerced)
-    assert _coerce_lenient_args(coerced, schema) == coerced
+    assert set(coerced_keys) <= set(coerced)
+    # Each value is either passed through unchanged or LOSSLESSLY scalar-coerced.
+    for key in coerced:
+        if key in coerced_keys:
+            # The source was a string and the result is now a real scalar that
+            # round-trips back to that exact string token (lossless).
+            assert isinstance(args[key], str)
+            assert isinstance(coerced[key], (int, float, bool))
+            if isinstance(coerced[key], bool):
+                assert ("true" if coerced[key] else "false") == args[key]
+            else:
+                assert repr(coerced[key]) == args[key] or str(coerced[key]) == args[key]
+        else:
+            assert coerced[key] == args[key]
+    # Idempotent: re-running over the coerced output is a fixed point (coerced
+    # scalars are no longer strings, so nothing further fires).
+    again, again_keys = _coerce_lenient_args(coerced, schema)
+    assert again == coerced
+    assert again_keys == []
 
 
 @_SETTINGS

@@ -187,6 +187,10 @@ class TaskContext(BaseModel):
     skill_routing_hints: list[str] | None = None
     response_format: ResponseFormat | str | None = None
     output_schema: dict[str, Any] | None = None
+    #: Validate a structured reply against ``output_schema`` at the inference service
+    #: boundary. ``None`` -> the default (on); a caller with its own richer validation
+    #: (TypedAgent) sets ``False`` so the service does not pre-empt its repair loop.
+    validate_structured_output: bool | None = None
 
     # --- prompt rendering -------------------------------------------------------
     role: str | None = None
@@ -3105,7 +3109,14 @@ class SingleAgentRuntime:
         workflow = None
         route_override = None
         timeout_seconds: float | None = None
+        seed: int | None = None
         tool_names = ctx.get("tool_names")
+        # Default ON; a caller running its own richer structured-output validation
+        # (e.g. TypedAgent's pydantic + repair loop) opts out via this context flag so
+        # the inference service does not pre-empt it at the boundary.
+        validate_structured_output = ctx.get("validate_structured_output", True)
+        if not isinstance(validate_structured_output, bool):
+            validate_structured_output = True
 
         if llm_config is not None:
             response_format = llm_config.response_format
@@ -3113,6 +3124,7 @@ class SingleAgentRuntime:
             workflow = llm_config.workflow
             route_override = llm_config.route_override
             timeout_seconds = llm_config.timeout_seconds
+            seed = llm_config.seed
             if llm_config.temperature is not None:
                 generation_params["temperature"] = llm_config.temperature
             if llm_config.max_tokens is not None:
@@ -3178,6 +3190,8 @@ class SingleAgentRuntime:
             output_json_schema=output_json_schema,
             workflow=workflow,
             generation_params=generation_params,
+            seed=seed,
+            validate_structured_output=validate_structured_output,
             route_override=route_override,
             metadata=_cache_scope_metadata(ctx),
             cache_policy=self._prompt_cache_policy(model_key, cache_busted=cache_busted),

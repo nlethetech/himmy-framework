@@ -39,6 +39,7 @@ from himmy.services.inference.models import (
     ToolExecutor,
     ToolReturnRecord,
 )
+from himmy.services.tools.schema_normalize import normalize_tool_schema
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.inference.models import GatewayRuntimeConfig
@@ -159,19 +160,33 @@ class PydanticAIClientManager:
         for bound in request.bound_tools:
             if allowed is not None and bound.name not in allowed:
                 continue
-            tools.append(self._make_tool(pydantic_ai, bound, request.tool_executor))
+            tools.append(
+                self._make_tool(
+                    pydantic_ai,
+                    bound,
+                    request.tool_executor,
+                    self.provider_name,
+                )
+            )
         # Caller-supplied toolsets pass straight through.
         tools.extend(request.toolsets or [])
         return tools
 
     @staticmethod
-    def _make_tool(pydantic_ai: Any, bound: Any, executor: ToolExecutor | None) -> Any:
+    def _make_tool(
+        pydantic_ai: Any,
+        bound: Any,
+        executor: ToolExecutor | None,
+        provider: str = "pydantic_ai",
+    ) -> Any:
         """Build one pydantic-ai Tool from a BoundTool, routing to the executor.
 
         The tool's ``args_json_schema`` is handed to pydantic-ai explicitly via
         ``Tool.from_schema`` so the provider advertises the REAL parameter names/types to
         the model. Without it, a ``**kwargs`` runner exposes no parameters and the model
         guesses arg names (e.g. calling ``sql_query`` with ``query`` instead of ``sql``).
+        The schema is first normalized for the provider (``$ref`` inlining, nullable-union
+        collapse, …) so a cross-provider schema does not break pydantic-ai's schema bind.
         """
 
         async def _runner(**kwargs: Any) -> Any:
@@ -181,7 +196,9 @@ class PydanticAIClientManager:
             return ret.content
 
         _runner.__name__ = bound.name
-        schema = bound.args_json_schema or {"type": "object", "properties": {}}
+        schema = normalize_tool_schema(
+            bound.args_json_schema or {"type": "object", "properties": {}}, provider
+        )
         return pydantic_ai.Tool.from_schema(  # type: ignore[attr-defined]
             _runner,
             name=bound.name,
@@ -358,7 +375,10 @@ class PydanticAIClientManager:
         ):
             try:
                 pydantic_ai = _require_pydantic_ai()
-                return pydantic_ai.StructuredDict(request.output_json_schema)  # type: ignore[attr-defined]
+                schema = normalize_tool_schema(
+                    request.output_json_schema, self.provider_name
+                )
+                return pydantic_ai.StructuredDict(schema)  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001 - fall back to free text
                 return None
         return None

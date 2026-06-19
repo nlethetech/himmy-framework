@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from himmy.services.inference.models import InferenceRequest, InferenceResponse
 
@@ -69,7 +69,7 @@ def compute_cache_key(request: InferenceRequest) -> str:
     gen = {
         k: v for k, v in sorted(request.generation_params.items()) if k != "use_cache"
     }
-    payload = {
+    payload: dict[str, Any] = {
         "model_key": request.model_key,
         "route_override": request.route_override,
         "response_format": (
@@ -94,6 +94,11 @@ def compute_cache_key(request: InferenceRequest) -> str:
     scope = derive_cache_scope(request)
     if scope is not None:
         payload["cache_scope"] = scope
+    # Seed partitions the cache so two reproducible runs with different seeds never
+    # collide. OMITTED (not ``None``-stamped) when unset so unseeded keys — including
+    # previously recorded replay-cassette keys — are byte-for-byte unchanged.
+    if request.seed is not None:
+        payload["seed"] = request.seed
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 

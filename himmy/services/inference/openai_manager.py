@@ -56,6 +56,11 @@ from himmy.services.inference.prompt_cache import (
     resolve_cache_rates,
 )
 from himmy.services.tools.access import describe_for_model
+from himmy.services.tools.schema_normalize import (
+    is_strict_expressible,
+    normalize_tool_schema,
+    strict_output_schema,
+)
 
 #: A default OpenAI model used when the caller doesn't name one (cheap + current).
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
@@ -105,21 +110,45 @@ def _normalize_openai_error(exc: BaseException) -> InferenceError:
     return InferenceError(code=code, message=str(exc) or name, retryable=retryable)
 
 
-def _openai_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
-    """Project bound tools into OpenAI's function-tool schema."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": describe_for_model(
-                    tool.name, tool.description, tool.read_only
-                ),
-                "parameters": tool.args_json_schema or {"type": "object"},
-            },
+def _openai_tools(
+    bound_tools: list[BoundTool],
+    *,
+    provider: str = "openai",
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    """Project bound tools into OpenAI's function-tool schema.
+
+    Each tool's ``args_json_schema`` is normalized for the provider (``$ref``
+    inlining, nullable-union collapse, …) via the shared cross-provider primitive
+    so a schema another provider tolerates does not break OpenAI tool calling.
+    When ``strict`` is set the function declares ``strict: true`` and its
+    parameters are the strict-tightened (full ``required`` + ``additionalProperties
+    false``) form — gate the caller on ``is_openai_family_model``.
+    """
+    tools: list[dict[str, Any]] = []
+    for tool in bound_tools:
+        raw = tool.args_json_schema or {"type": "object"}
+        normalized = normalize_tool_schema(raw, provider)
+        # Strict is decided PER TOOL: only when the model is eligible (``strict``)
+        # AND this tool's schema is losslessly strict-expressible. An open dict
+        # (e.g. arbitrary HTTP headers) or an items-less array cannot be closed
+        # without breaking the tool, so it falls back to the lenient (widen-only)
+        # schema with no ``strict`` flag — which the provider still accepts —
+        # instead of 400-rejecting the whole request.
+        use_strict = strict and is_strict_expressible(normalized)
+        function: dict[str, Any] = {
+            "name": tool.name,
+            "description": describe_for_model(
+                tool.name, tool.description, tool.read_only
+            ),
+            "parameters": (
+                strict_output_schema(raw, provider) if use_strict else normalized
+            ),
         }
-        for tool in bound_tools
-    ]
+        if use_strict:
+            function["strict"] = True
+        tools.append({"type": "function", "function": function})
+    return tools
 
 
 def _tool_call_block(m: InferenceMessage) -> dict[str, Any] | None:
@@ -327,9 +356,15 @@ class OpenAIClientManager:
             payload["max_tokens"] = params["max_tokens"]
         if params.get("top_p") is not None:
             payload["top_p"] = params["top_p"]
+        if request.seed is not None:
+            payload["seed"] = request.seed
+        strict = self._strict_eligible(model)
         if request.bound_tools:
-            payload["tools"] = self._tools_payload(request)
-        rf = self._response_format(request)
+            payload["tools"] = self._tools_payload(request, strict=strict)
+            tool_choice = self._tool_choice(request)
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
+        rf = self._response_format(request, strict=strict)
         if rf is not None:
             payload["response_format"] = rf
         self._apply_prompt_cache_key(request, model, payload)
@@ -354,20 +389,68 @@ class OpenAIClientManager:
             request, completion, model, model_path, started
         )
 
-    @staticmethod
-    def _response_format(request: InferenceRequest) -> dict[str, Any] | None:
-        """Build the ``response_format`` kwarg for JSON / structured requests."""
+    def _response_format(
+        self, request: InferenceRequest, *, strict: bool = False
+    ) -> dict[str, Any] | None:
+        """Build the ``response_format`` kwarg for JSON / structured requests.
+
+        For ``STRUCTURED_OUTPUT`` the schema is normalized for this provider. When
+        ``strict`` is set (an OpenAI-family / openai-backed model that honors strict
+        structured output) the schema is the strict-tightened form and
+        ``json_schema.strict`` is declared so the provider enforces it; otherwise
+        the lenient normalized schema is emitted (byte-identical-shaped to before
+        for an already-normalized schema).
+        """
         if request.response_format == ResponseFormat.JSON_OBJECT:
             return {"type": "json_object"}
         if request.response_format == ResponseFormat.STRUCTURED_OUTPUT:
-            return {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": _STRUCTURED_SCHEMA_NAME,
-                    "schema": _structured_schema(request),
-                },
+            raw = _structured_schema(request)
+            normalized = normalize_tool_schema(raw, self.provider_name)
+            # Per-schema strict gate (see _openai_tools): an open / items-less output
+            # schema falls back to the lenient json_schema rather than a 400.
+            use_strict = strict and is_strict_expressible(normalized)
+            schema = (
+                strict_output_schema(raw, self.provider_name)
+                if use_strict
+                else normalized
+            )
+            json_schema: dict[str, Any] = {
+                "name": _STRUCTURED_SCHEMA_NAME,
+                "schema": schema,
             }
+            if use_strict:
+                json_schema["strict"] = True
+            return {"type": "json_schema", "json_schema": json_schema}
         return None
+
+    def _strict_eligible(self, model: str) -> bool:
+        """True when this model honors OpenAI strict mode (function/json_schema).
+
+        Strict mode is an OpenAI-specific feature: ``strict: true`` and the
+        all-``required`` + ``additionalProperties:false`` schema shape are enforced
+        only by OpenAI's own engine. Sending ``strict`` to an arbitrary open-model
+        backend (a Llama/Mistral/Qwen/DeepSeek/etc. served through OpenRouter or a
+        custom ``base_url``) is at best ignored and at worst 400-rejected, and the
+        tightened schema would needlessly force every optional field. So strict is
+        eligible ONLY for genuinely OpenAI-served models:
+
+        * the manager is direct OpenAI (``provider_name == "openai"``) and the model
+          id is OpenAI-family; OR
+        * the manager is OpenRouter (``provider_name == "openrouter"``) and the model
+          is the OpenAI-backed ``openai/...`` slash form.
+
+        Every other model (anthropic/google passthrough, any other open-model
+        backend, a non-OpenAI ``base_url``) returns ``False`` so the lenient
+        (widen-only) schema is sent unchanged.
+        """
+        provider = (self.provider_name or "").lower()
+        if provider == "openai":
+            return is_openai_family_model(model)
+        if provider == "openrouter":
+            # Allowlist openai-backed ids only; never assume strict for arbitrary
+            # open models routed through OpenRouter.
+            return is_openai_family_model(model)
+        return False
 
     def _passthrough_caches_system(
         self, request: InferenceRequest, model: str
@@ -390,19 +473,42 @@ class OpenAIClientManager:
             return False
         return openrouter_passthrough_backend(model) is not None
 
-    def _tools_payload(self, request: InferenceRequest) -> list[dict[str, Any]]:
+    @staticmethod
+    def _tool_choice(request: InferenceRequest) -> dict[str, Any] | None:
+        """Provider-native ``tool_choice`` for a forced tool, else ``None``.
+
+        ``normalize_forced_tool`` (the service boundary) rewrites a
+        ``ResponseFormat.TOOL`` request into an ``AUTO_TOOLS`` call binding only the
+        forced tool and stamps ``metadata['forced_tool']`` with its name. We surface
+        that as OpenAI's native ``{"type": "function", "function": {"name": ...}}`` so
+        forcing no longer relies on the prompt nudge alone. Returns ``None`` when no
+        tool is forced (the model chooses naturally) so the default payload is
+        byte-identical to before.
+        """
+        forced = request.metadata.get("forced_tool")
+        if not isinstance(forced, str) or not forced:
+            return None
+        # Only force a tool that is actually bound for this call.
+        if not any(t.name == forced for t in request.bound_tools):
+            return None
+        return {"type": "function", "function": {"name": forced}}
+
+    def _tools_payload(
+        self, request: InferenceRequest, *, strict: bool = False
+    ) -> list[dict[str, Any]]:
         """Project bound tools, name-sorting them when caching is active for stability.
 
         OpenAI-family caching is AUTOMATIC on a byte-stable prefix; the tool array is part
         of that prefix, so an active cache policy sorts tools by name for a deterministic
         order (consistent with the response-cache key in ``cache.py``). Sorting is gated
         on the active policy so the default path keeps registry order and stays
-        byte-identical to the pinned contract.
+        byte-identical to the pinned contract. Each tool's schema is normalized for
+        the provider; ``strict`` (OpenAI strict tool args) is forwarded through.
         """
         tools = request.bound_tools
         if cache_policy_active(request):
             tools = sorted(tools, key=lambda t: t.name)
-        return _openai_tools(tools)
+        return _openai_tools(tools, provider=self.provider_name, strict=strict)
 
     def _apply_prompt_cache_key(
         self, request: InferenceRequest, model: str, payload: dict[str, Any]
@@ -529,8 +635,15 @@ class OpenAIClientManager:
             payload["temperature"] = params["temperature"]
         if params.get("max_tokens") is not None:
             payload["max_tokens"] = params["max_tokens"]
+        if request.seed is not None:
+            payload["seed"] = request.seed
         if request.bound_tools:
-            payload["tools"] = self._tools_payload(request)
+            payload["tools"] = self._tools_payload(
+                request, strict=self._strict_eligible(model)
+            )
+            tool_choice = self._tool_choice(request)
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
         self._apply_prompt_cache_key(request, model, payload)
         self._apply_usage_accounting(payload)
         if self._default_headers:

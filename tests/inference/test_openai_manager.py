@@ -146,7 +146,14 @@ def test_structured_output_sets_json_schema_response_format() -> None:
     assert resp.output_structured == {"city": "Bardaghat"}
     rf = client.chat.completions.seen["response_format"]
     assert rf["type"] == "json_schema"
-    assert rf["json_schema"]["schema"] == schema
+    # gpt-4o-mini is OpenAI-family, so strict structured output is emitted: the
+    # schema is the strict-tightened (additionalProperties:false + full required)
+    # form and json_schema.strict is declared.
+    assert rf["json_schema"]["strict"] is True
+    out_schema = rf["json_schema"]["schema"]
+    assert out_schema["properties"] == schema["properties"]
+    assert out_schema["required"] == ["city"]
+    assert out_schema["additionalProperties"] is False
 
 
 # ------------------------------------------------------------------- tools
@@ -226,6 +233,109 @@ def test_model_passes_through_verbatim_to_create() -> None:
     assert client.chat.completions.seen["model"] == "anthropic/claude-3.5-sonnet"
     assert resp.model_path == "openai:anthropic/claude-3.5-sonnet"
     assert resp.provider_name == "openrouter"
+
+
+def test_openrouter_open_model_does_not_send_strict() -> None:
+    """An arbitrary OpenRouter open model (non-``openai/...``) is NOT sent strict.
+
+    Strict mode is OpenAI-engine-specific; sending ``strict``/all-required schema to a
+    Llama/Mistral/Qwen backend is at best ignored, at worst 400-rejected, and would
+    force every optional tool arg. So the lenient (widen-only) schema is sent — the
+    optional ``count`` field is NOT force-added to ``required``.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    client = _FakeClient(_completion(content='{"query": "x"}'))
+    mgr = OpenAIClientManager(
+        model="meta-llama/llama-3.1-70b-instruct",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-unit",
+        client=client,
+        provider_name="openrouter",
+    )
+    run_async(
+        mgr.generate(
+            _req(
+                model_key="meta-llama/llama-3.1-70b-instruct",
+                response_format=ResponseFormat.STRUCTURED_OUTPUT,
+                output_json_schema=schema,
+            )
+        )
+    )
+    rf = client.chat.completions.seen["response_format"]
+    assert rf["type"] == "json_schema"
+    # NOT strict: no strict flag, and the optional field is not forced into required.
+    assert "strict" not in rf["json_schema"]
+    assert rf["json_schema"]["schema"]["required"] == ["query"]
+
+
+def test_openrouter_openai_backed_model_sends_strict() -> None:
+    """An ``openai/...`` OpenRouter model IS strict-eligible (allowlisted)."""
+    schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+    client = _FakeClient(_completion(content='{"query": "x"}'))
+    mgr = OpenAIClientManager(
+        model="openai/gpt-4o-mini",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-unit",
+        client=client,
+        provider_name="openrouter",
+    )
+    run_async(
+        mgr.generate(
+            _req(
+                model_key="openai/gpt-4o-mini",
+                response_format=ResponseFormat.STRUCTURED_OUTPUT,
+                output_json_schema=schema,
+            )
+        )
+    )
+    rf = client.chat.completions.seen["response_format"]
+    assert rf["json_schema"]["strict"] is True
+
+
+def test_strict_structured_output_keeps_optional_field_nullable() -> None:
+    """On a real strict OpenAI structured call an optional field stays NULLABLE.
+
+    The strict schema sent to the provider lists the optional ``count`` in
+    ``required`` (strict demands it) but makes it nullable so the model may emit
+    null — it is never force-required to a real value — and strict-unsupported
+    ``minimum``/``maximum`` keywords are stripped so the call is not 400-rejected.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    client = _FakeClient(_completion(content='{"query": "x", "count": null}'))
+    mgr = OpenAIClientManager(model=PRICED_MODEL, client=client)  # direct OpenAI
+    run_async(
+        mgr.generate(
+            _req(
+                response_format=ResponseFormat.STRUCTURED_OUTPUT,
+                output_json_schema=schema,
+            )
+        )
+    )
+    sent = client.chat.completions.seen["response_format"]["json_schema"]["schema"]
+    assert sorted(sent["required"]) == ["count", "query"]
+    count = sent["properties"]["count"]
+    assert "null" in count["type"] and "integer" in count["type"]
+    assert "minimum" not in count and "maximum" not in count
 
 
 def test_openrouter_opts_into_detailed_usage_accounting() -> None:

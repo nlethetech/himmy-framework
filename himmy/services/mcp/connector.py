@@ -15,6 +15,7 @@ from typing import Any
 from himmy.core.errors import HimmyError
 from himmy.services.mcp.client import MCPClient
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
+from himmy.services.tools.schema_normalize import normalize_tool_schema
 
 
 def _refuse_builtin_shadow(registry: ToolRegistry, tool_name: str) -> None:
@@ -69,12 +70,18 @@ async def register_mcp_tools(
             continue
         tool_name = f"{prefix}{tool.name}"
         _refuse_builtin_shadow(registry, tool_name)
+        # MCP servers commonly ship schemas with ``$ref``/``$defs`` (the single most
+        # common cross-provider tool-schema failure). Run the provider-agnostic
+        # normalizer (``None`` profile = ref-inlining + def-stripping only, no
+        # provider narrowing) at registration; the per-provider egress normalizer
+        # runs again at the manager (idempotent + widen-only, so this is safe).
+        args_schema = normalize_tool_schema(tool.input_schema, None)
         register_local_tool(
             registry,
             name=tool_name,
             handler=_make_handler(client, tool.name),
             description=tool.description,
-            args_json_schema=tool.input_schema,
+            args_json_schema=args_schema,
             requires_approval=requires_approval,
             metadata={"backend": "mcp", "mcp_tool": tool.name},
         )

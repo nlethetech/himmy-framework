@@ -371,7 +371,14 @@ class TypedAgent[DepsT, OutputT: BaseModel]:
         """Build the runtime Task requesting structured output for ``OutputT``."""
         from himmy.agents.base_agent.task import Task
 
-        context: dict[str, Any] = {"output_schema": self._output_schema}
+        context: dict[str, Any] = {
+            "output_schema": self._output_schema,
+            # TypedAgent re-validates the structured reply against its pydantic
+            # ``OutputT`` (with a corrective repair loop), so the inference service
+            # must NOT also fail the reply at its boundary — that would pre-empt the
+            # repair loop and swap the precise pydantic error for a jsonschema one.
+            "validate_structured_output": False,
+        }
         if tool_names is not None:
             context["tool_names"] = tool_names
         if self._model_key is not None:

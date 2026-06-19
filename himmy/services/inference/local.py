@@ -42,6 +42,7 @@ from himmy.services.inference.tool_protocol import (
 )
 from himmy.services.tools.access import describe_for_model
 from himmy.services.tools.repair import resolve_tool_name, unknown_tool_message
+from himmy.services.tools.schema_normalize import normalize_tool_schema
 
 
 def _failed(
@@ -85,11 +86,16 @@ def _compose_prompt(request: InferenceRequest) -> str:
     return "\n\n".join(parts)
 
 
-def _ollama_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
+def _ollama_tools(
+    bound_tools: list[BoundTool], *, provider: str = "ollama"
+) -> list[dict[str, Any]]:
     """Project bound tools into Ollama's ``/api/chat`` function-tool schema.
 
     Descriptions carry a read/write intent hint so a small model doesn't pick a
-    write tool for a look-up (reader/writer disambiguation).
+    write tool for a look-up (reader/writer disambiguation). Each tool's
+    ``args_json_schema`` is run through the shared cross-provider normalizer
+    (``$ref`` inlining, nullable-union collapse, …) so a schema that another
+    provider tolerates still parses for the local backend.
     """
     return [
         {
@@ -99,7 +105,9 @@ def _ollama_tools(bound_tools: list[BoundTool]) -> list[dict[str, Any]]:
                 "description": describe_for_model(
                     tool.name, tool.description, tool.read_only
                 ),
-                "parameters": tool.args_json_schema or {"type": "object"},
+                "parameters": normalize_tool_schema(
+                    tool.args_json_schema or {"type": "object"}, provider
+                ),
             },
         }
         for tool in bound_tools
@@ -128,16 +136,24 @@ def _parse_ollama_tool_calls(data: dict[str, Any]) -> list[ToolCallRecord]:
     return calls
 
 
-def _react_tool_manifest(bound_tools: list[BoundTool]) -> str:
+def _react_tool_manifest(
+    bound_tools: list[BoundTool], *, provider: str = "claude-cli"
+) -> str:
     """A text manifest + protocol instruction for a text-only model (Claude CLI).
 
     Parsing tolerates several reply shapes (see
     :func:`~himmy.services.inference.tool_protocol.parse_text_tool_calls`), but a single
-    documented format keeps the model on the most reliable path.
+    documented format keeps the model on the most reliable path. The advertised
+    arg schema is normalized for the provider so a text-only model sees the same
+    ``$ref``-inlined, nullable-collapsed shape every other backend gets.
     """
     lines = ["You can call tools. Available tools:"]
     for tool in bound_tools:
-        schema = json.dumps(tool.args_json_schema or {"type": "object"})
+        schema = json.dumps(
+            normalize_tool_schema(
+                tool.args_json_schema or {"type": "object"}, provider
+            )
+        )
         desc = describe_for_model(tool.name, tool.description, tool.read_only)
         lines.append(f"- {tool.name}: {desc} | args schema: {schema}")
     example = bound_tools[0].name if bound_tools else "tool_name"
@@ -274,6 +290,8 @@ class OllamaClientManager:
             options["temperature"] = params["temperature"]
         if params.get("max_tokens") is not None:
             options["num_predict"] = params["max_tokens"]
+        if request.seed is not None:
+            options["seed"] = request.seed
         payload: dict[str, Any] = {
             "model": model,
             "messages": _chat_messages(request),
@@ -282,7 +300,9 @@ class OllamaClientManager:
         if options:
             payload["options"] = options
         if request.bound_tools:
-            payload["tools"] = _ollama_tools(request.bound_tools)
+            payload["tools"] = _ollama_tools(
+                request.bound_tools, provider=self.provider_name
+            )
         structured_requested = (
             request.response_format == ResponseFormat.STRUCTURED_OUTPUT
             and request.output_json_schema is not None
@@ -456,7 +476,10 @@ class ClaudeCliClientManager:
         prompt = _compose_prompt(request)
         if request.bound_tools:
             # Text-only CLI: a best-effort ReAct protocol the runtime loop drives.
-            prompt = f"{prompt}\n\n{_react_tool_manifest(request.bound_tools)}"
+            prompt = (
+                f"{prompt}\n\n"
+                f"{_react_tool_manifest(request.bound_tools, provider=self.provider_name)}"
+            )
         structured_requested = (
             request.response_format == ResponseFormat.STRUCTURED_OUTPUT
             and request.output_json_schema is not None

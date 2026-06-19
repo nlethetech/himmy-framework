@@ -194,35 +194,110 @@ def _link_target_allowed(
     )
 
 
+def _scalar_types(prop: dict[str, Any]) -> set[str]:
+    """The set of JSON-schema scalar type names a property declares (if any).
+
+    Reads ``type`` (a single string or a list union). Only the scalar targets we can
+    losslessly coerce a string into — ``integer``/``number``/``boolean`` — are
+    returned; everything else is dropped so coercion never fires for them.
+    """
+    declared = prop.get("type")
+    names: set[str]
+    if isinstance(declared, str):
+        names = {declared}
+    elif isinstance(declared, list):
+        names = {t for t in declared if isinstance(t, str)}
+    else:
+        return set()
+    return names & {"integer", "number", "boolean"}
+
+
+def _coerce_scalar(value: str, targets: set[str]) -> tuple[bool, Any]:
+    """Losslessly coerce a stringified scalar to a declared scalar type.
+
+    Returns ``(True, coerced)`` only when ``value`` round-trips EXACTLY to a target
+    the schema declares (so no information is lost and an ambiguous/lossy value is
+    left untouched). Integer is tried before number so ``"5"`` becomes ``5`` (int)
+    when ``integer`` is allowed, and ``"3.14"`` becomes a float only under ``number``.
+    Booleans accept just the canonical ``"true"``/``"false"`` tokens. Returns
+    ``(False, value)`` when no lossless coercion applies.
+    """
+    if "boolean" in targets and value in ("true", "false"):
+        return True, value == "true"
+    if "integer" in targets:
+        try:
+            parsed = int(value)
+        except ValueError:
+            parsed = None
+        # Lossless only when the canonical str of the parsed int equals the input
+        # (rejects "5.0", " 5", "0x5", "+5", leading zeros like "05", etc.).
+        if parsed is not None and str(parsed) == value:
+            return True, parsed
+    if "number" in targets:
+        try:
+            parsed_f = float(value)
+        except ValueError:
+            parsed_f = None
+        # Reject non-finite (inf/nan) and require an exact float round-trip so we
+        # never silently reshape the model's literal (e.g. "1e3" -> 1000.0).
+        if (
+            parsed_f is not None
+            and parsed_f == parsed_f  # not NaN
+            and parsed_f not in (float("inf"), float("-inf"))
+            and repr(parsed_f) == value
+        ):
+            return True, parsed_f
+    return False, value
+
+
 def _coerce_lenient_args(
     args: dict[str, Any], schema: dict[str, Any]
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[str]]:
     """Tolerate small-model arg fuzz before strict validation (Tier 1.2).
 
-    Two minimal, safe normalizations against an object schema: (1) drop keys the
-    model hallucinated that the schema forbids (``additionalProperties: false``); and
-    (2) drop ``null``-valued *optional* keys (a model emitting ``"date": null`` for an
-    absent optional should behave like omitting it, so the handler's default applies).
-    Required fields and typed values are left untouched, so validation stays strict.
+    Three minimal, safe normalizations against an object schema: (1) drop keys the
+    model hallucinated that the schema forbids (``additionalProperties: false``); (2)
+    drop ``null``-valued *optional* keys (a model emitting ``"date": null`` for an
+    absent optional should behave like omitting it, so the handler's default applies);
+    and (3) LOSSLESSLY coerce a stringified scalar (``"5"`` -> ``5``, ``"3.14"`` ->
+    ``3.14``, ``"true"`` -> ``True``) ONLY when the schema declares that scalar type
+    and the conversion round-trips exactly. This closes the gap where the local
+    Ollama/Claude-CLI path (small models that stringify everything) was strictly worse
+    than cloud providers, whose strict validator hard-fails on a stringified scalar.
+
+    Required fields keep their values; coercion never widens an ambiguous/lossy string.
+    Returns ``(cleaned_args, coerced_keys)`` — ``coerced_keys`` names every key whose
+    value was scalar-coerced, recorded on the result metadata for measurement.
     """
     properties = schema.get("properties") or {}
     required = set(schema.get("required") or [])
     extras_allowed = schema.get("additionalProperties", True) is not False
     cleaned: dict[str, Any] = {}
+    coerced_keys: list[str] = []
     for key, value in args.items():
-        if key not in properties:
+        prop = properties.get(key)
+        if prop is None:
             if extras_allowed:
                 cleaned[key] = value  # schema permits extras — keep as-is
             continue  # otherwise strip the unknown key
         if value is None and key not in required:
-            prop_type = properties[key].get("type")
+            prop_type = prop.get("type")
             allows_null = prop_type == "null" or (
                 isinstance(prop_type, list) and "null" in prop_type
             )
             if not allows_null:
                 continue  # drop the null optional → treated as omitted
+        # Lossless scalar coercion: only a bare string against a declared scalar type.
+        if isinstance(value, str) and isinstance(prop, dict):
+            targets = _scalar_types(prop)
+            if targets:
+                did, coerced = _coerce_scalar(value, targets)
+                if did:
+                    cleaned[key] = coerced
+                    coerced_keys.append(key)
+                    continue
         cleaned[key] = value
-    return cleaned
+    return cleaned, coerced_keys
 
 
 def _schema_hint(schema: dict[str, Any]) -> str:
@@ -458,9 +533,10 @@ class ToolService:
         # --- input validation against args_json_schema ---------------------
         args = dict(invocation.args)
         schema = definition.args_json_schema
+        coerced_keys: list[str] = []
         if schema and schema.get("type") == "object":
             if self._lenient_args:
-                args = _coerce_lenient_args(args, schema)
+                args, coerced_keys = _coerce_lenient_args(args, schema)
             err = validate_against_schema(args, schema)
             if err is not None:
                 # Self-correction (Tier 1.4): hand the model the schema so it can fix
@@ -553,6 +629,10 @@ class ToolService:
             outcome="success",
             result=raw,
             latency_ms=latency_ms,
+            # Record which args were losslessly scalar-coerced (small-model fuzz
+            # repair) so the gap-closing can be measured; absent when none, so the
+            # default-path metadata is unchanged.
+            metadata=({"coerced_args": coerced_keys} if coerced_keys else {}),
         )
 
         # --- post-execution hook (may transform the result) ---------------

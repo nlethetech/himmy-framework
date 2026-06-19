@@ -49,6 +49,9 @@ class InferenceErrorCode(str, Enum):
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     INVALID_REQUEST = "INVALID_REQUEST"
     TIMEOUT = "TIMEOUT"
+    #: The provider returned a structured reply that violated the requested
+    #: ``output_json_schema`` (validated at the service boundary).
+    OUTPUT_VALIDATION = "OUTPUT_VALIDATION"
     UNKNOWN = "UNKNOWN"
 
 
@@ -223,6 +226,12 @@ class InferenceRequest(BaseModel):
     output_json_schema: dict[str, Any] | None = None
     workflow: WorkflowState | None = None
     generation_params: dict[str, Any] = {}
+    #: Optional provider sampling seed for reproducible generations. ``None`` (the
+    #: default) is a byte-identical no-op: managers omit the seed kwarg entirely so
+    #: payloads match the no-seed path. When set it is forwarded to providers that
+    #: support seeding (OpenAI ``seed``, Ollama ``options.seed``) and partitions the
+    #: response cache (it is folded into ``generation_params`` for the cache key).
+    seed: int | None = None
     timeout_seconds: float = 30.0
     route_override: str | None = None
     metadata: dict[str, Any] = {}
@@ -232,6 +241,14 @@ class InferenceRequest(BaseModel):
     #: ``None`` means no execution capability — managers then synthesize stub results.
     tool_executor: ToolExecutor | None = None
     tool_names_override: list[str] | None = None
+    #: When a structured reply is requested (``STRUCTURED_OUTPUT`` /
+    #: ``JSON_OBJECT`` with an ``output_json_schema``), validate the provider's parsed
+    #: ``output_structured`` against that schema at the service boundary; a violation
+    #: yields a FAILED response with ``OUTPUT_VALIDATION`` rather than silently shipping
+    #: SUCCESS. ``True`` by default. Callers that run their own richer validation (e.g.
+    #: :class:`~himmy.typed_agent.TypedAgent`, which re-validates against a pydantic
+    #: model with its own repair loop) set this ``False`` to avoid double-validation.
+    validate_structured_output: bool = True
     #: Optional prompt-cache hint for the stable system+tools prefix. ``None`` (the
     #: default) yields byte-identical payloads to the no-cache path; a manager that
     #: supports caching consults it only when it is non-``None`` and ``enabled``.
@@ -315,6 +332,9 @@ class LLMConfig(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     top_p: float | None = None
+    #: Optional sampling seed for reproducible generations (mapped to
+    #: :attr:`InferenceRequest.seed`); ``None`` leaves the no-seed path unchanged.
+    seed: int | None = None
     timeout_seconds: float | None = None
     use_cache: bool | None = None
     route_override: str | None = None
