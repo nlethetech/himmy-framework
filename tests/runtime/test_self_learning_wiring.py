@@ -92,6 +92,33 @@ def test_self_learning_on_wires_adapter_and_provider() -> None:
     assert set(adapter._tool_names or []) == {"ping", "wire_money"}  # type: ignore[attr-defined]
 
 
+def test_build_inside_running_loop_does_not_raise() -> None:
+    """Building a self-learning runtime from INSIDE a running event loop must not crash.
+
+    The server path (FastAPI) builds the runtime while its event loop is already running.
+    The build-time reputation prime used a blocking ``asyncio.run`` which raises
+    "cannot be called from a running event loop" there. The fix detects the running loop
+    and schedules the prime as a background task instead, so the build succeeds and the
+    adapter/provider are still wired. The first turn may read a neutral snapshot until the
+    task lands — that is harmless.
+    """
+
+    async def _build() -> object:
+        spec = AgentSpec(
+            name="t",
+            self_learning=True,
+            tools_module=_TOOLS_MODULE,
+        )
+        runtime, _registry = build_runtime_for_spec(spec)
+        # Let the scheduled background refresh task run to completion.
+        await asyncio.sleep(0)
+        return runtime
+
+    runtime = asyncio.run(_build())
+    assert "learned_hints" in _adapter_names(runtime)
+    assert runtime.tool_service._reputation_provider is not None  # type: ignore[union-attr]
+
+
 def test_hint_adapter_pinned_to_bound_subset_not_full_registry() -> None:
     """When the spec pins a tool subset, the hint adapter assesses ONLY that subset.
 

@@ -436,7 +436,23 @@ def build_runtime_for_spec(
             # (not on the per-turn hot path), so the sync ``bound_tools`` reorder reads a
             # ready snapshot with no I/O. Best-effort: ``refresh`` swallows any error.
             tool_names = [d.name for d in registry.list()]
-            asyncio.run(reputation_provider.refresh(tool_names))
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is None:
+                # No loop running (the one-shot CLI / offline path): prime synchronously
+                # so the snapshot is ready before the first turn — byte-identical to before.
+                asyncio.run(reputation_provider.refresh(tool_names))
+            else:
+                # A loop is ALREADY running (the FastAPI/server path builds the runtime from
+                # inside its event loop). ``asyncio.run`` would raise "cannot be called from a
+                # running event loop", so schedule the refresh as a background task on the live
+                # loop instead. The first turn or two may read a not-yet-primed (neutral)
+                # snapshot, which is harmless — the sync ``bound_tools`` reorder simply falls
+                # back to the declared order until the task lands. Best-effort: ``refresh``
+                # swallows its own errors; the task is fire-and-forget by design.
+                running_loop.create_task(reputation_provider.refresh(tool_names))
             # Pin the hint adapter to the run's BOUND subset (``spec.tools``) when one is
             # declared, not the full registry — the registry holds every registered pack/
             # module/http tool regardless of ``spec.tools``, but the model is only advertised
