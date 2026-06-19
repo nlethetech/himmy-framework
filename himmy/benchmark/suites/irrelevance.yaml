@@ -1,0 +1,76 @@
+name: irrelevance
+# The abstention / irrelevance suite. Over-calling — reaching for a tool when none is
+# needed — is a top small/open-model failure mode, and BFCL scores it first-class. Every
+# task here BINDS tools the prompt does NOT need (the `packs` give the model real tools to
+# misuse, exactly like a distractor pack) and grades `max_tool_calls: 0`: the correct
+# behaviour is to answer from the prompt/knowledge alone and call no tool.
+#
+# These tasks feed the `irrelevance_accuracy` headline metric (the share of irrelevance
+# trials where the model abstained), reported SEPARATELY from tool-call accuracy — a model
+# can be excellent at calling the right tool yet still over-call when it shouldn't call at
+# all. Category is `irrelevance` (the first-class marker the scorecard keys off of).
+#
+# Reported, not gated: this suite is not part of the pinned baseline floor; it is a
+# diagnostic on a distinct failure axis. Every task is OFFLINE and self-contained.
+tasks:
+  - id: irrel_general_knowledge
+    category: irrelevance
+    # A pure-knowledge question. The calculator/clock are bound but irrelevant — the
+    # answer needs no tool.
+    prompt: "What is the capital of Japan? Answer in one word, no tools."
+    packs: [utils]
+    grade: { type: contains, value: tokyo }
+    trajectory: { type: max_tool_calls, value: 0 }
+
+  - id: irrel_trivial_arithmetic
+    category: irrelevance
+    # Trivial mental arithmetic. A calculator IS bound, but 2 + 2 needs no tool — reaching
+    # for it is over-calling.
+    prompt: "What is 2 plus 2? Answer with just the number. Do not use any tool."
+    packs: [utils]
+    grade: { type: numeric, value: 4 }
+    trajectory: { type: max_tool_calls, value: 0 }
+
+  - id: irrel_no_file_needed
+    category: irrelevance
+    # File tools are bound, but the prompt contains everything: no file exists to read.
+    # A model that calls read_file/list_dir is over-calling.
+    prompt: >-
+      The password is HELIOTROPE. Repeat the password back to me. Do not read
+      any file — it is right here in this message.
+    packs: [files]
+    grade: { type: contains, value: heliotrope }
+    trajectory: { type: max_tool_calls, value: 0 }
+
+  - id: irrel_no_web_needed
+    category: irrelevance
+    # Web tools are bound, but the fact is general knowledge and the prompt forbids
+    # searching. Calling web_search is over-calling.
+    prompt: >-
+      How many days are in a (non-leap) week? Answer with just the number.
+      Do not search the web.
+    packs: [web]
+    grade: { type: numeric, value: 7 }
+    trajectory: { type: max_tool_calls, value: 0 }
+
+  - id: irrel_no_sql_needed
+    category: irrelevance
+    # SQL tools are bound, but there is no database and the answer is in the prompt.
+    # A model that calls sql_query/sql_schema is over-calling.
+    prompt: >-
+      A basket holds 3 mangoes and 4 guavas. How many fruits are in the basket
+      in total? Answer with just the number. There is no database to query.
+    packs: [data]
+    grade: { type: numeric, value: 7 }
+    trajectory: { type: max_tool_calls, value: 0 }
+
+  - id: irrel_definition
+    category: irrelevance
+    # A definitional question with many tools bound at once (the strongest distractor
+    # case). The model should answer from knowledge and touch none of them.
+    prompt: >-
+      In one short sentence, what is the primary color of a clear daytime sky?
+      Answer directly without using any tool.
+    packs: [utils, web, files]
+    grade: { type: contains, value: blue }
+    trajectory: { type: max_tool_calls, value: 0 }

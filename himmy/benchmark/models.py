@@ -20,6 +20,13 @@ from himmy.benchmark.stats import (
     percentile,
     wilson_interval,
 )
+from himmy.benchmark.trajectory import Trajectory
+
+#: Task category that marks an irrelevance/abstention task — one that binds tools the
+#: prompt does NOT need, where calling any tool is the failure (over-calling is a top
+#: small/open-model failure, scored first-class by BFCL). The ``irrelevance_accuracy``
+#: headline metric is computed over exactly these tasks, separate from tool-call accuracy.
+ABSTENTION_CATEGORY = "irrelevance"
 
 
 @dataclass(frozen=True)
@@ -189,6 +196,11 @@ class TrialResult:
     error: str | None = None
     answer_ok: bool = True
     trajectory_ok: bool | None = None
+    # The full structured tool-call trajectory (name + args + result, grouped by the turn
+    # each call was emitted in) the arg-level / parallelism graders run against. The flat
+    # name-only `tools_called` above is its `.names` view, kept for back-compat with the
+    # baseline gate, cache, and the legacy trajectory graders. Empty when no tool was used.
+    trajectory: Trajectory = field(default_factory=Trajectory)
     # LLM-as-judge tier (appended last so positional construction in existing tests stays
     # valid). ``judged`` marks a trial graded by a JUDGE model (a judge-tier task) — these
     # are reported separately and NEVER fold into the deterministic accuracy/gate.
@@ -263,6 +275,37 @@ class TaskScore:
     def is_judge_tier(self) -> bool:
         """Whether this task is graded by an LLM judge (any trial ``judged``)."""
         return any(t.judged for t in self.trials)
+
+    @property
+    def is_irrelevance(self) -> bool:
+        """Whether this is an irrelevance/abstention task (category ``irrelevance``).
+
+        These tasks bind tools the prompt does NOT need; the correct behaviour is to
+        abstain (call no tool). The category is the first-class marker (BFCL scores
+        irrelevance as its own suite), kept distinct from the gated accuracy/tool-call
+        metrics so over-calling reads as its own headline number.
+        """
+        return self.category == ABSTENTION_CATEGORY
+
+    @property
+    def abstained(self) -> int:
+        """Irrelevance trials where the model correctly abstained (called no tool).
+
+        Excludes errored trials: a provider/schema error (e.g. a 400) is not an
+        abstention DECISION — the model never got to choose — so it must not be
+        counted as a correct abstention.
+        """
+        return sum(1 for t in self.trials if not t.tools_called and not t.error)
+
+    @property
+    def abstention_rate(self) -> float | None:
+        """Fraction of (non-errored) trials that abstained (``None`` for non-irrelevance)."""
+        if not self.is_irrelevance:
+            return None
+        clean = [t for t in self.trials if not t.error]
+        if not clean:
+            return None
+        return self.abstained / len(clean)
 
     @property
     def judge_passes(self) -> int:
@@ -355,6 +398,42 @@ class ModelScorecard:
         """Total trials across the suite whose trajectory grader explicitly failed."""
         return sum(1 for t in self._all if t.trajectory_ok is False)
 
+    @property
+    def irrelevance_scores(self) -> list[TaskScore]:
+        """The irrelevance/abstention task scores (category ``irrelevance``)."""
+        return [s for s in self.task_scores if s.is_irrelevance]
+
+    @property
+    def has_irrelevance_tier(self) -> bool:
+        """Whether the suite has any irrelevance/abstention task."""
+        return bool(self.irrelevance_scores)
+
+    @property
+    def irrelevance_accuracy(self) -> float | None:
+        """Fraction of irrelevance trials the model correctly ABSTAINED on (no tool).
+
+        The BFCL-style abstention headline: over tasks that bind tools the prompt does
+        NOT need, the share of trials where the model used no tool at all. A model that
+        always abstains scores ``1.0``; one that over-calls on every such task scores
+        ``0.0``. ``None`` when the suite has no irrelevance task. Reported SEPARATELY
+        from :attr:`tool_call_accuracy` (over-calling is its own failure mode).
+
+        Errored trials (e.g. a provider 400) are EXCLUDED from both numerator and
+        denominator — an error is not an abstention decision, so it must not inflate
+        the score; surfacing errors is :attr:`error_rate`'s job.
+        """
+        trials = [
+            t for s in self.irrelevance_scores for t in s.trials if not t.error
+        ]
+        if not trials:
+            return None
+        return sum(1 for t in trials if not t.tools_called) / len(trials)
+
+    @property
+    def irrelevance_total_trials(self) -> int:
+        """Total irrelevance/abstention trials run."""
+        return sum(len(s.trials) for s in self.irrelevance_scores)
+
     def by_category(self) -> dict[str, float]:
         """Accuracy per task category (deterministic tier only; feeds the gate)."""
         cats: dict[str, list[TrialResult]] = {}
@@ -436,4 +515,5 @@ __all__ = [
     "TaskScore",
     "ModelScorecard",
     "compare_scorecards",
+    "ABSTENTION_CATEGORY",
 ]

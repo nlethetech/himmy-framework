@@ -94,13 +94,14 @@ _NOISE_Z = 1.6448536269514722
 _METRIC_KEYS = (
     "accuracy",
     "tool_call_accuracy",
+    "irrelevance_accuracy",
     "error_rate",
     "p50_latency_s",
     "p95_latency_s",
     "mean_cost",
 )
 #: Metrics where a *lower* value is worse (a drop is a regression).
-_HIGHER_IS_BETTER = ("accuracy", "tool_call_accuracy")
+_HIGHER_IS_BETTER = ("accuracy", "tool_call_accuracy", "irrelevance_accuracy")
 #: Metrics where a *higher* value is worse (a rise is a regression).
 _LOWER_IS_BETTER = ("error_rate",)
 
@@ -155,6 +156,9 @@ def _record(
         "metrics": {
             "accuracy": card.accuracy,
             "tool_call_accuracy": card.tool_call_accuracy,
+            # Irrelevance/abstention headline (None when the suite has no irrelevance
+            # task). Tracked for trend/regression like the other accuracy-type metrics.
+            "irrelevance_accuracy": card.irrelevance_accuracy,
             "error_rate": card.error_rate,
             "p50_latency_s": card.p50_latency,
             "p95_latency_s": card.p95_latency,

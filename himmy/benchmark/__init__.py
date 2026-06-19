@@ -62,6 +62,19 @@ def nepali_suite() -> BenchmarkSuite:
     return BenchmarkSuite.from_yaml(Path(__file__).parent / "suites" / "nepali.yaml")
 
 
+def irrelevance_suite() -> BenchmarkSuite:
+    """Load the packaged ``irrelevance`` abstention suite.
+
+    Every task binds tools the prompt does NOT need and grades ``max_tool_calls: 0`` —
+    the correct behaviour is to abstain (call no tool). Feeds the ``irrelevance_accuracy``
+    headline metric, reported separately from tool-call accuracy (over-calling is a top
+    small/open-model failure mode, scored first-class by BFCL). Reported, not gated.
+    """
+    return BenchmarkSuite.from_yaml(
+        Path(__file__).parent / "suites" / "irrelevance.yaml"
+    )
+
+
 def multiagent_suite() -> BenchmarkSuite:
     """Load the packaged ``multiagent`` collaboration suite (handoff/delegation/chat).
 
@@ -86,6 +99,7 @@ __all__ = [
     "default_suite",
     "nepali_suite",
     "multiagent_suite",
+    "irrelevance_suite",
     "JudgeVerdict",
     "SameModelJudgeError",
     "load_baseline",

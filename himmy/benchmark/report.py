@@ -64,10 +64,17 @@ def render_markdown(cards: Sequence[ModelScorecard], *, suite_name: str = "") ->
     trials = cards[0].task_scores[0].n if cards[0].task_scores else 0
     n_tasks = len(cards[0].task_scores)
     show_traj = any(card.trajectory_failures for card in cards)
+    # Irrelevance/abstention is a headline metric SEPARATE from tool-call accuracy: it
+    # measures whether the model declines to call a tool when none is needed (over-calling
+    # is a top small/open-model failure). Only shown when the suite has irrelevance tasks.
+    show_irrel = any(card.has_irrelevance_tier for card in cards)
     header = (
         "| Model | Accuracy (95% CI) | Tool-call | p50 | p95 | Cost/trial | Errors |"
     )
     rule = "|---|---|---|---|---|---|---|"
+    if show_irrel:
+        header += " Abstain |"
+        rule += "---|"
     if show_traj:
         header += " Traj✗ |"
         rule += "---|"
@@ -89,9 +96,18 @@ def render_markdown(cards: Sequence[ModelScorecard], *, suite_name: str = "") ->
             f"| ${card.mean_cost:.4f} "
             f"| {_pct(card.error_rate)} |"
         )
+        if show_irrel:
+            row += f" {_pct(card.irrelevance_accuracy)} |"
         if show_traj:
             row += f" {card.trajectory_failures} |"
         lines.append(row)
+    if show_irrel:
+        lines += [
+            "",
+            "_`Abstain` = fraction of irrelevance tasks (tools bound but not needed) "
+            "where the model correctly called no tool. Separate from `Tool-call` "
+            "accuracy — over-calling when no tool is needed is its own failure mode._",
+        ]
     if show_traj:
         lines += _trajectory_section(cards)
 
@@ -324,6 +340,10 @@ def to_json(cards: Sequence[ModelScorecard], *, suite_name: str = "") -> dict[st
                 "accuracy": card.accuracy,
                 "accuracy_ci": list(card.accuracy_ci),
                 "tool_call_accuracy": card.tool_call_accuracy,
+                # Irrelevance/abstention headline, separate from tool_call_accuracy. None
+                # when the suite has no irrelevance task.
+                "irrelevance_accuracy": card.irrelevance_accuracy,
+                "irrelevance_total_trials": card.irrelevance_total_trials,
                 "p50_latency_s": card.p50_latency,
                 "p95_latency_s": card.p95_latency,
                 "mean_cost": card.mean_cost,

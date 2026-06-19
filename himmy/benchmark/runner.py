@@ -24,6 +24,7 @@ from himmy.benchmark.models import (
     TaskScore,
     TrialResult,
 )
+from himmy.benchmark.trajectory import Trajectory
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Iterator, Sequence
@@ -34,8 +35,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 ProgressFn = "Callable[[ModelSpec, BenchmarkTask, int, int], None]"
 
 #: A trial's normalized outcome, shared by the single-agent and team code paths:
-#: ``(answer, ordered_tools_called, turns, (input_tokens, output_tokens), cost, error)``.
-_RunOutcome = tuple[str, list[str], int, tuple[int, int], float, "str | None"]
+#: ``(answer, structured_trajectory, turns, (input_tokens, output_tokens), cost,
+#: error)``. The flat name-only ``tools_called`` view is derived from the trajectory
+#: (:attr:`Trajectory.names`) so the existing name-only graders are unchanged.
+_RunOutcome = tuple[str, "Trajectory", int, tuple[int, int], float, "str | None"]
 
 
 class BenchmarkRunner:
@@ -190,7 +193,8 @@ class BenchmarkRunner:
                 else:
                     outcome = await self._run_single(spec, task, config)
             latency = self._clock() - started
-            answer, called, turns, tokens, cost, run_error = outcome
+            answer, traj, turns, tokens, cost, run_error = outcome
+            called = traj.names
             # A judge-tier task is graded by an LLM judge (reported, never gating). Its
             # deterministic `grade`/`trajectory` blocks are OPTIONAL, but when declared
             # they still gate `correct` *in addition to* the judge verdict — matching the
@@ -202,7 +206,7 @@ class BenchmarkRunner:
             # Trajectory grading is optional: when the task declares a `trajectory`
             # block, the ordered tool-call sequence must satisfy it too.
             trajectory_ok = (
-                grade_trajectory(task.trajectory, called) if task.trajectory else None
+                grade_trajectory(task.trajectory, traj) if task.trajectory else None
             )
             # A judge-tier candidate with NO judge configured records the trial ungraded
             # (the documented ModelSpec degrade path) rather than crashing — so the
@@ -227,6 +231,7 @@ class BenchmarkRunner:
                 task_id=task.id,
                 answer=answer,
                 tools_called=called,
+                trajectory=traj,
                 correct=correct,
                 tool_ok=(set(task.expect_tools) <= set(called))
                 if task.expect_tools
@@ -296,10 +301,15 @@ class BenchmarkRunner:
             route_tools=spec.tool_router,
         )
         final = loop.final
-        called = [tc.tool_name for t in loop.turns for tc in t.tool_calls]
+        # Record the FULL tool exchange (name + args + result) grouped by the turn it was
+        # emitted in, so arg-level + within-turn-parallelism graders can run. The flat
+        # name-only view (Trajectory.names) is what the legacy graders still see.
+        traj = Trajectory.from_turns(
+            (t.tool_calls, t.tool_returns) for t in loop.turns
+        )
         return (
             final.output_text or "",
-            called,
+            traj,
             loop.turn_count,
             (final.input_tokens, final.output_tokens),
             loop.total_cost,
@@ -370,13 +380,16 @@ class BenchmarkRunner:
             output_text, total_cost = team_result.output_text, team_result.total_cost
             stop_reason = team_result.stopped_reason
 
-        called = [tc.tool_name for _, r in turns for tc in r.tool_calls]
+        # Each orchestrator turn is one member's RunResult; its tool calls/returns are the
+        # turn's parallel batch. The synthetic transfer_to_*/ask_*/final_answer calls flow
+        # in too (they live in r.tool_calls), so routing graders still see them by name.
+        traj = Trajectory.from_turns((r.tool_calls, r.tool_returns) for _, r in turns)
         in_tokens = sum(r.input_tokens for _, r in turns)
         out_tokens = sum(r.output_tokens for _, r in turns)
         error = self._team_error(turns, stop_reason)
         return (
             output_text or "",
-            called,
+            traj,
             len(turns),
             (in_tokens, out_tokens),
             total_cost,

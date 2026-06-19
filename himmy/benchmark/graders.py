@@ -29,19 +29,44 @@ fails loud rather than silently mis-scoring.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from himmy.benchmark.trajectory import RecordedCall, Trajectory
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Sequence
+
+#: Argument-/result-/parallelism-level trajectory grader types. These require the full
+#: structured :class:`~himmy.benchmark.trajectory.Trajectory` (call args, results, and
+#: turn grouping), not just the flat name-only sequence the legacy graders use. A flat
+#: ``list[str]`` carries no args/results, so :func:`grade_trajectory` returns ``False``
+#: (no matching arg/result — never crashes) if one is graded against a name-only
+#: sequence. In practice the runner always passes a full :class:`Trajectory`.
+ARG_TRAJECTORY_TYPES = frozenset(
+    {
+        "tool_called_with",
+        "arg_equals",
+        "arg_matches",
+        "result_contains",
+        "parallel_in_turn",
+        "max_parallel",
+    }
+)
 
 #: Grader ``type`` values that grade the ordered tool-call trajectory rather than the
 #: final answer text. :func:`grade` uses this set to reject a trajectory-type leaf placed
 #: in an answer ``grade`` block (fail-loud), not to silently route it to the other family.
-TRAJECTORY_TYPES = frozenset(
-    {
-        "first_tool",
-        "max_tool_calls",
-        "tool_called",
-        "tool_not_called",
-        "tool_sequence",
-    }
+TRAJECTORY_TYPES = (
+    frozenset(
+        {
+            "first_tool",
+            "max_tool_calls",
+            "tool_called",
+            "tool_not_called",
+            "tool_sequence",
+        }
+    )
+    | ARG_TRAJECTORY_TYPES
 )
 
 
@@ -103,11 +128,22 @@ def grade(spec: dict[str, Any], answer: str) -> bool:
     raise ValueError(f"unknown grader type {gtype!r}")
 
 
-def grade_trajectory(spec: dict[str, Any], tool_sequence: list[str]) -> bool:
-    """Return whether ``tool_sequence`` satisfies the trajectory grader ``spec``.
+def grade_trajectory(
+    spec: dict[str, Any],
+    tool_sequence: Sequence[str] | Trajectory | None,
+) -> bool:
+    """Return whether the tool-call trajectory satisfies the trajectory grader ``spec``.
 
-    ``tool_sequence`` is the agent's tools called *in order, with repeats* (a benchmark
-    trial's :attr:`~himmy.benchmark.models.TrialResult.tools_called`). Predicate types:
+    ``tool_sequence`` is EITHER the agent's tools called *in order, with repeats* (the
+    flat name-only ``list[str]`` — a benchmark trial's
+    :attr:`~himmy.benchmark.models.TrialResult.tools_called`) OR the richer structured
+    :class:`~himmy.benchmark.trajectory.Trajectory` (call args, results, and turn
+    grouping). The name-only graders accept either; the argument-/result-/parallelism
+    graders need a :class:`Trajectory` (a flat list carries no args/results, so they
+    return ``False`` — no matching arg — rather than crashing or mis-scoring). In
+    practice the runner always passes a full :class:`Trajectory`.
+
+    Name-only predicate types (work on either input):
 
     * ``first_tool`` — the first tool called must equal ``spec["value"]`` (fails on an
       empty sequence — nothing was called first).
@@ -120,10 +156,28 @@ def grade_trajectory(spec: dict[str, Any], tool_sequence: list[str]) -> bool:
     * ``tool_sequence`` — ``spec["value"]`` (a list of tool names) appears as an ordered
       **subsequence** (gaps allowed, order preserved) of the trajectory.
 
+    Argument-/result-/parallelism predicate types (require a :class:`Trajectory` — the
+    BFCL AST-check equivalent for "right tool, WRONG args", the dominant small-model
+    failure):
+
+    * ``tool_called_with`` — ``spec["tool"]`` was called somewhere with arguments
+      MATCHING ``spec["args"]`` (each listed arg present and equal; extra args ignored).
+    * ``arg_equals`` — some call to ``spec["tool"]`` passed ``spec["arg"]`` exactly equal
+      to ``spec["value"]`` (with forgiving scalar coercion: ``"42"`` matches ``42``).
+    * ``arg_matches`` — some call to ``spec["tool"]`` passed ``spec["arg"]`` whose string
+      form matches the regex ``spec["value"]`` (case-insensitive).
+    * ``result_contains`` — some call to ``spec["tool"]`` returned a result whose string
+      form contains ``spec["value"]`` (case-insensitive substring). Only calls whose
+      result was captured count.
+    * ``parallel_in_turn`` — ``spec["value"]`` (a list of tool names) were ALL called
+      within a single assistant turn (within-turn parallelism).
+    * ``max_parallel`` — at most ``spec["value"]`` tool calls in any single turn.
+
     Composes under ``all_of`` / ``any_of`` exactly like :func:`grade`, over a list of
     trajectory sub-specs under ``of`` (a missing/empty ``of`` raises — fail loud).
     """
-    calls = list(tool_sequence or [])
+    traj = _as_trajectory(tool_sequence)
+    calls = traj.names
     gtype = spec.get("type")
 
     if gtype == "first_tool":
@@ -138,13 +192,107 @@ def grade_trajectory(spec: dict[str, Any], tool_sequence: list[str]) -> bool:
     if gtype == "tool_sequence":
         expected = [str(x) for x in spec["value"]]
         return _is_subsequence(expected, calls)
+    if gtype in ARG_TRAJECTORY_TYPES:
+        return _grade_arg_trajectory(spec, traj, gtype)
     if gtype in ("all_of", "any_of"):
         sub = spec.get("of")
         if not sub:
             raise ValueError(f"{gtype} grader requires a non-empty 'of' list")
         combiner = all if gtype == "all_of" else any
-        return combiner(grade_trajectory(s, calls) for s in sub)
+        return combiner(grade_trajectory(s, traj) for s in sub)
     raise ValueError(f"unknown trajectory grader type {gtype!r}")
+
+
+def _as_trajectory(value: Sequence[str] | Trajectory | None) -> Trajectory:
+    """Coerce the grader input to a :class:`Trajectory`.
+
+    A :class:`Trajectory` passes through. A flat name-only sequence (the legacy input,
+    or ``None``) is wrapped as a single turn of arg-less calls — enough for the name-only
+    graders; the arg/result graders then find no matching arg/result and return ``False``
+    (never crash) on such an input.
+    """
+    if isinstance(value, Trajectory):
+        return value
+    names = list(value or [])
+    return Trajectory(turns=[[RecordedCall(name=str(n)) for n in names]] if names else [])
+
+
+def _grade_arg_trajectory(spec: dict[str, Any], traj: Trajectory, gtype: str) -> bool:
+    """Argument-/result-/parallelism graders over the structured trajectory."""
+    if gtype == "parallel_in_turn":
+        expected = {str(x) for x in spec["value"]}
+        return any(expected <= {c.name for c in turn} for turn in traj.turns)
+    if gtype == "max_parallel":
+        return traj.max_parallel <= int(spec["value"])
+    # The remaining graders inspect a named tool's calls.
+    tool = str(spec["tool"])
+    matched = [c for c in traj.calls if c.name == tool]
+    if gtype == "tool_called_with":
+        want = dict(spec.get("args") or {})
+        return any(_args_match(c.args, want) for c in matched)
+    if gtype == "arg_equals":
+        arg = str(spec["arg"])
+        want = spec["value"]
+        return any(arg in c.args and _scalar_equal(c.args[arg], want) for c in matched)
+    if gtype == "arg_matches":
+        arg = str(spec["arg"])
+        pattern = str(spec["value"])
+        return any(
+            arg in c.args
+            and re.search(pattern, _as_text(c.args[arg]), re.IGNORECASE) is not None
+            for c in matched
+        )
+    if gtype == "result_contains":
+        needle = str(spec["value"]).lower()
+        return any(
+            c.has_result and needle in _as_text(c.result).lower() for c in matched
+        )
+    raise ValueError(f"unknown trajectory grader type {gtype!r}")  # pragma: no cover
+
+
+def _args_match(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+    """Whether every ``expected`` key is present in ``actual`` and scalar-equal.
+
+    Extra keys in ``actual`` are ignored (the model passing additional optional args is
+    not a failure). Scalar values compare with forgiving coercion (``"42"`` == ``42``);
+    non-scalar (list/dict) values compare structurally for equality.
+    """
+    for key, want in expected.items():
+        if key not in actual:
+            return False
+        if not _scalar_equal(actual[key], want):
+            return False
+    return True
+
+
+def _scalar_equal(actual: Any, expected: Any) -> bool:
+    """Forgiving equality: exact match, else compare string forms (``"42"`` == ``42``).
+
+    Models often stringify numeric/boolean args, so a literal ``==`` would spuriously
+    fail "right tool, right value, wrong type". We accept equality if the values are
+    equal OR their normalized string forms are equal.
+    """
+    if actual == expected:
+        return True
+    return _as_text(actual).strip().lower() == _as_text(expected).strip().lower()
+
+
+def _as_text(value: Any) -> str:
+    """Stable string form of an arg/result value for substring/regex/coercion checks."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float, list, dict)):
+        import json
+
+        try:
+            return json.dumps(value, sort_keys=True, default=str)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return str(value)
+    return str(value)
 
 
 def _is_subsequence(needle: list[str], haystack: list[str]) -> bool:
@@ -153,4 +301,9 @@ def _is_subsequence(needle: list[str], haystack: list[str]) -> bool:
     return all(item in it for item in needle)
 
 
-__all__ = ["grade", "grade_trajectory", "TRAJECTORY_TYPES"]
+__all__ = [
+    "grade",
+    "grade_trajectory",
+    "TRAJECTORY_TYPES",
+    "ARG_TRAJECTORY_TYPES",
+]

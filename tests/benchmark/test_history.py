@@ -395,3 +395,61 @@ def test_round_trip_append_then_trends(tmp_path: Path) -> None:
     )
     trend = compute_trends(load_history(path), threshold=0.1)[0]
     assert trend.regressed  # accuracy 1.0 -> 0.25
+
+
+def _irrelevance_card(name: str, abstained: list[bool]) -> ModelScorecard:
+    trials = [
+        TrialResult(
+            "irr",
+            "4",
+            [] if ok else ["calculator"],
+            ok,
+            None,
+            1.0,
+            1,
+            1,
+            1,
+            0.0,
+            trajectory_ok=ok,
+        )
+        for ok in abstained
+    ]
+    return ModelScorecard(
+        spec=ModelSpec("ollama", name),
+        task_scores=[TaskScore("irr", "irrelevance", trials)],
+    )
+
+
+def test_history_records_irrelevance_accuracy(tmp_path: Path) -> None:
+    path = tmp_path / "history.jsonl"
+    append_run(
+        [_irrelevance_card("m", [True, True, False, True])],
+        suite_name="irrelevance",
+        path=path,
+        when="t1",
+        enabled=True,
+    )
+    rec = load_history(path)[0]
+    assert rec["metrics"]["irrelevance_accuracy"] == 0.75
+
+
+def test_irrelevance_accuracy_regression_is_flagged(tmp_path: Path) -> None:
+    path = tmp_path / "history.jsonl"
+    append_run(
+        [_irrelevance_card("m", [True, True, True, True])],
+        suite_name="irrelevance",
+        path=path,
+        when="t1",
+        enabled=True,
+    )
+    append_run(
+        [_irrelevance_card("m", [False, False, False, True])],
+        suite_name="irrelevance",
+        path=path,
+        when="t2",
+        enabled=True,
+    )
+    trend = compute_trends(load_history(path), threshold=0.1)[0]
+    # Abstention fell 1.0 -> 0.25; irrelevance_accuracy is a higher-is-better metric.
+    regressed = {t.metric for t in trend.regressions}
+    assert "irrelevance_accuracy" in regressed
