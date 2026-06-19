@@ -15,6 +15,7 @@ APIs with the connected account's token. HTTP goes through a module-level
 from __future__ import annotations
 
 import base64
+import re
 import secrets as _secrets
 import time
 from email.message import EmailMessage
@@ -327,6 +328,7 @@ class CalendarEvent(BaseModel):
     end: str = ""
     location: str | None = None
     html_link: str | None = None
+    recurring_event_id: str | None = None  # set on instances of a repeating series
 
 
 async def calendar_list(max_results: int = 20) -> list[CalendarEvent]:
@@ -348,6 +350,33 @@ async def calendar_list(max_results: int = 20) -> list[CalendarEvent]:
     return [_parse_event(e) for e in data.get("items", [])]
 
 
+def _local_tz() -> str:
+    """The machine's IANA timezone (e.g. 'America/New_York'); falls back to UTC."""
+    try:
+        from tzlocal import get_localzone_name  # type: ignore[import-untyped]
+
+        return get_localzone_name() or "UTC"
+    except Exception:  # noqa: BLE001 - no tzlocal -> behave as UTC
+        return "UTC"
+
+
+def _time_field(value: str, all_day: bool) -> dict[str, Any]:
+    """Build a Google start/end field, interpreting a timed value as LOCAL wall-clock.
+
+    Users describe events in their own time ("1 PM" = 1 PM where they are), so we drop any
+    trailing ``Z`` / offset from the datetime and attach the machine's local time zone. Google
+    then places the event correctly and recurrence has the time-zone anchor it requires.
+    """
+    if all_day:
+        return {"date": value}
+    v = (value or "").strip()
+    if v.endswith("Z"):
+        v = v[:-1]
+    else:
+        v = re.sub(r"[+-]\d{2}:?\d{2}$", "", v)  # strip a trailing +05:45 / -04:00 offset
+    return {"dateTime": v, "timeZone": _local_tz()}
+
+
 def _parse_event(e: dict[str, Any]) -> CalendarEvent:
     start = e.get("start", {})
     end = e.get("end", {})
@@ -358,20 +387,30 @@ def _parse_event(e: dict[str, Any]) -> CalendarEvent:
         end=end.get("dateTime") or end.get("date") or "",
         location=e.get("location"),
         html_link=e.get("htmlLink"),
+        recurring_event_id=e.get("recurringEventId"),
     )
 
 
 async def calendar_create(
-    summary: str, start: str, end: str, *, all_day: bool = False
+    summary: str, start: str, end: str, *, all_day: bool = False,
+    location: str | None = None, recurrence: list[str] | None = None,
 ) -> CalendarEvent:
     """Create an event on the primary calendar.
 
     ``start``/``end`` are RFC3339 datetimes (``2026-06-09T14:00:00Z``) or, when
-    ``all_day``, plain ``YYYY-MM-DD`` dates.
+    ``all_day``, plain ``YYYY-MM-DD`` dates. ``recurrence`` is a list of RRULE strings
+    (e.g. ``["RRULE:FREQ=WEEKLY;BYDAY=SU"]``) for a repeating event.
     """
     token = await _access_token()
-    key = "date" if all_day else "dateTime"
-    payload = {"summary": summary, "start": {key: start}, "end": {key: end}}
+    payload: dict[str, Any] = {
+        "summary": summary,
+        "start": _time_field(start, all_day),
+        "end": _time_field(end, all_day),
+    }
+    if location:
+        payload["location"] = location
+    if recurrence:
+        payload["recurrence"] = recurrence
     async with _http() as client:
         resp = await client.post(
             _CAL_BASE,
@@ -380,6 +419,61 @@ async def calendar_create(
         )
         data = _json_or_raise(resp, "calendar create")
     return _parse_event(data)
+
+
+async def calendar_range(
+    time_min: str, time_max: str, max_results: int = 250
+) -> list[CalendarEvent]:
+    """List events between two RFC3339 datetimes (powers a calendar grid)."""
+    token = await _access_token()
+    async with _http() as client:
+        resp = await client.get(
+            _CAL_BASE,
+            params={
+                "timeMin": time_min, "timeMax": time_max,
+                "maxResults": max_results, "singleEvents": "true", "orderBy": "startTime",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        data = _json_or_raise(resp, "calendar range")
+    return [_parse_event(e) for e in data.get("items", [])]
+
+
+async def calendar_update(
+    event_id: str, *, summary: str | None = None, start: str | None = None,
+    end: str | None = None, all_day: bool = False, location: str | None = None,
+) -> CalendarEvent:
+    """Patch fields of an existing event on the primary calendar (only given fields change)."""
+    token = await _access_token()
+    payload: dict[str, Any] = {}
+    if summary is not None:
+        payload["summary"] = summary
+    if location is not None:
+        payload["location"] = location
+    if start is not None:
+        payload["start"] = _time_field(start, all_day)
+    if end is not None:
+        payload["end"] = _time_field(end, all_day)
+    async with _http() as client:
+        resp = await client.patch(
+            f"{_CAL_BASE}/{event_id}",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        data = _json_or_raise(resp, "calendar update")
+    return _parse_event(data)
+
+
+async def calendar_delete(event_id: str) -> None:
+    """Delete an event from the primary calendar."""
+    token = await _access_token()
+    async with _http() as client:
+        resp = await client.delete(
+            f"{_CAL_BASE}/{event_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    if resp.status_code not in (200, 204):
+        _json_or_raise(resp, "calendar delete")  # surface Google's error detail
 
 
 # ---- http helpers -------------------------------------------------------
