@@ -76,6 +76,17 @@ class ToolCallGrammarFlags:
     #: GENERIC keeps the native path (today's behavior); the ChatML-XML grammar uses
     #: the text path so the FORMAT is the single independent variable in an A/B.
     use_text_tool_path: bool = False
+    #: Number of synthesized few-shot exemplars to APPEND to the manifest (0 = none).
+    #: Small open-weight models (e.g. HimalayaGPT-0.5b) do NOT emit ``<tool_call>``
+    #: zero-shot — the few-shot exemplar is the trigger (NousResearch recipe,
+    #: DEFAULT_FEWSHOT=2). Data-only + opt-in: 0 keeps the manifest byte-identical so
+    #: existing Hermes/Qwen users are unaffected and GENERIC byte-parity is untouched.
+    fewshot: int = 0
+    #: Append the explicit "output ONLY the ``<tool_call>`` line, do not write code /
+    #: prose" instruction to the manifest. The 0.5b otherwise answers in prose or
+    #: writes a ```python``` block; this nudge (paired with few-shot) keeps it on the
+    #: grammar. Opt-in so the canonical Hermes/Qwen manifest stays byte-for-byte.
+    no_code_instruction: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,9 +196,71 @@ _HERMES_TOOLS_INSTRUCTION = (
 #: ``<tool_call>`` tag so this regex skips it for free.
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
+#: The explicit emission discipline a small open-weight model needs (HimalayaGPT-0.5b
+#: otherwise answers in prose or writes a ```python``` block). Appended to the manifest
+#: only when ``flags.no_code_instruction`` is set — opt-in, so the canonical Hermes/Qwen
+#: manifest stays byte-for-byte for every other user.
+_HERMES_NO_CODE_INSTRUCTION = (
+    "\n\n"
+    "When a tool is needed, output ONLY the <tool_call>...</tool_call> line and "
+    "NOTHING else — do not write Python, do not use code fences, do not explain. "
+    "If no tool is needed, answer the user directly in prose."
+)
 
-def _hermes_render_system_manifest(tools: Sequence[BoundTool], provider: str) -> str:
-    """Render the Hermes/Qwen ``<tools>`` manifest body (system-prompt text).
+
+def _synthesize_fewshot_example(tools: Sequence[BoundTool], flags: ToolCallGrammarFlags) -> str:
+    """Synthesize ONE generic exemplar: a user line + the ideal ``<tool_call>`` reply.
+
+    The exemplar uses the FIRST bound tool and fills its first declared property with a
+    type-appropriate placeholder, so the shape the model copies is grammatically exact
+    and tied to the real manifest (not a hard-coded weather demo). Generic by design —
+    it teaches the *envelope*, not a domain — so any Hermes-family caller that opts into
+    few-shot gets a faithful exemplar for its own tools.
+    """
+    tool = tools[0]
+    schema = tool.args_json_schema or {}
+    props = schema.get("properties") or {}
+    example_args: dict[str, Any] = {}
+    for key, spec in props.items():
+        if not isinstance(spec, dict):
+            continue
+        t = spec.get("type")
+        if t == "integer":
+            example_args[key] = 1
+        elif t == "number":
+            example_args[key] = 1.0
+        elif t == "boolean":
+            example_args[key] = True
+        elif t == "array":
+            example_args[key] = []
+        elif t == "object":
+            example_args[key] = {}
+        else:  # string / unknown
+            example_args[key] = "example"
+        break  # one filled property is enough to teach the envelope
+    call = {flags.name_key: tool.name, flags.arg_key: example_args}
+    call_json = json.dumps(call, separators=(", ", ": "), ensure_ascii=False)
+    return (
+        f"Example — user: Use the {tool.name} tool.\n"
+        f"Example — assistant:\n<tool_call>\n{call_json}\n</tool_call>"
+    )
+
+
+def _render_fewshot_block(tools: Sequence[BoundTool], flags: ToolCallGrammarFlags) -> str:
+    """Render up to ``flags.fewshot`` exemplars (empty when fewshot<=0 or no tools)."""
+    if flags.fewshot <= 0 or not tools:
+        return ""
+    n = min(flags.fewshot, max(1, len(tools)))
+    examples = []
+    for i in range(n):
+        # Rotate the lead tool so multiple exemplars cover different tools when present.
+        rotated = list(tools[i:]) + list(tools[:i])
+        examples.append(_synthesize_fewshot_example(rotated, flags))
+    return "\n\n# Examples\n\n" + "\n\n".join(examples)
+
+
+def _make_hermes_render_system_manifest(flags: ToolCallGrammarFlags) -> ManifestRenderer:
+    """Build the Hermes/Qwen ``<tools>`` manifest renderer bound to ``flags``.
 
     The ``<|im_start|>system`` / ``<|im_end|>`` ChatML envelope is added by the chat
     wrapper; this emits the inner body the model template expects. Each tool is one
@@ -196,34 +269,52 @@ def _hermes_render_system_manifest(tools: Sequence[BoundTool], provider: str) ->
     (so a text-only model sees the same ``$ref``-inlined, nullable-collapsed shape
     every other backend gets) and ``description`` carries himmy's reader/writer intent
     hint (:func:`describe_for_model`) for tool-disambiguation consistency.
-    """
-    from himmy.services.tools.access import describe_for_model
-    from himmy.services.tools.schema_normalize import normalize_tool_schema
 
-    lines = [_HERMES_TOOLS_PREAMBLE]
-    for tool in tools:
-        function = {
-            "name": tool.name,
-            "description": describe_for_model(
-                tool.name, tool.description, tool.read_only
-            ),
-            "parameters": normalize_tool_schema(
-                tool.args_json_schema or {"type": "object"}, provider
-            ),
-        }
-        # Compact separators match the local template's single-line per-tool object;
-        # ensure_ascii=False keeps non-ASCII (e.g. Nepali tool text) literal on the
-        # wire instead of \uXXXX-escaping it, matching the HF/Ollama template output.
-        lines.append(
-            json.dumps(
-                {"type": "function", "function": function},
-                separators=(", ", ": "),
-                ensure_ascii=False,
+    When ``flags.fewshot``/``flags.no_code_instruction`` are set the manifest gains the
+    synthesized exemplars + the "output only <tool_call>" nudge — APPENDED after the
+    canonical body so the default (fewshot=0, no_code=False) manifest is byte-identical.
+    """
+
+    def _render(tools: Sequence[BoundTool], provider: str) -> str:
+        from himmy.services.tools.access import describe_for_model
+        from himmy.services.tools.schema_normalize import normalize_tool_schema
+
+        lines = [_HERMES_TOOLS_PREAMBLE]
+        for tool in tools:
+            function = {
+                "name": tool.name,
+                "description": describe_for_model(
+                    tool.name, tool.description, tool.read_only
+                ),
+                "parameters": normalize_tool_schema(
+                    tool.args_json_schema or {"type": "object"}, provider
+                ),
+            }
+            # Compact separators match the local template's single-line per-tool object;
+            # ensure_ascii=False keeps non-ASCII (e.g. Nepali tool text) literal on the
+            # wire instead of \uXXXX-escaping it, matching the HF/Ollama template output.
+            lines.append(
+                json.dumps(
+                    {"type": "function", "function": function},
+                    separators=(", ", ": "),
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
-            + "\n"
-        )
-    lines.append(_HERMES_TOOLS_INSTRUCTION)
-    return "".join(lines)
+        lines.append(_HERMES_TOOLS_INSTRUCTION)
+        if flags.no_code_instruction:
+            lines.append(_HERMES_NO_CODE_INSTRUCTION)
+        lines.append(_render_fewshot_block(tools, flags))
+        return "".join(lines)
+
+    return _render
+
+
+#: The canonical (fewshot=0, no-nudge) Hermes manifest renderer — kept as a module-level
+#: name so the GENERIC byte-parity wrappers and existing imports stay stable.
+_hermes_render_system_manifest = _make_hermes_render_system_manifest(
+    ToolCallGrammarFlags()
+)
 
 
 def _hermes_native_calls(
@@ -336,7 +427,7 @@ _HERMES_FLAGS = ToolCallGrammarFlags(
 
 HERMES_CHATML_XML = ToolCallFormat(
     name="hermes_chatml_xml",
-    render_system_manifest=_hermes_render_system_manifest,
+    render_system_manifest=_make_hermes_render_system_manifest(_HERMES_FLAGS),
     parse=_make_hermes_parse(_HERMES_FLAGS),
     render_tool_results=_make_hermes_render_tool_results(_HERMES_FLAGS),
     # Auto-select for Qwen2.5-Instruct + the Hermes families. ``qwen2.5-coder`` is
@@ -344,6 +435,42 @@ HERMES_CHATML_XML = ToolCallFormat(
     model_tags=frozenset({"qwen2.5", "qwen2_5", "hermes"}),
     exclude_tags=frozenset({"coder"}),
     flags=_HERMES_FLAGS,
+)
+
+
+# --------------------------------------------------------------------------- #
+# HERMES_CHATML_XML_FEWSHOT — same wire grammar, but the manifest carries 2
+# synthesized few-shot exemplars + the "output only <tool_call>, no code" nudge.
+#
+# This is the format that makes a SMALL open-weight model (HimalayaGPT-0.5b, nanochat
+# arch) actually emit <tool_call> blocks: the 0.5b does not do so zero-shot — it
+# answers in prose, loops, or writes ```python```. Per the NousResearch / Himalaya AI
+# recipe the FEW-SHOT exemplar (DEFAULT_FEWSHOT=2) is the trigger. It shares the Hermes
+# parser/result-renderer byte-for-byte; only the manifest differs (data-only flags), so
+# the canonical HERMES_CHATML_XML and GENERIC paths are completely unaffected. It does
+# NOT auto-select by model tag — a manager opts in via ``tool_call_format`` (the
+# HimalayaGPT manager defaults to it), keeping larger Hermes/Qwen users on the lean
+# zero-shot manifest.
+# --------------------------------------------------------------------------- #
+_HERMES_FEWSHOT_FLAGS = ToolCallGrammarFlags(
+    arg_key="arguments",
+    name_key="name",
+    result_role="user",
+    batch_consecutive_results=True,
+    parallel_supported=True,
+    use_text_tool_path=True,
+    fewshot=2,
+    no_code_instruction=True,
+)
+
+HERMES_CHATML_XML_FEWSHOT = ToolCallFormat(
+    name="hermes_chatml_xml_fewshot",
+    render_system_manifest=_make_hermes_render_system_manifest(_HERMES_FEWSHOT_FLAGS),
+    parse=_make_hermes_parse(_HERMES_FEWSHOT_FLAGS),
+    render_tool_results=_make_hermes_render_tool_results(_HERMES_FEWSHOT_FLAGS),
+    # Opt-in only (no auto-select tags): a manager pins it via tool_call_format.
+    model_tags=frozenset(),
+    flags=_HERMES_FEWSHOT_FLAGS,
 )
 
 
@@ -408,6 +535,7 @@ class ToolCallFormatRegistry:
 #: HERMES_CHATML_XML auto-selects for Hermes / Qwen2.5-Instruct resolved tags.
 _REGISTRY = ToolCallFormatRegistry()
 _REGISTRY.register_format(HERMES_CHATML_XML)
+_REGISTRY.register_format(HERMES_CHATML_XML_FEWSHOT)
 
 
 def register_format(fmt: ToolCallFormat) -> ToolCallFormat:
@@ -438,6 +566,7 @@ __all__ = [
     "ToolCallFormatRegistry",
     "GENERIC",
     "HERMES_CHATML_XML",
+    "HERMES_CHATML_XML_FEWSHOT",
     "register_format",
     "get_format",
     "list_formats",

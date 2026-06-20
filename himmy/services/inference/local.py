@@ -611,10 +611,17 @@ class ClaudeCliClientManager:
 class HimalayaGptClientManager:
     """A :class:`ClientManager` for a self-hosted HF Transformers model (HimalayaGPT)."""
 
+    #: When no explicit ``tool_call_format`` is pinned, the HimalayaGPT-0.5b base model
+    #: has NO native tool field and does not emit ``<tool_call>`` zero-shot, so it
+    #: defaults to the few-shot Hermes grammar (manifest carries 2 synthesized exemplars
+    #: + the "output only <tool_call>, no code" nudge — the recipe that makes the 0.5b
+    #: tool-capable). An explicit ``tool_call_format`` (incl. "generic") overrides this.
+    _DEFAULT_TOOL_FORMAT = "hermes_chatml_xml_fewshot"
+
     def __init__(
         self,
         *,
-        model_name: str = "HimalayaAI/HimalayaGPT-0.5B",
+        model_name: str = "himalaya-ai/himalayagpt-0.5b-it",
         generate_fn: Callable[[str], str] | None = None,
         max_new_tokens: int = 256,
         provider_name: str = "himalayagpt",
@@ -622,9 +629,10 @@ class HimalayaGptClientManager:
     ) -> None:
         """Configure the model id and (test) generate function.
 
-        ``tool_call_format`` pins the tool-call grammar for this manager; ``None``
-        auto-selects by resolved model tag and falls back to the GENERIC format
-        (today's behavior). See :mod:`himmy.services.inference.tool_formats`.
+        ``tool_call_format`` pins the tool-call grammar for this manager. ``None``
+        resolves to the few-shot Hermes format (:data:`_DEFAULT_TOOL_FORMAT`) — the
+        base model has no native tool field, so it needs the prompted grammar + few-shot
+        to call tools at all. See :mod:`himmy.services.inference.tool_formats`.
         """
         self._model_name = model_name
         self._generate_fn = generate_fn
@@ -639,11 +647,27 @@ class HimalayaGptClientManager:
             return self._model_name
         return model_key
 
+    def _resolve_format(self, model: str) -> Any:
+        """Resolve the tool-call format, defaulting this model to the few-shot Hermes
+        grammar. An explicit ``tool_call_format`` (any registered name) wins."""
+        override = self._tool_call_format or self._DEFAULT_TOOL_FORMAT
+        return format_for(model, override)
+
     async def generate(self, request: InferenceRequest) -> InferenceResponse:
-        """Generate text on a worker thread (Transformers inference is blocking)."""
+        """Generate text on a worker thread (Transformers inference is blocking).
+
+        With bound tools, the manifest is rendered via the resolved format and injected
+        as a leading system turn (the model has no native tool field), the reply is
+        parsed for ``<tool_call>`` blocks via the format, and any calls are executed and
+        their results fed back in the format's result grammar — so the model is driven
+        tool-capable end-to-end THROUGH this manager + the format registry.
+        """
+        model = self.resolve(request.model_key)
+        tool_format = self._resolve_format(model)
         started = time.perf_counter()
+        prompt = self._compose_tool_prompt(request, tool_format)
         try:
-            text = await asyncio.to_thread(self._infer, _compose_prompt(request))
+            text = await asyncio.to_thread(self._infer, prompt)
         except Exception as exc:  # noqa: BLE001 - normalize to FAILED
             return _failed(
                 request,
@@ -652,15 +676,80 @@ class HimalayaGptClientManager:
                 model_path=self._model_name,
                 started=started,
             )
+        tool_calls: list[ToolCallRecord] = []
+        if request.bound_tools and text:
+            known = {t.name for t in request.bound_tools}
+            try:
+                tool_calls = tool_format.parse(text, known)
+            except Exception:  # noqa: BLE001 - parse is fail-open, never fatal
+                tool_calls = []
+            if tool_calls:
+                text = ""  # the reply was a tool call, not a final answer
+        tool_returns = await _execute_tool_calls(
+            request.bound_tools, tool_calls, request.tool_executor
+        )
         return InferenceResponse(
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,
             output_text=text,
+            tool_calls=tool_calls,
+            tool_returns=tool_returns,
             model_path=self._model_name,
             provider_name=self.provider_name,
             cost=0.0,
             latency_ms=(time.perf_counter() - started) * 1000.0,
         )
+
+    def _compose_tool_prompt(self, request: InferenceRequest, tool_format: Any) -> str:
+        """Flatten the conversation into the single labeled prompt the model receives.
+
+        No bound tools (or a non-text-path format): unchanged ``_compose_prompt`` so the
+        plain-chat path is a strict no-op. With bound tools on a text-path format, the
+        rendered tool manifest is prepended as a leading ``[System]`` block and any
+        already-present tool returns are re-labeled via the format's result grammar, so
+        the model sees the tool advertisement, the few-shot exemplars, and the prior
+        results in the grammar it was taught.
+        """
+        use_text_path = bool(request.bound_tools) and getattr(
+            tool_format.flags, "use_text_tool_path", False
+        )
+        if not use_text_path:
+            return _compose_prompt(request)
+        manifest = tool_format.render_system_manifest(
+            request.bound_tools, self.provider_name
+        )
+        parts = [f"[System]\n{manifest}"]
+        results: list[ToolReturnRecord] = []
+
+        def _flush_results() -> None:
+            if results:
+                body = tool_format.render_tool_results(results)
+                if body:
+                    parts.append(f"[Tool result]\n{body}")
+                results.clear()
+
+        for message in request.messages:
+            role = str(message.role).lower()
+            if role == "tool":
+                # Buffer consecutive tool returns so the format can batch them, then
+                # render via the format's result grammar (<tool_response> for Hermes).
+                results.append(
+                    ToolReturnRecord(
+                        tool_call_id="",
+                        tool_name="",
+                        content=message.content,
+                    )
+                )
+                continue
+            _flush_results()
+            if not message.content:
+                continue
+            label = {"user": "[User]", "assistant": "[Assistant]"}.get(
+                role, "[System]"
+            )
+            parts.append(f"{label}\n{message.content}")
+        _flush_results()
+        return "\n\n".join(parts)
 
     def _infer(self, prompt: str) -> str:
         if self._generate_fn is not None:

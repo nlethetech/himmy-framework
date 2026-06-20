@@ -12,6 +12,7 @@ from typing import Any
 
 from himmy.services.inference.local import (
     ClaudeCliClientManager,
+    HimalayaGptClientManager,
     OllamaClientManager,
     _react_tool_manifest,
 )
@@ -24,6 +25,7 @@ from himmy.services.inference.models import (
 from himmy.services.inference.tool_formats import (
     GENERIC,
     HERMES_CHATML_XML,
+    HERMES_CHATML_XML_FEWSHOT,
     ToolCallFormat,
     ToolCallFormatRegistry,
     format_for,
@@ -547,3 +549,246 @@ def test_ollama_hermes_text_path_parses_xml_tool_call() -> None:
     ]
     assert resp.tool_returns[0].content == "sunny in KTM"
     assert resp.output_text == ""  # the reply was a tool call, not a final answer
+
+
+# ========================================================================== #
+# PHASE 2 — HERMES_CHATML_XML_FEWSHOT (the recipe that makes the 0.5b call tools)
+# ========================================================================== #
+
+# The few-shot variant shares the canonical Hermes grammar; only the MANIFEST differs
+# (synthesized exemplars + the "output only <tool_call>, no code" nudge). The canonical
+# HERMES_CHATML_XML and GENERIC manifests must stay byte-identical (no regression).
+
+
+def test_fewshot_registered_and_opt_in_only() -> None:
+    """The few-shot format is registered but NEVER auto-selects by model tag."""
+    assert get_format("hermes_chatml_xml_fewshot") is HERMES_CHATML_XML_FEWSHOT
+    assert HERMES_CHATML_XML_FEWSHOT.model_tags == frozenset()
+    # A bare tag (no override) keeps the lean zero-shot Hermes manifest, not few-shot.
+    assert format_for("qwen2.5:7b-instruct") is HERMES_CHATML_XML
+    # Opt-in via override resolves it.
+    assert (
+        format_for("anything", override="hermes_chatml_xml_fewshot")
+        is HERMES_CHATML_XML_FEWSHOT
+    )
+
+
+def test_fewshot_flags_pinned() -> None:
+    f = HERMES_CHATML_XML_FEWSHOT.flags
+    assert f.fewshot == 2
+    assert f.no_code_instruction is True
+    assert f.use_text_tool_path is True
+    # Shares the wire-grammar knobs with canonical Hermes (only the manifest differs).
+    assert f.arg_key == "arguments"
+    assert f.name_key == "name"
+    assert f.result_role == "user"
+
+
+def test_canonical_hermes_manifest_unaffected_by_fewshot() -> None:
+    """Adding the few-shot format must not regress the canonical Hermes manifest."""
+    assert (
+        HERMES_CHATML_XML.render_system_manifest([_WEATHER_TOOL], "ollama")
+        == _GOLDEN_HERMES_MANIFEST
+    )
+    # The canonical manifest carries NO examples / no-code nudge.
+    assert "# Examples" not in _GOLDEN_HERMES_MANIFEST
+    assert "output ONLY" not in HERMES_CHATML_XML.render_system_manifest(
+        [_WEATHER_TOOL], "ollama"
+    )
+
+
+#: The exact few-shot manifest for the single get_weather tool — the canonical body,
+#: then the no-code nudge, then a single synthesized exemplar per fewshot count (2).
+_GOLDEN_FEWSHOT_MANIFEST = (
+    _GOLDEN_HERMES_MANIFEST
+    + "\n\n"
+    + (
+        "When a tool is needed, output ONLY the <tool_call>...</tool_call> line and "
+        "NOTHING else — do not write Python, do not use code fences, do not explain. "
+        "If no tool is needed, answer the user directly in prose."
+    )
+    + "\n\n# Examples\n\n"
+    + (
+        "Example — user: Use the get_weather tool.\n"
+        "Example — assistant:\n<tool_call>\n"
+        '{"name": "get_weather", "arguments": {"city": "example"}}\n'
+        "</tool_call>"
+    )
+)
+
+
+def test_fewshot_render_manifest_golden_single_tool() -> None:
+    """The few-shot manifest = canonical body + no-code nudge + 1 synthesized exemplar.
+
+    With one bound tool, fewshot=2 still yields a single exemplar (n is capped at the
+    tool count) — the golden pins exemplar shape, placeholder fill, and ordering.
+    """
+    got = HERMES_CHATML_XML_FEWSHOT.render_system_manifest([_WEATHER_TOOL], "ollama")
+    assert got == _GOLDEN_FEWSHOT_MANIFEST
+
+
+def test_fewshot_exemplar_count_capped_at_two() -> None:
+    """fewshot=2 over many tools emits exactly two exemplars, leading distinct tools."""
+    many = [
+        BoundTool(name=f"tool_{i}", description="d", args_json_schema={"type": "object"})
+        for i in range(4)
+    ]
+    manifest = HERMES_CHATML_XML_FEWSHOT.render_system_manifest(many, "ollama")
+    assert manifest.count("Example — user:") == 2
+    # The two exemplars rotate the lead tool, so they cover the first two tools.
+    assert "Use the tool_0 tool." in manifest
+    assert "Use the tool_1 tool." in manifest
+
+
+def test_fewshot_exemplar_fills_typed_placeholder() -> None:
+    """The synthesized exemplar fills the first property with a type-correct value."""
+    int_tool = BoundTool(
+        name="egg_totals",
+        description="Sum eggs.",
+        args_json_schema={
+            "type": "object",
+            "properties": {"days": {"type": "integer"}},
+        },
+    )
+    manifest = HERMES_CHATML_XML_FEWSHOT.render_system_manifest([int_tool], "ollama")
+    assert '{"name": "egg_totals", "arguments": {"days": 1}}' in manifest
+
+
+def test_fewshot_empty_tools_no_examples_block() -> None:
+    """No bound tools → no exemplars (the synthesizer needs a tool to copy)."""
+    manifest = HERMES_CHATML_XML_FEWSHOT.render_system_manifest([], "ollama")
+    assert "# Examples" not in manifest
+
+
+def test_fewshot_parser_is_canonical_hermes_parser() -> None:
+    """The few-shot variant parses identically to canonical Hermes (same grammar)."""
+    text = (
+        "<tool_call>\n"
+        '{"name": "get_weather", "arguments": {"city": "KTM"}}\n'
+        "</tool_call>"
+    )
+    assert [
+        (c.tool_name, c.args) for c in HERMES_CHATML_XML_FEWSHOT.parse(text, _WEATHER_KNOWN)
+    ] == [("get_weather", {"city": "KTM"})]
+
+
+def test_fewshot_render_tool_results_is_canonical() -> None:
+    """Result feedback uses the same <tool_response> grammar as canonical Hermes."""
+    results = [
+        ToolReturnRecord(tool_call_id="a", tool_name="get_weather", content="sunny")
+    ]
+    assert HERMES_CHATML_XML_FEWSHOT.render_tool_results(
+        results
+    ) == HERMES_CHATML_XML.render_tool_results(results)
+
+
+# ---- HimalayaGptClientManager render/parse path --------------------------
+
+
+def _hgpt_prompt_and_resp(
+    *,
+    reply: str,
+    tools: list[BoundTool],
+    tool_call_format: str | None = None,
+    extra_messages: list[InferenceMessage] | None = None,
+    executor: Any = None,
+) -> tuple[str, Any]:
+    """Drive the manager with a fake generate_fn; return (prompt seen, response)."""
+    captured: dict[str, str] = {}
+
+    def gen(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return reply
+
+    mgr = HimalayaGptClientManager(
+        generate_fn=gen, tool_call_format=tool_call_format
+    )
+    messages = [InferenceMessage(role="user", content="weather in KTM?")]
+    if extra_messages:
+        messages.extend(extra_messages)
+    req = InferenceRequest(
+        messages=messages, bound_tools=tools, tool_executor=executor
+    )
+    resp = run_async(mgr.generate(req))
+    return captured["prompt"], resp
+
+
+def test_hgpt_defaults_to_fewshot_hermes_format() -> None:
+    """No explicit format → the 0.5b manager renders the FEW-SHOT Hermes manifest."""
+    prompt, _ = _hgpt_prompt_and_resp(reply="hi", tools=[_WEATHER_TOOL])
+    assert "<tools>" in prompt  # tool manifest injected
+    assert "# Examples" in prompt  # few-shot exemplar present
+    assert "output ONLY" in prompt  # the no-code nudge present
+    assert "[System]" in prompt  # injected as a system block
+
+
+def test_hgpt_parses_and_executes_tool_call_through_manager() -> None:
+    """End-to-end: the manager renders, the model emits <tool_call>, it is executed."""
+
+    async def executor(name: str, args: dict[str, Any]) -> ToolReturnRecord:
+        return ToolReturnRecord(
+            tool_call_id="x", tool_name=name, content=f"sunny in {args['city']}"
+        )
+
+    reply = (
+        "<tool_call>\n"
+        '{"name": "get_weather", "arguments": {"city": "KTM"}}\n'
+        "</tool_call>"
+    )
+    _, resp = _hgpt_prompt_and_resp(
+        reply=reply, tools=[_WEATHER_TOOL], executor=executor
+    )
+    assert [(c.tool_name, c.args) for c in resp.tool_calls] == [
+        ("get_weather", {"city": "KTM"})
+    ]
+    assert resp.tool_returns[0].content == "sunny in KTM"
+    assert resp.output_text == ""  # a tool call, not a final answer
+
+
+def test_hgpt_prose_reply_passes_through_when_no_tool_call() -> None:
+    """A prose answer (no <tool_call>) is returned as the final answer untouched."""
+    _, resp = _hgpt_prompt_and_resp(
+        reply="It is sunny today.", tools=[_WEATHER_TOOL]
+    )
+    assert resp.tool_calls == []
+    assert resp.output_text == "It is sunny today."
+
+
+def test_hgpt_no_tools_is_plain_chat_no_manifest() -> None:
+    """With no bound tools the prompt is the plain composed chat (strict no-op)."""
+    captured: dict[str, str] = {}
+
+    def gen(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return "काठमाडौं"
+
+    mgr = HimalayaGptClientManager(generate_fn=gen)
+    req = InferenceRequest(
+        messages=[InferenceMessage(role="user", content="राजधानी?")]
+    )
+    resp = run_async(mgr.generate(req))
+    assert "<tools>" not in captured["prompt"]
+    assert "# Examples" not in captured["prompt"]
+    assert resp.output_text == "काठमाडौं"
+
+
+def test_hgpt_feeds_tool_results_in_format_grammar() -> None:
+    """Prior tool returns on the thread are re-rendered via the format's grammar."""
+    prompt, _ = _hgpt_prompt_and_resp(
+        reply="done",
+        tools=[_WEATHER_TOOL],
+        extra_messages=[InferenceMessage(role="tool", content="sunny, 24C")],
+    )
+    # The tool result is fed back inside the Hermes <tool_response> envelope.
+    assert "<tool_response>\nsunny, 24C\n</tool_response>" in prompt
+
+
+def test_hgpt_explicit_generic_format_overrides_default() -> None:
+    """Pinning 'generic' opts OUT of the few-shot Hermes manifest (operator trusted)."""
+    prompt, _ = _hgpt_prompt_and_resp(
+        reply="hi", tools=[_WEATHER_TOOL], tool_call_format="generic"
+    )
+    # GENERIC is not a text-path format → the manager uses the plain composed prompt,
+    # so neither the Hermes <tools> block nor the few-shot examples appear.
+    assert "<tools>" not in prompt
+    assert "# Examples" not in prompt
