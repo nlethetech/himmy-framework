@@ -50,6 +50,7 @@ ARG_TRAJECTORY_TYPES = frozenset(
         "result_contains",
         "parallel_in_turn",
         "max_parallel",
+        "result_feeds_arg",
     }
 )
 
@@ -172,6 +173,17 @@ def grade_trajectory(
     * ``parallel_in_turn`` — ``spec["value"]`` (a list of tool names) were ALL called
       within a single assistant turn (within-turn parallelism).
     * ``max_parallel`` — at most ``spec["value"]`` tool calls in any single turn.
+    * ``result_feeds_arg`` — the BFCL multi-turn data-flow check: a tool result feeds the
+      NEXT call's argument. Some call to ``spec["from_tool"]`` returned a result, and a
+      LATER call to ``spec["to_tool"]`` passed ``spec["arg"]`` whose value was carried from
+      that result — i.e. the model used the captured result downstream rather than
+      re-deriving or hallucinating it. "Carried" means the later arg's string form and the
+      earlier result's string form share the token ``spec["value"]`` (case-insensitive)
+      when ``value`` is given; otherwise it means the arg's (non-empty) string form is a
+      substring of the result's string form (the result literally contains what was passed
+      on). Ordering matters: the producing call (``from_tool``) must come before the
+      consuming call (``to_tool``) in trajectory order. Only ``from_tool`` calls whose
+      result was captured count (``has_result``).
 
     Composes under ``all_of`` / ``any_of`` exactly like :func:`grade`, over a list of
     trajectory sub-specs under ``of`` (a missing/empty ``of`` raises — fail loud).
@@ -224,6 +236,8 @@ def _grade_arg_trajectory(spec: dict[str, Any], traj: Trajectory, gtype: str) ->
         return any(expected <= {c.name for c in turn} for turn in traj.turns)
     if gtype == "max_parallel":
         return traj.max_parallel <= int(spec["value"])
+    if gtype == "result_feeds_arg":
+        return _grade_result_feeds_arg(spec, traj)
     # The remaining graders inspect a named tool's calls.
     tool = str(spec["tool"])
     matched = [c for c in traj.calls if c.name == tool]
@@ -248,6 +262,53 @@ def _grade_arg_trajectory(spec: dict[str, Any], traj: Trajectory, gtype: str) ->
             c.has_result and needle in _as_text(c.result).lower() for c in matched
         )
     raise ValueError(f"unknown trajectory grader type {gtype!r}")  # pragma: no cover
+
+
+def _grade_result_feeds_arg(spec: dict[str, Any], traj: Trajectory) -> bool:
+    """Whether a ``from_tool`` result was carried into a LATER ``to_tool`` argument.
+
+    The multi-turn data-flow predicate: scans the flat call sequence in trajectory order
+    and, for each consuming call to ``to_tool`` that passed ``arg``, checks whether any
+    EARLIER producing call to ``from_tool`` (with a captured result) supplied that value.
+    When ``spec["value"]`` is given, both the earlier result and the later arg must contain
+    that token (the data-flow carried a known value); otherwise the later arg's string form
+    must be a non-empty substring of the earlier result's string form (the result literally
+    contained what was passed on). Order is enforced over the flat call list so a result can
+    only feed a call that comes after it.
+    """
+    from_tool = str(spec["from_tool"])
+    to_tool = str(spec["to_tool"])
+    arg = str(spec["arg"])
+    token = spec.get("value")
+    calls = traj.calls
+    # Producing calls (with a captured result), paired with their flat index for ordering.
+    producers = [
+        (i, c)
+        for i, c in enumerate(calls)
+        if c.name == from_tool and c.has_result
+    ]
+    if not producers:
+        return False
+    for j, consumer in enumerate(calls):
+        if consumer.name != to_tool or arg not in consumer.args:
+            continue
+        arg_text = _as_text(consumer.args[arg]).strip()
+        if not arg_text:
+            continue
+        for i, producer in producers:
+            if i >= j:
+                break  # producer must precede the consumer
+            result_text = _as_text(producer.result)
+            if token is not None:
+                tok = _as_text(token).lower()
+                if (
+                    tok in result_text.lower()
+                    and tok in arg_text.lower()
+                ):
+                    return True
+            elif arg_text.lower() in result_text.lower():
+                return True
+    return False
 
 
 def _args_match(actual: dict[str, Any], expected: dict[str, Any]) -> bool:

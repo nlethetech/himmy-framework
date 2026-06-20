@@ -95,13 +95,21 @@ _METRIC_KEYS = (
     "accuracy",
     "tool_call_accuracy",
     "irrelevance_accuracy",
+    "arg_accuracy",
+    "multi_turn_accuracy",
     "error_rate",
     "p50_latency_s",
     "p95_latency_s",
     "mean_cost",
 )
 #: Metrics where a *lower* value is worse (a drop is a regression).
-_HIGHER_IS_BETTER = ("accuracy", "tool_call_accuracy", "irrelevance_accuracy")
+_HIGHER_IS_BETTER = (
+    "accuracy",
+    "tool_call_accuracy",
+    "irrelevance_accuracy",
+    "arg_accuracy",
+    "multi_turn_accuracy",
+)
 #: Metrics where a *higher* value is worse (a rise is a regression).
 _LOWER_IS_BETTER = ("error_rate",)
 
@@ -159,6 +167,11 @@ def _record(
             # Irrelevance/abstention headline (None when the suite has no irrelevance
             # task). Tracked for trend/regression like the other accuracy-type metrics.
             "irrelevance_accuracy": card.irrelevance_accuracy,
+            # BFCL axes: argument-/data-flow-level ("right tool, RIGHT args") and
+            # multi-turn (chained-call) accuracy. None when the suite has no such task;
+            # tracked for trend/regression like the other accuracy-type metrics.
+            "arg_accuracy": card.arg_accuracy,
+            "multi_turn_accuracy": card.multi_turn_accuracy,
             "error_rate": card.error_rate,
             "p50_latency_s": card.p50_latency,
             "p95_latency_s": card.p95_latency,

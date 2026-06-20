@@ -68,10 +68,21 @@ def render_markdown(cards: Sequence[ModelScorecard], *, suite_name: str = "") ->
     # measures whether the model declines to call a tool when none is needed (over-calling
     # is a top small/open-model failure). Only shown when the suite has irrelevance tasks.
     show_irrel = any(card.has_irrelevance_tier for card in cards)
+    # Arg-level and multi-turn are headline tool-use axes, shown only when the suite
+    # actually exercises them (else `—`-padding noise). Over-calling/abstention stays its
+    # own column too.
+    show_arg = any(card.has_arg_tier for card in cards)
+    show_mt = any(card.has_multi_turn_tier for card in cards)
     header = (
         "| Model | Accuracy (95% CI) | Tool-call | p50 | p95 | Cost/trial | Errors |"
     )
     rule = "|---|---|---|---|---|---|---|"
+    if show_arg:
+        header += " Arg-acc |"
+        rule += "---|"
+    if show_mt:
+        header += " Multi-turn |"
+        rule += "---|"
     if show_irrel:
         header += " Abstain |"
         rule += "---|"
@@ -96,6 +107,10 @@ def render_markdown(cards: Sequence[ModelScorecard], *, suite_name: str = "") ->
             f"| ${card.mean_cost:.4f} "
             f"| {_pct(card.error_rate)} |"
         )
+        if show_arg:
+            row += f" {_pct(card.arg_accuracy)} |"
+        if show_mt:
+            row += f" {_pct(card.multi_turn_accuracy)} |"
         if show_irrel:
             row += f" {_pct(card.irrelevance_accuracy)} |"
         if show_traj:
@@ -130,6 +145,72 @@ def render_markdown(cards: Sequence[ModelScorecard], *, suite_name: str = "") ->
 
     lines += _pairwise_section(cards)
     lines += _judge_section(cards)
+    return "\n".join(lines)
+
+
+def render_leaderboard(
+    cards: Sequence[ModelScorecard], *, suite_name: str = ""
+) -> str:
+    """A BFCL-style ranked tool-use leaderboard across models.
+
+    One row per model, ranked by overall accuracy, with the headline tool-use axes as
+    columns: overall **Accuracy** (with its Wilson 95% CI), **Tool-call** accuracy
+    (set-membership "called the expected tool"), **Arg-acc** (correctness over tasks
+    graded at the ARGUMENT / data-flow level — "right tool, RIGHT args", the dominant
+    small-model failure), **Multi-turn** (correctness over chained tasks where a tool
+    result feeds the next call), and **Abstain** (irrelevance accuracy — declining to call
+    a tool when none is needed). Each axis column shows ``—`` when the suite has no task on
+    that axis, so the board never implies a metric the run did not measure. Below the board
+    sit the per-category breakdown and the Holm-corrected pairwise McNemar comparison
+    (reused from :func:`render_markdown`'s sections), so the leaderboard is self-contained.
+    """
+    if not cards:
+        return "(no results)"
+    trials = cards[0].task_scores[0].n if cards[0].task_scores else 0
+    n_tasks = len(cards[0].task_scores)
+    lines = [
+        f"# Tool-use leaderboard{f': {suite_name}' if suite_name else ''} "
+        f"({n_tasks} tasks × {trials} trials)",
+        "",
+        "_Ranked by overall accuracy. `Arg-acc` = correctness over argument-/data-flow-"
+        "graded tasks (right tool, RIGHT args). `Multi-turn` = chained tasks where a tool "
+        "result feeds the next call. `Abstain` = irrelevance accuracy (declining to call a "
+        "tool when none is needed). `—` = the suite has no task on that axis._",
+        "",
+        "| Rank | Model | Accuracy (95% CI) | Tool-call | Arg-acc | Multi-turn | Abstain |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    ranked = sorted(cards, key=lambda c: c.accuracy, reverse=True)
+    for rank, card in enumerate(ranked, start=1):
+        lo, hi = card.accuracy_ci
+        lines.append(
+            f"| {rank} "
+            f"| {card.spec.name} "
+            f"| {_pct(card.accuracy)} ({_pct(lo)}–{_pct(hi)}) "
+            f"| {_pct(card.tool_call_accuracy)} "
+            f"| {_pct(card.arg_accuracy)} "
+            f"| {_pct(card.multi_turn_accuracy)} "
+            f"| {_pct(card.irrelevance_accuracy)} |"
+        )
+
+    categories = sorted({c for card in cards for c in card.by_category()})
+    if categories:
+        lines += [
+            "",
+            "## By category",
+            "",
+            f"_Categories with < {MIN_CATEGORY_TASKS} tasks show per-task pass "
+            "counts (a percentage off a handful of tasks is noise), not a rate._",
+            "",
+        ]
+        lines.append("| Model | " + " | ".join(categories) + " |")
+        lines.append("|---|" + "|".join(["---"] * len(categories)) + "|")
+        for card in ranked:
+            cells = _category_breakdown(card)
+            row = " | ".join(cells.get(cat, "—") for cat in categories)
+            lines.append(f"| {card.spec.name} | {row} |")
+
+    lines += _pairwise_section(cards)
     return "\n".join(lines)
 
 
@@ -344,6 +425,13 @@ def to_json(cards: Sequence[ModelScorecard], *, suite_name: str = "") -> dict[st
                 # when the suite has no irrelevance task.
                 "irrelevance_accuracy": card.irrelevance_accuracy,
                 "irrelevance_total_trials": card.irrelevance_total_trials,
+                # Argument-/data-flow-level accuracy ("right tool, RIGHT args") and
+                # multi-turn (chained-call) accuracy — the BFCL axes, each None when the
+                # suite has no task on that axis.
+                "arg_accuracy": card.arg_accuracy,
+                "arg_total_trials": card.arg_total_trials,
+                "multi_turn_accuracy": card.multi_turn_accuracy,
+                "multi_turn_total_trials": card.multi_turn_total_trials,
                 "p50_latency_s": card.p50_latency,
                 "p95_latency_s": card.p95_latency,
                 "mean_cost": card.mean_cost,
@@ -403,6 +491,7 @@ def to_json(cards: Sequence[ModelScorecard], *, suite_name: str = "") -> dict[st
 
 __all__ = [
     "render_markdown",
+    "render_leaderboard",
     "to_json",
     "MIN_CATEGORY_TASKS",
     "PAIRWISE_ALPHA",

@@ -28,6 +28,14 @@ from himmy.benchmark.trajectory import Trajectory
 #: headline metric is computed over exactly these tasks, separate from tool-call accuracy.
 ABSTENTION_CATEGORY = "irrelevance"
 
+#: Task category that marks a MULTI-TURN tool task — one where a tool's RESULT must feed a
+#: later tool call's argument (BFCL's multi-turn data-flow axis). The ``multi_turn``
+#: leaderboard column is computed over exactly these tasks. A multi-turn task is scored
+#: deterministically like any other (and gates ``correct``); the category is the headline
+#: marker so chained-call competence reads as its own number, distinct from single-shot
+#: tool accuracy.
+MULTI_TURN_CATEGORY = "multi_turn"
+
 
 @dataclass(frozen=True)
 class BenchmarkTask:
@@ -220,10 +228,27 @@ class TaskScore:
     task_id: str
     category: str
     trials: list[TrialResult]
+    # Whether the task declared an ARGUMENT-/result-level trajectory grader (the BFCL
+    # AST-check equivalent — "right tool, RIGHT args / right data-flow", not just the right
+    # tool name). Set by the runner from the task's `trajectory` block. Feeds the
+    # leaderboard's arg-accuracy column, which pools exactly these tasks so the dominant
+    # small-model failure ("right tool, WRONG args") reads as its own headline. Defaults
+    # False so existing positional construction (`TaskScore(id, cat, trials)`) is unchanged.
+    uses_arg_grader: bool = False
 
     @property
     def n(self) -> int:
         return len(self.trials)
+
+    @property
+    def is_multi_turn(self) -> bool:
+        """Whether this is a multi-turn task (category ``multi_turn``).
+
+        A multi-turn task chains tool calls so a tool's result feeds a later call's
+        argument (the BFCL data-flow axis). The category is the first-class marker the
+        leaderboard's ``multi_turn`` column keys off of.
+        """
+        return self.category == MULTI_TURN_CATEGORY
 
     @property
     def successes(self) -> int:
@@ -434,6 +459,71 @@ class ModelScorecard:
         """Total irrelevance/abstention trials run."""
         return sum(len(s.trials) for s in self.irrelevance_scores)
 
+    @property
+    def arg_scores(self) -> list[TaskScore]:
+        """Deterministic task scores that declared an argument-/result-level grader.
+
+        These are the tasks whose `trajectory` block checks call ARGUMENTS or data-flow
+        (the BFCL AST-check equivalent), not just the tool name — the dominant small-model
+        failure is "right tool, WRONG args". Judge-tier tasks are excluded (their accuracy
+        is reported separately and never gated).
+        """
+        return [s for s in self.deterministic_scores if s.uses_arg_grader]
+
+    @property
+    def has_arg_tier(self) -> bool:
+        """Whether the suite has any argument-/result-level graded task."""
+        return bool(self.arg_scores)
+
+    @property
+    def arg_accuracy(self) -> float | None:
+        """Pooled correctness over tasks graded at the ARGUMENT/data-flow level.
+
+        The BFCL "right tool, RIGHT args" headline: a model that calls the right tool with
+        the wrong arguments scores 0 here even though a name-only tool-call check would pass.
+        ``None`` when the suite has no argument-graded task.
+        """
+        trials = [t for s in self.arg_scores for t in s.trials]
+        if not trials:
+            return None
+        return sum(1 for t in trials if t.correct) / len(trials)
+
+    @property
+    def arg_total_trials(self) -> int:
+        """Total argument-/result-level graded trials run."""
+        return sum(len(s.trials) for s in self.arg_scores)
+
+    @property
+    def multi_turn_scores(self) -> list[TaskScore]:
+        """Deterministic task scores in the multi-turn category (chained tool calls)."""
+        return [
+            s
+            for s in self.deterministic_scores
+            if s.category == MULTI_TURN_CATEGORY
+        ]
+
+    @property
+    def has_multi_turn_tier(self) -> bool:
+        """Whether the suite has any multi-turn (chained-call) task."""
+        return bool(self.multi_turn_scores)
+
+    @property
+    def multi_turn_accuracy(self) -> float | None:
+        """Pooled correctness over multi-turn tasks (a tool result feeds a later call).
+
+        The BFCL multi-turn headline: can the model carry one tool's output into the next
+        call's argument? ``None`` when the suite has no multi-turn task.
+        """
+        trials = [t for s in self.multi_turn_scores for t in s.trials]
+        if not trials:
+            return None
+        return sum(1 for t in trials if t.correct) / len(trials)
+
+    @property
+    def multi_turn_total_trials(self) -> int:
+        """Total multi-turn trials run."""
+        return sum(len(s.trials) for s in self.multi_turn_scores)
+
     def by_category(self) -> dict[str, float]:
         """Accuracy per task category (deterministic tier only; feeds the gate)."""
         cats: dict[str, list[TrialResult]] = {}
@@ -516,4 +606,5 @@ __all__ = [
     "ModelScorecard",
     "compare_scorecards",
     "ABSTENTION_CATEGORY",
+    "MULTI_TURN_CATEGORY",
 ]

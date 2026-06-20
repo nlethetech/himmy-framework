@@ -41,7 +41,7 @@ from himmy.benchmark.models import (
     TrialResult,
     compare_scorecards,
 )
-from himmy.benchmark.report import render_markdown, to_json
+from himmy.benchmark.report import render_leaderboard, render_markdown, to_json
 from himmy.benchmark.runner import BenchmarkRunner
 from himmy.benchmark.stats import McNemarResult, mcnemar_exact, mcnemar_from_outcomes
 
@@ -75,6 +75,18 @@ def irrelevance_suite() -> BenchmarkSuite:
     )
 
 
+def bfcl_suite() -> BenchmarkSuite:
+    """Load the packaged ``bfcl`` multi-turn + nested-argument tool-use suite.
+
+    Two BFCL axes the core suite does not isolate: MULTI-TURN tasks (category
+    ``multi_turn``) where a tool's result must feed a later call's argument (graded with
+    the ``result_feeds_arg`` data-flow predicate), and NESTED / COMPLEX-ARG tasks (object/
+    array arguments) graded with the argument-level matchers. Offline + self-contained like
+    the rest of the benchmark. Reported, not gated.
+    """
+    return BenchmarkSuite.from_yaml(Path(__file__).parent / "suites" / "bfcl.yaml")
+
+
 def multiagent_suite() -> BenchmarkSuite:
     """Load the packaged ``multiagent`` collaboration suite (handoff/delegation/chat).
 
@@ -95,11 +107,13 @@ __all__ = [
     "ModelScorecard",
     "BenchmarkRunner",
     "render_markdown",
+    "render_leaderboard",
     "to_json",
     "default_suite",
     "nepali_suite",
     "multiagent_suite",
     "irrelevance_suite",
+    "bfcl_suite",
     "JudgeVerdict",
     "SameModelJudgeError",
     "load_baseline",

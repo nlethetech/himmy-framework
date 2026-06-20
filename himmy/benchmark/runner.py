@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from himmy.benchmark.graders import grade, grade_trajectory
+from himmy.benchmark.graders import ARG_TRAJECTORY_TYPES, grade, grade_trajectory
 from himmy.benchmark.judge import build_judge, build_judge_spec, has_judge, judge_answer
 from himmy.benchmark.models import (
     ModelScorecard,
@@ -39,6 +39,23 @@ ProgressFn = "Callable[[ModelSpec, BenchmarkTask, int, int], None]"
 #: error)``. The flat name-only ``tools_called`` view is derived from the trajectory
 #: (:attr:`Trajectory.names`) so the existing name-only graders are unchanged.
 _RunOutcome = tuple[str, "Trajectory", int, tuple[int, int], float, "str | None"]
+
+
+def _declares_arg_grader(trajectory: dict[str, Any]) -> bool:
+    """Whether a task's ``trajectory`` block uses an argument-/result-level grader.
+
+    Recurses through ``all_of`` / ``any_of`` combinators so a nested arg/data-flow
+    predicate (``arg_equals`` / ``tool_called_with`` / ``result_feeds_arg`` / …) is still
+    detected. Drives :attr:`TaskScore.uses_arg_grader`, which the leaderboard pools into
+    its arg-accuracy column. A name-only trajectory (``first_tool`` / ``tool_sequence`` /
+    …) or an empty block returns ``False``.
+    """
+    if not trajectory:
+        return False
+    gtype = trajectory.get("type")
+    if gtype in ("all_of", "any_of"):
+        return any(_declares_arg_grader(s) for s in (trajectory.get("of") or []))
+    return gtype in ARG_TRAJECTORY_TYPES
 
 
 class BenchmarkRunner:
@@ -98,7 +115,14 @@ class BenchmarkRunner:
                     trials.append(await self._run_trial(spec, task))
                     if self._on_progress is not None:
                         self._on_progress(spec, task, i + 1, self._trials)
-                task_scores.append(TaskScore(task.id, task.category, trials))
+                task_scores.append(
+                    TaskScore(
+                        task.id,
+                        task.category,
+                        trials,
+                        uses_arg_grader=_declares_arg_grader(task.trajectory),
+                    )
+                )
             cards.append(ModelScorecard(spec=spec, task_scores=task_scores))
         self._maybe_append_history(cards, suite)
         return cards

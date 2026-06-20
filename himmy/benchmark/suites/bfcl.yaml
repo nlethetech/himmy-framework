@@ -1,0 +1,297 @@
+name: bfcl
+# A BFCL-style tool-use suite focused on the two axes the core suite does not isolate:
+#
+#   * MULTI-TURN data-flow (category `multi_turn`): a tool's RESULT must feed a LATER
+#     tool call's argument. The `result_feeds_arg` trajectory grader checks the data-flow
+#     literally — the producing tool's captured result carried the value that the consuming
+#     tool was then called with. This catches the failure where a model calls both tools
+#     but re-derives/hallucinates the bridging value instead of carrying the real one.
+#
+#   * NESTED / COMPLEX-ARG calls: tools whose arguments are OBJECTS or ARRAYS, graded with
+#     the argument-level matchers (`tool_called_with` / `arg_equals` / `arg_matches`) — the
+#     BFCL AST-check equivalent for "right tool, RIGHT (structured) args". A name-only
+#     tool-call check would pass a model that emits the right tool with a malformed array;
+#     these tasks fail it.
+#
+# Every task is OFFLINE and self-contained (sqlite/files fixtures materialized per trial,
+# in-process scratchpad/todo state), so the suite is deterministic and replayable like the
+# rest of the benchmark. Reported, not gated: this suite is a diagnostic on the multi-turn
+# and structured-arg axes, not part of the pinned baseline floor.
+tasks:
+  # --- multi-turn: a tool result feeds the next tool's argument ------------------------
+  - id: mt_sql_then_calc
+    category: multi_turn
+    # Read the chicken count from SQL (30), then pass it into the calculator to double it.
+    # The data-flow check: the calculator's `expression` arg carries the 30 that the
+    # sql_query result produced (not a hallucinated count).
+    prompt: >
+      The animals table records how many chickens the farm has. First query the table to
+      find the chicken count, then use the calculator to multiply that exact count by 2,
+      and report the total eggs (2 per chicken).
+    packs: [data, utils]
+    expect_tools: [sql_query, calculator]
+    instructions: ["The DB has a table animals(name TEXT, quantity INTEGER)."]
+    sqlite:
+      - "CREATE TABLE animals(name TEXT, quantity INTEGER); INSERT INTO animals VALUES ('ducks',12),('chickens',30),('bees',40000);"
+    grade: { type: numeric, value: 60 }
+    trajectory:
+      type: all_of
+      of:
+        - { type: tool_sequence, value: [sql_query, calculator] }
+        - {
+            type: result_feeds_arg,
+            from_tool: sql_query,
+            to_tool: calculator,
+            arg: expression,
+            value: "30",
+          }
+
+  - id: mt_file_then_calc
+    category: multi_turn
+    # Read a starting count from a file (21), then pass it into the calculator to double it.
+    # The 21 must flow from the read_file result into the calculator expression.
+    prompt: >
+      Read base.txt to get the starting count, then use the calculator to multiply that
+      exact count by 2 and report the doubled number.
+    packs: [files, utils]
+    expect_tools: [read_file, calculator]
+    files:
+      base.txt: "count=21\n"
+    grade: { type: numeric, value: 42 }
+    trajectory:
+      type: all_of
+      of:
+        - { type: tool_sequence, value: [read_file, calculator] }
+        - {
+            type: result_feeds_arg,
+            from_tool: read_file,
+            to_tool: calculator,
+            arg: expression,
+            value: "21",
+          }
+
+  - id: mt_sql_lookup_then_calc
+    category: multi_turn
+    # A two-hop numeric chain: read the area of the 'north' plot (10), then compute its
+    # value at 5 NPR per unit. The 10 must be carried from the SQL result into the calc.
+    prompt: >
+      The plots table stores each plot's area. Find the area of the plot named 'north',
+      then use the calculator to multiply that exact area by 5 (the price per unit) and
+      report the total value.
+    packs: [data, utils]
+    expect_tools: [sql_query, calculator]
+    instructions: ["Table: plots(name TEXT, area INTEGER)."]
+    sqlite:
+      - "CREATE TABLE plots(name TEXT, area INTEGER); INSERT INTO plots VALUES ('north',10),('south',25),('east',7);"
+    grade: { type: numeric, value: 50 }
+    trajectory:
+      type: result_feeds_arg
+      from_tool: sql_query
+      to_tool: calculator
+      arg: expression
+      value: "10"
+
+  - id: mt_kb_ingest_then_search
+    category: multi_turn
+    # Ingest a note, then search it — the search must surface the ingested fact (the
+    # ingested content feeds the retrieval). Graded on the recalled value.
+    prompt: >
+      First store this note with kb_ingest, then use kb_search to answer: what is the
+      irrigation channel's flow rate? Note: "The irrigation channel flows at 47 litres
+      per second."
+    packs: [knowledge]
+    expect_tools: [kb_search]
+    grade: { type: numeric, value: 47 }
+    trajectory:
+      type: tool_sequence
+      value: [kb_ingest, kb_search]
+
+  - id: mt_write_then_read_back
+    category: multi_turn
+    # Compute a value, write it to a file, then read it back — the written value must be
+    # the one read. Round-trip data-flow through the filesystem.
+    prompt: >
+      Use the calculator to compute 6 times 7, write the result to answer.txt, then read
+      answer.txt back and report the number it contains.
+    packs: [files, utils]
+    expect_tools: [write_file, read_file]
+    grade: { type: numeric, value: 42 }
+    trajectory:
+      type: tool_sequence
+      value: [calculator, write_file, read_file]
+
+  # --- nested / complex-arg calls (object / array arguments) ---------------------------
+  - id: nested_todo_array
+    category: nested_args
+    # todo_write takes an ARRAY argument (`items`). The arg-level grader asserts the model
+    # passed the array with the right elements — a name-only check would pass a malformed
+    # or empty array.
+    prompt: >
+      Use todo_write to record exactly these three tasks, in this order: 'water garden',
+      'feed goats', 'collect eggs'. Then report the plan.
+    packs: [agentic]
+    expect_tools: [todo_write]
+    grade:
+      type: any_of
+      of:
+        - { type: contains, value: water garden }
+        - { type: contains, value: collect eggs }
+    trajectory:
+      type: tool_called_with
+      tool: todo_write
+      args:
+        items: ["water garden", "feed goats", "collect eggs"]
+
+  - id: nested_todo_array_contains
+    category: nested_args
+    # A laxer array-arg check: the items array must at least contain a specific element
+    # (arg_matches over the stringified array), tolerating extra/re-ordered items.
+    prompt: >
+      Use todo_write to plan a morning routine that includes the task 'milk the cow'
+      somewhere in the list, then report the plan.
+    packs: [agentic]
+    expect_tools: [todo_write]
+    grade: { type: contains, value: milk the cow }
+    trajectory:
+      type: arg_matches
+      tool: todo_write
+      arg: items
+      value: "milk the cow"
+
+  - id: nested_scratchpad_structured
+    category: nested_args
+    # Store a structured value under a key. The arg-level grader asserts BOTH the key and
+    # the (compound) value were passed correctly — two named args on one call.
+    prompt: >
+      Use scratchpad_set to store, under the key 'plot', the exact value
+      'north:10;south:25'. Then use scratchpad_get to read the key 'plot' and report its
+      value.
+    packs: [agentic]
+    expect_tools: [scratchpad_set]
+    grade:
+      type: all_of
+      of:
+        - { type: contains, value: "north:10" }
+        - { type: contains, value: "south:25" }
+    trajectory:
+      type: tool_called_with
+      tool: scratchpad_set
+      args:
+        key: plot
+        value: "north:10;south:25"
+
+  - id: nested_sql_filter_args
+    category: nested_args
+    # Right tool, RIGHT query intent: the model must query for the 'east' plot specifically.
+    # The arg-level grader asserts the SQL it issued references 'east' (arg_matches over the
+    # query string) — not just that it called sql_query.
+    prompt: >
+      The plots table stores each plot's area. Query the table to find the area of the
+      plot named 'east' and report just that area.
+    packs: [data]
+    expect_tools: [sql_query]
+    instructions: ["Table: plots(name TEXT, area INTEGER)."]
+    sqlite:
+      - "CREATE TABLE plots(name TEXT, area INTEGER); INSERT INTO plots VALUES ('north',10),('south',25),('east',7);"
+    grade: { type: numeric, value: 7 }
+    trajectory:
+      type: arg_matches
+      tool: sql_query
+      arg: sql
+      value: east
+
+  # --- parallel: TWO DISTINCT independent calls that should co-occur in one turn ---------
+  # Each task asks for two facts with NO data dependency on each other, so a competent model
+  # batches both calls in a single assistant turn. `parallel_in_turn` asserts the named
+  # tools co-occurred within one turn (it matches tool NAMES as a set, so the two tools must
+  # be DISTINCT for the check to be meaningful — see the caveat in the report). `max_parallel`
+  # bounds the within-turn fan-out. These are the BFCL "parallel function call" axis.
+  - id: par_sql_and_calc
+    category: parallel
+    # Two independent facts: a SQL lookup of the 'north' plot's area, and a calculator
+    # product. No dependency between them, so both calls should be emitted together.
+    prompt: >
+      In a single step do BOTH independent things: (a) query the plots table for the area
+      of the plot named 'north', and (b) use the calculator to compute 8 times 9. Then
+      report both the area and the product.
+    packs: [data, utils]
+    expect_tools: [sql_query, calculator]
+    instructions: ["Table: plots(name TEXT, area INTEGER). Issue both calls together."]
+    sqlite:
+      - "CREATE TABLE plots(name TEXT, area INTEGER); INSERT INTO plots VALUES ('north',10),('south',25),('east',7);"
+    grade:
+      type: all_of
+      of:
+        - { type: contains, value: "10" }
+        - { type: contains, value: "72" }
+    trajectory:
+      type: all_of
+      of:
+        - { type: parallel_in_turn, value: [sql_query, calculator] }
+        - { type: max_parallel, value: 4 }
+
+  - id: par_calc_and_time
+    category: parallel
+    # Two unrelated facts: a computed product and the current time. No dependency between
+    # them, so the model should call calculator and current_time together in one turn.
+    prompt: >
+      In a single step, do BOTH of these independent things: use the calculator to compute
+      8 times 9, and use the clock tool to get the current time. Then report the product.
+    packs: [utils]
+    expect_tools: [calculator, current_time]
+    grade: { type: numeric, value: 72 }
+    trajectory:
+      type: all_of
+      of:
+        - { type: parallel_in_turn, value: [calculator, current_time] }
+        - { type: max_parallel, value: 4 }
+
+  - id: par_read_and_list
+    category: parallel
+    # Two independent filesystem facts: read a.txt and list the directory. With no ordering
+    # dependency, both should be batched in one turn (distinct tools, so the set check bites).
+    prompt: >
+      In one step, do BOTH independent things: read a.txt to get its number, and list the
+      directory to see what files exist. Then report the number from a.txt.
+    packs: [files]
+    expect_tools: [read_file, list_dir]
+    files:
+      a.txt: "alpha=11\n"
+      b.txt: "beta=22\n"
+    grade: { type: contains, value: "11" }
+    trajectory:
+      type: all_of
+      of:
+        - { type: parallel_in_turn, value: [read_file, list_dir] }
+        - { type: max_parallel, value: 4 }
+
+  # --- irrelevance: tools are bound but the prompt needs none — the model must abstain ---
+  # Over-calling (reaching for a tool when none is needed) is a top small/open-model failure
+  # and BFCL scores it first-class. Each task binds real tools the prompt does NOT need and
+  # grades `max_tool_calls: 0`. Feeds the `Abstain` (irrelevance_accuracy) leaderboard axis,
+  # reported separately from tool-call accuracy.
+  - id: irrel_trivial_arithmetic
+    category: irrelevance
+    # A calculator is bound, but 3 + 4 needs no tool — reaching for it is over-calling.
+    prompt: "What is 3 plus 4? Answer with just the number. Do not use any tool."
+    packs: [utils]
+    grade: { type: numeric, value: 7 }
+    trajectory: { type: max_tool_calls, value: 0 }
+
+  - id: irrel_general_knowledge
+    category: irrelevance
+    # Pure knowledge. The calculator/clock are bound but irrelevant.
+    prompt: "What is the capital of France? Answer in one word, no tools."
+    packs: [utils]
+    grade: { type: contains, value: paris }
+    trajectory: { type: max_tool_calls, value: 0 }
+
+  - id: irrel_no_sql_needed
+    category: irrelevance
+    # SQL tools are bound, but there is no database and the answer is in the prompt.
+    prompt: >-
+      A crate holds 5 apples and 6 pears. How many fruits are in the crate in total?
+      Answer with just the number. There is no database to query.
+    packs: [data]
+    grade: { type: numeric, value: 11 }
+    trajectory: { type: max_tool_calls, value: 0 }
