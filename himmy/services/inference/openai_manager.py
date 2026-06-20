@@ -55,6 +55,7 @@ from himmy.services.inference.prompt_cache import (
     read_openai_usage,
     resolve_cache_rates,
 )
+from himmy.services.inference.structured import constrained_decoding_requested
 from himmy.services.tools.access import describe_for_model
 from himmy.services.tools.schema_normalize import (
     is_strict_expressible,
@@ -400,6 +401,15 @@ class OpenAIClientManager:
         ``json_schema.strict`` is declared so the provider enforces it; otherwise
         the lenient normalized schema is emitted (byte-identical-shaped to before
         for an already-normalized schema).
+
+        GUARANTEED structured output (opt-in, ``constrained_decoding``): an
+        OpenRouter-routed OPEN model (llama/mistral/qwen/…) is not OpenAI-family, so
+        ``strict`` is normally ``False`` and the lenient json_schema is sent. When
+        the request opts in AND the schema is strict-expressible, we ALSO declare
+        ``json_schema.strict`` for that open model — OpenRouter's structured-output
+        backends (vLLM / llama.cpp server / Fireworks …) enforce it, turning a hint
+        into a hard constraint. Fail-open: a backend that ignores ``strict`` still
+        sees the same schema, and the un-opted-in default is byte-identical.
         """
         if request.response_format == ResponseFormat.JSON_OBJECT:
             return {"type": "json_object"}
@@ -409,6 +419,14 @@ class OpenAIClientManager:
             # Per-schema strict gate (see _openai_tools): an open / items-less output
             # schema falls back to the lenient json_schema rather than a 400.
             use_strict = strict and is_strict_expressible(normalized)
+            # Opt-in: extend strict enforcement to OpenRouter open models too.
+            if (
+                not use_strict
+                and self.provider_name == "openrouter"
+                and constrained_decoding_requested(request)
+                and is_strict_expressible(normalized)
+            ):
+                use_strict = True
             schema = (
                 strict_output_schema(raw, self.provider_name)
                 if use_strict

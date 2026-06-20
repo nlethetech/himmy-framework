@@ -817,6 +817,471 @@ HERMES_CHATML_XML_FEWSHOT_BASELINE = ToolCallFormat(
 )
 
 
+# --------------------------------------------------------------------------- #
+# Shared OpenAI-style tool-schema serialization for the JSON-list family.
+#
+# Llama-3.1 and Mistral both advertise tools as a JSON LIST of OpenAI-style
+# ``{"type":"function","function":{name, description, parameters}}`` objects (NOT the
+# per-line ``<tools>`` block Hermes uses). The single helper below builds that list of
+# dicts once (normalized + read/write-hint-tagged, exactly like the Hermes body) so both
+# families render from one source of truth — no ``if model ==`` and no duplicated schema
+# plumbing. Each family then frames the list differently (Llama: a first-user-message
+# manifest sentence; Mistral: an ``[AVAILABLE_TOOLS]`` envelope).
+# --------------------------------------------------------------------------- #
+def _openai_function_specs(
+    tools: Sequence[BoundTool], provider: str
+) -> list[dict[str, Any]]:
+    """Build the list of OpenAI-style ``{"type":"function","function":{...}}`` dicts.
+
+    Mirrors the Hermes manifest body's per-tool object EXACTLY (same
+    :func:`describe_for_model` read/write hint, same per-tool
+    :func:`normalize_tool_schema` of ``parameters``) so the only difference between the
+    families is the envelope/framing, never the advertised schema.
+    """
+    from himmy.services.tools.access import describe_for_model
+    from himmy.services.tools.schema_normalize import normalize_tool_schema
+
+    specs: list[dict[str, Any]] = []
+    for tool in tools:
+        specs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": describe_for_model(
+                        tool.name, tool.description, tool.read_only
+                    ),
+                    "parameters": normalize_tool_schema(
+                        tool.args_json_schema or {"type": "object"}, provider
+                    ),
+                },
+            }
+        )
+    return specs
+
+
+# --------------------------------------------------------------------------- #
+# LLAMA3_JSON — Llama-3.1 / Llama-3.2 / Llama-3.3 Instruct (JSON-function calling).
+#
+# Llama-3.1's "JSON based tool calling" convention (Meta's model card + the HF llama-3.1
+# chat template):
+#   * MANIFEST: the tool schemas are advertised as a JSON LIST in the FIRST USER message,
+#     prefixed by Meta's literal instruction. The model card's wording is
+#     "Given the following functions, please respond with a JSON for a function call with
+#      its proper arguments that best answers the given prompt." — reproduced verbatim.
+#   * CALL: a BARE single JSON object ``{"name": ..., "parameters": {...}}`` — note the
+#     arg key is ``parameters`` (NOT ``arguments``), and there is no XML wrapper.
+#   * RESULT: tool output is fed back in an ``ipython``-role turn
+#     (``<|start_header_id|>ipython<|end_header_id|>`` ... ``<|eot_id|>``), the Llama-3.1
+#     role reserved for tool/function responses.
+# The parser is FAIL-OPEN: the bare-JSON ``{"name","parameters"}`` pass is OR-ed with the
+# generic tolerant pass AND a ``<tool_call>``-style pass, so a Llama that drifts onto the
+# Hermes envelope (some fine-tunes do) is still recovered. ``parameters``-keyed args are
+# read by setting ``flags.arg_key="parameters"``.
+# --------------------------------------------------------------------------- #
+
+#: Meta's literal first-user-message manifest instruction (verbatim from the Llama-3.1
+#: model card / HF template). ``{tools_json}`` is the JSON list of function specs.
+_LLAMA3_MANIFEST_PREAMBLE = (
+    "You have access to the following functions. To call a function, respond with a "
+    "JSON for a function call with its proper arguments that best answers the given "
+    "prompt.\n\n"
+    "Respond in the format {\"name\": function name, \"parameters\": dictionary of "
+    "argument name and its value}. Do not use variables.\n\n"
+)
+
+
+def _llama3_render_system_manifest(tools: Sequence[BoundTool], provider: str) -> str:
+    """Render the Llama-3.1 JSON-function manifest (preamble + JSON list of specs).
+
+    The manager injects this as the leading system/first-user block. The function
+    specs are the shared OpenAI-style list (one source of truth with Mistral); the
+    JSON list is pretty-printed with 4-space indent the way the Llama template shows it,
+    ``ensure_ascii=False`` so Nepali tool text stays literal on the wire.
+    """
+    specs = _openai_function_specs(tools, provider)
+    tools_json = json.dumps(specs, indent=4, ensure_ascii=False)
+    return f"{_LLAMA3_MANIFEST_PREAMBLE}{tools_json}"
+
+
+#: Match a BARE ``{"name": ..., "parameters": {...}}`` JSON object anywhere in the reply.
+#: Non-greedy + DOTALL on the body; the real JSON shape is validated by ``json.loads`` in
+#: the parser (this regex only finds candidate object spans, balanced via the decoder).
+#: We anchor on a ``{`` that is followed (in any key order) by a ``"name"`` key so a plain
+#: structured-output JSON answer that happens to be an object is not mis-read as a call.
+_LLAMA3_BARE_CALL_HINT = re.compile(r'"name"\s*:', re.DOTALL)
+
+
+def _llama3_native_calls(
+    text: str, known: set[str], flags: ToolCallGrammarFlags
+) -> list[ToolCallRecord]:
+    """Extract bare ``{"name": ..., "parameters": {...}}`` call object(s) from the reply.
+
+    Llama-3.1 emits the call as a bare JSON object (no XML/markers). It may emit ONE
+    object, or a JSON ARRAY of objects for parallel calls. We scan every balanced JSON
+    value in the text (via the shared :func:`_iter_json_objects`), accept dicts that
+    carry the name key, and read args from ``flags.arg_key`` (``parameters``). A name is
+    accepted only when it is a plausible bound tool (``_name_is_plausible``) so a generic
+    JSON answer is never mis-parsed as a call. Malformed spans are skipped, never fatal.
+    """
+    from himmy.core.ids import new_uuid
+    from himmy.services.inference.models import ToolCallRecord
+    from himmy.services.inference.tool_protocol import (
+        _iter_json_objects,
+        _name_is_plausible,
+    )
+
+    if not _LLAMA3_BARE_CALL_HINT.search(text):
+        return []  # no object carrying a "name" key — nothing bare to parse
+    calls: list[ToolCallRecord] = []
+    for obj in _iter_json_objects(text):
+        candidates = obj if isinstance(obj, list) else [obj]
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            name = cand.get(flags.name_key)
+            if not isinstance(name, str) or not name:
+                continue
+            if not _name_is_plausible(name, known):
+                continue
+            args: Any = cand.get(flags.arg_key, {})
+            if isinstance(args, str):  # parameters delivered as a JSON string
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+            calls.append(
+                ToolCallRecord(tool_call_id=new_uuid(), tool_name=name, args=args)
+            )
+    return calls
+
+
+def _make_llama3_parse(flags: ToolCallGrammarFlags) -> ReplyParser:
+    """Build the FAIL-OPEN Llama-3.1 parser bound to ``flags``.
+
+    Pass order (each pass can only ADD a ``(name, args)`` the prior passes missed):
+      1. bare ``{"name","parameters"}`` object(s) — the native Llama-3.1 shape;
+      2. :func:`parse_text_tool_calls` — the generic tolerant pass (TOOL_CALL markers /
+         fenced blocks / the ``{"name","arguments"}`` shape some Llama fine-tunes use);
+      3. :func:`_hermes_native_calls` — a ``<tool_call>`` envelope a Hermes-flavored
+         Llama fine-tune might emit (read with the SAME ``parameters``/``name`` keys).
+    Every pass is wrapped so an unexpected error leaves the earlier passes' result.
+    """
+
+    def _parse(text: str, known: set[str]) -> list[ToolCallRecord]:
+        from himmy.services.inference.tool_protocol import parse_text_tool_calls
+
+        try:
+            calls = _llama3_native_calls(text, known, flags)
+        except Exception:  # noqa: BLE001 - native pass is best-effort, never fatal
+            calls = []
+        seen = {_dedup_key(c.tool_name, c.args) for c in calls}
+
+        def _merge(extra: list[ToolCallRecord]) -> None:
+            for call in extra:
+                key = _dedup_key(call.tool_name, call.args)
+                if key not in seen:
+                    seen.add(key)
+                    calls.append(call)
+
+        try:
+            _merge(parse_text_tool_calls(text, known))
+        except Exception:  # noqa: BLE001 - keep whatever native already found
+            pass
+        # OR-in a Hermes-style <tool_call> envelope (read with name/parameters keys).
+        try:
+            _merge(_hermes_native_calls(text, known, flags))
+        except Exception:  # noqa: BLE001 - fallback is best-effort, never fatal
+            pass
+        return calls
+
+    return _parse
+
+
+def _make_llama3_render_tool_results(flags: ToolCallGrammarFlags) -> ResultRenderer:
+    """Build the Llama-3.1 ``ipython``-role result renderer bound to ``flags``.
+
+    Tool output is fed back in the ``ipython`` role Llama-3.1 reserves for function
+    responses: ``<|start_header_id|>ipython<|end_header_id|>\\n\\n{content}<|eot_id|>``.
+    When ``batch_consecutive_results`` is set the results share ONE ipython turn (joined
+    by blank lines); otherwise each result gets its own turn. Empty -> "" (no-op).
+    """
+
+    def _render(results: Sequence[ToolReturnRecord]) -> str:
+        if not results:
+            return ""
+        header = f"<|start_header_id|>{flags.result_role}<|end_header_id|>\n\n"
+        if flags.batch_consecutive_results:
+            body = "\n\n".join(str(r.content) for r in results)
+            return f"{header}{body}<|eot_id|>"
+        return "".join(
+            f"{header}{r.content}<|eot_id|>" for r in results
+        )
+
+    return _render
+
+
+#: Llama-3.1 wire-divergence flags: BARE ``{"name","parameters"}`` calls (arg_key=
+#: ``parameters``), tool results in the ``ipython`` role, parallel = a JSON array.
+_LLAMA3_FLAGS = ToolCallGrammarFlags(
+    arg_key="parameters",
+    name_key="name",
+    result_role="ipython",
+    batch_consecutive_results=True,
+    parallel_supported=True,
+    use_text_tool_path=True,
+)
+
+
+def _make_llama3_render_system_manifest(
+    flags: ToolCallGrammarFlags,
+) -> ManifestRenderer:
+    """Build the Llama-3.1 manifest renderer (kept arity-compatible with the registry)."""
+
+    def _render(tools: Sequence[BoundTool], provider: str) -> str:
+        return _llama3_render_system_manifest(tools, provider)
+
+    return _render
+
+
+LLAMA3_JSON = ToolCallFormat(
+    name="llama3_json",
+    render_system_manifest=_make_llama3_render_system_manifest(_LLAMA3_FLAGS),
+    parse=_make_llama3_parse(_LLAMA3_FLAGS),
+    render_tool_results=_make_llama3_render_tool_results(_LLAMA3_FLAGS),
+    # Auto-select for Llama-3.x instruct tags (``llama3`` / ``llama-3`` / ``llama_3``).
+    # ``code``/``guard`` variants are EXCLUDED (Code Llama / Llama Guard do not use this
+    # JSON-function grammar); a non-instruct base ``llama`` (no "3") never matches.
+    model_tags=frozenset({"llama3", "llama-3", "llama_3", "llama 3"}),
+    exclude_tags=frozenset({"code", "guard", "vision"}),
+    flags=_LLAMA3_FLAGS,
+)
+
+
+# --------------------------------------------------------------------------- #
+# MISTRAL_V3 — Mistral / Mixtral / Mistral-Nemo Instruct (v3 tokenizer tool calling).
+#
+# Mistral's v3 (and v3-tekken) instruct tool-calling convention (mistral-common /
+# the HF mistralai chat template):
+#   * MANIFEST: tools are advertised inside ``[AVAILABLE_TOOLS]`` ... ``[/AVAILABLE_TOOLS]``
+#     as a JSON LIST of OpenAI-style function specs, placed NEAR THE LAST user turn (the
+#     manager injects the manifest as the leading text block; the envelope is what marks
+#     it as Mistral's available-tools section).
+#   * CALL: ``[TOOL_CALLS]`` followed by a JSON ARRAY of ``{"name", "arguments"}`` objects
+#     — natively PARALLEL (one array, N entries; arg key is ``arguments``).
+#   * RESULT: ``[TOOL_RESULTS]`` ... ``[/TOOL_RESULTS]`` carrying ``{"call_id", "content"}``.
+#     Mistral pairs a result to its call by a 9-char ``[a-zA-Z0-9]`` ``call_id`` (a.k.a.
+#     ``tool_call_id``). That 9-char id is a WIRE artifact ONLY: himmy's own UUID stays on
+#     the record; the 9-char id is MINTED AT RENDER TIME (deterministically from the UUID)
+#     so a call/result pair lines up within one serialization and the himmy UUID never
+#     leaves the record.
+# The parser is FAIL-OPEN: the ``[TOOL_CALLS]`` array pass is OR-ed with the generic
+# tolerant pass and a ``<tool_call>`` pass.
+# --------------------------------------------------------------------------- #
+
+#: The Mistral v3 9-char tool-call id alphabet (mistral-common: ``[a-zA-Z0-9]{9}``).
+_MISTRAL_ID_ALPHABET = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
+_MISTRAL_ID_LEN = 9
+
+
+def mint_mistral_tool_call_id(himmy_id: str) -> str:
+    """Mint Mistral's 9-char ``[a-zA-Z0-9]`` wire id DETERMINISTICALLY from a himmy id.
+
+    Mistral requires a 9-char alphanumeric ``tool_call_id`` to pair a ``[TOOL_RESULTS]``
+    block back to its ``[TOOL_CALLS]`` entry. himmy's own ids are UUIDs (longer, with
+    hyphens) which Mistral rejects — so the 9-char id is a RENDER-TIME-ONLY artifact: we
+    derive it from the himmy id (a stable hash projected onto the 9-char alphabet) so the
+    same himmy id always maps to the same wire id WITHIN a render (call ↔ result pair up)
+    while the himmy UUID itself never leaves the :class:`ToolCallRecord` /
+    :class:`ToolReturnRecord`. Deterministic (golden-pinnable) and collision-resistant
+    enough for the handful of calls in one turn.
+    """
+    import hashlib
+
+    digest = hashlib.sha256((himmy_id or "").encode("utf-8")).digest()
+    # Project the digest bytes onto the 9-char alphabet (base-62-ish, fixed length).
+    out: list[str] = []
+    acc = int.from_bytes(digest[:12], "big")
+    for _ in range(_MISTRAL_ID_LEN):
+        acc, rem = divmod(acc, len(_MISTRAL_ID_ALPHABET))
+        out.append(_MISTRAL_ID_ALPHABET[rem])
+    return "".join(out)
+
+
+#: Match the ``[TOOL_CALLS]`` marker followed by its JSON array body. DOTALL so the array
+#: may span lines; the decoder validates the real (balanced) JSON shape.
+_MISTRAL_TOOL_CALLS_RE = re.compile(r"\[TOOL_CALLS\]\s*", re.DOTALL)
+
+
+def _mistral_native_calls(
+    text: str, known: set[str], flags: ToolCallGrammarFlags
+) -> list[ToolCallRecord]:
+    """Extract ``[TOOL_CALLS]`` JSON-array call(s) into ToolCallRecords.
+
+    Mistral emits ``[TOOL_CALLS][{"name": ..., "arguments": {...}}, ...]`` — a single
+    marker then a JSON ARRAY (native parallel). We locate the marker, decode the array
+    that follows it (tolerating a leading object too), and read each entry's name +
+    ``flags.arg_key`` (``arguments``). A bare array with no marker is also accepted as a
+    fallback. Malformed entries are skipped; never fatal.
+    """
+    from himmy.core.ids import new_uuid
+    from himmy.services.inference.models import ToolCallRecord
+
+    calls: list[ToolCallRecord] = []
+
+    def _emit(entries: Any) -> None:
+        items = entries if isinstance(entries, list) else [entries]
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get(flags.name_key)
+            if not isinstance(name, str) or not name:
+                continue
+            args: Any = entry.get(flags.arg_key, {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+            calls.append(
+                ToolCallRecord(tool_call_id=new_uuid(), tool_name=name, args=args)
+            )
+
+    decoder = json.JSONDecoder()
+    for marker in _MISTRAL_TOOL_CALLS_RE.finditer(text):
+        rest = text[marker.end() :]
+        start = rest.find("[")
+        obj_start = rest.find("{")
+        # Prefer the array; fall back to a single object if that comes first.
+        if start == -1 or (obj_start != -1 and obj_start < start):
+            start = obj_start
+        if start == -1:
+            continue
+        try:
+            decoded, _ = decoder.raw_decode(rest[start:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        _emit(decoded)
+    return calls
+
+
+def _make_mistral_parse(flags: ToolCallGrammarFlags) -> ReplyParser:
+    """Build the FAIL-OPEN Mistral parser bound to ``flags``.
+
+    Pass order (add-only; each can only ADD a ``(name, args)`` the prior passes missed):
+      1. ``[TOOL_CALLS]`` JSON-array pass — the native Mistral shape (parallel);
+      2. :func:`parse_text_tool_calls` — the generic tolerant pass;
+      3. :func:`_hermes_native_calls` — a ``<tool_call>`` envelope a Hermes-flavored
+         Mistral fine-tune might emit (read with the same name/arguments keys).
+    """
+
+    def _parse(text: str, known: set[str]) -> list[ToolCallRecord]:
+        from himmy.services.inference.tool_protocol import parse_text_tool_calls
+
+        try:
+            calls = _mistral_native_calls(text, known, flags)
+        except Exception:  # noqa: BLE001 - native pass is best-effort, never fatal
+            calls = []
+        seen = {_dedup_key(c.tool_name, c.args) for c in calls}
+
+        def _merge(extra: list[ToolCallRecord]) -> None:
+            for call in extra:
+                key = _dedup_key(call.tool_name, call.args)
+                if key not in seen:
+                    seen.add(key)
+                    calls.append(call)
+
+        try:
+            _merge(parse_text_tool_calls(text, known))
+        except Exception:  # noqa: BLE001 - keep whatever native already found
+            pass
+        try:
+            _merge(_hermes_native_calls(text, known, flags))
+        except Exception:  # noqa: BLE001 - fallback is best-effort, never fatal
+            pass
+        return calls
+
+    return _parse
+
+
+def _make_mistral_render_system_manifest(
+    flags: ToolCallGrammarFlags,
+) -> ManifestRenderer:
+    """Build the Mistral ``[AVAILABLE_TOOLS]`` manifest renderer.
+
+    The function specs are the shared OpenAI-style list (one source of truth with
+    Llama-3.1), wrapped in Mistral's ``[AVAILABLE_TOOLS]`` ... ``[/AVAILABLE_TOOLS]``
+    envelope. The JSON is compact (mistral-common renders the array without indentation)
+    and ``ensure_ascii=False`` keeps non-ASCII literal.
+    """
+
+    def _render(tools: Sequence[BoundTool], provider: str) -> str:
+        specs = _openai_function_specs(tools, provider)
+        tools_json = json.dumps(specs, separators=(", ", ": "), ensure_ascii=False)
+        return f"[AVAILABLE_TOOLS] {tools_json} [/AVAILABLE_TOOLS]"
+
+    return _render
+
+
+def _make_mistral_render_tool_results(flags: ToolCallGrammarFlags) -> ResultRenderer:
+    """Build the Mistral ``[TOOL_RESULTS]`` result renderer bound to ``flags``.
+
+    Each result is rendered ``[TOOL_RESULTS] {"call_id": <9char>, "content": ...}
+    [/TOOL_RESULTS]`` where ``call_id`` is the 9-char wire id minted AT RENDER TIME from
+    the result's himmy ``tool_call_id`` (see :func:`mint_mistral_tool_call_id`) — the
+    himmy UUID itself never appears on the wire. Each result is its own ``[TOOL_RESULTS]``
+    block (mistral-common emits one block per result). Empty -> "" (no-op).
+    """
+
+    def _render(results: Sequence[ToolReturnRecord]) -> str:
+        if not results:
+            return ""
+        blocks: list[str] = []
+        for r in results:
+            payload = {
+                "call_id": mint_mistral_tool_call_id(r.tool_call_id),
+                "content": r.content,
+            }
+            body = json.dumps(payload, separators=(", ", ": "), ensure_ascii=False)
+            blocks.append(f"[TOOL_RESULTS] {body} [/TOOL_RESULTS]")
+        return "".join(blocks)
+
+    return _render
+
+
+#: Mistral v3 wire-divergence flags: ``[TOOL_CALLS]`` JSON array (arg_key=``arguments``,
+#: native parallel), results in ``[TOOL_RESULTS]`` blocks keyed by a 9-char wire id.
+_MISTRAL_FLAGS = ToolCallGrammarFlags(
+    arg_key="arguments",
+    name_key="name",
+    result_role="tool",
+    batch_consecutive_results=False,
+    parallel_supported=True,
+    use_text_tool_path=True,
+)
+
+
+MISTRAL_V3 = ToolCallFormat(
+    name="mistral_v3",
+    render_system_manifest=_make_mistral_render_system_manifest(_MISTRAL_FLAGS),
+    parse=_make_mistral_parse(_MISTRAL_FLAGS),
+    render_tool_results=_make_mistral_render_tool_results(_MISTRAL_FLAGS),
+    # Auto-select for Mistral / Mixtral / Mistral-Nemo / Ministral instruct tags.
+    # ``embed`` (Mistral embedding models) and ``codestral`` (a CODE model that does not
+    # use this tool grammar reliably — the coder-exclude rule, like qwen2.5-coder for
+    # Hermes) are EXCLUDED. An explicit override still wins over an exclude.
+    model_tags=frozenset({"mistral", "mixtral", "ministral", "magistral"}),
+    exclude_tags=frozenset({"embed", "codestral"}),
+    flags=_MISTRAL_FLAGS,
+)
+
+
 class ToolCallFormatRegistry:
     """Resolve a :class:`ToolCallFormat` from a model tag + optional override.
 
@@ -880,6 +1345,8 @@ _REGISTRY = ToolCallFormatRegistry()
 _REGISTRY.register_format(HERMES_CHATML_XML)
 _REGISTRY.register_format(HERMES_CHATML_XML_FEWSHOT)
 _REGISTRY.register_format(HERMES_CHATML_XML_FEWSHOT_BASELINE)
+_REGISTRY.register_format(LLAMA3_JSON)
+_REGISTRY.register_format(MISTRAL_V3)
 
 
 def register_format(fmt: ToolCallFormat) -> ToolCallFormat:
@@ -912,6 +1379,9 @@ __all__ = [
     "HERMES_CHATML_XML",
     "HERMES_CHATML_XML_FEWSHOT",
     "HERMES_CHATML_XML_FEWSHOT_BASELINE",
+    "LLAMA3_JSON",
+    "MISTRAL_V3",
+    "mint_mistral_tool_call_id",
     "register_format",
     "get_format",
     "list_formats",

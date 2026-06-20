@@ -123,9 +123,14 @@ def test_generic_render_tool_results_label() -> None:
 
 
 def test_format_for_defaults_to_generic() -> None:
-    """No override, unknown tag → GENERIC (the no-op default)."""
-    assert format_for("llama3.2") is GENERIC
-    assert format_for("mistral:7b") is GENERIC
+    """No override, unknown tag → GENERIC (the no-op default).
+
+    NOTE: ``llama3``/``mistral`` tags now auto-select their native formats (LLAMA3_JSON /
+    MISTRAL_V3) — see the LLAMA3_JSON / MISTRAL_V3 selection tests. The tags here are
+    genuinely unrecognized families that still fall through to GENERIC.
+    """
+    assert format_for("phi3:mini") is GENERIC
+    assert format_for("gemma2:9b") is GENERIC
     assert format_for(None) is GENERIC
     assert format_for("") is GENERIC
 
@@ -495,8 +500,12 @@ def _ollama_payload_for(model: str) -> dict[str, Any]:
 
 
 def test_ollama_generic_keeps_native_tools_field() -> None:
-    """A GENERIC model (llama) keeps Ollama's native `tools=` field (today's path)."""
-    payload = _ollama_payload_for("llama3.2")
+    """A GENERIC model keeps Ollama's native `tools=` field (today's path).
+
+    Uses a family with no native format row (gemma2) — ``llama3.2`` now auto-selects
+    LLAMA3_JSON and drives the text path, which is asserted separately.
+    """
+    payload = _ollama_payload_for("gemma2:9b")
     assert "tools" in payload
     assert payload["tools"][0]["function"]["name"] == "get_weather"
     # No manifest system message injected on the native path.

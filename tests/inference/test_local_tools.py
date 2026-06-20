@@ -56,7 +56,10 @@ def test_ollama_injects_tools_and_parses_tool_calls() -> None:
             }
         }
 
-    mgr = OllamaClientManager(transport=transport)
+    # Pin GENERIC so this exercises Ollama's NATIVE tools= field (the default model
+    # llama3.2 now auto-selects LLAMA3_JSON, a prompt/text-path format — covered in
+    # test_tool_formats_llama_mistral.py). GENERIC is the native-tools path.
+    mgr = OllamaClientManager(transport=transport, tool_call_format="generic")
     resp = run_async(mgr.generate(_req()))
     assert "tools" in seen  # tools injected into the payload
     assert seen["tools"][0]["function"]["name"] == "web_search"

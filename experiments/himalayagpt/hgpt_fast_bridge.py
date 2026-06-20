@@ -143,13 +143,20 @@ class HimalayaGptFastBridge:
             self._proc = None
 
     # -- generation ----------------------------------------------------------
-    def generate(self, prompt: str, **overrides) -> str:
+    def generate(self, prompt: str, *, grammar: str | None = None, **overrides) -> str:
         """POST the RAW prompt to /completion (parse_special) and return the text.
 
         The kwargs match the transformers worker's vocabulary
         (``max_new_tokens`` / ``temperature`` / ``repetition_penalty``) so the
         manager and the A/B runner inject identical values; they are mapped onto
         llama.cpp's ``n_predict`` / ``temperature`` / ``repeat_penalty``.
+
+        ``grammar`` (opt-in, GUARANTEED structured output): a GBNF grammar that
+        CONSTRAINS decoding so the reply is forced to match the requested JSON
+        schema token-by-token. ``None`` (the default) is unconstrained — the
+        backend behaves exactly as before. :class:`HimalayaGptClientManager`
+        compiles the grammar from a request's ``output_json_schema`` and passes it
+        through; the field name is llama.cpp's own ``/completion`` ``grammar``.
         """
         kw = {**self._default_kwargs, **overrides}
         payload = {
@@ -163,6 +170,9 @@ class HimalayaGptFastBridge:
             "stop": _STOP,
             "cache_prompt": True,
         }
+        if grammar:
+            # llama-server constrains decoding to this GBNF grammar; absent => free.
+            payload["grammar"] = grammar
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self._base_url + "/completion",
@@ -177,11 +187,16 @@ class HimalayaGptFastBridge:
             raise RuntimeError(f"llama-server /completion failed: {exc}") from exc
         return str(body.get("content", ""))
 
-    def generate_fn(self, **overrides) -> Callable[[str], str]:
-        """Return a ``(prompt) -> str`` callable for HimalayaGptClientManager."""
+    def generate_fn(self, **overrides) -> Callable[..., str]:
+        """Return a ``(prompt, *, grammar=None) -> str`` callable for the manager.
 
-        def _fn(prompt: str) -> str:
-            return self.generate(prompt, **overrides)
+        The optional ``grammar`` keyword is what lets the manager pass a compiled
+        GBNF grammar through for guaranteed structured output; a caller that ignores
+        it gets the plain unconstrained path.
+        """
+
+        def _fn(prompt: str, *, grammar: str | None = None) -> str:
+            return self.generate(prompt, grammar=grammar, **overrides)
 
         return _fn
 

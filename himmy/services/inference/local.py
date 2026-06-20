@@ -36,6 +36,11 @@ from himmy.services.inference.models import (
     ToolExecutor,
     ToolReturnRecord,
 )
+from himmy.services.inference.structured import (
+    constrained_decoding_requested,
+    ollama_format,
+    schema_to_gbnf,
+)
 from himmy.services.inference.tool_formats import format_for
 from himmy.services.inference.tool_protocol import (
     _iter_json_objects,
@@ -327,7 +332,17 @@ class OllamaClientManager:
         )
         if structured_requested:
             # Ollama's native structured-output: constrain the reply to the schema.
-            payload["format"] = request.output_json_schema
+            # Opt-in (constrained_decoding): run the schema through the shared
+            # cross-provider normalizer first ($ref inlining, nullable collapse) so a
+            # referenced/exotic schema still constrains rather than being passed
+            # through un-inlined. Default (un-opted-in) path is byte-identical to
+            # before: the raw schema, exactly as today.
+            if constrained_decoding_requested(request):
+                payload["format"] = ollama_format(
+                    request.output_json_schema, provider=self.provider_name
+                )
+            else:
+                payload["format"] = request.output_json_schema
         # Floor the per-call budget like the CLI manager does: a CPU host can
         # legitimately need minutes; request defaults must not kill valid calls.
         effective_timeout = max(request.timeout_seconds or 0.0, self._timeout)
@@ -666,8 +681,14 @@ class HimalayaGptClientManager:
         tool_format = self._resolve_format(model)
         started = time.perf_counter()
         prompt = self._compose_tool_prompt(request, tool_format)
+        # Guaranteed structured output (opt-in): compile the schema into a GBNF
+        # grammar and pass it to the llama.cpp backend so decoding is CONSTRAINED to
+        # valid JSON. Fail-open: only when the request opted in AND asked for a
+        # structured reply AND the backend's generate-fn accepts a ``grammar`` kwarg;
+        # otherwise the prompt is unchanged (today's behaviour).
+        grammar = self._maybe_grammar(request)
         try:
-            text = await asyncio.to_thread(self._infer, prompt)
+            text = await asyncio.to_thread(self._infer, prompt, grammar)
         except Exception as exc:  # noqa: BLE001 - normalize to FAILED
             return _failed(
                 request,
@@ -688,16 +709,76 @@ class HimalayaGptClientManager:
         tool_returns = await _execute_tool_calls(
             request.bound_tools, tool_calls, request.tool_executor
         )
+        # When decoding was grammar-constrained to the schema, parse the (now
+        # guaranteed-valid) JSON reply into ``output_structured`` like Ollama does.
+        output_structured = None
+        if grammar is not None and text and not tool_calls:
+            try:
+                output_structured = json.loads(text)
+            except json.JSONDecodeError:
+                output_structured = None
         return InferenceResponse(
             request_id=request.request_id,
             status=InferenceStatus.SUCCESS,
             output_text=text,
+            output_structured=output_structured,
             tool_calls=tool_calls,
             tool_returns=tool_returns,
             model_path=self._model_name,
             provider_name=self.provider_name,
             cost=0.0,
             latency_ms=(time.perf_counter() - started) * 1000.0,
+        )
+
+    def _maybe_grammar(self, request: InferenceRequest) -> str | None:
+        """Compile a GBNF grammar for an opt-in structured-output request, else ``None``.
+
+        Returns ``None`` (the unconstrained path, byte-identical to before) unless:
+        the request opted into constrained decoding
+        (:func:`constrained_decoding_requested`), it asked for a STRUCTURED_OUTPUT
+        reply with a schema, AND the configured ``generate_fn`` actually accepts a
+        ``grammar`` keyword (a backend that can apply it — e.g. the llama.cpp fast
+        bridge). A tool-call turn is left unconstrained so the model can still emit a
+        ``<tool_call>`` block. Fail-open: any error returns ``None``.
+        """
+        if request.bound_tools:
+            return None
+        if not constrained_decoding_requested(request):
+            return None
+        if (
+            request.response_format != ResponseFormat.STRUCTURED_OUTPUT
+            or request.output_json_schema is None
+        ):
+            return None
+        if not self._generate_fn_accepts_grammar():
+            return None
+        try:
+            return schema_to_gbnf(request.output_json_schema, provider=self.provider_name)
+        except Exception:  # noqa: BLE001 - fail-open: never break a call on a grammar bug
+            return None
+
+    def _generate_fn_accepts_grammar(self) -> bool:
+        """True when the configured ``generate_fn`` accepts a ``grammar`` keyword.
+
+        The real Transformers pipeline path (``generate_fn is None``) has no grammar
+        backend, so it returns ``False`` (no constraint). An injected bridge whose
+        callable takes ``grammar`` (the llama.cpp fast bridge) returns ``True``.
+        """
+        fn = self._generate_fn
+        if fn is None:
+            return False
+        try:
+            import inspect
+
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            return False
+        params = sig.parameters
+        if "grammar" in params:
+            return True
+        # A ``**kwargs``-accepting callable can also take ``grammar``.
+        return any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
 
     def _compose_tool_prompt(self, request: InferenceRequest, tool_format: Any) -> str:
@@ -781,8 +862,13 @@ class HimalayaGptClientManager:
         _flush_results()
         return "\n\n".join(parts)
 
-    def _infer(self, prompt: str) -> str:
+    def _infer(self, prompt: str, grammar: str | None = None) -> str:
         if self._generate_fn is not None:
+            # Pass the GBNF grammar only when one was compiled (opt-in structured
+            # output) — ``_maybe_grammar`` already verified the callable accepts it,
+            # so a plain ``(prompt) -> str`` fn is still called with a single arg.
+            if grammar is not None:
+                return self._generate_fn(prompt, grammar=grammar)  # type: ignore[call-arg]
             return self._generate_fn(prompt)
         if self._pipe is None:  # pragma: no cover - heavy model load, not in CI
             from transformers import pipeline
