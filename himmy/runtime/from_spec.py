@@ -362,17 +362,32 @@ def build_runtime_for_spec(
             LearnedHintsContextAdapter,
             LearningService,
             ToolReputationProvider,
+            TrajectoryAdvisor,
         )
 
         # ``subject`` (the run's workspace_id) scopes the reputation read to this tenant on
         # a shared event store; ``None`` reads unscoped (CLI/offline, byte-identical).
-        learning = LearningService(storage, workspace_id=subject)
+        # P2: ``outcome_weight`` blends the OUTCOME-quality signal into reputation when > 0
+        # (default 0.0 → operational-only, byte-identical to P1).
+        learning = LearningService(
+            storage, workspace_id=subject, outcome_weight=spec.outcome_weight
+        )
         reputation_provider = ToolReputationProvider(learning, event_sink=storage)
+        # P2: the trajectory advisor adds run-sequence-aware hints (looping / don't-call-
+        # first). Built only when ``trajectory_hints`` is on, so the default path leaves the
+        # learned-hints adapter producing exactly the P1 per-tool note.
+        trajectory_advisor = (
+            TrajectoryAdvisor(storage, workspace_id=subject)
+            if spec.trajectory_hints
+            else None
+        )
         # The adapter's candidate tools are the run's bound tools, but the registry is
         # built below, so we hold a reference and pin ``tool_names`` once it exists (the
         # snapshot scope never carries the run's tool list — see the priming next to the
         # reputation refresh). Without this the hint half of the loop is a silent no-op.
-        learned_hints_adapter = LearnedHintsContextAdapter(learning, event_sink=storage)
+        learned_hints_adapter = LearnedHintsContextAdapter(
+            learning, event_sink=storage, trajectory_advisor=trajectory_advisor
+        )
         context_adapters.append(learned_hints_adapter)
 
     if context_adapters:

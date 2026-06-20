@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from himmy.agents.base_agent.task import Task
 from himmy.agents.personas.persona import Persona
@@ -97,6 +97,16 @@ class AgentSpec(BaseModel):
     # bound toolset and (b) injects a short reliability hint into the prompt. Default
     # False → zero behaviour change. Needs a runtime wired with the learning service.
     self_learning: bool = False
+    # Self-learning (P2, outcome quality, opt-in): blend an OUTCOME-quality signal (was the
+    # ANSWER good, from the LLM judge / a deterministic grader / user feedback) into the
+    # P1 operational reputation (did the tool RUN). ``outcome_weight`` in [0, 1] is the
+    # convex blend weight: 0.0 (the default) means outcome scores are recorded but NEVER
+    # blended, so reputation/hints/reorder stay byte-identical to P1; >0.0 mixes the
+    # outcome-weighted success rate into the score. Inert unless ``self_learning`` is also
+    # on. ``trajectory_hints`` (default off) adds run-sequence-aware hints ("you appear to
+    # be looping / don't call X first") mined from the run's OWN tool-call order.
+    outcome_weight: float = 0.0
+    trajectory_hints: bool = False
     # Files/dirs to auto-ingest into the agent's knowledge base at startup (no driver
     # code). The agent gains kb_search and can answer grounded in these docs.
     knowledge: list[str] = []
@@ -108,6 +118,14 @@ class AgentSpec(BaseModel):
     language: str = "en"  # "ne" → instruct the agent to respond in Nepali (Devanagari)
     output_schema: dict[str, Any] | None = None
     metadata: dict[str, Any] = {}
+
+    @field_validator("outcome_weight")
+    @classmethod
+    def _check_outcome_weight(cls, v: float) -> float:
+        """``outcome_weight`` is a convex blend weight — it must live in [0, 1]."""
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"outcome_weight must be in [0, 1], got {v}")
+        return v
 
     def to_persona(self) -> Persona:
         """Project the spec into a :class:`Persona` (role folded into metadata)."""

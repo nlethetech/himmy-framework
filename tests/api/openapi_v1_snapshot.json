@@ -202,6 +202,11 @@
             "title": "Name",
             "type": "string"
           },
+          "outcome_weight": {
+            "default": 0.0,
+            "title": "Outcome Weight",
+            "type": "number"
+          },
           "output_schema": {
             "anyOf": [
               {
@@ -297,6 +302,11 @@
               }
             ],
             "title": "Tools Module"
+          },
+          "trajectory_hints": {
+            "default": false,
+            "title": "Trajectory Hints",
+            "type": "boolean"
           }
         },
         "required": [

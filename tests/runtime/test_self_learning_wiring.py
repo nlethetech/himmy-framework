@@ -239,3 +239,62 @@ def test_reprime_picks_up_late_registered_mcp_tools() -> None:
     # After the re-prime both halves now include the MCP tool (snapshot + hint candidates).
     assert "mcp_remote" in provider._snapshot  # type: ignore[attr-defined]
     assert "mcp_remote" in (adapter._tool_names or [])  # type: ignore[attr-defined]
+
+
+# ----------------------------------------------------------------- P2 outcome wiring
+def test_outcome_weight_defaults_zero_and_validates_range() -> None:
+    """``outcome_weight`` defaults to 0.0 (off) and rejects out-of-range values."""
+    assert AgentSpec(name="t").outcome_weight == 0.0
+    assert AgentSpec(name="t").trajectory_hints is False
+    assert AgentSpec(name="t", outcome_weight=0.5).outcome_weight == 0.5
+    with pytest.raises(ValueError, match="outcome_weight"):
+        AgentSpec(name="t", outcome_weight=1.5)
+    with pytest.raises(ValueError, match="outcome_weight"):
+        AgentSpec(name="t", outcome_weight=-0.1)
+
+
+def test_self_learning_off_path_unchanged_by_p2_fields() -> None:
+    """P2 fields set but self_learning off → no adapter, no provider (byte-identical off)."""
+    spec = AgentSpec(
+        name="t",
+        tools_module=_TOOLS_MODULE,
+        outcome_weight=0.9,
+        trajectory_hints=True,
+    )
+    runtime, _registry = build_runtime_for_spec(spec)
+    assert runtime.tool_service._reputation_provider is None  # type: ignore[union-attr]
+    assert "learned_hints" not in _adapter_names(runtime)
+
+
+def test_outcome_weight_threads_into_learning_service() -> None:
+    """``outcome_weight`` reaches the LearningService; default leaves the blend off."""
+    on = AgentSpec(
+        name="t", self_learning=True, tools_module=_TOOLS_MODULE, outcome_weight=0.4
+    )
+    runtime, _ = build_runtime_for_spec(on)
+    provider = runtime.tool_service._reputation_provider  # type: ignore[union-attr]
+    assert provider._learning._outcome_weight == 0.4  # type: ignore[attr-defined]
+    assert provider._learning.outcome_enabled is True  # type: ignore[attr-defined]
+
+    off = AgentSpec(name="t", self_learning=True, tools_module=_TOOLS_MODULE)
+    runtime2, _ = build_runtime_for_spec(off)
+    prov2 = runtime2.tool_service._reputation_provider  # type: ignore[union-attr]
+    assert prov2._learning._outcome_weight == 0.0  # type: ignore[attr-defined]
+    assert prov2._learning.outcome_enabled is False  # type: ignore[attr-defined]
+
+
+def test_trajectory_hints_flag_wires_advisor() -> None:
+    """``trajectory_hints`` on → the adapter carries a TrajectoryAdvisor; off → None."""
+    on = AgentSpec(
+        name="t", self_learning=True, tools_module=_TOOLS_MODULE, trajectory_hints=True
+    )
+    runtime, _ = build_runtime_for_spec(on, subject="A")
+    adapter = _learned_hints_adapter(runtime)
+    assert adapter._trajectory_advisor is not None  # type: ignore[attr-defined]
+    # The advisor is workspace-scoped exactly like the reputation read.
+    assert adapter._trajectory_advisor._workspace_id == "A"  # type: ignore[attr-defined]
+
+    off = AgentSpec(name="t", self_learning=True, tools_module=_TOOLS_MODULE)
+    runtime2, _ = build_runtime_for_spec(off)
+    adapter2 = _learned_hints_adapter(runtime2)
+    assert adapter2._trajectory_advisor is None  # type: ignore[attr-defined]

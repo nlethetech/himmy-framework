@@ -1174,16 +1174,31 @@ def cmd_bench(args: argparse.Namespace) -> int:
         BenchmarkRunner,
         BenchmarkSuite,
         ModelSpec,
+        bfcl_suite,
         default_suite,
+        irrelevance_suite,
+        multiagent_suite,
+        nepali_suite,
+        render_leaderboard,
         render_markdown,
         to_json,
     )
 
-    suite = (
-        BenchmarkSuite.from_yaml(args.suite)
-        if getattr(args, "suite", None)
-        else default_suite()
-    )
+    # `--suite` accepts a built-in name (resolved offline) or a path to a suite.yaml.
+    _BUILTIN_SUITES = {
+        "core": default_suite,
+        "nepali": nepali_suite,
+        "irrelevance": irrelevance_suite,
+        "multiagent": multiagent_suite,
+        "bfcl": bfcl_suite,
+    }
+    suite_arg = getattr(args, "suite", None)
+    if not suite_arg:
+        suite = default_suite()
+    elif suite_arg in _BUILTIN_SUITES:
+        suite = _BUILTIN_SUITES[suite_arg]()
+    else:
+        suite = BenchmarkSuite.from_yaml(suite_arg)
     extra = [
         p.strip()
         for p in (getattr(args, "extra_packs", None) or "").split(",")
@@ -1227,7 +1242,10 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"({len(suite.tasks)} tasks × {args.trials} trials)…"
     )
     cards = asyncio.run(runner.run(suite, specs))
-    print(render_markdown(cards, suite_name=suite.name))
+    if getattr(args, "leaderboard", False):
+        print(render_leaderboard(cards, suite_name=suite.name))
+    else:
+        print(render_markdown(cards, suite_name=suite.name))
 
     # Cache the scorecards so Studio's Doctor can show per-model reliability.
     from datetime import datetime

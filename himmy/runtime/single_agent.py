@@ -2456,6 +2456,20 @@ class SingleAgentRuntime:
         capture_io = self._capture_io and not train_suppressed
 
         # --- 1. snapshot resolve/build -------------------------------------
+        # Thread the run reference (trace/thread id) into the context-build metadata so a
+        # context adapter can scope to THIS run's own event sequence (e.g. the P2
+        # trajectory-aware learned-hints advisor mining the run's own tool-call order).
+        # Additive + idempotent: only fills the keys when absent, so a caller that already
+        # set them — and every adapter that ignores them — is unaffected.
+        cb_meta = ctx.get("context_metadata")
+        if isinstance(cb_meta, dict):
+            cb_meta.setdefault("run_trace_id", trace_id)
+            cb_meta.setdefault("run_thread_id", thread.thread_id)
+        elif cb_meta is None and ctx.get("context_build_spec") is not None:
+            ctx["context_metadata"] = {
+                "run_trace_id": trace_id,
+                "run_thread_id": thread.thread_id,
+            }
         snapshot, snapshot_id, snapshot_error = await self._resolve_snapshot(
             persona, task, ctx, snapshot_id
         )

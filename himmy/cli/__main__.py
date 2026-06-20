@@ -254,7 +254,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma list of provider:model (e.g. ollama:qwen2.5:3b-instruct,claude-cli:haiku)",
     )
     p_bench.add_argument(
-        "--suite", help="path to a suite.yaml (default: built-in core)"
+        "--suite",
+        help="path to a suite.yaml, or a built-in suite name "
+        "(core/nepali/irrelevance/multiagent/bfcl); default: built-in core",
+    )
+    p_bench.add_argument(
+        "--leaderboard",
+        action="store_true",
+        help="render a BFCL-style ranked leaderboard (Accuracy + CI, tool-call, "
+        "arg-accuracy, multi-turn, abstain, McNemar) instead of the default scorecard",
     )
     p_bench.add_argument(
         "--trials", type=int, default=3, help="runs per task (more → tighter CIs)"

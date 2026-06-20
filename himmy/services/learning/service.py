@@ -60,10 +60,32 @@ DEFAULT_MIN_SAMPLES = 3
 #: or barely-seen tool is NEVER deprioritised (a stable sort on all-1.0 is a no-op).
 NEUTRAL_SCORE = 1.0
 
+#: Default convex blend weight for the OUTCOME-quality signal (P2). 0.0 means the blended
+#: ``score`` equals the operational ``operational_score`` exactly — so a LearningService
+#: built with the default is byte-for-byte the P1 service. A value in (0, 1] mixes in the
+#: outcome-weighted success rate.
+DEFAULT_OUTCOME_WEIGHT = 0.0
+
 
 @dataclass(frozen=True)
 class ToolReputation:
-    """A tool's recent reliability, derived from its TOOL_FAILED/TOOL_COMPLETED events."""
+    """A tool's recent reliability, derived from its recorded events.
+
+    Two signals are carried, and ``score`` is a convex blend of them controlled by the
+    service's ``outcome_weight``:
+
+    * the **operational** signal (P1): did the tool RUN — ``completed / (completed +
+      failed)`` over the recent ``TOOL_COMPLETED`` / ``TOOL_FAILED`` window. This is
+      :attr:`operational_score`.
+    * the **outcome** signal (P2): when the tool ran, was the produced ANSWER GOOD — the
+      mean of the ``OUTCOME_SCORED`` scores in ``[0, 1]`` attributed to this tool. This is
+      :attr:`outcome_score` (``None`` until enough outcome samples exist).
+
+    With ``outcome_weight == 0`` (the default / feature-off) ``score`` IS
+    ``operational_score`` to the bit, so every P1 consumer — the sort key, the unreliable
+    floor, the hint — is unchanged. With a positive weight and a present outcome signal,
+    ``score = (1 - w) * operational_score + w * outcome_score``.
+    """
 
     tool_name: str
     completed: int
@@ -72,6 +94,16 @@ class ToolReputation:
     #: Whether enough samples exist for ``score`` to be trusted below neutral. When
     #: False the score is the neutral prior regardless of the (sub-threshold) counts.
     has_min_samples: bool
+    #: The pure operational reliability (P1): ``completed / (completed + failed)`` (or the
+    #: neutral prior below ``min_samples``). ``score`` equals this exactly when the outcome
+    #: signal is off / absent, so callers that want the legacy number read it directly.
+    operational_score: float = NEUTRAL_SCORE
+    #: Mean OUTCOME score in ``[0, 1]`` attributed to this tool, or ``None`` when there are
+    #: fewer than ``min_outcome_samples`` outcome events (so a single early grade can't
+    #: swing the blend). Always ``None`` when the outcome signal is off.
+    outcome_score: float | None = None
+    #: Number of OUTCOME_SCORED events that fed ``outcome_score`` (0 when off / absent).
+    outcome_samples: int = 0
 
     @property
     def total(self) -> int:
@@ -95,6 +127,8 @@ class LearningService:
         window: int = DEFAULT_WINDOW,
         min_samples: int = DEFAULT_MIN_SAMPLES,
         workspace_id: str | None = None,
+        outcome_weight: float = DEFAULT_OUTCOME_WEIGHT,
+        min_outcome_samples: int = DEFAULT_MIN_SAMPLES,
     ) -> None:
         self._events = event_log
         self._window = max(1, int(window))
@@ -105,6 +139,16 @@ class LearningService:
         # whole stream unscoped — the historical behaviour and the byte-identical default
         # for the isolated-per-process CLI store.
         self._workspace_id = workspace_id
+        # P2 OUTCOME blend weight, clamped to [0, 1]. 0.0 (the default) short-circuits the
+        # outcome read entirely (no extra storage I/O) and makes ``score`` exactly the
+        # operational score — the byte-identical feature-off path.
+        self._outcome_weight = min(1.0, max(0.0, float(outcome_weight)))
+        self._min_outcome_samples = max(1, int(min_outcome_samples))
+
+    @property
+    def outcome_enabled(self) -> bool:
+        """Whether the OUTCOME-quality blend is active (weight > 0)."""
+        return self._outcome_weight > 0.0
 
     async def get_tool_reputation(
         self, tool_names: list[str]
@@ -136,22 +180,86 @@ class LearningService:
         total = completed + failed
         if total < self._min_samples:
             # Cold-start / sub-threshold: keep the neutral prior but carry the real
-            # counts so a hint can still mention them if a consumer chooses to.
+            # counts so a hint can still mention them if a consumer chooses to. The
+            # operational signal is what gates samples, so the outcome read is skipped:
+            # an under-sampled tool always reports neutral regardless of any grades.
             return ToolReputation(
                 tool_name=tool_name,
                 completed=completed,
                 failed=failed,
                 score=NEUTRAL_SCORE,
                 has_min_samples=False,
+                operational_score=NEUTRAL_SCORE,
             )
-        score = completed / total if total else NEUTRAL_SCORE
+        operational = completed / total if total else NEUTRAL_SCORE
+        # P2: read+blend the outcome signal ONLY when the weight is positive. With the
+        # weight at 0 this branch is skipped entirely (no second storage read) and the
+        # blended ``score`` is the operational score to the bit — the feature-off invariant.
+        outcome_score: float | None = None
+        outcome_samples = 0
+        if self._outcome_weight > 0.0:
+            try:
+                outcome_score, outcome_samples = await self._outcome_signal(tool_name)
+            except Exception:  # pragma: no cover - defensive: outcome read never breaks
+                logger.debug(
+                    "outcome read failed for tool %r; using operational only",
+                    tool_name,
+                    exc_info=True,
+                )
+                outcome_score, outcome_samples = None, 0
+        score = self._blend(operational, outcome_score)
         return ToolReputation(
             tool_name=tool_name,
             completed=completed,
             failed=failed,
             score=score,
             has_min_samples=True,
+            operational_score=operational,
+            outcome_score=outcome_score,
+            outcome_samples=outcome_samples,
         )
+
+    def _blend(self, operational: float, outcome: float | None) -> float:
+        """Convex-blend the operational and outcome signals by ``outcome_weight``.
+
+        Returns ``operational`` EXACTLY when the weight is 0 or no outcome signal exists
+        (the off / cold-outcome path), else ``(1 - w) * operational + w * outcome``. The
+        ``w == 0`` short-circuit means even a float round-trip cannot perturb the legacy
+        score: it is the same object returned, not ``1.0 * operational``.
+        """
+        if self._outcome_weight <= 0.0 or outcome is None:
+            return operational
+        w = self._outcome_weight
+        return (1.0 - w) * operational + w * outcome
+
+    async def _outcome_signal(self, tool_name: str) -> tuple[float | None, int]:
+        """Return ``(mean_outcome_score, n)`` over a tool's recent OUTCOME_SCORED events.
+
+        Reads up to ``window`` of the tool's most-recent ``OUTCOME_SCORED`` events (scoped
+        to ``workspace_id`` when set, mirroring the operational read) and averages their
+        ``payload['outcome_score']``. Below ``min_outcome_samples`` valid scores it returns
+        ``(None, n)`` so a single early grade can't swing the blend. Any malformed score is
+        skipped, never raised — the read stays best-effort.
+        """
+        events = await self._events.list_events(
+            event_type=EventType.OUTCOME_SCORED,
+            tool_name=tool_name,
+            workspace_id=self._workspace_id,
+            limit=self._window,
+            newest_first=True,
+        )
+        scores: list[float] = []
+        for e in events:
+            raw = (e.payload or {}).get("outcome_score")
+            try:
+                val = float(raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= val <= 1.0:
+                scores.append(val)
+        if len(scores) < self._min_outcome_samples:
+            return None, len(scores)
+        return sum(scores) / len(scores), len(scores)
 
     async def _recent_counts(self, tool_name: str) -> tuple[int, int]:
         """Return ``(completed, failed)`` over a SINGLE combined most-recent-N window.
@@ -208,6 +316,7 @@ class LearningService:
             failed=0,
             score=NEUTRAL_SCORE,
             has_min_samples=False,
+            operational_score=NEUTRAL_SCORE,
         )
 
 

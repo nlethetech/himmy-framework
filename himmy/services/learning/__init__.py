@@ -16,15 +16,31 @@ learning must never break or noticeably slow a run.
 from __future__ import annotations
 
 from himmy.services.learning.adapter import LearnedHintsContextAdapter
+from himmy.services.learning.outcome import (
+    OutcomeRecorder,
+    OutcomeSource,
+    clamp_score,
+)
 from himmy.services.learning.service import (
     LearningService,
     ToolReputation,
     ToolReputationProvider,
 )
+from himmy.services.learning.trajectory import (
+    TrajectoryAdvisor,
+    TrajectorySignal,
+    render_trajectory_hints,
+)
 
 __all__ = [
     "LearnedHintsContextAdapter",
     "LearningService",
+    "OutcomeRecorder",
+    "OutcomeSource",
     "ToolReputation",
     "ToolReputationProvider",
+    "TrajectoryAdvisor",
+    "TrajectorySignal",
+    "clamp_score",
+    "render_trajectory_hints",
 ]

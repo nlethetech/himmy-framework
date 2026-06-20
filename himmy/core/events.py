@@ -60,6 +60,14 @@ class EventType(str, Enum):
     # and/or a learned reliability hint was injected (emitted per-run, with the run's
     # trace context). Emitted best-effort so the behavioural change is auditable.
     LEARNING_APPLIED = "LEARNING_APPLIED"
+    # Self-learning (P2, outcome quality): an OUTCOME score in [0, 1] was attached to a
+    # run (and, when a single tool dominated the run, to that tool). Unlike TOOL_COMPLETED
+    # / TOOL_FAILED — which only say a tool RAN — this says whether the produced answer was
+    # GOOD, sourced from the (same-model-guarded) LLM judge, a deterministic grader hook,
+    # explicit user feedback, or a trajectory grade. Carries ``payload['tool_name']`` (the
+    # same denormalised column the reputation miner already filters on) so an outcome stat
+    # blends into ToolReputation with no schema change. Emitted best-effort, opt-in.
+    OUTCOME_SCORED = "OUTCOME_SCORED"
 
 
 class RunEvent(BaseModel):
