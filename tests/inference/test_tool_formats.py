@@ -597,8 +597,10 @@ def test_canonical_hermes_manifest_unaffected_by_fewshot() -> None:
     )
 
 
-#: The exact few-shot manifest for the single get_weather tool — the canonical body,
-#: then the no-code nudge, then a single synthesized exemplar per fewshot count (2).
+#: The exact few-shot manifest for the single get_weather tool — the canonical body, the
+#: no-code nudge, the anti-parrot framing line, then a single synthesized exemplar per
+#: fewshot count (2). The placeholder value is an obviously-fake "<example-text>" sentinel
+#: (FIX 3) and the framing tells the model to fill args from the user, not the example.
 _GOLDEN_FEWSHOT_MANIFEST = (
     _GOLDEN_HERMES_MANIFEST
     + "\n\n"
@@ -609,39 +611,44 @@ _GOLDEN_FEWSHOT_MANIFEST = (
     )
     + "\n\n# Examples\n\n"
     + (
+        "Below are examples of the FORMAT only. Fill the arguments from the USER's "
+        "request, NOT from the examples."
+    )
+    + "\n\n"
+    + (
         "Example — user: Use the get_weather tool.\n"
         "Example — assistant:\n<tool_call>\n"
-        '{"name": "get_weather", "arguments": {"city": "example"}}\n'
+        '{"name": "get_weather", "arguments": {"city": "<example-text>"}}\n'
         "</tool_call>"
     )
 )
 
 
 def test_fewshot_render_manifest_golden_single_tool() -> None:
-    """The few-shot manifest = canonical body + no-code nudge + 1 synthesized exemplar.
+    """The few-shot manifest = canonical body + no-code nudge + framing + 1 exemplar.
 
     With one bound tool, fewshot=2 still yields a single exemplar (n is capped at the
-    tool count) — the golden pins exemplar shape, placeholder fill, and ordering.
+    tool count) — the golden pins exemplar shape, placeholder fill, framing, and ordering.
     """
     got = HERMES_CHATML_XML_FEWSHOT.render_system_manifest([_WEATHER_TOOL], "ollama")
     assert got == _GOLDEN_FEWSHOT_MANIFEST
 
 
 def test_fewshot_exemplar_count_capped_at_two() -> None:
-    """fewshot=2 over many tools emits exactly two exemplars, leading distinct tools."""
+    """fewshot=2 over many tools emits exactly two exemplars over distinct tools."""
     many = [
         BoundTool(name=f"tool_{i}", description="d", args_json_schema={"type": "object"})
         for i in range(4)
     ]
     manifest = HERMES_CHATML_XML_FEWSHOT.render_system_manifest(many, "ollama")
     assert manifest.count("Example — user:") == 2
-    # The two exemplars rotate the lead tool, so they cover the first two tools.
+    # The two exemplars cover the first two DISTINCT tools (anti-parrot diversity).
     assert "Use the tool_0 tool." in manifest
     assert "Use the tool_1 tool." in manifest
 
 
 def test_fewshot_exemplar_fills_typed_placeholder() -> None:
-    """The synthesized exemplar fills the first property with a type-correct value."""
+    """The synthesized exemplar fills the first property with a fake type-correct value."""
     int_tool = BoundTool(
         name="egg_totals",
         description="Sum eggs.",
@@ -651,7 +658,9 @@ def test_fewshot_exemplar_fills_typed_placeholder() -> None:
         },
     )
     manifest = HERMES_CHATML_XML_FEWSHOT.render_system_manifest([int_tool], "ollama")
-    assert '{"name": "egg_totals", "arguments": {"days": 1}}' in manifest
+    # FIX 3: int placeholder is a distinctive 4242 (not a small round int the model
+    # parrots like 99/2/5, and not a value any plausible task would carry).
+    assert '{"name": "egg_totals", "arguments": {"days": 4242}}' in manifest
 
 
 def test_fewshot_empty_tools_no_examples_block() -> None:
@@ -714,10 +723,16 @@ def _hgpt_prompt_and_resp(
 
 
 def test_hgpt_defaults_to_fewshot_hermes_format() -> None:
-    """No explicit format → the 0.5b manager renders the FEW-SHOT Hermes manifest."""
+    """No explicit format → the 0.5b manager renders the FEW-SHOT Hermes manifest.
+
+    With multi-turn few-shot (FIX 2) the flattened in-manifest ``# Examples`` block is
+    replaced by REAL prior turns, so the manifest no longer carries ``# Examples``; the
+    exemplar surfaces as a ``[User]``/``[Assistant]`` turn pair instead.
+    """
     prompt, _ = _hgpt_prompt_and_resp(reply="hi", tools=[_WEATHER_TOOL])
     assert "<tools>" in prompt  # tool manifest injected
-    assert "# Examples" in prompt  # few-shot exemplar present
+    assert "# Examples" not in prompt  # flattened block gone (exemplars are turns now)
+    assert "Use the get_weather tool." in prompt  # exemplar present as a real turn
     assert "output ONLY" in prompt  # the no-code nudge present
     assert "[System]" in prompt  # injected as a system block
 
@@ -792,3 +807,451 @@ def test_hgpt_explicit_generic_format_overrides_default() -> None:
     # so neither the Hermes <tools> block nor the few-shot examples appear.
     assert "<tools>" not in prompt
     assert "# Examples" not in prompt
+
+
+# ========================================================================== #
+# FIX 2 — TRUE MULTI-TURN FEW-SHOT (exemplars as REAL prior turns)
+# ========================================================================== #
+
+from himmy.services.inference.tool_formats import render_fewshot_turns  # noqa: E402
+
+
+def test_render_fewshot_turns_are_user_assistant_pairs() -> None:
+    """render_fewshot_turns emits a (user, assistant) pair per exemplar tool."""
+    turns = HERMES_CHATML_XML_FEWSHOT.fewshot_turns([_WEATHER_TOOL])
+    assert turns == [
+        ("user", "Use the get_weather tool."),
+        (
+            "assistant",
+            '<tool_call>\n{"name": "get_weather", "arguments": {"city": "<example-text>"}}\n</tool_call>',
+        ),
+    ]
+
+
+def test_render_fewshot_turns_two_distinct_tools() -> None:
+    """fewshot=2 over many tools → two (user, assistant) pairs over the first two tools."""
+    many = [
+        BoundTool(name=f"tool_{i}", description="d", args_json_schema={"type": "object"})
+        for i in range(4)
+    ]
+    turns = render_fewshot_turns(many, HERMES_CHATML_XML_FEWSHOT.flags)
+    assert len(turns) == 4  # 2 exemplars * (user + assistant)
+    assert turns[0] == ("user", "Use the tool_0 tool.")
+    assert turns[2] == ("user", "Use the tool_1 tool.")
+
+
+def test_render_fewshot_turns_empty_without_tools() -> None:
+    assert HERMES_CHATML_XML_FEWSHOT.fewshot_turns([]) == []
+
+
+def test_canonical_hermes_has_no_fewshot_turns() -> None:
+    """Single-turn formats expose no multi-turn renderer (opt-in only)."""
+    assert HERMES_CHATML_XML.fewshot_turns is None
+    assert GENERIC.fewshot_turns is None
+
+
+def test_base_manifest_omits_flattened_examples() -> None:
+    """render_system_manifest_base drops the flattened # Examples (used with turns)."""
+    base = HERMES_CHATML_XML_FEWSHOT.render_system_manifest_base(
+        [_WEATHER_TOOL], "ollama"
+    )
+    assert "# Examples" not in base
+    # ...but keeps the no-code nudge + canonical body.
+    assert "output ONLY" in base
+    assert "<tools>" in base
+
+
+def test_hgpt_renders_fewshot_as_real_prior_turns() -> None:
+    """The 0.5b manager composes few-shot as REAL [User]/[Assistant] turns, no flatten."""
+    prompt, _ = _hgpt_prompt_and_resp(reply="hi", tools=[_WEATHER_TOOL])
+    # The flattened in-manifest block is GONE (exemplars are turns now).
+    assert "# Examples" not in prompt
+    assert "Example — user:" not in prompt
+    # The exemplar is a real prior turn pair, in order, between manifest and real user.
+    sys_idx = prompt.index("[System]")
+    ex_user_idx = prompt.index("[User]\nUse the get_weather tool.")
+    ex_asst_idx = prompt.index("[Assistant]\n<tool_call>")
+    real_user_idx = prompt.index("[User]\nweather in KTM?")
+    assert sys_idx < ex_user_idx < ex_asst_idx < real_user_idx
+    # The system block still advertises the tools + the no-code nudge.
+    assert "<tools>" in prompt
+    assert "output ONLY" in prompt
+
+
+def test_hgpt_generic_format_has_no_multi_turn_fewshot() -> None:
+    """A format without fewshot_turns (generic) keeps the plain single-turn prompt."""
+    prompt, _ = _hgpt_prompt_and_resp(
+        reply="hi", tools=[_WEATHER_TOOL], tool_call_format="generic"
+    )
+    assert "Use the get_weather tool." not in prompt
+
+
+def test_hgpt_canonical_hermes_format_stays_single_turn() -> None:
+    """Canonical Hermes on the 0.5b manager: no exemplar turns, no flattened examples."""
+    prompt, _ = _hgpt_prompt_and_resp(
+        reply="hi", tools=[_WEATHER_TOOL], tool_call_format="hermes_chatml_xml"
+    )
+    assert "# Examples" not in prompt
+    assert "Use the get_weather tool." not in prompt
+    assert "<tools>" in prompt  # but the manifest is still rendered
+
+
+# ========================================================================== #
+# FIX 3 — ANTI-PARROT EXEMPLARS (values can't collide with eval inputs)
+# ========================================================================== #
+
+
+def test_fewshot_framing_instruction_present() -> None:
+    """The 'fill from the USER's request' anti-parrot framing is in the manifest."""
+    manifest = HERMES_CHATML_XML_FEWSHOT.render_system_manifest([_WEATHER_TOOL], "ollama")
+    assert "Fill the arguments from the USER's request, NOT from the examples" in manifest
+
+
+def test_fewshot_exemplar_values_differ_from_eval_inputs() -> None:
+    """The synthesized exemplar values do NOT collide with the A/B eval-suite inputs.
+
+    If they did, the 0.5b could parrot the exemplar literal and still 'pass'. Assert the
+    placeholder values (the only literals the exemplar carries) are disjoint from every
+    arg value the eval tasks expect.
+    """
+    import json as _json
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experiments" / "himalayagpt"))
+    from tool_suite import TASKS, TOOLS  # type: ignore[import-not-found]
+
+    # Every literal value the exemplars carry (across both fewshot tools).
+    turns = render_fewshot_turns(TOOLS, HERMES_CHATML_XML_FEWSHOT.flags)
+    exemplar_values: set[str] = set()
+    for role, content in turns:
+        if role != "assistant":
+            continue
+        body = content.split("<tool_call>\n", 1)[1].split("\n</tool_call>", 1)[0]
+        args = _json.loads(body)["arguments"]
+        for v in args.values():
+            exemplar_values.add(str(v))
+
+    # Every expected arg value across the eval suite.
+    eval_values: set[str] = set()
+    for task in TASKS:
+        for v in task["expect_args"].values():
+            eval_values.add(str(v))
+
+    assert exemplar_values  # exemplars actually carry values
+    assert exemplar_values.isdisjoint(eval_values), (
+        f"exemplar values {exemplar_values} collide with eval inputs {eval_values} "
+        "— the model could parrot them"
+    )
+
+
+# ========================================================================== #
+# FIX 4 — EXEMPLAR SYNTHESIZER FILLS *EVERY* REQUIRED PROP (the EN 50% ceiling)
+# ========================================================================== #
+
+from himmy.services.inference.tool_formats import (  # noqa: E402
+    _example_args_for,
+    _fewshot_tools,
+)
+
+# Two- and three-arg tools the single-property synthesizer could never satisfy.
+_ADD_TOOL = BoundTool(
+    name="add_numbers",
+    description="Add two integers together and return the sum.",
+    args_json_schema={
+        "type": "object",
+        "properties": {
+            "a": {"type": "integer"},
+            "b": {"type": "integer"},
+        },
+        "required": ["a", "b"],
+    },
+    read_only=True,
+)
+_TRANSLATE_TOOL = BoundTool(
+    name="translate_text",
+    description="Translate text into a target language.",
+    args_json_schema={
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "target_language": {"type": "string"},
+        },
+        "required": ["text", "target_language"],
+    },
+    read_only=True,
+)
+
+
+def test_example_args_fills_all_required_props_two_arg() -> None:
+    """A 2-arg tool's exemplar fills BOTH required args (was only the first → 50% cap)."""
+    args = _example_args_for(_ADD_TOOL)
+    assert set(args) == {"a", "b"}
+    assert args["a"] == 4242 and args["b"] == 4242  # both int sentinels
+
+
+def test_example_args_two_string_args_get_distinct_values() -> None:
+    """A 2-string-arg tool's exemplar gives each slot a DISTINCT fake value (not one
+    repeated literal) so the exemplar demonstrates two real, different arguments."""
+    args = _example_args_for(_TRANSLATE_TOOL)
+    assert set(args) == {"text", "target_language"}
+    assert args["text"] != args["target_language"]
+    # both are obviously-fake bracketed sentinels
+    assert args["text"].startswith("<") and args["target_language"].startswith("<")
+
+
+def test_example_args_uses_required_not_just_first_prop() -> None:
+    """Only the REQUIRED props are filled; an optional prop is left out of the exemplar."""
+    tool = BoundTool(
+        name="search",
+        description="Search.",
+        args_json_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    )
+    args = _example_args_for(tool)
+    assert set(args) == {"query"}  # only the required prop
+
+
+def test_example_args_no_required_key_fills_all_declared() -> None:
+    """When a schema omits `required`, the exemplar falls back to all declared props."""
+    tool = BoundTool(
+        name="noreq",
+        description="No required key.",
+        args_json_schema={
+            "type": "object",
+            "properties": {"x": {"type": "integer"}, "y": {"type": "string"}},
+        },
+    )
+    args = _example_args_for(tool)
+    assert set(args) == {"x", "y"}
+
+
+def _suite_tools() -> list[BoundTool]:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[2] / "experiments" / "himalayagpt")
+    )
+    from tool_suite import TOOLS  # type: ignore[import-not-found]
+
+    return list(TOOLS)
+
+
+def test_every_synthesized_exemplar_fills_all_required_props_over_suite() -> None:
+    """Over the real A/B suite: EVERY synthesized exemplar fills ALL of its tool's
+    required props — the contract that lets 2-arg tools (add_numbers, translate_text)
+    pass the args check and lifts the EN ceiling past 50%."""
+    import json as _json
+
+    tools = _suite_tools()
+    chosen = _fewshot_tools(tools, HERMES_CHATML_XML_FEWSHOT.flags)
+    assert chosen  # the synthesizer actually selected exemplar tools
+
+    by_name = {t.name: t for t in tools}
+    turns = render_fewshot_turns(tools, HERMES_CHATML_XML_FEWSHOT.flags)
+    asst = [c for r, c in turns if r == "assistant"]
+    assert len(asst) == len(chosen)
+    for content in asst:
+        body = content.split("<tool_call>\n", 1)[1].split("\n</tool_call>", 1)[0]
+        call = _json.loads(body)
+        tool = by_name[call["name"]]
+        required = set((tool.args_json_schema or {}).get("required") or [])
+        assert required.issubset(set(call["arguments"])), (
+            f"exemplar for {call['name']} missing required props "
+            f"{required - set(call['arguments'])}"
+        )
+
+
+def test_fewshot_exemplar_set_demonstrates_a_two_arg_tool() -> None:
+    """The exemplar set covers >=2 distinct tools AND includes at least one 2-arg tool
+    (when the toolset has one) — a single-arg-only exemplar set is what capped EN at 50%."""
+    tools = _suite_tools()
+    chosen = _fewshot_tools(tools, HERMES_CHATML_XML_FEWSHOT.flags)
+    assert len(chosen) >= 2  # >=2 diverse exemplars
+    assert len({t.name for t in chosen}) == len(chosen)  # over DIFFERENT tools
+
+    def _req_count(t: BoundTool) -> int:
+        schema = t.args_json_schema or {}
+        props = schema.get("properties") or {}
+        required = schema.get("required") or list(props)
+        return len([k for k in props if k in required])
+
+    assert any(_req_count(t) >= 2 for t in chosen), (
+        "exemplar set has no multi-arg tool — 2-arg tasks can never be demonstrated"
+    )
+
+
+# ========================================================================== #
+# PRE-BOOST BASELINE FORMAT — the A/B baseline arm. It reproduces main's ORIGINAL
+# single-turn few-shot so the boost is the SOLE difference in the powered A/B.
+# ========================================================================== #
+
+from himmy.services.inference.tool_formats import (  # noqa: E402
+    HERMES_CHATML_XML_FEWSHOT_BASELINE,
+)
+
+
+def test_baseline_format_registered_and_opt_in_only() -> None:
+    """The baseline format is registered by name and NEVER auto-selects (opt-in)."""
+    assert (
+        get_format("hermes_chatml_xml_fewshot_baseline")
+        is HERMES_CHATML_XML_FEWSHOT_BASELINE
+    )
+    assert HERMES_CHATML_XML_FEWSHOT_BASELINE.model_tags == frozenset()
+    # An explicit override resolves to it; nothing auto-selects it by tag.
+    assert (
+        format_for("qwen2.5", override="hermes_chatml_xml_fewshot_baseline")
+        is HERMES_CHATML_XML_FEWSHOT_BASELINE
+    )
+
+
+def test_baseline_is_single_turn_no_python_fallback() -> None:
+    """The baseline has NO multi-turn few-shot and NO python-call fallback (pre-boost)."""
+    assert HERMES_CHATML_XML_FEWSHOT_BASELINE.fewshot_turns is None
+    assert HERMES_CHATML_XML_FEWSHOT_BASELINE.render_system_manifest_base is None
+    assert HERMES_CHATML_XML_FEWSHOT_BASELINE.flags.python_call_fallback is False
+    # It still carries the pre-boost few-shot knobs (those existed before the boost).
+    assert HERMES_CHATML_XML_FEWSHOT_BASELINE.flags.fewshot == 2
+    assert HERMES_CHATML_XML_FEWSHOT_BASELINE.flags.no_code_instruction is True
+
+
+def test_baseline_exemplar_fills_only_first_prop() -> None:
+    """The baseline 2-arg exemplar shows ONLY the first arg (the documented 50% cap)."""
+    import json as _json
+    import re
+
+    manifest = HERMES_CHATML_XML_FEWSHOT_BASELINE.render_system_manifest(
+        _suite_tools(), "himalayagpt"
+    )
+    # Find the add_numbers exemplar in the flattened # Examples block.
+    assert "# Examples" in manifest
+    block = manifest.split("# Examples", 1)[1]
+    # Each exemplar is a full ``{"name": ..., "arguments": ...}`` JSON object inside a
+    # <tool_call> tag; pull the add_numbers one and confirm it shows only the first prop.
+    add_call = next(
+        c
+        for c in re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", block, re.DOTALL)
+        if '"add_numbers"' in c
+    )
+    args = _json.loads(add_call)["arguments"]
+    assert set(args) == {"a"}, f"baseline exemplar should show only first prop, got {args}"
+    assert args["a"] == 1  # the parrotable pre-boost int placeholder
+
+
+def test_baseline_manifest_byte_identical_to_main_prefix() -> None:
+    """The baseline manifest carries no anti-parrot framing line (pre-boost)."""
+    manifest = HERMES_CHATML_XML_FEWSHOT_BASELINE.render_system_manifest(
+        _suite_tools(), "himalayagpt"
+    )
+    assert "Fill the arguments from the USER's" not in manifest  # no anti-parrot framing
+
+
+def test_fewshot_swaps_in_multi_arg_when_leading_slice_all_single_arg() -> None:
+    """If the first-N slice is all single-arg, a multi-arg tool is swapped into the last
+    slot so the exemplar set always demonstrates a 2-arg call when one is available."""
+    single_a = BoundTool(
+        name="s_a", description="d",
+        args_json_schema={"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+    )
+    single_b = BoundTool(
+        name="s_b", description="d",
+        args_json_schema={"type": "object", "properties": {"y": {"type": "string"}}, "required": ["y"]},
+    )
+    multi = BoundTool(
+        name="m", description="d",
+        args_json_schema={
+            "type": "object",
+            "properties": {"p": {"type": "string"}, "q": {"type": "string"}},
+            "required": ["p", "q"],
+        },
+    )
+    # multi is LAST, outside the leading fewshot=2 slice [s_a, s_b].
+    chosen = _fewshot_tools([single_a, single_b, multi], HERMES_CHATML_XML_FEWSHOT.flags)
+    names = {t.name for t in chosen}
+    assert "m" in names  # the multi-arg tool was swapped in
+    assert len(chosen) == 2
+
+
+# ========================================================================== #
+# FIX 4 — GENERIC + canonical-Hermes manifests stay BYTE-IDENTICAL (re-pinned SHA)
+# ========================================================================== #
+
+import hashlib  # noqa: E402
+
+#: Re-pinned SHA-256 of the GENERIC + canonical-Hermes manifests over a representative
+#: tool set (incl. a 2-arg tool) across all three providers, RU-separated. The exemplar-
+#: synthesizer rework touches ONLY the opt-in few-shot path; if either of these hashes
+#: drifts, a "no-op" change leaked into GENERIC or canonical Hermes — a regression.
+_SHA_PIN_TOOLS = [
+    BoundTool(
+        name="get_weather",
+        description="Get weather",
+        args_json_schema={
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+        read_only=True,
+    ),
+    BoundTool(
+        name="add_numbers",
+        description="Add two integers together and return the sum.",
+        args_json_schema={
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+            "required": ["a", "b"],
+        },
+        read_only=True,
+    ),
+]
+_GENERIC_MANIFEST_SHA = (
+    "94e4cc3c5049d6b341211ad79fd936e3e669257911892c28cb2702d8991e666f"
+)
+_HERMES_MANIFEST_SHA = (
+    "5270d4ef2a80e999b6bc56b9b35bc4f43da5630cce9e1a60d73c683153da4a89"
+)
+
+
+def _manifest_sha(fmt: ToolCallFormat) -> str:
+    blob = ""
+    for provider in ("claude-cli", "ollama", "himalayagpt"):
+        blob += fmt.render_system_manifest(_SHA_PIN_TOOLS, provider) + "\x1e"
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def test_generic_manifest_sha_unchanged() -> None:
+    """GENERIC manifest is byte-identical to the pinned SHA (the rework is a no-op here)."""
+    assert _manifest_sha(GENERIC) == _GENERIC_MANIFEST_SHA
+
+
+def test_canonical_hermes_manifest_sha_unchanged() -> None:
+    """Canonical Hermes manifest is byte-identical to the pinned SHA (no fewshot leakage)."""
+    assert _manifest_sha(HERMES_CHATML_XML) == _HERMES_MANIFEST_SHA
+
+
+def test_generic_and_canonical_parse_byte_unchanged() -> None:
+    """GENERIC + canonical-Hermes PARSE are unchanged by the few-shot rework.
+
+    GENERIC stays record-identical to parse_text_tool_calls; canonical Hermes parses a
+    native <tool_call> the same way (the synthesizer touches rendering only, not parse)."""
+    samples = [
+        'TOOL_CALL get_weather {"city": "KTM"}',
+        '<tool_call>\n{"name": "add_numbers", "arguments": {"a": 1, "b": 2}}\n</tool_call>',
+        "Just prose.",
+    ]
+    known = {"get_weather", "add_numbers"}
+    for text in samples:
+        assert [(c.tool_name, c.args) for c in GENERIC.parse(text, known)] == [
+            (c.tool_name, c.args) for c in parse_text_tool_calls(text, known)
+        ]
+    native = '<tool_call>\n{"name": "add_numbers", "arguments": {"a": 1, "b": 2}}\n</tool_call>'
+    assert [
+        (c.tool_name, c.args) for c in HERMES_CHATML_XML.parse(native, known)
+    ] == [("add_numbers", {"a": 1, "b": 2})]

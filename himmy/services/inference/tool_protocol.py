@@ -18,6 +18,7 @@ typo'd name later). Identical calls are de-duplicated.
 
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import re
@@ -146,4 +147,99 @@ def parse_text_tool_calls(
     return calls
 
 
-__all__ = ["parse_text_tool_calls"]
+# --------------------------------------------------------------------------- #
+# Python-call fallback — recover a tool call from PYTHON-call syntax a small model
+# emits instead of <tool_call>. Small open-weight models (HimalayaGPT-0.5b) often
+# answer with ``get_weather(city="Paris")`` — a bare call line, a ```python``` fenced
+# block, or a ``<|python_start|>...<|python_end|>`` span (nanochat tool-token style).
+# The GENERIC tolerant parser MISSES these (counts as 0 emit) even when the tool choice
+# was right. This pass recovers them, but is GATED behind a format flag and only fires
+# for a name that matches a bound tool (preserving _name_is_plausible), so it can only
+# ADD hits — it never raises, never false-fires on prose, and never touches GENERIC.
+# --------------------------------------------------------------------------- #
+
+#: Strip the nanochat python tool-token span ``<|python_start|>...<|python_end|>`` so
+#: the call expression inside it is parsed like any other bare/fenced call.
+_PYTHON_TOKEN_RE = re.compile(
+    r"<\|python_start\|>(.*?)<\|python_end\|>", re.DOTALL
+)
+#: A bare ``name(...)`` call line: a python identifier immediately followed by a
+#: balanced-looking ``(...)``. Greedy on the args; ``ast`` validates the real shape.
+_BARE_CALL_RE = re.compile(
+    r"(?:^|\n)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)\s*(?=\n|$)", re.DOTALL
+)
+
+
+def _call_from_expr(expr: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse one python call expression ``name(arg=val, ...)`` into ``(name, args)``.
+
+    Uses ``ast`` (never ``eval``): the expression must be a single ``ast.Call`` on a
+    plain name; keyword arguments are read into a dict via :func:`ast.literal_eval`
+    (so only literals are accepted — no code execution). Positional args are tolerated
+    but ignored (they carry no key). Anything that is not a literal-keyword call
+    returns ``None``.
+    """
+    expr = expr.strip()
+    if not expr:
+        return None
+    try:
+        node = ast.parse(expr, mode="eval")
+    except (SyntaxError, ValueError):
+        return None
+    call = node.body
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+        return None
+    name = call.func.id
+    args: dict[str, Any] = {}
+    for kw in call.keywords:
+        if kw.arg is None:  # **kwargs splat — no static key, skip
+            continue
+        try:
+            args[kw.arg] = ast.literal_eval(kw.value)
+        except (ValueError, SyntaxError, TypeError):
+            continue
+    return name, args
+
+
+def parse_python_tool_calls(
+    text: str, known_names: set[str] | None = None
+) -> list[ToolCallRecord]:
+    """Recover tool calls from PYTHON-call syntax (fenced / bare / python-token).
+
+    Three sources, in order: a ``<|python_start|>...<|python_end|>`` span, a
+    ```` ```python ```` / ```` ```tool_call ```` fenced block, and a bare ``name(...)``
+    line. Each candidate expression is parsed with :func:`_call_from_expr` and accepted
+    ONLY when its name matches a known bound tool (:func:`_name_is_plausible`), so a
+    prose sentence that merely mentions a tool name never false-fires. De-duplicated in
+    first-seen order; never raises.
+    """
+    known = known_names or set()
+    calls: list[ToolCallRecord] = []
+    seen: set[str] = set()
+
+    def _add(name: str, args: dict[str, Any]) -> None:
+        if not _name_is_plausible(name, known):
+            return
+        key = f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+        if key in seen:
+            return
+        seen.add(key)
+        calls.append(ToolCallRecord(tool_call_id=new_uuid(), tool_name=name, args=args))
+
+    candidates: list[str] = []
+    # 1) nanochat python-token spans — the whole span is one call expression.
+    candidates.extend(m.strip() for m in _PYTHON_TOKEN_RE.findall(text))
+    # 2) ```python``` / ```tool_call``` fenced blocks (any fence body may hold a call).
+    candidates.extend(f.strip() for f in _FENCE_RE.findall(text))
+    # 3) bare ``name(args)`` call lines anywhere in the reply.
+    for m in _BARE_CALL_RE.finditer(text):
+        candidates.append(f"{m.group(1)}({m.group(2)})")
+
+    for cand in candidates:
+        norm = _call_from_expr(cand)
+        if norm is not None:
+            _add(*norm)
+    return calls
+
+
+__all__ = ["parse_text_tool_calls", "parse_python_tool_calls"]

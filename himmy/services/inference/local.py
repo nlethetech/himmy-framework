@@ -709,16 +709,46 @@ class HimalayaGptClientManager:
         already-present tool returns are re-labeled via the format's result grammar, so
         the model sees the tool advertisement, the few-shot exemplars, and the prior
         results in the grammar it was taught.
+
+        When the format exposes ``fewshot_turns`` (the himalaya few-shot format), the
+        exemplars are emitted as REAL prior ``[User]``/``[Assistant]`` turns (between the
+        manifest and the real conversation) and the FLATTENED in-manifest ``# Examples``
+        block is suppressed (the ``render_system_manifest_base`` renderer) so the
+        exemplars are not duplicated — the vendor multi-turn few-shot recipe. This is
+        OPT-IN: a format without ``fewshot_turns`` (canonical Hermes/Qwen, GENERIC, every
+        other manager) renders single-turn byte-identically to before.
         """
         use_text_path = bool(request.bound_tools) and getattr(
             tool_format.flags, "use_text_tool_path", False
         )
         if not use_text_path:
             return _compose_prompt(request)
-        manifest = tool_format.render_system_manifest(
-            request.bound_tools, self.provider_name
-        )
+        # Multi-turn few-shot (opt-in): exemplars become real prior turns and the system
+        # block uses the base (no flattened # Examples) manifest. Fail-open: any error or
+        # an absent renderer falls back to the single-turn flattened manifest.
+        fewshot_turns: list[tuple[str, str]] = []
+        fewshot_renderer = getattr(tool_format, "fewshot_turns", None)
+        if fewshot_renderer is not None:
+            try:
+                fewshot_turns = list(fewshot_renderer(request.bound_tools))
+            except Exception:  # noqa: BLE001 - few-shot turns are best-effort, never fatal
+                fewshot_turns = []
+        if fewshot_turns:
+            base_renderer = (
+                getattr(tool_format, "render_system_manifest_base", None)
+                or tool_format.render_system_manifest
+            )
+            manifest = base_renderer(request.bound_tools, self.provider_name)
+        else:
+            manifest = tool_format.render_system_manifest(
+                request.bound_tools, self.provider_name
+            )
         parts = [f"[System]\n{manifest}"]
+        for role, content in fewshot_turns:
+            label = {"user": "[User]", "assistant": "[Assistant]"}.get(
+                str(role).lower(), "[User]"
+            )
+            parts.append(f"{label}\n{content}")
         results: list[ToolReturnRecord] = []
 
         def _flush_results() -> None:

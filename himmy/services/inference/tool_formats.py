@@ -49,6 +49,9 @@ ManifestRenderer = Callable[[Sequence["BoundTool"], str], str]
 ReplyParser = Callable[[str, set[str]], list["ToolCallRecord"]]
 #: Render tool-result records into the text fed back to the model.
 ResultRenderer = Callable[[Sequence["ToolReturnRecord"]], str]
+#: Render few-shot exemplars as REAL prior ``(role, content)`` turns (opt-in; empty list
+#: means "no multi-turn few-shot" so the manager renders single-turn as before).
+FewshotTurnRenderer = Callable[[Sequence["BoundTool"]], list[tuple[str, str]]]
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,14 @@ class ToolCallGrammarFlags:
     #: writes a ```python``` block; this nudge (paired with few-shot) keeps it on the
     #: grammar. Opt-in so the canonical Hermes/Qwen manifest stays byte-for-byte.
     no_code_instruction: bool = False
+    #: OR-in :func:`parse_python_tool_calls` as a FINAL fallback pass: recover a call
+    #: the model emitted as PYTHON syntax (``get_weather(city="Paris")``, a
+    #: ```python``` fenced block, or a ``<|python_start|>...<|python_end|>`` span)
+    #: instead of a ``<tool_call>`` block. Add-only + name-guarded (a bound tool must
+    #: match), so it never false-fires on prose and never changes a successful
+    #: ``<tool_call>`` parse. Opt-in (False by default) so GENERIC stays byte-for-byte
+    #: ``parse_text_tool_calls`` and canonical Hermes/Qwen recall is unchanged.
+    python_call_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -115,6 +126,16 @@ class ToolCallFormat:
     exclude_tags: frozenset[str] = field(default_factory=frozenset)
     #: Data-only wire-divergence knobs (see :class:`ToolCallGrammarFlags`).
     flags: ToolCallGrammarFlags = field(default_factory=ToolCallGrammarFlags)
+    #: OPT-IN renderer that exposes few-shot exemplars as REAL prior ``(role, content)``
+    #: turns. ``None`` (the default for GENERIC + canonical Hermes/Qwen + every other
+    #: format) means a manager renders single-turn exactly as before — only a format that
+    #: sets this (the himalaya few-shot format) can be composed multi-turn by a manager
+    #: that supports it. A manager that ignores it is unaffected.
+    fewshot_turns: FewshotTurnRenderer | None = None
+    #: OPT-IN manifest renderer that OMITS the flattened ``# Examples`` block, used by a
+    #: manager that renders ``fewshot_turns`` as real turns (so exemplars aren't doubled).
+    #: ``None`` means "same as :attr:`render_system_manifest`".
+    render_system_manifest_base: ManifestRenderer | None = None
 
 
 def _normalize(value: str | None) -> str:
@@ -208,55 +229,212 @@ _HERMES_NO_CODE_INSTRUCTION = (
 )
 
 
-def _synthesize_fewshot_example(tools: Sequence[BoundTool], flags: ToolCallGrammarFlags) -> str:
-    """Synthesize ONE generic exemplar: a user line + the ideal ``<tool_call>`` reply.
+#: The one-line framing instruction that precedes the exemplars: it tells the model the
+#: examples teach the SHAPE only, and that argument values must come from the user's
+#: request — the anti-parrot guard so the 0.5b doesn't copy the exemplar literal.
+_FEWSHOT_FRAMING = (
+    "Below are examples of the FORMAT only. Fill the arguments from the USER's "
+    "request, NOT from the examples."
+)
 
-    The exemplar uses the FIRST bound tool and fills its first declared property with a
-    type-appropriate placeholder, so the shape the model copies is grammatically exact
-    and tied to the real manifest (not a hard-coded weather demo). Generic by design —
-    it teaches the *envelope*, not a domain — so any Hermes-family caller that opts into
-    few-shot gets a faithful exemplar for its own tools.
+#: Obviously-example-only placeholder VALUES, chosen so they cannot collide with (and
+#: thus be parroted into) a real eval/user input. Deliberately NOT a real city / a small
+#: round int the model parrots (99 / 2 / 5): the string sentinels are bracketed
+#: ``<...>`` markers that no natural user phrase contains, and the int sentinel is a
+#: distinctive 4242 (not a value any plausible "add a and b" / "set a timer for N"
+#: request would carry). If the model copies one verbatim it is unmistakably a parrot
+#: (the anti-parrot test asserts these are disjoint from the eval-suite inputs).
+#:
+#: A small POOL of distinct string sentinels (cycled per property) so a multi-arg tool's
+#: exemplar shows a DIFFERENT value in each slot — a 2-arg tool must demonstrate both
+#: args carrying distinct, type-correct, obviously-fake values, not one repeated literal.
+_PLACEHOLDER_STRINGS = ("<example-text>", "<example-target>", "<example-value>")
+_PLACEHOLDER_INT = 4242
+_PLACEHOLDER_NUMBER = 42.42
+_PLACEHOLDER_BOOL = True
+
+
+def _example_args_for(tool: BoundTool) -> dict[str, Any]:
+    """Fill EVERY required property of the tool with an obviously-fake, type-correct value.
+
+    Filling all required props (not just the first) is what lets a 2-arg exemplar
+    (``add_numbers`` a+b, ``translate_text`` text+target_language) actually DEMONSTRATE
+    both arguments — a one-arg exemplar can never pass the args check for such a tool, so
+    the few-shot recipe capped at ~50%. Each value is a clearly example-only sentinel
+    (see :data:`_PLACEHOLDER_STRINGS` et al.) and string slots cycle through a small pool
+    so a multi-arg call shows DISTINCT per-slot values, not one repeated literal — a small
+    model that copies any of them instead of extracting from the user query is plainly
+    parroting. Required props are filled (falling back to every declared prop when the
+    schema omits ``required``) so the exemplar always satisfies the tool's arg contract.
     """
-    tool = tools[0]
     schema = tool.args_json_schema or {}
     props = schema.get("properties") or {}
+    if not isinstance(props, dict):
+        return {}
+    required = schema.get("required")
+    # Fill the REQUIRED props (in declared order); fall back to all declared props when a
+    # schema omits `required` so the exemplar still demonstrates real arguments.
+    if isinstance(required, list) and required:
+        keys = [k for k in props if k in required]
+    else:
+        keys = list(props)
+
     example_args: dict[str, Any] = {}
-    for key, spec in props.items():
+    string_slot = 0
+    for key in keys:
+        spec = props.get(key)
         if not isinstance(spec, dict):
             continue
         t = spec.get("type")
         if t == "integer":
-            example_args[key] = 1
+            example_args[key] = _PLACEHOLDER_INT
         elif t == "number":
-            example_args[key] = 1.0
+            example_args[key] = _PLACEHOLDER_NUMBER
         elif t == "boolean":
-            example_args[key] = True
+            example_args[key] = _PLACEHOLDER_BOOL
         elif t == "array":
             example_args[key] = []
         elif t == "object":
             example_args[key] = {}
-        else:  # string / unknown
-            example_args[key] = "example"
-        break  # one filled property is enough to teach the envelope
-    call = {flags.name_key: tool.name, flags.arg_key: example_args}
-    call_json = json.dumps(call, separators=(", ", ": "), ensure_ascii=False)
+        else:  # string / unknown — cycle the pool so each slot differs
+            example_args[key] = _PLACEHOLDER_STRINGS[
+                string_slot % len(_PLACEHOLDER_STRINGS)
+            ]
+            string_slot += 1
+    return example_args
+
+
+def _required_prop_count(tool: BoundTool) -> int:
+    """How many required args the tool declares (falls back to declared-prop count)."""
+    schema = tool.args_json_schema or {}
+    props = schema.get("properties") or {}
+    if not isinstance(props, dict):
+        return 0
+    required = schema.get("required")
+    if isinstance(required, list) and required:
+        return sum(1 for k in props if k in required)
+    return len(props)
+
+
+def _fewshot_tools(tools: Sequence[BoundTool], flags: ToolCallGrammarFlags) -> list[BoundTool]:
+    """The (up to ``flags.fewshot``) DISTINCT tools to build exemplars over.
+
+    Picks the first N distinct tools so the exemplars cover DIFFERENT tools (anti-parrot:
+    diversity over one tool's value), capped at the available tool count. When at least
+    one MULTI-ARG tool exists but the leading-N slice would be all single-arg, the first
+    multi-arg tool is swapped into the last slot so the exemplar set always demonstrates a
+    2-arg call when one is available — a single-arg-only exemplar set is what lets a model
+    pass single-arg tasks while failing every 2-arg tool (the ~50% ceiling).
+    """
+    if flags.fewshot <= 0 or not tools:
+        return []
+    n = min(flags.fewshot, len(tools))
+    chosen = list(tools[:n])
+    if n >= 1 and not any(_required_prop_count(t) >= 2 for t in chosen):
+        multi = next((t for t in tools if _required_prop_count(t) >= 2), None)
+        if multi is not None:
+            chosen[-1] = multi
+    return chosen
+
+
+def _exemplar_call_json(tool: BoundTool, flags: ToolCallGrammarFlags) -> str:
+    """The ``<tool_call>`` JSON body for one exemplar tool (placeholder-filled args)."""
+    call = {flags.name_key: tool.name, flags.arg_key: _example_args_for(tool)}
+    return json.dumps(call, separators=(", ", ": "), ensure_ascii=False)
+
+
+def _synthesize_fewshot_example(tool: BoundTool, flags: ToolCallGrammarFlags) -> str:
+    """Synthesize ONE flattened exemplar: a user line + the ideal ``<tool_call>`` reply.
+
+    Used for the single-turn (in-manifest) rendering. The exemplar is tied to the real
+    manifest (not a hard-coded weather demo) and uses an obviously-fake placeholder value
+    (anti-parrot). It teaches the *envelope*, not a domain.
+    """
+    call_json = _exemplar_call_json(tool, flags)
     return (
         f"Example — user: Use the {tool.name} tool.\n"
         f"Example — assistant:\n<tool_call>\n{call_json}\n</tool_call>"
     )
 
 
+def render_fewshot_turns(
+    tools: Sequence[BoundTool], flags: ToolCallGrammarFlags
+) -> list[tuple[str, str]]:
+    """Render the few-shot exemplars as REAL prior conversation turns.
+
+    Returns a list of ``(role, content)`` pairs — per exemplar a ``user`` turn (the
+    example query) followed by an ``assistant`` turn (the ``<tool_call>`` answer) — so a
+    manager that supports multi-turn (the himalaya path) can present few-shot as genuine
+    PRIOR TURNS (the vendor recipe) instead of one flattened block. Empty when
+    ``flags.fewshot<=0`` or there are no tools. This is data-only and OPT-IN: a manager
+    that does not call it (canonical Hermes/Qwen single-turn, GENERIC, every other
+    manager) renders byte-identically to before.
+    """
+    turns: list[tuple[str, str]] = []
+    for tool in _fewshot_tools(tools, flags):
+        call_json = _exemplar_call_json(tool, flags)
+        turns.append(("user", f"Use the {tool.name} tool."))
+        turns.append(("assistant", f"<tool_call>\n{call_json}\n</tool_call>"))
+    return turns
+
+
 def _render_fewshot_block(tools: Sequence[BoundTool], flags: ToolCallGrammarFlags) -> str:
     """Render up to ``flags.fewshot`` exemplars (empty when fewshot<=0 or no tools)."""
-    if flags.fewshot <= 0 or not tools:
+    chosen = _fewshot_tools(tools, flags)
+    if not chosen:
         return ""
-    n = min(flags.fewshot, max(1, len(tools)))
-    examples = []
-    for i in range(n):
-        # Rotate the lead tool so multiple exemplars cover different tools when present.
-        rotated = list(tools[i:]) + list(tools[:i])
-        examples.append(_synthesize_fewshot_example(rotated, flags))
-    return "\n\n# Examples\n\n" + "\n\n".join(examples)
+    examples = [_synthesize_fewshot_example(tool, flags) for tool in chosen]
+    return (
+        "\n\n# Examples\n\n"
+        + _FEWSHOT_FRAMING
+        + "\n\n"
+        + "\n\n".join(examples)
+    )
+
+
+def _hermes_manifest_body(
+    tools: Sequence[BoundTool],
+    provider: str,
+    flags: ToolCallGrammarFlags,
+    *,
+    include_fewshot: bool,
+) -> str:
+    """The Hermes/Qwen ``<tools>`` manifest body (the inner template the chat wrapper
+    wraps). ``include_fewshot`` gates ONLY the flattened ``# Examples`` block — set False
+    when a manager presents the exemplars as real prior turns instead (so they are not
+    duplicated). The canonical body + the no-code nudge are unaffected by this flag.
+    """
+    from himmy.services.tools.access import describe_for_model
+    from himmy.services.tools.schema_normalize import normalize_tool_schema
+
+    lines = [_HERMES_TOOLS_PREAMBLE]
+    for tool in tools:
+        function = {
+            "name": tool.name,
+            "description": describe_for_model(
+                tool.name, tool.description, tool.read_only
+            ),
+            "parameters": normalize_tool_schema(
+                tool.args_json_schema or {"type": "object"}, provider
+            ),
+        }
+        # Compact separators match the local template's single-line per-tool object;
+        # ensure_ascii=False keeps non-ASCII (e.g. Nepali tool text) literal on the
+        # wire instead of \uXXXX-escaping it, matching the HF/Ollama template output.
+        lines.append(
+            json.dumps(
+                {"type": "function", "function": function},
+                separators=(", ", ": "),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+    lines.append(_HERMES_TOOLS_INSTRUCTION)
+    if flags.no_code_instruction:
+        lines.append(_HERMES_NO_CODE_INSTRUCTION)
+    if include_fewshot:
+        lines.append(_render_fewshot_block(tools, flags))
+    return "".join(lines)
 
 
 def _make_hermes_render_system_manifest(flags: ToolCallGrammarFlags) -> ManifestRenderer:
@@ -276,36 +454,23 @@ def _make_hermes_render_system_manifest(flags: ToolCallGrammarFlags) -> Manifest
     """
 
     def _render(tools: Sequence[BoundTool], provider: str) -> str:
-        from himmy.services.tools.access import describe_for_model
-        from himmy.services.tools.schema_normalize import normalize_tool_schema
+        return _hermes_manifest_body(tools, provider, flags, include_fewshot=True)
 
-        lines = [_HERMES_TOOLS_PREAMBLE]
-        for tool in tools:
-            function = {
-                "name": tool.name,
-                "description": describe_for_model(
-                    tool.name, tool.description, tool.read_only
-                ),
-                "parameters": normalize_tool_schema(
-                    tool.args_json_schema or {"type": "object"}, provider
-                ),
-            }
-            # Compact separators match the local template's single-line per-tool object;
-            # ensure_ascii=False keeps non-ASCII (e.g. Nepali tool text) literal on the
-            # wire instead of \uXXXX-escaping it, matching the HF/Ollama template output.
-            lines.append(
-                json.dumps(
-                    {"type": "function", "function": function},
-                    separators=(", ", ": "),
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-        lines.append(_HERMES_TOOLS_INSTRUCTION)
-        if flags.no_code_instruction:
-            lines.append(_HERMES_NO_CODE_INSTRUCTION)
-        lines.append(_render_fewshot_block(tools, flags))
-        return "".join(lines)
+    return _render
+
+
+def _make_hermes_render_system_manifest_base(
+    flags: ToolCallGrammarFlags,
+) -> ManifestRenderer:
+    """Build the manifest renderer that OMITS the flattened ``# Examples`` block.
+
+    A manager composing few-shot as REAL turns uses this for the system block so the
+    exemplars are not duplicated (once as turns, once flattened). The no-code nudge and
+    canonical body are identical to :func:`_make_hermes_render_system_manifest`.
+    """
+
+    def _render(tools: Sequence[BoundTool], provider: str) -> str:
+        return _hermes_manifest_body(tools, provider, flags, include_fewshot=False)
 
     return _render
 
@@ -363,30 +528,44 @@ def _make_hermes_parse(flags: ToolCallGrammarFlags) -> ReplyParser:
 
     Native ``<tool_call>`` blocks are extracted first, then
     :func:`parse_text_tool_calls` is OR-ed in as a secondary pass and any call it
-    finds whose ``(name, args)`` de-dup key is not already present is appended. The
-    native pass can therefore only ADD hits the generic parser misses — never
-    replace or drop one — so recall strictly improves and the generic path is
-    never regressed. Any unexpected error falls back to the generic-only result.
+    finds whose ``(name, args)`` de-dup key is not already present is appended. When
+    ``flags.python_call_fallback`` is set, :func:`parse_python_tool_calls` is OR-ed in
+    as a FINAL pass too (recovers a call the model wrote as python syntax). Every pass
+    can only ADD hits the prior passes missed — never replace or drop one — so recall
+    strictly improves and the generic path is never regressed. Any unexpected error in
+    a pass is swallowed so the earlier passes' result still stands.
     """
 
     def _parse(text: str, known: set[str]) -> list[ToolCallRecord]:
-        from himmy.services.inference.tool_protocol import parse_text_tool_calls
+        from himmy.services.inference.tool_protocol import (
+            parse_python_tool_calls,
+            parse_text_tool_calls,
+        )
 
         try:
             calls = _hermes_native_calls(text, known, flags)
         except Exception:  # noqa: BLE001 - native pass is best-effort, never fatal
             calls = []
         seen = {_dedup_key(c.tool_name, c.args) for c in calls}
+
+        def _merge(extra: list[ToolCallRecord]) -> None:
+            for call in extra:
+                key = _dedup_key(call.tool_name, call.args)
+                if key not in seen:
+                    seen.add(key)
+                    calls.append(call)
+
         # OR-in the tolerant generic parser (TOOL_CALL markers / fenced / bare JSON).
         try:
-            generic = parse_text_tool_calls(text, known)
+            _merge(parse_text_tool_calls(text, known))
         except Exception:  # noqa: BLE001 - keep whatever native already found
-            generic = []
-        for call in generic:
-            key = _dedup_key(call.tool_name, call.args)
-            if key not in seen:
-                seen.add(key)
-                calls.append(call)
+            pass
+        # OR-in the python-call fallback LAST (opt-in, add-only, name-guarded).
+        if flags.python_call_fallback:
+            try:
+                _merge(parse_python_tool_calls(text, known))
+            except Exception:  # noqa: BLE001 - fallback is best-effort, never fatal
+                pass
         return calls
 
     return _parse
@@ -461,7 +640,15 @@ _HERMES_FEWSHOT_FLAGS = ToolCallGrammarFlags(
     use_text_tool_path=True,
     fewshot=2,
     no_code_instruction=True,
+    # The 0.5b frequently emits the call as python (a ```python``` block or a bare
+    # get_weather(city=...) line) which the <tool_call>/JSON parsers miss — recover it.
+    python_call_fallback=True,
 )
+
+def _fewshot_turns_renderer(tools: Sequence[BoundTool]) -> list[tuple[str, str]]:
+    """Bind :func:`render_fewshot_turns` to the few-shot flags (FewshotTurnRenderer)."""
+    return render_fewshot_turns(tools, _HERMES_FEWSHOT_FLAGS)
+
 
 HERMES_CHATML_XML_FEWSHOT = ToolCallFormat(
     name="hermes_chatml_xml_fewshot",
@@ -471,6 +658,162 @@ HERMES_CHATML_XML_FEWSHOT = ToolCallFormat(
     # Opt-in only (no auto-select tags): a manager pins it via tool_call_format.
     model_tags=frozenset(),
     flags=_HERMES_FEWSHOT_FLAGS,
+    # Multi-turn few-shot: a manager that supports it (HimalayaGptClientManager) renders
+    # these exemplars as REAL prior turns + uses the base (no flattened # Examples)
+    # manifest. A single-turn caller (Ollama on this format) ignores both and gets the
+    # flattened in-manifest exemplars exactly as before.
+    fewshot_turns=_fewshot_turns_renderer,
+    render_system_manifest_base=_make_hermes_render_system_manifest_base(
+        _HERMES_FEWSHOT_FLAGS
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# HERMES_CHATML_XML_FEWSHOT_BASELINE — the PRE-BOOST few-shot format, reconstructed.
+#
+# This format reproduces main's ORIGINAL ``hermes_chatml_xml_fewshot`` behavior
+# byte-for-byte so the A/B's BASELINE arm is the genuine pre-boost recipe and the only
+# difference vs the boosted format is the three+one prompting boosts:
+#   * exemplar fills ONLY the FIRST property (original ``_example_args_for`` w/ ``break``),
+#     so a 2-arg tool's exemplar can never demonstrate both args (the ~50% ceiling);
+#   * placeholders are the non-distinct, parrotable originals (``"example"`` / ``1``),
+#     with NO anti-parrot framing line and NO multi-arg swap;
+#   * single-turn ONLY (no ``fewshot_turns`` / no ``render_system_manifest_base``);
+#   * the canonical Hermes parser (NO ``python_call_fallback``).
+# It keeps ``fewshot=2`` + ``no_code_instruction`` (those existed pre-boost too), so the
+# boost is the SOLE independent variable. Opt-in only (no auto-select tags); used by the
+# A/B harness as the baseline arm. The shipping default stays the boosted format.
+# --------------------------------------------------------------------------- #
+_HERMES_FEWSHOT_BASELINE_FLAGS = ToolCallGrammarFlags(
+    arg_key="arguments",
+    name_key="name",
+    result_role="user",
+    batch_consecutive_results=True,
+    parallel_supported=True,
+    use_text_tool_path=True,
+    fewshot=2,
+    no_code_instruction=True,
+    # No python_call_fallback, no multi-arg-aware exemplar tooling: PRE-BOOST behavior.
+    python_call_fallback=False,
+)
+
+#: The original (pre-boost) placeholder for a string slot — a parrotable literal.
+_BASELINE_PLACEHOLDER_STRING = "example"
+
+
+def _baseline_example_args_for(tool: BoundTool) -> dict[str, Any]:
+    """Pre-boost exemplar args: fill ONLY the FIRST declared property (main's behavior).
+
+    Mirrors main's original ``_example_args_for``: it filled a single property (the first
+    one, then ``break``-ed) with a non-distinct placeholder. A 2-arg tool's exemplar thus
+    shows only ONE argument, so the exemplar can never satisfy the tool's full arg
+    contract — the documented ~50% ceiling this baseline exists to demonstrate.
+    """
+    schema = tool.args_json_schema or {}
+    props = schema.get("properties") or {}
+    if not isinstance(props, dict):
+        return {}
+    example_args: dict[str, Any] = {}
+    for key, spec in props.items():
+        if not isinstance(spec, dict):
+            continue
+        t = spec.get("type")
+        if t == "integer":
+            example_args[key] = 1
+        elif t == "number":
+            example_args[key] = 1.0
+        elif t == "boolean":
+            example_args[key] = True
+        elif t == "array":
+            example_args[key] = []
+        elif t == "object":
+            example_args[key] = {}
+        else:  # string / unknown
+            example_args[key] = _BASELINE_PLACEHOLDER_STRING
+        break  # one filled property is enough to teach the envelope (pre-boost)
+    return example_args
+
+
+def _baseline_fewshot_tools(
+    tools: Sequence[BoundTool], flags: ToolCallGrammarFlags
+) -> list[BoundTool]:
+    """Pre-boost exemplar tool pick: rotate the lead over the first N (no multi-arg swap)."""
+    if flags.fewshot <= 0 or not tools:
+        return []
+    n = min(flags.fewshot, max(1, len(tools)))
+    return [tools[i % len(tools)] for i in range(n)]
+
+
+def _baseline_synthesize_example(tool: BoundTool, flags: ToolCallGrammarFlags) -> str:
+    """One pre-boost flattened exemplar (first-prop-only args, no anti-parrot framing)."""
+    call = {flags.name_key: tool.name, flags.arg_key: _baseline_example_args_for(tool)}
+    call_json = json.dumps(call, separators=(", ", ": "), ensure_ascii=False)
+    return (
+        f"Example — user: Use the {tool.name} tool.\n"
+        f"Example — assistant:\n<tool_call>\n{call_json}\n</tool_call>"
+    )
+
+
+def _baseline_render_fewshot_block(
+    tools: Sequence[BoundTool], flags: ToolCallGrammarFlags
+) -> str:
+    """The pre-boost ``# Examples`` block: NO framing line, first-prop-only exemplars."""
+    chosen = _baseline_fewshot_tools(tools, flags)
+    if not chosen:
+        return ""
+    examples = [_baseline_synthesize_example(t, flags) for t in chosen]
+    return "\n\n# Examples\n\n" + "\n\n".join(examples)
+
+
+def _baseline_manifest_body(
+    tools: Sequence[BoundTool], provider: str, flags: ToolCallGrammarFlags
+) -> str:
+    """The pre-boost Hermes manifest body: canonical body + no-code nudge + pre-boost
+    flattened ``# Examples`` block (no anti-parrot framing, first-prop-only exemplars)."""
+    from himmy.services.tools.access import describe_for_model
+    from himmy.services.tools.schema_normalize import normalize_tool_schema
+
+    lines = [_HERMES_TOOLS_PREAMBLE]
+    for tool in tools:
+        function = {
+            "name": tool.name,
+            "description": describe_for_model(
+                tool.name, tool.description, tool.read_only
+            ),
+            "parameters": normalize_tool_schema(
+                tool.args_json_schema or {"type": "object"}, provider
+            ),
+        }
+        lines.append(
+            json.dumps(
+                {"type": "function", "function": function},
+                separators=(", ", ": "),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+    lines.append(_HERMES_TOOLS_INSTRUCTION)
+    if flags.no_code_instruction:
+        lines.append(_HERMES_NO_CODE_INSTRUCTION)
+    lines.append(_baseline_render_fewshot_block(tools, flags))
+    return "".join(lines)
+
+
+def _baseline_render_system_manifest(tools: Sequence[BoundTool], provider: str) -> str:
+    return _baseline_manifest_body(tools, provider, _HERMES_FEWSHOT_BASELINE_FLAGS)
+
+
+HERMES_CHATML_XML_FEWSHOT_BASELINE = ToolCallFormat(
+    name="hermes_chatml_xml_fewshot_baseline",
+    render_system_manifest=_baseline_render_system_manifest,
+    # Canonical Hermes parser (NO python fallback) — pre-boost recall.
+    parse=_make_hermes_parse(_HERMES_FEWSHOT_BASELINE_FLAGS),
+    render_tool_results=_make_hermes_render_tool_results(_HERMES_FEWSHOT_BASELINE_FLAGS),
+    model_tags=frozenset(),  # opt-in only — never auto-selected.
+    flags=_HERMES_FEWSHOT_BASELINE_FLAGS,
+    # Single-turn ONLY: no fewshot_turns, no base manifest -> the manager renders the
+    # flattened in-manifest exemplars exactly as main did pre-boost.
 )
 
 
@@ -536,6 +879,7 @@ class ToolCallFormatRegistry:
 _REGISTRY = ToolCallFormatRegistry()
 _REGISTRY.register_format(HERMES_CHATML_XML)
 _REGISTRY.register_format(HERMES_CHATML_XML_FEWSHOT)
+_REGISTRY.register_format(HERMES_CHATML_XML_FEWSHOT_BASELINE)
 
 
 def register_format(fmt: ToolCallFormat) -> ToolCallFormat:
@@ -567,11 +911,14 @@ __all__ = [
     "GENERIC",
     "HERMES_CHATML_XML",
     "HERMES_CHATML_XML_FEWSHOT",
+    "HERMES_CHATML_XML_FEWSHOT_BASELINE",
     "register_format",
     "get_format",
     "list_formats",
     "format_for",
+    "render_fewshot_turns",
     "ManifestRenderer",
     "ReplyParser",
     "ResultRenderer",
+    "FewshotTurnRenderer",
 ]
