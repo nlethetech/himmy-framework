@@ -50,16 +50,33 @@ from himmy.services.inference.models import (  # noqa: E402
     ToolReturnRecord,
 )
 
-RESULTS = Path(__file__).with_name("ab_results.jsonl")
+#: The POWERED primary run writes to its own file (fresh, expanded suite) so it never
+#: mixes with the earlier n=10 smaller-suite ``ab_results.jsonl`` run. Override with
+#: ``--results <path>`` if needed.
+RESULTS = Path(__file__).with_name("ab_results_powered.jsonl")
 
 ARM_FORMAT = {
     "zero": "hermes_chatml_xml",
     "fewshot": "hermes_chatml_xml_fewshot",
+    # "boost" drives the SAME few-shot format, but with the three no-training boosts now
+    # baked into it (python-call parser fallback + true multi-turn few-shot + anti-parrot
+    # exemplars). The prior "fewshot" cell in ab_results.jsonl is the baseline to beat.
+    "boost": "hermes_chatml_xml_fewshot",
+    # PRIMARY POWERED TEST arms: the ONLY difference between them is the boost.
+    #   baseline -> main's ORIGINAL single-turn few-shot, reconstructed byte-for-byte
+    #               (single-property exemplar, no multi-turn, no python fallback, no
+    #               anti-parrot framing).
+    #   new      -> the full boosted few-shot (all-args exemplar fix + anti-parrot +
+    #               multi-turn + python-call fallback) = the shipping himalaya default.
+    "baseline": "hermes_chatml_xml_fewshot_baseline",
+    "new": "hermes_chatml_xml_fewshot",
 }
 
 # Generation budget: temp 0 (greedy), enough tokens to emit a <tool_call> block, repetition
-# penalty to suppress the 0.5b's loop-to-EOS. 96 tokens comfortably fits a tool_call line.
-GEN_KWARGS = {"max_new_tokens": 96, "temperature": 0.0, "repetition_penalty": 1.15}
+# penalty to suppress the 0.5b's loop-to-EOS. 64 tokens comfortably fits a single
+# <tool_call> line for these tools while bounding per-trial CPU time (the model otherwise
+# burns the whole budget writing prose; prefill of the ~700-tok manifest already dominates).
+GEN_KWARGS = {"max_new_tokens": 64, "temperature": 0.0, "repetition_penalty": 1.15}
 
 
 async def _stub_executor(name: str, args: dict) -> ToolReturnRecord:
@@ -105,10 +122,19 @@ def _grade(task: dict, traj: Trajectory) -> dict:
 async def run() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lang", choices=["en", "ne"], required=True)
-    ap.add_argument("--arm", choices=["zero", "fewshot"], required=True)
+    ap.add_argument(
+        "--arm",
+        choices=["zero", "fewshot", "boost", "baseline", "new"],
+        required=True,
+    )
     ap.add_argument("--task-start", type=int, default=0)
     ap.add_argument("--task-count", type=int, default=len(TASKS))
+    ap.add_argument("--results", type=str, default=None)
     args = ap.parse_args()
+
+    global RESULTS
+    if args.results:
+        RESULTS = Path(args.results)
 
     tasks = TASKS[args.task_start : args.task_start + args.task_count]
     done = _load_done()

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import re
 import threading
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -77,8 +76,78 @@ def load() -> None:
         _model, _tok, _ids = model, tok, ids
 
 
+# A labeled-block header the himmy manager emits ([System]/[User]/[Assistant]/[Tool
+# result]). When the manager renders multi-turn few-shot, the prompt is several such
+# blocks; we split on them and build REAL nanochat turns (the vendor recipe). A prompt
+# with no recognized header is treated as a single user turn (back-compat).
+_LABEL_RE = re.compile(r"(?m)^\[(System|User|Assistant|Tool result)\]\n")
+
+
+def _split_labeled_blocks(prompt: str) -> list[tuple[str, str]] | None:
+    """Split a manager-composed labeled prompt into ``(role, content)`` blocks.
+
+    Returns ``None`` when the prompt has no recognized ``[Role]`` header (a plain single
+    prompt) so the caller falls back to the single-turn render. ``System`` and ``Tool
+    result`` blocks are folded into the following user turn (nanochat has no system/tool
+    role — system messages merge into the next user turn).
+    """
+    matches = list(_LABEL_RE.finditer(prompt))
+    if not matches:
+        return None
+    blocks: list[tuple[str, str]] = []
+    for i, m in enumerate(matches):
+        label = m.group(1)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(prompt)
+        content = prompt[start:end].strip("\n")
+        role = {
+            "System": "user",
+            "User": "user",
+            "Assistant": "assistant",
+            "Tool result": "user",
+        }[label]
+        blocks.append((role, content))
+    return blocks
+
+
+def _render_multi_turn(blocks: list[tuple[str, str]]) -> list[int]:
+    """Render multiple ``(role, content)`` turns in the nanochat chat format -> ids.
+
+    Consecutive same-role blocks (e.g. a System block then the real User turn) are
+    merged so the wire stays a clean user/assistant alternation, then each turn is
+    wrapped in its ``<|*_start|>...<|*_end|>`` pair. Ends on ``<|assistant_start|>``
+    (the model continues from there).
+    """
+    # Merge consecutive same-role blocks (system folds into the next user turn).
+    merged: list[tuple[str, str]] = []
+    for role, content in blocks:
+        if merged and merged[-1][0] == role:
+            merged[-1] = (role, merged[-1][1] + "\n\n" + content)
+        else:
+            merged.append((role, content))
+    ids = [_ids["<|bos|>"]]
+    for role, content in merged:
+        start = _ids["<|user_start|>"] if role == "user" else _ids["<|assistant_start|>"]
+        end = _ids["<|user_end|>"] if role == "user" else _ids["<|assistant_end|>"]
+        cids = _tok(content, add_special_tokens=False)["input_ids"]
+        ids += [start] + cids + [end]
+    # Open the assistant turn the model is to complete.
+    ids.append(_ids["<|assistant_start|>"])
+    return ids
+
+
 def _render_turn(prompt: str) -> list[int]:
-    """Render one user turn in the nanochat chat format -> token ids."""
+    """Render the prompt into nanochat token ids.
+
+    Multi-turn when the prompt carries manager ``[Role]`` headers (so few-shot exemplars
+    are real prior turns); otherwise a single user turn (back-compat / plain chat).
+    """
+    blocks = _split_labeled_blocks(prompt)
+    if blocks is not None and any(r == "assistant" for r, _ in blocks):
+        # Only take the multi-turn path when there is a genuine prior assistant turn
+        # (a few-shot exemplar); a lone system+user prompt stays single-turn to keep the
+        # existing zero-shot/plain behavior byte-identical.
+        return _render_multi_turn(blocks)
     uids = _tok(prompt, add_special_tokens=False)["input_ids"]
     return (
         [_ids["<|bos|>"], _ids["<|user_start|>"]]

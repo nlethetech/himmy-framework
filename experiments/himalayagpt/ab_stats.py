@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 RESULTS = Path(__file__).with_name("ab_results.jsonl")
+if len(sys.argv) > 1:
+    RESULTS = Path(sys.argv[1])
 
 
 def _binom_pmf(k: int, n: int, p: float) -> float:
@@ -67,8 +70,14 @@ def main() -> None:
         index[(r["lang"], r["arm"], r["task_id"])] = r
 
     langs = ["en", "ne"]
-    arms = ["zero", "fewshot"]
-    metrics = ["emit", "selection", "args"]
+    arms = ["zero", "fewshot", "boost", "baseline", "new"]
+    # USABLE = end-to-end (right tool AND right args). Derived per-row so it pairs cleanly.
+    for r in rows:
+        r["usable"] = bool(r["selection"] and r["args"])
+    metrics = ["emit", "selection", "args", "usable"]
+    # Only report arms actually present in the results (so a partial run still aggregates).
+    present_arms = {r["arm"] for r in rows}
+    arms = [a for a in arms if a in present_arms] or ["zero", "fewshot"]
 
     print("=" * 78)
     print("PER-CELL RATES (n = tasks completed in that cell)")
@@ -87,45 +96,60 @@ def main() -> None:
             print(line)
         print("-" * 78)
 
+    # Each pair is (baseline, treatment): b = baseline-FAIL & treatment-PASS (treatment
+    # wins). "boost" vs "fewshot" measures the three no-training boosts on top of few-shot.
+    pairs = [
+        (a, b)
+        for a, b in [
+            ("zero", "fewshot"),
+            ("fewshot", "boost"),
+            ("zero", "boost"),
+            # PRIMARY POWERED TEST: new (full boost) vs baseline (pre-boost few-shot).
+            ("baseline", "new"),
+        ]
+        if a in present_arms and b in present_arms
+    ]
     print("\n" + "=" * 78)
-    print("PAIRED McNEMAR (few-shot vs zero-shot), per language, per metric")
-    print("  b = zero-FAIL & fewshot-PASS (few-shot wins)")
-    print("  c = zero-PASS & fewshot-FAIL (zero wins)")
+    print("PAIRED McNEMAR (treatment vs baseline), per language, per metric")
+    print("  b = baseline-FAIL & treatment-PASS (treatment wins)")
+    print("  c = baseline-PASS & treatment-FAIL (baseline wins)")
     print("=" * 78)
-    for lang in langs:
-        for m in metrics:
-            # paired over tasks present in BOTH arms
-            task_ids = sorted(
-                {r["task_id"] for r in rows if r["lang"] == lang and r["arm"] == "zero"}
-                & {r["task_id"] for r in rows if r["lang"] == lang and r["arm"] == "fewshot"}
-            )
-            b = c = both = neither = 0
-            for tid in task_ids:
-                z = index[(lang, "zero", tid)][m]
-                f = index[(lang, "fewshot", tid)][m]
-                if f and not z:
-                    b += 1
-                elif z and not f:
-                    c += 1
-                elif z and f:
-                    both += 1
-                else:
-                    neither += 1
-            n_pairs = len(task_ids)
-            p_mc = mcnemar_exact(b, c)
-            # Fisher on the marginal 2x2: pass/fail x arm
-            zk, zn = cell_rate[(lang, "zero", m)]
-            fk, fn = cell_rate[(lang, "fewshot", m)]
-            p_f = fisher_exact_2x2(fk, fn - fk, zk, zn - zk)
-            zr = f"{zk}/{zn}"
-            fr = f"{fk}/{fn}"
-            sig = "SIGNIFICANT" if p_mc < 0.05 else "n.s."
-            print(
-                f"lang={lang} metric={m:<9} pairs={n_pairs:>2} | "
-                f"zero={zr} fewshot={fr} | b={b} c={c} both={both} neither={neither} | "
-                f"McNemar p={p_mc:.4f} ({sig}) | Fisher p={p_f:.4f}"
-            )
-        print("-" * 78)
+    for base, treat in pairs:
+        print(f"\n### {treat} vs {base}")
+        for lang in langs:
+            for m in metrics:
+                # paired over tasks present in BOTH arms
+                task_ids = sorted(
+                    {r["task_id"] for r in rows if r["lang"] == lang and r["arm"] == base}
+                    & {r["task_id"] for r in rows if r["lang"] == lang and r["arm"] == treat}
+                )
+                b = c = both = neither = 0
+                for tid in task_ids:
+                    z = index[(lang, base, tid)][m]
+                    f = index[(lang, treat, tid)][m]
+                    if f and not z:
+                        b += 1
+                    elif z and not f:
+                        c += 1
+                    elif z and f:
+                        both += 1
+                    else:
+                        neither += 1
+                n_pairs = len(task_ids)
+                p_mc = mcnemar_exact(b, c)
+                # Fisher on the marginal 2x2: pass/fail x arm
+                zk, zn = cell_rate.get((lang, base, m), (0, 0))
+                fk, fn = cell_rate.get((lang, treat, m), (0, 0))
+                p_f = fisher_exact_2x2(fk, fn - fk, zk, zn - zk)
+                zr = f"{zk}/{zn}"
+                fr = f"{fk}/{fn}"
+                sig = "SIGNIFICANT" if p_mc < 0.05 else "n.s."
+                print(
+                    f"lang={lang} metric={m:<9} pairs={n_pairs:>2} | "
+                    f"{base}={zr} {treat}={fr} | b={b} c={c} both={both} neither={neither} | "
+                    f"McNemar p={p_mc:.4f} ({sig}) | Fisher p={p_f:.4f}"
+                )
+            print("-" * 78)
 
     # Latency summary (proves the real model ran — real wall clock per trial).
     print("\n" + "=" * 78)

@@ -78,13 +78,43 @@ TOOLS: list[BoundTool] = [
     ),
     BoundTool(
         name="set_timer",
-        description="Set a countdown timer for a number of minutes.",
+        description="Set a countdown timer for a number of minutes, with a label.",
         args_json_schema={
             "type": "object",
             "properties": {
                 "minutes": {"type": "integer", "description": "Duration in minutes."},
+                "label": {"type": "string", "description": "What the timer is for."},
             },
-            "required": ["minutes"],
+            "required": ["minutes", "label"],
+        },
+        read_only=False,
+    ),
+    BoundTool(
+        name="convert_currency",
+        description="Convert an amount of money into a target currency.",
+        args_json_schema={
+            "type": "object",
+            "properties": {
+                "amount": {"type": "number", "description": "Amount of money."},
+                "to_currency": {
+                    "type": "string",
+                    "description": "Target currency code, e.g. USD.",
+                },
+            },
+            "required": ["amount", "to_currency"],
+        },
+        read_only=True,
+    ),
+    BoundTool(
+        name="schedule_reminder",
+        description="Schedule a reminder with a message at a given time.",
+        args_json_schema={
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "Reminder text."},
+                "time": {"type": "string", "description": "Time, e.g. 3pm."},
+            },
+            "required": ["message", "time"],
         },
         read_only=False,
     ),
@@ -96,7 +126,13 @@ TOOLS: list[BoundTool] = [
 # call must carry (argument-correctness). ``en`` / ``ne`` are the user prompts; only the
 # prompt is translated — tool names + arg keys stay English.
 # --------------------------------------------------------------------------- #
+#: The suite is weighted toward 2-ARG tools (add_numbers, translate_text, set_timer,
+#: convert_currency, schedule_reminder) because the exemplar all-args fix targets exactly
+#: those: a pre-boost exemplar that demonstrates only ONE argument can never satisfy a
+#: 2-arg tool's arg contract (the documented ~50% ceiling). The 1-arg tools (get_weather,
+#: get_stock_price) are the control: the boost should not regress them. EN n=18.
 TASKS: list[dict] = [
+    # --- 1-arg control tasks (get_weather, get_stock_price) ---
     {
         "id": "weather_paris",
         "en": "What is the weather in Paris right now?",
@@ -112,18 +148,11 @@ TASKS: list[dict] = [
         "expect_args": {"city": "Tokyo"},
     },
     {
-        "id": "add_7_5",
-        "en": "Add 7 and 5 for me.",
-        "ne": "मेरो लागि ७ र ५ जोड्नुहोस्।",
-        "expect_tool": "add_numbers",
-        "expect_args": {"a": 7, "b": 5},
-    },
-    {
-        "id": "add_42_8",
-        "en": "What is 42 plus 8?",
-        "ne": "४२ जोड ८ कति हुन्छ?",
-        "expect_tool": "add_numbers",
-        "expect_args": {"a": 42, "b": 8},
+        "id": "weather_london",
+        "en": "How is the weather in London?",
+        "ne": "लन्डनको मौसम कस्तो छ?",
+        "expect_tool": "get_weather",
+        "expect_args": {"city": "London"},
     },
     {
         "id": "stock_aapl",
@@ -140,6 +169,36 @@ TASKS: list[dict] = [
         "expect_args": {"ticker": "TSLA"},
     },
     {
+        "id": "stock_msft",
+        "en": "What's the share price of MSFT?",
+        "ne": "MSFT को सेयर मूल्य कति छ?",
+        "expect_tool": "get_stock_price",
+        "expect_args": {"ticker": "MSFT"},
+    },
+    # --- 2-arg tasks: add_numbers (a + b) ---
+    {
+        "id": "add_7_5",
+        "en": "Add 7 and 5 for me.",
+        "ne": "मेरो लागि ७ र ५ जोड्नुहोस्।",
+        "expect_tool": "add_numbers",
+        "expect_args": {"a": 7, "b": 5},
+    },
+    {
+        "id": "add_42_8",
+        "en": "What is 42 plus 8?",
+        "ne": "४२ जोड ८ कति हुन्छ?",
+        "expect_tool": "add_numbers",
+        "expect_args": {"a": 42, "b": 8},
+    },
+    {
+        "id": "add_13_29",
+        "en": "Add 13 and 29 together.",
+        "ne": "१३ र २९ जोड्नुहोस्।",
+        "expect_tool": "add_numbers",
+        "expect_args": {"a": 13, "b": 29},
+    },
+    # --- 2-arg tasks: translate_text (text + target_language) ---
+    {
         "id": "translate_hello_fr",
         "en": "Translate the text 'hello' into French.",
         "ne": "'hello' भन्ने पाठलाई फ्रेन्चमा अनुवाद गर्नुहोस्।",
@@ -154,18 +213,56 @@ TASKS: list[dict] = [
         "expect_args": {"text": "thank you", "target_language": "Spanish"},
     },
     {
-        "id": "timer_10",
-        "en": "Set a timer for 10 minutes.",
-        "ne": "१० मिनेटको टाइमर सेट गर्नुहोस्।",
+        "id": "translate_goodbye_german",
+        "en": "Translate the text 'goodbye' into German.",
+        "ne": "'goodbye' भन्ने पाठलाई जर्मनमा अनुवाद गर्नुहोस्।",
+        "expect_tool": "translate_text",
+        "expect_args": {"text": "goodbye", "target_language": "German"},
+    },
+    # --- 2-arg tasks: set_timer (minutes + label) ---
+    {
+        "id": "timer_10_pasta",
+        "en": "Set a timer for 10 minutes labeled pasta.",
+        "ne": "pasta नाम दिएर १० मिनेटको टाइमर सेट गर्नुहोस्।",
         "expect_tool": "set_timer",
-        "expect_args": {"minutes": 10},
+        "expect_args": {"minutes": 10, "label": "pasta"},
     },
     {
-        "id": "timer_5",
-        "en": "Start a 5 minute timer please.",
-        "ne": "कृपया ५ मिनेटको टाइमर सुरु गर्नुहोस्।",
+        "id": "timer_5_tea",
+        "en": "Start a 5 minute timer called tea.",
+        "ne": "tea नामको ५ मिनेटको टाइमर सुरु गर्नुहोस्।",
         "expect_tool": "set_timer",
-        "expect_args": {"minutes": 5},
+        "expect_args": {"minutes": 5, "label": "tea"},
+    },
+    # --- 2-arg tasks: convert_currency (amount + to_currency) ---
+    {
+        "id": "convert_100_usd",
+        "en": "Convert 100 into USD.",
+        "ne": "१०० लाई USD मा रूपान्तरण गर्नुहोस्।",
+        "expect_tool": "convert_currency",
+        "expect_args": {"amount": 100, "to_currency": "USD"},
+    },
+    {
+        "id": "convert_50_eur",
+        "en": "Convert 50 into EUR.",
+        "ne": "५० लाई EUR मा रूपान्तरण गर्नुहोस्।",
+        "expect_tool": "convert_currency",
+        "expect_args": {"amount": 50, "to_currency": "EUR"},
+    },
+    # --- 2-arg tasks: schedule_reminder (message + time) ---
+    {
+        "id": "remind_meeting_3pm",
+        "en": "Schedule a reminder 'meeting' at 3pm.",
+        "ne": "'meeting' भन्ने रिमाइन्डर ३ बजे राख्नुहोस्।",
+        "expect_tool": "schedule_reminder",
+        "expect_args": {"message": "meeting", "time": "3pm"},
+    },
+    {
+        "id": "remind_call_9am",
+        "en": "Schedule a reminder 'call mom' at 9am.",
+        "ne": "'call mom' भन्ने रिमाइन्डर ९ बजे राख्नुहोस्।",
+        "expect_tool": "schedule_reminder",
+        "expect_args": {"message": "call mom", "time": "9am"},
     },
 ]
 
