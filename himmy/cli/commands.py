@@ -1505,6 +1505,16 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
             except Exception:  # noqa: BLE001 - a store read failure is non-fatal here
                 n_routines = -1
             scheduler = get_scheduler()
+            # Catch-up-on-launch (Phase 1): apply each routine's missed-run policy BEFORE
+            # the tick loop starts, reading the authoritative anchor (last_run_at), so a
+            # missed-while-asleep occurrence is coalesced/skipped/backfilled deterministically
+            # rather than racing the first tick.
+            try:
+                actions = await scheduler.catch_up_on_launch()
+                if actions:
+                    log.info("routine catch-up on launch: %s", actions)
+            except Exception:  # noqa: BLE001 - catch-up must never block worker startup
+                log.warning("routine catch-up on launch failed", exc_info=True)
             scheduler.start()
         elif run_scheduler and not scheduler_enabled:
             log.info("routine scheduler disabled via HIMMY_ROUTINES_SCHEDULER")

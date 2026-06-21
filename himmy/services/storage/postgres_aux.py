@@ -1241,6 +1241,34 @@ class _AsyncRoutinesStore:
                     routine_id,
                 )
 
+    async def advance_next_fire(
+        self, routine_id: str, next_fire_at: str | None
+    ) -> None:
+        """Persist the recomputed ``next_fire_at`` into the JSON blob (Phase 1).
+
+        Read-modify-write of the routine's ``data`` so the new pydantic field round-trips;
+        idempotent against the same planned instant. The dedup claim keyed on the planned
+        fire is the at-most-once backstop — this is the observable hint, not the primitive.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT data FROM aux_routines "
+                    "WHERE tenant = $1 AND id = $2 FOR UPDATE",
+                    self._tenant,
+                    routine_id,
+                )
+                if row is None:
+                    return
+                data = dict(row["data"])
+                data["next_fire_at"] = next_fire_at
+                await conn.execute(
+                    "UPDATE aux_routines SET data = $1 WHERE tenant = $2 AND id = $3",
+                    data,
+                    self._tenant,
+                    routine_id,
+                )
+
 
 class PostgresRoutinesStore:
     """Synchronous Postgres mirror of :class:`RoutinesStore` (K4) with the atomic tick.
@@ -1320,6 +1348,10 @@ class PostgresRoutinesStore:
                 delivery=delivery,
             )
         )
+
+    def advance_next_fire(self, routine_id: str, next_fire_at: str | None) -> None:
+        """Persist the recomputed ``next_fire_at`` (Phase 1; cluster mirror)."""
+        self._pool.run(self._async.advance_next_fire(routine_id, next_fire_at))
 
     def close(self) -> None:
         self._pool.close()

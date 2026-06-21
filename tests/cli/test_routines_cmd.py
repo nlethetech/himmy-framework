@@ -158,3 +158,104 @@ def test_run_now_lands_in_canonical_store(
 
 def test_run_now_unknown_routine(local_project: Path) -> None:
     assert main(["routines", "run-now", "does-not-exist"]) == 1
+
+
+# ----------------------------------------------- Phase 1: cron / tz / missed-run flags
+
+
+def test_add_cron_with_timezone_and_missed_run(
+    local_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--cron`` + ``--timezone`` + ``--missed-run`` create a cron routine (needs himmy[cron])."""
+    pytest.importorskip("cronsim")
+    rc = main(
+        [
+            "routines",
+            "add",
+            "--name",
+            "nepal-brief",
+            "-f",
+            "agent.yaml",
+            "-p",
+            "morning brief",
+            "--cron",
+            "30 6 * * *",
+            "--timezone",
+            "Asia/Kathmandu",
+            "--missed-run",
+            "run_each",
+            "--overlap",
+            "skip",
+        ]
+    )
+    assert rc == 0
+    r = svc.get_routines_store().list(workspace_id=svc.LOCAL_WORKSPACE)[0]
+    assert r.schedule.kind == "cron"
+    assert r.schedule.expr == "30 6 * * *"
+    assert r.schedule.timezone == "Asia/Kathmandu"
+    assert r.schedule.missed == "run_each"
+    assert r.schedule.overlap == "skip"
+
+
+def test_add_at_one_shot(local_project: Path) -> None:
+    rc = main(
+        [
+            "routines",
+            "add",
+            "--name",
+            "once",
+            "-f",
+            "agent.yaml",
+            "-p",
+            "do it once",
+            "--at",
+            "2026-07-01T09:00:00+05:45",
+        ]
+    )
+    assert rc == 0
+    r = svc.get_routines_store().list(workspace_id=svc.LOCAL_WORKSPACE)[0]
+    assert r.schedule.kind == "at"
+    assert r.schedule.at_datetime == "2026-07-01T09:00:00+05:45"
+
+
+def test_add_cron_invalid_expr_rejected(local_project: Path) -> None:
+    pytest.importorskip("cronsim")
+    rc = main(
+        [
+            "routines",
+            "add",
+            "--name",
+            "bad",
+            "-f",
+            "agent.yaml",
+            "-p",
+            "x",
+            "--cron",
+            "not a cron",
+        ]
+    )
+    assert rc == 1
+
+
+def test_cron_graceful_error_without_dependency(
+    local_project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cron routine fired without cronsim degrades cleanly (no fire, clear warning)."""
+    import himmy.api.routine_schedule as rs
+
+    def _boom() -> tuple[type, type]:
+        raise rs.CronUnavailableError()
+
+    monkeypatch.setattr(rs, "_import_cronsim", _boom)
+    # planned_fire_at returns None (logged), so a cron routine is simply never due.
+    from datetime import UTC, datetime
+
+    r = svc.Routine(
+        name="c",
+        agent_path="agent.yaml",
+        prompt="p",
+        schedule=svc.Schedule(kind="cron", expr="0 9 * * *"),
+        created_at="2026-06-01T00:00:00+00:00",
+    )
+    assert svc.planned_fire_at(r, datetime(2026, 6, 1, tzinfo=UTC)) is None
+    assert svc.is_due(r, datetime(2026, 6, 2, tzinfo=UTC)) is False

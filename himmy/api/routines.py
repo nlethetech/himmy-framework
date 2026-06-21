@@ -80,16 +80,55 @@ PREVIEW_MAX_CHARS = 400
 DEFAULT_RUN_TIMEOUT_S = 300.0
 
 
+#: Missed-run / catch-up policy (Phase 1). Read the doc on each member; ``coalesce`` is the
+#: laptop-sleep-safe default (fire ONCE now if anything was missed).
+MissedRunPolicy = Literal["coalesce", "skip", "run_each"]
+#: Overlap policy (Phase 1). Only ``skip`` exists today (a routine never runs concurrently
+#: with itself — the lane/flock already serialises it); the field is here for forward room.
+OverlapPolicy = Literal["skip"]
+
+#: Defaults for the ``run_each`` catch-up backfill (a storm cap + a staleness floor).
+DEFAULT_MAX_CATCHUP = 100
+DEFAULT_GRACE_SECONDS = 900
+
+
 class Schedule(BaseModel):
-    """When a routine runs. Deliberately simple — no cron strings.
+    """When a routine runs.
+
+    The original two kinds are UNCHANGED (byte-identical behaviour):
 
     * ``{"kind": "daily", "at": "HH:MM"}`` — once a day at that local time.
     * ``{"kind": "every", "hours": N}`` — every N hours (1..168).
+
+    Phase 1 adds two wall-clock-anchored kinds plus per-routine scheduling policy:
+
+    * ``{"kind": "cron", "expr": "30 6 * * *"}`` — a 5-field cron expression, computed in
+      the routine's ``timezone`` (needs the optional ``cronsim`` dependency). Cron is the
+      right choice for a wall-clock-anchored cadence (e.g. 'every day at 06:30 Kathmandu')
+      — unlike ``every`` it does not drift against the wall clock.
+    * ``{"kind": "at", "at_datetime": "<ISO>"}`` — a ONE-SHOT run at a single instant; once
+      fired it never fires again.
+
+    ``timezone`` (IANA, e.g. ``Asia/Kathmandu``) governs the wall-clock kinds (``daily`` /
+    ``cron`` / ``at``-with-naive-instant). Unset → env ``HIMMY_TZ`` → host-local. ``missed``
+    / ``max_catchup`` / ``grace_seconds`` drive catch-up on launch; ``overlap`` is reserved.
+
+    BACK-COMPAT: every new field has a default, and the ``daily`` / ``every`` validation +
+    semantics are unchanged, so an existing routine (and its stored row / JSON blob)
+    round-trips and behaves exactly as before.
     """
 
-    kind: Literal["daily", "every"]
+    kind: Literal["daily", "every", "cron", "at"]
     at: str | None = Field(default=None, max_length=5)
     hours: int | None = Field(default=None, ge=1, le=168)
+    # -- Phase 1 additive fields (all defaulted; daily/every ignore them) --------
+    expr: str | None = Field(default=None, max_length=200)
+    at_datetime: str | None = Field(default=None, max_length=64)
+    timezone: str | None = Field(default=None, max_length=64)
+    missed: MissedRunPolicy = "coalesce"
+    max_catchup: int = Field(default=DEFAULT_MAX_CATCHUP, ge=1, le=100_000)
+    grace_seconds: int = Field(default=DEFAULT_GRACE_SECONDS, ge=0)
+    overlap: OverlapPolicy = "skip"
 
     @model_validator(mode="after")
     def _check_fields(self) -> Schedule:
@@ -97,17 +136,42 @@ class Schedule(BaseModel):
             if not self.at or not _AT_RE.match(self.at):
                 raise ValueError("daily schedule needs at='HH:MM' (24-hour)")
             self.hours = None
-        else:  # every
+        elif self.kind == "every":
             if self.hours is None:
                 raise ValueError("every schedule needs hours (1..168)")
             self.at = None
+        elif self.kind == "cron":
+            from himmy.api.routine_schedule import validate_cron
+
+            if not self.expr or not self.expr.strip():
+                raise ValueError("cron schedule needs a non-empty expr (e.g. '30 6 * * *')")
+            validate_cron(self.expr)
+            self.at = None
+            self.hours = None
+        else:  # at — one-shot
+            if not self.at_datetime or not self.at_datetime.strip():
+                raise ValueError("at schedule needs at_datetime (an ISO-8601 instant)")
+            if _parse_iso(self.at_datetime) is None:
+                raise ValueError(
+                    f"at_datetime {self.at_datetime!r} is not a valid ISO-8601 datetime"
+                )
+            self.at = None
+            self.hours = None
+        if self.timezone is not None:
+            from himmy.api.routine_schedule import validate_timezone
+
+            validate_timezone(self.timezone)
         return self
 
     def describe(self) -> str:
-        """A short human string ('daily 07:00' / 'every 6h')."""
+        """A short human string ('daily 07:00' / 'every 6h' / 'cron 30 6 * * *')."""
         if self.kind == "daily":
             return f"daily {self.at}"
-        return f"every {self.hours}h"
+        if self.kind == "every":
+            return f"every {self.hours}h"
+        if self.kind == "cron":
+            return f"cron {self.expr}"
+        return f"at {self.at_datetime}"
 
 
 class Routine(BaseModel):
@@ -143,6 +207,10 @@ class Routine(BaseModel):
     idempotency_key: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
+    #: The next planned fire instant, persisted as a UTC ISO string (Phase 1). Computed in
+    #: the routine's timezone then normalised to UTC. ``None`` until first computed (lazily
+    #: on the first tick) or for a daily/every routine that has not opted into the column.
+    next_fire_at: str | None = None
     last_run_at: str | None = None
     last_status: str | None = None  # running | ok | error | timeout | awaiting_approval
     last_preview: str = ""
@@ -179,7 +247,9 @@ def is_due(routine: Routine, now: datetime) -> bool:
     The anchor is the last run (or creation, so a fresh routine never fires
     retroactively). ``daily``: due when the most recent HH:MM occurrence (in
     ``now``'s timezone) is after the anchor. ``every``: due when N hours have
-    passed since the anchor.
+    passed since the anchor. ``cron`` / ``at``: due when the planned fire (the next
+    occurrence STRICTLY after the anchor, computed in the routine's timezone) is at-or-
+    before ``now`` (see :func:`planned_fire_at`). daily/every math is unchanged.
     """
     if not routine.enabled:
         return False
@@ -197,10 +267,67 @@ def is_due(routine: Routine, now: datetime) -> bool:
         if occurrence > now:
             occurrence -= timedelta(days=1)
         return anchor < occurrence
-    hours = sched.hours or 0
-    if hours <= 0:
+    if sched.kind == "every":
+        hours = sched.hours or 0
+        if hours <= 0:
+            return False
+        return now >= anchor + timedelta(hours=hours)
+    # cron / at — tz-aware: due when the planned fire after the anchor has arrived.
+    planned = planned_fire_at(routine, anchor)
+    if planned is None:
         return False
-    return now >= anchor + timedelta(hours=hours)
+    return now >= planned
+
+
+def planned_fire_at(routine: Routine, anchor: datetime) -> datetime | None:
+    """The next planned fire instant (UTC, aware) STRICTLY after ``anchor`` for cron/at.
+
+    For ``cron`` this is the next cron occurrence in the routine's timezone, normalised to
+    UTC — the *planned_fire_at* the dedup key + ``create_run`` idempotency key are built on
+    (so concurrent ticks/boots coalesce to one fire, and the key is the planned instant, not
+    ``now()``). For a one-shot ``at`` it is the configured instant if it is still after the
+    anchor (i.e. not yet fired), else ``None`` (already fired — never again). Returns
+    ``None`` for daily/every (they do not use this seam) or when ``cronsim`` is unavailable.
+    """
+    sched = routine.schedule
+    if sched.kind == "cron":
+        from himmy.api.routine_schedule import (
+            CronUnavailableError,
+            cron_next_fire,
+            resolve_zone,
+        )
+
+        if not sched.expr:
+            return None
+        try:
+            return cron_next_fire(sched.expr, anchor, resolve_zone(sched.timezone))
+        except CronUnavailableError:
+            logger.warning(
+                "routine %s is a cron routine but cronsim is not installed; "
+                "install himmy[cron]",
+                routine.id,
+            )
+            return None
+    if sched.kind == "at":
+        instant = _parse_iso(sched.at_datetime or "")
+        if instant is None:
+            return None
+        instant = _to_utc(instant)
+        # One-shot: due only while the configured instant is still strictly after the
+        # anchor (a successful fire stamps last_run_at >= instant, so it never re-fires).
+        return instant if instant > anchor else None
+    return None
+
+
+def _to_utc(dt: datetime) -> datetime:
+    """Normalise an aware datetime to UTC (naive is assumed UTC)."""
+    if dt.tzinfo is None:
+        from datetime import UTC
+
+        return dt.replace(tzinfo=UTC)
+    from datetime import UTC
+
+    return dt.astimezone(UTC)
 
 
 # ---- the store --------------------------------------------------------------
@@ -223,6 +350,14 @@ CREATE TABLE IF NOT EXISTS routines (
     schedule_kind  TEXT NOT NULL,
     schedule_at    TEXT,
     schedule_hours INTEGER,
+    schedule_expr  TEXT,
+    schedule_at_datetime TEXT,
+    timezone       TEXT,
+    missed_policy  TEXT NOT NULL DEFAULT 'coalesce',
+    max_catchup    INTEGER NOT NULL DEFAULT 100,
+    grace_seconds  INTEGER NOT NULL DEFAULT 900,
+    overlap_policy TEXT NOT NULL DEFAULT 'skip',
+    next_fire_at   TEXT,
     provider       TEXT,
     model          TEXT,
     deliver        TEXT NOT NULL DEFAULT 'none',
@@ -236,6 +371,36 @@ CREATE TABLE IF NOT EXISTS routines (
     last_delivery  TEXT
 );
 """
+
+#: The Phase-1 additive columns + their ADD COLUMN DDL, applied idempotently by
+#: :meth:`RoutinesStore._migrate`. Each is nullable or has a DEFAULT so an existing row
+#: upgrades cleanly (an old daily/every routine keeps behaving identically — these columns
+#: only matter for the new cron/at kinds + catch-up policy).
+_PHASE1_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("schedule_expr", "ALTER TABLE routines ADD COLUMN schedule_expr TEXT"),
+    (
+        "schedule_at_datetime",
+        "ALTER TABLE routines ADD COLUMN schedule_at_datetime TEXT",
+    ),
+    ("timezone", "ALTER TABLE routines ADD COLUMN timezone TEXT"),
+    (
+        "missed_policy",
+        "ALTER TABLE routines ADD COLUMN missed_policy TEXT NOT NULL DEFAULT 'coalesce'",
+    ),
+    (
+        "max_catchup",
+        "ALTER TABLE routines ADD COLUMN max_catchup INTEGER NOT NULL DEFAULT 100",
+    ),
+    (
+        "grace_seconds",
+        "ALTER TABLE routines ADD COLUMN grace_seconds INTEGER NOT NULL DEFAULT 900",
+    ),
+    (
+        "overlap_policy",
+        "ALTER TABLE routines ADD COLUMN overlap_policy TEXT NOT NULL DEFAULT 'skip'",
+    ),
+    ("next_fire_at", "ALTER TABLE routines ADD COLUMN next_fire_at TEXT"),
+)
 
 
 def _row_to_routine(r: sqlite3.Row) -> Routine:
@@ -255,6 +420,26 @@ def _row_to_routine(r: sqlite3.Row) -> Routine:
             kind=r["schedule_kind"],
             at=r["schedule_at"],
             hours=r["schedule_hours"],
+            expr=(r["schedule_expr"] if "schedule_expr" in keys else None),
+            at_datetime=(
+                r["schedule_at_datetime"] if "schedule_at_datetime" in keys else None
+            ),
+            timezone=(r["timezone"] if "timezone" in keys else None),
+            missed=(
+                (r["missed_policy"] if "missed_policy" in keys else None) or "coalesce"
+            ),
+            max_catchup=(
+                (r["max_catchup"] if "max_catchup" in keys else None)
+                or DEFAULT_MAX_CATCHUP
+            ),
+            grace_seconds=(
+                r["grace_seconds"]
+                if ("grace_seconds" in keys and r["grace_seconds"] is not None)
+                else DEFAULT_GRACE_SECONDS
+            ),
+            overlap=(
+                (r["overlap_policy"] if "overlap_policy" in keys else None) or "skip"
+            ),
         ),
         provider=r["provider"],
         model=r["model"],
@@ -262,6 +447,7 @@ def _row_to_routine(r: sqlite3.Row) -> Routine:
         enabled=bool(r["enabled"]),
         created_at=r["created_at"],
         updated_at=r["updated_at"],
+        next_fire_at=(r["next_fire_at"] if "next_fire_at" in keys else None),
         last_run_at=r["last_run_at"],
         last_status=r["last_status"],
         last_preview=r["last_preview"] or "",
@@ -315,6 +501,15 @@ class RoutinesStore:
                 self._conn.execute(
                     "ALTER TABLE routines ADD COLUMN idempotency_key TEXT"
                 )
+        # Phase 1: additively add the cron/tz/catch-up columns. Idempotent — only adds a
+        # column that is missing — so this converges whether the table came from a fresh
+        # _SCHEMA (already has them), a pre-Phase-1 T3c table, or a just-rebuilt legacy one
+        # (the rebuild emits the current _SCHEMA, so they are present and these are no-ops).
+        post_info = self._conn.execute("PRAGMA table_info(routines)").fetchall()
+        post_cols = {row["name"] for row in post_info}
+        for name, ddl in _PHASE1_COLUMNS:
+            if name not in post_cols:
+                self._conn.execute(ddl)
         # Create the workspace index AFTER the column is guaranteed to exist (a fresh
         # database has it from _SCHEMA; a legacy one just got it above). Idempotent.
         self._conn.execute(
@@ -388,10 +583,13 @@ class RoutinesStore:
             """
             INSERT INTO routines (
                 id, name, workspace_id, agent_path, agent_id, idempotency_key,
-                prompt, schedule_kind, schedule_at, schedule_hours, provider, model,
+                prompt, schedule_kind, schedule_at, schedule_hours,
+                schedule_expr, schedule_at_datetime, timezone, missed_policy,
+                max_catchup, grace_seconds, overlap_policy, next_fire_at,
+                provider, model,
                 deliver, enabled, created_at, updated_at, last_run_at, last_status,
                 last_preview, last_error, last_delivery
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, workspace_id=excluded.workspace_id,
                 agent_path=excluded.agent_path, agent_id=excluded.agent_id,
@@ -399,6 +597,14 @@ class RoutinesStore:
                 prompt=excluded.prompt, schedule_kind=excluded.schedule_kind,
                 schedule_at=excluded.schedule_at,
                 schedule_hours=excluded.schedule_hours,
+                schedule_expr=excluded.schedule_expr,
+                schedule_at_datetime=excluded.schedule_at_datetime,
+                timezone=excluded.timezone,
+                missed_policy=excluded.missed_policy,
+                max_catchup=excluded.max_catchup,
+                grace_seconds=excluded.grace_seconds,
+                overlap_policy=excluded.overlap_policy,
+                next_fire_at=excluded.next_fire_at,
                 provider=excluded.provider, model=excluded.model,
                 deliver=excluded.deliver, enabled=excluded.enabled,
                 updated_at=excluded.updated_at,
@@ -419,6 +625,14 @@ class RoutinesStore:
                 routine.schedule.kind,
                 routine.schedule.at,
                 routine.schedule.hours,
+                routine.schedule.expr,
+                routine.schedule.at_datetime,
+                routine.schedule.timezone,
+                routine.schedule.missed,
+                routine.schedule.max_catchup,
+                routine.schedule.grace_seconds,
+                routine.schedule.overlap,
+                routine.next_fire_at,
                 routine.provider,
                 routine.model,
                 routine.deliver,
@@ -508,6 +722,20 @@ class RoutinesStore:
             "UPDATE routines SET last_status = ?, last_preview = ?,"
             " last_error = ?, last_delivery = ? WHERE id = ?",
             (status, preview[:PREVIEW_MAX_CHARS], error, delivery, routine_id),
+        )
+        self._conn.commit()
+
+    def advance_next_fire(self, routine_id: str, next_fire_at: str | None) -> None:
+        """Persist the recomputed ``next_fire_at`` after a fire (Phase 1).
+
+        Idempotent against the same planned instant: writing the same value twice (e.g. a
+        crash-replayed advance) is a no-op-equivalent UPDATE. The dedup claim — keyed on the
+        planned fire — is the crash backstop that guarantees at-most-once even if the advance
+        never lands; this column is the observable hint, not the safety primitive.
+        """
+        self._conn.execute(
+            "UPDATE routines SET next_fire_at = ? WHERE id = ?",
+            (next_fire_at, routine_id),
         )
         self._conn.commit()
 
@@ -868,11 +1096,63 @@ def routine_lock_name(routine_id: str) -> str:
     return f"routine-{routine_id}"
 
 
+#: The dedup scope for scheduled routine fires (namespaces the at-most-once keys so a
+#: routine fire never collides with a webhook delivery id).
+SCHEDULE_DEDUP_SCOPE = "schedule"
+#: Floor on the dedup completed-TTL for a single fire. The TTL must be >= the routine's
+#: cadence so two ticks/boots within one interval coalesce to one fire; a short-cadence
+#: cron (e.g. every minute) sets a small interval, but never below this floor so a slow
+#: run + a fast next tick still dedupe.
+_DEDUP_TTL_FLOOR_SECONDS = 120.0
+
+
+def schedule_dedup_key(routine_id: str, planned_fire_at_iso: str) -> str:
+    """The at-most-once dedup key for a single planned fire (Phase 1).
+
+    Keyed on the PLANNED fire instant (UTC ISO), never ``now()``, so concurrent ticks /
+    boots that observe the same due fire coalesce to exactly one claim → one ``create_run``.
+    """
+    return f"{routine_id}:{planned_fire_at_iso}"
+
+
+def _dedup_ttl_for(routine: Routine) -> float:
+    """The completed-TTL (seconds) for a fire's dedup row: >= the routine cadence.
+
+    For ``every`` it is N hours; for ``cron`` it is the gap to the NEXT occurrence after the
+    one we are firing (so two fires of a short cadence never share a TTL window); for
+    daily/at a day. Always at least :data:`_DEDUP_TTL_FLOOR_SECONDS`.
+    """
+    sched = routine.schedule
+    if sched.kind == "every" and sched.hours:
+        return max(sched.hours * 3600.0, _DEDUP_TTL_FLOOR_SECONDS)
+    if sched.kind == "cron" and sched.expr:
+        from himmy.api.routine_schedule import (
+            CronUnavailableError,
+            cron_next_fire,
+            resolve_zone,
+        )
+
+        anchor = _parse_iso(routine.next_fire_at or "") or _parse_iso(
+            routine.last_run_at or routine.created_at
+        )
+        if anchor is not None:
+            try:
+                zone = resolve_zone(sched.timezone)
+                nxt = cron_next_fire(sched.expr, anchor, zone)
+                gap = (nxt - _to_utc(anchor)).total_seconds()
+                return max(gap, _DEDUP_TTL_FLOOR_SECONDS)
+            except (CronUnavailableError, StopIteration):
+                pass
+    # daily / at / fallback — a day comfortably covers a once-a-day cadence.
+    return max(86_400.0, _DEDUP_TTL_FLOOR_SECONDS)
+
+
 async def execute_routine(
     routine_id: str,
     *,
     now: Callable[[], datetime] | None = None,
     expected_last_run_at: Any = UNCONDITIONAL,
+    planned_fire_at_iso: str | None = None,
 ) -> Routine | None:
     """Run one routine end-to-end: run → deliver → record → notify.
 
@@ -907,9 +1187,86 @@ async def execute_routine(
                 routine,
                 now=now,
                 expected_last_run_at=expected_last_run_at,
+                planned_fire_at_iso=planned_fire_at_iso,
             )
     except ProcessLockBusy as exc:
         raise RoutineBusyError(routine_id) from exc
+
+
+async def _try_schedule_dedup_claim(
+    routine: Routine, planned_fire_at_iso: str
+) -> bool | None:
+    """Durable at-most-once claim for one planned fire (Phase 1 backstop).
+
+    Returns ``True`` when THIS caller won the claim (run), ``False`` when the same planned
+    fire was already claimed/completed (a concurrent tick/boot — do NOT run), or ``None``
+    when no durable dedup store is available (offline in-memory) — the caller then relies on
+    the flock + cluster CAS alone (single-box-safe; documented).
+
+    Keyed on ``routine_id:planned_fire_at`` (the planned instant, NOT now), so two ticks or
+    a tick + a boot-catch-up that resolve to the SAME planned fire coalesce to one run. The
+    completed-TTL is the routine cadence (>= the interval) so a short-cadence routine's
+    consecutive fires never share a window. We do NOT call ``dedup_complete`` here — the
+    in-flight lease is left to EXPIRE so a crash mid-run is reclaimable (the routine's own
+    ``last_run_at`` advance + the cluster CAS prevent a same-tick re-fire; the dedup row's
+    role is the cross-boot coalesce of the SAME planned instant within the TTL window).
+    """
+    storage = _resolve_dedup_storage()
+    if storage is None:
+        return None
+    from himmy.services.storage.trigger_dedup import CLAIM_WON
+
+    key = schedule_dedup_key(routine.id, planned_fire_at_iso)
+    ttl = _dedup_ttl_for(routine)
+    try:
+        claim = await storage.dedup_try_claim(
+            SCHEDULE_DEDUP_SCOPE, key, lease_seconds=ttl
+        )
+    except Exception:  # noqa: BLE001 - a dedup-store failure must not block the fire
+        logger.warning(
+            "schedule dedup claim failed for %s; proceeding on flock/CAS only",
+            routine.id,
+            exc_info=True,
+        )
+        return None
+    if claim.outcome is CLAIM_WON:
+        # Mark the planned fire COMPLETED immediately (its result is irrelevant — the run's
+        # own record carries the outcome). Completing now upgrades the short in-flight lease
+        # to the full cadence TTL so the SAME planned instant cannot be re-claimed by a later
+        # boot within the window, which is exactly the cross-boot coalesce we want.
+        try:
+            await storage.dedup_complete(
+                SCHEDULE_DEDUP_SCOPE, key, result="fired", ttl_seconds=ttl
+            )
+        except Exception:  # noqa: BLE001 - completion is best-effort; lease still expires
+            logger.debug("schedule dedup complete failed for %s", routine.id)
+        return True
+    # CLAIM_DONE / CLAIM_IN_FLIGHT — this planned fire is already handled elsewhere.
+    return False
+
+
+def _resolve_dedup_storage() -> Any | None:
+    """Resolve the process-wide durable StorageService for dedup, or ``None`` offline.
+
+    Uses the same server-storage seam the run substrate publishes (``set_server_storage``).
+    A plain CLI/in-memory deployment has no durable dedup store; the flock + cluster CAS are
+    the at-most-once guarantee there (single-box-safe — documented; cross-node single-fire
+    holds only on a shared Postgres dedup table).
+    """
+    try:
+        from himmy.services.storage.factory import server_storage
+    except Exception:  # noqa: BLE001 - defensive
+        return None
+    try:
+        storage = server_storage()
+    except Exception:  # noqa: BLE001 - no server storage published
+        return None
+    if storage is None:
+        return None
+    # Only durable backends carry the dedup table; the in-memory facade also implements it
+    # but its rows die with the process (no cross-boot value), so treat it as present only
+    # when it exposes the dedup surface.
+    return storage if hasattr(storage, "dedup_try_claim") else None
 
 
 async def _execute_locked(
@@ -918,16 +1275,38 @@ async def _execute_locked(
     *,
     now: Callable[[], datetime] | None = None,
     expected_last_run_at: Any = UNCONDITIONAL,
+    planned_fire_at_iso: str | None = None,
 ) -> Routine | None:
     """The guarded body of :func:`execute_routine` (runs while the flock is held).
 
-    The start stamp is the atomic claim: when ``expected_last_run_at`` is a captured
-    sentinel (the tick path) and the conditional ``mark_started`` matches 0 rows, a peer
-    replica already won this tick — return the routine WITHOUT running so the gated tools /
-    deliveries fire exactly once cluster-wide.
+    COMMIT ORDER (Phase 1 red-team gate — a crash between steps must not double-fire):
+
+      1. **dedup CLAIM_WON** — the durable at-most-once claim keyed on the PLANNED fire
+         (``routine_id:planned_fire_at``). If this planned fire was already claimed (a
+         concurrent tick/boot), return WITHOUT running. Offline (no durable store) this is a
+         no-op and we fall through to the flock + CAS.
+      2. **mark_started (cluster CAS)** — the conditional start stamp. On the Postgres mirror
+         this is the cross-replica claim; on SQLite it is the local anchor advance under the
+         flock. A 0-row match means a peer won — return without running.
+      3. **run** (``_run_headless``) → record_result.
+      4. **advance next_fire_at** — recompute and persist the next planned fire LAST. A crash
+         before this leaves ``next_fire_at`` stale, but the dedup claim (1) + the advanced
+         ``last_run_at`` (2) prevent re-firing the SAME planned instant; the next tick simply
+         recomputes from ``last_run_at``. The advance is idempotent vs the same instant.
     """
     store = get_routines_store()
     now_fn = now or _default_now
+
+    # 1) Durable at-most-once claim on the planned fire (the crash backstop / cross-boot
+    #    coalesce). Only applies to a tick fire that carries a planned instant.
+    if planned_fire_at_iso is not None:
+        won = await _try_schedule_dedup_claim(routine, planned_fire_at_iso)
+        if won is False:
+            # This exact planned fire was already claimed by another tick/boot.
+            already: Routine | None = store.get(routine_id)
+            return already
+
+    # 2) Cluster-wide / local atomic start claim.
     claimed = store.mark_started(
         routine_id,
         now_fn().isoformat(),
@@ -954,9 +1333,29 @@ async def _execute_locked(
     store.record_result(
         routine_id, status=status, preview=preview, error=error, delivery=delivery
     )
+    # 4) Advance next_fire_at LAST (idempotent vs the same planned instant). Best-effort:
+    #    the dedup claim + advanced last_run_at are the at-most-once guarantees, not this.
+    _advance_next_fire(store, routine_id, now=now_fn)
     _notify(routine, status, preview, error)
     refreshed: Routine | None = store.get(routine_id)
     return refreshed
+
+
+def _advance_next_fire(
+    store: Any, routine_id: str, *, now: Callable[[], datetime]
+) -> None:
+    """Recompute + persist ``next_fire_at`` after a fire (cron/at only; safe no-op else)."""
+    if not hasattr(store, "advance_next_fire"):
+        return
+    routine = store.get(routine_id)
+    if routine is None or routine.schedule.kind not in ("cron", "at"):
+        return
+    anchor = _parse_iso(routine.last_run_at or "") or now()
+    nxt = planned_fire_at(routine, anchor)
+    try:
+        store.advance_next_fire(routine_id, nxt.isoformat() if nxt else None)
+    except Exception:  # noqa: BLE001 - the column is a hint, not the safety primitive
+        logger.debug("advance_next_fire failed for %s", routine_id, exc_info=True)
 
 
 # ---- the scheduler -----------------------------------------------------------
@@ -965,6 +1364,22 @@ async def _execute_locked(
 def _default_now() -> datetime:
     """Aware local time — 'daily at 07:00' means the user's 7am."""
     return datetime.now().astimezone()
+
+
+def _tick_planned_fire_iso(routine: Routine) -> str | None:
+    """The planned-fire UTC ISO for a due cron/at routine (the dedup key), else ``None``.
+
+    For cron/at this is the next occurrence STRICTLY after the anchor (the instant is_due
+    just crossed). For daily/every it is ``None`` — they keep their existing flock + CAS
+    at-most-once with no planned-instant dedup (byte-identical behaviour).
+    """
+    if routine.schedule.kind not in ("cron", "at"):
+        return None
+    anchor = _parse_iso(routine.last_run_at or routine.created_at)
+    if anchor is None:
+        return None
+    planned = planned_fire_at(routine, anchor)
+    return planned.isoformat() if planned is not None else None
 
 
 class RoutineBusyError(RuntimeError):
@@ -1052,12 +1467,21 @@ class RoutineScheduler:
             # thread it into the atomic start claim, so the cluster-wide conditional UPDATE
             # gates on the value this tick observed — not a fresh re-read that a peer replica
             # may already have moved (K4 reviewer must_fix).
-            self._launch(routine.id, routine.last_run_at)
+            #
+            # For cron/at also compute the PLANNED fire (the instant is_due crossed) and
+            # thread it as the dedup key — so two ticks/boots on the same planned fire
+            # coalesce to one run. daily/every pass None (no dedup-by-planned-instant): their
+            # at-most-once stays the existing flock + CAS, byte-identical to before.
+            planned_iso = _tick_planned_fire_iso(routine)
+            self._launch(routine.id, routine.last_run_at, planned_iso)
             launched.append(routine.id)
         return launched
 
     def _launch(
-        self, routine_id: str, expected_last_run_at: Any
+        self,
+        routine_id: str,
+        expected_last_run_at: Any,
+        planned_fire_at_iso: str | None = None,
     ) -> asyncio.Task[Routine | None]:
         """Fire-and-forget launch for the tick loop — failures are swallowed.
 
@@ -1065,10 +1489,13 @@ class RoutineScheduler:
         cross-process flock contention) must not escape: :func:`_guarded_execute`
         funnels everything to a logged ``None``. ``run_now`` does NOT use this path
         precisely because it must let :class:`RoutineBusyError` surface (a 409).
-        ``expected_last_run_at`` is the due-time sentinel for the atomic cluster-wide claim.
+        ``expected_last_run_at`` is the due-time sentinel for the atomic cluster-wide claim;
+        ``planned_fire_at_iso`` is the dedup key for cron/at (``None`` for daily/every).
         """
         task = asyncio.create_task(
-            self._guarded_execute(routine_id, expected_last_run_at),
+            self._guarded_execute(
+                routine_id, expected_last_run_at, planned_fire_at_iso
+            ),
             name=f"himmy-routine-{routine_id}",
         )
         self._track(routine_id, task)
@@ -1080,19 +1507,173 @@ class RoutineScheduler:
         task.add_done_callback(lambda _t: self._running.pop(routine_id, None))
 
     async def _guarded_execute(
-        self, routine_id: str, expected_last_run_at: Any
+        self,
+        routine_id: str,
+        expected_last_run_at: Any,
+        planned_fire_at_iso: str | None = None,
     ) -> Routine | None:
         try:
             return await execute_routine(
                 routine_id,
                 now=self._now,
                 expected_last_run_at=expected_last_run_at,
+                planned_fire_at_iso=planned_fire_at_iso,
             )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - one failed run never kills the scheduler
             logger.exception("routine %s failed", routine_id)
             return None
+
+    # -- catch-up on launch -------------------------------------------------------
+
+    async def catch_up_on_launch(self) -> dict[str, str]:
+        """Apply each routine's missed-run policy on worker/scheduler startup (Phase 1).
+
+        Reads the AUTHORITATIVE anchor (``last_run_at``), NOT a wall-clock delta, so it is
+        clock-skew safe. Per routine:
+
+        * ``coalesce`` (default): do nothing here — a missed occurrence leaves ``is_due``
+          true, so the very next normal tick fires it EXACTLY ONCE. (Laptop-sleep-safe.)
+        * ``skip``: drop the gap — advance ``last_run_at`` / ``next_fire_at`` to the latest
+          MISSED occurrence WITHOUT running, so the next tick only fires the next FUTURE one.
+        * ``run_each``: backfill each missed occurrence, oldest-first, HARD-CAPPED by
+          ``max_catchup`` and dropping occurrences older than ``grace_seconds`` (the storm
+          cap is enforced AT ENQUEUE — never an unbounded backlog after a long sleep).
+
+        Returns ``{routine_id: action}`` for observability (``coalesce`` / ``skip:N`` /
+        ``run_each:N`` / ``none``). Only cron/at/daily routines with a real gap are touched;
+        ``every`` keeps its interval-anchored behaviour (it drifts vs wall-clock by design —
+        cron is the recommended wall-clock cadence).
+        """
+        now = self._now()
+        try:
+            routines = get_routines_store().list()
+        except Exception:  # noqa: BLE001 - a broken store must not break startup
+            logger.exception("routine store unavailable during catch-up")
+            return {}
+        actions: dict[str, str] = {}
+        for routine in routines:
+            try:
+                action = await self._catch_up_one(routine, now)
+            except Exception:  # noqa: BLE001 - one bad routine never breaks the sweep
+                logger.exception("catch-up failed for routine %s", routine.id)
+                action = "error"
+            if action != "none":
+                actions[routine.id] = action
+        return actions
+
+    async def _catch_up_one(self, routine: Routine, now: datetime) -> str:
+        """Apply one routine's missed-run policy; return the action taken."""
+        if not routine.enabled:
+            return "none"
+        if routine.schedule.kind == "every":
+            return "none"  # interval-anchored; no wall-clock catch-up
+        if not is_due(routine, now):
+            return "none"  # nothing missed
+        policy = routine.schedule.missed
+        if policy == "coalesce":
+            return "coalesce"  # the next normal tick fires it once
+        if policy == "skip":
+            return self._catch_up_skip(routine, now)
+        return await self._catch_up_run_each(routine, now)
+
+    def _catch_up_skip(self, routine: Routine, now: datetime) -> str:
+        """``skip``: advance past every missed occurrence WITHOUT firing."""
+        store = get_routines_store()
+        # Stamp last_run_at to NOW so is_due no longer sees the missed occurrence; recompute
+        # next_fire_at from there. A plain (unconditional) stamp is fine — we deliberately
+        # drop the gap and do not run.
+        stamped = now.isoformat()
+        try:
+            store.mark_started(routine.id, stamped)  # stamps last_run_at + 'running'
+            # Immediately settle the status back so a skipped routine isn't left 'running'.
+            store.record_result(
+                routine.id, status="skipped", preview="(missed run skipped)", error=None
+            )
+            _advance_next_fire(store, routine.id, now=self._now)
+        except Exception:  # noqa: BLE001 - skip is best-effort housekeeping
+            logger.debug("skip catch-up stamp failed for %s", routine.id, exc_info=True)
+        return "skip:1"
+
+    async def _catch_up_run_each(self, routine: Routine, now: datetime) -> str:
+        """``run_each``: backfill missed occurrences (cap + grace), oldest-first."""
+        occurrences = self._missed_occurrences(routine, now)
+        if not occurrences:
+            return "none"
+        fired = 0
+        for planned in occurrences:
+            if self.is_running(routine.id):
+                break
+            # Fire through the SAME rails with the planned instant as the dedup key, so a
+            # backfilled occurrence is at-most-once just like a live tick. Awaited so the
+            # backfill is sequential (overlap=skip) and the cap is honoured at enqueue.
+            await self._guarded_execute(
+                routine.id, routine.last_run_at, planned.isoformat()
+            )
+            fired += 1
+            refreshed = get_routines_store().get(routine.id)
+            if refreshed is None:
+                break
+            routine = refreshed
+        return f"run_each:{fired}"
+
+    def _missed_occurrences(self, routine: Routine, now: datetime) -> list[datetime]:
+        """Missed occurrences to backfill for ``run_each`` (cap + grace applied)."""
+        anchor = _parse_iso(routine.last_run_at or routine.created_at)
+        if anchor is None:
+            return []
+        grace = float(routine.schedule.grace_seconds)
+        cap = routine.schedule.max_catchup
+        cutoff = now - timedelta(seconds=grace)
+        sched = routine.schedule
+        if sched.kind == "cron" and sched.expr:
+            from himmy.api.routine_schedule import (
+                CronUnavailableError,
+                cron_occurrences_between,
+                resolve_zone,
+            )
+
+            try:
+                occ = cron_occurrences_between(
+                    sched.expr, anchor, now, resolve_zone(sched.timezone), limit=cap
+                )
+            except CronUnavailableError:
+                return []
+        elif sched.kind == "daily":
+            occ = self._daily_occurrences_between(routine, anchor, now, cap)
+        elif sched.kind == "at":
+            planned = planned_fire_at(routine, anchor)
+            occ = [planned] if planned is not None and planned <= now else []
+        else:
+            return []
+        # grace: drop occurrences older than the cutoff (a long sleep doesn't replay ancient
+        # fires); the cap was already applied at enumeration for cron, apply it here for all.
+        kept = [o for o in occ if o >= cutoff]
+        return kept[-cap:] if len(kept) > cap else kept
+
+    def _daily_occurrences_between(
+        self, routine: Routine, anchor: datetime, now: datetime, cap: int
+    ) -> list[datetime]:
+        """Daily HH:MM occurrences in ``(anchor, now]`` in the routine timezone, capped."""
+        from himmy.api.routine_schedule import resolve_zone
+
+        m = _AT_RE.match(routine.schedule.at or "")
+        if not m:
+            return []
+        zone = resolve_zone(routine.schedule.timezone)
+        anchor_local = _to_utc(anchor).astimezone(zone)
+        now_local = now.astimezone(zone)
+        out: list[datetime] = []
+        cursor = anchor_local.replace(
+            hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0
+        )
+        if cursor <= anchor_local:
+            cursor += timedelta(days=1)
+        while cursor <= now_local and len(out) < cap * 2 + 2:
+            out.append(_to_utc(cursor))
+            cursor += timedelta(days=1)
+        return out[-cap:] if len(out) > cap else out
 
     # -- manual trigger -----------------------------------------------------------
 
@@ -1136,9 +1717,14 @@ def reset_scheduler() -> None:
 
 
 __all__ = [
+    "DEFAULT_GRACE_SECONDS",
+    "DEFAULT_MAX_CATCHUP",
     "DELIVERY_MAX_CHARS",
     "LOCAL_WORKSPACE",
     "PREVIEW_MAX_CHARS",
+    "SCHEDULE_DEDUP_SCOPE",
+    "MissedRunPolicy",
+    "OverlapPolicy",
     "Routine",
     "RoutineBusyError",
     "RoutineScheduler",
@@ -1148,11 +1734,13 @@ __all__ = [
     "get_routines_store",
     "get_scheduler",
     "is_due",
+    "planned_fire_at",
     "reset_routines_store",
     "reset_scheduler",
     "resolve_routine_container",
     "routine_lock_name",
     "routines_db_path",
     "run_timeout_s",
+    "schedule_dedup_key",
     "set_routine_container_provider",
 ]

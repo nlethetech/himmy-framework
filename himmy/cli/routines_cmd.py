@@ -70,16 +70,46 @@ def _print_row(routine: svc.Routine) -> None:
 
 
 def _build_schedule(args: argparse.Namespace) -> svc.Schedule:
-    """Build a validated :class:`Schedule` from ``--daily HH:MM`` / ``--every N``."""
+    """Build a validated :class:`Schedule` from ``--daily`` / ``--every`` / ``--cron`` / ``--at``.
+
+    Exactly one cadence must be chosen. ``--timezone`` (IANA, e.g. ``Asia/Kathmandu``),
+    ``--missed-run`` (coalesce|skip|run_each) and ``--overlap`` (skip) are common scheduling
+    policy applied to whichever cadence is picked. daily/every keep their original meaning.
+    """
     daily: str | None = getattr(args, "daily", None)
     every: int | None = getattr(args, "every", None)
-    if (daily is None) == (every is None):
+    cron: str | None = getattr(args, "cron", None)
+    at: str | None = getattr(args, "at", None)
+    chosen = [c for c in (daily, every, cron, at) if c is not None]
+    if len(chosen) != 1:
         raise SystemExit(
-            "error: choose exactly one of --daily HH:MM or --every N (hours)"
+            "error: choose exactly one of --daily HH:MM, --every N, "
+            "--cron 'EXPR', or --at ISO"
         )
+    common: dict[str, Any] = {
+        "timezone": getattr(args, "timezone", None),
+        "missed": getattr(args, "missed_run", None) or "coalesce",
+        "overlap": getattr(args, "overlap", None) or "skip",
+    }
     if daily is not None:
-        return svc.Schedule(kind="daily", at=daily)
-    return svc.Schedule(kind="every", hours=every)
+        return svc.Schedule(kind="daily", at=daily, **common)
+    if every is not None:
+        return svc.Schedule(kind="every", hours=every, **common)
+    if cron is not None:
+        if not svc_cron_available():
+            raise SystemExit(
+                "error: --cron needs the optional 'cronsim' dependency; "
+                "install it with `pip install 'himmy[cron]'`"
+            )
+        return svc.Schedule(kind="cron", expr=cron, **common)
+    return svc.Schedule(kind="at", at_datetime=at, **common)
+
+
+def svc_cron_available() -> bool:
+    """True when the optional cron dependency is installed (so ``--cron`` can run)."""
+    from himmy.api.routine_schedule import cron_is_available
+
+    return cron_is_available()
 
 
 def cmd_routines(args: argparse.Namespace) -> int:
@@ -354,6 +384,35 @@ def add_routines_parser(sub: Any) -> None:
     sched.add_argument("--daily", metavar="HH:MM", help="run daily at this 24h time")
     sched.add_argument(
         "--every", metavar="HOURS", type=int, help="run every N hours (1..168)"
+    )
+    sched.add_argument(
+        "--cron",
+        metavar="EXPR",
+        help="run on a 5-field cron expression (e.g. '30 6 * * *'); "
+        "wall-clock-anchored, honours --timezone (needs himmy[cron])",
+    )
+    sched.add_argument(
+        "--at",
+        metavar="ISO",
+        help="run ONCE at a single ISO-8601 instant, then never again",
+    )
+    p_add.add_argument(
+        "--timezone",
+        metavar="IANA",
+        help="IANA timezone for daily/cron/at (e.g. Asia/Kathmandu); "
+        "default: $HIMMY_TZ else host-local",
+    )
+    p_add.add_argument(
+        "--missed-run",
+        choices=["coalesce", "skip", "run_each"],
+        dest="missed_run",
+        help="catch-up policy for runs missed while asleep (default: coalesce — "
+        "fire once now; skip — drop; run_each — backfill each, capped)",
+    )
+    p_add.add_argument(
+        "--overlap",
+        choices=["skip"],
+        help="overlap policy (default: skip — never run concurrently with itself)",
     )
     p_add.add_argument("--provider", help="inference provider (default: auto)")
     p_add.add_argument("--model", help="model key/name for the provider")

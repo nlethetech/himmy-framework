@@ -76,6 +76,13 @@ connectors = ["feedparser>=6", "openpyxl>=3"]
 discord = ["discord.py>=2.3"]
 # Nepal domain primitives: the Bikram Sambat calendar.
 nepal = ["nepali-datetime>=1.0"]
+# Cron-expression routine schedules (Phase 1 scheduling). cronsim is pure-Python with
+# ZERO transitive deps and BSD-licensed; chosen over croniter because it fires a DST
+# fall-back occurrence EXACTLY ONCE (croniter double-fires at two distinct UTC instants,
+# which a dedup-by-planned-UTC backstop cannot coalesce — disqualifying for an at-most-once
+# scheduler). Optional: daily/every routines never need it; a cron routine raises a clear
+# install hint if it is absent.
+cron = ["cronsim>=2.7"]
 # Optional full-fidelity JSON Schema validation for tool args/output. Without it,
 # Himmy falls back to a built-in offline schema-validation subset.
 validation = ["jsonschema>=4"]
@@ -95,6 +102,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
     "types-PyYAML>=6",
+    # so the cron-routine tests run in CI (the runtime dep lives in the `cron` extra)
+    "cronsim>=2.7",
     # so the OIDC auth tests run in CI (the runtime dep lives in the `auth` extra)
     "pyjwt[crypto]>=2.8",
     # PyPA build frontend: lets test_built_wheel_contains_studio_gui actually run
@@ -118,6 +127,7 @@ all = [
     "feedparser>=6",
     "openpyxl>=3",
     "nepali-datetime>=1.0",
+    "cronsim>=2.7",
     "jsonschema>=4",
     "beautifulsoup4>=4.12",
     "fastembed>=0.3",

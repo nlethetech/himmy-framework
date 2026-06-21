@@ -2943,7 +2943,7 @@
         "type": "object"
       },
       "Schedule": {
-        "description": "When a routine runs. Deliberately simple \u2014 no cron strings.\n\n* ``{\"kind\": \"daily\", \"at\": \"HH:MM\"}`` \u2014 once a day at that local time.\n* ``{\"kind\": \"every\", \"hours\": N}`` \u2014 every N hours (1..168).",
+        "description": "When a routine runs.\n\nThe original two kinds are UNCHANGED (byte-identical behaviour):\n\n* ``{\"kind\": \"daily\", \"at\": \"HH:MM\"}`` \u2014 once a day at that local time.\n* ``{\"kind\": \"every\", \"hours\": N}`` \u2014 every N hours (1..168).\n\nPhase 1 adds two wall-clock-anchored kinds plus per-routine scheduling policy:\n\n* ``{\"kind\": \"cron\", \"expr\": \"30 6 * * *\"}`` \u2014 a 5-field cron expression, computed in\n  the routine's ``timezone`` (needs the optional ``cronsim`` dependency). Cron is the\n  right choice for a wall-clock-anchored cadence (e.g. 'every day at 06:30 Kathmandu')\n  \u2014 unlike ``every`` it does not drift against the wall clock.\n* ``{\"kind\": \"at\", \"at_datetime\": \"<ISO>\"}`` \u2014 a ONE-SHOT run at a single instant; once\n  fired it never fires again.\n\n``timezone`` (IANA, e.g. ``Asia/Kathmandu``) governs the wall-clock kinds (``daily`` /\n``cron`` / ``at``-with-naive-instant). Unset \u2192 env ``HIMMY_TZ`` \u2192 host-local. ``missed``\n/ ``max_catchup`` / ``grace_seconds`` drive catch-up on launch; ``overlap`` is reserved.\n\nBACK-COMPAT: every new field has a default, and the ``daily`` / ``every`` validation +\nsemantics are unchanged, so an existing routine (and its stored row / JSON blob)\nround-trips and behaves exactly as before.",
         "properties": {
           "at": {
             "anyOf": [
@@ -2956,6 +2956,36 @@
               }
             ],
             "title": "At"
+          },
+          "at_datetime": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At Datetime"
+          },
+          "expr": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expr"
+          },
+          "grace_seconds": {
+            "default": 900,
+            "minimum": 0.0,
+            "title": "Grace Seconds",
+            "type": "integer"
           },
           "hours": {
             "anyOf": [
@@ -2973,10 +3003,47 @@
           "kind": {
             "enum": [
               "daily",
-              "every"
+              "every",
+              "cron",
+              "at"
             ],
             "title": "Kind",
             "type": "string"
+          },
+          "max_catchup": {
+            "default": 100,
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Max Catchup",
+            "type": "integer"
+          },
+          "missed": {
+            "default": "coalesce",
+            "enum": [
+              "coalesce",
+              "skip",
+              "run_each"
+            ],
+            "title": "Missed",
+            "type": "string"
+          },
+          "overlap": {
+            "const": "skip",
+            "default": "skip",
+            "title": "Overlap",
+            "type": "string"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
           }
         },
         "required": [

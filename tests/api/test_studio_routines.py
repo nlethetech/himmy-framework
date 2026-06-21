@@ -143,7 +143,19 @@ def test_crud_roundtrip(client: TestClient) -> None:
     created = client.post("/api/studio/routines", json=_body())
     assert created.status_code == 200
     rid = created.json()["id"]
-    assert created.json()["schedule"] == {"kind": "daily", "at": "07:00", "hours": None}
+    # Phase 1 adds additive, defaulted schedule fields; the daily semantics are unchanged.
+    assert created.json()["schedule"] == {
+        "kind": "daily",
+        "at": "07:00",
+        "hours": None,
+        "expr": None,
+        "at_datetime": None,
+        "timezone": None,
+        "missed": "coalesce",
+        "max_catchup": 100,
+        "grace_seconds": 900,
+        "overlap": "skip",
+    }
     assert created.json()["enabled"] is True
     assert created.json()["last_run_at"] is None
 

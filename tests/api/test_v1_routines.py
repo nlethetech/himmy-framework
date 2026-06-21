@@ -103,7 +103,19 @@ def test_create_and_read_routine(client: TestClient) -> None:
     body = res.json()
     assert body["agent_id"] == agent_id
     assert body["workspace_id"] == "acme"
-    assert body["schedule"] == {"kind": "daily", "at": "07:00", "hours": None}
+    # Phase 1 adds additive, defaulted schedule fields; the daily semantics are unchanged.
+    assert body["schedule"] == {
+        "kind": "daily",
+        "at": "07:00",
+        "hours": None,
+        "expr": None,
+        "at_datetime": None,
+        "timezone": None,
+        "missed": "coalesce",
+        "max_catchup": 100,
+        "grace_seconds": 900,
+        "overlap": "skip",
+    }
     # No agent_path leaks into the view.
     assert "agent_path" not in body
 
