@@ -10,7 +10,6 @@ runs on shutdown (AAEO-1). It is a thin transport layer: behavior lives below it
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -20,6 +19,7 @@ from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from himmy import __version__
+from himmy.api import runtime_bootstrap as _bootstrap
 from himmy.api.auth import (
     build_access_policy,
     build_authenticator,
@@ -63,6 +63,13 @@ from himmy.api.routers import (
     teams,
     threads,
     workflows,
+)
+from himmy.api.runtime_bootstrap import (
+    start_run_substrate,
+    stop_run_substrate,
+)
+from himmy.api.runtime_bootstrap import (
+    wants_durable_store as _bootstrap_wants_durable_store,
 )
 from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.core.errors import HimmyError
@@ -231,141 +238,40 @@ def _enforce_auth_posture(authenticator: object | None, bind_host: str) -> None:
 def _wants_durable_store() -> bool:
     """True when the server should wire the durable store instead of in-memory.
 
-    Opt-in so ``create_app()`` stays offline-green by default: a durable backend is
-    selected when a database DSN is configured (``HIMMY_DATABASE_URL``) or when the
-    operator explicitly asks for it (``HIMMY_DURABLE_STORAGE=1``). Either way the
-    backend is resolved by :class:`StoreFactory` (Postgres for a ``postgres://`` DSN,
-    file-backed SQLite otherwise) — this entrypoint only decides *whether* to use it.
+    Thin alias over :func:`himmy.api.runtime_bootstrap.wants_durable_store` — the shared
+    bootstrap is the single source of truth so the lifespan and the standalone worker
+    decide durability identically. Kept under this name for backward-compat callers.
     """
-    import os
-
-    from himmy.config.secrets import get_secret
-
-    if (get_secret("HIMMY_DATABASE_URL") or "").strip():
-        return True
-    return os.environ.get("HIMMY_DURABLE_STORAGE", "").lower() in ("1", "true", "yes")
-
-
-def _dispatch_env_overrides(
-    *,
-    default_concurrency: int,
-    default_timeout_seconds: float,
-    default_max_attempts: int,
-) -> tuple[int, float, int]:
-    """Resolve the dispatcher's tunable knobs from the environment (dx).
-
-    The leased run dispatcher otherwise pins ``max_concurrency=8``, the run wall-clock
-    timeout, and the per-run retry ceiling to hard-coded defaults. An operator sizing a
-    deployment to its hardware/provider quota can override them without a code change via
-    ``HIMMY_DISPATCH_CONCURRENCY`` (worker fan-out), ``HIMMY_RUN_TIMEOUT_SECONDS`` (each
-    run's wall clock — also the lease TTL basis), and ``HIMMY_DISPATCH_MAX_ATTEMPTS`` (the
-    enqueue retry budget). Each defaults to the value passed in, and an unparseable or
-    non-positive value falls back to that default so a typo never breaks startup.
-    """
-    import os
-
-    def _positive_int(name: str, default: int) -> int:
-        raw = os.environ.get(name)
-        if raw is None or not raw.strip():
-            return default
-        try:
-            value = int(raw.strip())
-        except ValueError:
-            return default
-        return value if value > 0 else default
-
-    def _positive_float(name: str, default: float) -> float:
-        raw = os.environ.get(name)
-        if raw is None or not raw.strip():
-            return default
-        try:
-            value = float(raw.strip())
-        except ValueError:
-            return default
-        return value if value > 0 else default
-
-    return (
-        _positive_int("HIMMY_DISPATCH_CONCURRENCY", default_concurrency),
-        _positive_float("HIMMY_RUN_TIMEOUT_SECONDS", default_timeout_seconds),
-        _positive_int("HIMMY_DISPATCH_MAX_ATTEMPTS", default_max_attempts),
-    )
+    return _bootstrap_wants_durable_store()
 
 
 #: How often the lifespan maintenance loop GC's the durable trigger-dedup ledger (s).
-#: ``storage.dedup_sweep`` deletes only EXPIRED rows (those past their delivery-dedup
-#: TTL), so without this loop the table accrues one permanent row per delivery id forever
-#: on a busy webhook/Slack/Discord deployment. Hourly is ample — the rows it removes are
-#: already past their dedup window, so a slightly late sweep is harmless.
-_DEDUP_SWEEP_INTERVAL_SECONDS = 3600.0
+#: Backward-compat alias over the shared bootstrap's constant — kept so existing tests
+#: that ``monkeypatch.setattr(app, "_DEDUP_SWEEP_INTERVAL_SECONDS", …)`` still resolve a
+#: name here; the live value the lifespan uses comes from the bootstrap module.
+_DEDUP_SWEEP_INTERVAL_SECONDS = _bootstrap.DEDUP_SWEEP_INTERVAL_SECONDS
 
 
-async def _dedup_sweep_loop(
-    storage: Any,
-    *,
-    interval: float = _DEDUP_SWEEP_INTERVAL_SECONDS,
-    stop: asyncio.Event | None = None,
-) -> None:
-    """Periodically GC the durable trigger-dedup ledger until cancelled/``stop`` is set.
-
-    Wired into the lifespan only when the run store is DURABLE (the in-memory store keeps a
-    bounded dedup map that vanishes on exit, so it has nothing to sweep). A sweep error must
-    not kill the loop — the next tick retries. Returns promptly when ``stop`` is signalled so
-    shutdown does not wait a full interval.
-    """
-    stop = stop or asyncio.Event()
-    while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
-            return
-        except TimeoutError:
-            pass
-        try:
-            removed = await storage.dedup_sweep()
-            if removed:
-                logger.info("swept %d expired dedup row(s)", removed)
-        except Exception:  # noqa: BLE001 - a sweep error must not kill the loop
-            logger.warning("dedup sweep cycle failed", exc_info=True)
-
-
-def _run_store_is_durable(container: ApiContainer) -> bool:
-    """True when the container's run store is a DURABLE backend (SQLite/Postgres) (Q3).
-
-    The leased dispatcher's whole value is recovering runs across a restart, which only a
-    durable run store provides — the in-memory ``StorageService`` (the zero-config default and
-    the degraded in-memory fallback) loses every run on exit, so a dispatcher there would
-    leave runs stuck QUEUED with nothing to recover them. Gating the dispatcher on a durable
-    store keeps the offline default in INLINE fire-and-forget mode (byte-unchanged) and only
-    engages the queue for the deployments (``HIMMY_DATABASE_URL`` / ``HIMMY_DURABLE_STORAGE``
-    or an injected durable container) where it is meaningful and safe.
-    """
-    storage = getattr(container, "storage", None)
-    if storage is None:
-        return False
-    from himmy.services.storage.postgres import PostgresStorageService
-    from himmy.services.storage.sqlite import SqliteStorageService
-
-    return isinstance(storage, (SqliteStorageService, PostgresStorageService))
+#: Backward-compat re-exports: the dispatcher-knob resolver, the dedup-sweep loop, and the
+#: durable-store predicate now live in :mod:`himmy.api.runtime_bootstrap` (the single source
+#: of truth shared with the standalone ``himmy worker``). Re-exported under their old names
+#: so existing importers/monkeypatchers keep working. Tests that need to intercept the LIVE
+#: loop must patch the bootstrap module, since the lifespan calls the bootstrap directly.
+_dispatch_env_overrides = _bootstrap.dispatch_env_overrides
+_dedup_sweep_loop = _bootstrap._dedup_sweep_loop
+_run_store_is_durable = _bootstrap.run_store_is_durable
 
 
 def _active_backend_name(container: ApiContainer) -> str:
     """Name the container's storage backend for the readiness truth (G3): one of
     ``postgres`` / ``sqlite`` / ``memory`` / ``none``.
 
-    Read by ``/readyz`` (G4): a ``postgres`` backend triggers the live ``SELECT 1`` +
-    applied-migration check; ``sqlite``/``memory`` are file-local/ephemeral and need no
-    network probe. Cheap ``isinstance`` so it is safe to call in the create_app body.
+    Thin alias over :func:`himmy.api.runtime_bootstrap.active_backend_name` (single source
+    of truth shared with the worker). Read by ``/readyz`` (G4): a ``postgres`` backend
+    triggers the live ``SELECT 1`` + applied-migration check; ``sqlite``/``memory`` need no
+    network probe.
     """
-    storage = getattr(container, "storage", None)
-    if storage is None:
-        return "none"
-    from himmy.services.storage.postgres import PostgresStorageService
-    from himmy.services.storage.sqlite import SqliteStorageService
-
-    if isinstance(storage, PostgresStorageService):
-        return "postgres"
-    if isinstance(storage, SqliteStorageService):
-        return "sqlite"
-    return "memory"
+    return _bootstrap.active_backend_name(container)
 
 
 def _record_durability_truth(
@@ -431,7 +337,6 @@ def _build_lifespan(
         # later in-process CLI/test run reverts to the in-memory default.
         from himmy.services.storage.factory import (
             reset_server_context,
-            reset_server_storage,
             set_server_context,
             set_server_storage,
         )
@@ -523,166 +428,33 @@ def _build_lifespan(
         # ``app.state.container.storage`` dynamically, so the rebind above (to the
         # durable store) is automatically reflected — no re-wiring needed here.
 
-        # Startup: sweep runs left non-terminal by a previous process so they
-        # reach a terminal state instead of hanging in QUEUED/RUNNING forever.
-        run_app = getattr(active, "run_app", None)
-        # Q3: the leased dispatcher owns execution ONLY when the run store is DURABLE (the
-        # queue's value requires durability — an in-memory store loses everything on exit, so
-        # there is nothing to recover). When durable, enable dispatch BEFORE the sweep so the
-        # sweep re-queues lease-expired runs instead of mass-failing them; then start the
-        # claim/reaper loops AFTER recovery. The in-memory default + the zero-DSN spine-rebind
-        # keep INLINE fire-and-forget, so a no-dispatcher deployment is byte-unchanged.
-        dispatcher = None
-        dedup_sweep_task: asyncio.Task[None] | None = None
-        dedup_sweep_stop: asyncio.Event | None = None
-        if run_app is not None and _run_store_is_durable(active):
-            from himmy.application.dispatcher import RunDispatcher
-
-            # dx: let an operator size the dispatcher to its hardware/provider quota via
-            # env, defaulting to the current pinned values (concurrency 8, the service's
-            # constructed run timeout, and its enqueue retry ceiling).
-            concurrency, run_timeout_seconds, max_attempts = _dispatch_env_overrides(
-                default_concurrency=8,
-                default_timeout_seconds=run_app.run_timeout_seconds,
-                default_max_attempts=run_app.default_max_attempts,
-            )
-            dispatcher = RunDispatcher(run_app, max_concurrency=concurrency)
-            run_app.enable_dispatch(
-                max_attempts=max_attempts,
-                run_timeout_seconds=run_timeout_seconds,
-            )
-        if run_app is not None:
-            try:
-                swept = await run_app.sweep_stuck_runs()
-                if swept:
-                    logger.info(
-                        "recovered %d stuck run(s) on startup "
-                        "(re-queued under dispatch, else failed)",
-                        len(swept),
-                    )
-            except Exception:  # pragma: no cover - startup sweep is best-effort
-                logger.warning("startup run sweep failed", exc_info=True)
-            # Re-drive HITL resumes left at RESOLVING by a crash (exactly-once via the
-            # member checkpoint claim + ledger). Done AFTER the sweep, which never reaps a
-            # RESOLVING run.
-            try:
-                redriven = await run_app.reconcile_resolving_runs()
-                if redriven:
-                    logger.info(
-                        "re-drove %d crashed HITL resume(s) on startup", len(redriven)
-                    )
-            except Exception:  # pragma: no cover - startup reconcile is best-effort
-                logger.warning("startup resume reconcile failed", exc_info=True)
-            # Launch the dispatcher's claim + reaper loops now that recovery has run.
-            if dispatcher is not None:
-                try:
-                    dispatcher.start()
-                    logger.info(
-                        "leased run dispatcher started (owner=%s)", dispatcher.owner_id
-                    )
-                except Exception:  # pragma: no cover - dispatcher start is best-effort
-                    logger.warning("run dispatcher failed to start", exc_info=True)
-                    dispatcher = None
-            # Start the durable trigger-dedup GC loop (gated on a durable backend, same as
-            # the dispatcher): ``storage.dedup_sweep`` has no other caller, so without this
-            # the dedup ledger grows one permanent row per delivery id forever on a busy
-            # webhook/Slack/Discord deployment.
-            storage = getattr(active, "storage", None)
-            if storage is not None and _run_store_is_durable(active):
-                try:
-                    dedup_sweep_stop = asyncio.Event()
-                    dedup_sweep_task = asyncio.create_task(
-                        _dedup_sweep_loop(
-                            storage,
-                            interval=_DEDUP_SWEEP_INTERVAL_SECONDS,
-                            stop=dedup_sweep_stop,
-                        ),
-                        name="himmy-dedup-sweep",
-                    )
-                    logger.info("durable dedup-ledger sweep loop started")
-                except Exception:  # pragma: no cover - sweep start is best-effort
-                    logger.warning("dedup sweep loop failed to start", exc_info=True)
-                    dedup_sweep_task = None
-                    dedup_sweep_stop = None
-        # Materialize Studio "connection" non-secret fields (SMTP host, search
-        # backend, …) from the writable secrets backend into the process env so
-        # tool config picks them up without a restart.
-        try:
-            from himmy.api.studio_connections import apply_connections_to_env
-
-            apply_connections_to_env()
-        except Exception:  # pragma: no cover - connections are best-effort
-            logger.warning("applying studio connections to env failed", exc_info=True)
+        # Startup: bring up the durable run substrate (publish store, enable dispatch
+        # BEFORE the recovery sweep, sweep + HITL reconcile, start dispatcher AFTER
+        # recovery, start the dedup-ledger GC loop). This is the EXACT same sequence the
+        # standalone ``himmy worker`` runs — both call the shared bootstrap so the wiring
+        # never drifts. ``set_server_storage`` is called inside; ``install_providers=False``
+        # because create_app's body already installed providers that read
+        # ``app.state.container`` dynamically (so the durable rebind above is reflected) —
+        # re-installing fixed-container lambdas would shadow that.
+        substrate = await start_run_substrate(active, install_providers=False)
         try:
             yield
         finally:
-            # Shutdown: stop the dispatcher (drains in-flight claimed runs) THEN drain any
-            # inline background tasks, then release container resources (e.g. a Postgres pool).
-            if dispatcher is not None:
-                try:
-                    await dispatcher.stop()
-                except Exception:  # pragma: no cover - shutdown best-effort
-                    logger.warning("run dispatcher stop failed", exc_info=True)
-            # Stop the dedup-ledger sweep loop before the store closes under it.
-            if dedup_sweep_task is not None:
-                if dedup_sweep_stop is not None:
-                    dedup_sweep_stop.set()
-                dedup_sweep_task.cancel()
-                try:
-                    await dedup_sweep_task
-                except (asyncio.CancelledError, Exception):  # pragma: no cover
-                    pass
-            if run_app is not None:
-                try:
-                    await run_app.drain()
-                except Exception:  # pragma: no cover - shutdown best-effort
-                    logger.warning("run drain failed on shutdown", exc_info=True)
-            try:
-                await active.aclose()
-            except Exception:  # pragma: no cover - shutdown best-effort
-                pass
-            # Also close the original container if we swapped it out (for a durable
-            # store OR a durable-spine rebind) so its construction-time spine/store
-            # handle is released.
-            if (built_durable or rebuilt_for_spine) and active is not container:
-                try:
-                    await container.aclose()
-                except Exception:  # pragma: no cover - shutdown best-effort
-                    pass
-            # Clear the canonical-storage provider so a later in-process CLI/test run
-            # does not mirror into this (now-closed) container's store.
-            try:
-                from himmy.api.studio_canonical import set_canonical_storage_provider
-
-                set_canonical_storage_provider(None)
-            except Exception:  # pragma: no cover - shutdown best-effort
-                pass
-            # Clear the routine container provider for the same reason.
-            try:
-                from himmy.api.routines import set_routine_container_provider
-
-                set_routine_container_provider(None)
-            except Exception:  # pragma: no cover - shutdown best-effort
-                pass
-            # Tear down the shared aux-store background loop (K2) so a later in-process
-            # run does not inherit a loop bound to this (now-closed) deployment's pool.
-            try:
-                from himmy.services.storage.aux_store_factory import (
-                    reset_aux_store_factory,
-                )
-
-                reset_aux_store_factory()
-            except Exception:  # pragma: no cover - shutdown best-effort
-                pass
-            # Clear the published server storage (K1) so a later in-process CLI/test run
-            # does not route through this (now-closed) container's store. Done before the
-            # context flag is reset so no window leaves the flag set with stale storage.
-            try:
-                reset_server_storage()
-            except Exception:  # pragma: no cover - shutdown best-effort
-                pass
+            # Shutdown: tear the substrate down in reverse (stop dispatcher → drain inline
+            # → close container → clear providers/aux loop). The lifespan owns the
+            # server-context token, so it clears that itself below AFTER the substrate
+            # teardown (no window leaves the flag set with stale storage). The original
+            # container is closed too when it was swapped for a durable store / spine.
+            await stop_run_substrate(
+                substrate,
+                original_container=(
+                    container if (built_durable or rebuilt_for_spine) else None
+                ),
+                clear_providers=True,
+            )
             # Clear the server-context flag so a subsequent in-process CLI/test run
-            # reverts to the in-memory one-shot default.
+            # reverts to the in-memory one-shot default. (The substrate already cleared
+            # the published server storage before this.)
             try:
                 reset_server_context(server_ctx_token)
             except Exception:  # pragma: no cover - shutdown best-effort

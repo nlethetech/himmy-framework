@@ -729,6 +729,7 @@ async def stream_agent_run(
     steer_queue: Any | None = None,
     plan_mode: bool = False,
     canonical_storage: Any | None = None,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run an agent for one user turn, yielding GUI events.
 
@@ -959,7 +960,7 @@ async def stream_agent_run(
         )
     except Exception:  # noqa: BLE001 - persistence must never break the stream
         pass
-    await _record_canonical(canonical_storage, built)
+    await _record_canonical(canonical_storage, built, extra_metadata=extra_metadata)
 
     if interrupted:
         # An interrupted (cancelled) consumer must observe the cancellation, not
@@ -1056,7 +1057,12 @@ def _record_run(
     return run
 
 
-async def _record_canonical(canonical_storage: Any, built: Any | None) -> None:
+async def _record_canonical(
+    canonical_storage: Any,
+    built: Any | None,
+    *,
+    extra_metadata: dict[str, Any] | None = None,
+) -> None:
     """Mirror a Studio run into the ONE canonical RunRecord store (T2.2, main loop).
 
     Best-effort and idempotent: a persistence failure must never break the live
@@ -1065,13 +1071,24 @@ async def _record_canonical(canonical_storage: Any, built: Any | None) -> None:
     cache write already happened synchronously in the worker thread. No-op when no
     canonical store is wired (e.g. a unit test calling the streamer directly) or the
     studio.db write itself failed.
+
+    ``extra_metadata`` (when supplied) is shallow-merged into the canonical record's
+    ``metadata`` BEFORE the upsert — the bridge stamps ``{"actor": {"source": "routine",
+    "routine_id": ...}, "source": "routine"}`` here so a scheduled/run-now run is
+    attributable to its routine in ``GET /v1/runs`` + ``himmy runs`` + Studio, with the
+    same RUN_* lineage every canonical run carries.
     """
     if canonical_storage is None or built is None:
         return
     try:
         from himmy.api.studio_canonical import save_canonical_run, studio_run_to_record
 
-        await save_canonical_run(canonical_storage, studio_run_to_record(built))
+        record = studio_run_to_record(built)
+        if extra_metadata:
+            merged = dict(record.metadata or {})
+            merged.update(extra_metadata)
+            record = record.model_copy(update={"metadata": merged})
+        await save_canonical_run(canonical_storage, record)
     except Exception:  # noqa: BLE001 - canonical mirror must never break the stream
         logger.debug("canonical run mirror failed for %s", built.id, exc_info=True)
 

@@ -649,6 +649,16 @@ async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
     status = "ok"
     error: str | None = None
 
+    # Stamp the routine actor + lineage source onto the canonical run record so a
+    # scheduled / run-now run is attributable to its routine in GET /v1/runs +
+    # ``himmy runs`` + Studio (the durable-bridge contract). The agent_id seam carries
+    # the same actor through ``create_run``; this is its agent_path equivalent.
+    routine_metadata = {
+        "source": "routine",
+        "actor": {"source": "routine", "routine_id": routine.id},
+        "routine_id": routine.id,
+    }
+
     async def _drain() -> None:
         nonlocal output, status, error
         async for event in studio_service.stream_agent_run(
@@ -658,6 +668,7 @@ async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
             model=routine.model,
             agent_path=agent_path,
             canonical_storage=canonical,
+            extra_metadata=routine_metadata,
         ):
             kind = event.get("type")
             if kind == "message":

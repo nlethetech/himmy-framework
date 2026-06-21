@@ -420,6 +420,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.set_defaults(func=commands.cmd_serve)
 
+    p_worker = sub.add_parser(
+        "worker",
+        help="run the routine scheduler + durable run-queue dispatcher (no API server)",
+    )
+    p_worker.add_argument(
+        "--store",
+        help="path for the durable SQLite run store (sets HIMMY_STORE_PATH; "
+        "ignored when HIMMY_DATABASE_URL selects Postgres)",
+    )
+    p_worker.add_argument(
+        "--concurrency",
+        type=int,
+        help="max concurrent dispatched runs (sets HIMMY_DISPATCH_CONCURRENCY; default 8)",
+    )
+    p_worker.add_argument(
+        "--no-scheduler",
+        action="store_true",
+        help="queue worker only: drain enqueued runs, do NOT fire routines",
+    )
+    p_worker.add_argument(
+        "--scheduler-only",
+        action="store_true",
+        help="tick routines only: no run-queue dispatcher (another worker drains the queue)",
+    )
+    p_worker.set_defaults(func=commands.cmd_worker)
+
     p_studio = sub.add_parser(
         "studio", help="serve Himmy Studio, the local web GUI (needs studio extra)"
     )

@@ -457,13 +457,14 @@ def test_durable_lifespan_invokes_dedup_sweep(
     """
     import time as _time
 
-    import himmy.api.app as app_mod
+    import himmy.api.runtime_bootstrap as bootstrap_mod
     from himmy.services.storage.sqlite import SqliteStorageService
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
     monkeypatch.setenv("HIMMY_DURABLE_STORAGE", "1")
-    monkeypatch.setattr(app_mod, "_DEDUP_SWEEP_INTERVAL_SECONDS", 0.02)
+    # The lifespan drives the shared bootstrap, so patch the LIVE interval there.
+    monkeypatch.setattr(bootstrap_mod, "DEDUP_SWEEP_INTERVAL_SECONDS", 0.02)
 
     calls = {"n": 0}
     real_sweep = SqliteStorageService.dedup_sweep
@@ -489,20 +490,21 @@ def test_in_memory_default_does_not_start_dedup_sweep(
     The in-memory dedup map is bounded + vanishes on exit, so there is nothing to GC; the
     loop is durable-gated exactly like the dispatcher, leaving the offline path unchanged.
     """
-    import himmy.api.app as app_mod
+    import himmy.api.runtime_bootstrap as bootstrap_mod
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
     monkeypatch.delenv("HIMMY_DURABLE_STORAGE", raising=False)
 
     started = {"n": 0}
-    real_loop = app_mod._dedup_sweep_loop
+    real_loop = bootstrap_mod._dedup_sweep_loop
 
     async def _spy_loop(*args: Any, **kwargs: Any) -> None:
         started["n"] += 1
         return await real_loop(*args, **kwargs)
 
-    monkeypatch.setattr(app_mod, "_dedup_sweep_loop", _spy_loop)
+    # The lifespan drives the shared bootstrap, so spy on the LIVE loop there.
+    monkeypatch.setattr(bootstrap_mod, "_dedup_sweep_loop", _spy_loop)
 
     with TestClient(create_app()) as client:
         assert client.app.state.container.run_app.dispatch_enabled is False

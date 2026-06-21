@@ -1383,6 +1383,174 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------- worker
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    """Run the durable run-queue dispatcher + routine scheduler with NO API server.
+
+    The routines layer + the leased run dispatcher are normally only started inside the
+    FastAPI server (the dispatcher in the app lifespan, the scheduler via a Studio-router
+    startup event). A CLI / desktop user with no server therefore gets NEITHER — routines
+    silently never fire offline and queued runs never drain. ``himmy worker`` closes that
+    gap: in ONE process it constructs the SAME durable container the lifespan builds,
+    publishes the store process-wide, enables dispatch, starts the :class:`RunDispatcher`
+    (the queue consumer), and starts the :class:`RoutineScheduler` — then blocks until
+    SIGINT/SIGTERM and shuts everything down gracefully (scheduler stop → dispatcher drain).
+
+    Modes:
+      * default — scheduler + queue worker (the desktop "everything offline" mode);
+      * ``--no-scheduler`` — queue worker only (drain runs others enqueue, fire nothing);
+      * ``--scheduler-only`` — scheduler only (no dispatcher; useful when a SEPARATE pool of
+        workers drains the queue and this node just ticks routines).
+
+    A durable run store is REQUIRED for the dispatcher (the queue's whole value is surviving
+    a restart). ``--store`` sets ``HIMMY_STORE_PATH`` for the file-backed SQLite default;
+    ``HIMMY_DATABASE_URL`` selects Postgres (and is what makes cross-node single-fire safe —
+    see the runbook). ``--concurrency`` maps to ``HIMMY_DISPATCH_CONCURRENCY``.
+    """
+    import logging
+
+    if args.store:
+        os.environ["HIMMY_STORE_PATH"] = str(args.store)
+    if args.concurrency is not None:
+        os.environ["HIMMY_DISPATCH_CONCURRENCY"] = str(args.concurrency)
+    # The dispatcher needs a durable run store; opt it in unless a Postgres DSN already does.
+    os.environ.setdefault("HIMMY_DURABLE_STORAGE", "1")
+
+    run_scheduler = not args.no_scheduler
+    run_dispatcher = not args.scheduler_only
+    if args.no_scheduler and args.scheduler_only:
+        _eprint("error: --no-scheduler and --scheduler-only are mutually exclusive")
+        return 1
+
+    # Surface the worker's lifecycle log lines on stderr (the CLI default is quiet).
+    logging.basicConfig(
+        level=os.environ.get("HIMMY_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    try:
+        asyncio.run(_run_worker(run_scheduler=run_scheduler, run_dispatcher=run_dispatcher))
+    except KeyboardInterrupt:  # pragma: no cover - interactive Ctrl-C before signal wiring
+        _eprint("worker interrupted")
+        return 130
+    return 0
+
+
+async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
+    """Async body of ``himmy worker``: bring up the substrate, block, tear down.
+
+    Reuses the SHARED bootstrap (:mod:`himmy.api.runtime_bootstrap`) so the worker's run
+    substrate is byte-identical to the FastAPI lifespan's — the dispatcher is gated on a
+    durable store there, so a no-dispatcher fallback (in-memory) is honest about itself.
+    The scheduler is the one piece the lifespan does NOT own (a Studio router event handler
+    does), so the worker starts/stops it explicitly, gated on the same
+    ``HIMMY_ROUTINES_SCHEDULER`` env as the router for parity.
+    """
+    import asyncio as _asyncio
+    import logging
+    import signal
+
+    from himmy.api.routines import get_routines_store, get_scheduler
+    from himmy.api.runtime_bootstrap import (
+        build_durable_container,
+        start_run_substrate,
+        stop_run_substrate,
+    )
+    from himmy.services.storage.factory import (
+        reset_server_context,
+        set_server_context,
+    )
+
+    log = logging.getLogger("himmy.worker")
+
+    scheduler_enabled = os.environ.get(
+        "HIMMY_ROUTINES_SCHEDULER", "on"
+    ).lower() not in ("off", "0", "false", "no")
+
+    # 1) server context FIRST so the container's spine + any in-process agent resolve the
+    #    durable backend (the bootstrap relies on this being set before it builds).
+    server_token = set_server_context(True)
+    substrate = None
+    scheduler = None
+    try:
+        # 2) build the durable container (Postgres / file-backed SQLite) + bring up the run
+        #    substrate (publish store, enable dispatch BEFORE the sweep, sweep + reconcile,
+        #    start dispatcher AFTER recovery, start dedup GC, install both providers).
+        container, built_durable = await build_durable_container()
+        substrate = await start_run_substrate(container, install_providers=True)
+
+        backend = substrate.backend
+        if run_dispatcher and not substrate.dispatch_on:
+            log.warning(
+                "queue dispatcher NOT engaged: run store is %r (not durable). "
+                "Set HIMMY_DATABASE_URL or HIMMY_DURABLE_STORAGE=1 for a durable queue.",
+                backend,
+            )
+        elif not run_dispatcher and substrate.dispatcher is not None:
+            # scheduler-only mode: stop the dispatcher the bootstrap started (the bootstrap
+            # always starts it when the store is durable; this mode wants it off).
+            await substrate.dispatcher.stop()
+            substrate.dispatcher = None
+            substrate.dispatch_on = False
+            log.info("scheduler-only mode: leased dispatcher stopped")
+
+        # 3) the routine scheduler (the lifespan does not own this — a router event does).
+        n_routines = 0
+        if run_scheduler and scheduler_enabled:
+            try:
+                n_routines = len(get_routines_store().list())
+            except Exception:  # noqa: BLE001 - a store read failure is non-fatal here
+                n_routines = -1
+            scheduler = get_scheduler()
+            scheduler.start()
+        elif run_scheduler and not scheduler_enabled:
+            log.info("routine scheduler disabled via HIMMY_ROUTINES_SCHEDULER")
+
+        # 4) startup banner: what store, dispatch on, N routines.
+        log.info(
+            "himmy worker up: store=%s dispatch=%s scheduler=%s routines=%s "
+            "(owner=%s)",
+            backend,
+            "on" if substrate.dispatch_on else "off",
+            "on" if (scheduler is not None) else "off",
+            (n_routines if n_routines >= 0 else "?"),
+            (substrate.dispatcher.owner_id if substrate.dispatcher else "-"),
+        )
+
+        # 5) block until a stop signal arrives, then fall through to graceful shutdown.
+        stop = _asyncio.Event()
+        loop = _asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, RuntimeError):  # pragma: no cover - non-POSIX
+                pass
+        await stop.wait()
+        log.info("himmy worker stopping (signal received)")
+    finally:
+        # Graceful shutdown: scheduler FIRST (stop firing new routine runs), then the run
+        # substrate (drain in-flight dispatcher workers + inline tasks, close the container,
+        # clear providers), then the server-context flag.
+        if scheduler is not None:
+            try:
+                await scheduler.stop()
+            except Exception:  # noqa: BLE001 - shutdown best-effort
+                log.warning("routine scheduler stop failed", exc_info=True)
+        if substrate is not None:
+            try:
+                await stop_run_substrate(substrate, clear_providers=True)
+            except Exception:  # noqa: BLE001 - shutdown best-effort
+                log.warning("run substrate stop failed", exc_info=True)
+        try:
+            reset_server_context(server_token)
+        except Exception:  # noqa: BLE001 - shutdown best-effort
+            pass
+        log.info("himmy worker stopped")
+
+
 # ---------------------------------------------------------------------- studio
 
 
