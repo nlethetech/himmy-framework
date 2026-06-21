@@ -165,6 +165,12 @@ class StorageService:
         """Atomically create a run unless its idempotency key already exists."""
         return await self._run_store.save_run_if_absent_by_idempotency(run)
 
+    async def save_run_if_under_quota(
+        self, run: RunRecord, *, cap: int
+    ) -> tuple[RunRecord, bool]:
+        """Atomically create a run IFF the tenant is under its outstanding-run cap (T3)."""
+        return await self._run_store.save_run_if_under_quota(run, cap=cap)
+
     async def claim_run_for_resume(
         self, run_id: str, *, workspace_id: str
     ) -> bool:
@@ -180,10 +186,22 @@ class StorageService:
         *,
         lanes: list[str] | None = None,
         now: str | None = None,
+        fairness: bool = False,
+        workspace_concurrency: int = 0,
     ) -> RunRecord | None:
-        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (Q2; or None)."""
+        """Atomically claim the next ready QUEUED run for ``owner_id`` (Q2; or None).
+
+        ``fairness`` / ``workspace_concurrency`` (T3) opt into per-tenant fair interleaving
+        (least-loaded workspace first) and a cross-node per-tenant concurrency cap; both
+        default OFF so the single-tenant path is byte-identical global FIFO.
+        """
         return await self._run_store.claim_next_queued_run(
-            owner_id, lease_seconds, lanes=lanes, now=now
+            owner_id,
+            lease_seconds,
+            lanes=lanes,
+            now=now,
+            fairness=fairness,
+            workspace_concurrency=workspace_concurrency,
         )
 
     async def renew_lease(
@@ -267,6 +285,10 @@ class StorageService:
     ) -> list[RunRecord]:
         """List runs filtered by workspace, subject, and/or status."""
         return await self._run_store.list_runs(workspace_id, subject_id, status)
+
+    async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
+        """Count a workspace's non-terminal (in-flight) runs (T3 cross-node quota)."""
+        return await self._run_store.count_active_runs_for_workspace(workspace_id)
 
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -51,6 +52,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context 
     from himmy.services.context.models import ContextField, ContextSnapshot
     from himmy.services.evaluation.models import EvaluationRun
     from himmy.services.storage.trigger_dedup import DedupClaim
+
+logger = logging.getLogger("himmy.services.storage.sqlite")
 
 #: Idempotent schema for the full storage surface. Each concern table stores the full
 #: record JSON in ``payload`` plus the indexed filter columns the list queries need —
@@ -954,6 +957,91 @@ class SqliteStorageService:
                 self._rollback_quietly()
                 raise
 
+    async def save_run_if_under_quota(
+        self, run: RunRecord, *, cap: int
+    ) -> tuple[RunRecord, bool]:
+        """Atomically create ``run`` IFF the tenant is under its outstanding-run cap (T3, HARD).
+
+        Fuses the idempotency check, the active-run COUNT, and the INSERT into ONE
+        ``BEGIN IMMEDIATE`` transaction under :attr:`_lock`: SQLite is single-writer, so the
+        write lock is taken UP FRONT (before the count), serialising concurrent
+        same-workspace creates even across processes sharing the file — the loser re-counts
+        after the winner's row is committed and sees the true count. The result is EXACTLY
+        ``cap`` admits, never the unlocked count-then-insert overshoot.
+
+        Returns ``(run, admitted)``. ``admitted=False`` ⇒ at/over ``cap``, nothing inserted.
+        An idempotent re-submit returns the prior run with ``admitted=True`` and does NOT
+        consume a slot. ``cap <= 0`` admits unconditionally.
+
+        FAIL-OPEN on an infrastructure error: a DB failure during the locked count-then-create
+        falls back to the plain race-safe idempotent insert and reports ``admitted=True`` so an
+        infra hiccup never turns a quota guard into a hard outage; only a clean over-cap is a
+        fail-CLOSED reject.
+        """
+        run.updated_at = utc_now_iso()
+        if cap <= 0:
+            return await self._save_run_if_absent_sync_async(run)
+        try:
+            return await asyncio.to_thread(
+                self._save_run_if_under_quota_sync, run, cap
+            )
+        except Exception:  # noqa: BLE001 - fail OPEN on infra error (not over-cap)
+            logger.warning(
+                "atomic run-quota create failed for workspace %s; admitting",
+                run.workspace_id,
+            )
+            return await self._save_run_if_absent_sync_async(run)
+
+    async def _save_run_if_absent_sync_async(
+        self, run: RunRecord
+    ) -> tuple[RunRecord, bool]:
+        """Async wrapper around the plain idempotent insert (the fail-open fallback)."""
+        return await asyncio.to_thread(self._save_run_if_absent_sync, run)
+
+    def _save_run_if_under_quota_sync(
+        self, run: RunRecord, cap: int
+    ) -> tuple[RunRecord, bool]:
+        """The locked idempotency-check + active-COUNT + insert for the run quota.
+
+        One ``BEGIN IMMEDIATE`` (write lock taken before any read) so the count and the insert
+        are atomic across processes sharing the file. Counts BEFORE the insert ⇒ rejects at/over
+        the cap so a cap of N admits exactly N concurrent in-flight runs. Rolls back on failure
+        so a lost race cannot leave the transaction open.
+        """
+        from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+        statuses = [s.value for s in ACTIVE_RUN_STATUSES]
+        placeholders = ",".join("?" for _ in statuses)
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if run.idempotency_key is not None:
+                    existing = self._conn.execute(
+                        "SELECT payload FROM runs WHERE workspace_id = ? AND "
+                        "idempotency_key = ?",
+                        (run.workspace_id, run.idempotency_key),
+                    ).fetchone()
+                    if existing is not None:
+                        # Re-submit returns the prior run WITHOUT consuming a slot.
+                        self._conn.commit()
+                        return self._row_to_run(existing), True
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM runs "  # noqa: S608
+                    f"WHERE workspace_id = ? AND status IN ({placeholders})",
+                    (run.workspace_id, *statuses),
+                ).fetchone()
+                current = int(row["n"]) if row is not None else 0
+                if current >= cap:
+                    self._conn.commit()  # nothing inserted; release the write lock
+                    return run, False
+                sql, params = self._run_upsert(run)
+                self._conn.execute(sql, params)
+                self._conn.commit()
+                return run, True
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
     async def claim_run_for_resume(
         self, run_id: str, *, workspace_id: str
     ) -> bool:
@@ -1011,11 +1099,13 @@ class SqliteStorageService:
         *,
         lanes: list[str] | None = None,
         now: str | None = None,
+        fairness: bool = False,
+        workspace_concurrency: int = 0,
     ) -> RunRecord | None:
-        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (or None).
+        """Atomically claim the next ready QUEUED run for ``owner_id`` (or None).
 
         The structural twin of :meth:`claim_run_for_resume`: a ``BEGIN IMMEDIATE`` (write lock
-        up front) selects the OLDEST ready row — ``status=QUEUED`` and ``next_attempt_at <=
+        up front) selects a ready row — ``status=QUEUED`` and ``next_attempt_at <=
         now`` — by its ``rowid`` (a sub-SELECT, NOT ``UPDATE … LIMIT`` so we do not depend on
         the optional ``SQLITE_ENABLE_UPDATE_DELETE_LIMIT`` compile flag), flips it to
         ``RUNNING``, stamps ``owner_id``/``lease_expires_at``/``heartbeat_at`` and increments
@@ -1027,9 +1117,21 @@ class SqliteStorageService:
         keying): a dispatcher whose LOCAL-model probe is failing passes only the cloud/default
         lanes, so a stalled local probe never blocks claiming cloud runs. ``None`` claims any
         lane.
+
+        T3-fairness (opt-in via ``fairness=True``): the ready row is chosen from the workspace
+        with the FEWEST live-leased RUNNING runs first (least-loaded round-robin), and when
+        ``workspace_concurrency > 0`` a workspace already at that cap is excluded so its backlog
+        waits — a per-tenant fairness + concurrency cap so one tenant cannot starve others.
+        Both default OFF (single-tenant path is byte-identical FIFO).
         """
         return await asyncio.to_thread(
-            self._claim_next_queued_run_sync, owner_id, lease_seconds, lanes, now
+            self._claim_next_queued_run_sync,
+            owner_id,
+            lease_seconds,
+            lanes,
+            now,
+            fairness,
+            workspace_concurrency,
         )
 
     def _claim_next_queued_run_sync(
@@ -1038,8 +1140,10 @@ class SqliteStorageService:
         lease_seconds: float,
         lanes: list[str] | None,
         now: str | None,
+        fairness: bool = False,
+        workspace_concurrency: int = 0,
     ) -> RunRecord | None:
-        """The locked select-oldest-then-CAS claim for the leased queue."""
+        """The locked select-then-CAS claim for the leased queue."""
         now_iso = now or utc_now_iso()
         lease_until = _iso_plus_seconds(now_iso, lease_seconds)
         lane_clause = ""
@@ -1054,15 +1158,24 @@ class SqliteStorageService:
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                # Oldest ready row by rowid (created_at order ~ insertion order); rowid is the
-                # stable tiebreak. The sub-SELECT avoids the UPDATE…LIMIT compile dependency.
-                target = self._conn.execute(
-                    "SELECT rowid, payload, attempt FROM runs "  # noqa: S608
-                    "WHERE status = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
-                    f"{lane_clause} "
-                    "ORDER BY next_attempt_at ASC, rowid ASC LIMIT 1",
-                    (RunStatus.QUEUED.value, now_iso, *lane_params),
-                ).fetchone()
+                if fairness:
+                    target = self._select_fair_target_locked(
+                        now_iso,
+                        lane_clause=lane_clause,
+                        lane_params=lane_params,
+                        workspace_concurrency=workspace_concurrency,
+                    )
+                else:
+                    # Oldest ready row by rowid (created_at order ~ insertion order); rowid is
+                    # the stable tiebreak. The sub-SELECT avoids the UPDATE…LIMIT compile dep.
+                    target = self._conn.execute(
+                        "SELECT rowid, payload, attempt FROM runs "  # noqa: S608
+                        "WHERE status = ? "
+                        "AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+                        f"{lane_clause} "
+                        "ORDER BY next_attempt_at ASC, rowid ASC LIMIT 1",
+                        (RunStatus.QUEUED.value, now_iso, *lane_params),
+                    ).fetchone()
                 if target is None:
                     self._conn.commit()
                     return None
@@ -1099,6 +1212,51 @@ class SqliteStorageService:
             except BaseException:
                 self._rollback_quietly()
                 raise
+
+    def _select_fair_target_locked(
+        self,
+        now_iso: str,
+        *,
+        lane_clause: str,
+        lane_params: tuple[Any, ...],
+        workspace_concurrency: int,
+    ) -> Any:
+        """Pick the ready row from the least-loaded workspace, under the per-tenant cap (T3).
+
+        Mirrors the Postgres fair claim: a per-workspace LEFT JOIN on the live-leased RUNNING
+        count orders candidates least-loaded-first (round-robin fairness), and a positive
+        ``workspace_concurrency`` excludes a workspace already at that many live runs (the
+        cross-node per-tenant concurrency cap). Returns a ``(rowid, payload, attempt)`` row or
+        ``None``. Caller already holds the write lock (``BEGIN IMMEDIATE``).
+        """
+        cap_clause = ""
+        cap_params: tuple[Any, ...] = ()
+        if workspace_concurrency > 0:
+            cap_clause = " AND COALESCE(load.running, 0) < ?"
+            cap_params = (int(workspace_concurrency),)
+        return self._conn.execute(
+            "SELECT r.rowid AS rowid, r.payload AS payload, r.attempt AS attempt "  # noqa: S608
+            "FROM runs r "
+            "LEFT JOIN ("
+            "  SELECT workspace_id, COUNT(*) AS running FROM runs "
+            "  WHERE status = ? "
+            "    AND (lease_expires_at IS NULL OR lease_expires_at > ?) "
+            "  GROUP BY workspace_id"
+            ") load ON load.workspace_id = r.workspace_id "
+            "WHERE r.status = ? "
+            "AND (r.next_attempt_at IS NULL OR r.next_attempt_at <= ?)"
+            f"{lane_clause}{cap_clause} "
+            "ORDER BY COALESCE(load.running, 0) ASC, "
+            "r.next_attempt_at ASC, r.rowid ASC LIMIT 1",
+            (
+                RunStatus.RUNNING.value,
+                now_iso,
+                RunStatus.QUEUED.value,
+                now_iso,
+                *lane_params,
+                *cap_params,
+            ),
+        ).fetchone()
 
     async def renew_lease(
         self,
@@ -1519,6 +1677,25 @@ class SqliteStorageService:
             tuple(params),
         )
         return [self._row_to_run(r) for r in rows]
+
+    async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
+        """Count a workspace's non-terminal (in-flight) runs (T3 cross-node quota).
+
+        QUEUED/RUNNING/AWAITING_APPROVAL/RESOLVING occupy the tenant's outstanding budget;
+        terminal SUCCEEDED/FAILED/PARKED do not. Counted from the shared DB so the per-tenant
+        enqueue cap holds across worker processes (an in-RAM counter cannot).
+        """
+        from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+        statuses = [s.value for s in ACTIVE_RUN_STATUSES]
+        placeholders = ",".join("?" for _ in statuses)
+        row = await asyncio.to_thread(
+            self._fetchone,
+            "SELECT COUNT(*) AS n FROM runs "  # noqa: S608
+            f"WHERE workspace_id = ? AND status IN ({placeholders})",
+            (workspace_id, *statuses),
+        )
+        return int(row["n"]) if row is not None else 0
 
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str

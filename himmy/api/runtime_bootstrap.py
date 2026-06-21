@@ -138,6 +138,21 @@ def dispatch_env_overrides(
     )
 
 
+def dispatch_fairness_enabled(*, default: bool) -> bool:
+    """Resolve per-tenant fair-queue dispatch from ``HIMMY_DISPATCH_FAIRNESS`` (T3).
+
+    Fairness (least-loaded-workspace claim + the cross-node per-tenant concurrency cap) is the
+    multi-tenant protection: a tenant flooding the queue cannot starve others or exceed its
+    concurrency cap across worker processes. It defaults ON for the multi-node Postgres backend
+    (where many workers share one queue) and OFF otherwise; the env forces it either way. An
+    unset/blank value keeps the passed default, so a single-tenant box is unaffected.
+    """
+    raw = os.environ.get("HIMMY_DISPATCH_FAIRNESS")
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 async def _dedup_sweep_loop(
     storage: Any,
     *,
@@ -264,11 +279,16 @@ async def start_run_substrate(
             default_max_attempts=run_app.default_max_attempts,
         )
         dispatcher = RunDispatcher(run_app, max_concurrency=concurrency)
+        # T3 per-tenant fairness defaults ON for the multi-node Postgres backend (many workers
+        # share one queue, so fair interleaving + the cross-node per-tenant cap matter there)
+        # and OFF for the single-box sqlite/memory path; HIMMY_DISPATCH_FAIRNESS forces either.
+        fairness = dispatch_fairness_enabled(default=backend == "postgres")
         # Enable dispatch BEFORE the sweep so the sweep re-queues lease-expired runs
         # instead of mass-failing them.
         run_app.enable_dispatch(
             max_attempts=max_attempts,
             run_timeout_seconds=run_timeout_seconds,
+            fairness=fairness,
         )
 
     if run_app is not None:

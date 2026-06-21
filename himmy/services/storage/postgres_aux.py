@@ -95,21 +95,33 @@ class _AuxPgPool:
         The aux store's async bodies run ON the shared aux loop, so pool resolution must
         ``await`` — NEVER block on a nested :meth:`_LoopThread.run`. A nested ``run`` would
         submit a coroutine to the very loop whose only thread is already parked in
-        ``Future.result()``, deadlocking it (the K3 owned-pool path: a DSN-backed store with
-        no server-published pool, e.g. tests or any non-server embedding). The server path
-        publishes a shared pool, so :func:`aux_pool` short-circuits before we get here.
-        """
-        from himmy.services.storage.aux_store_factory import aux_pool
+        ``Future.result()``, deadlocking it.
 
-        published = aux_pool()
-        if published is not None:
-            return published
+        LOOP AFFINITY (the cross-loop fix): an asyncpg pool is bound to the event loop it was
+        created on, and a connection from it can only be acquired/used on THAT loop. The K1
+        lifespan's server pool is created on the process MAIN loop, but every aux store drives
+        its work on the dedicated aux loop — so reusing the server pool here raised
+        ``RuntimeError: ... attached to a different loop`` on EVERY aux Postgres operation
+        (the routine scheduler's tick/catch-up/sleep-planning all failed silently → no
+        routine ever fired on Postgres). The correct, loop-safe choice is to open the aux
+        store's OWN pool ON the aux loop, from the configured DSN. This is one extra small
+        pool per process (min 1 / max 5), bound to the right loop — not the N-pools smell the
+        K2 reuse was avoiding, since all aux stores still share this single aux-loop pool path.
+        """
         if self._owned_pool is not None:
             return self._owned_pool
+        # No explicit DSN (the get_*_store singletons construct with dsn=None and historically
+        # leaned on the published pool): fall back to the process DSN so we can open an
+        # aux-loop-bound pool. Resolved lazily here (on the aux loop) so the offline/no-DSN
+        # path never reaches this branch.
+        if not self._dsn:
+            from himmy.config.secrets import get_secret
+
+            self._dsn = (get_secret("HIMMY_DATABASE_URL") or "").strip() or None
         if not self._dsn:
             raise HimmyError(
-                "an aux Postgres store needs either the server's published pool "
-                "or a DSN to open its own; neither is available."
+                "an aux Postgres store needs a DSN (HIMMY_DATABASE_URL) to open its "
+                "aux-loop pool; none is available."
             )
         # Lazily bind the lock to the running (aux) loop; the check-then-set has no await,
         # so it is atomic on the single-threaded loop.
@@ -118,6 +130,14 @@ class _AuxPgPool:
         async with self._create_lock:
             if self._owned_pool is None:
                 self._owned_pool = await self._create_owned_pool(self._dsn)
+                # Register for orderly close on the aux loop at reset/shutdown — the pool is
+                # bound to this loop, so it MUST be closed on it (a main-loop close would
+                # hit the same loop-affinity error this fix exists to avoid).
+                from himmy.services.storage.aux_store_factory import (
+                    register_aux_owned_pool,
+                )
+
+                register_aux_owned_pool(self._owned_pool)
         return self._owned_pool
 
     async def _create_owned_pool(self, dsn: str) -> Any:
@@ -191,6 +211,36 @@ def _new_aux_pool(dsn: str | None = None) -> _AuxPgPool:
     from himmy.services.storage.aux_store_factory import aux_loop
 
     return _AuxPgPool(aux_loop(), dsn)
+
+
+#: Fixed first key of the two-int advisory-lock namespace for the per-WORKSPACE routine-count
+#: quota (T3). A transaction-scoped ``pg_advisory_xact_lock(NS, ws_hash)`` serialises the
+#: count-then-create for ONE workspace across processes (different workspaces use different
+#: second keys and never contend), making the per-tenant routine cap a HARD cap rather than a
+#: racy unlocked count-then-upsert. DISTINCT from ``FAIR_CLAIM_ADVISORY_NAMESPACE`` (the runs
+#: budget) so routine-create and run-admit never cross-contend, and distinct from the
+#: migration/leader 1-int (int8) keys so neither family collides.
+ROUTINE_QUOTA_ADVISORY_NAMESPACE = 0x5251  # 'RQ'
+
+#: Statement timeout (ms) bounding the BLOCKING advisory-lock wait in the atomic quota create,
+#: so a pathologically stuck lock fails the statement (→ fail-OPEN admit) instead of hanging
+#: the aux pool forever. Generous enough that normal same-workspace contention drains first.
+_QUOTA_LOCK_STATEMENT_TIMEOUT_MS = 5000
+
+
+def _routine_quota_advisory_key(workspace_id: str) -> int:
+    """Derive the stable signed-32-bit second advisory key for a workspace (routine quota).
+
+    Mirrors :func:`himmy.services.storage.postgres._workspace_advisory_key` (sha256 of the
+    workspace id, first 4 bytes, recentered into signed int4) so the two-int
+    ``pg_advisory_xact_lock(int4, int4)`` form applies; the DISTINCT namespace constant keeps
+    it from colliding with the run-budget claim lock.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(workspace_id.encode("utf-8")).digest()[:4]
+    value = int.from_bytes(digest, "big", signed=False)
+    return value - (1 << 31)
 
 
 # ============================================================ K3: HITL checkpoint mirrors
@@ -1098,25 +1148,121 @@ class _AsyncRoutinesStore:
             return None
         return routine
 
+    async def count(self, workspace_id: str, enabled_only: bool) -> int:
+        """Count a workspace's routines (per-tenant routine quota, T3).
+
+        ``enabled_only`` restricts to ENABLED routines (the ones that actually fire), which is
+        what the per-tenant active-routine cap is enforced against. ``enabled`` lives inside
+        the JSON blob (the PG mirror stores the whole routine as ``data``), so it is read with
+        ``(data->>'enabled')::boolean`` — mirroring the SQLite store's ``enabled = 1`` filter.
+        """
+        async with self._pool.acquire() as conn:
+            if enabled_only:
+                n = await conn.fetchval(
+                    "SELECT COUNT(*) FROM aux_routines "
+                    "WHERE tenant = $1 AND workspace_id = $2 "
+                    "AND COALESCE((data->>'enabled')::boolean, true) IS TRUE",
+                    self._tenant,
+                    workspace_id,
+                )
+            else:
+                n = await conn.fetchval(
+                    "SELECT COUNT(*) FROM aux_routines "
+                    "WHERE tenant = $1 AND workspace_id = $2",
+                    self._tenant,
+                    workspace_id,
+                )
+        return int(n or 0)
+
+    async def _upsert_on_conn(self, conn: Any, routine: Any) -> None:
+        """Run the routine INSERT…ON CONFLICT on an explicit ``conn`` (no acquire).
+
+        Factored out so :meth:`upsert` (own connection) and
+        :meth:`create_routine_if_under_quota` (the advisory-locked transaction's connection)
+        write the BYTE-IDENTICAL row; the caller stamps ``updated_at`` first.
+        """
+        await conn.execute(
+            "INSERT INTO aux_routines "
+            "(tenant, id, workspace_id, data, last_run_at, agent_id, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+            "ON CONFLICT (tenant, id) DO UPDATE SET "
+            "workspace_id = EXCLUDED.workspace_id, data = EXCLUDED.data, "
+            "last_run_at = EXCLUDED.last_run_at, agent_id = EXCLUDED.agent_id",
+            self._tenant,
+            routine.id,
+            routine.workspace_id,
+            json.loads(routine.model_dump_json()),
+            routine.last_run_at,
+            routine.agent_id,
+            _norm_ts(routine.created_at),
+        )
+
     async def upsert(self, routine: Any) -> Any:
         routine.updated_at = utc_now_iso()
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO aux_routines "
-                "(tenant, id, workspace_id, data, last_run_at, agent_id, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7) "
-                "ON CONFLICT (tenant, id) DO UPDATE SET "
-                "workspace_id = EXCLUDED.workspace_id, data = EXCLUDED.data, "
-                "last_run_at = EXCLUDED.last_run_at, agent_id = EXCLUDED.agent_id",
-                self._tenant,
-                routine.id,
-                routine.workspace_id,
-                json.loads(routine.model_dump_json()),
-                routine.last_run_at,
-                routine.agent_id,
-                _norm_ts(routine.created_at),
-            )
+            await self._upsert_on_conn(conn, routine)
         return routine
+
+    async def create_routine_if_under_quota(
+        self, routine: Any, *, cap: int, enabled_only: bool = True
+    ) -> tuple[Any, bool]:
+        """Atomically create ``routine`` IFF the tenant is under its routine cap (T3, HARD).
+
+        Fuses the per-tenant COUNT and the INSERT into ONE transaction guarded by a
+        TRANSACTION-scoped per-workspace BLOCKING advisory lock
+        (``pg_advisory_xact_lock(ROUTINE_QUOTA_ADVISORY_NAMESPACE, ws_hash)``), so concurrent
+        creates for the SAME workspace SERIALISE across processes: a create cannot
+        skip-on-contention like the fair-CLAIM (that would be a spurious 429), so it BLOCKS,
+        and the loser then re-counts under the lock and sees the winner's committed row — the
+        result is EXACTLY ``cap`` admits with the rest a deterministic over-cap reject, never
+        the unlocked count-then-upsert overshoot. Different workspaces hash to different keys
+        and never block each other; the xact-scoped lock auto-releases on commit/rollback (no
+        leak, even on a crash). ``SET LOCAL statement_timeout`` bounds the lock wait so a
+        genuinely stuck lock fails the statement (→ fail-OPEN) instead of hanging the pool.
+
+        Returns ``(routine, admitted)``. ``admitted=False`` ⇒ at/over ``cap``, nothing
+        written. FAIL-OPEN on an infrastructure error (lock/count/db/timeout): fall back to
+        the plain :meth:`upsert` and report ``admitted=True`` so an infra hiccup never turns a
+        quota guard into a hard outage; only a clean over-cap is a fail-CLOSED reject.
+        """
+        if cap <= 0:  # defensive: an uncapped tenant is always admitted (plain upsert)
+            return await self.upsert(routine), True
+        routine.updated_at = utc_now_iso()
+        enabled_clause = (
+            " AND COALESCE((data->>'enabled')::boolean, true) IS TRUE"
+            if enabled_only
+            else ""
+        )
+        try:
+            async with self._pool.acquire() as conn, conn.transaction():
+                # Bound the BLOCKING lock wait so a stuck lock cannot hang the aux loop /
+                # exhaust the pool; a trip raises → caught below → fail-OPEN admit.
+                await conn.execute(
+                    f"SET LOCAL statement_timeout = {_QUOTA_LOCK_STATEMENT_TIMEOUT_MS}"
+                )
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1, $2)",
+                    ROUTINE_QUOTA_ADVISORY_NAMESPACE,
+                    _routine_quota_advisory_key(routine.workspace_id),
+                )
+                current = await conn.fetchval(
+                    "SELECT COUNT(*) FROM aux_routines "  # noqa: S608
+                    "WHERE tenant = $1 AND workspace_id = $2" + enabled_clause,
+                    self._tenant,
+                    routine.workspace_id,
+                )
+                if int(current or 0) >= cap:
+                    return routine, False  # over cap: commit (no insert), lock releases
+                await self._upsert_on_conn(conn, routine)
+                return routine, True
+        except Exception:  # noqa: BLE001 - fail OPEN on infra error (not over-cap)
+            import logging
+
+            logging.getLogger("himmy.services.storage.postgres_aux").warning(
+                "atomic routine-quota create failed for workspace %s; admitting",
+                routine.workspace_id,
+            )
+            return await self.upsert(routine), True
 
     async def delete(self, routine_id: str, workspace_id: str | None) -> bool:
         async with self._pool.acquire() as conn:
@@ -1290,8 +1436,28 @@ class PostgresRoutinesStore:
     def get(self, routine_id: str, *, workspace_id: str | None = None) -> Any | None:
         return self._pool.run(self._async.get(routine_id, workspace_id))  # type: ignore[no-any-return]
 
+    def count(self, *, workspace_id: str, enabled_only: bool = False) -> int:
+        """Count a workspace's routines (T3 per-tenant routine quota; PG mirror of SQLite)."""
+        return int(self._pool.run(self._async.count(workspace_id, enabled_only)))
+
     def upsert(self, routine: Any) -> Any:
         return self._pool.run(self._async.upsert(routine))
+
+    def create_routine_if_under_quota(
+        self, routine: Any, *, cap: int, enabled_only: bool = True
+    ) -> tuple[Any, bool]:
+        """Atomic per-tenant routine-quota create (PG mirror of the SQLite store).
+
+        Drives :meth:`_AsyncRoutinesStore.create_routine_if_under_quota` — one
+        advisory-locked transaction that fuses count+insert so concurrent same-workspace
+        creates serialise and land EXACTLY at ``cap`` across worker processes. Returns
+        ``(routine, admitted)``.
+        """
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.create_routine_if_under_quota(
+                routine, cap=cap, enabled_only=enabled_only
+            )
+        )
 
     def delete(self, routine_id: str, *, workspace_id: str | None = None) -> bool:
         return bool(self._pool.run(self._async.delete(routine_id, workspace_id)))

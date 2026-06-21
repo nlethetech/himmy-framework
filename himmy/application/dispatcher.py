@@ -248,7 +248,15 @@ class RunDispatcher:
             # Acquire a concurrency slot up front; release it if nothing was claimable.
             await self._sem.acquire()
             run = await self._run_app.storage.claim_next_queued_run(
-                self._owner_id, self._run_app.lease_seconds, lanes=lanes
+                self._owner_id,
+                self._run_app.lease_seconds,
+                lanes=lanes,
+                fairness=self._run_app.dispatch_fairness,
+                workspace_concurrency=(
+                    self._run_app.workspace_concurrency
+                    if self._run_app.dispatch_fairness
+                    else 0
+                ),
             )
             if run is None:
                 self._sem.release()

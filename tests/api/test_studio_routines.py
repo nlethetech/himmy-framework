@@ -457,6 +457,232 @@ def test_scheduler_env_off_disables_the_loop(workspace: Path) -> None:
         assert not svc.get_scheduler().active
 
 
+# ---- next_fire math (sleep-to-next-fire seam) -----------------------------------
+
+
+def test_next_fire_already_due_returns_now() -> None:
+    """A routine due at ``now`` returns ``now`` (fire on the next wake, no oversleep)."""
+    now = _at("2026-06-10T07:00:00+00:00")
+    r = _mk(schedule=svc.Schedule(kind="daily", at="07:00"))
+    assert svc.is_due(r, now)
+    assert svc.next_fire(r, now) == now
+
+
+def test_next_fire_daily_points_at_the_next_hhmm() -> None:
+    r = _mk(schedule=svc.Schedule(kind="daily", at="07:00"))
+    # Not yet due (anchored on creation 10:00 the prior day); next boundary is tomorrow 07:00.
+    now = _at("2026-06-10T06:00:00+00:00")
+    assert not svc.is_due(r, now)
+    nxt = svc.next_fire(r, now)
+    assert nxt == _at("2026-06-10T07:00:00+00:00")
+
+
+def test_next_fire_daily_rolls_to_tomorrow_after_its_time() -> None:
+    r = _mk(
+        schedule=svc.Schedule(kind="daily", at="07:00"),
+        last_run_at="2026-06-10T07:00:05+00:00",
+    )
+    now = _at("2026-06-10T08:00:00+00:00")
+    assert not svc.is_due(r, now)
+    assert svc.next_fire(r, now) == _at("2026-06-11T07:00:00+00:00")
+
+
+def test_next_fire_every_anchors_on_last_run() -> None:
+    r = _mk(
+        schedule=svc.Schedule(kind="every", hours=2),
+        last_run_at="2026-06-09T12:00:00+00:00",
+    )
+    now = _at("2026-06-09T13:00:00+00:00")
+    assert not svc.is_due(r, now)
+    assert svc.next_fire(r, now) == _at("2026-06-09T14:00:00+00:00")
+
+
+def test_next_fire_disabled_is_none() -> None:
+    r = _mk(schedule=svc.Schedule(kind="every", hours=1), enabled=False)
+    assert svc.next_fire(r, _at("2027-01-01T00:00:00+00:00")) is None
+
+
+def test_next_fire_one_shot_at_after_firing_is_none() -> None:
+    r = _mk(
+        schedule=svc.Schedule(kind="at", at_datetime="2026-06-10T07:00:00+00:00"),
+        last_run_at="2026-06-10T07:00:01+00:00",
+    )
+    # Already fired -> never again.
+    now = _at("2026-06-10T08:00:00+00:00")
+    assert not svc.is_due(r, now)
+    assert svc.next_fire(r, now) is None
+
+
+# ---- sleep-to-next-fire loop (no fixed 30s tick) --------------------------------
+
+
+def test_max_sleep_cap_is_env_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HIMMY_SCHEDULER_MAX_SLEEP", "5")
+    assert svc.RoutineScheduler().tick_seconds == 5.0
+    # A typo / non-positive value falls back to the 30s default (never wedges).
+    monkeypatch.setenv("HIMMY_SCHEDULER_MAX_SLEEP", "nonsense")
+    assert svc.RoutineScheduler().tick_seconds == 30.0
+    monkeypatch.setenv("HIMMY_SCHEDULER_MAX_SLEEP", "-1")
+    assert svc.RoutineScheduler().tick_seconds == 30.0
+    # An explicit constructor value still wins (back-compat for tests).
+    assert svc.RoutineScheduler(tick_seconds=2.0).tick_seconds == 2.0
+
+
+def test_sleep_delay_is_time_to_soonest_boundary_capped(
+    workspace: Path,
+) -> None:
+    # Cap at 100s; a routine due in ~3600s should plan a sleep of exactly the cap.
+    sched = svc.RoutineScheduler(
+        tick_seconds=100.0, now=lambda: _at("2026-06-10T06:00:00+00:00")
+    )
+    _store_routine(
+        schedule=svc.Schedule(kind="daily", at="07:00"),
+        last_run_at="2026-06-09T07:00:05+00:00",
+    )
+    # next boundary is 07:00 (3600s away) -> capped to 100s.
+    assert sched._sleep_delay() == 100.0
+
+
+def test_sleep_delay_no_routines_sleeps_the_full_cap(workspace: Path) -> None:
+    sched = svc.RoutineScheduler(tick_seconds=42.0)
+    assert sched._sleep_delay() == 42.0
+
+
+def test_sleep_delay_due_routine_floors_not_zero(workspace: Path) -> None:
+    # Already due -> tick promptly but never busy-spin at 0.0.
+    sched = svc.RoutineScheduler(
+        tick_seconds=30.0, now=lambda: _at("2027-01-01T00:00:00+00:00")
+    )
+    _store_routine()  # every-1h, created in the past -> due
+    delay = sched._sleep_delay()
+    assert 0 < delay <= 0.1
+
+
+@pytest.mark.asyncio
+async def test_loop_fires_within_a_second_of_a_boundary(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: a routine that becomes due ~0.3s from now fires within ~1s.
+
+    Uses real wall-clock + a small cap; the sleep-to-next-fire loop must plan a short
+    sleep (not the old fixed 30s) and tick right after the boundary crosses.
+    """
+    fired = asyncio.Event()
+
+    async def _fake_execute(routine_id: str, **_k: Any) -> None:
+        fired.set()
+
+    monkeypatch.setattr(svc, "execute_routine", _fake_execute)
+
+    from datetime import UTC, datetime, timedelta
+
+    boundary = datetime.now(UTC) + timedelta(seconds=0.3)
+    # An 'at' one-shot that fires at the boundary; anchor (creation) is just before it.
+    _store_routine(
+        schedule=svc.Schedule(
+            kind="at", at_datetime=boundary.isoformat()
+        ),
+        created_at=(boundary - timedelta(seconds=1)).isoformat(),
+        last_run_at=None,
+    )
+    sched = svc.RoutineScheduler(tick_seconds=30.0)  # cap is high; planning must be tight
+    sched.start()
+    try:
+        await asyncio.wait_for(fired.wait(), timeout=1.2)
+    finally:
+        await sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_loop_wakes_immediately_on_crud(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """notify_change() wakes the loop now instead of waiting out the (long) cap."""
+    fired = asyncio.Event()
+
+    async def _fake_execute(routine_id: str, **_k: Any) -> None:
+        fired.set()
+
+    monkeypatch.setattr(svc, "execute_routine", _fake_execute)
+    # Huge cap: without wake-on-CRUD this test would hang ~999s.
+    sched = svc.RoutineScheduler(
+        tick_seconds=999.0, now=lambda: _at("2027-01-01T00:00:00+00:00")
+    )
+    sched.start()
+    await asyncio.sleep(0.05)  # let the loop reach its long sleep
+    try:
+        # Add a routine that is immediately due, then nudge the loop.
+        _store_routine()  # every-1h, created in the past -> due at the frozen now
+        sched.notify_change()
+        await asyncio.wait_for(fired.wait(), timeout=1.0)
+    finally:
+        await sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_loop_does_not_busy_spin_with_no_due_routines(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With nothing due, tick() is called at most a couple of times over a short window."""
+    ticks = 0
+    real_tick = svc.RoutineScheduler.tick
+
+    def _counting_tick(self: svc.RoutineScheduler) -> list[str]:
+        nonlocal ticks
+        ticks += 1
+        return real_tick(self)
+
+    monkeypatch.setattr(svc.RoutineScheduler, "tick", _counting_tick)
+    # Routine far in the future; small cap so we'd notice a spin quickly.
+    sched = svc.RoutineScheduler(
+        tick_seconds=0.2, now=lambda: _at("2026-06-10T06:00:00+00:00")
+    )
+    _store_routine(
+        schedule=svc.Schedule(kind="daily", at="07:00"),
+        last_run_at="2026-06-09T07:00:05+00:00",
+    )
+    sched.start()
+    try:
+        await asyncio.sleep(0.5)  # ~2-3 cap-length sleeps, not thousands of spins
+        assert ticks <= 5
+    finally:
+        await sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_crud_endpoint_wakes_the_running_scheduler(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Creating a routine via the router sets the scheduler wakeup Event."""
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "on")
+    monkeypatch.setenv("HIMMY_SCHEDULER_MAX_SLEEP", "999")
+
+    woke = asyncio.Event()
+    real_notify = svc.RoutineScheduler.notify_change
+
+    def _spy(self: svc.RoutineScheduler) -> None:
+        woke.set()
+        real_notify(self)
+
+    monkeypatch.setattr(svc.RoutineScheduler, "notify_change", _spy)
+
+    # Start the scheduler in-loop so it is active when the endpoint fires.
+    sched = svc.get_scheduler()
+    sched.start()
+    assert sched.active
+    try:
+        # The sync TestClient shares this running event loop's stores; drive the create
+        # endpoint off-thread so the handler's _wake_scheduler() hits our spy.
+        c = TestClient(create_app())
+        resp = await asyncio.to_thread(
+            c.post, "/api/studio/routines", json=_body()
+        )
+        assert resp.status_code == 200
+        assert woke.is_set()
+    finally:
+        await sched.stop()
+
+
 # ---- live (optional): real local model through the same rails -------------------
 
 

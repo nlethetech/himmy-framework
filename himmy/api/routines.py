@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -90,6 +91,149 @@ OverlapPolicy = Literal["skip"]
 #: Defaults for the ``run_each`` catch-up backfill (a storm cap + a staleness floor).
 DEFAULT_MAX_CATCHUP = 100
 DEFAULT_GRACE_SECONDS = 900
+
+#: T3 per-tenant QUOTAS (additive, fail-open). A real (non-``__local__``) tenant may hold at
+#: most this many ENABLED routines and backfill at most this much catch-up per routine; both
+#: protect the SHARED queue from one tenant flooding it. ``0`` disables a cap. The reserved
+#: ``__local__`` single-user workspace is always exempt, so the offline/single-tenant path is
+#: unaffected. Operators override via ``HIMMY_TENANT_MAX_ROUTINES`` /
+#: ``HIMMY_TENANT_MAX_CATCHUP``. Defaults are generous so a normal multi-tenant load is never
+#: clipped — the cap only bites a runaway.
+DEFAULT_TENANT_MAX_ROUTINES = 200
+DEFAULT_TENANT_MAX_CATCHUP = 100
+
+
+class TenantRoutineQuotaExceeded(Exception):
+    """A workspace exceeded its per-tenant routine quota at create (T3 -> HTTP 429).
+
+    Raised by the routine-create path when a tenant already holds its maximum number of
+    ENABLED routines. Carries the workspace + the cap so the router returns an informative
+    429 instead of letting one tenant flood the shared scheduler/queue with routines.
+    """
+
+    def __init__(self, workspace_id: str, *, cap: int, count: int) -> None:
+        """Record the workspace and the routine cap it hit for the API error surface."""
+        self.workspace_id = workspace_id
+        self.cap = cap
+        self.count = count
+        super().__init__(
+            f"workspace {workspace_id!r} already has {count} enabled routine(s); "
+            f"the per-tenant cap is {cap}. Delete or disable a routine first."
+        )
+
+
+def tenant_max_routines() -> int:
+    """The per-tenant ENABLED-routine cap (``HIMMY_TENANT_MAX_ROUTINES``; 0 = unlimited)."""
+    raw = os.environ.get("HIMMY_TENANT_MAX_ROUTINES")
+    if raw is None or not raw.strip():
+        return DEFAULT_TENANT_MAX_ROUTINES
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return DEFAULT_TENANT_MAX_ROUTINES
+    return value if value >= 0 else DEFAULT_TENANT_MAX_ROUTINES
+
+
+def tenant_max_catchup() -> int:
+    """The per-tenant per-routine catch-up ceiling (``HIMMY_TENANT_MAX_CATCHUP``; 0 = unlimited).
+
+    A tenant-level upper bound on a routine's own ``schedule.max_catchup`` so a tenant cannot
+    set an arbitrarily large backfill that storms the shared queue on launch. Clamps DOWN; the
+    routine keeps its own (possibly smaller) value.
+    """
+    raw = os.environ.get("HIMMY_TENANT_MAX_CATCHUP")
+    if raw is None or not raw.strip():
+        return DEFAULT_TENANT_MAX_CATCHUP
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return DEFAULT_TENANT_MAX_CATCHUP
+    return value if value >= 0 else DEFAULT_TENANT_MAX_CATCHUP
+
+
+def enforce_tenant_routine_quota(
+    store: RoutinesStore, *, workspace_id: str, is_new: bool
+) -> None:
+    """Reject a routine create that pushes a tenant past its ENABLED-routine cap (T3).
+
+    Fail-open + additive: exempts the reserved ``__local__`` single-user workspace and a
+    zero/disabled cap, so single-tenant + existing behaviour is unchanged. ``is_new`` is True
+    for a create (the new routine would ADD to the count) and False for an update of an
+    existing row (no net add — an update never trips the cap). A count error never blocks the
+    write (the cap is a guard, not a correctness invariant).
+
+    .. note::
+       This is the legacy SOFT check (an unlocked ``count()`` round-trip) — it has a TOCTOU
+       window against the later ``upsert`` under concurrent same-workspace creates. The
+       create path now uses :func:`create_routine_with_quota`, which fuses the count and the
+       insert into ONE atomic store op (advisory-locked on Postgres, ``BEGIN IMMEDIATE`` on
+       SQLite) and is HARD under concurrency. This function is retained for back-compat /
+       callers that only want the pre-check; prefer the atomic helper for creates.
+    """
+    if not is_new or workspace_id == LOCAL_WORKSPACE:
+        return
+    cap = tenant_max_routines()
+    if cap <= 0:
+        return
+    try:
+        current = store.count(workspace_id=workspace_id, enabled_only=True)
+    except Exception:  # noqa: BLE001 - fail OPEN
+        logger.warning(
+            "tenant routine-quota count failed for workspace %s; admitting", workspace_id
+        )
+        return
+    if current >= cap:
+        raise TenantRoutineQuotaExceeded(workspace_id, cap=cap, count=current)
+
+
+def create_routine_with_quota(
+    store: RoutinesStore, routine: Routine, *, workspace_id: str
+) -> Routine:
+    """Create ``routine``, enforcing the per-tenant routine cap ATOMICALLY (T3, HARD).
+
+    The hard replacement for the soft ``enforce_tenant_routine_quota`` + later ``upsert``
+    pair: that split (count, then insert in a separate round-trip with no lock between)
+    overshoots the cap under concurrent same-workspace creates. This routes the create through
+    the store's atomic ``create_routine_if_under_quota`` — count and insert fused into ONE
+    advisory-locked transaction (Postgres) / ``BEGIN IMMEDIATE`` (SQLite) — so concurrent
+    creates serialise and land EXACTLY at the cap.
+
+    The exempt paths short-circuit to a plain :meth:`upsert` BEFORE the atomic op so the
+    single-tenant path is byte-identical (no lock taken): the reserved ``__local__``
+    workspace and a zero/disabled cap. Raises :class:`TenantRoutineQuotaExceeded` (→ HTTP
+    429) on a clean over-cap; FAIL-OPEN on an infra error happens INSIDE the store op (it
+    falls back to a plain upsert and admits), so an infra hiccup never blocks a legitimate
+    create.
+    """
+    if workspace_id == LOCAL_WORKSPACE:
+        return store.upsert(routine)
+    cap = tenant_max_routines()
+    if cap <= 0:
+        return store.upsert(routine)
+    stored, admitted = store.create_routine_if_under_quota(routine, cap=cap)
+    if not admitted:
+        # ``create_routine_if_under_quota`` did NOT write the row; report the cap as the
+        # count (the tenant is AT the cap). The exact pre-insert count is not surfaced —
+        # the 429 message only needs the cap and that the tenant is at it.
+        raise TenantRoutineQuotaExceeded(workspace_id, cap=cap, count=cap)
+    return stored
+
+
+def clamp_tenant_catchup(routine: Routine) -> Routine:
+    """Clamp a routine's ``schedule.max_catchup`` DOWN to the tenant ceiling (T3, in place).
+
+    Exempts ``__local__`` and a zero ceiling. A routine asking for more backfill than the
+    tenant ceiling is silently clamped so one tenant's launch cannot storm the shared queue;
+    a routine within the ceiling is untouched.
+    """
+    if routine.workspace_id == LOCAL_WORKSPACE:
+        return routine
+    ceiling = tenant_max_catchup()
+    if ceiling <= 0:
+        return routine
+    if routine.schedule.max_catchup > ceiling:
+        routine.schedule.max_catchup = ceiling
+    return routine
 
 
 class Schedule(BaseModel):
@@ -330,6 +474,54 @@ def _to_utc(dt: datetime) -> datetime:
     return dt.astimezone(UTC)
 
 
+def next_fire(routine: Routine, now: datetime) -> datetime | None:
+    """The earliest instant ``t >= now`` at which ``routine`` becomes due, or ``None``.
+
+    This is the *sleep-to-next-fire* seam. It is the temporal dual of :func:`is_due`:
+
+    * If the routine is **already due** at ``now`` (``is_due(routine, now)`` is true) the
+      answer is ``now`` itself — the scheduler should fire on the very next wake.
+    * Otherwise it is the next future boundary the routine will cross.
+    * ``None`` means *never* (disabled, malformed, a one-shot ``at`` that already fired, or
+      a cron expression we cannot evaluate because ``cronsim`` is absent).
+
+    The per-kind math mirrors :func:`is_due` exactly so there is no drift between "is it due
+    now?" and "when is it due next?" — daily/every/cron/at all reuse the same anchors and the
+    same timezone resolution. This function is *advisory*: oversleeping past a boundary is
+    harmless because :func:`is_due` stays true on the next wake and catch-up covers misses.
+    The returned datetime preserves ``now``'s timezone for the already-due case and is UTC-
+    aware otherwise (the caller only ever takes ``(t - now).total_seconds()``).
+    """
+    if not routine.enabled:
+        return None
+    anchor = _parse_iso(routine.last_run_at or routine.created_at)
+    if anchor is None:
+        return None
+    # Already past a boundary -> fire on the next tick (do not sleep past it).
+    if is_due(routine, now):
+        return now
+    sched = routine.schedule
+    if sched.kind == "daily":
+        m = _AT_RE.match(sched.at or "")
+        if not m:
+            return None
+        # The next HH:MM occurrence in ``now``'s wall clock that is strictly after ``now``.
+        occurrence = now.replace(
+            hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0
+        )
+        if occurrence <= now:
+            occurrence += timedelta(days=1)
+        return occurrence
+    if sched.kind == "every":
+        hours = sched.hours or 0
+        if hours <= 0:
+            return None
+        # Not-yet-due (is_due was False above) -> the boundary is strictly ahead.
+        return anchor + timedelta(hours=hours)
+    # cron / at — the next planned instant after the anchor (UTC-aware) or None.
+    return planned_fire_at(routine, anchor)
+
+
 # ---- the store --------------------------------------------------------------
 
 #: The current (T3c) routines-table shape. ``agent_path`` is NULLABLE because a
@@ -464,6 +656,14 @@ class RoutinesStore:
 
         self._conn = connect_hardened(path)
         self._conn.row_factory = sqlite3.Row
+        # The connection is ``check_same_thread=False`` (shared across the request loop +
+        # ``to_thread`` workers), and this store — unlike ``SqliteStorageService`` — had NO
+        # Python-level lock. The atomic per-tenant quota create
+        # (:meth:`create_routine_if_under_quota`) needs the COUNT and the INSERT to be one
+        # serialized critical section, so a write lock guards that ``BEGIN IMMEDIATE`` block
+        # (mirroring ``SqliteStorageService._lock``). Other methods keep their existing
+        # autocommit behaviour — only the count-then-create needs the up-front write lock.
+        self._lock = threading.Lock()
         self._conn.executescript(_SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -563,6 +763,84 @@ class RoutinesStore:
             ).fetchall()
         return [_row_to_routine(r) for r in rows]
 
+    def count(
+        self, *, workspace_id: str, enabled_only: bool = False
+    ) -> int:
+        """Count a workspace's routines (T3 per-tenant routine quota).
+
+        ``enabled_only`` restricts the count to ENABLED routines (the ones that actually
+        fire), which is what the per-tenant active-routine cap is enforced against.
+        """
+        if enabled_only:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM routines "
+                "WHERE workspace_id = ? AND enabled = 1",
+                (workspace_id,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM routines WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+        return int(row["n"]) if row is not None else 0
+
+    def create_routine_if_under_quota(
+        self, routine: Routine, *, cap: int, enabled_only: bool = True
+    ) -> tuple[Routine, bool]:
+        """Atomically create ``routine`` IFF the tenant is under its routine cap (T3, HARD).
+
+        Fuses the per-tenant COUNT and the INSERT into ONE ``BEGIN IMMEDIATE`` write
+        transaction under :attr:`_lock`, so concurrent creates for the SAME workspace
+        SERIALIZE: the write lock is taken UP FRONT (before the count), so the loser re-counts
+        only after the winner's row is committed and sees the true post-insert count. The
+        result is therefore EXACTLY ``cap`` admits with the rest a deterministic over-cap
+        reject — never the unlocked count-then-create overshoot.
+
+        Returns ``(routine, admitted)``. ``admitted=False`` means the tenant was at/over
+        ``cap`` and NOTHING was written (cleaner than insert-then-delete). The caller is
+        responsible for the exempt short-circuit (``__local__`` / ``cap <= 0``) so this is
+        only reached for a genuinely capped tenant — but it defends ``cap <= 0`` anyway by
+        admitting unconditionally.
+
+        FAIL-OPEN on an infrastructure error: an unexpected DB failure during the locked
+        count-then-create must not turn a quota guard into a hard outage, so it falls back to
+        the plain :meth:`upsert` (the prior soft behaviour) and reports ``admitted=True``.
+        Only a clean over-cap (count >= cap under the lock) is a fail-CLOSED reject.
+        """
+        if cap <= 0:  # defensive: an uncapped tenant is always admitted (plain upsert)
+            return self.upsert(routine), True
+        routine.updated_at = utc_now_iso()
+        sql, params = self._upsert_sql(routine)
+        enabled_clause = " AND enabled = 1" if enabled_only else ""
+        try:
+            with self._lock:
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    row = self._conn.execute(
+                        "SELECT COUNT(*) AS n FROM routines "  # noqa: S608
+                        f"WHERE workspace_id = ?{enabled_clause}",
+                        (routine.workspace_id,),
+                    ).fetchone()
+                    current = int(row["n"]) if row is not None else 0
+                    if current >= cap:
+                        self._conn.commit()  # nothing written; release the write lock
+                        return routine, False
+                    self._conn.execute(sql, params)
+                    self._conn.commit()
+                    return routine, True
+                except BaseException:
+                    try:
+                        self._conn.rollback()
+                    except sqlite3.Error:  # pragma: no cover - rollback on dead conn
+                        pass
+                    raise
+        except Exception:  # noqa: BLE001 - fail OPEN on infra error (not over-cap)
+            logger.warning(
+                "atomic routine-quota create failed for workspace %s; admitting",
+                routine.workspace_id,
+            )
+            return self.upsert(routine), True
+
     def get(
         self, routine_id: str, *, workspace_id: str | None = None
     ) -> Routine | None:
@@ -577,10 +855,16 @@ class RoutinesStore:
             return None
         return routine
 
-    def upsert(self, routine: Routine) -> Routine:
-        routine.updated_at = utc_now_iso()
-        self._conn.execute(
-            """
+    @staticmethod
+    def _upsert_sql(routine: Routine) -> tuple[str, tuple[Any, ...]]:
+        """The INSERT…ON CONFLICT statement + bound params for a routine upsert.
+
+        Factored out so :meth:`upsert` and the atomic
+        :meth:`create_routine_if_under_quota` write the BYTE-IDENTICAL row — the only
+        difference between them is whether the write runs in autocommit (upsert) or inside
+        the quota ``BEGIN IMMEDIATE`` (the atomic create).
+        """
+        sql = """
             INSERT INTO routines (
                 id, name, workspace_id, agent_path, agent_id, idempotency_key,
                 prompt, schedule_kind, schedule_at, schedule_hours,
@@ -613,39 +897,44 @@ class RoutinesStore:
                 last_preview=excluded.last_preview,
                 last_error=excluded.last_error,
                 last_delivery=excluded.last_delivery
-            """,
-            (
-                routine.id,
-                routine.name,
-                routine.workspace_id,
-                routine.agent_path,
-                routine.agent_id,
-                routine.idempotency_key,
-                routine.prompt,
-                routine.schedule.kind,
-                routine.schedule.at,
-                routine.schedule.hours,
-                routine.schedule.expr,
-                routine.schedule.at_datetime,
-                routine.schedule.timezone,
-                routine.schedule.missed,
-                routine.schedule.max_catchup,
-                routine.schedule.grace_seconds,
-                routine.schedule.overlap,
-                routine.next_fire_at,
-                routine.provider,
-                routine.model,
-                routine.deliver,
-                int(routine.enabled),
-                routine.created_at,
-                routine.updated_at,
-                routine.last_run_at,
-                routine.last_status,
-                routine.last_preview,
-                routine.last_error,
-                routine.last_delivery,
-            ),
+            """
+        params = (
+            routine.id,
+            routine.name,
+            routine.workspace_id,
+            routine.agent_path,
+            routine.agent_id,
+            routine.idempotency_key,
+            routine.prompt,
+            routine.schedule.kind,
+            routine.schedule.at,
+            routine.schedule.hours,
+            routine.schedule.expr,
+            routine.schedule.at_datetime,
+            routine.schedule.timezone,
+            routine.schedule.missed,
+            routine.schedule.max_catchup,
+            routine.schedule.grace_seconds,
+            routine.schedule.overlap,
+            routine.next_fire_at,
+            routine.provider,
+            routine.model,
+            routine.deliver,
+            int(routine.enabled),
+            routine.created_at,
+            routine.updated_at,
+            routine.last_run_at,
+            routine.last_status,
+            routine.last_preview,
+            routine.last_error,
+            routine.last_delivery,
         )
+        return sql, params
+
+    def upsert(self, routine: Routine) -> Routine:
+        routine.updated_at = utc_now_iso()
+        sql, params = self._upsert_sql(routine)
+        self._conn.execute(sql, params)
         self._conn.commit()
         return routine
 
@@ -1366,6 +1655,31 @@ def _default_now() -> datetime:
     return datetime.now().astimezone()
 
 
+#: Default cap on a single scheduler sleep (seconds). The loop sleeps to the next computed
+#: fire boundary but never longer than this, so a wall-clock jump / laptop suspend that
+#: swallows a boundary is bounded to one cap-length of latency before the next re-evaluation.
+_SCHEDULER_DEFAULT_MAX_SLEEP = 30.0
+#: Floor on a single sleep so a due-but-unclaimable routine cannot spin the loop at 100% CPU.
+_SCHEDULER_MIN_SLEEP = 0.05
+
+
+def _scheduler_max_sleep_seconds() -> float:
+    """The per-sleep cap from ``HIMMY_SCHEDULER_MAX_SLEEP`` (seconds), else the default.
+
+    An unset / blank / unparseable / non-positive value falls back to
+    :data:`_SCHEDULER_DEFAULT_MAX_SLEEP` so a typo never wedges the scheduler. Mirrors the
+    parse-with-fallback contract of ``dispatch_env_overrides`` in ``runtime_bootstrap``.
+    """
+    raw = os.environ.get("HIMMY_SCHEDULER_MAX_SLEEP")
+    if raw is None or not raw.strip():
+        return _SCHEDULER_DEFAULT_MAX_SLEEP
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return _SCHEDULER_DEFAULT_MAX_SLEEP
+    return value if value > 0 else _SCHEDULER_DEFAULT_MAX_SLEEP
+
+
 def _tick_planned_fire_iso(routine: Routine) -> str | None:
     """The planned-fire UTC ISO for a due cron/at routine (the dedup key), else ``None``.
 
@@ -1397,13 +1711,30 @@ class RoutineScheduler:
     def __init__(
         self,
         *,
-        tick_seconds: float = 30.0,
+        tick_seconds: float | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        self._tick_seconds = tick_seconds
+        # ``tick_seconds`` is the *cap* on a single sleep, not a fixed cadence: the loop
+        # sleeps until the next computed fire boundary but never longer than this, so a
+        # clock-jump / laptop-sleep that swallows a boundary is bounded to one cap-length
+        # of latency (catch-up + a re-evaluation on the next wake cover the actual miss).
+        # Env-configurable via ``HIMMY_SCHEDULER_MAX_SLEEP`` (seconds); a typo / non-positive
+        # value falls back to the 30s default so a misconfig never wedges the scheduler.
+        self._max_sleep = (
+            _scheduler_max_sleep_seconds() if tick_seconds is None else tick_seconds
+        )
         self._now = now or _default_now
         self._loop_task: asyncio.Task[None] | None = None
         self._running: dict[str, asyncio.Task[Any]] = {}
+        # Set on routine CRUD (add/update/delete/enable/run_now) so the loop wakes
+        # immediately to re-plan instead of oversleeping a freshly-changed schedule. The
+        # Event is created lazily-bound to the running loop in :meth:`start`.
+        self._wakeup: asyncio.Event = asyncio.Event()
+
+    @property
+    def tick_seconds(self) -> float:
+        """The maximum single-sleep cap (back-compat alias; was the fixed tick)."""
+        return self._max_sleep
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -1415,9 +1746,23 @@ class RoutineScheduler:
     def start(self) -> None:
         """Start the tick loop (idempotent)."""
         if self._loop_task is None or self._loop_task.done():
+            # Re-bind the wakeup Event to the *currently running* loop. An Event created in
+            # __init__ may be bound to a different (or no) loop; rebinding here guarantees
+            # ``set()`` from a request handler and ``wait()`` in the tick loop share one loop.
+            self._wakeup = asyncio.Event()
             self._loop_task = asyncio.create_task(
                 self._loop(), name="himmy-routines-scheduler"
             )
+
+    def notify_change(self) -> None:
+        """Wake the tick loop now (call after any routine CRUD / enable / run_now).
+
+        Fail-open: if the Event is bound to a different loop (e.g. called from a thread
+        without a running loop) we swallow the error — the worst case is the loop wakes on
+        its own sleep cap instead of instantly, which is still correct, just less prompt.
+        """
+        with contextlib.suppress(RuntimeError):
+            self._wakeup.set()
 
     async def stop(self) -> None:
         """Cancel the loop and any in-flight routine runs; await them."""
@@ -1433,12 +1778,59 @@ class RoutineScheduler:
         self._running.clear()
 
     async def _loop(self) -> None:
+        # Tick once immediately on start (covers a routine already due at boot before the
+        # first sleep), then sleep-to-next-fire: compute the soonest boundary across all
+        # enabled routines, sleep until then (capped), and wake early on CRUD.
         while True:
-            await asyncio.sleep(self._tick_seconds)
             try:
                 self.tick()
             except Exception:  # noqa: BLE001 - one bad tick never kills the loop
                 logger.exception("routine scheduler tick failed")
+            try:
+                delay = self._sleep_delay()
+            except Exception:  # noqa: BLE001 - planning failure -> fall back to the cap
+                logger.exception("routine scheduler sleep-planning failed")
+                delay = self._max_sleep
+            self._wakeup.clear()
+            try:
+                # Wake on the soonest of: the computed boundary (capped) or a CRUD event.
+                await asyncio.wait_for(self._wakeup.wait(), timeout=delay)
+            except TimeoutError:
+                # Normal path: the planned sleep elapsed; loop around and tick.
+                pass
+
+    def _sleep_delay(self) -> float:
+        """Seconds to sleep before the next tick: time-to-soonest-fire, capped, never <0.
+
+        A value at-or-below zero (something is already due, or a boundary is in the past)
+        collapses to a tiny floor so the loop ticks promptly without busy-spinning. The
+        cap (``_max_sleep``) bounds clock-jump / laptop-sleep latency. With no enabled
+        routines the loop simply sleeps the full cap (no busy-spin) and re-checks.
+        """
+        now = self._now()
+        soonest: float | None = None
+        try:
+            routines = get_routines_store().list()
+        except Exception:  # noqa: BLE001 - a broken store must not pin the loop
+            logger.exception("routine store unavailable during sleep-planning")
+            return self._max_sleep
+        for routine in routines:
+            # A routine that is already running has no *next* fire we must wake for until it
+            # finishes (overlap is skipped/queued anyway); skip it so it cannot peg delay=0.
+            if self.is_running(routine.id):
+                continue
+            nxt = next_fire(routine, now)
+            if nxt is None:
+                continue
+            secs = (nxt - now).total_seconds()
+            if soonest is None or secs < soonest:
+                soonest = secs
+        if soonest is None:
+            return self._max_sleep
+        # Floor at a small positive value: a past/now boundary should tick almost
+        # immediately, but never 0.0 (which could spin if a due routine cannot be claimed).
+        delay = max(soonest, _SCHEDULER_MIN_SLEEP)
+        return min(delay, self._max_sleep)
 
     # -- ticking ----------------------------------------------------------------
 
@@ -1719,6 +2111,8 @@ def reset_scheduler() -> None:
 __all__ = [
     "DEFAULT_GRACE_SECONDS",
     "DEFAULT_MAX_CATCHUP",
+    "DEFAULT_TENANT_MAX_CATCHUP",
+    "DEFAULT_TENANT_MAX_ROUTINES",
     "DELIVERY_MAX_CHARS",
     "LOCAL_WORKSPACE",
     "PREVIEW_MAX_CHARS",
@@ -1730,6 +2124,9 @@ __all__ = [
     "RoutineScheduler",
     "RoutinesStore",
     "Schedule",
+    "TenantRoutineQuotaExceeded",
+    "clamp_tenant_catchup",
+    "enforce_tenant_routine_quota",
     "execute_routine",
     "get_routines_store",
     "get_scheduler",
@@ -1743,4 +2140,6 @@ __all__ = [
     "run_timeout_s",
     "schedule_dedup_key",
     "set_routine_container_provider",
+    "tenant_max_catchup",
+    "tenant_max_routines",
 ]

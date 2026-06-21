@@ -25,6 +25,18 @@ from himmy.api.routers.studio_common import build_studio_router
 router = build_studio_router("routines", tag="studio-routines")
 
 
+def _wake_scheduler() -> None:
+    """Wake the sleep-to-next-fire loop after a CRUD so a changed schedule re-plans now.
+
+    Fail-open: a scheduler that is not running (or in another process / another node)
+    simply doesn't wake — it will pick the change up on its next sleep cap, which is still
+    correct. Only the in-process scheduler can be nudged this way.
+    """
+    sched = svc.get_scheduler()
+    if sched.active:
+        sched.notify_change()
+
+
 # ---- request/response models -------------------------------------------------
 
 
@@ -143,7 +155,9 @@ async def create_routine(body: RoutineCreate) -> RoutineView:
         deliver=body.deliver,
         enabled=body.enabled,
     )
-    return _view(svc.get_routines_store().upsert(routine))
+    stored = svc.get_routines_store().upsert(routine)
+    _wake_scheduler()
+    return _view(stored)
 
 
 @router.get("/{routine_id}", response_model=RoutineView)
@@ -171,13 +185,16 @@ async def update_routine(routine_id: str, body: RoutineUpdate) -> RoutineView:
     if "agent_path" in patch:
         _validate_agent_path(patch["agent_path"])
     updated = routine.model_copy(update=patch)
-    return _view(store.upsert(updated))
+    stored = store.upsert(updated)
+    _wake_scheduler()
+    return _view(stored)
 
 
 @router.delete("/{routine_id}")
 async def delete_routine(routine_id: str) -> dict[str, bool]:
     if not svc.get_routines_store().delete(routine_id):
         raise HTTPException(status_code=404, detail="routine not found")
+    _wake_scheduler()
     return {"ok": True}
 
 
@@ -202,6 +219,8 @@ async def run_now(routine_id: str) -> RoutineView:
         ) from exc
     if routine is None:  # deleted mid-run
         raise HTTPException(status_code=404, detail="routine not found")
+    # last_run_at advanced -> re-plan the next boundary off the new anchor.
+    _wake_scheduler()
     return _view(routine)
 
 
@@ -213,13 +232,105 @@ def _scheduler_enabled() -> bool:
     return raw not in ("off", "0", "false", "no")
 
 
+#: Module-scoped leadership lease + failover watchdog for the FastAPI-hosted scheduler.
+#: In a multi-replica deployment EVERY replica runs this startup event, so without leader
+#: election every replica would tick. The lease (Postgres) / topology guard (SQLite) ensures
+#: at most one replica actually ticks; the watchdog promotes a follower on failover.
+_LEADERSHIP: object | None = None
+_WATCHDOG: object | None = None
+
+
 async def _start_scheduler() -> None:
-    if _scheduler_enabled():
+    """Bid for scheduler leadership, then start the tick loop iff this replica wins.
+
+    Fail-open: if leadership wiring is unavailable (e.g. no container in a bare app), fall back
+    to the legacy unconditional start so a single-process server keeps working — the per-fire
+    dedup-CAS stays the single-fire backstop either way.
+    """
+    global _LEADERSHIP, _WATCHDOG
+    if not _scheduler_enabled():
+        return
+    container = svc.resolve_routine_container()
+    if container is None:
+        # No container wired (a bare/in-memory app): nothing to coordinate — start directly.
+        svc.get_scheduler().start()
+        return
+    try:
+        import asyncio
+
+        from himmy.api.scheduler_leader import acquire_scheduler_leadership
+
+        require_ack = os.environ.get(
+            "HIMMY_SCHEDULER_REQUIRE_ACK", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        leadership = await acquire_scheduler_leadership(
+            container, require_single_scheduler_ack=require_ack
+        )
+        _LEADERSHIP = leadership
+        if leadership.is_leader:
+            sched = svc.get_scheduler()
+            try:
+                await sched.catch_up_on_launch()
+            except Exception:  # noqa: BLE001 - catch-up must not block startup
+                pass
+            sched.start()
+        if leadership.mode in ("postgres-lease", "follower"):
+            _WATCHDOG = asyncio.create_task(
+                _failover_loop(leadership), name="himmy-studio-scheduler-failover"
+            )
+    except Exception:  # noqa: BLE001 - fail open to the legacy direct start
         svc.get_scheduler().start()
 
 
+async def _failover_loop(leadership: object) -> None:
+    """Promote this replica's scheduler on the leader's failover (Studio-hosted variant)."""
+    import asyncio
+
+    raw = os.environ.get("HIMMY_SCHEDULER_FAILOVER_INTERVAL", "").strip()
+    try:
+        interval = float(raw) if raw else 5.0
+    except ValueError:
+        interval = 5.0
+    if interval <= 0:
+        interval = 5.0
+    while True:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        try:
+            was = leadership.is_leader  # type: ignore[attr-defined]
+            now = await leadership.refresh()  # type: ignore[attr-defined]
+            sched = svc.get_scheduler()
+            if now and not was:
+                try:
+                    await sched.catch_up_on_launch()
+                except Exception:  # noqa: BLE001
+                    pass
+                sched.start()
+            elif not now and was and sched.active:
+                await sched.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - watchdog must not crash the server
+            pass
+
+
 async def _stop_scheduler() -> None:
+    global _LEADERSHIP, _WATCHDOG
+    if _WATCHDOG is not None:
+        try:
+            _WATCHDOG.cancel()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        _WATCHDOG = None
     await svc.get_scheduler().stop()
+    if _LEADERSHIP is not None:
+        try:
+            await _LEADERSHIP.release()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        _LEADERSHIP = None
 
 
 router.add_event_handler("startup", _start_scheduler)

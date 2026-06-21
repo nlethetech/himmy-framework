@@ -86,9 +86,17 @@ class _FakePool:
 
 
 def _install_pool(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> None:
-    import himmy.services.storage.aux_store_factory as factory
+    """Short-circuit aux-pool resolution to the recording fake (loop-affinity fix).
 
-    monkeypatch.setattr(factory, "aux_pool", lambda: pool)
+    The aux stores open their OWN aux-loop-bound pool now (they no longer reuse the main-loop
+    server pool); these wiring tests assert SQL, so we override ``_AuxPgPool._resolve_async``.
+    """
+    from himmy.services.storage.postgres_aux import _AuxPgPool
+
+    async def _resolve(self: _AuxPgPool) -> Any:
+        return pool
+
+    monkeypatch.setattr(_AuxPgPool, "_resolve_async", _resolve, raising=True)
 
 
 # --------------------------------------------------------------------- routing wiring

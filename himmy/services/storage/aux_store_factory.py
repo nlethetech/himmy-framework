@@ -58,6 +58,18 @@ _T = TypeVar("_T")
 _AUX_LOOP: _LoopThread | None = None
 _AUX_LOOP_LOCK = threading.Lock()
 
+#: Owned asyncpg pools opened ON the aux loop by aux Postgres stores (see
+#: ``_AuxPgPool._resolve_async``). Tracked so :func:`reset_aux_store_factory` can close them
+#: ON the aux loop before stopping it — an asyncpg pool is loop-bound and must be closed on
+#: the loop it was created on. Guarded by ``_AUX_LOOP_LOCK``.
+_AUX_OWNED_POOLS: list[object] = []
+
+
+def register_aux_owned_pool(pool: object) -> None:
+    """Record an aux-loop-bound owned pool for orderly close at reset/shutdown."""
+    with _AUX_LOOP_LOCK:
+        _AUX_OWNED_POOLS.append(pool)
+
 
 def _is_postgres_dsn(dsn: str | None) -> bool:
     """True when ``dsn`` names a Postgres database (``postgres://``/``postgresql://``)."""
@@ -138,12 +150,24 @@ def aux_pool() -> object | None:
 
 
 def reset_aux_store_factory() -> None:
-    """Tear down the shared aux loop (lifespan shutdown / test isolation). Idempotent."""
+    """Tear down the shared aux loop (lifespan shutdown / test isolation). Idempotent.
+
+    Closes any aux-loop-bound owned pools ON the aux loop FIRST (a loop-bound pool must be
+    closed on its own loop), then stops the loop thread. Best-effort: a close failure is
+    swallowed so shutdown always completes.
+    """
     global _AUX_LOOP
     with _AUX_LOOP_LOCK:
         loop = _AUX_LOOP
         _AUX_LOOP = None
+        pools = list(_AUX_OWNED_POOLS)
+        _AUX_OWNED_POOLS.clear()
     if loop is not None:
+        for pool in pools:
+            try:
+                loop.run(pool.close())  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
         loop.close()
 
 
@@ -153,6 +177,7 @@ __all__ = [
     "aux_loop",
     "aux_pool",
     "aux_postgres_enabled",
+    "register_aux_owned_pool",
     "reset_aux_store_factory",
     "select_aux_store",
 ]

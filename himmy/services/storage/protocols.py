@@ -148,6 +148,10 @@ class RunStore(Protocol):
         self, run: RunRecord
     ) -> tuple[RunRecord, bool]: ...
 
+    async def save_run_if_under_quota(
+        self, run: RunRecord, *, cap: int
+    ) -> tuple[RunRecord, bool]: ...
+
     async def claim_run_for_resume(
         self, run_id: str, *, workspace_id: str
     ) -> bool: ...
@@ -159,6 +163,8 @@ class RunStore(Protocol):
         *,
         lanes: list[str] | None = None,
         now: str | None = None,
+        fairness: bool = False,
+        workspace_concurrency: int = 0,
     ) -> RunRecord | None: ...
 
     async def renew_lease(
@@ -190,6 +196,8 @@ class RunStore(Protocol):
         subject_id: str | None = None,
         status: RunStatus | None = None,
     ) -> list[RunRecord]: ...
+
+    async def count_active_runs_for_workspace(self, workspace_id: str) -> int: ...
 
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str

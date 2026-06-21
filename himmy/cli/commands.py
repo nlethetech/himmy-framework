@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib
 import json
 import os
@@ -1459,6 +1460,7 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
         start_run_substrate,
         stop_run_substrate,
     )
+    from himmy.api.scheduler_leader import acquire_scheduler_leadership
     from himmy.services.storage.factory import (
         reset_server_context,
         set_server_context,
@@ -1475,6 +1477,8 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
     server_token = set_server_context(True)
     substrate = None
     scheduler = None
+    leadership = None
+    watchdog: _asyncio.Task[None] | None = None
     try:
         # 2) build the durable container (Postgres / file-backed SQLite) + bring up the run
         #    substrate (publish store, enable dispatch BEFORE the sweep, sweep + reconcile,
@@ -1498,24 +1502,41 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
             log.info("scheduler-only mode: leased dispatcher stopped")
 
         # 3) the routine scheduler (the lifespan does not own this — a router event does).
+        #    Leader/worker split: bid for cross-node scheduler leadership. Only the LEADER
+        #    ticks + runs maintenance sweeps; every other `himmy worker` drains the queue
+        #    (worker-only) and promotes itself on the leader's failover. On SQLite the bid is
+        #    the topology guard (same-host single-scheduler flock + cross-host warning).
         n_routines = 0
         if run_scheduler and scheduler_enabled:
+            require_ack = os.environ.get(
+                "HIMMY_SCHEDULER_REQUIRE_ACK", ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            leadership = await acquire_scheduler_leadership(
+                substrate.active, require_single_scheduler_ack=require_ack
+            )
+            if leadership.is_leader:
+                scheduler = await _start_scheduler_as_leader(get_scheduler, log)
+                log.info("scheduler leader (%s): ticking routines", leadership.mode)
+            else:
+                # worker-only this cycle; a watchdog will promote us on failover.
+                log.info(
+                    "scheduler NOT started on this node (%s): %s",
+                    leadership.mode,
+                    leadership.reason or "another node leads",
+                )
             try:
                 n_routines = len(get_routines_store().list())
             except Exception:  # noqa: BLE001 - a store read failure is non-fatal here
                 n_routines = -1
-            scheduler = get_scheduler()
-            # Catch-up-on-launch (Phase 1): apply each routine's missed-run policy BEFORE
-            # the tick loop starts, reading the authoritative anchor (last_run_at), so a
-            # missed-while-asleep occurrence is coalesced/skipped/backfilled deterministically
-            # rather than racing the first tick.
-            try:
-                actions = await scheduler.catch_up_on_launch()
-                if actions:
-                    log.info("routine catch-up on launch: %s", actions)
-            except Exception:  # noqa: BLE001 - catch-up must never block worker startup
-                log.warning("routine catch-up on launch failed", exc_info=True)
-            scheduler.start()
+            # Failover watchdog: a follower re-contends for the lease (promote on the prior
+            # leader's death); a leader confirms its lease is still live (demote on drop).
+            if leadership.mode in ("postgres-lease", "follower"):
+                watchdog = _asyncio.create_task(
+                    _scheduler_failover_watchdog(
+                        leadership, get_scheduler, log
+                    ),
+                    name="himmy-scheduler-failover",
+                )
         elif run_scheduler and not scheduler_enabled:
             log.info("routine scheduler disabled via HIMMY_ROUTINES_SCHEDULER")
 
@@ -1541,14 +1562,32 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
         await stop.wait()
         log.info("himmy worker stopping (signal received)")
     finally:
-        # Graceful shutdown: scheduler FIRST (stop firing new routine runs), then the run
-        # substrate (drain in-flight dispatcher workers + inline tasks, close the container,
-        # clear providers), then the server-context flag.
-        if scheduler is not None:
+        # Graceful shutdown: stop the failover watchdog FIRST (so it can't promote/start the
+        # scheduler mid-teardown), then the scheduler (stop firing new routine runs), release
+        # the leadership lease, then the run substrate (drain in-flight dispatcher workers +
+        # inline tasks, close the container, clear providers), then the server-context flag.
+        if watchdog is not None:
+            watchdog.cancel()
+            with contextlib.suppress(_asyncio.CancelledError, Exception):
+                await watchdog
+        # The watchdog may have promoted a follower and started the scheduler after the local
+        # ``scheduler`` var was set, so resolve the live singleton for a clean stop.
+        active_scheduler = scheduler
+        if active_scheduler is None:
+            with contextlib.suppress(Exception):
+                live = get_scheduler()
+                if live.active:
+                    active_scheduler = live
+        if active_scheduler is not None:
             try:
-                await scheduler.stop()
+                await active_scheduler.stop()
             except Exception:  # noqa: BLE001 - shutdown best-effort
                 log.warning("routine scheduler stop failed", exc_info=True)
+        if leadership is not None:
+            try:
+                await leadership.release()
+            except Exception:  # noqa: BLE001 - shutdown best-effort
+                log.warning("scheduler leadership release failed", exc_info=True)
         if substrate is not None:
             try:
                 await stop_run_substrate(substrate, clear_providers=True)
@@ -1559,6 +1598,77 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
         except Exception:  # noqa: BLE001 - shutdown best-effort
             pass
         log.info("himmy worker stopped")
+
+
+async def _start_scheduler_as_leader(get_scheduler: Any, log: Any) -> Any:
+    """Run catch-up-on-launch then start the scheduler tick loop; return the scheduler.
+
+    Catch-up reads the AUTHORITATIVE anchor (``last_run_at``) so a missed-while-asleep (or
+    missed-while-this-node-was-a-follower) occurrence is coalesced/skipped/backfilled
+    deterministically before the first tick — this is also what makes a NEWLY-PROMOTED leader
+    fire any fire that fell in the failover gap (no permanently-missed fire).
+    """
+    scheduler = get_scheduler()
+    try:
+        actions = await scheduler.catch_up_on_launch()
+        if actions:
+            log.info("routine catch-up on launch: %s", actions)
+    except Exception:  # noqa: BLE001 - catch-up must never block scheduler startup
+        log.warning("routine catch-up on launch failed", exc_info=True)
+    scheduler.start()
+    return scheduler
+
+
+async def _scheduler_failover_watchdog(
+    leadership: Any, get_scheduler: Any, log: Any
+) -> None:
+    """Periodically refresh leadership: promote a follower / demote a dropped leader.
+
+    A follower re-contends for the Postgres advisory lease; when the previous leader dies its
+    lease auto-releases and this node wins the next bid → it runs catch-up (covering the
+    failover gap) and starts ticking. A leader whose lease dropped (transient session loss)
+    stops its tick loop so it doesn't fire without the lease — the dedup-CAS still guards the
+    overlap, but demoting promptly keeps the cluster to one active ticker. Fail-open: an error
+    is logged and the loop continues; cancellation (shutdown) propagates cleanly.
+    """
+    interval = _scheduler_failover_interval_seconds()
+    while True:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        try:
+            was_leader = leadership.is_leader
+            now_leader = await leadership.refresh()
+            scheduler = get_scheduler()
+            if now_leader and not was_leader:
+                log.info("scheduler FAILOVER: this node is now the leader")
+                await _start_scheduler_as_leader(get_scheduler, log)
+            elif not now_leader and was_leader:
+                log.warning("scheduler demoted (lease lost); stopping tick loop")
+                if scheduler.active:
+                    await scheduler.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the watchdog must never crash the worker
+            log.warning("scheduler failover watchdog cycle failed", exc_info=True)
+
+
+def _scheduler_failover_interval_seconds() -> float:
+    """Seconds between failover re-contend checks (``HIMMY_SCHEDULER_FAILOVER_INTERVAL``).
+
+    Defaults to 5s — the failover latency upper bound (a dead leader's lease frees instantly,
+    so a follower picks it up within one interval). A typo / non-positive value falls back to
+    the default so a misconfig never wedges failover.
+    """
+    raw = os.environ.get("HIMMY_SCHEDULER_FAILOVER_INTERVAL")
+    if raw is None or not raw.strip():
+        return 5.0
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return 5.0
+    return value if value > 0 else 5.0
 
 
 # ---------------------------------------------------------------------- studio

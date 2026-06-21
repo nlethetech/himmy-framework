@@ -60,6 +60,18 @@ class RunStatus(str, Enum):
     PARKED = "PARKED"
 
 
+#: The non-terminal (in-flight) run statuses (T3): a run in one of these still occupies a
+#: tenant's outstanding-run budget. SUCCEEDED/FAILED/PARKED are terminal and free the slot.
+#: Used by the per-tenant outstanding-quota count that gates enqueue in dispatch mode (where
+#: the in-process counter cannot span worker processes).
+ACTIVE_RUN_STATUSES: tuple[RunStatus, ...] = (
+    RunStatus.QUEUED,
+    RunStatus.RUNNING,
+    RunStatus.AWAITING_APPROVAL,
+    RunStatus.RESOLVING,
+)
+
+
 class RecommendationStatus(str, Enum):
     """Lifecycle state of an advisory recommendation extracted from a run."""
 

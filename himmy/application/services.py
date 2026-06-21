@@ -754,12 +754,19 @@ class RunAppService:
         self._dispatch_enabled = False
         # The retry ceiling stamped on every enqueued run (the dispatcher's backoff budget).
         self._default_max_attempts = DEFAULT_QUEUE_MAX_ATTEMPTS
+        # T3 per-tenant FAIRNESS on the durable claim. DEFAULT off = global FIFO (byte-identical
+        # single-tenant behaviour). When on, the dispatcher claims the least-loaded workspace's
+        # run first (round-robin) and refuses to claim a workspace already at its CROSS-NODE
+        # per-tenant concurrency cap (``_workspace_concurrency`` — the same cap the in-process
+        # execution semaphore uses, now enforced globally across worker processes via the DB).
+        self._dispatch_fairness = False
 
     def enable_dispatch(
         self,
         *,
         max_attempts: int | None = None,
         run_timeout_seconds: float | None = None,
+        fairness: bool | None = None,
     ) -> None:
         """Switch this service into leased-dispatch mode (the Q3 dispatcher owns execution).
 
@@ -777,11 +784,28 @@ class RunAppService:
             self._default_max_attempts = max(1, int(max_attempts))
         if run_timeout_seconds is not None:
             self._run_timeout_seconds = max(1.0, float(run_timeout_seconds))
+        if fairness is not None:
+            self._dispatch_fairness = bool(fairness)
 
     @property
     def dispatch_enabled(self) -> bool:
         """Whether the leased dispatcher owns execution (vs. inline fire-and-forget)."""
         return self._dispatch_enabled
+
+    @property
+    def dispatch_fairness(self) -> bool:
+        """Whether the dispatcher claims runs with per-tenant fairness + the cross-node cap (T3)."""
+        return self._dispatch_fairness
+
+    @property
+    def workspace_concurrency(self) -> int:
+        """The per-workspace execution-concurrency cap (T0.4 in-process / T3 cross-node)."""
+        return self._workspace_concurrency
+
+    @property
+    def workspace_max_outstanding(self) -> int:
+        """The per-workspace outstanding-run cap enforced at enqueue (T0.4 / T3)."""
+        return self._workspace_max_outstanding
 
     @property
     def run_timeout_seconds(self) -> float:
@@ -954,10 +978,55 @@ class RunAppService:
             hitl=hitl,
             plan=plan,
         )
+        # T3 HARD per-tenant outstanding-run cap (dispatch / multi-node path): when the cap
+        # is ON and the workspace is not the exempt ``__local__``, the create goes through the
+        # ATOMIC store op that FUSES the idempotency check, the active-run COUNT, and the
+        # INSERT into ONE advisory-locked transaction (Postgres) / ``BEGIN IMMEDIATE``
+        # (SQLite) — so concurrent same-workspace creates serialise and land EXACTLY at the
+        # cap, never the unlocked count-then-insert overshoot. ``admitted=False`` means the
+        # tenant was at/over cap and NOTHING was written (cleaner than the old
+        # insert-then-mark-FAILED): raise the same 429 surface. An idempotent re-submit
+        # returns the prior run with ``admitted=True`` and does NOT consume a slot — it must
+        # NOT relaunch, so it is distinguished via ``created``.
+        if (
+            self._dispatch_enabled
+            and self._workspace_max_outstanding > 0
+            and workspace_id != LOCAL_WORKSPACE
+        ):
+            stored, admitted = await self._storage.save_run_if_under_quota(
+                run, cap=self._workspace_max_outstanding
+            )
+            if not admitted:
+                raise WorkspaceRunQuotaExceeded(
+                    workspace_id,
+                    cap=self._workspace_max_outstanding,
+                    outstanding=self._workspace_max_outstanding,
+                )
+            # A re-submit of an existing run (same run object identity is NOT guaranteed;
+            # detect it by idempotency key resolving to a prior row) must not relaunch. The
+            # atomic op returns the stored row; ``run.run_id != stored.run_id`` (or a
+            # mismatched created_at) signals a re-submit. The op returns the PRIOR run on a
+            # key hit, so compare ids: a fresh insert returns the same object we passed in.
+            if stored.run_id != run.run_id:
+                return stored
+            return await self._launch_or_enqueue(
+                stored,
+                workspace_id=workspace_id,
+                persona=persona,
+                task=task,
+                llm_config=llm_config,
+                agent_spec=agent_spec,
+                agent_def=agent_def,
+                hitl=hitl,
+                plan=plan,
+                quota_already_admitted=True,
+            )
+
         # Atomic idempotent insert FIRST (the race-safe primitive), so an idempotent
         # re-submit (created=False) returns the prior run without ever touching the
         # T0.4 cap — a duplicate spawns no new task. Only a NEWLY-created run is
-        # admitted against the per-workspace outstanding cap below.
+        # admitted against the per-workspace outstanding cap below. (Used by the INLINE
+        # path, the exempt ``__local__`` workspace, and the cap-disabled case.)
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:
             return stored
@@ -1081,6 +1150,46 @@ class RunAppService:
             hitl=hitl,
             plan=plan,
         )
+        # T3 HARD per-tenant outstanding-run cap (dispatch / multi-node path): a continuation
+        # is a real run and MUST land under the SAME atomic gate as a fresh ``create_run`` —
+        # the prior soft ``save_run_if_absent`` + count-then-mark-FAILED ``_admit`` had a
+        # TOCTOU window letting concurrent same-conversation/same-workspace continuations
+        # overshoot the cap. Mirror create_run (count+insert fused in ONE advisory-locked
+        # xact): ``admitted=False`` means the tenant was at/over cap and NOTHING was written
+        # (raise the 429); an idempotent re-submit returns the prior row WITHOUT relaunching
+        # and WITHOUT consuming a slot; a fresh admit launches with the soft re-check skipped.
+        if (
+            self._dispatch_enabled
+            and self._workspace_max_outstanding > 0
+            and workspace_id != LOCAL_WORKSPACE
+        ):
+            stored, admitted = await self._storage.save_run_if_under_quota(
+                run, cap=self._workspace_max_outstanding
+            )
+            if not admitted:
+                raise WorkspaceRunQuotaExceeded(
+                    workspace_id,
+                    cap=self._workspace_max_outstanding,
+                    outstanding=self._workspace_max_outstanding,
+                )
+            if stored.run_id != run.run_id:
+                # idempotent re-submit: do not relaunch, do not consume a slot.
+                return stored
+            return await self._launch_or_enqueue(
+                stored,
+                workspace_id=workspace_id,
+                persona=persona,
+                task=task,
+                llm_config=llm_config,
+                agent_spec=agent_spec,
+                agent_def=agent_def,
+                hitl=hitl,
+                plan=plan,
+                thread=thread,
+                quota_already_admitted=True,
+            )
+
+        # OFF / __local__ / cap<=0 / inline — byte-identical legacy soft path.
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:
             return stored
@@ -1150,6 +1259,7 @@ class RunAppService:
         hitl: bool,
         plan: bool,
         thread: ChatThread | None = None,
+        quota_already_admitted: bool = False,
     ) -> RunRecord:
         """Admit + (inline) launch OR (dispatch) leave QUEUED for the dispatcher (Q3).
 
@@ -1161,8 +1271,25 @@ class RunAppService:
         in dispatch mode is the dispatcher's job (its bounded claim loop + the per-workspace
         execution semaphore at run time), so the in-memory outstanding counter — which a
         cross-process claim could never release — is NOT taken here.
+
+        ``quota_already_admitted`` is set by the dispatch caller when the per-tenant
+        outstanding cap was already enforced ATOMICALLY (count+insert fused) via
+        :meth:`StorageService.save_run_if_under_quota` — the HARD path. In that case the
+        durable count-then-mark-FAILED admit below is SKIPPED (it would double-count and the
+        atomic op already rejected an over-cap create before any row was written).
         """
         if self._dispatch_enabled:
+            # T3 per-tenant QUOTA at enqueue (dispatch / multi-node path): the in-RAM
+            # outstanding counter cannot span worker processes, so the cap is enforced by
+            # COUNTING the workspace's non-terminal runs in the SHARED store before leaving the
+            # run QUEUED. When the caller already enforced the cap atomically
+            # (``quota_already_admitted``), this soft re-check is skipped — the atomic op is
+            # the HARD enforcer and a second count here would only double-work. Otherwise (the
+            # legacy soft fallback) a burst beyond the cap is rejected (the record is marked
+            # FAILED, not orphaned QUEUED) and the 429 propagates. ``0`` disables the cap
+            # (single-tenant default unaffected, since the LOCAL workspace is exempted).
+            if not quota_already_admitted:
+                await self._admit_workspace_run_durable(workspace_id, stored)
             # Recoverable QUEUED state; the dispatcher claims + executes it.
             return stored
 
@@ -1217,6 +1344,48 @@ class RunAppService:
                 outstanding=current,
             )
         self._ws_outstanding[workspace_id] = current + 1
+
+    async def _admit_workspace_run_durable(
+        self, workspace_id: str, stored: RunRecord
+    ) -> None:
+        """Reject a QUEUED enqueue when the tenant is at its outstanding cap (T3, dispatch).
+
+        The cross-node analog of :meth:`_admit_workspace_run`: instead of an in-RAM counter
+        (which a sibling worker process cannot see), it COUNTS the workspace's non-terminal
+        runs in the shared store. A workspace already at :attr:`_workspace_max_outstanding`
+        in-flight runs has THIS run marked FAILED (record preserved, not orphaned QUEUED) and
+        :class:`WorkspaceRunQuotaExceeded` raised (HTTP 429). The reserved ``__local__``
+        single-user workspace is EXEMPT so the offline/single-tenant dispatch path is unchanged
+        (it had no cap before). ``0`` disables the cap. The stored run already exists, so the
+        count includes it; the cap is treated as a ceiling ON TOP of this run (``> cap``).
+        """
+        if self._workspace_max_outstanding <= 0:
+            return
+        if workspace_id == LOCAL_WORKSPACE:
+            return
+        try:
+            active = await self._storage.count_active_runs_for_workspace(workspace_id)
+        except Exception:  # noqa: BLE001 - fail OPEN: a count error must not block enqueue
+            logger.warning(
+                "durable outstanding-quota count failed for workspace %s; admitting",
+                workspace_id,
+            )
+            return
+        # ``active`` includes the just-stored QUEUED run; reject only when it pushes the tenant
+        # ABOVE the cap (so a cap of N admits exactly N concurrent in-flight runs).
+        if active > self._workspace_max_outstanding:
+            stored.status = RunStatus.FAILED
+            stored.error = "rejected: workspace run-concurrency quota exceeded"
+            stored.updated_at = _now()
+            try:
+                await self._storage.save_run(stored)
+            except Exception:  # pragma: no cover - best-effort terminal mark
+                logger.warning("failed to mark quota-rejected run %s", stored.run_id)
+            raise WorkspaceRunQuotaExceeded(
+                workspace_id,
+                cap=self._workspace_max_outstanding,
+                outstanding=active - 1,
+            )
 
     def _release_workspace_run(self, workspace_id: str) -> None:
         """Release one outstanding-run slot for ``workspace_id`` (floors at 0)."""
@@ -2792,6 +2961,40 @@ class RunAppService:
 
             run.lane_key = LANE_DEFAULT
             run.max_attempts = self._default_max_attempts
+        # T3 HARD per-tenant outstanding-run cap (dispatch / multi-node path): an N-member
+        # orchestration writes EXACTLY ONE run row (this single PARENT; members execute
+        # in-process under the parent's per-workspace semaphore and never persist their own
+        # RunRecords), so the parent IS the single admission unit and gating it is the whole
+        # logical-unit gate. In dispatch mode the old code short-circuited to ``return stored``
+        # WITHOUT ever admitting against the outstanding cap — the cap was simply NOT enforced
+        # at create time (deferred to the dispatcher's runtime concurrency cap). Route it
+        # through the SAME atomic op as create_run so a concurrent burst lands EXACTLY at the
+        # cap. ``admitted=False`` => at/over cap and NOTHING written (no parent row, no member
+        # state => zero partial/orphaned orchestration): raise the same 429. An idempotent
+        # re-submit returns the prior row and does NOT consume a slot. A fresh admit leaves the
+        # parent QUEUED for the dispatcher (recoverable on crash) — the SAME dispatch tail as
+        # before, just now atomically capped. No soft ``_admit_workspace_run_durable`` is added
+        # (the dispatch orchestration path never called it; the atomic op is the enforcer).
+        if (
+            self._dispatch_enabled
+            and self._workspace_max_outstanding > 0
+            and workspace_id != LOCAL_WORKSPACE
+        ):
+            stored, admitted = await self._storage.save_run_if_under_quota(
+                run, cap=self._workspace_max_outstanding
+            )
+            if not admitted:
+                raise WorkspaceRunQuotaExceeded(
+                    workspace_id,
+                    cap=self._workspace_max_outstanding,
+                    outstanding=self._workspace_max_outstanding,
+                )
+            if stored.run_id != run.run_id:
+                # idempotent re-submit: do not relaunch, do not consume a slot.
+                return stored
+            # Fresh admit: leave QUEUED for the dispatcher (recoverable on crash).
+            return stored
+
         stored, created = await self._storage.save_run_if_absent_by_idempotency(run)
         if not created:
             return stored

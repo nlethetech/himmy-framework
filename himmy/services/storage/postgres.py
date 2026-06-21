@@ -25,7 +25,9 @@ Production hardening (see IMPROVEMENTS SE-1/4/5/6/10/11):
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -51,6 +53,8 @@ from himmy.services.storage.protocols import normalize_event_type
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.storage.trigger_dedup import DedupClaim
+
+logger = logging.getLogger("himmy.services.storage.postgres")
 
 
 class _Unset:
@@ -722,6 +726,42 @@ def _migration_advisory_lock_key() -> int:
 #: across processes (same derivation style as the entity-registry writer lock).
 MIGRATION_ADVISORY_LOCK_KEY = _migration_advisory_lock_key()
 
+#: Fixed first key of the two-int advisory-lock namespace for the per-WORKSPACE fair-claim
+#: cap (T3). A transaction-scoped ``pg_advisory_xact_lock(NS, ws_hash)`` serialises the
+#: count-then-claim for ONE workspace across worker processes (different workspaces use
+#: different second keys and never contend), so the cross-node per-tenant concurrency cap is a
+#: HARD cap, not a racy best-effort. Distinct from the migration/leader keys.
+FAIR_CLAIM_ADVISORY_NAMESPACE = 0x4654  # 'FT'
+
+
+def _workspace_advisory_key(workspace_id: str) -> int:
+    """Derive the stable signed-32-bit second advisory key for a workspace (T3 fair cap)."""
+    import hashlib
+
+    digest = hashlib.sha256(workspace_id.encode("utf-8")).digest()[:4]
+    value = int.from_bytes(digest, "big", signed=False)
+    return value - (1 << 31)  # pg_advisory_xact_lock(int4, int4) takes signed int4s
+
+
+def _scheduler_leader_lock_key() -> int:
+    """Derive the stable signed-64-bit advisory-lock key for the scheduler-leader lease.
+
+    Distinct from :data:`MIGRATION_ADVISORY_LOCK_KEY` (a DIFFERENT namespace string) so a
+    migrator holding its lock can never block leader election and vice-versa.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(b"himmy.api.scheduler.leader").digest()[:8]
+    value = int.from_bytes(digest, "big", signed=False)
+    return value - (1 << 63)
+
+
+#: Session-level advisory-lock key for the cross-node SCHEDULER-LEADER lease. Exactly one
+#: holder cluster-wide may tick the routine scheduler + run the maintenance sweeps; a
+#: ``pg_try_advisory_lock`` on this key is the lease, auto-released when the holder's
+#: connection drops (process death) for clean failover.
+SCHEDULER_LEADER_LOCK_KEY = _scheduler_leader_lock_key()
+
 
 def _require_asyncpg() -> Any:
     """Import asyncpg lazily, raising a clear error when the extra is missing."""
@@ -1301,6 +1341,80 @@ class PostgresRunStore(_PgStoreBase):
             )
         return _row_to_run(existing, cipher=self._cipher), False
 
+    async def save_run_if_under_quota(
+        self, run: RunRecord, *, cap: int
+    ) -> tuple[RunRecord, bool]:
+        """Atomically create ``run`` IFF the tenant is under its outstanding-run cap (T3, HARD).
+
+        Fuses the idempotency pre-check, the active-run COUNT, and the INSERT into ONE
+        transaction guarded by a TRANSACTION-scoped per-workspace BLOCKING advisory lock
+        (``pg_advisory_xact_lock(FAIR_CLAIM_ADVISORY_NAMESPACE, ws_hash)`` — the SAME
+        namespace as the fair-CLAIM, so a concurrent claimer and a concurrent creator on one
+        workspace serialise against the same per-tenant run-budget lock, while different
+        workspaces hash to different keys and never block each other). A create cannot
+        skip-on-contention like the claim (that would be a spurious 429), so it BLOCKS; the
+        loser then re-counts under the lock and sees the winner's committed row — EXACTLY
+        ``cap`` admits, with the rest a deterministic over-cap reject. The xact-scoped lock
+        auto-releases on commit/rollback (no leak, even on a crash); ``SET LOCAL
+        statement_timeout`` bounds the wait so a stuck lock fails the statement (→ fail-OPEN)
+        rather than hanging the pool.
+
+        Returns ``(run, admitted)``. ``admitted=False`` ⇒ at/over ``cap``, NOTHING inserted
+        (cleaner than the prior insert-then-mark-FAILED). An idempotent re-submit returns the
+        prior run with ``admitted=True`` and does NOT consume a slot. ``cap <= 0`` admits
+        unconditionally.
+
+        FAIL-OPEN on an infrastructure error (lock/count/db/timeout): fall back to the plain
+        race-safe :meth:`save_run_if_absent_by_idempotency` and report ``admitted=True`` so an
+        infra hiccup never turns a quota guard into a hard outage; only a clean over-cap is a
+        fail-CLOSED reject.
+        """
+        if cap <= 0:
+            return await self.save_run_if_absent_by_idempotency(run)
+        from himmy.core.ids import utc_now_iso
+        from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+        run.updated_at = utc_now_iso()
+        statuses = [s.value for s in ACTIVE_RUN_STATUSES]
+        pool = self._require_pool()
+        try:
+            async with pool.acquire() as conn, conn.transaction():
+                # Bound the BLOCKING lock wait so a stuck lock cannot hang the pool; a trip
+                # raises → caught below → fail-OPEN admit.
+                await conn.execute("SET LOCAL statement_timeout = 5000")
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1, $2)",
+                    FAIR_CLAIM_ADVISORY_NAMESPACE,
+                    _workspace_advisory_key(run.workspace_id),
+                )
+                # Idempotent re-submit returns the prior run WITHOUT consuming a slot.
+                if run.idempotency_key is not None:
+                    existing = await conn.fetchrow(
+                        "SELECT * FROM runs "
+                        "WHERE workspace_id = $1 AND idempotency_key = $2",
+                        run.workspace_id,
+                        run.idempotency_key,
+                    )
+                    if existing is not None:
+                        return _row_to_run(existing, cipher=self._cipher), True
+                current = await conn.fetchval(
+                    "SELECT COUNT(*) FROM runs "
+                    "WHERE workspace_id = $1 AND status = ANY($2::text[])",
+                    run.workspace_id,
+                    statuses,
+                )
+                # Count BEFORE insert ⇒ reject at/over the cap so a cap of N admits exactly N.
+                if int(current or 0) >= cap:
+                    return run, False
+                await conn.execute(self._RUN_UPSERT_BY_ID, *self._run_params(run))
+                return run, True
+        except Exception:  # noqa: BLE001 - fail OPEN on infra error (not over-cap)
+            logger.warning(
+                "atomic run-quota create failed for workspace %s; admitting",
+                run.workspace_id,
+            )
+            return await self.save_run_if_absent_by_idempotency(run)
+
     async def claim_run_for_resume(
         self, run_id: str, *, workspace_id: str
     ) -> bool:
@@ -1343,17 +1457,28 @@ class PostgresRunStore(_PgStoreBase):
         *,
         lanes: list[str] | None = None,
         now: str | None = None,
+        fairness: bool = False,
+        workspace_concurrency: int = 0,
     ) -> RunRecord | None:
-        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (or None).
+        """Atomically claim the next ready QUEUED run for ``owner_id`` (or None).
 
         The structural twin of :meth:`claim_run_for_resume`, scaled to many concurrent
-        workers: ``SELECT … FOR UPDATE SKIP LOCKED`` grabs the oldest READY row (``QUEUED`` and
+        workers: ``SELECT … FOR UPDATE SKIP LOCKED`` grabs a READY row (``QUEUED`` and
         ``next_attempt_at <= now``) WITHOUT blocking on a row another worker already locked, so
         N workers each claim a DISTINCT run with no contention — the Postgres-native at-most-
         once dispatch. The selected row is flipped to ``RUNNING`` with owner/lease/heartbeat
         stamped and ``attempt`` incremented, in the SAME transaction. ``lanes`` filters on
         ``lane_key`` (Q2 lane keying) so a dispatcher whose LOCAL probe is down passes only the
         cloud/default lanes and never blocks claiming cloud runs.
+
+        T3-fairness (opt-in via ``fairness=True``): instead of pure global FIFO, the claim
+        prefers the workspace with the FEWEST runs currently RUNNING with a live lease
+        (least-loaded round-robin), so a tenant flooding the queue cannot monopolise free
+        worker slots and starve quieter tenants. ``workspace_concurrency > 0`` additionally
+        applies a CROSS-NODE per-tenant concurrency cap: a workspace already running that many
+        live-leased runs is skipped (its backlog waits), which the per-process execution
+        semaphore alone cannot guarantee across many worker processes. Both default OFF, so the
+        single-tenant / unset-workspace path is byte-identical global FIFO.
         """
         now_iso = now or utc_now_iso()
         lease_until = _iso_plus_seconds(now_iso, lease_seconds)
@@ -1365,6 +1490,15 @@ class PostgresRunStore(_PgStoreBase):
             params.append(list(lanes))
             lane_clause = f" AND lane_key = ANY(${len(params)}::text[])"
         pool = self._require_pool()
+        if fairness:
+            return await self._claim_next_queued_run_fair(
+                owner_id,
+                lease_until,
+                now_iso,
+                lane_clause=lane_clause,
+                params=params,
+                workspace_concurrency=workspace_concurrency,
+            )
         async with pool.acquire() as conn, conn.transaction():
             target = await conn.fetchrow(
                 "SELECT run_id FROM runs "
@@ -1391,6 +1525,115 @@ class PostgresRunStore(_PgStoreBase):
                 now_iso,
             )
         return _row_to_run(row, cipher=self._cipher) if row is not None else None
+
+    async def _claim_next_queued_run_fair(
+        self,
+        owner_id: str,
+        lease_until: str,
+        now_iso: str,
+        *,
+        lane_clause: str,
+        params: list[Any],
+        workspace_concurrency: int,
+    ) -> RunRecord | None:
+        """Per-tenant fair claim: least-loaded workspace first + a HARD cross-node cap (T3).
+
+        Two phases in ONE transaction:
+
+        1. Rank the workspaces that have a ready QUEUED run by their CURRENT live-leased
+           RUNNING load (``lease_expires_at > now`` — an expired lease does not count, it will
+           be reaped), least-loaded first. This is the round-robin fairness: a tenant flooding
+           the queue is always behind a quieter tenant once it has even one run going.
+        2. Walk those workspaces in order. For each, take a TRANSACTION-scoped per-workspace
+           advisory lock (``pg_advisory_xact_lock`` keyed on the workspace) so concurrent
+           claimers for the SAME workspace SERIALISE — without it, N worker transactions each
+           read the same pre-commit count and all admit one more, blowing the cap. Under the
+           lock RE-COUNT the workspace's live load; if still under ``workspace_concurrency``,
+           claim its oldest ready run (``FOR UPDATE SKIP LOCKED`` — the unchanged per-fire
+           at-most-once CAS) and return. Otherwise release (by moving on) and try the next
+           workspace. Different workspaces use different advisory keys, so they never block each
+           other — a lone tenant is never starved or deadlocked.
+
+        ``workspace_concurrency <= 0`` skips the cap entirely (fairness ordering only). The
+        advisory lock auto-releases at transaction end, so a crash never leaks it.
+        """
+        capped = workspace_concurrency > 0
+        # Phase 1: rank candidate workspaces by live load (least first), honouring the lane
+        # filter. ``params`` = [QUEUED, now_iso, *lanes]; ``$2`` is the ready/live "now".
+        rank_sql = (
+            "SELECT r.workspace_id AS ws, COALESCE(load.running, 0) AS running "
+            "FROM runs r "
+            "LEFT JOIN ("
+            "  SELECT workspace_id, COUNT(*) AS running FROM runs "
+            "  WHERE status = 'RUNNING' "
+            "    AND (lease_expires_at IS NULL OR lease_expires_at > $2) "
+            "  GROUP BY workspace_id"
+            ") load ON load.workspace_id = r.workspace_id "
+            "WHERE r.status = $1 "
+            "  AND (r.next_attempt_at IS NULL OR r.next_attempt_at <= $2)"
+            f"{lane_clause} "
+            "GROUP BY r.workspace_id, load.running "
+            "ORDER BY COALESCE(load.running, 0) ASC, r.workspace_id ASC"
+        )
+        pool = self._require_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            candidates = await conn.fetch(rank_sql, *params)
+            for cand in candidates:
+                ws = cand["ws"]
+                if capped:
+                    # Serialise claims for THIS workspace across processes via a TRY-lock
+                    # (non-blocking): a workspace another worker is currently claiming for is
+                    # skipped this round (that worker will admit/reject it), so claimers never
+                    # WAIT on each other and a cross-workspace lock-order deadlock is impossible.
+                    got_lock = await conn.fetchval(
+                        "SELECT pg_try_advisory_xact_lock($1, $2)",
+                        FAIR_CLAIM_ADVISORY_NAMESPACE,
+                        _workspace_advisory_key(ws),
+                    )
+                    if not got_lock:
+                        continue
+                    live = await conn.fetchval(
+                        "SELECT COUNT(*) FROM runs "
+                        "WHERE workspace_id = $1 AND status = 'RUNNING' "
+                        "AND (lease_expires_at IS NULL OR lease_expires_at > $2)",
+                        ws,
+                        params[1],
+                    )
+                    if int(live or 0) >= workspace_concurrency:
+                        continue  # this tenant is at its cap; try the next workspace
+                # Claim the oldest ready run for this workspace (unchanged per-fire CAS).
+                # Keep ``params`` in their original positions (so ``lane_clause``'s ``$N`` still
+                # resolves) and append ``ws`` as a NEW trailing placeholder.
+                ws_placeholder = len(params) + 1
+                target_params: list[Any] = [*params, ws]
+                target = await conn.fetchrow(
+                    "SELECT run_id FROM runs "
+                    "WHERE status = $1 "
+                    "  AND (next_attempt_at IS NULL OR next_attempt_at <= $2)"
+                    f"{lane_clause} "
+                    f"  AND workspace_id = ${ws_placeholder} "
+                    "ORDER BY next_attempt_at ASC NULLS FIRST, created_at ASC "
+                    "FOR UPDATE SKIP LOCKED LIMIT 1",
+                    *target_params,
+                )
+                if target is None:
+                    continue  # another worker drained it between phases; next workspace
+                row = await conn.fetchrow(
+                    """
+                    UPDATE runs
+                    SET status = $2, owner_id = $3, lease_expires_at = $4,
+                        heartbeat_at = $5, attempt = attempt + 1, updated_at = $5
+                    WHERE run_id = $1
+                    RETURNING *
+                    """,
+                    target["run_id"],
+                    RunStatus.RUNNING.value,
+                    owner_id,
+                    lease_until,
+                    now_iso,
+                )
+                return _row_to_run(row, cipher=self._cipher) if row is not None else None
+        return None
 
     async def renew_lease(
         self,
@@ -1603,6 +1846,27 @@ class PostgresRunStore(_PgStoreBase):
                 f"SELECT * FROM runs{where} ORDER BY created_at ASC", *params
             )
         return [_row_to_run(r, cipher=self._cipher) for r in rows]
+
+    async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
+        """Count a workspace's non-terminal (in-flight) runs (T3 cross-node quota).
+
+        The authoritative per-tenant outstanding count for enqueue admission in dispatch mode:
+        an in-RAM counter on one process cannot see runs another worker enqueued, so the cap is
+        counted from the shared DB. QUEUED/RUNNING/AWAITING_APPROVAL/RESOLVING all occupy the
+        tenant's budget; terminal SUCCEEDED/FAILED/PARKED do not.
+        """
+        from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+        statuses = [s.value for s in ACTIVE_RUN_STATUSES]
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchval(
+                "SELECT COUNT(*) FROM runs "
+                "WHERE workspace_id = $1 AND status = ANY($2::text[])",
+                workspace_id,
+                statuses,
+            )
+        return int(row or 0)
 
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str
@@ -2302,6 +2566,73 @@ class PostgresStorageService:
         async with pool.acquire() as conn:
             await conn.execute(STORAGE_DDL)
 
+    # ----------------------------------------------------- scheduler-leader lease
+    async def try_acquire_scheduler_leader(self) -> Any | None:
+        """Try to become the cluster-wide scheduler leader; return a held handle or ``None``.
+
+        Acquires a SESSION-level ``pg_try_advisory_lock`` on :data:`SCHEDULER_LEADER_LOCK_KEY`
+        on a DEDICATED connection checked out of the pool and HELD for the lease's lifetime
+        (it must not be returned to the pool, or the session — and thus the lock — would be
+        recycled). Non-blocking: returns ``None`` immediately if another node already holds
+        the lease.
+
+        On success returns the live connection object (the caller keeps it and passes it back
+        to :meth:`release_scheduler_leader`). The lock is released when the caller calls that —
+        and AUTOMATICALLY by Postgres if this process dies and the TCP connection drops, which
+        is exactly the clean-failover property: a dead leader's lease frees itself and another
+        node's next acquire attempt succeeds, with no permanently-held lock and no manual GC.
+        """
+        pool = self._require_pool()
+        # Check OUT (not ``async with``) so the connection — and its session lock — outlive
+        # this call. release_scheduler_leader checks it back in.
+        conn = await pool.acquire()
+        try:
+            got = await conn.fetchval(
+                "SELECT pg_try_advisory_lock($1)", SCHEDULER_LEADER_LOCK_KEY
+            )
+        except Exception:
+            # Acquire query failed (e.g. connection died): return it and report no lease.
+            with contextlib.suppress(Exception):
+                await pool.release(conn)
+            raise
+        if not got:
+            with contextlib.suppress(Exception):
+                await pool.release(conn)
+            return None
+        return conn
+
+    async def release_scheduler_leader(self, handle: Any | None) -> None:
+        """Release a scheduler-leader lease acquired via :meth:`try_acquire_scheduler_leader`.
+
+        Unlocks the advisory lock on the held connection, then returns that connection to the
+        pool. Idempotent / fail-open: a ``None`` handle or an already-dead connection is a
+        no-op (Postgres will have released the lock on the dropped session anyway).
+        """
+        if handle is None:
+            return
+        pool = self._require_pool()
+        with contextlib.suppress(Exception):
+            await handle.execute(
+                "SELECT pg_advisory_unlock($1)", SCHEDULER_LEADER_LOCK_KEY
+            )
+        with contextlib.suppress(Exception):
+            await pool.release(handle)
+
+    async def scheduler_leader_is_held(self, handle: Any | None) -> bool:
+        """True when ``handle`` is a live connection still holding the leader lease.
+
+        Used by the failover watchdog: if the held connection has dropped (e.g. a transient
+        network blip closed the session and Postgres released the lock), this returns False so
+        the scheduler tier can demote itself and re-contend rather than tick without a lease.
+        """
+        if handle is None:
+            return False
+        try:
+            # A cheap round-trip that also confirms the session (and thus the lock) is alive.
+            return bool(await handle.fetchval("SELECT 1") == 1)
+        except Exception:
+            return False
+
     # ----------------------------------------------------------- knowledge / pgvector
     def knowledge_backend(self) -> Any:
         """Return a pgvector knowledge backend bound to this service's pool.
@@ -2561,6 +2892,12 @@ class PostgresStorageService:
         """Atomically create a run unless its idempotency key already exists."""
         return await self._run_store.save_run_if_absent_by_idempotency(run)
 
+    async def save_run_if_under_quota(
+        self, run: RunRecord, *, cap: int
+    ) -> tuple[RunRecord, bool]:
+        """Atomically create a run IFF the tenant is under its outstanding-run cap (T3)."""
+        return await self._run_store.save_run_if_under_quota(run, cap=cap)
+
     async def claim_run_for_resume(
         self, run_id: str, *, workspace_id: str
     ) -> bool:
@@ -2576,10 +2913,22 @@ class PostgresStorageService:
         *,
         lanes: list[str] | None = None,
         now: str | None = None,
+        fairness: bool = False,
+        workspace_concurrency: int = 0,
     ) -> RunRecord | None:
-        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (Q2; or None)."""
+        """Atomically claim the next ready QUEUED run for ``owner_id`` (Q2; or None).
+
+        ``fairness`` / ``workspace_concurrency`` (T3) opt into per-tenant fair interleaving
+        (least-loaded workspace first) + a cross-node per-tenant concurrency cap; both default
+        OFF so the single-tenant path is byte-identical global FIFO.
+        """
         return await self._run_store.claim_next_queued_run(
-            owner_id, lease_seconds, lanes=lanes, now=now
+            owner_id,
+            lease_seconds,
+            lanes=lanes,
+            now=now,
+            fairness=fairness,
+            workspace_concurrency=workspace_concurrency,
         )
 
     async def renew_lease(
@@ -2663,6 +3012,10 @@ class PostgresStorageService:
     ) -> list[RunRecord]:
         """List runs filtered by workspace, subject, and/or status."""
         return await self._run_store.list_runs(workspace_id, subject_id, status)
+
+    async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
+        """Count a workspace's non-terminal (in-flight) runs (T3 cross-node quota)."""
+        return await self._run_store.count_active_runs_for_workspace(workspace_id)
 
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str

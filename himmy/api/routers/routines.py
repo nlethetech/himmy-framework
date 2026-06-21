@@ -196,7 +196,22 @@ async def create_routine(
         enabled=body.enabled,
         idempotency_key=body.idempotency_key,
     )
-    stored = store.upsert(routine)
+    # T3 per-tenant catch-up ceiling: clamp the routine's backfill down to the tenant cap so
+    # one tenant's launch cannot storm the shared queue with a huge catch-up burst. (Pure
+    # in-memory mutate; must run BEFORE the row is written.)
+    svc.clamp_tenant_catchup(routine)
+    # T3 per-tenant routine quota (HARD): a tenant at its ENABLED-routine cap cannot flood the
+    # shared scheduler with more routines (429). The count and the insert are fused into ONE
+    # atomic store op (advisory-locked on Postgres, BEGIN IMMEDIATE on SQLite) so concurrent
+    # same-workspace creates serialise and land EXACTLY at the cap — no TOCTOU overshoot.
+    # Exempts ``__local__`` + a zero cap (byte-identical single-tenant upsert); fail-open on
+    # infra error inside the store op.
+    try:
+        stored = svc.create_routine_with_quota(
+            store, routine, workspace_id=workspace_id
+        )
+    except svc.TenantRoutineQuotaExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     audit_event(
         request,
         event_type="access",

@@ -219,6 +219,128 @@ def test_worker_scheduler_only_mode_stops_the_dispatcher(
     assert started["stop"] >= 1
 
 
+# --------------------------------------------------- leader / worker split
+
+
+def test_worker_only_mode_never_starts_the_scheduler(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--no-scheduler`` (worker-only) drains the queue but NEVER ticks the scheduler.
+
+    This is the leader/worker split's worker half: many such nodes drain the run-queue while
+    exactly one leader ticks. Assert the scheduler's ``start`` is never called and it stays
+    inactive — even though the dispatcher engages.
+    """
+    import asyncio as _asyncio
+
+    import himmy.cli.commands as commands_mod
+    from himmy.api.routines import get_scheduler, reset_scheduler
+
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "on")
+    reset_scheduler()
+
+    started = {"n": 0}
+    real_start = type(get_scheduler()).start
+
+    def _spy_start(self: Any) -> None:
+        started["n"] += 1
+        return real_start(self)
+
+    monkeypatch.setattr(type(get_scheduler()), "start", _spy_start)
+    reset_scheduler()
+
+    class _InstantEvent(_asyncio.Event):
+        async def wait(self) -> bool:
+            return True
+
+    monkeypatch.setattr(_asyncio, "Event", _InstantEvent)
+
+    run_async(
+        commands_mod._run_worker(run_scheduler=False, run_dispatcher=True)
+    )
+
+    assert started["n"] == 0, "worker-only mode must never start the scheduler"
+    assert get_scheduler().active is False
+
+
+def test_worker_acquires_sqlite_host_leadership_and_starts_scheduler(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lone SQLite worker wins the host-flock topology guard and ticks the scheduler."""
+    import asyncio as _asyncio
+
+    import himmy.cli.commands as commands_mod
+    from himmy.api.routines import get_scheduler, reset_scheduler
+
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "on")
+    reset_scheduler()
+
+    started = {"n": 0}
+    real_start = type(get_scheduler()).start
+
+    def _spy_start(self: Any) -> None:
+        started["n"] += 1
+        return real_start(self)
+
+    monkeypatch.setattr(type(get_scheduler()), "start", _spy_start)
+    reset_scheduler()
+
+    class _InstantEvent(_asyncio.Event):
+        async def wait(self) -> bool:
+            return True
+
+    monkeypatch.setattr(_asyncio, "Event", _InstantEvent)
+
+    run_async(commands_mod._run_worker(run_scheduler=True, run_dispatcher=True))
+
+    assert started["n"] == 1, "the lone SQLite scheduler should have been started once"
+    assert get_scheduler().active is False  # stopped on teardown
+
+
+def test_sqlite_second_scheduler_refused_but_first_runs(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On SQLite the topology guard refuses a SECOND scheduler while the first holds the host flock."""
+
+    from himmy.api.scheduler_leader import acquire_scheduler_leadership
+
+    async def _drive() -> None:
+        from himmy.api.runtime_bootstrap import (
+            build_durable_container,
+            start_run_substrate,
+            stop_run_substrate,
+        )
+        from himmy.services.storage.factory import (
+            reset_server_context,
+            set_server_context,
+        )
+
+        token = set_server_context(True)
+        container, _ = await build_durable_container()
+        substrate = await start_run_substrate(container, install_providers=True)
+        try:
+            assert substrate.backend == "sqlite"
+            lock_base = tmp_path / "locks-host"
+            first = await acquire_scheduler_leadership(
+                container, lock_base=lock_base
+            )
+            assert first.is_leader is True
+            assert first.mode == "host-flock"
+            # A second scheduler on this host cannot coordinate over SQLite -> refused.
+            second = await acquire_scheduler_leadership(
+                container, lock_base=lock_base
+            )
+            assert second.is_leader is False
+            assert second.mode == "refused"
+            await first.release()
+            await second.release()
+        finally:
+            await stop_run_substrate(substrate, clear_providers=True)
+            reset_server_context(token)
+
+    run_async(_drive())
+
+
 # --------------------------------------------------- run-now durable bridge
 
 

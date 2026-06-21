@@ -213,6 +213,46 @@ class InMemoryRunStore:
         self._runs[run.run_id] = run
         return run, True
 
+    async def save_run_if_under_quota(
+        self, run: RunRecord, *, cap: int
+    ) -> tuple[RunRecord, bool]:
+        """Atomically create ``run`` IFF the tenant is under its outstanding-run cap (T3).
+
+        Fuses the idempotency check, the active-run COUNT, and the INSERT — with NO ``await``
+        between them, so on the single event loop two concurrent same-workspace creates cannot
+        interleave: each sees the other's already-inserted run in the count. The result is
+        EXACTLY ``cap`` admits, never the unlocked count-then-insert overshoot.
+
+        Returns ``(run, admitted)``. ``admitted=False`` ⇒ the tenant was at/over ``cap`` and
+        NOTHING was inserted. An idempotent re-submit of an existing key returns the prior run
+        with ``admitted=True`` and does NOT consume a slot (it already holds one). ``cap <= 0``
+        admits unconditionally (cap disabled).
+        """
+        # Idempotent re-submit returns the prior run WITHOUT counting against the cap.
+        key = run.idempotency_key
+        if key is not None:
+            existing_id = self._runs_by_idempotency.get((run.workspace_id, key))
+            if existing_id is not None:
+                existing = self._runs.get(existing_id)
+                if existing is not None:
+                    return existing, True
+        if cap > 0:
+            from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+            active = set(ACTIVE_RUN_STATUSES)
+            current = sum(
+                1
+                for r in self._runs.values()
+                if r.workspace_id == run.workspace_id and r.status in active
+            )
+            # Count BEFORE insert ⇒ reject at/over the cap so a cap of N admits exactly N.
+            if current >= cap:
+                return run, False
+        run.updated_at = utc_now_iso()
+        self._index_idempotency(run)
+        self._runs[run.run_id] = run
+        return run, True
+
     async def claim_run_for_resume(
         self, run_id: str, *, workspace_id: str
     ) -> bool:
@@ -246,15 +286,23 @@ class InMemoryRunStore:
         *,
         lanes: list[str] | None = None,
         now: str | None = None,
+        fairness: bool = False,
+        workspace_concurrency: int = 0,
     ) -> RunRecord | None:
-        """Atomically claim the oldest ready QUEUED run for ``owner_id`` (or None).
+        """Atomically claim the next ready QUEUED run for ``owner_id`` (or None).
 
         The in-memory analog of the SQLite/Postgres claim CAS: with NO ``await`` between the
         scan and the mutation, two concurrent claims on one event loop cannot both win a run.
-        The oldest READY (``QUEUED`` and ``next_attempt_at <= now``) run is selected by
-        ``created_at`` order; ``lanes`` restricts it to the given ``lane_key`` set (Q2 lane
-        keying). The winner flips to ``RUNNING`` with owner/lease/heartbeat stamped and
-        ``attempt`` incremented.
+        A READY (``QUEUED`` and ``next_attempt_at <= now``) run is selected by ``created_at``
+        order; ``lanes`` restricts it to the given ``lane_key`` set (Q2 lane keying). The
+        winner flips to ``RUNNING`` with owner/lease/heartbeat stamped and ``attempt``
+        incremented.
+
+        T3-fairness (opt-in via ``fairness=True``): candidates are ordered by their workspace's
+        live-leased RUNNING count first (least-loaded round-robin), and a positive
+        ``workspace_concurrency`` excludes a workspace already at that cap — the same per-tenant
+        fairness + concurrency cap the durable backends apply, so the in-memory path stays
+        behaviourally faithful for tests. Both default OFF (FIFO unchanged).
         """
         now_iso = now or utc_now_iso()
         if lanes is not None and not lanes:
@@ -269,6 +317,38 @@ class InMemoryRunStore:
         ]
         if not ready:
             return None
+        if fairness:
+            # Per-workspace live-leased RUNNING load (an expired lease will be reaped and
+            # does not count toward the live concurrency).
+            load: dict[str, int] = {}
+            for r in self._runs.values():
+                if r.status == RunStatus.RUNNING and (
+                    r.lease_expires_at is None or r.lease_expires_at > now_iso
+                ):
+                    load[r.workspace_id] = load.get(r.workspace_id, 0) + 1
+            if workspace_concurrency > 0:
+                ready = [
+                    r
+                    for r in ready
+                    if load.get(r.workspace_id, 0) < workspace_concurrency
+                ]
+                if not ready:
+                    return None
+            ready.sort(
+                key=lambda r: (
+                    load.get(r.workspace_id, 0),
+                    r.next_attempt_at or r.created_at,
+                    r.created_at,
+                )
+            )
+            run = ready[0]
+            run.status = RunStatus.RUNNING
+            run.owner_id = owner_id
+            run.lease_expires_at = _iso_plus_seconds(now_iso, lease_seconds)
+            run.heartbeat_at = now_iso
+            run.attempt = int(run.attempt or 0) + 1
+            run.updated_at = now_iso
+            return run
         # Oldest by next_attempt_at then created_at (insertion-order proxy), stable.
         ready.sort(key=lambda r: (r.next_attempt_at or r.created_at, r.created_at))
         run = ready[0]
@@ -379,6 +459,21 @@ class InMemoryRunStore:
             and (subject_id is None or r.subject_id == subject_id)
             and (status is None or r.status == status)
         ]
+
+    async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
+        """Count a workspace's non-terminal (in-flight) runs (T3 quota).
+
+        QUEUED/RUNNING/AWAITING_APPROVAL/RESOLVING occupy the tenant's outstanding budget;
+        terminal SUCCEEDED/FAILED/PARKED do not.
+        """
+        from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+        active = set(ACTIVE_RUN_STATUSES)
+        return sum(
+            1
+            for r in self._runs.values()
+            if r.workspace_id == workspace_id and r.status in active
+        )
 
     async def load_run_by_idempotency(
         self, workspace_id: str, idempotency_key: str

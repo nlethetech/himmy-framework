@@ -91,15 +91,20 @@ class _FakePool:
 
 
 def _install_pool(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> None:
-    """Publish ``pool`` as BOTH the aux pool and reset the shared loop for isolation."""
-    import himmy.services.storage.postgres_aux as aux
+    """Make every aux store resolve ``pool`` as its (loop-bound) pool, for isolated wiring.
 
-    monkeypatch.setattr(aux, "aux_pool", lambda: pool, raising=False)
-    # postgres_aux imports aux_pool lazily inside _AuxPgPool._resolve_async via the factory
-    # module, so patch THAT symbol (the import site).
-    import himmy.services.storage.aux_store_factory as factory
+    The aux stores no longer reuse the main-loop server pool (a loop-affinity bug — an
+    asyncpg pool is bound to its creating loop, so the aux loop could not use it). They open
+    their OWN pool on the aux loop instead. These wiring tests assert the emitted SQL, not the
+    pool plumbing, so we short-circuit ``_AuxPgPool._resolve_async`` to hand back the recording
+    fake — independent of any DSN / live DB.
+    """
+    from himmy.services.storage.postgres_aux import _AuxPgPool
 
-    monkeypatch.setattr(factory, "aux_pool", lambda: pool)
+    async def _resolve(self: _AuxPgPool) -> Any:
+        return pool
+
+    monkeypatch.setattr(_AuxPgPool, "_resolve_async", _resolve, raising=True)
 
 
 def test_owned_pool_resolves_inline_without_nested_loop_run(

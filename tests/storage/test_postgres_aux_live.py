@@ -221,3 +221,39 @@ def test_routine_atomic_tick_null_first_run() -> None:  # pragma: no cover
         r.id, "2026-06-13T02:00:00+00:00", expected_last_run_at=None
     )
     assert again is False
+
+
+def test_routine_count_per_tenant_quota() -> None:  # pragma: no cover
+    """``count`` is the per-tenant routine-quota predicate — it MUST exist + be PG-accurate.
+
+    Regression: the PG routines mirror previously lacked ``count`` entirely, so
+    ``enforce_tenant_routine_quota`` raised AttributeError and the quota FAILED OPEN on the
+    exact multi-tenant Postgres deployment where it matters. This asserts the mirror counts
+    a workspace's routines (and ``enabled_only`` honours the JSON ``enabled`` flag) so the
+    cap actually bites on Postgres.
+    """
+    from himmy.api.routines import Routine, Schedule
+    from himmy.services.storage.postgres_aux import PostgresRoutinesStore
+
+    store = PostgresRoutinesStore(tenant=_tenant(), dsn=_DSN)
+
+    def _mk(ws: str, *, enabled: bool = True) -> Routine:
+        return Routine(
+            name="n",
+            workspace_id=ws,
+            agent_id="a",
+            prompt="p",
+            enabled=enabled,
+            schedule=Schedule(kind="every", hours=1),
+        )
+
+    store.upsert(_mk("ws-1"))
+    store.upsert(_mk("ws-1"))
+    store.upsert(_mk("ws-1", enabled=False))
+    store.upsert(_mk("ws-2"))
+
+    assert store.count(workspace_id="ws-1") == 3
+    assert store.count(workspace_id="ws-1", enabled_only=True) == 2
+    assert store.count(workspace_id="ws-2", enabled_only=True) == 1
+    # a tenant with no routines counts zero (the never-flooded base case)
+    assert store.count(workspace_id="ws-empty", enabled_only=True) == 0
