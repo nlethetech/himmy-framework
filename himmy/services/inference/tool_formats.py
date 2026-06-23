@@ -217,6 +217,20 @@ _HERMES_TOOLS_INSTRUCTION = (
 #: ``<tool_call>`` tag so this regex skips it for free.
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
+#: General format-native tool-use guidance appended to the SHIPPING Hermes/Qwen manifest
+#: (NOT the byte-for-byte A/B baseline body, which uses its own ``_baseline_manifest_body``).
+#: Covers two cases the canonical local template is silent on: emitting several independent
+#: calls in one turn (Hermes's native multi-call form is N back-to-back ``<tool_call>``
+#: blocks, not an array) and declining when no advertised function fits (do not fabricate
+#: a call). General best practice, not benchmark-specific syntax.
+_HERMES_TOOLS_GUIDANCE = (
+    "\n\n"
+    "When several independent calls are needed, emit multiple "
+    "<tool_call></tool_call> blocks back-to-back in the same reply (one JSON object "
+    "per block). If no available function fits the request, do not emit a "
+    "<tool_call>; answer the user directly."
+)
+
 #: The explicit emission discipline a small open-weight model needs (HimalayaGPT-0.5b
 #: otherwise answers in prose or writes a ```python``` block). Appended to the manifest
 #: only when ``flags.no_code_instruction`` is set — opt-in, so the canonical Hermes/Qwen
@@ -430,6 +444,7 @@ def _hermes_manifest_body(
             + "\n"
         )
     lines.append(_HERMES_TOOLS_INSTRUCTION)
+    lines.append(_HERMES_TOOLS_GUIDANCE)
     if flags.no_code_instruction:
         lines.append(_HERMES_NO_CODE_INSTRUCTION)
     if include_fewshot:
@@ -890,6 +905,16 @@ _LLAMA3_MANIFEST_PREAMBLE = (
     "argument name and its value}. Do not use variables.\n\n"
 )
 
+#: General format-native guidance appended AFTER the JSON spec list (outside the array).
+#: Llama's native parallel form is a JSON list of such call objects, and a non-call answer
+#: is plain text. Both are documented Llama-3.1 behaviours, not benchmark-specific syntax.
+_LLAMA3_MANIFEST_GUIDANCE = (
+    "\n\n"
+    "If multiple independent calls are needed, respond with a JSON list of such "
+    "objects. If none of the functions are relevant, respond in plain text instead "
+    "of a function call."
+)
+
 
 def _llama3_render_system_manifest(tools: Sequence[BoundTool], provider: str) -> str:
     """Render the Llama-3.1 JSON-function manifest (preamble + JSON list of specs).
@@ -901,7 +926,7 @@ def _llama3_render_system_manifest(tools: Sequence[BoundTool], provider: str) ->
     """
     specs = _openai_function_specs(tools, provider)
     tools_json = json.dumps(specs, indent=4, ensure_ascii=False)
-    return f"{_LLAMA3_MANIFEST_PREAMBLE}{tools_json}"
+    return f"{_LLAMA3_MANIFEST_PREAMBLE}{tools_json}{_LLAMA3_MANIFEST_GUIDANCE}"
 
 
 #: Match a BARE ``{"name": ..., "parameters": {...}}`` JSON object anywhere in the reply.
@@ -1210,6 +1235,17 @@ def _make_mistral_parse(flags: ToolCallGrammarFlags) -> ReplyParser:
     return _parse
 
 
+#: General format-native guidance appended AFTER the ``[/AVAILABLE_TOOLS]`` envelope.
+#: Mistral's native parallel form is multiple entries in one ``[TOOL_CALLS]`` JSON array,
+#: and a non-call answer is plain text. Documented mistral-common behaviour, not
+#: benchmark-specific syntax.
+_MISTRAL_MANIFEST_GUIDANCE = (
+    " When multiple independent calls are needed, include them as multiple entries "
+    "in a single [TOOL_CALLS] array. If no available tool fits, reply in plain text "
+    "without a [TOOL_CALLS] block."
+)
+
+
 def _make_mistral_render_system_manifest(
     flags: ToolCallGrammarFlags,
 ) -> ManifestRenderer:
@@ -1224,7 +1260,10 @@ def _make_mistral_render_system_manifest(
     def _render(tools: Sequence[BoundTool], provider: str) -> str:
         specs = _openai_function_specs(tools, provider)
         tools_json = json.dumps(specs, separators=(", ", ": "), ensure_ascii=False)
-        return f"[AVAILABLE_TOOLS] {tools_json} [/AVAILABLE_TOOLS]"
+        return (
+            f"[AVAILABLE_TOOLS] {tools_json} [/AVAILABLE_TOOLS]"
+            f"{_MISTRAL_MANIFEST_GUIDANCE}"
+        )
 
     return _render
 

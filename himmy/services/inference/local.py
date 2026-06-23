@@ -167,8 +167,11 @@ def _react_tool_manifest(
         "To call a tool, write a line of the form:\n"
         "TOOL_CALL <tool_name> <json-args>\n"
         f'e.g.  TOOL_CALL {example} {{"some_arg": "value"}}\n'
-        "Use the tool names EXACTLY as listed. You may call more than one tool. "
-        "When you are done using tools, reply with your final answer in prose."
+        "Use the tool names EXACTLY as listed. If the request needs several "
+        "independent tool calls, emit them together, one TOOL_CALL line per call, "
+        "in the same reply. If none of the listed tools can address the request, do "
+        "not invent a call: just reply normally in prose. When you are done using "
+        "tools, reply with your final answer in prose."
     )
     return "\n".join(lines)
 
