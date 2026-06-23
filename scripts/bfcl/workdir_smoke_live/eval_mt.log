@@ -1,0 +1,16 @@
+Number of models evaluated:   0%|          | 0/1 [00:00<?, ?it/s][himmy-arm] init model=qwen/qwen-2.5-7b-instruct format=hermes_chatml_xml use_text_path=True override=hermes_chatml_xml
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 2 call(s): ['mkdir', 'mv']
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 0 call(s): []
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 1 call(s): ['grep']
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 0 call(s): []
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 0 call(s): []
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 3 call(s): ['mkdir', 'mv', 'diff']
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 0 call(s): []
+Number of models evaluated: 100%|██████████| 1/1 [00:00<00:00,  4.83it/s]Number of models evaluated: 100%|██████████| 1/1 [00:00<00:00,  4.83it/s]
+🦍 Model: or-himmy-qwen2.5-7b
+🔍 Running test: multi_turn_base
+✅ Test completed: multi_turn_base. 🎯 Accuracy: 0.00%
+📈 Aggregating data to generate leaderboard score table...
+🏁 Evaluation completed. See /Users/samriddhagc/LocalProjects/himmy-agent-test/scripts/bfcl/workdir_smoke_live/score/data_overall.csv for overall evaluation results on BFCL V4.
+⚠️  Partial evaluation for a single category is enabled (--partial-run flag is set). Accuracy scores are computed only on the subset of entries present in the model result files, which may differ from a full evaluation and from the official leaderboard score.
+See /Users/samriddhagc/LocalProjects/himmy-agent-test/scripts/bfcl/workdir_smoke_live/score/data_live.csv, /Users/samriddhagc/LocalProjects/himmy-agent-test/scripts/bfcl/workdir_smoke_live/score/data_non_live.csv, /Users/samriddhagc/LocalProjects/himmy-agent-test/scripts/bfcl/workdir_smoke_live/score/data_multi_turn.csv, /Users/samriddhagc/LocalProjects/himmy-agent-test/scripts/bfcl/workdir_smoke_live/score/data_agentic.csv and /Users/samriddhagc/LocalProjects/himmy-agent-test/scripts/bfcl/workdir_smoke_live/score/data_format_sensitivity.csv for detailed evaluation results on each sub-section categories respectively.

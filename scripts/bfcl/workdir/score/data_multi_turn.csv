@@ -1,0 +1,5 @@
+Rank,Model,Multi Turn Overall Acc,Base,Miss Func,Miss Param,Long Context
+1,gpt-4o-mini under himmy (OpenRouter, prompting, generic format),6.25%,25.00%,N/A,N/A,N/A
+2,Qwen2.5-7B-Instruct RAW (OpenRouter, prompting),2.50%,10.00%,N/A,N/A,N/A
+3,Qwen2.5-7B-Instruct under himmy (OpenRouter, prompting, hermes_chatml_xml),1.25%,5.00%,N/A,N/A,N/A
+4,gpt-4o-mini RAW (OpenRouter, prompting),1.25%,5.00%,N/A,N/A,N/A

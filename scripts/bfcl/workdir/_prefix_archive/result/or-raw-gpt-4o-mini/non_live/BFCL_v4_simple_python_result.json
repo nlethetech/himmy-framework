@@ -1,0 +1,5 @@
+{"id": "simple_python_0", "result": [{"calculate_triangle_area": "{\"base\":10,\"height\":5}"}], "input_token_count": 117, "output_token_count": 19, "latency": 1.2291719913482666}
+{"id": "simple_python_1", "result": [{"math_factorial": "{\"number\":5}"}], "input_token_count": 79, "output_token_count": 15, "latency": 0.6946558952331543}
+{"id": "simple_python_2", "result": [{"math_hypot": "{\"x\":4,\"y\":5}"}], "input_token_count": 143, "output_token_count": 20, "latency": 0.6722879409790039}
+{"id": "simple_python_3", "result": [{"algebra_quadratic_roots": "{\"a\":1,\"b\":-3,\"c\":2}"}], "input_token_count": 116, "output_token_count": 28, "latency": 2.212430953979492}
+{"id": "simple_python_4", "result": [{"solve_quadratic_equation": "{\"a\":2,\"b\":6,\"c\":5}"}], "input_token_count": 107, "output_token_count": 26, "latency": 0.7847921848297119}

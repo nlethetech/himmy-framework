@@ -1,0 +1,29 @@
+=== QWEN HIMMY-V2 FULL RUN start 2026-06-22T19:30:20 ===
+model=or-himmy-qwen2.5-7b timeout=90s attempts=4
+>>> GENERATE or-himmy-qwen2.5-7b / simple_python  19:30:20
+json.decoder.JSONDecodeError: Expecting value: line 715 column 1 (char 3927)
+Generating results for or-himmy-qwen2.5-7b: 100%|██████████| 170/170 [53:14<00:00, 44.83s/it]Generating results for or-himmy-qwen2.5-7b: 100%|██████████| 170/170 [53:14<00:00, 18.79s/it]
+>>> EVALUATE or-himmy-qwen2.5-7b / simple_python  20:23:39
+✅ Test completed: simple_python. 🎯 Accuracy: 96.67%
+⚠️  Partial evaluation for a single category is enabled (--partial-run flag is set). Accuracy scores are computed only on the subset of entries present in the model result files, which may differ from a full evaluation and from the official leaderboard score.
+>>> GENERATE or-himmy-qwen2.5-7b / multiple  20:23:47
+>>> EVALUATE or-himmy-qwen2.5-7b / multiple  20:23:53
+✅ Test completed: multiple. 🎯 Accuracy: 90.00%
+⚠️  Partial evaluation for a single category is enabled (--partial-run flag is set). Accuracy scores are computed only on the subset of entries present in the model result files, which may differ from a full evaluation and from the official leaderboard score.
+>>> GENERATE or-himmy-qwen2.5-7b / parallel  20:23:59
+>>> EVALUATE or-himmy-qwen2.5-7b / parallel  20:24:05
+✅ Test completed: parallel. 🎯 Accuracy: 83.33%
+⚠️  Partial evaluation for a single category is enabled (--partial-run flag is set). Accuracy scores are computed only on the subset of entries present in the model result files, which may differ from a full evaluation and from the official leaderboard score.
+>>> GENERATE or-himmy-qwen2.5-7b / parallel_multiple  20:24:12
+>>> EVALUATE or-himmy-qwen2.5-7b / parallel_multiple  20:24:18
+✅ Test completed: parallel_multiple. 🎯 Accuracy: 80.00%
+⚠️  Partial evaluation for a single category is enabled (--partial-run flag is set). Accuracy scores are computed only on the subset of entries present in the model result files, which may differ from a full evaluation and from the official leaderboard score.
+>>> GENERATE or-himmy-qwen2.5-7b / irrelevance  20:24:24
+>>> EVALUATE or-himmy-qwen2.5-7b / irrelevance  20:24:30
+✅ Test completed: irrelevance. 🎯 Accuracy: 63.33%
+⚠️  Partial evaluation for a single category is enabled (--partial-run flag is set). Accuracy scores are computed only on the subset of entries present in the model result files, which may differ from a full evaluation and from the official leaderboard score.
+>>> GENERATE or-himmy-qwen2.5-7b / multi_turn_base  20:24:36
+>>> EVALUATE or-himmy-qwen2.5-7b / multi_turn_base  20:24:42
+✅ Test completed: multi_turn_base. 🎯 Accuracy: 5.00%
+⚠️  Partial evaluation for a single category is enabled (--partial-run flag is set). Accuracy scores are computed only on the subset of entries present in the model result files, which may differ from a full evaluation and from the official leaderboard score.
+=== QWEN HIMMY-V2 FULL RUN done 2026-06-22T20:24:49 ===

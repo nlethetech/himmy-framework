@@ -1,0 +1,1 @@
+{"id": "simple_python_0", "result": "<tool_call>\n{\"name\": \"calculate_triangle_area\", \"arguments\": {\"base\": 10, \"height\": 5}}\n</tool_call>", "input_token_count": 296, "output_token_count": 28, "latency": 1.915884017944336}

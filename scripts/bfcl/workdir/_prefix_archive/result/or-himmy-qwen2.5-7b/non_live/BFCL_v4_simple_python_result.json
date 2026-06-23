@@ -1,0 +1,5 @@
+{"id": "simple_python_0", "result": "<tool_call>\n{\"name\": \"calculate_triangle_area\", \"arguments\": {\"base\": 10, \"height\": 5}}\n</tool_call>", "input_token_count": 248, "output_token_count": 28, "latency": 2.8244500160217285}
+{"id": "simple_python_1", "result": "<tool_call>\n{\"name\": \"math.factorial\", \"arguments\": {\"number\": 5}}\n</tool_call>", "input_token_count": 185, "output_token_count": 21, "latency": 0.9287381172180176}
+{"id": "simple_python_2", "result": "<tool_call>\n{\"name\": \"math.hypot\", \"arguments\": {\"x\": 4, \"y\": 5}}\n</tool_call>", "input_token_count": 272, "output_token_count": 28, "latency": 3.3784940242767334}
+{"id": "simple_python_3", "result": "<tool_call>\n{\"name\": \"algebra.quadratic_roots\", \"arguments\": {\"a\": 1, \"b\": -3, \"c\": 2}}\n</tool_call>", "input_token_count": 246, "output_token_count": 36, "latency": 1.9409730434417725}
+{"id": "simple_python_4", "result": "<tool_call>\n{\"name\": \"solve_quadratic_equation\", \"arguments\": {\"a\": 2, \"b\": 6, \"c\": 5}}\n</tool_call>", "input_token_count": 235, "output_token_count": 35, "latency": 0.9223449230194092}

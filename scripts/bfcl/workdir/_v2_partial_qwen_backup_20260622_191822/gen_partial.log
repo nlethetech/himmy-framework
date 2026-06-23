@@ -1,0 +1,19 @@
+=== GENERATE simple_python 19:00:50 ===
+[himmy-arm] init model=qwen/qwen-2.5-7b-instruct format=hermes_chatml_xml use_text_path=True override=hermes_chatml_xml
+Generating results for ['or-himmy-qwen2.5-7b']
+Running specific test cases. Ignoring `--test-category` argument.
+Generating results for or-himmy-qwen2.5-7b:   0%|          | 0/170 [00:00<?, ?it/s][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1067
+Generating results for or-himmy-qwen2.5-7b:   1%|          | 1/170 [00:02<05:48,  2.06s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1087
+Generating results for or-himmy-qwen2.5-7b:   1%|          | 2/170 [03:53<5:44:07, 122.90s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1199
+Generating results for or-himmy-qwen2.5-7b:   2%|▏         | 3/170 [03:56<3:38:22, 78.46s/it] [himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1277
+Generating results for or-himmy-qwen2.5-7b:   2%|▏         | 4/170 [03:57<2:35:21, 56.15s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1120
+Generating results for or-himmy-qwen2.5-7b:   3%|▎         | 5/170 [03:59<1:57:46, 42.83s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1187
+Generating results for or-himmy-qwen2.5-7b:   4%|▎         | 6/170 [08:53<4:23:29, 96.40s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1075
+Generating results for or-himmy-qwen2.5-7b:   4%|▍         | 7/170 [08:55<3:32:37, 78.27s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1075
+Generating results for or-himmy-qwen2.5-7b:   5%|▍         | 8/170 [08:56<2:55:02, 64.83s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=940
+Generating results for or-himmy-qwen2.5-7b:   5%|▌         | 9/170 [12:54<4:09:31, 92.99s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1178
+Generating results for or-himmy-qwen2.5-7b:   6%|▌         | 10/170 [12:57<3:31:13, 79.21s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1278
+Generating results for or-himmy-qwen2.5-7b:   6%|▋         | 11/170 [12:59<3:00:00, 67.93s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1177
+Generating results for or-himmy-qwen2.5-7b:   7%|▋         | 12/170 [13:00<2:34:26, 58.65s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1216
+Generating results for or-himmy-qwen2.5-7b:   8%|▊         | 13/170 [13:01<2:13:15, 50.93s/it][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1520
+Generating results for or-himmy-qwen2.5-7b:   8%|▊         | 13/170 [16:04<3:14:12, 74.22s/it]

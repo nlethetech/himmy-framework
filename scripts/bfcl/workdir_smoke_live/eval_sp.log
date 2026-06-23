@@ -1,0 +1,84 @@
+Number of models evaluated:   0%|          | 0/1 [00:00<?, ?it/s][himmy-arm] init model=qwen/qwen-2.5-7b-instruct format=hermes_chatml_xml use_text_path=True override=hermes_chatml_xml
+[himmy-arm] decode format=hermes_chatml_xml known=1 parsed 1 call(s): ['calculate_triangle_area']
+Number of models evaluated: 100%|██████████| 1/1 [00:00<00:00, 16.18it/s]
+🦍 Model: or-himmy-qwen2.5-7b
+🔍 Running test: simple_python
+✅ Test completed: simple_python. 🎯 Accuracy: 100.00%
+📈 Aggregating data to generate leaderboard score table...
+╭───────────────────── Traceback (most recent call last) ──────────────────────╮
+│ /Users/samriddhagc/.bfcl-venv/lib/python3.12/site-packages/bfcl_eval/__main_ │
+│ _.py:283 in evaluate                                                         │
+│                                                                              │
+│   280 │   """                                                                │
+│   281 │                                                                      │
+│   282 │   load_dotenv(dotenv_path=DOTENV_PATH, verbose=True, override=True)  │
+│       # Load the .env file                                                   │
+│ ❱ 283 │   evaluation_main(model, test_category, result_dir, score_dir,       │
+│       partial_eval)                                                          │
+│   284                                                                        │
+│   285                                                                        │
+│   286 @cli.command()                                                         │
+│                                                                              │
+│ /Users/samriddhagc/.bfcl-venv/lib/python3.12/site-packages/bfcl_eval/eval_ch │
+│ ecker/eval_runner.py:852 in main                                             │
+│                                                                              │
+│   849 │   │   │   model_names.append(model_name.replace("/", "_"))           │
+│   850 │                                                                      │
+│   851 │   # Driver function to run the evaluation for all categories         │
+│       involved.                                                              │
+│ ❱ 852 │   runner(                                                            │
+│   853 │   │   model_names,                                                   │
+│   854 │   │   all_test_categories,                                           │
+│   855 │   │   result_dir,                                                    │
+│                                                                              │
+│ /Users/samriddhagc/.bfcl-venv/lib/python3.12/site-packages/bfcl_eval/eval_ch │
+│ ecker/eval_runner.py:821 in runner                                           │
+│                                                                              │
+│   818 │   # evaluation for a subset of models and test categories.           │
+│   819 │   update_leaderboard_table_with_local_score_file(leaderboard_table,  │
+│       score_dir)                                                             │
+│   820 │   # Write the leaderboard table to a file                            │
+│ ❱ 821 │   generate_leaderboard_csv(leaderboard_table, score_dir)             │
+│   822                                                                        │
+│   823                                                                        │
+│   824 def main(model, test_categories, result_dir, score_dir, partial_eval:  │
+│       bool = False):                                                         │
+│                                                                              │
+│ /Users/samriddhagc/.bfcl-venv/lib/python3.12/site-packages/bfcl_eval/eval_ch │
+│ ecker/eval_runner_helper.py:305 in generate_leaderboard_csv                  │
+│                                                                              │
+│   302 │   │                                                                  │
+│   303 │   │   cost_data = value.get("cost", {"input_data": [],               │
+│       "output_data": []})                                                    │
+│   304 │   │   latency_data = value.get("latency", {"data": []})              │
+│ ❱ 305 │   │   cost, latency_mean, latency_std, percentile_95_latency =       │
+│       get_cost_latency_info(                                                 │
+│   306 │   │   │   model_name_escaped, cost_data, latency_data                │
+│   307 │   │   )                                                              │
+│   308                                                                        │
+│                                                                              │
+│ /Users/samriddhagc/.bfcl-venv/lib/python3.12/site-packages/bfcl_eval/eval_ch │
+│ ecker/eval_runner_helper.py:224 in get_cost_latency_info                     │
+│                                                                              │
+│   221 │   # Calculate latency statistics for ALL models (both API and local) │
+│   222 │   if len(latency_data["data"]) != 0:                                 │
+│   223 │   │   mean_latency = statistics.mean(latency_data["data"])           │
+│ ❱ 224 │   │   std_latency = statistics.stdev(latency_data["data"])           │
+│   225 │   │   percentile_95_latency = np.percentile(latency_data["data"],    │
+│       95)                                                                    │
+│   226 │   │   mean_latency = round(mean_latency, 2)                          │
+│   227 │   │   std_latency = round(std_latency, 2)                            │
+│                                                                              │
+│ /Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/statistics │
+│ .py:970 in stdev                                                             │
+│                                                                              │
+│    967 │   """                                                               │
+│    968 │   T, ss, c, n = _ss(data, xbar)                                     │
+│    969 │   if n < 2:                                                         │
+│ ❱  970 │   │   raise StatisticsError('stdev requires at least two data       │
+│        points')                                                              │
+│    971 │   mss = ss / (n - 1)                                                │
+│    972 │   if issubclass(T, Decimal):                                        │
+│    973 │   │   return _decimal_sqrt_of_frac(mss.numerator, mss.denominator)  │
+╰──────────────────────────────────────────────────────────────────────────────╯
+StatisticsError: stdev requires at least two data points

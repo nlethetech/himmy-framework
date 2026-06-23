@@ -1,0 +1,4 @@
+=== MATRIX: RAW=or-raw-gpt-4o-mini-prompting  HIMMY=or-himmy-gpt-4o-mini ===
+categories: simple_python multiple parallel parallel_multiple irrelevance multi_turn_base
+
+>>> generate or-raw-gpt-4o-mini-prompting / simple_python

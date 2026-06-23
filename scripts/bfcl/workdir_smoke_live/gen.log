@@ -1,0 +1,5 @@
+Usage: bfcl generate [OPTIONS]
+Try 'bfcl generate -h' for help.
+╭─ Error ──────────────────────────────────────────────────────────────────────╮
+│ Got unexpected extra argument (multi_turn_base)                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

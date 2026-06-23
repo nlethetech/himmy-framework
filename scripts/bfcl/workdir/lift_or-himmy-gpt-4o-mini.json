@@ -1,0 +1,188 @@
+{
+  "raw_model": "or-raw-gpt-4o-mini-prompting",
+  "himmy_model": "or-himmy-gpt-4o-mini",
+  "categories": [
+    {
+      "category": "simple_python",
+      "n": 30,
+      "raw_correct": 28,
+      "himmy_correct": 27,
+      "raw_acc": 0.9333333333333333,
+      "himmy_acc": 0.9,
+      "raw_ci": [
+        0.7867654163738308,
+        0.9815229762087295
+      ],
+      "himmy_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "lift_pp": -3.3333333333333326,
+      "mcnemar_b_raw_only": 1,
+      "mcnemar_c_himmy_only": 0,
+      "mcnemar_p": 1.0,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "simple_python_17"
+      ]
+    },
+    {
+      "category": "multiple",
+      "n": 30,
+      "raw_correct": 27,
+      "himmy_correct": 23,
+      "raw_acc": 0.9,
+      "himmy_acc": 0.7666666666666667,
+      "raw_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "himmy_ci": [
+        0.5907167384187784,
+        0.8820761185551049
+      ],
+      "lift_pp": -13.33333333333333,
+      "mcnemar_b_raw_only": 5,
+      "mcnemar_c_himmy_only": 1,
+      "mcnemar_p": 0.21875,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "multiple_10",
+        "multiple_13",
+        "multiple_17",
+        "multiple_20",
+        "multiple_21",
+        "multiple_26"
+      ]
+    },
+    {
+      "category": "parallel",
+      "n": 30,
+      "raw_correct": 27,
+      "himmy_correct": 27,
+      "raw_acc": 0.9,
+      "himmy_acc": 0.9,
+      "raw_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "himmy_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "lift_pp": 0.0,
+      "mcnemar_b_raw_only": 1,
+      "mcnemar_c_himmy_only": 1,
+      "mcnemar_p": 1.0,
+      "mcnemar_leader": null,
+      "discordant_task_ids": [
+        "parallel_8",
+        "parallel_9"
+      ]
+    },
+    {
+      "category": "parallel_multiple",
+      "n": 30,
+      "raw_correct": 29,
+      "himmy_correct": 23,
+      "raw_acc": 0.9666666666666667,
+      "himmy_acc": 0.7666666666666667,
+      "raw_ci": [
+        0.8332960900859082,
+        0.9940914096183874
+      ],
+      "himmy_ci": [
+        0.5907167384187784,
+        0.8820761185551049
+      ],
+      "lift_pp": -19.999999999999996,
+      "mcnemar_b_raw_only": 6,
+      "mcnemar_c_himmy_only": 0,
+      "mcnemar_p": 0.03125,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "parallel_multiple_13",
+        "parallel_multiple_18",
+        "parallel_multiple_21",
+        "parallel_multiple_25",
+        "parallel_multiple_27",
+        "parallel_multiple_3"
+      ]
+    },
+    {
+      "category": "irrelevance",
+      "n": 30,
+      "raw_correct": 28,
+      "himmy_correct": 27,
+      "raw_acc": 0.9333333333333333,
+      "himmy_acc": 0.9,
+      "raw_ci": [
+        0.7867654163738308,
+        0.9815229762087295
+      ],
+      "himmy_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "lift_pp": -3.3333333333333326,
+      "mcnemar_b_raw_only": 2,
+      "mcnemar_c_himmy_only": 1,
+      "mcnemar_p": 1.0,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "irrelevance_14",
+        "irrelevance_25",
+        "irrelevance_26"
+      ]
+    },
+    {
+      "category": "multi_turn_base",
+      "n": 20,
+      "raw_correct": 1,
+      "himmy_correct": 5,
+      "raw_acc": 0.05,
+      "himmy_acc": 0.25,
+      "raw_ci": [
+        0.008881448800795402,
+        0.23613119344674205
+      ],
+      "himmy_ci": [
+        0.11186170140766569,
+        0.468700877618744
+      ],
+      "lift_pp": 20.0,
+      "mcnemar_b_raw_only": 1,
+      "mcnemar_c_himmy_only": 5,
+      "mcnemar_p": 0.21875,
+      "mcnemar_leader": "or-himmy-gpt-4o-mini",
+      "discordant_task_ids": [
+        "multi_turn_base_1",
+        "multi_turn_base_12",
+        "multi_turn_base_13",
+        "multi_turn_base_14",
+        "multi_turn_base_3",
+        "multi_turn_base_7"
+      ]
+    }
+  ],
+  "overall": {
+    "n": 170,
+    "raw_correct": 140,
+    "himmy_correct": 132,
+    "raw_acc": 0.8235294117647058,
+    "himmy_acc": 0.7764705882352941,
+    "raw_ci": [
+      0.7592618409609786,
+      0.8734986106954794
+    ],
+    "himmy_ci": [
+      0.7081306516869896,
+      0.8325919160921655
+    ],
+    "lift_pp": -4.705882352941177,
+    "mcnemar_b_raw_only": 16,
+    "mcnemar_c_himmy_only": 8,
+    "mcnemar_p": 0.15158963203430176,
+    "mcnemar_leader": "or-raw-gpt-4o-mini-prompting"
+  }
+}

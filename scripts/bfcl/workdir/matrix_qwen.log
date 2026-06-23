@@ -1,0 +1,28 @@
+=== MATRIX: RAW=or-raw-qwen2.5-7b-prompting  HIMMY=or-himmy-qwen2.5-7b ===
+categories: simple_python multiple parallel parallel_multiple irrelevance multi_turn_base
+
+>>> generate or-raw-qwen2.5-7b-prompting / simple_python
+Generating results for or-raw-qwen2.5-7b-prompting:  98%|█████████▊| 166/170 [16:47<01:31, 22.93s/it]Generating results for or-raw-qwen2.5-7b-prompting:  98%|█████████▊| 167/170 [18:05<01:25, 28.42s/it]Generating results for or-raw-qwen2.5-7b-prompting:  99%|█████████▉| 168/170 [19:25<01:07, 33.61s/it]Generating results for or-raw-qwen2.5-7b-prompting:  99%|█████████▉| 169/170 [20:58<00:39, 39.54s/it]Generating results for or-raw-qwen2.5-7b-prompting: 100%|██████████| 170/170 [22:31<00:00, 44.84s/it]Generating results for or-raw-qwen2.5-7b-prompting: 100%|██████████| 170/170 [22:31<00:00,  7.95s/it]
+>>> evaluate or-raw-qwen2.5-7b-prompting / simple_python
+✅ Test completed: simple_python. 🎯 Accuracy: 96.67%
+>>> generate or-raw-qwen2.5-7b-prompting / multiple
+Generating results for ['or-raw-qwen2.5-7b-prompting']
+>>> evaluate or-raw-qwen2.5-7b-prompting / multiple
+✅ Test completed: multiple. 🎯 Accuracy: 83.33%
+>>> generate or-raw-qwen2.5-7b-prompting / parallel
+Generating results for ['or-raw-qwen2.5-7b-prompting']
+>>> evaluate or-raw-qwen2.5-7b-prompting / parallel
+✅ Test completed: parallel. 🎯 Accuracy: 83.33%
+>>> generate or-raw-qwen2.5-7b-prompting / parallel_multiple
+Generating results for ['or-raw-qwen2.5-7b-prompting']
+>>> evaluate or-raw-qwen2.5-7b-prompting / parallel_multiple
+✅ Test completed: parallel_multiple. 🎯 Accuracy: 73.33%
+>>> generate or-raw-qwen2.5-7b-prompting / irrelevance
+Generating results for ['or-raw-qwen2.5-7b-prompting']
+>>> evaluate or-raw-qwen2.5-7b-prompting / irrelevance
+✅ Test completed: irrelevance. 🎯 Accuracy: 76.67%
+>>> generate or-raw-qwen2.5-7b-prompting / multi_turn_base
+Generating results for ['or-raw-qwen2.5-7b-prompting']
+>>> evaluate or-raw-qwen2.5-7b-prompting / multi_turn_base
+✅ Test completed: multi_turn_base. 🎯 Accuracy: 10.00%
+>>> generate or-himmy-qwen2.5-7b / simple_python

@@ -1,0 +1,30 @@
+{"id": "simple_python_0", "result": "[calculate_triangle_area(base=10, height=5)]", "input_token_count": 411, "output_token_count": 13, "latency": 1.0416648387908936}
+{"id": "simple_python_1", "result": "[math.factorial(number=5)]", "input_token_count": 339, "output_token_count": 9, "latency": 0.7844688892364502}
+{"id": "simple_python_2", "result": "[math.hypot(x=4, y=5)]", "input_token_count": 437, "output_token_count": 14, "latency": 1.2835147380828857}
+{"id": "simple_python_3", "result": "[algebra.quadratic_roots(a=1, b=-3, c=2)]", "input_token_count": 413, "output_token_count": 20, "latency": 1.3201830387115479}
+{"id": "simple_python_4", "result": "[solve_quadratic_equation(a=2, b=6, c=5)]", "input_token_count": 403, "output_token_count": 19, "latency": 0.7909882068634033}
+{"id": "simple_python_5", "result": "[solve_quadratic(a=3, b=-11, c=-4)]", "input_token_count": 506, "output_token_count": 18, "latency": 0.8963849544525146}
+{"id": "simple_python_6", "result": "[solve_quadratic(a=2, b=5, c=3)]", "input_token_count": 406, "output_token_count": 17, "latency": 0.662222146987915}
+{"id": "simple_python_7", "result": "[calculate_circumference(radius=4, unit='inches')]", "input_token_count": 383, "output_token_count": 16, "latency": 0.9433882236480713}
+{"id": "simple_python_8", "result": "[geometry.area_circle(radius=10)]", "input_token_count": 374, "output_token_count": 9, "latency": 0.8538141250610352}
+{"id": "simple_python_9", "result": "[geometry.calculate_area_circle(radius=5)]", "input_token_count": 377, "output_token_count": 9, "latency": 0.6732420921325684}
+{"id": "simple_python_10", "result": "[calculate_area(base=6, height=10, unit='cm')]", "input_token_count": 429, "output_token_count": 15, "latency": 0.7250697612762451}
+{"id": "simple_python_11", "result": "[calculate_triangle_area(base=10, height=5)]", "input_token_count": 384, "output_token_count": 13, "latency": 0.9669089317321777}
+{"id": "simple_python_12", "result": "[geometry.circumference(radius=3)]", "input_token_count": 371, "output_token_count": 10, "latency": 1.302504062652588}
+{"id": "simple_python_13", "result": "[calculate_area_under_curve(function=\"x**2\", interval=[1, 3])]", "input_token_count": 449, "output_token_count": 18, "latency": 0.7512016296386719}
+{"id": "simple_python_14", "result": "[calculate_derivative(function=\"3*x**2 + 2*x - 1\")]", "input_token_count": 381, "output_token_count": 19, "latency": 0.8382658958435059}
+{"id": "simple_python_15", "result": "[integrate(function='x^3', start_x=-2, end_x=3, method='simpson')]", "input_token_count": 487, "output_token_count": 25, "latency": 0.7449579238891602}
+{"id": "simple_python_16", "result": "[calculus.derivative(function=\"2*x**2\", value=1)]", "input_token_count": 423, "output_token_count": 17, "latency": 0.781444787979126}
+{"id": "simple_python_17", "result": "[get_prime_factors(number=450, formatted=True)]", "input_token_count": 375, "output_token_count": 12, "latency": 0.7844858169555664}
+{"id": "simple_python_18", "result": "[number_analysis.prime_factors(number=123456)]", "input_token_count": 340, "output_token_count": 12, "latency": 0.5856928825378418}
+{"id": "simple_python_19", "result": "[math.gcd(num1=40, num2=50)]", "input_token_count": 368, "output_token_count": 14, "latency": 0.7203497886657715}
+{"id": "simple_python_20", "result": "[math.hcf(number1=36, number2=24)]", "input_token_count": 365, "output_token_count": 14, "latency": 0.6228640079498291}
+{"id": "simple_python_21", "result": "[number_theory.gcd(number1=36, number2=48)]", "input_token_count": 379, "output_token_count": 16, "latency": 1.079172134399414}
+{"id": "simple_python_22", "result": "[math.gcd(num1=12, num2=15)]", "input_token_count": 378, "output_token_count": 15, "latency": 0.8106191158294678}
+{"id": "simple_python_23", "result": "[prime_factorize(number=60, return_type='dictionary')]", "input_token_count": 412, "output_token_count": 14, "latency": 0.7057499885559082}
+{"id": "simple_python_24", "result": "[math.gcd(num1=12, num2=18)]", "input_token_count": 368, "output_token_count": 15, "latency": 1.0200810432434082}
+{"id": "simple_python_25", "result": "[calculate_final_velocity(height=150, initial_velocity=0)]", "input_token_count": 446, "output_token_count": 13, "latency": 0.5770418643951416}
+{"id": "simple_python_26", "result": "[calculate_velocity(distance=50, duration=2)]", "input_token_count": 429, "output_token_count": 11, "latency": 1.2185652256011963}
+{"id": "simple_python_27", "result": "[final_velocity(initial_velocity=10, acceleration=2, time=5)]", "input_token_count": 447, "output_token_count": 16, "latency": 0.6216328144073486}
+{"id": "simple_python_28", "result": "[calculate_displacement(initial_velocity=10, time=5, acceleration=9.8)]", "input_token_count": 442, "output_token_count": 20, "latency": 1.0903680324554443}
+{"id": "simple_python_29", "result": "[calculate_final_speed(initial_speed=0, time=5)]", "input_token_count": 459, "output_token_count": 13, "latency": 0.5774130821228027}

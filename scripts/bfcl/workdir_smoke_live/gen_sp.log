@@ -1,0 +1,40 @@
+[himmy-arm] init model=qwen/qwen-2.5-7b-instruct format=hermes_chatml_xml use_text_path=True override=hermes_chatml_xml
+Generating results for ['or-himmy-qwen2.5-7b']
+Running specific test cases. Ignoring `--test-category` argument.
+Generating results for or-himmy-qwen2.5-7b:   0%|          | 0/2 [00:00<?, ?it/s][himmy-arm] manifest format=hermes_chatml_xml tools=1 bytes=1156
+Generating results for or-himmy-qwen2.5-7b:  50%|█████     | 1/2 [00:01<00:01,  1.92s/it][himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21805
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 2 call(s): ['mkdir', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=173
+[himmy-arm] known-names exact-miss; using per-model union (33 names)
+[himmy-arm] decode format=hermes_chatml_xml known=33 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (33 names)
+[himmy-arm] decode format=hermes_chatml_xml known=33 parsed 1 call(s): ['grep']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=123
+[himmy-arm] known-names exact-miss; using per-model union (33 names)
+[himmy-arm] decode format=hermes_chatml_xml known=33 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (33 names)
+[himmy-arm] decode format=hermes_chatml_xml known=33 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (33 names)
+[himmy-arm] decode format=hermes_chatml_xml known=33 parsed 3 call(s): ['mkdir', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=364
+[himmy-arm] known-names exact-miss; using per-model union (33 names)
+[himmy-arm] decode format=hermes_chatml_xml known=33 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b: 100%|██████████| 2/2 [00:24<00:00, 12.83s/it]Generating results for or-himmy-qwen2.5-7b: 100%|██████████| 2/2 [00:24<00:00, 12.29s/it]
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 2, Step: 0
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 1
+Empty response from the model. Proceed to next turn.

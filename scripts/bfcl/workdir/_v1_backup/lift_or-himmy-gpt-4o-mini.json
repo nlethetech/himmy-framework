@@ -1,0 +1,212 @@
+{
+  "raw_model": "or-raw-gpt-4o-mini-prompting",
+  "himmy_model": "or-himmy-gpt-4o-mini",
+  "categories": [
+    {
+      "category": "simple_python",
+      "n": 30,
+      "raw_correct": 28,
+      "himmy_correct": 27,
+      "raw_acc": 0.9333333333333333,
+      "himmy_acc": 0.9,
+      "raw_ci": [
+        0.7867654163738308,
+        0.9815229762087295
+      ],
+      "himmy_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "lift_pp": -3.3333333333333326,
+      "mcnemar_b_raw_only": 1,
+      "mcnemar_c_himmy_only": 0,
+      "mcnemar_p": 1.0,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "simple_python_17"
+      ]
+    },
+    {
+      "category": "multiple",
+      "n": 30,
+      "raw_correct": 27,
+      "himmy_correct": 24,
+      "raw_acc": 0.9,
+      "himmy_acc": 0.8,
+      "raw_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "himmy_ci": [
+        0.6269430358685175,
+        0.9049489282271013
+      ],
+      "lift_pp": -9.999999999999998,
+      "mcnemar_b_raw_only": 6,
+      "mcnemar_c_himmy_only": 3,
+      "mcnemar_p": 0.5078125,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "multiple_1",
+        "multiple_10",
+        "multiple_13",
+        "multiple_17",
+        "multiple_18",
+        "multiple_20",
+        "multiple_21",
+        "multiple_26",
+        "multiple_7"
+      ]
+    },
+    {
+      "category": "parallel",
+      "n": 30,
+      "raw_correct": 27,
+      "himmy_correct": 16,
+      "raw_acc": 0.9,
+      "himmy_acc": 0.5333333333333333,
+      "raw_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "himmy_ci": [
+        0.36142299619873297,
+        0.6976761109230025
+      ],
+      "lift_pp": -36.66666666666667,
+      "mcnemar_b_raw_only": 11,
+      "mcnemar_c_himmy_only": 0,
+      "mcnemar_p": 0.0009765625,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "parallel_1",
+        "parallel_11",
+        "parallel_15",
+        "parallel_2",
+        "parallel_21",
+        "parallel_22",
+        "parallel_24",
+        "parallel_3",
+        "parallel_5",
+        "parallel_6",
+        "parallel_7"
+      ]
+    },
+    {
+      "category": "parallel_multiple",
+      "n": 30,
+      "raw_correct": 29,
+      "himmy_correct": 11,
+      "raw_acc": 0.9666666666666667,
+      "himmy_acc": 0.36666666666666664,
+      "raw_ci": [
+        0.8332960900859082,
+        0.9940914096183874
+      ],
+      "himmy_ci": [
+        0.21873920806100708,
+        0.5448643634520511
+      ],
+      "lift_pp": -60.00000000000001,
+      "mcnemar_b_raw_only": 18,
+      "mcnemar_c_himmy_only": 0,
+      "mcnemar_p": 7.62939453125e-06,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "parallel_multiple_12",
+        "parallel_multiple_13",
+        "parallel_multiple_15",
+        "parallel_multiple_16",
+        "parallel_multiple_17",
+        "parallel_multiple_18",
+        "parallel_multiple_19",
+        "parallel_multiple_20",
+        "parallel_multiple_21",
+        "parallel_multiple_22",
+        "parallel_multiple_23",
+        "parallel_multiple_25",
+        "parallel_multiple_27",
+        "parallel_multiple_29",
+        "parallel_multiple_3",
+        "parallel_multiple_5",
+        "parallel_multiple_6",
+        "parallel_multiple_8"
+      ]
+    },
+    {
+      "category": "irrelevance",
+      "n": 30,
+      "raw_correct": 28,
+      "himmy_correct": 27,
+      "raw_acc": 0.9333333333333333,
+      "himmy_acc": 0.9,
+      "raw_ci": [
+        0.7867654163738308,
+        0.9815229762087295
+      ],
+      "himmy_ci": [
+        0.7437891742081593,
+        0.9654001112526658
+      ],
+      "lift_pp": -3.3333333333333326,
+      "mcnemar_b_raw_only": 2,
+      "mcnemar_c_himmy_only": 1,
+      "mcnemar_p": 1.0,
+      "mcnemar_leader": "or-raw-gpt-4o-mini-prompting",
+      "discordant_task_ids": [
+        "irrelevance_14",
+        "irrelevance_25",
+        "irrelevance_26"
+      ]
+    },
+    {
+      "category": "multi_turn_base",
+      "n": 20,
+      "raw_correct": 1,
+      "himmy_correct": 5,
+      "raw_acc": 0.05,
+      "himmy_acc": 0.25,
+      "raw_ci": [
+        0.008881448800795402,
+        0.23613119344674205
+      ],
+      "himmy_ci": [
+        0.11186170140766569,
+        0.468700877618744
+      ],
+      "lift_pp": 20.0,
+      "mcnemar_b_raw_only": 1,
+      "mcnemar_c_himmy_only": 5,
+      "mcnemar_p": 0.21875,
+      "mcnemar_leader": "or-himmy-gpt-4o-mini",
+      "discordant_task_ids": [
+        "multi_turn_base_1",
+        "multi_turn_base_13",
+        "multi_turn_base_14",
+        "multi_turn_base_16",
+        "multi_turn_base_3",
+        "multi_turn_base_5"
+      ]
+    }
+  ],
+  "overall": {
+    "n": 170,
+    "raw_correct": 140,
+    "himmy_correct": 110,
+    "raw_acc": 0.8235294117647058,
+    "himmy_acc": 0.6470588235294118,
+    "raw_ci": [
+      0.7592618409609786,
+      0.8734986106954794
+    ],
+    "himmy_ci": [
+      0.5726962953934424,
+      0.7149220917231297
+    ],
+    "lift_pp": -17.647058823529413,
+    "mcnemar_b_raw_only": 39,
+    "mcnemar_c_himmy_only": 9,
+    "mcnemar_p": 1.5221826110689562e-05,
+    "mcnemar_leader": "or-raw-gpt-4o-mini-prompting"
+  }
+}

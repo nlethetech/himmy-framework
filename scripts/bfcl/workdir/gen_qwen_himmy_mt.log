@@ -1,0 +1,1608 @@
+[himmy-arm] init model=qwen/qwen-2.5-7b-instruct format=hermes_chatml_xml use_text_path=True override=hermes_chatml_xml
+Generating results for ['or-himmy-qwen2.5-7b']
+Running specific test cases. Ignoring `--test-category` argument.
+Generating results for or-himmy-qwen2.5-7b:   0%|          | 0/20 [00:00<?, ?it/s][himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21560
+[himmy-arm] decode format=hermes_chatml_xml known=32 parsed 2 call(s): ['mkdir', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=173
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['grep']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=108
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['grep']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=123
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['touch', 'grep']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=121
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['sort']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=83
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['echo', 'sort']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=204
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=262
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=311
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['touch', 'mv', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=374
+Generating results for or-himmy-qwen2.5-7b:   5%|▌         | 1/20 [07:13<2:17:20, 433.72s/it][himmy-arm] manifest format=hermes_chatml_xml tools=18 bytes=13407
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=105
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=187
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['grep']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=114
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  10%|█         | 2/20 [07:28<1:03:55, 213.08s/it][himmy-arm] manifest format=hermes_chatml_xml tools=27 bytes=18872
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'touch']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=153
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cd', 'touch']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=178
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=139
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=79
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['mkdir', 'cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=187
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=323
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=125
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=125
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=121
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=121
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=139
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=266
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=266
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 1, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 1, Step: 3
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 2, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 2, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 6
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 7
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 8
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 9
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 10
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 11
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 12
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 13
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 14
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 15
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 16
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 17
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 18
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 19
+----------------------------------------------------------------------------------------------------
+ID: base_0, Turn: 3, Step: 20
+----------------------------------------------------------------------------------------------------
+ID: base_1, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_1, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_1, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_1, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_1, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_1, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_1, Turn: 3, Step: 0
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 0, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 0, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 2, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 2, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 3, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 3, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 6
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 7
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 8
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 9
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=367
+Generating results for or-himmy-qwen2.5-7b:  15%|█▌        | 3/20 [09:04<48:09, 169.95s/it]  [himmy-arm] manifest format=hermes_chatml_xml tools=18 bytes=13407
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=199
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 4 call(s): ['mkdir', 'cp', 'cp', 'cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=4 bytes=454
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=120
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cp', 'cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=289
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=120
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=120
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=256
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=120
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['find', 'find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=207
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cp', 'cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=289
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=120
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=116
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=157
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=120
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=118
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=159
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=256
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=116
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=157
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cd']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=163
+Generating results for or-himmy-qwen2.5-7b:  20%|██        | 4/20 [10:52<40:30, 151.88s/it][himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21560
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=106
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['sort']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=138
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['post_tweet']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=222
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  25%|██▌       | 5/20 [11:11<29:53, 119.54s/it][himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21560
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['find', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=218
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=146
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=174
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=146
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=146
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=146
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=127
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 10
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 11
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 12
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 13
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 14
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 15
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 16
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 17
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 18
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 19
+----------------------------------------------------------------------------------------------------
+ID: base_2, Turn: 4, Step: 20
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 6
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 7
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 8
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 9
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 10
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 11
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 12
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 13
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 14
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 15
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 16
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 17
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 18
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 19
+----------------------------------------------------------------------------------------------------
+ID: base_3, Turn: 1, Step: 20
+----------------------------------------------------------------------------------------------------
+ID: base_4, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_4, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_4, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_4, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_4, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_4, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 6
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 7
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 8
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 9
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 10
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 11
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 12
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 0, Step: 13
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 1, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 1, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 1, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 1, Step: 5
+----------------------------------------------------------------------------------------------------
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['authenticate_twitter', 'post_tweet']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=274
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['comment']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=109
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  30%|███       | 6/20 [13:27<28:42, 123.00s/it][himmy-arm] manifest format=hermes_chatml_xml tools=18 bytes=13407
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['touch']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=151
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['wc']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=90
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=133
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['touch']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  35%|███▌      | 7/20 [14:19<23:41, 109.35s/it][himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21560
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'mkdir']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=148
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=121
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mkdir']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=132
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=121
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=173
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=121
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=94
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=286
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=248
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=225
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['mkdir', 'echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=251
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'echo', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=353
+Generating results for or-himmy-qwen2.5-7b:  40%|████      | 8/20 [17:13<24:09, 120.75s/it][himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21560
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['grep']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=193
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=268
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['authenticate_twitter', 'post_tweet']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=475
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['comment']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=109
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  45%|████▌     | 9/20 [17:42<19:22, 105.71s/it][himmy-arm] manifest format=hermes_chatml_xml tools=18 bytes=13407
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=93
+ID: base_5, Turn: 1, Step: 6
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_5, Turn: 3, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 0, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 0, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 3, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 4, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 4, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 4, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_6, Turn: 4, Step: 3
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 0, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 0, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 0, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 0, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 0, Step: 5
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 1, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 6
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 7
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 8
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 9
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 10
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 11
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 12
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 13
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 14
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 15
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 16
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 17
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 18
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 19
+----------------------------------------------------------------------------------------------------
+ID: base_7, Turn: 2, Step: 20
+----------------------------------------------------------------------------------------------------
+ID: base_8, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_8, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_8, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_8, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_8, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_8, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_8, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_8, Turn: 3, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 0, Step: 1
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=109
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=123
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cd']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=107
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=177
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=124
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mkdir']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=128
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=129
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=143
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=143
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=123
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=143
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=123
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=143
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=147
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=131
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['head']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=111
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=177
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['sort']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=179
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=177
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  50%|█████     | 10/20 [19:09<17:08, 102.86s/it][himmy-arm] manifest format=hermes_chatml_xml tools=18 bytes=13407
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mkdir']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=136
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['touch']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['echo', 'diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=226
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=123
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['touch', 'echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=79
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['wc']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=95
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  55%|█████▌    | 11/20 [19:37<13:47, 91.94s/it] [himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21560
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=114
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=118
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['post_tweet']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=223
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  60%|██████    | 12/20 [19:52<10:50, 81.32s/it][himmy-arm] manifest format=hermes_chatml_xml tools=18 bytes=13407
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'touch']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=141
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['wc']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=90
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  65%|██████▌   | 13/20 [20:11<08:30, 72.87s/it][himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21560
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['ls', 'find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=201
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['tail']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=117
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=105
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=105
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=105
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=105
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=197
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['head', 'head']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=195
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 0, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 0, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 0, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 0, Step: 5
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 6
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 7
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 8
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 9
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 10
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 11
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 12
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 1, Step: 13
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 2, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 2, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 2, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_9, Turn: 2, Step: 4
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 3, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 3, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 3, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 3, Step: 4
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 4, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_10, Turn: 4, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_11, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_11, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_11, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_11, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_11, Turn: 1, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_12, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_12, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_12, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_12, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_12, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_12, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 0, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 0, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 0, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 0, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 0, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 0, Step: 6
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 1, Step: 2
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cat', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=171
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  70%|███████   | 14/20 [21:09<07:06, 71.04s/it][himmy-arm] manifest format=hermes_chatml_xml tools=28 bytes=18261
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=169
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['grep']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=370
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['tail']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=364
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['message_login', 'send_message', 'add_contact']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=344
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  75%|███████▌  | 15/20 [22:10<05:48, 69.69s/it][himmy-arm] manifest format=hermes_chatml_xml tools=35 bytes=22054
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['touch']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['echo']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['tail']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=91
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['wc', 'wc', 'wc']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=223
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mean']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=77
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  80%|████████  | 16/20 [22:55<04:26, 66.65s/it][himmy-arm] manifest format=hermes_chatml_xml tools=18 bytes=13407
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=256
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=104
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['cd', 'ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=201
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=369
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['mkdir', 'cp', 'mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=355
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+Generating results for or-himmy-qwen2.5-7b:  85%|████████▌ | 17/20 [24:41<03:34, 71.45s/it][himmy-arm] manifest format=hermes_chatml_xml tools=28 bytes=18261
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=103
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['cd', 'find', 'cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=250
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 3 call(s): ['add_contact', 'send_message', 'view_messages_sent']
+[himmy-arm] thread-results format=hermes_chatml_xml n=3 bytes=357
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 2 call(s): ['send_message', 'view_messages_sent']
+[himmy-arm] thread-results format=hermes_chatml_xml n=2 bytes=331
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  90%|█████████ | 18/20 [25:13<02:13, 66.78s/it][himmy-arm] manifest format=hermes_chatml_xml tools=32 bytes=21560
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cd']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=123
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['pwd']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=111
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=191
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mkdir']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=65
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=76
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['ls']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=212
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cat']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=128
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 1, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_13, Turn: 1, Step: 4
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_14, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_14, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_14, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_14, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_14, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_14, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_14, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_14, Turn: 3, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 2, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 3, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 3, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 4, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_15, Turn: 4, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 6
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 7
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 8
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 9
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 10
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 11
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 12
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 13
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 14
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 15
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 16
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 17
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 18
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 19
+----------------------------------------------------------------------------------------------------
+ID: base_16, Turn: 0, Step: 20
+----------------------------------------------------------------------------------------------------
+ID: base_17, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_17, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_17, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_17, Turn: 1, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_17, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_17, Turn: 2, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_17, Turn: 2, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 0, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 0, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 0, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 0, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 0, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 0, Step: 6
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['sort']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=130
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['diff']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=170
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['post_tweet']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=280
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+Generating results for or-himmy-qwen2.5-7b:  95%|█████████▌| 19/20 [26:08<01:05, 65.44s/it][himmy-arm] manifest format=hermes_chatml_xml tools=28 bytes=18261
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=97
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 0 call(s): []
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['find']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=88
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['mv']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+[himmy-arm] known-names exact-miss; using per-model union (260 names)
+[himmy-arm] decode format=hermes_chatml_xml known=260 parsed 1 call(s): ['cp']
+[himmy-arm] thread-results format=hermes_chatml_xml n=1 bytes=149
+Generating results for or-himmy-qwen2.5-7b: 100%|██████████| 20/20 [28:22<00:00, 73.20s/it]Generating results for or-himmy-qwen2.5-7b: 100%|██████████| 20/20 [28:22<00:00, 85.12s/it]
+ID: base_18, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 1, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 2, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 2, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_18, Turn: 2, Step: 2
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 0, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 0, Step: 1
+Empty response from the model. Proceed to next turn.
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 0
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 1
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 2
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 3
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 4
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 5
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 6
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 7
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 8
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 9
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 10
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 11
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 12
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 13
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 14
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 15
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 16
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 17
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 18
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 19
+----------------------------------------------------------------------------------------------------
+ID: base_19, Turn: 1, Step: 20

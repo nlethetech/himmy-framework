@@ -1,0 +1,71 @@
+=== MATRIX: RAW=or-raw-gpt-4o-mini-prompting  HIMMY=or-himmy-gpt-4o-mini ===
+categories: simple_python multiple parallel parallel_multiple irrelevance multi_turn_base
+
+>>> generate or-raw-gpt-4o-mini-prompting / simple_python
+Generating results for or-raw-gpt-4o-mini-prompting:  99%|█████████▉| 169/170 [06:25<00:08,  8.06s/it]Generating results for or-raw-gpt-4o-mini-prompting: 100%|██████████| 170/170 [06:45<00:00,  9.21s/it]Generating results for or-raw-gpt-4o-mini-prompting: 100%|██████████| 170/170 [06:45<00:00,  2.39s/it]
+>>> evaluate or-raw-gpt-4o-mini-prompting / simple_python
+✅ Test completed: simple_python. 🎯 Accuracy: 93.33%
+>>> generate or-raw-gpt-4o-mini-prompting / multiple
+Generating results for ['or-raw-gpt-4o-mini-prompting']
+>>> evaluate or-raw-gpt-4o-mini-prompting / multiple
+✅ Test completed: multiple. 🎯 Accuracy: 90.00%
+>>> generate or-raw-gpt-4o-mini-prompting / parallel
+Generating results for ['or-raw-gpt-4o-mini-prompting']
+>>> evaluate or-raw-gpt-4o-mini-prompting / parallel
+✅ Test completed: parallel. 🎯 Accuracy: 90.00%
+>>> generate or-raw-gpt-4o-mini-prompting / parallel_multiple
+Generating results for ['or-raw-gpt-4o-mini-prompting']
+>>> evaluate or-raw-gpt-4o-mini-prompting / parallel_multiple
+✅ Test completed: parallel_multiple. 🎯 Accuracy: 96.67%
+>>> generate or-raw-gpt-4o-mini-prompting / irrelevance
+Generating results for ['or-raw-gpt-4o-mini-prompting']
+>>> evaluate or-raw-gpt-4o-mini-prompting / irrelevance
+✅ Test completed: irrelevance. 🎯 Accuracy: 93.33%
+>>> generate or-raw-gpt-4o-mini-prompting / multi_turn_base
+Generating results for ['or-raw-gpt-4o-mini-prompting']
+>>> evaluate or-raw-gpt-4o-mini-prompting / multi_turn_base
+✅ Test completed: multi_turn_base. 🎯 Accuracy: 5.00%
+>>> generate or-himmy-gpt-4o-mini / simple_python
+Generating results for or-himmy-gpt-4o-mini: 100%|██████████| 165/165 [11:55<00:00, 15.94s/it]Generating results for or-himmy-gpt-4o-mini: 100%|██████████| 165/165 [11:55<00:00,  4.33s/it]
+>>> evaluate or-himmy-gpt-4o-mini / simple_python
+✅ Test completed: simple_python. 🎯 Accuracy: 90.00%
+>>> generate or-himmy-gpt-4o-mini / multiple
+Generating results for ['or-himmy-gpt-4o-mini']
+>>> evaluate or-himmy-gpt-4o-mini / multiple
+✅ Test completed: multiple. 🎯 Accuracy: 80.00%
+>>> generate or-himmy-gpt-4o-mini / parallel
+Generating results for ['or-himmy-gpt-4o-mini']
+>>> evaluate or-himmy-gpt-4o-mini / parallel
+✅ Test completed: parallel. 🎯 Accuracy: 53.33%
+>>> generate or-himmy-gpt-4o-mini / parallel_multiple
+Generating results for ['or-himmy-gpt-4o-mini']
+>>> evaluate or-himmy-gpt-4o-mini / parallel_multiple
+✅ Test completed: parallel_multiple. 🎯 Accuracy: 36.67%
+>>> generate or-himmy-gpt-4o-mini / irrelevance
+Generating results for ['or-himmy-gpt-4o-mini']
+>>> evaluate or-himmy-gpt-4o-mini / irrelevance
+✅ Test completed: irrelevance. 🎯 Accuracy: 90.00%
+>>> generate or-himmy-gpt-4o-mini / multi_turn_base
+Generating results for ['or-himmy-gpt-4o-mini']
+>>> evaluate or-himmy-gpt-4o-mini / multi_turn_base
+✅ Test completed: multi_turn_base. 🎯 Accuracy: 25.00%
+
+=== LIFT ANALYSIS ===
+
+SAME-MODEL LIFT  RAW=or-raw-gpt-4o-mini-prompting  vs  HIMMY=or-himmy-gpt-4o-mini
+(both arms: same OpenRouter model, same tasks, temperature 0, prompting mode; only difference = himmy manifest+tolerant-parse+coercion in the loop)
+------------------------------------------------------------------------------------------------------------
+category               n    RAW acc   HIMMY acc   lift pp   b(R>H) c(H>R)    McNemar p  leader
+------------------------------------------------------------------------------------------------------------
+simple_python         30      93.3%       90.0%     -3.3        1      0       1.0000  RAW
+multiple              30      90.0%       80.0%    -10.0        6      3       0.5078  RAW
+parallel              30      90.0%       53.3%    -36.7       11      0       0.0010  RAW
+parallel_multiple     30      96.7%       36.7%    -60.0       18      0       0.0000  RAW
+irrelevance           30      93.3%       90.0%     -3.3        2      1       1.0000  RAW
+multi_turn_base       20       5.0%       25.0%    +20.0        1      5       0.2188  HIMMY
+------------------------------------------------------------------------------------------------------------
+POOLED               170      82.4%       64.7%    -17.6       39      9       0.0000  RAW
+------------------------------------------------------------------------------------------------------------
+
+wrote JSON summary -> /Users/samriddhagc/LocalProjects/himmy-agent-test/scripts/bfcl/workdir/lift_or-himmy-gpt-4o-mini.json
+rote JSON summary -> /Users/samriddhagc/LocalProjects/himmy-agent-test/scripts/bfcl/workdir/lift_or-himmy-gpt-4o-mini.json

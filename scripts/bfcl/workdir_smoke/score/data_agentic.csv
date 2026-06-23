@@ -1,0 +1,2 @@
+Rank,Model,Agentic Overall Acc,Web Search Summary,Web Search Base,Web Search No Snippet,Memory Summary,Memory KV,Memory Vector,Memory Recursive Summarization
+1,Qwen2.5-7B-Instruct under himmy (OpenRouter, prompting, hermes_chatml_xml),0.00%,N/A,N/A,N/A,N/A,N/A,N/A,N/A
