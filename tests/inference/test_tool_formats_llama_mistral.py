@@ -101,6 +101,10 @@ _GOLDEN_LLAMA3_MANIFEST = (
     "        }\n"
     "    }\n"
     "]"
+    "\n\n"
+    "If multiple independent calls are needed, respond with a JSON list of such "
+    "objects. If none of the functions are relevant, respond in plain text instead "
+    "of a function call."
 )
 
 
@@ -116,8 +120,9 @@ def test_llama3_manifest_uses_parameters_key_and_first_user_framing() -> None:
     m = LLAMA3_JSON.render_system_manifest([_WEATHER_TOOL], "ollama")
     assert m.startswith("You have access to the following functions.")
     assert '"parameters": dictionary of argument name' in m
-    # The JSON list (not a per-line <tools> block) carries the specs.
-    body = m.split("\n\n", 2)[2]
+    # The JSON list (not a per-line <tools> block) carries the specs; general
+    # format-native guidance prose now trails the list after a blank line.
+    body = m.split("\n\n", 2)[2].rsplit("\n\n", 1)[0]
     parsed = _json.loads(body)
     assert isinstance(parsed, list) and parsed[0]["function"]["name"] == "get_weather"
 
@@ -134,7 +139,7 @@ def test_llama3_manifest_normalizes_per_tool() -> None:
         },
     )
     m = LLAMA3_JSON.render_system_manifest([tool], "ollama")
-    body = m.split("\n\n", 2)[2]
+    body = m.split("\n\n", 2)[2].rsplit("\n\n", 1)[0]
     spec = _json.loads(body)[0]
     assert spec["function"]["parameters"]["properties"]["q"] == {"type": "string"}
 
@@ -313,6 +318,9 @@ _GOLDEN_MISTRAL_MANIFEST = (
     '"parameters": {"type": "object", "properties": {"city": {"type": "string"}}, '
     '"required": ["city"]}}}]'
     " [/AVAILABLE_TOOLS]"
+    " When multiple independent calls are needed, include them as multiple entries "
+    "in a single [TOOL_CALLS] array. If no available tool fits, reply in plain text "
+    "without a [TOOL_CALLS] block."
 )
 
 
@@ -325,8 +333,13 @@ def test_mistral_render_manifest_golden() -> None:
 def test_mistral_manifest_is_available_tools_json_array() -> None:
     m = MISTRAL_V3.render_system_manifest([_WEATHER_TOOL, _TIME_TOOL], "ollama")
     assert m.startswith("[AVAILABLE_TOOLS] ")
-    assert m.endswith(" [/AVAILABLE_TOOLS]")
-    inner = m[len("[AVAILABLE_TOOLS] ") : -len(" [/AVAILABLE_TOOLS]")]
+    # General format-native guidance prose now trails the envelope; slice the JSON
+    # array out from between the canonical [AVAILABLE_TOOLS] ... [/AVAILABLE_TOOLS]
+    # markers rather than off the end of the string.
+    prefix = "[AVAILABLE_TOOLS] "
+    suffix = " [/AVAILABLE_TOOLS]"
+    assert suffix in m
+    inner = m[len(prefix) : m.index(suffix)]
     arr = _json.loads(inner)
     assert [s["function"]["name"] for s in arr] == ["get_weather", "get_time"]
 
@@ -560,17 +573,17 @@ _SHA_PIN_TOOLS = [
 # These two SHAs are the SAME values pinned in test_tool_formats.py — re-pinning them
 # here proves adding LLAMA3_JSON / MISTRAL_V3 did not perturb GENERIC or canonical Hermes.
 _GENERIC_MANIFEST_SHA = (
-    "94e4cc3c5049d6b341211ad79fd936e3e669257911892c28cb2702d8991e666f"
+    "a3843801b22db0510d330b12d6e7156e706ef7ddf54eeba0ab98fd2dc64b3e74"
 )
 _HERMES_MANIFEST_SHA = (
-    "5270d4ef2a80e999b6bc56b9b35bc4f43da5630cce9e1a60d73c683153da4a89"
+    "6b8be9a85924495a245c43bd6aa02184a7f6664717f12b73717873038e92cd8c"
 )
 # The new families' own manifest SHAs (golden-pinned: any drift is a wire-grammar change).
 _LLAMA3_MANIFEST_SHA = (
-    "8f13e00db1acc439ff2239617159fa7bfbeecb050f47ca8425dccc1075f725cd"
+    "b12b9f6ea051ed6a1fc3fdf74fc488523acebc239943fe631ba2f13cccce5f1e"
 )
 _MISTRAL_MANIFEST_SHA = (
-    "34fb463b8dd46a186fc3baa4355ba9a333951733d96333d8f270079092b4ce9f"
+    "34ba5cdb6ec3becc63ba13803c7603a8adeae9b1bc100555c20326475fe68833"
 )
 
 

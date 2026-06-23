@@ -246,6 +246,11 @@ _GOLDEN_HERMES_MANIFEST = (
     "<tool_call>\n"
     '{"name": <function-name>, "arguments": <args-json-object>}\n'
     "</tool_call>"
+    "\n\n"
+    "When several independent calls are needed, emit multiple "
+    "<tool_call></tool_call> blocks back-to-back in the same reply (one JSON object "
+    "per block). If no available function fits the request, do not emit a "
+    "<tool_call>; answer the user directly."
 )
 
 
@@ -1221,10 +1226,10 @@ _SHA_PIN_TOOLS = [
     ),
 ]
 _GENERIC_MANIFEST_SHA = (
-    "94e4cc3c5049d6b341211ad79fd936e3e669257911892c28cb2702d8991e666f"
+    "a3843801b22db0510d330b12d6e7156e706ef7ddf54eeba0ab98fd2dc64b3e74"
 )
 _HERMES_MANIFEST_SHA = (
-    "5270d4ef2a80e999b6bc56b9b35bc4f43da5630cce9e1a60d73c683153da4a89"
+    "6b8be9a85924495a245c43bd6aa02184a7f6664717f12b73717873038e92cd8c"
 )
 
 
