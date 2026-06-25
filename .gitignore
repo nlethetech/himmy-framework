@@ -69,3 +69,11 @@ benchmarks/results/*.log
 # docs/services/*.md + agent guidance, not in the report files).
 docs/inference-reconciliation-reports/
 docs/tools-reconciliation-reports/
+
+# Generated external-benchmark run artifacts (tau2 / Berkeley-BFCL harnesses under
+# scripts/). The harness SCRIPTS are committed; their run output (logs, pid files,
+# file locks, scored results, jsonl turn dumps) is ephemeral and regenerated per run.
+scripts/tau2/workdir/
+scripts/real_bfcl/proj/.file_locks/
+scripts/real_bfcl/proj/score/
+scripts/real_bfcl/proj/result/
