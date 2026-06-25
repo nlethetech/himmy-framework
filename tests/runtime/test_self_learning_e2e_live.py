@@ -61,7 +61,7 @@ from examples.self_learning_live_study import (  # noqa: E402
 )
 
 
-def _isolate_durable_state(tmp_path: Path) -> None:
+def _isolate_durable_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Point the durable spine + run store at a fresh temp dir for this test.
 
     The content-addressed entity spine (``.himmy/spine.db``) is durable and shared across
@@ -69,21 +69,27 @@ def _isolate_durable_state(tmp_path: Path) -> None:
     on-disk tool_definition with a different payload would raise a content-address violation.
     Isolating the spine + store keeps every registration self-consistent. Must run BEFORE any
     runtime build (the spine path is resolved eagerly).
+
+    Uses ``monkeypatch`` so the env mutations are auto-restored at teardown — otherwise the
+    stale (deleted-tmp) HIMMY_SPINE_PATH/HIMMY_STORE_PATH leak into every subsequent test in
+    the same process and break later durable-wiring tests.
     """
-    os.environ["HIMMY_SPINE_PATH"] = str(tmp_path / "spine.db")
-    os.environ["HIMMY_STORE_PATH"] = str(tmp_path / "store.db")
-    os.environ.pop("HIMMY_DATABASE_URL", None)
-    os.environ.pop("HIMMY_SPINE_DATABASE_URL", None)
+    monkeypatch.setenv("HIMMY_SPINE_PATH", str(tmp_path / "spine.db"))
+    monkeypatch.setenv("HIMMY_STORE_PATH", str(tmp_path / "store.db"))
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.delenv("HIMMY_SPINE_DATABASE_URL", raising=False)
 
 
-def test_real_model_steered_away_from_flagged_tool(tmp_path: Path) -> None:
+def test_real_model_steered_away_from_flagged_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """B vs C on a REAL model: self_learning ON reduces flagged-tool selection.
 
     Bounded for runtime (N=4 per arrangement -> 16 trials per condition, 4 conditions =
     64 live turns) but rigorous: counterbalanced, production make_task path, pre-flight
     invariants verified, real token usage asserted, pre-registered pass criterion enforced.
     """
-    _isolate_durable_state(tmp_path)
+    _isolate_durable_state(tmp_path, monkeypatch)
 
     async def _run() -> None:
         # --- Pre-flight: reorder + annotation + hint + hint-in-system-prompt MUST all

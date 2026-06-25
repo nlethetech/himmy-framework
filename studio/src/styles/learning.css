@@ -1,0 +1,159 @@
+/* Learning panel — per-tool reputation rows + reorder history. */
+
+.learn-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 2px 0 10px;
+}
+.learn-flaky {
+  color: var(--red);
+}
+.learn-ok {
+  color: var(--ok);
+}
+.dimtext {
+  color: var(--text-dim);
+}
+
+.learn-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.4fr) 2fr 44px 70px 110px auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  margin-bottom: 6px;
+}
+/* Muted (ignored) tools are de-emphasised — out of the flaky bucket. */
+.learn-row-ignored {
+  opacity: 0.55;
+}
+.learn-name {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.learn-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.learn-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+}
+.learn-bar-fill.ok {
+  background: var(--ok);
+}
+.learn-bar-fill.warn {
+  background: var(--warn);
+}
+.learn-bar-fill.err {
+  background: var(--red);
+}
+.learn-bar-fill.dim {
+  background: var(--text-dim);
+}
+.learn-score {
+  font-size: 12px;
+  text-align: right;
+  color: var(--text);
+}
+.learn-counts {
+  font-size: 11px;
+}
+.learn-reorder {
+  font-size: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.learn-reorder:last-child {
+  border-bottom: none;
+}
+
+/* ---- Operator overrides (Sprint 2 "teach & correct") ------------------- */
+
+/* Trust-feedback gate header. */
+.learn-trust {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+}
+.learn-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.learn-toggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.learn-trust-help {
+  font-size: 11px;
+}
+
+/* Per-row action buttons (Pin / Mute / Reset / Clear). */
+.learn-actions {
+  display: inline-flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.learn-act {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+.learn-act:hover:not(:disabled) {
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+.learn-act:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Override verdict chips — replace the auto-learning pill when set. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+.chip-pinned {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.chip-ignored {
+  color: var(--text-dim);
+}
+.chip-reset {
+  color: var(--warn);
+}

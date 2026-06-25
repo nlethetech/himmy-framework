@@ -90,6 +90,14 @@ class AgentSpec(BaseModel):
     # models from tool-choice overload. Small toolsets skip routing entirely.
     tool_router: bool | None = None
     guardrails: list[str] = []
+    # Secure-by-default credential redaction. When True (the default), himmy redacts
+    # CREDENTIALS ONLY (API keys, JWTs, URL-embedded credentials) from every outbound
+    # vector — tool arguments, tool results, and the final answer — for EVERY spec-built
+    # agent (including ones created in Studio). Unlike full ``pii`` (email/phone/...), the
+    # secrets subset never appears in legitimate agent output, so this is safe to enforce
+    # by default and closes the "a spec that omits guardrails leaks secrets" hole. Set
+    # False to opt out entirely; add ``"pii"`` to ``guardrails`` for personal-data redaction.
+    redact_secrets: bool = True
     memory: bool = False  # auto-recall long-term memory into the prompt each run
     memory_top_k: int = 5
     # Self-learning (P1, opt-in): mine recorded TOOL_FAILED/TOOL_COMPLETED signals into a

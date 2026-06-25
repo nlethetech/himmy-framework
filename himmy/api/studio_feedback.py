@@ -18,15 +18,24 @@ version — a full, ordered audit of every verdict change.
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 from pydantic import BaseModel
 
 from himmy.api.studio_entities import get_entity_registry
 from himmy.api.studio_runs import FEEDBACK_VERDICTS, get_run_store
+from himmy.core.events import EventType
 from himmy.core.ids import utc_now_iso
 from himmy.entities.records import stable_id_for
 
+logger = logging.getLogger("himmy.api.studio_feedback")
+
 #: Entity-spine kind for human run feedback.
 RUN_FEEDBACK_KIND = "run_feedback"
+
+#: Map a feedback verdict to a [0, 1] outcome score (👍 → 1.0, 👎 → 0.0).
+_VERDICT_SCORE = {"up": 1.0, "down": 0.0}
 
 
 def _feedback_subject() -> str:
@@ -118,6 +127,76 @@ def record_feedback(
         created_at=at,
         version=record.version,
     )
+
+
+async def _discover_run_tools(
+    storage: Any, *, trace_id: str | None, thread_id: str | None
+) -> list[str]:
+    """The tool names a run invoked, from its ``TOOL_COMPLETED`` events (trace then thread)."""
+    events: list[Any] = []
+    try:
+        if trace_id:
+            events = await storage.list_events(
+                trace_id=trace_id, event_type=EventType.TOOL_COMPLETED, limit=500
+            )
+        if not events and thread_id:
+            events = await storage.list_events(
+                thread_id=thread_id, event_type=EventType.TOOL_COMPLETED, limit=500
+            )
+    except Exception:  # pragma: no cover - defensive: discovery never breaks feedback
+        logger.debug("feedback tool discovery failed", exc_info=True)
+        return []
+    return [
+        name
+        for name in (getattr(e, "payload", {}).get("tool_name") for e in events)
+        if isinstance(name, str) and name
+    ]
+
+
+async def attribute_feedback_outcomes(
+    *,
+    verdict: str,
+    run_id: str | None = None,
+    trace_id: str | None = None,
+    thread_id: str | None = None,
+    workspace_id: str | None = None,
+) -> int:
+    """Turn a 👍/👎 verdict into per-tool ``OUTCOME_SCORED`` signals (best-effort).
+
+    Attributes the run-level verdict to every tool the run actually called, so positive
+    feedback reinforces the tools behind a good answer and a thumbs-down counts against the
+    ones behind a bad one. The events are recorded now and surfaced in the Learning panel,
+    but only move a tool's reputation for an agent that opts into ``outcome_weight > 0`` —
+    off by default, so there is no surprise behaviour change. Never raises; returns the
+    number of ``OUTCOME_SCORED`` events emitted.
+    """
+    score = _VERDICT_SCORE.get(verdict)
+    if score is None:
+        return 0
+    try:
+        from himmy.api.studio_canonical import resolve_canonical_storage
+        from himmy.services.learning.outcome import OutcomeRecorder
+
+        storage = resolve_canonical_storage()
+        if storage is None:
+            return 0
+        # CLI feeds run_id == trace_id; Studio feeds a run_id + the run's thread_id.
+        tools = await _discover_run_tools(
+            storage, trace_id=trace_id or run_id, thread_id=thread_id
+        )
+        if not tools:
+            return 0
+        recorder = OutcomeRecorder(storage, workspace_id=workspace_id)
+        return await recorder.record_user_feedback(
+            score,
+            tool_names=tools,
+            run_id=run_id,
+            trace_id=trace_id,
+            thread_id=thread_id,
+        )
+    except Exception:  # pragma: no cover - defensive: a learning signal never breaks feedback
+        logger.debug("attribute_feedback_outcomes failed", exc_info=True)
+        return 0
 
 
 def get_feedback(run_id: str) -> RunFeedback | None:

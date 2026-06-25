@@ -61,19 +61,29 @@ def _ipv4_ok(text: str) -> bool:
 def _phone_ok(text: str) -> bool:
     """False for values the broad phone pattern over-catches and must NOT redact:
 
-    * a bare decimal number — a lat/long coordinate, price, or version like
-      ``27.7172453``;
-    * an ISO-8601 calendar date like ``2026-06-12`` — legitimate input for
-      date-aware tools (a forex ``from_date``, a calendar query), and no real phone
-      number is shaped ``YYYY-MM-DD``.
+    * ANY value containing a decimal number — a digit-dot-digit anywhere — because real
+      phone numbers are never written with a decimal point. This covers a lone decimal
+      (a lat/long ``27.7172453``, a price, a version), AND the broad-pattern's worst
+      failure: several numbers MERGED across the spaces/parens/dots the phone class allows,
+      e.g. ``2.00 (-0.376647834`` from "down -2.00 (-0.38%)" or ``816.69 (-1.03`` from a
+      NAV line — financial/statistical text the recommender and money tools emit constantly;
+    * an ISO-8601 calendar date like ``2026-06-12`` — legitimate input for date-aware tools;
+    * a range of two calendar years like ``1916-2016`` (or ``2011 - 2019``) — ubiquitous in
+      research/citations. Scoped to plausible years (1500–2099) so a genuine 8-digit number
+      like ``1234-5678`` still redacts.
 
-    Everything else (real phones, long digit runs the phone rule catches as a safety
-    net) returns True and is left for redaction.
+    Everything else (real phones — contiguous digit groups separated only by spaces/hyphens/
+    parens, with no decimal point — and long bare digit runs) returns True for redaction. The
+    trade-off: a dotted phone like ``415.555.0132`` is left intact, which is the right call for
+    a research/finance assistant where decimals are overwhelmingly data, not phone numbers.
     """
     stripped = text.strip()
-    if re.fullmatch(r"\d+\.\d+", stripped):  # lat/long, price, version number
+    if re.search(r"\d\.\d", stripped):  # contains a decimal number -> data, not a phone
         return False
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stripped):  # ISO-8601 date
+        return False
+    _YEAR = r"(?:1[5-9]\d{2}|20\d{2})"  # 1500–2099
+    if re.fullmatch(rf"{_YEAR}\s*-\s*{_YEAR}", stripped):  # year range, e.g. 1916-2016
         return False
     return True
 
@@ -188,6 +198,31 @@ class PIIGuardrail:
         """Replace any detected PII with typed placeholders (never blocks)."""
         redacted, flags = _redact(text, self._rules)
         return GuardrailVerdict(allowed=True, text=redacted, flags=flags)
+
+
+# The credential-only subset of the PII rules: things that must NEVER leak and that no
+# legitimate agent output, tool argument, or tool result should ever contain. Unlike the
+# personal-data rules (email/phone/card/...), redacting these breaks nothing real — a model
+# emitting a raw API key is hallucinating or exfiltrating — so this subset is safe to enable
+# by default (see ``SecretsGuardrail`` + ``AgentSpec.redact_secrets``).
+_SECRET_RULE_LABELS = frozenset({"api_key", "jwt", "url_credentials"})
+_SECRET_RULES: list[PIIRule] = [r for r in _PII_RULES if r.label in _SECRET_RULE_LABELS]
+
+
+class SecretsGuardrail(PIIGuardrail):
+    """Redacts ONLY credentials (API keys, JWTs, URL-embedded credentials).
+
+    The safe-by-default subset of :class:`PIIGuardrail`: enabling it cannot mangle a
+    legitimate email/phone the agent was asked to act on, so himmy turns it on for every
+    spec-built agent (opt out with ``redact_secrets: false``). For personal-data redaction
+    add ``pii`` to ``guardrails`` explicitly.
+    """
+
+    name = "secrets"
+
+    def __init__(self) -> None:
+        """Restrict the PII rule set to the credential subset."""
+        super().__init__(rules=_SECRET_RULES)
 
 
 # --------------------------------------------------------------------- injection
@@ -368,6 +403,7 @@ class GroundingGuardrail:
 #: no-arg factory (``factory()`` builds the guardrail in :func:`build_guardrail_pipeline`).
 BUILTIN_GUARDRAILS: dict[str, Callable[[], Guardrail]] = {
     "pii": PIIGuardrail,
+    "secrets": SecretsGuardrail,
     "injection": InjectionGuardrail,
     "nepal_pii": NepalPIIGuardrail,
     "grounding": GroundingGuardrail,
@@ -401,6 +437,7 @@ BUILTIN_GUARDRAILS["dlp"] = build_dlp_guardrail
 __all__ = [
     "PIIRule",
     "PIIGuardrail",
+    "SecretsGuardrail",
     "InjectionGuardrail",
     "BlocklistGuardrail",
     "NepalPIIGuardrail",

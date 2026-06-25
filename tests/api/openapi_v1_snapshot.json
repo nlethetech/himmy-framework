@@ -230,6 +230,11 @@
             ],
             "title": "Provider"
           },
+          "redact_secrets": {
+            "default": true,
+            "title": "Redact Secrets",
+            "type": "boolean"
+          },
           "role": {
             "anyOf": [
               {

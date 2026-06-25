@@ -406,6 +406,15 @@ async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if fb is None:
         raise HTTPException(status_code=404, detail="run not found")
+    # Attribute the verdict to the tools this run used (positive-signal learning). The run's
+    # thread_id locates its tool events; best-effort, off-by-default for behaviour change.
+    run = studio_feedback.get_run_store().get(run_id)
+    await studio_feedback.attribute_feedback_outcomes(
+        verdict=body.verdict,
+        run_id=run_id,
+        thread_id=getattr(run, "thread_id", None),
+        workspace_id=getattr(run, "workspace_id", None),
+    )
     return fb
 
 

@@ -43,6 +43,7 @@ from himmy.core.events import EventType, RunEvent
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.core.events import EventSink
+    from himmy.services.learning.overrides import OverrideSet
     from himmy.services.storage.protocols import EventLog
 
 logger = logging.getLogger("himmy.services.learning")
@@ -65,6 +66,12 @@ NEUTRAL_SCORE = 1.0
 #: built with the default is byte-for-byte the P1 service. A value in (0, 1] mixes in the
 #: outcome-weighted success rate.
 DEFAULT_OUTCOME_WEIGHT = 0.0
+
+#: The effective ``outcome_weight`` the runtime adopts when the per-workspace
+#: ``trust_feedback`` gate (Sprint 2) is ON and the operator has NOT set an explicit
+#: ``outcome_weight > 0`` — the sensible default that lifts the recorded 👍/👎 outcomes
+#: from inert (0.0). Kept here next to the weight it sets; re-exported from ``overrides``.
+TRUST_FEEDBACK_DEFAULT_WEIGHT = 0.3
 
 
 @dataclass(frozen=True)
@@ -129,6 +136,7 @@ class LearningService:
         workspace_id: str | None = None,
         outcome_weight: float = DEFAULT_OUTCOME_WEIGHT,
         min_outcome_samples: int = DEFAULT_MIN_SAMPLES,
+        override_set: OverrideSet | None = None,
     ) -> None:
         self._events = event_log
         self._window = max(1, int(window))
@@ -144,6 +152,11 @@ class LearningService:
         # operational score — the byte-identical feature-off path.
         self._outcome_weight = min(1.0, max(0.0, float(outcome_weight)))
         self._min_outcome_samples = max(1, int(min_outcome_samples))
+        # Sprint 2: operator overrides (pin / mute / reset). ``None`` (the default) means
+        # NO overrides -> every reputation read is byte-identical to Sprint 1: no apply,
+        # no reset-cutoff filter. The set is loaded once at runtime-build time and threaded
+        # in, so the per-turn read pays no extra storage cost.
+        self._override_set = override_set
 
     @property
     def outcome_enabled(self) -> bool:
@@ -168,7 +181,15 @@ class LearningService:
         return result
 
     async def _reputation_for_tool(self, tool_name: str) -> ToolReputation:
-        """Compute one tool's reputation, swallowing any storage/data error to neutral."""
+        """Compute one tool's reputation, swallowing any storage/data error to neutral.
+
+        The raw mined reputation is passed through the SHARED
+        :func:`~himmy.services.learning.overrides.apply_override` so a pinned / muted tool
+        is reported reliable (score 1.0, not flaky) — the SINGLE application point, so the
+        sync provider snapshot, the hint adapter, and the report all inherit it. With no
+        override set (the default) ``apply_override`` is the identity, so the read is
+        byte-identical to Sprint 1.
+        """
         try:
             completed, failed = await self._recent_counts(tool_name)
         except Exception:  # pragma: no cover - defensive: learning never breaks a run
@@ -176,20 +197,22 @@ class LearningService:
                 "reputation read failed for tool %r; using neutral", tool_name,
                 exc_info=True,
             )
-            return self._neutral(tool_name)
+            return self._apply_override(self._neutral(tool_name))
         total = completed + failed
         if total < self._min_samples:
             # Cold-start / sub-threshold: keep the neutral prior but carry the real
             # counts so a hint can still mention them if a consumer chooses to. The
             # operational signal is what gates samples, so the outcome read is skipped:
             # an under-sampled tool always reports neutral regardless of any grades.
-            return ToolReputation(
-                tool_name=tool_name,
-                completed=completed,
-                failed=failed,
-                score=NEUTRAL_SCORE,
-                has_min_samples=False,
-                operational_score=NEUTRAL_SCORE,
+            return self._apply_override(
+                ToolReputation(
+                    tool_name=tool_name,
+                    completed=completed,
+                    failed=failed,
+                    score=NEUTRAL_SCORE,
+                    has_min_samples=False,
+                    operational_score=NEUTRAL_SCORE,
+                )
             )
         operational = completed / total if total else NEUTRAL_SCORE
         # P2: read+blend the outcome signal ONLY when the weight is positive. With the
@@ -208,16 +231,32 @@ class LearningService:
                 )
                 outcome_score, outcome_samples = None, 0
         score = self._blend(operational, outcome_score)
-        return ToolReputation(
-            tool_name=tool_name,
-            completed=completed,
-            failed=failed,
-            score=score,
-            has_min_samples=True,
-            operational_score=operational,
-            outcome_score=outcome_score,
-            outcome_samples=outcome_samples,
+        return self._apply_override(
+            ToolReputation(
+                tool_name=tool_name,
+                completed=completed,
+                failed=failed,
+                score=score,
+                has_min_samples=True,
+                operational_score=operational,
+                outcome_score=outcome_score,
+                outcome_samples=outcome_samples,
+            )
         )
+
+    def _apply_override(self, rep: ToolReputation) -> ToolReputation:
+        """Fold this tool's operator override (if any) into the mined reputation.
+
+        Delegates to the shared :func:`~himmy.services.learning.overrides.apply_override`
+        so display and runtime behaviour can never diverge. With no override set this is
+        the identity (byte-identical to Sprint 1). RESET is NOT applied here — it is an
+        upstream event cutoff in :meth:`_recent_counts` / :meth:`_outcome_signal`.
+        """
+        if self._override_set is None:
+            return rep
+        from himmy.services.learning.overrides import apply_override
+
+        return apply_override(rep, self._override_set.for_tool(rep.tool_name))
 
     def _blend(self, operational: float, outcome: float | None) -> float:
         """Convex-blend the operational and outcome signals by ``outcome_weight``.
@@ -248,6 +287,7 @@ class LearningService:
             limit=self._window,
             newest_first=True,
         )
+        events = self._drop_before_reset(tool_name, events)
         scores: list[float] = []
         for e in events:
             raw = (e.payload or {}).get("outcome_score")
@@ -285,6 +325,14 @@ class LearningService:
             limit=self._window,
             newest_first=True,
         )
+        # Sprint 2 RESET: forget every event at/before the reset cutoff so a reset tool
+        # rebuilds its reputation from now. The list_events backends have no ``since``
+        # param (adding one touches all three), so this is an in-memory post-read string
+        # compare on the zero-padded ISO-microsecond UTC ``timestamp`` (lexicographic ==
+        # chronological — the same assumption the cross-type merge below makes). Runs only
+        # for a tool that actually has a cutoff, so the no-reset path is untouched.
+        completed = self._drop_before_reset(tool_name, completed)
+        failed = self._drop_before_reset(tool_name, failed)
         # Merge both newest-first reads and keep only the most-recent ``window`` events
         # across the two types (ordered by recorded timestamp, which is monotonic with
         # insertion order). Counting within that combined slice is the recency cut.
@@ -306,6 +354,30 @@ class LearningService:
         )[: self._window]
         n_completed = sum(1 for _, et in merged if et is EventType.TOOL_COMPLETED)
         return n_completed, len(merged) - n_completed
+
+    def _drop_before_reset(
+        self, tool_name: str, events: list[RunEvent]
+    ) -> list[RunEvent]:
+        """Drop events at/before this tool's RESET cutoff (no-op when there is none).
+
+        Returns ``events`` unchanged unless an :class:`OverrideSet` carries a RESET cutoff
+        for ``tool_name`` — so the no-reset path is byte-identical to Sprint 1. The compare
+        is ``e.timestamp <= cutoff`` on the zero-padded ISO-microsecond UTC strings, which
+        is chronological for ``utc_now_iso`` timestamps. A malformed / missing timestamp is
+        kept (fail-open).
+        """
+        if self._override_set is None:
+            return events
+        cutoff = self._override_set.reset_cutoff_for(tool_name)
+        if not cutoff:
+            return events
+        kept: list[RunEvent] = []
+        for e in events:
+            ts = getattr(e, "timestamp", None)
+            if isinstance(ts, str) and ts <= cutoff:
+                continue  # at/before the reset — forgotten
+            kept.append(e)
+        return kept
 
     @staticmethod
     def _neutral(tool_name: str) -> ToolReputation:
@@ -416,6 +488,7 @@ __all__ = [
     "DEFAULT_MIN_SAMPLES",
     "DEFAULT_WINDOW",
     "NEUTRAL_SCORE",
+    "TRUST_FEEDBACK_DEFAULT_WEIGHT",
     "LearningService",
     "ToolReputation",
     "ToolReputationProvider",

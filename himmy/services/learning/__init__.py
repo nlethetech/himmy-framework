@@ -21,7 +21,15 @@ from himmy.services.learning.outcome import (
     OutcomeSource,
     clamp_score,
 )
+from himmy.services.learning.overrides import (
+    OverrideKind,
+    OverrideSet,
+    OverrideStore,
+    ToolOverride,
+    apply_override,
+)
 from himmy.services.learning.service import (
+    TRUST_FEEDBACK_DEFAULT_WEIGHT,
     LearningService,
     ToolReputation,
     ToolReputationProvider,
@@ -33,14 +41,20 @@ from himmy.services.learning.trajectory import (
 )
 
 __all__ = [
+    "TRUST_FEEDBACK_DEFAULT_WEIGHT",
     "LearnedHintsContextAdapter",
     "LearningService",
     "OutcomeRecorder",
     "OutcomeSource",
+    "OverrideKind",
+    "OverrideSet",
+    "OverrideStore",
+    "ToolOverride",
     "ToolReputation",
     "ToolReputationProvider",
     "TrajectoryAdvisor",
     "TrajectorySignal",
+    "apply_override",
     "clamp_score",
     "render_trajectory_hints",
 ]

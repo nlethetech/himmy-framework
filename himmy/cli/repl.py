@@ -677,6 +677,22 @@ class ChatRepl:
             self._eprint(f"{c['crimson']}couldn't record feedback: {exc}{c['reset']}")
             return
         assert fb is not None  # require_studio_run=False never returns None
+        # Attribute the verdict to the tools this turn used so 👍/👎 feeds the same per-tool
+        # reputation the runtime learns from. Best-effort: it only changes behaviour for an
+        # agent that opts into outcome_weight > 0 (off by default — no surprise retraining).
+        try:
+            from himmy.api.studio_feedback import attribute_feedback_outcomes
+
+            asyncio.run(
+                attribute_feedback_outcomes(
+                    verdict=verdict,
+                    run_id=last.trace_id,
+                    trace_id=last.trace_id,
+                    thread_id=last.thread_id,
+                )
+            )
+        except Exception:  # never let a learning signal crash the REPL
+            pass
         label = "👍 good" if verdict == "up" else "👎 bad"
         suffix = f" · “{note}”" if note else ""
         self._eprint(

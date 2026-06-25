@@ -36,6 +36,21 @@ def test_cli_context_wires_in_memory_storage() -> None:
     assert not isinstance(runtime.memory_store, SqliteStorageService)
 
 
+def test_cli_self_learning_wires_durable_storage(tmp_path: Path) -> None:
+    """On the CLI (no server context), a ``self_learning`` agent gets the DURABLE SQLite
+    store so tool-reputation events persist across runs — otherwise learning resets every
+    process. A plain agent on the same path stays in-memory (unchanged)."""
+    runtime, _registry = build_runtime_for_spec(
+        AgentSpec(name="learner", self_learning=True)
+    )
+    assert isinstance(runtime.memory_store, SqliteStorageService)
+    assert runtime.memory_store.path == str(tmp_path / "storage.db")
+
+    plain, _ = build_runtime_for_spec(AgentSpec(name="plain"))
+    assert isinstance(plain.memory_store, StorageService)
+    assert not isinstance(plain.memory_store, SqliteStorageService)
+
+
 def test_server_context_wires_durable_storage(tmp_path: Path) -> None:
     """Inside a server context, the runtime's storage is the durable SQLite backend."""
     token = set_server_context(True)

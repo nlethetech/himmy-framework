@@ -48,6 +48,7 @@ from himmy.api.routers import (
     studio_files,
     studio_guardrails,
     studio_knowledge_upload,
+    studio_learning,
     studio_lineage,
     studio_mcp,
     studio_memory,
@@ -632,6 +633,7 @@ def create_app(
     app.include_router(studio_privacy.router)
     app.include_router(studio_guardrails.router)
     app.include_router(studio_seclog.router)
+    app.include_router(studio_learning.router)
     app.include_router(studio_lineage.router)
     app.include_router(studio_files.router)
     app.include_router(studio_knowledge_upload.router)

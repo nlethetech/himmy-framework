@@ -99,8 +99,14 @@ pre-encryption, at parity across in-memory / SQLite / Postgres). So on a **share
 store a tool's reputation reflects **only the run's own workspace** — one tenant's failures
 never pollute another's. The scope is threaded from the run's `workspace_id`
 (`build_runtime_for_spec(subject=...)`). `workspace_id=None` (the one-shot CLI / offline
-path, isolated in-memory store per process) reads the whole stream unscoped — byte-identical
-to the pre-tenancy behaviour.
+path) reads the whole stream unscoped — byte-identical to the pre-tenancy behaviour.
+
+**CLI persistence.** Self-learning only accumulates if the tool events it mines survive the
+process. A `self_learning: true` agent on the CLI therefore wires the **durable** local store
+(`StoreFactory.for_cli_durable()` → `.himmy/storage.db`) instead of the default ephemeral
+in-memory store, so reputation built up over yesterday's runs is still there today. It writes
+only to the local SQLite file (never a prod `HIMMY_DATABASE_URL`), so a one-shot stays
+self-contained. Agents without `self_learning` keep the zero-setup in-memory store.
 
 ## Extension points
 
@@ -118,6 +124,13 @@ to the pre-tenancy behaviour.
   a no-op (the zero-behaviour-change default).
 - **Reliability ≠ outcome.** This is operational reliability (did the tool execute), not
   whether the recommendation was correct — keep it distinct from evaluation/calibration.
+- **Positive-signal producer (👍/👎).** A human verdict on a run is attributed to the tools
+  that run used via `attribute_feedback_outcomes` (wired into the CLI `/good`·`/bad` and the
+  Studio `POST /runs/{id}/feedback`), which emits an `OUTCOME_SCORED` per tool through
+  `OutcomeRecorder.record_user_feedback`. These are **recorded and visible** (`himmy learned`,
+  the Studio Learning panel) but only blend into a tool's score when an agent sets
+  `outcome_weight > 0` — at the default `0.0` they are inert, so feedback never silently
+  retrains an agent. Inspect the blended view with `himmy learned --outcome-weight <w>`.
 - **Annotate, don't drop.** Below `floor`, a flaky tool is cautioned, not removed.
 - **`LEARNING_APPLIED` fires only on a real move** — a stable sort that doesn't change order
   emits nothing.

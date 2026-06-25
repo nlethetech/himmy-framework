@@ -65,6 +65,7 @@ pipeline's guardrail names.
 | Class | `name` | Behavior |
 | --- | --- | --- |
 | `PIIGuardrail` | `pii` | Redacts API keys, JWTs, URL credentials, emails, IBANs, Luhn-valid cards, SSNs, IPv4, MACs, phones. Never blocks. Rules ordered most-specific → loosest. |
+| `SecretsGuardrail` | `secrets` | The **credential-only** subset of `PIIGuardrail` (API keys, JWTs, URL credentials). Safe to enforce by default because no legitimate agent output contains a raw credential — so himmy redacts secrets on every outbound vector for every spec-built agent unless `redact_secrets: false`. Never blocks. |
 | `InjectionGuardrail` | `injection` | Flags common prompt-injection phrasings ("ignore previous instructions", "reveal your system prompt", …); denies when `block=True` (default). |
 | `BlocklistGuardrail` | `blocklist` | Denies when any configured (case-insensitive regex) pattern matches. Custom `name` per instance. |
 | `NepalPIIGuardrail` | `nepal_pii` | Redacts Nepal-specific PII: +977 / domestic mobiles, citizenship numbers, PAN (PAN requires the `PAN` label so a bare 9-digit number isn't wrongly redacted). Never blocks. |
@@ -132,12 +133,19 @@ steered into a blocked action via a tool argument.
 
 When building a runtime from a spec:
 
-1. `build_guardrail_pipeline(spec.guardrails)` becomes the **input** pipeline (and is
-   also used for the **tool-arg** pre-hook via `build_guardrail_pre_hook`).
-2. The **output** pipeline always prepends `grounding`:
-   `build_guardrail_pipeline(["grounding", *spec.guardrails])` — grounding
-   enforcement is an institutional default that blocks any answer given from stale
-   built-in knowledge, regardless of what the spec declares.
+1. `build_guardrail_pipeline(spec.guardrails)` becomes the **input** pipeline — only what
+   the spec declares, so the user's own prompt is never silently mangled.
+2. The **tool-arg** pre-hook pipeline is the secrets default + the spec guardrails:
+   `["secrets", *spec.guardrails]` (just `spec.guardrails` when `redact_secrets: false`).
+   This stops a model emitting a raw credential into a tool call.
+3. The **output** pipeline always prepends `grounding` and the secrets default:
+   `build_guardrail_pipeline(["grounding", "secrets", *spec.guardrails])`. Two institutional
+   defaults apply to **every** spec-built agent (including Studio-created ones):
+   - **`grounding`** blocks any answer given from stale built-in knowledge.
+   - **`secrets`** redacts credentials (API keys / JWTs / URL credentials) from tool args,
+     tool results, and the final answer. Opt out with `redact_secrets: false`; add `pii` to
+     `guardrails` for personal-data (email/phone/…) redaction. Unlike full `pii`, the secrets
+     subset never appears in legitimate output, so it is safe to enforce by default.
 
 ## Configuration
 

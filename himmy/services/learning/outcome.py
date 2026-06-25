@@ -179,5 +179,38 @@ class OutcomeRecorder:
             rationale=getattr(verdict, "rationale", None) or None,
         )
 
+    async def record_user_feedback(
+        self,
+        score: Any,
+        *,
+        tool_names: list[str],
+        run_id: str | None = None,
+        trace_id: str | None = None,
+        thread_id: str | None = None,
+        rationale: str | None = None,
+    ) -> int:
+        """Attribute a run-level human verdict (👍/👎) to every tool the run used.
+
+        A thumbs-up/down is a judgement of the whole answer, not one tool — but the tools a
+        run actually invoked are the levers that produced it, so the score is recorded
+        against each of them (deduplicated) as a :attr:`OutcomeSource.USER_FEEDBACK`
+        outcome. This is the missing positive-signal producer: it only changes a tool's
+        blended reputation for an agent that has opted into ``outcome_weight > 0`` — by
+        default the events are recorded and visible but inert. Returns the number emitted.
+        """
+        emitted = 0
+        for name in dict.fromkeys(tool_names):  # dedupe, preserve order
+            if await self.record(
+                score,
+                source=OutcomeSource.USER_FEEDBACK,
+                tool_name=name,
+                run_id=run_id,
+                trace_id=trace_id,
+                thread_id=thread_id,
+                rationale=rationale,
+            ):
+                emitted += 1
+        return emitted
+
 
 __all__ = ["OutcomeRecorder", "OutcomeSource", "clamp_score"]

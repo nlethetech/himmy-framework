@@ -264,11 +264,17 @@ def build_runtime_for_spec(
 
     server = durable_defaults if durable_defaults is not None else in_server_context()
     if storage is None:
-        storage = (
-            StoreFactory.for_context(server=True)
-            if server
-            else StoreFactory.for_context()
-        )
+        if server:
+            storage = StoreFactory.for_context(server=True)
+        elif spec.self_learning:
+            # Self-learning mines tool events from PAST runs into a reputation score, so the
+            # CLI path needs a DURABLE store — the default in-memory CLI store resets every
+            # process and learning could never accumulate. Use the local .himmy/storage.db
+            # (``for_cli_durable`` ignores any prod ``HIMMY_DATABASE_URL`` so a one-shot
+            # stays self-contained), the same database the durable CLI spine already writes.
+            storage = StoreFactory.for_cli_durable()
+        else:
+            storage = StoreFactory.for_context()
 
     overrides: dict[str, Any] = {"inference": inference, "storage": storage}
     if on_event is not None:
@@ -280,20 +286,34 @@ def build_runtime_for_spec(
 
     from himmy.services.guardrails import build_guardrail_pipeline
 
-    # Input + tool-argument guardrails: exactly what the spec declares (prompt/arg
-    # redaction or blocking, e.g. pii/injection/dlp). ``pipeline`` is reused below to
-    # guard tool arguments too.
-    pipeline = build_guardrail_pipeline(spec.guardrails) if spec.guardrails else None
-    if pipeline is not None:
-        overrides["input_guardrail"] = pipeline
+    # Secure-by-default: redact CREDENTIALS (api keys / JWTs / url-creds) on every OUTBOUND
+    # vector — tool args, tool returns, final answer — for EVERY spec-built agent (incl.
+    # Studio). Unlike full ``pii`` the secrets subset never appears in legitimate output, so
+    # it is safe to enforce by default; opt out with ``redact_secrets: false``. This is
+    # deliberately NOT applied to the user's INPUT prompt (that would silently mangle the
+    # user's own request, e.g. an address they asked the agent to use).
+    secret_default = ["secrets"] if spec.redact_secrets else []
+
+    # Input-prompt guardrail: ONLY what the spec declares (prompt redaction/blocking, e.g.
+    # pii/injection/dlp). Left untouched by the secrets default so the user's request reaches
+    # the model intact.
+    input_pipeline = build_guardrail_pipeline(spec.guardrails) if spec.guardrails else None
+    if input_pipeline is not None:
+        overrides["input_guardrail"] = input_pipeline
+
+    # Tool-argument guardrail (pre-hook): the secrets default + whatever the spec declares.
+    # Stops a model emitting a raw credential into a tool call (hallucinated/exfil secret).
+    arg_names = list(dict.fromkeys([*secret_default, *spec.guardrails]))
+    arg_pipeline = build_guardrail_pipeline(arg_names) if arg_names else None
 
     # Output guardrails: ALWAYS enforce grounding (an institutional default — block any
     # answer that falls back to stale built-in knowledge instead of grounding in a
-    # tool), plus whatever the spec declares. This applies to EVERY spec-built agent —
-    # including ones a user creates in Studio — and cannot be silently turned off, so
-    # the framework's anti-hallucination guarantee is enforced, not just advised. The
-    # grounding guard is a no-op on the input stage, so adding it to output only is safe.
-    output_names = list(dict.fromkeys(["grounding", *spec.guardrails]))
+    # tool), the secrets default, plus whatever the spec declares. This applies to EVERY
+    # spec-built agent — including ones a user creates in Studio — and cannot be silently
+    # turned off, so the framework's anti-hallucination + secret-safety guarantees are
+    # enforced, not just advised. The grounding guard is a no-op on the input stage, so
+    # adding it to output only is safe.
+    output_names = list(dict.fromkeys(["grounding", *secret_default, *spec.guardrails]))
     output_guardrail = build_guardrail_pipeline(output_names)
     overrides["output_guardrail"] = output_guardrail
 
@@ -359,18 +379,47 @@ def build_runtime_for_spec(
     _reprime: Any = None
     if spec.self_learning:
         from himmy.services.learning import (
+            TRUST_FEEDBACK_DEFAULT_WEIGHT,
             LearnedHintsContextAdapter,
             LearningService,
+            OverrideStore,
             ToolReputationProvider,
             TrajectoryAdvisor,
         )
+
+        # Sprint 2: load the operator overrides (pin / mute / reset) + per-workspace
+        # trust_feedback gate for this tenant from the durable spine (best-effort — a
+        # registry error yields an empty set / trust off, i.e. pure auto-learning). Loaded
+        # ONCE here alongside the reputation snapshot; an override set mid-session takes
+        # effect on the next build (the same staleness model as the snapshot).
+        try:
+            override_set = OverrideStore.for_context(server=server).load(subject)
+        except Exception:  # pragma: no cover - defensive: overrides never break a run
+            override_set = None
+
+        # The trust gate ACTIVATES Sprint-1's recorded-but-inert OUTCOME_SCORED feedback by
+        # choosing the EFFECTIVE outcome_weight here — it does NOT mutate spec.outcome_weight.
+        # Lift 0 -> a sensible default ONLY when the operator hasn't set an explicit positive
+        # weight (never override an intentional P2 value); toggling on blends ALL recorded
+        # historical feedback at once. Trust off (default) -> effective == spec value (0.0) ->
+        # LearningService._blend short-circuits -> byte-identical to Sprint 1, outcomes inert.
+        effective_weight = spec.outcome_weight
+        if (
+            override_set is not None
+            and override_set.trust_feedback
+            and effective_weight <= 0.0
+        ):
+            effective_weight = TRUST_FEEDBACK_DEFAULT_WEIGHT
 
         # ``subject`` (the run's workspace_id) scopes the reputation read to this tenant on
         # a shared event store; ``None`` reads unscoped (CLI/offline, byte-identical).
         # P2: ``outcome_weight`` blends the OUTCOME-quality signal into reputation when > 0
         # (default 0.0 → operational-only, byte-identical to P1).
         learning = LearningService(
-            storage, workspace_id=subject, outcome_weight=spec.outcome_weight
+            storage,
+            workspace_id=subject,
+            outcome_weight=effective_weight,
+            override_set=override_set,
         )
         reputation_provider = ToolReputationProvider(learning, event_sink=storage)
         # P2: the trajectory advisor adds run-sequence-aware hints (looping / don't-call-
@@ -490,15 +539,16 @@ def build_runtime_for_spec(
                 learned_hints_adapter if not spec.tools else None,
             )
 
-        if pipeline is not None:
+        if arg_pipeline is not None:
             # Guard tool arguments (pre) AND tool return content (post). The pre-hook
-            # stops PII/blocked args reaching the tool; the post-hook stops a tool
+            # stops secret/PII/blocked args reaching the tool; the post-hook stops a tool
             # handing back unredacted PII/secrets that would otherwise land on the
             # thread + next-turn context + final answer unfiltered. The post-hook uses
             # the OUTPUT pipeline (redact/tokenize per DLP policy; BLOCK-class →
-            # withheld placeholder). Both are wired ONLY when guardrails are
-            # configured, so the zero-config path stays untouched. The reputation
-            # provider (P1) rides along when self-learning is on.
+            # withheld placeholder). Wired whenever the secrets default is on (the norm)
+            # or the spec declares guardrails; only a ``redact_secrets: false`` spec with
+            # no guardrails skips them. The reputation provider (P1) rides along when
+            # self-learning is on.
             from himmy.services.guardrails import (
                 build_guardrail_post_hook,
                 build_guardrail_pre_hook,
@@ -507,7 +557,7 @@ def build_runtime_for_spec(
 
             overrides["tool_service"] = ToolService(
                 registry,
-                pre_execution_hook=build_guardrail_pre_hook(pipeline),
+                pre_execution_hook=build_guardrail_pre_hook(arg_pipeline),
                 post_execution_hook=build_guardrail_post_hook(output_guardrail),
                 reputation_provider=reputation_provider,
                 # Stamp the run's workspace onto emitted tool events so the reputation

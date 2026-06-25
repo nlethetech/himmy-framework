@@ -23,6 +23,7 @@ from himmy.services.guardrails.builtins import (
     NepalPIIGuardrail,
     PIIGuardrail,
     PIIRule,
+    SecretsGuardrail,
     build_guardrail_pipeline,
 )
 from himmy.services.guardrails.dlp import (
@@ -50,6 +51,7 @@ __all__ = [
     "GuardrailPipeline",
     "PIIRule",
     "PIIGuardrail",
+    "SecretsGuardrail",
     "InjectionGuardrail",
     "BlocklistGuardrail",
     "NepalPIIGuardrail",

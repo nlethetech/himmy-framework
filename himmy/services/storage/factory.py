@@ -175,6 +175,20 @@ class StoreFactory:
             return cls._sqlite_store()
         return cls.for_cli()
 
+    @classmethod
+    def for_cli_durable(cls) -> object:
+        """Return a DURABLE local store for a CLI run that must persist across processes.
+
+        Used by the CLI self-learning path: tool-reputation is mined from tool events
+        recorded over PAST runs, so those events must outlive the process or "learning"
+        never accumulates. Like :meth:`for_cli` this deliberately ignores
+        ``HIMMY_DATABASE_URL`` — a one-shot never touches a production Postgres — and writes
+        only to the local file-backed SQLite store at :data:`HIMMY_STORE_PATH` (default
+        ``.himmy/storage.db``), the same database the durable CLI spine already uses.
+        """
+        cls._enforce_residency()
+        return cls._sqlite_store()
+
     @staticmethod
     def _enforce_residency() -> None:
         """Refuse to build a durable store outside the residency policy (WS4.3).

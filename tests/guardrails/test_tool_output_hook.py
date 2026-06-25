@@ -201,12 +201,30 @@ def test_from_spec_wires_output_post_hook_when_guardrails_declared() -> None:
     assert getattr(runtime.tool_service, "_pre_hook", None) is not None
 
 
-def test_from_spec_no_post_hook_in_zero_config_path() -> None:
-    """Offline regression: tools but NO guardrails -> no post-hook (passthrough)."""
+def test_from_spec_secrets_default_wires_hooks_zero_config() -> None:
+    """Secure default: tools + NO explicit guardrails still wires the secret-redaction
+    pre/post hooks (``redact_secrets`` defaults True), so a credential can never leak
+    through a tool arg/return even on the zero-config path."""
     from himmy.config.agent_spec import AgentSpec
     from himmy.runtime.from_spec import build_runtime_for_spec
 
     spec = AgentSpec(name="Bare", provider="stub", tool_packs=["utils"])
     runtime, _registry = build_runtime_for_spec(spec)
 
+    assert getattr(runtime.tool_service, "_post_hook", None) is not None
+    assert getattr(runtime.tool_service, "_pre_hook", None) is not None
+
+
+def test_from_spec_no_hooks_when_secrets_default_opted_out() -> None:
+    """Opt-out regression: tools, no guardrails, and ``redact_secrets=False`` -> the
+    tool path is true passthrough (no pre/post hook)."""
+    from himmy.config.agent_spec import AgentSpec
+    from himmy.runtime.from_spec import build_runtime_for_spec
+
+    spec = AgentSpec(
+        name="Bare", provider="stub", tool_packs=["utils"], redact_secrets=False
+    )
+    runtime, _registry = build_runtime_for_spec(spec)
+
     assert getattr(runtime.tool_service, "_post_hook", None) is None
+    assert getattr(runtime.tool_service, "_pre_hook", None) is None

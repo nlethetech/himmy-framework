@@ -32,6 +32,7 @@ const ADVANCED = [
   { to: "/advanced/knowledge", label: "Knowledge", sub: "RAG document bases" },
   { to: "/advanced/memory", label: "Memory", sub: "durable agent memory" },
   { to: "/advanced/eval", label: "Evaluation", sub: "test suites and scores" },
+  { to: "/advanced/learning", label: "Learning", sub: "what Himmy learned about its tools" },
   { to: "/advanced/lineage", label: "Lineage", sub: "the entity audit trail" },
   { to: "/advanced/doctor", label: "Doctor", sub: "system health checks" },
   { to: "/theme", label: "Appearance", sub: "theme and accent" },
