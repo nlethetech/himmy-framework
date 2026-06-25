@@ -61,10 +61,21 @@ def client_factory(
     # "testserver" is the canonical test Host that the loopback BFF's DNS-rebinding
     # guard allows (browsers cannot forge a Host header, so it opens no hole). Using
     # it keeps the guarded ``/v1/*`` surface reachable from the in-process client.
+    #
+    # The cross-site guard also fails CLOSED on a guarded mutating request (POST/PUT/...)
+    # that carries no Origin/Referer — correct CSRF hardening, since a same-origin browser
+    # fetch ALWAYS sends Origin. Default a same-origin Origin header on the client (host
+    # ``testserver`` is in the guard's allow-list) so these in-process load POSTs look like
+    # a real same-origin call; a test that needs a different Origin can still override it.
     @asynccontextmanager
     async def _make(base_url: str = "http://testserver") -> AsyncIterator[AsyncClient]:
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url=base_url) as client:
+        headers = (
+            {"origin": base_url} if base_url.startswith("http://testserver") else {}
+        )
+        async with AsyncClient(
+            transport=transport, base_url=base_url, headers=headers
+        ) as client:
             yield client
 
     return _make

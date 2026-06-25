@@ -80,10 +80,22 @@ class Decision:
         return self.effect is Effect.ALLOW
 
 
-def consent_stable_id(subject_id: str, purpose: Purpose | str) -> str:
-    """Deterministic stable id for a ``(subject, purpose)`` consent version-chain."""
+def consent_stable_id(
+    subject_id: str, purpose: Purpose | str, *, workspace_id: str | None = None
+) -> str:
+    """Deterministic stable id for a ``(workspace, subject, purpose)`` version-chain.
+
+    ``workspace_id`` scopes the identity to one tenant so two tenants that share a
+    ``subject_id`` never collide. It is kept optional and, when ``None``, the id is the
+    legacy ``(subject, purpose)`` value so pre-existing records and ungoverned callers
+    still resolve unchanged; governed callers must always pass a concrete workspace.
+    """
     value = purpose.value if isinstance(purpose, Purpose) else str(purpose)
-    return stable_id_for(f"{subject_id}|{value}", namespace=CONSENT_KIND)
+    if workspace_id is None:
+        key = f"{subject_id}|{value}"
+    else:
+        key = f"{workspace_id}|{subject_id}|{value}"
+    return stable_id_for(key, namespace=CONSENT_KIND)
 
 
 class ConsentRecord(BaseModel):

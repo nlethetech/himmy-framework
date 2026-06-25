@@ -39,12 +39,86 @@ if hasattr(sqlite3, "SQLITE_RECURSIVE"):  # WITH RECURSIVE (Py 3.11+)
     _ALLOWED_SQLITE_ACTIONS.add(sqlite3.SQLITE_RECURSIVE)
 
 
+# Side-effecting functions/statements a Postgres READ ONLY transaction does NOT block:
+# local file reads, large-object import/export, cross-db / outbound network (dblink, the
+# http extension), and time-based DoS. The read-only txn stops writes, not these — so a
+# DB role with rights to them is a local-file-read / SSRF / DoS vector. Defense-in-depth;
+# the PRIMARY control is still a least-privilege DB role (see the tool docstring).
+_DANGEROUS_SQL_RE = re.compile(
+    r"\b(?:"
+    # file read + any pg_ls_* directory lister (dir/logdir/waldir/tmpdir/archive/...)
+    r"pg_read_file|pg_read_binary_file|pg_stat_file|pg_ls_\w+"
+    # large objects — convenience wrappers AND the primitives they call (incl. write)
+    r"|lo_import|lo_export|lo_get|lo_put|lo_from_bytea|loread|lowrite|lo_open|lo_creat|lo_unlink"
+    # cross-db / network — prefix-match so dblink_connect_u (the SECURITY-bypassing variant)
+    # and every other dblink* are covered, not just the exact names
+    r"|dblink\w*"
+    # the http extension: the named wrappers AND the core function they delegate to
+    r"|http_get|http_post|http_put|http_delete|http_head"
+    # time-based + admin DoS / state change
+    r"|pg_sleep|pg_sleep_for|pg_sleep_until"
+    r"|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile"
+    r"|pg_advisory_lock|pg_advisory_xact_lock"
+    # server-side file write (adminpack) + config / replication
+    r"|pg_file_write|pg_file_unlink|pg_file_rename"
+    r"|set_config|pg_create_logical_replication_slot|pg_drop_replication_slot"
+    r")\b",
+    re.IGNORECASE,
+)
+# The bare ``http(http_request)`` core function (the ``http_get``/``_post`` wrappers all
+# call it) matched as a CALL, so a literal ``'http://...'`` URL in a string is not flagged.
+_HTTP_FUNC_RE = re.compile(r"\bhttp\s*\(", re.IGNORECASE)
+# ``COPY ... PROGRAM`` runs a shell command (RCE); ``COPY ... TO/FROM '<file>'`` reads/writes
+# a server file. Neither is reliably stopped by the read-only txn — reject both. (``COPY ...
+# TO STDOUT`` has no quoted target, so legitimate streaming reads still work.)
+_COPY_DANGEROUS_RE = re.compile(
+    r"^\s*copy\b[\s\S]*?(?:\bprogram\b|\b(?:to|from)\b\s*['\"])", re.IGNORECASE
+)
+# SQL comments — stripped before matching so ``http/**/(`` or ``pg_read_file --\n(`` can't
+# split a banned name from its call to dodge the denylist.
+_SQL_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/|--[^\n]*")
+# Postgres ``U&"..."`` / ``U&'...'`` Unicode-escape string/identifier syntax: it can spell a
+# banned name with ``\XXXX`` escapes the text denylist can't see (e.g. ``U&"pg_read_fil\0065"``
+# == ``pg_read_file``). No legitimate read-only query needs it — reject outright.
+_UESCAPE_RE = re.compile(r"u&\s*[\"']", re.IGNORECASE)
+# Anonymous ``DO`` code blocks run procedural/dynamic SQL (``EXECUTE 'pg_read' || '_file'...``)
+# that builds a banned name at runtime, defeating any static text denylist. ``sql_query`` only
+# ever needs a single SELECT-shaped read, so reject DO outright.
+_DO_BLOCK_RE = re.compile(r"^\s*do\b", re.IGNORECASE)
+
+
+def _reject_dangerous_sql(sql: str) -> None:
+    """Block known side-effecting SQL functions/statements (read-only txn can't).
+
+    NOTE: a text denylist is defense-in-depth and inherently a cat-and-mouse game. The
+    PRIMARY control is the configured DB role: ``HIMMY_SQL_DSN`` MUST point at a read-only,
+    least-privilege Postgres role with NO rights to read files, open network connections,
+    import large objects, or run ``COPY ... PROGRAM``. The checks below are a second layer.
+    """
+    if _UESCAPE_RE.search(sql):
+        raise ToolSecurityError("U&-style Unicode-escape literals are not allowed")
+    # Match against a comment-stripped copy (the real SQL still goes to the driver intact).
+    scrubbed = _SQL_COMMENT_RE.sub(" ", sql)
+    if _DO_BLOCK_RE.search(scrubbed):
+        raise ToolSecurityError("anonymous DO blocks are not allowed")
+    match = _DANGEROUS_SQL_RE.search(scrubbed) or _HTTP_FUNC_RE.search(scrubbed)
+    if match is not None:
+        raise ToolSecurityError(
+            f"disallowed SQL function {match.group(0)!r}: a read-only query may not read "
+            "files or make network calls (use a least-privilege DB role)"
+        )
+    if _COPY_DANGEROUS_RE.search(scrubbed):
+        raise ToolSecurityError("COPY to/from a file or PROGRAM is not allowed")
+
+
 def _single_statement(sql: str) -> str:
     """Return the lone statement in ``sql`` or raise if there is more than one."""
     statements = [s for s in sql.split(";") if s.strip()]
     if len(statements) != 1:
         raise ToolSecurityError("exactly one SQL statement is allowed")
-    return statements[0].strip()
+    statement = statements[0].strip()
+    _reject_dangerous_sql(statement)
+    return statement
 
 
 def _readonly_authorizer(action: int, *_args: Any) -> int:

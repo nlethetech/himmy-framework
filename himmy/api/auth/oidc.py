@@ -13,6 +13,7 @@ self-signed key — no IdP or network required.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
@@ -47,28 +48,87 @@ class StaticJwks:
 class JwksCache:
     """Fetch + cache a JWKS from a URL with a TTL (refreshable on key rotation)."""
 
-    def __init__(self, url: str, *, ttl: float = 3600.0, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        ttl: float = 3600.0,
+        timeout: float = 10.0,
+        min_refetch_interval: float = 30.0,
+    ) -> None:
         self._url = url
         self._ttl = ttl
         self._timeout = timeout
+        # A forced refetch (key rotation: a token's ``kid`` is missing from the cache)
+        # is rate-limited to once per this interval. Without it, an UNAUTHENTICATED
+        # flood of tokens carrying random ``kid`` values would each trigger an outbound
+        # JWKS GET, a cache-stampede DoS against this server and the IdP's JWKS endpoint.
+        self._min_refetch_interval = min_refetch_interval
         self._jwks: dict[str, Any] | None = None
         self._fetched_at = float("-inf")
+        # Stamped on every fetch ATTEMPT (success OR failure), so the cooldown engages
+        # even when the IdP is failing and the cache never populates — otherwise a flood
+        # of unknown-kid tokens during an IdP OUTAGE would hammer the IdP unthrottled
+        # (the success-only timestamp below is not enough).
+        self._last_attempt_at = float("-inf")
+        self._last_error: Exception | None = None
+        # Single-flight: coalesce concurrent (re)fetches into ONE outbound request.
+        self._lock = asyncio.Lock()
 
-    async def get(self, *, force: bool = False) -> dict[str, Any]:
-        fresh = (
+    def _fresh(self) -> bool:
+        return (
             self._jwks is not None and (time.monotonic() - self._fetched_at) < self._ttl
         )
-        if not force and fresh:
+
+    def _attempt_throttled(self) -> bool:
+        # True while a (re)fetch was ATTEMPTED within the cooldown — back off regardless
+        # of whether it succeeded, so neither unknown-kid spam nor an IdP outage drives
+        # a fetch storm.
+        return (time.monotonic() - self._last_attempt_at) < self._min_refetch_interval
+
+    def _throttled_result(self) -> dict[str, Any] | None:
+        # When throttled: serve the cached JWKS if we have one, else FAIL the token
+        # (raise) rather than refetch — never refetch inside the cooldown.
+        if not self._attempt_throttled():
+            return None
+        if self._jwks is not None:
+            return self._jwks
+        raise AuthError("JWKS unavailable (refetch throttled)") from self._last_error
+
+    async def get(self, *, force: bool = False) -> dict[str, Any]:
+        if not force and self._fresh():
             assert self._jwks is not None
             return self._jwks
-        import httpx
+        throttled = self._throttled_result()
+        if throttled is not None:
+            return throttled
+        async with self._lock:
+            # Re-check under the lock: the race loser serves the just-fetched result (or
+            # the just-stamped throttle) instead of issuing its own outbound fetch.
+            if not force and self._fresh():
+                assert self._jwks is not None
+                return self._jwks
+            throttled = self._throttled_result()
+            if throttled is not None:
+                return throttled
+            return await self._fetch()
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.get(self._url)
-            resp.raise_for_status()
-            self._jwks = resp.json()
-        self._fetched_at = time.monotonic()
-        return self._jwks
+    async def _fetch(self) -> dict[str, Any]:
+        # Stamp BEFORE the call so a hang/failure still advances the cooldown.
+        self._last_attempt_at = time.monotonic()
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.get(self._url)
+                resp.raise_for_status()
+                self._jwks = resp.json()
+            self._fetched_at = time.monotonic()
+            self._last_error = None
+            return self._jwks
+        except Exception as exc:
+            self._last_error = exc
+            raise
 
 
 def _claim_path(claims: dict[str, Any], path: str) -> Any:

@@ -8,6 +8,7 @@ banned phrase — without pretending to be a complete safety system. Compose the
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -61,24 +62,35 @@ def _ipv4_ok(text: str) -> bool:
 def _phone_ok(text: str) -> bool:
     """False for values the broad phone pattern over-catches and must NOT redact:
 
-    * ANY value containing a decimal number — a digit-dot-digit anywhere — because real
-      phone numbers are never written with a decimal point. This covers a lone decimal
-      (a lat/long ``27.7172453``, a price, a version), AND the broad-pattern's worst
-      failure: several numbers MERGED across the spaces/parens/dots the phone class allows,
-      e.g. ``2.00 (-0.376647834`` from "down -2.00 (-0.38%)" or ``816.69 (-1.03`` from a
-      NAV line — financial/statistical text the recommender and money tools emit constantly;
+    * a value whose WHOLE span is a single clean decimal/financial number token — a lone
+      decimal (a lat/long ``27.7172453``, a price, a version like ``3.14``) — because such
+      a number is data, never a phone. The exemption is scoped to a number GRAMMAR matched
+      over the entire stripped span (optional sign, digit groups, at most a fractional part),
+      so a dot merely APPEARING inside a longer digit run does NOT exempt it: a dotted phone
+      like ``4155550.132`` (or ``415.555.0132``) still redacts, while ``3.14`` stays data;
     * an ISO-8601 calendar date like ``2026-06-12`` — legitimate input for date-aware tools;
     * a range of two calendar years like ``1916-2016`` (or ``2011 - 2019``) — ubiquitous in
       research/citations. Scoped to plausible years (1500–2099) so a genuine 8-digit number
       like ``1234-5678`` still redacts.
 
     Everything else (real phones — contiguous digit groups separated only by spaces/hyphens/
-    parens, with no decimal point — and long bare digit runs) returns True for redaction. The
-    trade-off: a dotted phone like ``415.555.0132`` is left intact, which is the right call for
-    a research/finance assistant where decimals are overwhelmingly data, not phone numbers.
+    parens/dots — and long bare digit runs) returns True for redaction.
     """
     stripped = text.strip()
-    if re.search(r"\d\.\d", stripped):  # contains a decimal number -> data, not a phone
+    # The broad phone class includes ``( )`` so it can MERGE two adjacent numbers across a
+    # parenthetical — e.g. ``2.00 (-0.376647834`` or ``816.69 (-1.03`` in financial/stat
+    # text — into one fake phone. A real phone match never contains an OPENING paren: the
+    # rule's ``(?<![\d.])`` lookbehind starts the span at the first digit, so a genuine
+    # ``(415) 555-0132`` is matched as ``415) 555-0132`` (a ``)`` but no ``(``). So an
+    # opening paren inside the span means the regex bridged two separate numbers → data.
+    if "(" in stripped:
+        return False
+    # A whole-span clean decimal/financial number token: optional sign, an integer part
+    # (either properly comma/space-grouped thousands, or a short <=4-digit ungrouped run),
+    # and an optional single fractional part. fullmatch (not search) over a SHORT integer
+    # grammar so a dot inside a longer phone-shaped digit run is NOT exempt — a dotted phone
+    # like ``4155550.132`` still redacts while a bare ``3.14`` stays data.
+    if re.fullmatch(r"[+-]?(?:\d{1,3}(?:[,\s]\d{3})+|\d{1,4})(?:\.\d+)?", stripped):
         return False
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stripped):  # ISO-8601 date
         return False
@@ -94,6 +106,32 @@ def _phone_ok(text: str) -> bool:
 #: ``user:pass@`` and still applies to URLs.)
 _URL_RE = re.compile(r"""https?://[^\s<>"')\]]+""")
 
+#: Hard cap on the input the PII regex scan will look at. The PII patterns are all
+#: bounded-quantifier (so linear, no catastrophic backtracking — see the email rule), so
+#: there is no exponential ReDoS. BUT even a linear scan holds the GIL while ``re`` runs:
+#: Python's regex engine does not release the GIL, so a large sub-cap input still pins the
+#: event loop for the duration of the match (a 2 MiB blob stalled the loop ~900 ms even via
+#: ``asyncio.to_thread`` — the thread cannot run concurrently with the loop while it holds
+#: the GIL). To keep the API responsive we cap the scan at 128 KiB; with the bounded linear
+#: patterns the worst-case ``inspect`` CPU then drops to ~tens of ms.
+#:
+#: Tradeoff (explicit): PII beyond the first 128 KiB of a SINGLE message is not
+#: regex-scanned. The split below scans the head and re-appends the (unscanned) tail
+#: verbatim, so no content is lost and any PII in the visible head is still redacted — but a
+#: secret pasted past the 128 KiB mark in one giant message will pass through unredacted.
+#: This is the deliberate price of bounding the loop-stall; realistic tool results /
+#: messages are far under 128 KiB and are scanned in FULL end-to-end.
+_MAX_PII_SCAN_LEN = 128 * 1024
+
+#: Cap on URL spans collected per rule for the "keep links intact" containment check.
+#: ``_MAX_PII_SCAN_LEN`` bounds the scanned LENGTH but not the URL/match COUNT, so a head
+#: packed with thousands of tiny ``http://a x@y.z`` tokens would otherwise drive an
+#: O(matches × spans) quadratic in :func:`_redact` (a single 128 KiB leaf measured ~6 s).
+#: Containment is now a binary search over sorted, non-overlapping spans, and the span list
+#: is capped here as an absolute backstop (excess URLs simply aren't link-protected — their
+#: inner PII is still redacted, which is the safe direction).
+_MAX_URL_SPANS = 8 * 1024
+
 
 def _redact(text: str, rules: list[PIIRule]) -> tuple[str, list[str]]:
     """Apply each rule (validated) in order; return redacted text + per-label flags.
@@ -102,25 +140,42 @@ def _redact(text: str, rules: list[PIIRule]) -> tuple[str, list[str]]:
     ``url_credentials`` — a tweet/news id in a URL path is not PII and redacting it would
     break the citation link. URL spans are recomputed per rule (the text mutates as rules
     redact), so the in-URL test stays aligned with the string being substituted.
+
+    Inputs longer than :data:`_MAX_PII_SCAN_LEN` are split: only the head is regex-scanned
+    (so a malicious giant string cannot stall the event loop via pathological backtracking)
+    and the untouched tail is re-appended, preserving the full text for callers downstream.
     """
-    redacted = text
     flags: list[str] = []
+    if len(text) > _MAX_PII_SCAN_LEN:
+        head, tail = text[:_MAX_PII_SCAN_LEN], text[_MAX_PII_SCAN_LEN:]
+        redacted_head, flags = _redact(head, rules)
+        return redacted_head + tail, flags
+    redacted = text
     for rule in rules:
         protect_urls = rule.label != "url_credentials"
-        spans = (
-            [(m.start(), m.end()) for m in _URL_RE.finditer(redacted)]
-            if protect_urls
-            else []
-        )
+        # URL spans are sorted by start and non-overlapping (finditer over a left-to-right
+        # regex), so a match is "inside a URL" iff the last span starting at or before it
+        # also ends at or after it — a binary search, not the old O(spans) scan PER match
+        # (which made the whole rule O(matches x spans), i.e. quadratic, on a dense leaf).
+        if protect_urls:
+            spans = [(m.start(), m.end()) for m in _URL_RE.finditer(redacted)]
+            if len(spans) > _MAX_URL_SPANS:
+                spans = spans[:_MAX_URL_SPANS]  # absolute backstop (see _MAX_URL_SPANS)
+            starts = [s for s, _e in spans]
+        else:
+            spans = []
+            starts = []
         hit = False
 
         def _replace(
             match: re.Match[str],
             r: PIIRule = rule,
             spans: list[tuple[int, int]] = spans,
+            starts: list[int] = starts,
         ) -> str:
             nonlocal hit
-            if any(s <= match.start() and match.end() <= e for s, e in spans):
+            idx = bisect.bisect_right(starts, match.start()) - 1
+            if idx >= 0 and match.end() <= spans[idx][1]:
                 return match.group(0)  # inside a URL — keep the link intact, not PII
             if r.validator is not None and not r.validator(match.group(0)):
                 return match.group(0)
@@ -155,7 +210,13 @@ _PII_RULES: list[PIIRule] = [
         "[REDACTED-URL]",
         re.compile(r"\bhttps?://[^\s/:@]+:[^\s/:@]+@\S+"),
     ),
-    PIIRule("email", "[REDACTED-EMAIL]", re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")),
+    # Quantifiers are BOUNDED (not unbounded ``+``) to kill catastrophic/quadratic
+    # backtracking: an adversarial ``"a-a-a..."`` run can no longer spin a core for minutes.
+    PIIRule(
+        "email",
+        "[REDACTED-EMAIL]",
+        re.compile(r"\b[\w.+-]{1,64}@[\w-]{1,255}\.[\w.-]{1,255}\b"),
+    ),
     PIIRule(
         "iban",
         "[REDACTED-IBAN]",

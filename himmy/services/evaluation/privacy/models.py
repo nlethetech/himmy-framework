@@ -217,6 +217,9 @@ class PrivacyAuditReport(BaseModel):
         passed: The overall posture verdict.
         metrics: Every :class:`PrivacyMetricResult` (probe + recorded).
         lookback_seconds: The recorded-data scan window used (``None`` ⇒ unbounded).
+        workspace_id: Tenant scope this report was run for (``None`` ⇒ global/ops). It
+            is projected into the record metadata so the tenant-scoped audit bundle
+            filter can exclude another tenant's reports.
         metadata: Derived diagnostics (e.g. counts of records scanned).
         created_at: When the audit ran.
     """
@@ -227,6 +230,7 @@ class PrivacyAuditReport(BaseModel):
     passed: bool = False
     metrics: list[PrivacyMetricResult] = Field(default_factory=list)
     lookback_seconds: float | None = None
+    workspace_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)
 
@@ -288,6 +292,7 @@ class PrivacyAuditReport(BaseModel):
                 "suite_name": self.suite_name,
                 "passed": self.passed,
                 "created_at": self.created_at,
+                "workspace_id": self.workspace_id,
             },
         )
 

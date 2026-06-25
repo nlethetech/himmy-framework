@@ -22,6 +22,7 @@ implementation that wraps one — the protocol exists for exactly that. The
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import signal
@@ -34,6 +35,37 @@ from pathlib import Path
 
 from himmy.core.errors import HimmyError
 from himmy.services.sandbox.models import SandboxLimits, SandboxResult
+
+_log = logging.getLogger("himmy.sandbox")
+#: One-time guard so the unenforced-limits notice is logged once per process, not per run.
+_limits_unenforced_warned = False
+
+
+def _warn_if_limits_unenforced() -> None:
+    """Log ONCE when this platform can't enforce the sandbox's resource limits.
+
+    Windows has no ``resource``/``setrlimit`` (so NO CPU/memory/file caps apply); macOS
+    silently ignores ``RLIMIT_AS`` (no memory cap). On those, ``SubprocessSandbox`` still
+    isolates *faults* (timeout, temp dir, stripped env) but is not a boundary against a
+    determined adversary — untrusted code should run under :class:`ContainerSandbox`.
+    (Network egress is unenforced on *every* platform; see the module threat model.)
+    """
+    global _limits_unenforced_warned
+    if _limits_unenforced_warned:
+        return
+    if os.name != "posix":
+        gap = "CPU/memory/file-size limits (this OS has no setrlimit)"
+    elif sys.platform == "darwin":
+        gap = "the memory cap (RLIMIT_AS is ignored on macOS)"
+    else:
+        return  # POSIX non-darwin: setrlimit applies; nothing platform-specific to warn.
+    _limits_unenforced_warned = True
+    _log.warning(
+        "SubprocessSandbox cannot enforce %s on this platform (%s); it isolates faults, "
+        "not a determined adversary. Use ContainerSandbox for UNTRUSTED code.",
+        gap,
+        sys.platform,
+    )
 
 
 class SubprocessSandbox:
@@ -57,6 +89,7 @@ class SubprocessSandbox:
         files: dict[str, str] | None = None,
     ) -> SandboxResult:
         """Execute ``code`` in a throwaway working dir and capture its result."""
+        _warn_if_limits_unenforced()
         limits = self._limits
         with tempfile.TemporaryDirectory(prefix="himmy-sbx-") as workdir:
             work = Path(workdir)

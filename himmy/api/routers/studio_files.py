@@ -12,8 +12,10 @@ Both share the toolkit's jail discipline (mirroring
 absolute paths and ``..`` traversal are rejected, every component below the
 root is refused if it is a symlink, hidden (dot-prefixed) entries are never
 listed nor served — the sandbox root is the launch cwd by default, so dotfiles
-like ``.env`` / ``.himmy/`` must stay invisible — and the download re-validates
-with ``O_NOFOLLOW`` at open time to close the check-to-use window.
+like ``.env`` / ``.himmy/`` must stay invisible — and the download re-opens the
+target one path segment at a time with ``O_NOFOLLOW`` on *every* component
+(``openat``-style, anchored to the resolved root ``fd``) so a directory swapped
+for a symlink between check and use still fails closed.
 """
 
 from __future__ import annotations
@@ -45,6 +47,10 @@ _CHUNK = 64 * 1024
 #: ``O_NOFOLLOW`` where the platform has it (0 elsewhere — the explicit symlink
 #: rejection in :func:`_validate_rel_path` still guards those platforms).
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+#: ``O_DIRECTORY`` where the platform has it (0 elsewhere); applied to every
+#: intermediate segment of the openat-style download traversal so an intermediate
+#: component swapped for a symlink-to-a-file is also refused.
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 class SandboxFile(BaseModel):
@@ -118,6 +124,36 @@ def _validate_rel_path(root: Path, rel: str) -> Path:
         if probe.is_symlink():
             raise _bad("symlinks are not allowed inside the sandbox")
     return candidate
+
+
+def _open_nofollow_segments(root_resolved: Path, rel: str) -> int:
+    """Open ``rel`` under ``root_resolved`` one segment at a time, ``O_NOFOLLOW``-jailed.
+
+    ``O_NOFOLLOW`` on a single ``os.open`` only guards the *final* component, so a
+    validated path whose intermediate directory is swapped for a symlink (TOCTOU)
+    would still open through it. This walks each segment anchored to the previous
+    segment's directory ``fd`` (``openat`` semantics) with ``O_NOFOLLOW`` on all of
+    them — intermediates additionally require ``O_DIRECTORY`` — so a symlinked
+    component anywhere along the path is rejected atomically at open time.
+
+    Returns an open read-only ``fd`` for the final file (caller owns closing it).
+    Raises :class:`OSError` (``ELOOP`` on a symlinked component, ``ENOENT`` if a
+    component vanished, ``ENOTDIR`` if an intermediate is not a directory).
+    """
+    parts = [p for p in PurePosixPath(rel).parts if p != "."]
+    dir_fd = os.open(root_resolved, os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY,
+                dir_fd=dir_fd,
+            )
+            os.close(dir_fd)
+            dir_fd = next_fd
+        return os.open(parts[-1], os.O_RDONLY | _O_NOFOLLOW, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 @router.get("", response_model=FileListResponse)
@@ -203,20 +239,31 @@ async def download_file(
 
     Rejects absolute paths, ``..`` traversal, hidden components, and symlinks
     (400); missing files and directories are 404; oversized files are 413. The
-    open itself re-validates with ``O_NOFOLLOW`` so a component swapped for a
-    symlink between check and use still fails closed.
+    open walks the path one segment at a time with ``O_NOFOLLOW`` on *every*
+    component (anchored to the resolved root ``fd``), so a directory swapped for a
+    symlink between check and use — including an intermediate one — fails closed.
     """
     root = _sandbox_root()
     target = _validate_rel_path(root, path)
+    try:
+        root_resolved = root.resolve()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=409, detail="sandbox root is not resolvable"
+        ) from exc
     if not target.exists():
         raise HTTPException(status_code=404, detail="file not found in the sandbox")
     if target.is_dir():
         raise HTTPException(status_code=404, detail="path is a directory, not a file")
 
     try:
-        fd = os.open(target, os.O_RDONLY | _O_NOFOLLOW)
+        fd = _open_nofollow_segments(root_resolved, path)
     except OSError as exc:
-        if exc.errno == errno.ELOOP:  # O_NOFOLLOW hit a symlink at open time
+        # O_NOFOLLOW on a symlinked component raises ELOOP (link→file) or, on
+        # some platforms (macOS), ENOTDIR when an intermediate link→dir is
+        # refused; an intermediate that is a plain non-dir file is ENOTDIR too.
+        # All are invalid-path rejections, not "file missing".
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
             raise HTTPException(
                 status_code=400, detail="invalid path: symlinks are not allowed"
             ) from exc

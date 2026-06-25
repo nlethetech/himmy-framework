@@ -28,6 +28,14 @@ from typing import Any
 #: The per-project state directory name (durable spine, store, memory all live here).
 HIMMY_DIR_NAME = ".himmy"
 
+#: Override for the project HOME the durable ``.himmy/`` state directory hangs off. When set,
+#: :func:`himmy_dir` (and therefore every default db path resolved from it — spine, keyvault,
+#: conversations, …) is rooted at ``$HIMMY_HOME/.himmy`` instead of the auto-detected project
+#: root. This is the supported way to point a TEST at a throwaway state dir so it never reads
+#: or contaminates the real repo ``.himmy/keyvault.db`` (the security-critical vault). Unset in
+#: production, so the auto-detected project root is used exactly as before.
+HIMMY_HOME_ENV = "HIMMY_HOME"
+
 #: Override for the canonical durable spine path (``.himmy/spine.db`` by default). When
 #: set it is honoured verbatim — the parent directory is created on first use.
 HIMMY_SPINE_PATH_ENV = "HIMMY_SPINE_PATH"
@@ -93,11 +101,17 @@ def find_project_root(start: str | Path | None = None) -> Path:
 def himmy_dir(start: str | Path | None = None) -> Path:
     """The project's durable ``.himmy/`` state directory (created on demand).
 
-    Resolved against :func:`find_project_root` so every interface launched from inside
-    the same project tree agrees on one location. The directory is created (idempotently)
-    so callers can write into it without a separate ``mkdir``.
+    Resolved against ``$HIMMY_HOME`` when set (so a test can point all default state at a
+    throwaway dir and never touch the real repo ``.himmy/``), otherwise against
+    :func:`find_project_root` so every interface launched from inside the same project tree
+    agrees on one location. The directory is created (idempotently) so callers can write into
+    it without a separate ``mkdir``.
     """
-    path = find_project_root(start) / HIMMY_DIR_NAME
+    home = os.environ.get(HIMMY_HOME_ENV)
+    if home and home.strip():
+        path = Path(home.strip()).expanduser() / HIMMY_DIR_NAME
+    else:
+        path = find_project_root(start) / HIMMY_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -207,6 +221,7 @@ __all__ = [
     "HIMMY_CONVERSATIONS_PATH_ENV",
     "HIMMY_DIR_NAME",
     "HIMMY_GRAPH_CHECKPOINTS_PATH_ENV",
+    "HIMMY_HOME_ENV",
     "HIMMY_KEYVAULT_PATH_ENV",
     "HIMMY_SPINE_PATH_ENV",
     "HIMMY_V1_APPROVALS_PATH_ENV",

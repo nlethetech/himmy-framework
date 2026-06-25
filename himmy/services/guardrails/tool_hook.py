@@ -105,6 +105,39 @@ def _attribution(triggers: list[GuardrailTrigger]) -> str:
     return ", ".join(fired) if fired else "guardrail:unknown"
 
 
+#: Aggregate cap on bytes handed to the guardrail pipeline across a SINGLE tool
+#: result (post-hook) walk. The per-leaf scan is already bounded inside the PII rule
+#: (``_MAX_PII_SCAN_LEN``), but a container of thousands of capped leaves (e.g.
+#: ``{"docs": [<128 KiB string> × N]}``) would otherwise multiply the GIL-held regex
+#: CPU by the leaf count and freeze the event loop for seconds. Once this budget is
+#: exhausted, remaining leaves pass through UNSCANNED — bounding total inspect CPU per
+#: tool result regardless of leaf count (worst case ~0.5 s of pathological content).
+_MAX_TOTAL_SCAN_BYTES = 512 * 1024
+
+#: Minimum budget charged per inspected leaf, so a container of hundreds of thousands
+#: of *tiny* leaves (each costing ~0 bytes but a full ``inspect`` call) can't slip past
+#: the byte budget — this also bounds the NUMBER of inspect calls to ~``_MAX_TOTAL_SCAN_BYTES
+#: / _MIN_LEAF_CHARGE`` (≈ 2048) per tool result.
+_MIN_LEAF_CHARGE = 256
+
+#: Cap on the total number of nodes (container elements + leaves) the walk may VISIT
+#: per tool result. The byte budget bounds regex CPU, but a wide container of millions
+#: of tiny / non-string (e.g. int) leaves still costs an unbounded O(N) synchronous
+#: walk + N-element rebuild that the byte budget never charges. This is checked BEFORE
+#: a dict/list/tuple is iterated (``len(value) > remaining`` → return the container
+#: unwalked), so a single huge container can never force the O(N) iteration, and the
+#: cumulative count bounds many medium containers. ~200k nodes ≈ tens of ms of walk.
+_MAX_TOTAL_NODES = 200_000
+
+#: Cap on native container nesting depth the walk will descend. A deeply nested narrow
+#: container (``[[[[…]]]]`` 1000+ deep, each level len 1 so the fanout cap never trips)
+#: would otherwise hit Python's recursion limit and raise — caught by the tool service as
+#: an EXECUTION_ERROR that drops the whole result (a crafted-result denial). Past this
+#: depth the subtree is returned unwalked. Distinct from ``_JSON_STRING_MAX_DEPTH`` (which
+#: bounds re-parsing JSON-in-string leaves), and well under the interpreter limit (~1000).
+_MAX_WALK_DEPTH = 200
+
+
 def _guard_value(
     pipeline: GuardrailPipeline,
     value: Any,
@@ -114,6 +147,8 @@ def _guard_value(
     blocked: list[str],
     triggers: list[GuardrailTrigger],
     depth: int = 0,
+    budget: list[int] | None = None,
+    walk_depth: int = 0,
 ) -> Any:
     """Guard one value, recursing into containers; collect flags/triggers/blocks.
 
@@ -129,7 +164,26 @@ def _guard_value(
     redactions are applied in place so partial structures stay usable. Every firing is
     attributed in ``triggers`` (guardrail name + matched label).
     """
+    if budget is None:
+        # Fresh budget for this top-level walk; threaded through the recursion so the
+        # caps span the WHOLE tool result. [0] = scan bytes remaining, [1] = nodes
+        # remaining (container elements + leaves the walk may still visit).
+        budget = [_MAX_TOTAL_SCAN_BYTES, _MAX_TOTAL_NODES]
+    if budget[0] <= 0 or budget[1] <= 0:
+        # A budget is exhausted: pass the entire remaining value/subtree through
+        # UNSCANNED. Short-circuiting here (before any container walk) bounds regex
+        # bytes, inspect calls, AND nodes visited, so neither huge leaves, a flood of
+        # tiny leaves, nor a wide container of non-string leaves can stall the loop.
+        return value
+    if walk_depth > _MAX_WALK_DEPTH:
+        # Native nesting too deep: pass the remaining subtree through unwalked rather
+        # than recurse into a RecursionError (which would drop the whole tool result).
+        return value
+    budget[1] -= 1  # this node counts toward the walk budget (every type, incl. ints)
     if isinstance(value, str):
+        # Charge at least _MIN_LEAF_CHARGE so a flood of tiny leaves still exhausts the
+        # budget (each leaf is a full inspect call regardless of its length).
+        budget[0] -= max(len(value), _MIN_LEAF_CHARGE)
         verdict: GuardrailVerdict = pipeline.inspect(value, context=context)
         flags.extend(verdict.flags)
         triggers.extend(verdict.triggers)
@@ -149,6 +203,8 @@ def _guard_value(
             blocked=blocked,
             triggers=triggers,
             depth=depth + 1,
+            budget=budget,
+            walk_depth=walk_depth + 1,
         )
         if guarded != parsed:
             # Redactions inside the decoded document: re-serialize so the leaf
@@ -156,6 +212,10 @@ def _guard_value(
             return json.dumps(guarded, ensure_ascii=False)
         return verdict.text
     if isinstance(value, dict):
+        if len(value) > budget[1]:
+            # Fanout cap: walking + rebuilding this container would exceed the node
+            # budget. Return it UNWALKED so the O(N) comprehension never runs.
+            return value
         return {
             key: _guard_value(
                 pipeline,
@@ -165,10 +225,15 @@ def _guard_value(
                 blocked=blocked,
                 triggers=triggers,
                 depth=depth,
+                budget=budget,
+                walk_depth=walk_depth + 1,
             )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
+        if len(value) > budget[1]:
+            # Fanout cap (see dict branch): too many elements to walk — pass through.
+            return value
         guarded_items = [
             _guard_value(
                 pipeline,
@@ -178,6 +243,8 @@ def _guard_value(
                 blocked=blocked,
                 triggers=triggers,
                 depth=depth,
+                budget=budget,
+                walk_depth=walk_depth + 1,
             )
             for item in value
         ]

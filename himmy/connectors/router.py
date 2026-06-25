@@ -73,7 +73,9 @@ _PROVIDER_RESPONSE: dict[str, ProviderResponse] = {
 }
 
 
-def provider_response_for(connector: InboundChannelConnector) -> ProviderResponse | None:
+def provider_response_for(
+    connector: InboundChannelConnector,
+) -> ProviderResponse | None:
     """The provider-response mapper for ``connector`` (None ⇒ return the whole result)."""
     return _PROVIDER_RESPONSE.get(getattr(connector, "name", ""))
 
@@ -112,15 +114,31 @@ def build_connector_router(
     from fastapi import APIRouter, Request
     from fastapi.responses import JSONResponse
 
+    from himmy.connectors.webhook import (
+        DEFAULT_MAX_BODY_BYTES,
+        BodyTooLarge,
+        read_body_capped,
+    )
+
     router = APIRouter(tags=list(tags))
     mapper = provider_response or provider_response_for(connector)
     # 202 only makes sense when a reply is delivered out-of-band (an async callback).
     has_callback = getattr(connector, "_result_callback", None) is not None
     ack_status = ack if ack is not None else (202 if has_callback else 200)
+    # Per-connector cap when it sets one (the webhook connector does); else the shared
+    # default. Bounds the body BEFORE it is buffered, so an oversized delivery on any
+    # inbound channel can't pin memory ahead of the connector's signature check.
+    max_body_bytes = getattr(connector, "_max_body_bytes", DEFAULT_MAX_BODY_BYTES)
 
     async def receive(request: Request) -> JSONResponse:
         """Receive a signed delivery, run the agent (gated), return the provider body."""
-        body = await request.body()
+        try:
+            body = await read_body_capped(request, max_body_bytes)
+        except BodyTooLarge:
+            # Reject an over-cap (or over-declared) body BEFORE buffering the whole thing.
+            return JSONResponse(
+                status_code=413, content={"ok": False, "reason": "payload too large"}
+            )
         result = await connector.handle_webhook(body, dict(request.headers))
         if result.get("ok"):
             status = ack_status if result.get("accepted") else 200

@@ -95,6 +95,68 @@ def _isolated_keyvault(
     monkeypatch.setenv("HIMMY_KEYVAULT_PATH", str(keyvault_db))
 
 
+# Guard-focused suites that deliberately drive the cross-site / CSRF middleware with
+# bespoke (or absent) Origin/Referer/Host headers — they must see the RAW guard
+# behaviour, so the same-origin default below is NOT injected for them.
+_GUARD_TEST_FILES = (
+    "test_csrf_origin_guard.py",
+    "test_studio_guard.py",
+    "test_v1_guard.py",
+)
+
+
+@pytest.fixture(autouse=True)
+def _testclient_same_origin(request: pytest.FixtureRequest) -> Any:
+    """Make Starlette ``TestClient`` requests look like a real same-origin browser call.
+
+    The Studio/``/v1`` cross-site guard (``_install_studio_guard``) fails CLOSED on a
+    guarded *mutating* request (POST/PUT/PATCH/DELETE) that carries no ``Origin``/
+    ``Referer`` — correct CSRF hardening, because a same-origin browser fetch ALWAYS
+    sends ``Origin``. ``TestClient`` (a server-to-server httpx client) omits it, so
+    without this fixture every API test that POSTs to a guarded route would 403.
+
+    A real same-origin request from the Studio SPA sends ``Origin: <app origin>``; the
+    TestClient's base origin is ``http://testserver`` (Host ``testserver`` is already in
+    the guard's allow-list). We inject that as a DEFAULT header only when the caller did
+    not set one of its own — so any test that explicitly passes an ``origin``/``referer``
+    (incl. the cross-origin / opaque-Origin negative cases) keeps full control and the
+    guard's real decision is exercised unchanged. The guard-focused suites above opt out
+    entirely so their no-header / bespoke-header cases stay raw.
+    """
+    fspath = str(request.node.fspath)
+    if any(fspath.endswith(name) for name in _GUARD_TEST_FILES):
+        yield
+        return
+
+    # Starlette's TestClient subclasses a (possibly vendored, e.g. ``httpx2``) httpx
+    # ``Client``; patch the single ``build_request`` choke point it inherits so the
+    # default Origin is injected for EVERY call path (``.request`` AND ``.stream``,
+    # which the SSE run/team/research tests use) regardless of construction site.
+    from starlette.testclient import TestClient as _TestClient
+
+    client_cls = _TestClient.__mro__[1]  # the underlying httpx Client base
+    _orig_build_request = client_cls.build_request
+
+    def _build_request_with_origin(
+        self: Any, method: str, url: Any, **kwargs: Any
+    ) -> Any:
+        request = _orig_build_request(self, method, url, **kwargs)
+        # Only patch the in-process ASGI transport used by TestClient (base_url
+        # http://testserver); never touch a real network client. A same-origin browser
+        # fetch always sends Origin, so default it when the caller set neither header.
+        base = str(getattr(self, "base_url", "") or "")
+        if base.startswith("http://testserver"):
+            if "origin" not in request.headers and "referer" not in request.headers:
+                request.headers["origin"] = "http://testserver"
+        return request
+
+    client_cls.build_request = _build_request_with_origin  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        client_cls.build_request = _orig_build_request  # type: ignore[method-assign]
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_embedder_cascade(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch

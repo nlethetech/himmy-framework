@@ -187,6 +187,7 @@ class PrivacyAuditService:
             passed=passed,
             metrics=metrics,
             lookback_seconds=window,
+            workspace_id=workspace_id,
             metadata={
                 "scanned": scanned,
                 "probe_ran": bool(probe_metrics),

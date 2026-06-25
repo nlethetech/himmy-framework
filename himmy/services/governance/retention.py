@@ -507,7 +507,7 @@ class SubjectKeyVault:
         except sqlite3.Error:  # pragma: no cover - checkpoint is best-effort
             pass
 
-    def destroy(self, subject_id: str) -> bool:
+    def destroy(self, subject_id: str, *, workspace_id: str | None = None) -> bool:
         """Crypto-shred durably: null the stored key + stamp ``shredded_at``.
 
         Returns ``True`` if a live key existed (and was destroyed), ``False`` if the subject
@@ -516,15 +516,31 @@ class SubjectKeyVault:
         restart and is irrecoverable. After committing the null, the WAL is checkpoint-truncated
         (:meth:`_checkpoint_locked`) so the shred is fsynced to the main DB and cannot be lost
         to a power-cut before the deletion certificate is written.
+
+        ``workspace_id`` (S5, defense-in-depth) gates the shred to the caller's tenant: when
+        given, the row's key must be provably bound to that SAME workspace; a row bound to a
+        different tenant OR an UNBOUND/global row (``workspace_id`` NULL — the production
+        default) is REFUSED (returns ``False``, destroying nothing), so a cross-tenant
+        withdrawal can never crypto-shred a key it does not own. ``None`` keeps the legacy
+        single-tenant/offline path: any row is shreddable, exactly as before.
         """
         self._cache.pop(subject_id, None)
         with self._lock:
             row = self._conn.execute(
-                "SELECT wrapped_dek, shredded_at FROM subject_keys "
+                "SELECT wrapped_dek, shredded_at, workspace_id FROM subject_keys "
                 "WHERE subject_id = ?",
                 (subject_id,),
             ).fetchone()
             if row is None or row[1] is not None or row[0] is None:
+                return False
+            # Cross-tenant guard (FAIL SAFE): a workspace-scoped destroy may ONLY shred a key
+            # provably bound to that same workspace. When the caller scopes the destroy
+            # (workspace_id given), an UNBOUND key (row[2] is None — the production default,
+            # since keys are minted without a workspace) or a key bound to a DIFFERENT tenant
+            # is REFUSED (None != workspace_id => refuse). A multi-tenant caller must not
+            # crypto-shred a global key per-tenant. The legacy unscoped path (workspace_id=None)
+            # is unchanged: any row is shreddable.
+            if workspace_id is not None and row[2] != workspace_id:
                 return False
             self._conn.execute(
                 "UPDATE subject_keys SET wrapped_dek = NULL, shredded_at = ? "
@@ -777,8 +793,19 @@ class RetentionService:
         self._reach = reach_map
         self._clock = clock or utc_now_iso
 
+    def workspace_of(self, subject_id: str) -> str | None:
+        """The ``workspace_id`` a subject's vault key is bound to (``None`` if unbound).
+
+        Exposed so a caller (e.g. :meth:`ConsentLedger.withdraw`) can gate a destructive
+        crypto-shred on tenant ownership BEFORE invoking :meth:`erase_subject`. Returns
+        ``None`` when no key vault is wired or the subject is unbound/unknown.
+        """
+        if self._keys is None:
+            return None
+        return self._keys.workspace_of(subject_id)
+
     def erase_subject(
-        self, subject_id: str, *, reason: str = ""
+        self, subject_id: str, *, reason: str = "", workspace_id: str | None = None
     ) -> DeletionCertificate:
         """Erase a subject everywhere and register a signed deletion certificate (S4).
 
@@ -794,11 +821,19 @@ class RetentionService:
         Backwards-compatible: with no reach map wired the per-store list is empty and the
         behavior reduces to the historical crypto-shred + tombstone (now also accompanied by
         the certificate).
+
+        ``workspace_id`` (defense-in-depth) is forwarded to :meth:`SubjectKeyVault.destroy`
+        so the crypto-shred is REFUSED when the subject's key is bound to a different tenant;
+        ``None`` keeps the legacy single-tenant/offline path.
         """
         key_version = (
             self._keys.key_version_of(subject_id) if self._keys is not None else None
         )
-        shredded = self._keys.destroy(subject_id) if self._keys is not None else False
+        shredded = (
+            self._keys.destroy(subject_id, workspace_id=workspace_id)
+            if self._keys is not None
+            else False
+        )
         per_store = self._reach.erase(subject_id) if self._reach is not None else []
         erased_at = self._clock()
 

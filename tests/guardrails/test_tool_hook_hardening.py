@@ -147,9 +147,16 @@ def test_deeply_nested_json_arrays_in_one_string_terminate() -> None:
 
 
 def test_oversized_json_string_is_not_parsed_but_still_inspected() -> None:
-    """A leaf above the size cap skips JSON parsing; raw inspection still applies."""
+    """A leaf above the size cap skips JSON parsing; raw inspection still applies.
+
+    The email is placed in the FIRST 128 KiB so it lands inside the regex-scanned head
+    (the PII scan caps at ``_MAX_PII_SCAN_LEN`` to bound the GIL-held loop stall — see
+    builtins.py), while the >1M-char ``pad`` still pushes the whole leaf past the JSON
+    parse cap so it is NOT parsed. This proves raw inspection still redacts PII in an
+    oversized, unparsed leaf.
+    """
     hook = build_guardrail_post_hook(build_guardrail_pipeline(["pii"]))
-    huge = '{"pad": "' + "x" * 1_000_100 + '", "email": "a@b.com"}'
+    huge = '{"email": "a@b.com", "pad": "' + "x" * 1_000_100 + '"}'
     out = run_async(hook(_result(huge), _defn()))
     assert "a@b.com" not in out  # raw regex still caught the unescaped email
 

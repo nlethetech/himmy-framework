@@ -90,9 +90,7 @@ DEFAULT_ID_FIELD = "id"
 
 
 # --------------------------------------------------------------------- signing helper
-def sign_webhook_body(
-    *, secret: str, body: bytes, timestamp: str | None = None
-) -> str:
+def sign_webhook_body(*, secret: str, body: bytes, timestamp: str | None = None) -> str:
     """Compute the ``sha256=<hex>`` signature a sender (or our callback) puts on the wire.
 
     Mirrors :meth:`WebhookInboundConnector.verify_webhook`: when ``timestamp`` is given the
@@ -118,6 +116,35 @@ def _header_lookup(headers: Mapping[str, str], name: str) -> str | None:
         if key.lower() == target:
             return value
     return None
+
+
+class BodyTooLarge(Exception):
+    """The inbound body exceeds ``max_body_bytes`` (declared or while streaming)."""
+
+
+async def read_body_capped(request: Any, max_body_bytes: int) -> bytes:
+    """Read a request body, refusing one that exceeds ``max_body_bytes``.
+
+    Closes a memory-pressure hole: ``await request.body()`` buffers the WHOLE body before
+    the connector's size cap is checked, so an oversized (or lying) sender can pin memory
+    before the signature is even looked at. This mirrors the early ``Content-Length`` check
+    used by the Studio upload route and additionally enforces the cap while *streaming* a
+    chunked body (no declared length), aborting the moment the running total crosses the
+    cap so at most ``max_body_bytes`` (plus one chunk) is ever held.
+
+    Raises :class:`BodyTooLarge` on an over-cap body; the caller maps that onto HTTP 413.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > max_body_bytes:
+        raise BodyTooLarge
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_body_bytes:
+            raise BodyTooLarge
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # ------------------------------------------------------------------- result callback
@@ -496,9 +523,7 @@ class WebhookInboundConnector(InboundChannelConnector):
 
     # The webhook connector is push-only: there is no poll loop to implement.
     async def fetch_updates(self, offset: int | None) -> list[Any]:
-        raise ConnectorError(
-            "webhook is push-only; use handle_webhook, not polling"
-        )
+        raise ConnectorError("webhook is push-only; use handle_webhook, not polling")
 
     def parse_update(self, update: Any) -> InboundMessage | None:  # pragma: no cover
         return None
@@ -548,7 +573,13 @@ def build_webhook_router(
 
     async def receive_webhook(request: Request) -> JSONResponse:
         """Receive a signed webhook, run the agent (gated), return the reply or an ack."""
-        body = await request.body()
+        try:
+            body = await read_body_capped(request, connector._max_body_bytes)  # noqa: SLF001
+        except BodyTooLarge:
+            # Reject an over-cap (or over-declared) body BEFORE buffering the whole thing.
+            return JSONResponse(
+                status_code=413, content={"ok": False, "reason": "payload too large"}
+            )
         # Map the SDK's structured outcome onto HTTP status codes. The outcome strings are
         # the connector's own (secret-free) reasons; we never surface the request body.
         result = await connector.handle_webhook(body, dict(request.headers))
@@ -572,7 +603,9 @@ def build_webhook_router(
     # FastAPI sees the real ``Request`` type without any module-level fastapi import.
     receive_webhook.__annotations__["request"] = Request
     receive_webhook.__annotations__["return"] = JSONResponse
-    router.add_api_route(path, receive_webhook, methods=["POST"], include_in_schema=True)
+    router.add_api_route(
+        path, receive_webhook, methods=["POST"], include_in_schema=True
+    )
 
     return router
 

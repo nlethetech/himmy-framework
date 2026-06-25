@@ -39,6 +39,10 @@ export function GoogleCard({ onChange }: { onChange?: () => void }) {
 
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
+      // Security: only trust postMessage events from our own origin (the OAuth
+      // popup is served same-origin). Drop anything else to prevent a malicious
+      // cross-origin window from spoofing the "connected" signal.
+      if (e.origin !== window.location.origin) return;
       if (e.data === "himmy-google-connected") {
         load();
         onChange?.();

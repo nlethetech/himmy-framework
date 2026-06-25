@@ -69,6 +69,15 @@ async def export_audit_bundle_route(request: Request) -> AuditBundle:
         *registry.list_by_kind(SECURITY_EVENT_KIND),
         *registry.list_by_kind(PRIVACY_AUDIT_REPORT_KIND),
     ]
+    # Tenant-scope the export exactly like /events: a tenant-bound auditor only sees
+    # its own workspace's records (plus global/ops records with no workspace_id),
+    # never another tenant's trail. An all_tenants principal resolves to None and
+    # keeps the full export.
+    workspace_id = resolve_workspace(request, None)
+    if workspace_id is not None:
+        records = [
+            r for r in records if r.metadata.get("workspace_id") in (None, workspace_id)
+        ]
     private_pem = get_secret("HIMMY_AUDIT_PRIVATE_KEY")
     if private_pem:
         return export_audit_bundle_ed25519(records, [], private_pem=private_pem)

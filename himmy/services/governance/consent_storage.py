@@ -48,6 +48,7 @@ GATED_SAVE_METHODS = frozenset(
     {
         "save_run",
         "save_run_if_absent_by_idempotency",
+        "save_run_if_under_quota",
         "save_snapshot",
         "save_memory",
         "save_episodic_memory",
@@ -96,9 +97,7 @@ class ConsentGatedStorage:
         silent. ``subject`` is intentionally omitted from the log to avoid leaking a
         subject identifier into operational logs.
         """
-        logger.warning(
-            "consent denied persist for resource=%s: %s", resource, reason
-        )
+        logger.warning("consent denied persist for resource=%s: %s", resource, reason)
         if self._audit is None:
             return
         from himmy.services.audit.models import SecurityEvent
@@ -129,6 +128,18 @@ class ConsentGatedStorage:
             return cast(
                 "tuple[RunRecord, bool]",
                 await self._inner.save_run_if_absent_by_idempotency(run),
+            )
+        return run, True
+
+    async def save_run_if_under_quota(
+        self, run: RunRecord, *, cap: int
+    ) -> tuple[RunRecord, bool]:
+        """Quota-gated atomic create, also consent-gated. Decision precedes the atomic
+        section; an unconsented subject's run is ephemeral and consumes no quota."""
+        if self._may_persist(run):
+            return cast(
+                "tuple[RunRecord, bool]",
+                await self._inner.save_run_if_under_quota(run, cap=cap),
             )
         return run, True
 

@@ -19,6 +19,7 @@ from urllib.parse import quote, quote_plus
 
 from himmy.connectors.fetcher import Fetcher, HttpxFetcher, get_json
 from himmy.services.tools.registry import ToolRegistry, register_local_tool
+from himmy.toolkit._net import build_pinned_transport, guard_url
 from himmy.toolkit.config import ToolkitConfig
 
 _WEATHER_SCHEMA = {
@@ -56,7 +57,27 @@ def register_datasources_pack(
     fetcher: Fetcher | None = None,
 ) -> None:
     """Register ``weather``, ``geocode``, and ``wikipedia`` over public APIs."""
-    fetch = fetcher or HttpxFetcher(timeout=config.http_timeout)
+    allow_hosts = set(config.egress_allow_hosts) or None
+
+    # Guard the model-driven URL AND every redirect hop, and pin the DNS-vetted IP
+    # at connect time — so a poisoned/MITM'd upstream that 302s to 169.254.169.254 /
+    # loopback / an RFC1918 host is refused before the hop is followed (SSRF defense),
+    # exactly like the web pack.
+    def _guard(target: str) -> str:
+        return guard_url(
+            target,
+            allow_private=config.allow_private_hosts,
+            allow_hosts=allow_hosts,
+        )
+
+    fetch = fetcher or HttpxFetcher(
+        timeout=config.http_timeout,
+        guard=_guard,
+        max_bytes=config.http_max_bytes,
+        transport=build_pinned_transport(
+            allow_private=config.allow_private_hosts, allow_hosts=allow_hosts
+        ),
+    )
 
     def weather(args: dict[str, Any]) -> dict[str, Any]:
         lat = float(args["latitude"])

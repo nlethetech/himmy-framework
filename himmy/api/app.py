@@ -564,9 +564,7 @@ def create_app(
     try:
         from himmy.api.routines import set_routine_container_provider
 
-        set_routine_container_provider(
-            lambda: getattr(app.state, "container", None)
-        )
+        set_routine_container_provider(lambda: getattr(app.state, "container", None))
     except Exception:  # pragma: no cover - routine wiring is best-effort
         logger.warning("wiring routine container failed", exc_info=True)
 
@@ -948,17 +946,30 @@ def _install_studio_guard(app: FastAPI) -> None:
     ) -> Response:
         if request.url.path.startswith(_GUARDED_PREFIXES):
             host = _studio_host(request.headers.get("host", ""))
-            if host and host not in allowed:
+            # Fail closed on a missing/empty Host too — an absent Host must NOT skip the
+            # DNS-rebinding guard (mirrors the Origin/Referer fail-closed handling below).
+            if not host or host not in allowed:
                 return JSONResponse(
                     status_code=403, content={"detail": "host not allowed"}
                 )
-            ref = request.headers.get("origin") or request.headers.get("referer")
-            if ref:
+            origin = request.headers.get("origin")
+            referer = request.headers.get("referer")
+            ref = origin or referer
+            if ref is not None:
+                # A present Origin/Referer must parse to an allowed host. Opaque
+                # values ("null", "file://...") yield an empty host: treat them as
+                # cross-site and REJECT (fail closed) rather than skipping the check.
                 rh = _origin_host(ref)
-                if rh and rh not in allowed:
+                if rh not in allowed:
                     return JSONResponse(
                         status_code=403, content={"detail": "cross-origin blocked"}
                     )
+            elif request.method in ("POST", "PUT", "PATCH", "DELETE"):
+                # A guarded state-changing request with NEITHER Origin nor Referer
+                # cannot be proven same-site: fail closed to block CSRF.
+                return JSONResponse(
+                    status_code=403, content={"detail": "cross-origin blocked"}
+                )
         return await call_next(request)
 
 

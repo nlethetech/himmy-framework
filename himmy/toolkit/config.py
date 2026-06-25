@@ -51,6 +51,10 @@ class ToolkitConfig(BaseModel):
 
     # comms pack ------------------------------------------------------------
     comms_allow_send: bool = False
+    #: Opt out of the Gmail/Calendar approval gate (``gmail_send`` / ``gcal_create``).
+    #: Defaults to False so mutating Google tools stay human-in-the-loop, mirroring
+    #: ``comms_allow_send``; set ``HIMMY_GOOGLE_ALLOW_SEND`` to release the gate.
+    google_allow_send: bool = False
     smtp_host: str | None = None
     smtp_port: int = 587
     smtp_user: str | None = None
@@ -188,6 +192,9 @@ class ToolkitConfig(BaseModel):
             ollama_base_url=env.get("HIMMY_OLLAMA_URL"),
             comms_allow_send=_env_bool(
                 env.get("HIMMY_COMMS_ALLOW_SEND"), default=False
+            ),
+            google_allow_send=_env_bool(
+                env.get("HIMMY_GOOGLE_ALLOW_SEND"), default=False
             ),
             smtp_host=env.get("HIMMY_SMTP_HOST"),
             smtp_port=int(env.get("HIMMY_SMTP_PORT", "587")),

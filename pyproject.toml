@@ -17,6 +17,10 @@ dependencies = [
     "pydantic>=2",
     "pyyaml>=6",
     "httpx>=0.27",
+    # Native OS keyring access for the macOS-keychain secret backend, so a written
+    # secret is handed to the keychain in-process and never exposed in the process
+    # table (argv) as the legacy `security` CLI path did.
+    "keyring>=24",
 ]
 
 [project.scripts]
@@ -209,6 +213,18 @@ ignore = [
 # from PRAGMA/sqlite_master and are regex-restricted to \w + validated against the live
 # schema — never raw model input. Values still go through the parameterized query path.
 "himmy/toolkit/data.py" = ["S608"]
+# Aux/tasks persistence: UPDATE column-list (`sets`) is built from a fixed, code-defined
+# set of column literals (no user input); all values go through the parameterized
+# (?/$n) path — same posture as the storage layers above.
+"himmy/services/storage/postgres_aux.py" = ["S608"]
+"himmy/api/studio_tasks.py" = ["S608"]
+# Local research/bench harnesses: drive a self-managed localhost model server over a
+# fixed subprocess + loopback HTTP (never untrusted input/URLs). Not shipped in the
+# package; kept lint-clean without weakening the active S rules in library code.
+"himmy/services/inference/himalaya_bridge.py" = ["S310", "S603"]
+"experiments/**" = ["S310", "S603", "E741"]
+"scripts/real_bfcl/**" = ["E402"]
+"scripts/gemma4_server/smoke_client.py" = ["S310"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -250,6 +266,8 @@ module = [
     "google.*",
     "azure.*",
     "presidio_analyzer.*",
+    "tzlocal.*",
+    "playwright.*",
 ]
 ignore_missing_imports = true
 

@@ -2784,7 +2784,19 @@ class SingleAgentRuntime:
         """
         if guardrail is None:
             return text
-        verdict = guardrail.inspect(text, context={"stage": stage})
+        # Run inspection in a worker thread. NOTE: for a regex/CPU-bound guardrail
+        # this does NOT move the work off the event loop in any real sense — Python's
+        # ``re`` engine holds the GIL while matching, so the loop is still stalled for
+        # the duration of the scan (a large sub-cap input pinned the loop ~900 ms even
+        # through to_thread). The actual loop protection for regex guardrails is the
+        # bounded (linear, non-backtracking) pattern + the small per-scan input cap in
+        # builtins (``_MAX_PII_SCAN_LEN``), which bound worst-case CPU to ~tens of ms.
+        # to_thread is kept because it DOES help I/O-bound guardrails (e.g. ones that
+        # call out to a service) which release the GIL; it is harmless for regex ones.
+        # Semantics are unchanged; only the thread the work runs on differs.
+        verdict = await asyncio.to_thread(
+            guardrail.inspect, text, context={"stage": stage}
+        )
         result = cast(str, verdict.text)
         if not verdict.allowed:
             # The block is enforced: never return the offending text. Honor a safe

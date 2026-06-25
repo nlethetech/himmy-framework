@@ -82,6 +82,33 @@ def _ledger(request: Request) -> Any:
     return ledger
 
 
+def _require_workspace(request: Request, requested: str | None) -> str | None:
+    """Resolve and authorize the caller's workspace for a consent operation.
+
+    Delegates to :func:`resolve_workspace` (which 403s a tenant-bound principal that
+    asks for a workspace it cannot access, and 400s an ambiguous multi-tenant omission).
+    The returned value scopes the consent identity to the caller's tenant. On the offline
+    / unrestricted path it is ``None``, which the ledger maps to the legacy id so the
+    zero-config surface is unchanged.
+    """
+    return resolve_workspace(request, requested)
+
+
+def _assert_same_tenant(record: ConsentRecord | None, workspace_id: str | None) -> None:
+    """404 when ``record`` belongs to a different tenant than the caller's workspace.
+
+    Defense-in-depth on top of the workspace-scoped stable id: even if a record were
+    reachable, a payload ``workspace_id`` that disagrees with the resolved caller
+    workspace is treated as not-found so one tenant can never read another's consent.
+    Skipped when the caller is unrestricted (``workspace_id is None``) or the record
+    predates tenant scoping (its ``workspace_id`` is ``None``).
+    """
+    if record is None or workspace_id is None:
+        return
+    if record.workspace_id is not None and record.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="consent record not found")
+
+
 def _enforce_self_scope(request: Request, subject_id: str) -> None:
     """A ``data_subject`` principal may only touch its own ``subject_id`` (else 403).
 
@@ -114,7 +141,7 @@ def _enforce_self_scope(request: Request, subject_id: str) -> None:
 async def grant_consent(body: ConsentWriteRequest, request: Request) -> ConsentRecord:
     """Record a GRANTED consent for ``(subject_id, purpose)`` (operator/admin)."""
     _enforce_self_scope(request, body.subject_id)
-    workspace_id = resolve_workspace(request, body.workspace_id)
+    workspace_id = _require_workspace(request, body.workspace_id)
     ledger = _ledger(request)
     record = ledger.grant(
         body.subject_id,
@@ -141,7 +168,7 @@ async def grant_consent(body: ConsentWriteRequest, request: Request) -> ConsentR
 async def deny_consent(body: ConsentWriteRequest, request: Request) -> ConsentRecord:
     """Record a DENIED consent for ``(subject_id, purpose)`` (operator/admin)."""
     _enforce_self_scope(request, body.subject_id)
-    workspace_id = resolve_workspace(request, body.workspace_id)
+    workspace_id = _require_workspace(request, body.workspace_id)
     ledger = _ledger(request)
     record = ledger.deny(
         body.subject_id,
@@ -213,11 +240,12 @@ async def withdraw_consent(
     """
     _enforce_self_scope(request, body.subject_id)
     await _authorize_withdraw(request, body.subject_id)
-    workspace_id = resolve_workspace(request, body.workspace_id)
+    workspace_id = _require_workspace(request, body.workspace_id)
     ledger = _ledger(request)
     records = ledger.withdraw(
         body.subject_id,
         body.purpose,
+        workspace_id=workspace_id,
         reason=body.reason,
         actor=get_principal(request).subject,
         source="api",
@@ -239,16 +267,19 @@ async def get_decision(
     request: Request,
     subject_id: str = Query(...),
     purpose: Purpose = Query(...),
+    workspace_id: str | None = Query(None),
 ) -> DecisionResponse:
     """Resolve the PDP decision for ``(subject_id, purpose)`` (self-scoped allowed)."""
     _enforce_self_scope(request, subject_id)
-    resolve_workspace(request, None)
+    workspace_id = _require_workspace(request, workspace_id)
     ledger = _ledger(request)
-    decision = ledger.decision(subject_id, purpose)
+    record = ledger.latest(subject_id, purpose, workspace_id=workspace_id)
+    _assert_same_tenant(record, workspace_id)
+    decision = ledger.decision(subject_id, purpose, workspace_id=workspace_id)
     return DecisionResponse(
         subject_id=subject_id,
         purpose=purpose,
-        state=ledger.state(subject_id, purpose),
+        state=ledger.state(subject_id, purpose, workspace_id=workspace_id),
         effect=decision.effect.value,
         allowed=decision.allowed,
         reason=decision.reason,
@@ -260,11 +291,14 @@ async def get_latest(
     request: Request,
     subject_id: str = Query(...),
     purpose: Purpose = Query(...),
+    workspace_id: str | None = Query(None),
 ) -> ConsentRecord | None:
     """Return the latest :class:`ConsentRecord` for the pair, or ``null``."""
     _enforce_self_scope(request, subject_id)
-    resolve_workspace(request, None)
-    return cast("ConsentRecord | None", _ledger(request).latest(subject_id, purpose))
+    workspace_id = _require_workspace(request, workspace_id)
+    record = _ledger(request).latest(subject_id, purpose, workspace_id=workspace_id)
+    _assert_same_tenant(record, workspace_id)
+    return cast("ConsentRecord | None", record)
 
 
 @router.get("/history", response_model=list[ConsentRecord], dependencies=_READ)
@@ -272,11 +306,15 @@ async def get_history(
     request: Request,
     subject_id: str = Query(...),
     purpose: Purpose = Query(...),
+    workspace_id: str | None = Query(None),
 ) -> list[ConsentRecord]:
     """Return the full append-only version chain for ``(subject_id, purpose)``."""
     _enforce_self_scope(request, subject_id)
-    resolve_workspace(request, None)
-    return cast("list[ConsentRecord]", _ledger(request).history(subject_id, purpose))
+    workspace_id = _require_workspace(request, workspace_id)
+    records = _ledger(request).history(subject_id, purpose, workspace_id=workspace_id)
+    for record in records:
+        _assert_same_tenant(record, workspace_id)
+    return cast("list[ConsentRecord]", records)
 
 
 __all__ = ["router"]

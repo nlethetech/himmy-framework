@@ -97,6 +97,19 @@ class FileSecrets:
         if self._dir is None:
             raise RuntimeError("FileSecrets has no base dir; cannot write")
         self._dir.mkdir(parents=True, exist_ok=True)
+        # Tighten the secrets dir (and its parent) to owner-only: the default umask
+        # leaves a fresh dir 0o755 / world-traversable, which leaks the *names* of
+        # stored secrets to other local users. The files themselves are 0600 below.
+        os.chmod(self._dir, 0o700)
+        parent = self._dir.parent
+        if parent != self._dir and parent.is_dir():
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                # Parent may be a shared/system mount we don't own (e.g. a custom
+                # HIMMY_SECRETS_DIR under /run/secrets); the dir's own 0o700 still
+                # protects the secret names.
+                pass
         target = self._dir / name
         # Atomic write with a 0600 temp file so the secret is never world-readable
         # nor half-written.
@@ -271,16 +284,23 @@ class AzureKeyVault:
 
 
 class KeychainSecrets:
-    """macOS login keychain via the ``security`` CLI (read + write + delete).
+    """macOS login keychain (read + write + delete).
 
     One generic-password item per secret name (``service="himmy"``,
     ``account=<NAME>``). Write-capable, so the Studio Connections UI can store a
     pasted token. macOS-only — :func:`build_secret_provider` falls back to a
     writable :class:`FileSecrets` on other platforms.
 
-    NOTE: ``set`` passes the value as a CLI argument, so it is briefly visible in
-    the process table. Acceptable for a local, single-user, loopback GUI; do not
-    use this backend on a shared host.
+    By default the secret value is handed to the OS keychain through the native
+    ``keyring`` library, so it is passed in-process and **never appears in the
+    process table (argv)**. The keyring backend is injectable (``keyring_backend``)
+    for tests.
+
+    Only if ``keyring`` is unavailable *and* no backend was injected does this fall
+    back to the legacy ``security`` CLI. That fallback passes the value as a CLI
+    argument, so it is briefly visible via ``ps`` — acceptable for a local,
+    single-user, loopback GUI, but never use it on a shared host. Passing an
+    explicit ``runner`` forces the CLI path (used by tests of the fallback).
     """
 
     _NOT_FOUND = 44  # `security`'s exit code for "item not found"
@@ -290,14 +310,39 @@ class KeychainSecrets:
         *,
         service: str = "himmy",
         runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+        keyring_backend: object | None = None,
     ) -> None:
         self._service = service
+        # An explicit runner forces the (argv-exposing) CLI fallback path; this
+        # preserves the injectable subprocess seam for fallback-path tests.
+        self._force_cli = runner is not None
         self._runner = runner or self._default_runner
+        if keyring_backend is not None:
+            self._keyring: object | None = keyring_backend
+        elif self._force_cli:
+            self._keyring = None
+        else:
+            self._keyring = self._load_keyring()
+
+    @staticmethod
+    def _load_keyring() -> object | None:
+        try:
+            import keyring
+        except Exception:
+            return None
+        return keyring
 
     @staticmethod
     def available() -> bool:
-        """True only on macOS with the ``security`` binary present."""
-        return platform.system() == "Darwin" and shutil.which("security") is not None
+        """True only on macOS with a keychain backend (``keyring`` or the CLI)."""
+        if platform.system() != "Darwin":
+            return False
+        try:
+            import keyring  # noqa: F401
+
+            return True
+        except Exception:
+            return shutil.which("security") is not None
 
     @staticmethod
     def _default_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -308,6 +353,9 @@ class KeychainSecrets:
         )
 
     def get(self, name: str) -> str | None:
+        if self._keyring is not None:
+            value = self._keyring.get_password(self._service, name)  # type: ignore[attr-defined]
+            return cast("str | None", value)
         result = self._runner(
             ["security", "find-generic-password", "-s", self._service, "-a", name, "-w"]
         )
@@ -316,6 +364,10 @@ class KeychainSecrets:
         return (result.stdout or "").rstrip("\n")
 
     def set(self, name: str, value: str) -> None:
+        if self._keyring is not None:
+            # In-process: the value never touches argv / the process table.
+            self._keyring.set_password(self._service, name, value)  # type: ignore[attr-defined]
+            return
         # -U upserts (replaces an existing item rather than erroring on duplicate).
         result = self._runner(
             [
@@ -336,6 +388,14 @@ class KeychainSecrets:
             )
 
     def delete(self, name: str) -> None:
+        if self._keyring is not None:
+            try:
+                self._keyring.delete_password(self._service, name)  # type: ignore[attr-defined]
+            except Exception:
+                # keyring raises PasswordDeleteError when the item is absent;
+                # delete is idempotent (absent == success).
+                pass
+            return
         result = self._runner(
             ["security", "delete-generic-password", "-s", self._service, "-a", name]
         )

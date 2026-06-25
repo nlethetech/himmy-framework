@@ -408,7 +408,7 @@ async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback
         raise HTTPException(status_code=404, detail="run not found")
     # Attribute the verdict to the tools this run used (positive-signal learning). The run's
     # thread_id locates its tool events; best-effort, off-by-default for behaviour change.
-    run = studio_feedback.get_run_store().get(run_id)
+    run = get_run_store().get(run_id)
     await studio_feedback.attribute_feedback_outcomes(
         verdict=body.verdict,
         run_id=run_id,
@@ -609,8 +609,12 @@ def _oauth_page(title: str, detail: str) -> str:
         "<style>body{font-family:system-ui,sans-serif;background:#111;color:#eee;"
         "display:grid;place-items:center;height:100vh;margin:0;text-align:center}"
         "h1{font-size:20px;margin:0 0 8px}p{color:#9aa;max-width:30rem}</style>"
+        # Security: post to the concrete Studio origin (this popup is served
+        # same-origin, so window.location.origin IS the Studio origin) instead of
+        # the wildcard "*", so the connected signal can't leak to other windows.
         "<script>try{if(window.opener){window.opener.postMessage("
-        "'himmy-google-connected','*');setTimeout(function(){window.close()},1200)}}"
+        "'himmy-google-connected',window.location.origin);"
+        "setTimeout(function(){window.close()},1200)}}"
         "catch(e){}</script></head><body><div>"
         f"<h1>{_html.escape(title)}</h1><p>{_html.escape(detail)}</p>"
         "</div></body></html>"

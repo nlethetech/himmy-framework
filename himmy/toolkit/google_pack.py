@@ -73,6 +73,12 @@ def register_google_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     """Register the Gmail + Calendar tools backed by the connected Google account."""
     from himmy.api import studio_google as g
 
+    # Mutating Google tools (send mail, create events) are human-in-the-loop by
+    # default — mirroring ``comms_allow_send`` in the comms pack — so a prompt
+    # injection in an incoming email can't silently send mail or schedule events
+    # from the real account. Set ``google_allow_send`` to opt out of the gate.
+    gated = not config.google_allow_send
+
     def gmail_inbox(args: dict[str, Any]) -> dict[str, Any]:
         if not g.status().connected:
             return {"connected": False, "messages": []}
@@ -135,6 +141,7 @@ def register_google_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
         handler=gmail_send,
         description="Send a plain-text email from the connected Google account.",
         args_json_schema=_SEND_SCHEMA,
+        requires_approval=gated,
         metadata={"pack": "google"},
     )
     register_local_tool(
@@ -153,6 +160,7 @@ def register_google_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
         handler=gcal_create,
         description="Create an event on the connected Google Calendar.",
         args_json_schema=_CREATE_SCHEMA,
+        requires_approval=gated,
         metadata={"pack": "google"},
     )
 

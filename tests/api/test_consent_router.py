@@ -160,10 +160,21 @@ def test_data_subject_cannot_withdraw_another(
     assert r.status_code == 403
 
 
-# --------------------------------------------------------------- withdrawal shreds
-def test_withdraw_crypto_shreds_and_flips_decision(
+# ------------------------------------------------- withdrawal flips decision (no shred)
+def test_workspace_scoped_withdraw_flips_decision_without_shredding_global_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A workspace-scoped withdrawal flips the decision to WITHDRAWN but does NOT shred.
+
+    SECURITY FAIL-SAFE (Phase-4): in production every subject key is minted via
+    ``vault.encryptor_for(subject)`` with NO workspace_id (consent_registry.py:100), so
+    the key is GLOBAL/unbound. A multi-tenant caller passing ``workspace_id`` therefore
+    does not provably own the key, and crypto-shred is REFUSED — otherwise a tenant-A
+    operator could forge a withdrawal and permanently destroy a key shared by tenant B.
+    The ledger state still flips to WITHDRAWN (the decision correctly becomes DENY); only
+    the destructive crypto-shred + erasure tombstone are withheld. (Single-tenant erasure,
+    ``workspace_id=None``, still shreds — see test_offline_unscoped_withdraw_shreds.)
+    """
     c = _keyed(_governed_client(monkeypatch, _principals("operator")))
     c.post("/v1/consent/grant", json=_grant_body())
     assert (
@@ -178,16 +189,16 @@ def test_withdraw_crypto_shreds_and_flips_decision(
         json={"subject_id": "teacher_a", "workspace_id": "t"},
     )
     assert r.status_code == 200
-    # Decision now DENY (withdrawn).
+    # Decision now DENY (withdrawn) — ledger state flips regardless of the shred gate.
     after = c.get(
         "/v1/consent/decision",
         params={"subject_id": "teacher_a", "purpose": "retain"},
     ).json()
     assert after["allowed"] is False
     assert after["state"] == "withdrawn"
-    # A signed erasure tombstone exists on the spine.
+    # No erasure tombstone: the global key was NOT shredded by a workspace-scoped caller.
     container = c.app.state.container  # type: ignore[attr-defined]
-    assert container.entity_registry.list_by_kind("erasure_tombstone")
+    assert not container.entity_registry.list_by_kind("erasure_tombstone")
 
 
 # ------------------------------------------- withdraw is :write for non-self callers
