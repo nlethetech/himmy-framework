@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fastapi import HTTPException, Request
+# fastapi is the [api] extra; this module must still IMPORT on a core (offline) install — the
+# route dependency below is only ever built when the API server is running.
+try:
+    from fastapi import HTTPException, Request
+except ModuleNotFoundError:  # pragma: no cover - exercised only when the API server runs
+    HTTPException = Request = None  # type: ignore[assignment, misc]
 
 from himmy.api.auth.context import get_principal
 

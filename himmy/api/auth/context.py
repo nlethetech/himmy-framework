@@ -17,7 +17,12 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-from fastapi import HTTPException, Request
+# fastapi is the [api] extra; this module must still IMPORT on a core (offline) install — its
+# request-time helpers below are only ever called when the API server is running.
+try:
+    from fastapi import HTTPException, Request
+except ModuleNotFoundError:  # pragma: no cover - exercised only when the API server runs
+    HTTPException = Request = None  # type: ignore[assignment, misc]
 
 from himmy.api.auth.base import AuthError
 from himmy.api.auth.principal import ANONYMOUS, Principal
