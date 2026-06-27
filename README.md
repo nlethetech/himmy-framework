@@ -3,6 +3,17 @@
 **Build AI agents that run entirely on your own machine — no API keys, no cloud, every
 run auditable and replayable.**
 
+[![PyPI](https://img.shields.io/pypi/v/himmy.svg)](https://pypi.org/project/himmy/)
+[![Python](https://img.shields.io/pypi/pyversions/himmy.svg)](https://pypi.org/project/himmy/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+```bash
+pip install himmy
+```
+
+[GitHub](https://github.com/nlethetech/himmy) · MIT licensed · Powers the **Himmy Personal
+Assistant** desktop app.
+
 Himmy is an **offline-first** Python agent framework. The default install pulls only three
 packages (`pydantic`, `pyyaml`, `httpx`) and needs zero network and zero keys: agents run
 against a deterministic stub out of the box. Real local models run through **Ollama** or the
@@ -33,7 +44,7 @@ The bare install runs against a deterministic stub, so this works with no provid
 network:
 
 ```bash
-pip install -e .
+pip install himmy
 himmy init my-agent
 himmy run -f my-agent/agent.yaml -p "Say hello in one sentence."
 ```
@@ -586,13 +597,17 @@ RPO/RTO guidance) have a dedicated runbook in
 
 ```bash
 # Core (offline) install — pydantic, pyyaml, httpx only.
-pip install -e .
+pip install himmy
 
 # Local API server (FastAPI + uvicorn).
-pip install -e ".[api]"
+pip install "himmy[api]"
 
 # A broad bundle (see the caveat below — it is NOT literally everything).
-pip install -e ".[all]"
+pip install "himmy[all]"
+
+# From source, to hack on himmy itself:
+git clone https://github.com/nlethetech/himmy.git
+cd himmy && pip install -e ".[dev]"
 ```
 
 There are **19 optional extras** (counting the three `secrets-*` backends separately). The
