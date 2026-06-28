@@ -130,8 +130,15 @@ class Principal:
         ``scopes`` is serialized so that rebuilt gate applies the SAME delegated
         scope-narrowing the live gate did (a read-only-scoped token cannot regain write
         tools across a process boundary). An unrestricted / ANONYMOUS principal
-        (``all_tenants``) omits the enforce flag, so the rebuilt authorizer is a
-        non-enforcing pass-through and the offline path is byte-unchanged.
+        (``all_tenants``) that carries NO scopes omits the enforce flag, so the rebuilt
+        authorizer is a non-enforcing pass-through and the offline path is byte-unchanged.
+
+        A SCOPE-NARROWED ``all_tenants`` token (e.g. an admin-role OIDC/CI token minted with
+        narrowing ``scopes`` but no tool scope) DOES carry the enforce flag: like
+        :meth:`ToolCapabilityAuthorizer.from_principal`, its tool reach is narrowed by those
+        scopes on the live path, so the rebuilt gate must enforce too — otherwise the
+        leased-dispatch recovery path would re-open the attenuation escape across a process
+        boundary. Only a truly scope-LESS all_tenants principal stays a pass-through.
         """
         meta: dict[str, Any] = {
             "subject": self.subject,
@@ -143,7 +150,7 @@ class Principal:
             meta["scopes"] = sorted(self.scopes)
         if self.source_ip:
             meta["source_ip"] = self.source_ip
-        if not self.all_tenants:
+        if not self.all_tenants or self.scopes:
             meta["tool_authz_enforce"] = True
         return meta
 

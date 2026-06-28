@@ -415,9 +415,14 @@ async def get_studio_run_unified(
     NO scoping — byte-unchanged single-box behavior — while a set makes a run whose
     canonical ``workspace_id`` is outside it read as **not found** (``None``), so a
     tenant-bound principal cannot fetch — or even confirm the existence of — another
-    tenant's run by id. The cache-only fallback (no canonical ``storage``) is left
-    unscoped because the studio.db cache carries no tenant stamp; it is only reachable
-    on the bare/single-box path where ``accessible_workspaces`` is ``None`` anyway.
+    tenant's run by id. The studio.db presentation cache carries NO tenant stamp, so a
+    cache-only row (canonical record absent/aged while the cache lingers) is
+    unattributable to any tenant: it is served ONLY when scoping is off
+    (``accessible_workspaces is None``) — either no canonical ``storage`` (the
+    bare/single-box path) or a tenant-bound principal whose canonical lookup missed. For a
+    tenant-bound principal (``accessible_workspaces`` is a set) a cache-only row is read as
+    **not found** rather than leaked cross-tenant, since its owning tenant cannot be
+    verified against the allow-list.
     """
     from himmy.api.studio_runs import get_run_store
 
@@ -427,6 +432,11 @@ async def get_studio_run_unified(
         return cached
     rec = await storage.get_run(run_id)
     if rec is None:
+        # No canonical record to attribute to a tenant. An unscoped (single-box) reader
+        # still gets the cache row; a tenant-bound reader must NOT — the cache has no
+        # tenant stamp, so serving it would bypass the workspace allow-list.
+        if accessible_workspaces is not None:
+            return None
         return cached
     if (
         accessible_workspaces is not None

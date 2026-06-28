@@ -182,7 +182,12 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
             "would run every caller as an all-tenants admin. Configure tenant-binding "
             "auth (HIMMY_API_KEYS_FILE with per-tenant keys, or HIMMY_AUTH_MODE=oidc)."
         )
-    truthy = ("1", "true", "yes")
+    # Use the SAME truthy vocabulary as the consuming sanitizers / authenticator
+    # (apikey._env_truthy, spec_sanitizer._truthy) so a posture kill-switch can never be
+    # half-honored: a value like ``on`` that enables the dangerous opt-in downstream MUST
+    # also trip the startup refusal here. Diverging the detector from the consumer
+    # silently fails the guard open (it accepts ``on`` but the refusal misses it).
+    truthy = ("1", "true", "yes", "on")
     # Studio is a network-isolated OPERATOR console (lineage, privacy, governance,
     # raw run inspection) — never a tenant-facing surface. ``HIMMY_STUDIO_AUTH=off``
     # is its auth kill-switch (intended only for a trusted single-user box); under a

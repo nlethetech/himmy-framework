@@ -326,3 +326,60 @@ def test_scope_survives_actor_roundtrip() -> None:
     assert rebuilt.scopes == frozenset({"tool:weather_get:invoke"})
     assert rebuilt.is_authorized("weather_get", True) is True
     assert rebuilt.is_authorized("send_email", False) is False
+
+
+def test_all_tenants_scoped_token_still_enforces_tool_reach() -> None:
+    """Red-team r3: a scope-narrowed all_tenants admin token must NOT regain full tools.
+
+    An operator mints a deliberately-attenuated delegated token (admin role for
+    all_tenants reach, but ``scopes=[run:read, run:write]`` and NO tool scope) so it may
+    START runs but never invoke side-effecting tools. The route layer ALREADY narrows its
+    tool reach (the ``tool`` resource is uncovered by its scopes), so the per-run tool gate
+    must enforce the SAME narrowing — else a run it starts could invoke any tool
+    (attenuation escape). Only a truly scope-LESS all_tenants principal is the pass-through.
+    """
+    tok = Principal.build(
+        subject="ci-bot",
+        roles=["admin"],
+        scopes=["run:read", "run:write"],
+        all_tenants=True,
+        auth_method="oidc",
+    )
+    # Sanity: the route layer honors the scope (token may create a run, not invoke tools).
+    assert DEFAULT_POLICY.authorize(tok, "run", "write") is True
+    assert DEFAULT_POLICY.authorize(tok, "tool", "send_email:write") is False
+    gate = ToolCapabilityAuthorizer.from_principal(tok, DEFAULT_POLICY)
+    assert gate.enforce is True  # the escape: previously False (non-enforcing)
+    # Every tool denied — the scope covers no tool resource.
+    assert gate.is_authorized("send_email", False) is False
+    assert gate.is_authorized("weather_get", True) is False
+
+
+def test_scopeless_all_tenants_principal_is_byte_unchanged_passthrough() -> None:
+    """A truly scope-LESS all_tenants principal (offline/ANONYMOUS) stays non-enforcing."""
+    for principal in (ANONYMOUS, Principal(subject="shared", all_tenants=True)):
+        gate = ToolCapabilityAuthorizer.from_principal(principal, DEFAULT_POLICY)
+        assert gate.enforce is False
+        assert gate.is_authorized("send_email", False) is True
+        assert gate.is_authorized("weather_get", True) is True
+
+
+def test_all_tenants_scoped_token_enforces_across_actor_roundtrip() -> None:
+    """The dispatch-recovery path also enforces a scope-narrowed all_tenants token.
+
+    ``actor_metadata`` must carry ``tool_authz_enforce`` for a scoped all_tenants token so
+    the leased-dispatch rebuild (``from_actor``) does not re-open the escape across a
+    process boundary.
+    """
+    tok = Principal.build(
+        subject="ci-bot",
+        roles=["admin"],
+        scopes=["run:read", "run:write"],
+        all_tenants=True,
+        auth_method="oidc",
+    )
+    actor = tok.actor_metadata()
+    assert actor.get("tool_authz_enforce") is True
+    rebuilt = ToolCapabilityAuthorizer.from_actor(actor, DEFAULT_POLICY)
+    assert rebuilt.enforce is True
+    assert rebuilt.is_authorized("send_email", False) is False

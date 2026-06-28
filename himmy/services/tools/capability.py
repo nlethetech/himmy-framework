@@ -86,18 +86,35 @@ class ToolCapabilityAuthorizer:
 
         Mirrors :func:`himmy.api.auth.rbac.require_permission`'s bypass exactly: a
         ``None`` principal (no auth seam) or an unrestricted ``all_tenants`` principal
-        (the ANONYMOUS offline default, or a trusted shared key) yields a NON-enforcing
-        authorizer — every tool is allowed, byte-identical to before. A tenant-bound
-        principal yields an enforcing one carrying its roles + scopes + the policy, so a
-        scope-narrowed token narrows its TOOL reach exactly as it narrows its route reach.
+        that carries NO scopes (the ANONYMOUS offline default, or a trusted shared key)
+        yields a NON-enforcing authorizer — every tool is allowed, byte-identical to
+        before. A tenant-bound principal yields an enforcing one carrying its roles +
+        scopes + the policy, so a scope-narrowed token narrows its TOOL reach exactly as
+        it narrows its route reach.
+
+        **Scope-narrowed all_tenants tokens still enforce (attenuation escape fix).** An
+        ``all_tenants`` principal is the trusted/admin shape, but a DELIBERATELY-ATTENUATED
+        delegated token (e.g. an OIDC service/CI token carrying an admin role but
+        ``scopes=["run:read","run:write"]`` and NO tool scope) is all_tenants AND scoped:
+        the operator minted it to start runs but NOT to invoke side-effecting tools, and
+        :class:`~himmy.api.auth.rbac.AccessPolicy` ALREADY narrows its ``/v1`` route reach
+        by those scopes (``tool:*`` denied). Returning a non-enforcing gate for it would
+        let a run it starts invoke ANY tool — the route layer narrows but the tool gate is
+        off, an amplification the module's 'Attenuation, never amplification' invariant
+        forbids. So an all_tenants principal that carries scopes builds an ENFORCING
+        authorizer too; the synthetic probe in :meth:`_grants` then applies the SAME
+        scope-narrowing the route layer does. Only a truly scope-LESS all_tenants principal
+        (offline / ANONYMOUS / unscoped shared key / role-only admin) is the byte-unchanged
+        non-enforcing pass-through.
         """
-        if principal is None or principal.all_tenants:
+        scopes = frozenset(getattr(principal, "scopes", ()) or ()) if principal else frozenset()
+        if principal is None or (principal.all_tenants and not scopes):
             return cls(enforce=False, roles=frozenset())
         return cls(
             enforce=True,
             roles=frozenset(principal.roles),
             policy=policy,
-            scopes=frozenset(principal.scopes),
+            scopes=scopes,
         )
 
     @classmethod

@@ -139,6 +139,7 @@ def _build_team_runtime(
     storage: Any,
     shared_inference: Any,
     checkpoint_store: Any = None,
+    tool_authorizer: Any = None,
 ) -> Any:
     """Build ``(team, registry, runtime)`` sharing the run service's storage.
 
@@ -153,6 +154,14 @@ def _build_team_runtime(
     pause into a durable member checkpoint. It is DISTINCT from the graph checkpoint store
     (which persists the orchestration position). With no requires_approval tool present the
     path is byte-identical to before (the store is simply never written).
+
+    ``tool_authorizer`` (P0 confused-deputy fix) is the LAUNCHING principal's
+    tool-capability gate, rebuilt from the run's persisted actor. Threaded into the member
+    runtime's ToolService so every member tool dispatch is gated by the launching
+    principal's grants — closing the confused-deputy hole where a team/workflow could
+    invoke a side-effecting member tool its launcher's own role was never granted
+    ``tool:<name>:invoke``/``:write`` for. ``None`` (offline / zero-config / no RBAC policy
+    wired) leaves member tool dispatch byte-unchanged, exactly like the single-agent path.
     """
     from himmy.config.team_spec import build_team, build_team_inference
     from himmy.runtime.builder import build_runtime
@@ -169,11 +178,18 @@ def _build_team_runtime(
         if member_pins_provider or shared_inference is None
         else shared_inference
     )
+    # A sub-agent / member runtime inherits the launcher's authorizer ATTENUATED (never
+    # wider than the launcher) — capability can only narrow down the orchestration, matching
+    # the spawn-chain contract the capability module documents.
+    member_authorizer = (
+        tool_authorizer.attenuate() if tool_authorizer is not None else None
+    )
     runtime, _inference, _tools = build_runtime(
         inference=inference,
         tool_registry=registry,
         storage=storage,
         checkpoint_store=checkpoint_store,
+        tool_authorizer=member_authorizer,
     )
     return team, registry, runtime
 
@@ -184,6 +200,7 @@ async def _run_multi_agent(
     *,
     storage: Any,
     shared_inference: Any,
+    tool_authorizer: Any = None,
 ) -> OrchestrationOutcome:
     """Drive the handoff/delegation orchestrator over the member team.
 
@@ -198,7 +215,11 @@ async def _run_multi_agent(
 
     team_spec = _build_team_spec(named, kind="multi_agent")
     team, registry, runtime = await asyncio.to_thread(
-        _build_team_runtime, team_spec, storage=storage, shared_inference=shared_inference
+        _build_team_runtime,
+        team_spec,
+        storage=storage,
+        shared_inference=shared_inference,
+        tool_authorizer=tool_authorizer,
     )
     orch = MultiAgentOrchestrator(
         runtime, team, registry, max_turns=_MULTI_AGENT_MAX_TURNS
@@ -223,6 +244,7 @@ async def _run_group_chat(
     *,
     storage: Any,
     shared_inference: Any,
+    tool_authorizer: Any = None,
 ) -> OrchestrationOutcome:
     """Drive the selector-driven group chat over the member team.
 
@@ -235,7 +257,11 @@ async def _run_group_chat(
 
     team_spec = _build_team_spec(named, kind="group_chat")
     team, registry, runtime = await asyncio.to_thread(
-        _build_team_runtime, team_spec, storage=storage, shared_inference=shared_inference
+        _build_team_runtime,
+        team_spec,
+        storage=storage,
+        shared_inference=shared_inference,
+        tool_authorizer=tool_authorizer,
     )
     orch = GroupChatOrchestrator(
         runtime, team, registry, max_rounds=_GROUP_CHAT_MAX_ROUNDS
@@ -308,6 +334,7 @@ async def _run_graph(
     checkpoint_store: Any = None,
     approve_member: bool | None = None,
     actor: str = "human",
+    tool_authorizer: Any = None,
 ) -> OrchestrationOutcome:
     """Drive a durable linear state-graph: one node per member, output threaded forward.
 
@@ -336,6 +363,7 @@ async def _run_graph(
         storage=storage,
         shared_inference=shared_inference,
         checkpoint_store=checkpoint_store,
+        tool_authorizer=tool_authorizer,
     )
 
     def _make_node(node_name: str, spec: AgentSpec) -> Any:
@@ -545,6 +573,7 @@ async def run_orchestration(
     checkpoint_store: Any = None,
     approve_member: bool | None = None,
     actor: str = "human",
+    tool_authorizer: Any = None,
 ) -> OrchestrationOutcome:
     """Resolve the member specs and drive the orchestrator for ``kind`` (T3b entry point).
 
@@ -557,6 +586,13 @@ async def run_orchestration(
     into the graph member runtime so a member calling an approval-gated tool pauses to
     AWAITING_APPROVAL (graph + workflow kinds only). ``approve_member`` (not None) routes to
     the HITL RESUME splice instead of a fresh run — ``True`` approves, ``False`` rejects.
+
+    ``tool_authorizer`` (P0 confused-deputy fix) is the LAUNCHING principal's
+    tool-capability gate, rebuilt by the run service from the run's persisted actor. It is
+    threaded into every member runtime (attenuated) so a team/workflow can never invoke a
+    side-effecting tool the launching principal's own role was not granted — closing the
+    same confused-deputy hole the single-agent path closes. ``None`` (offline / zero-config
+    / no RBAC policy wired) leaves member tool dispatch byte-unchanged.
     """
     named = _member_specs(members, operator_provisioned=operator_provisioned)
 
@@ -571,13 +607,22 @@ async def run_orchestration(
             checkpoint_store=checkpoint_store,
             approve_member=approve_member,
             actor=actor,
+            tool_authorizer=tool_authorizer,
         )
     if kind == "group_chat":
         return await _run_group_chat(
-            named, prompt, storage=storage, shared_inference=shared_inference
+            named,
+            prompt,
+            storage=storage,
+            shared_inference=shared_inference,
+            tool_authorizer=tool_authorizer,
         )
     return await _run_multi_agent(
-        named, prompt, storage=storage, shared_inference=shared_inference
+        named,
+        prompt,
+        storage=storage,
+        shared_inference=shared_inference,
+        tool_authorizer=tool_authorizer,
     )
 
 

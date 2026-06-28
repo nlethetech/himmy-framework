@@ -543,6 +543,93 @@ def test_bola_subject_scoped_thread_read_is_isolated() -> None:
         assert as_admin.status_code == 200, as_admin.text
 
 
+def test_bola_subject_scoped_thread_continue_is_isolated() -> None:
+    """WS-bola (r3): a subject-scoped principal cannot CONTINUE another subject's thread.
+
+    Closes the write-launder where subj-a posts to subj-b's thread (passing
+    ``subject_id=subj-a`` in the body, which the body-only ``enforce_subject_write``
+    accepted) and then reads subject B's private history back through its attacker-owned
+    run. The post path now gates on the THREAD's STORED subject (like the read path) and
+    folds a cross-subject continuation into a clean 404 — BEFORE any run is created, so no
+    laundered run exists to read back. A tenant_admin still crosses subjects; subj-a still
+    continues its OWN thread.
+    """
+    from himmy.api.auth.apikey import ApiKeyAuthenticator
+    from himmy.api.auth.principal import Principal
+
+    app = create_app(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "key-a": Principal.build(
+                "subj-a",
+                tenant_ids=["shared"],
+                roles=["operator"],
+                auth_method="apikey",
+                subject_scoped=True,
+            ),
+            "key-admin": Principal.build(
+                "admin-user",
+                tenant_ids=["shared"],
+                roles=["operator", "tenant_admin"],
+                auth_method="apikey",
+                subject_scoped=True,
+            ),
+        }
+    )
+    _seed_thread_for_subject(
+        app.state.container,
+        conversation_id="conv-b",
+        workspace_id="shared",
+        subject_id="subj-b",
+    )
+    _seed_thread_for_subject(
+        app.state.container,
+        conversation_id="conv-a",
+        workspace_id="shared",
+        subject_id="subj-a",
+    )
+    with TestClient(app) as client:
+        # subj-a continuing subj-b's thread, even stamping its OWN subject in the body → 404
+        # (the stored subject of conv-b is subj-b; the body value never relaxes the gate).
+        launder = client.post(
+            "/v1/threads/conv-b/messages",
+            json={
+                "workspace_id": "shared",
+                "subject_id": "subj-a",
+                "prompt": "continue",
+                "agent_id": "any",
+            },
+            headers={"x-himmy-internal-key": "key-a"},
+        )
+        assert launder.status_code == 404, launder.text
+        # Poisoning attempt: continuing subj-a's OWN thread but re-stamping it to subj-b is
+        # refused — the body's foreign subject is denied by enforce_subject_write (403).
+        poison = client.post(
+            "/v1/threads/conv-a/messages",
+            json={
+                "workspace_id": "shared",
+                "subject_id": "subj-b",
+                "prompt": "re-attribute",
+                "agent_id": "any",
+            },
+            headers={"x-himmy-internal-key": "key-a"},
+        )
+        assert poison.status_code in (403, 404), poison.text
+        # A tenant_admin crosses subjects within its tenant → not a 404 from the BOLA gate
+        # (it proceeds to agent resolution; an unknown agent_id is a 422, not 404).
+        as_admin = client.post(
+            "/v1/threads/conv-b/messages",
+            json={
+                "workspace_id": "shared",
+                "subject_id": "subj-b",
+                "prompt": "ok",
+                "agent_id": "missing-agent",
+            },
+            headers={"x-himmy-internal-key": "key-admin"},
+        )
+        assert as_admin.status_code != 404, as_admin.text
+
+
 def test_bola_offline_thread_read_is_unnarrowed(client: TestClient) -> None:
     """INVARIANT: offline (no auth) reads a subject-attributed thread (no narrowing)."""
     _seed_thread_for_subject(

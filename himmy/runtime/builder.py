@@ -150,6 +150,13 @@ def build_runtime(
     of ``inference``, ``storage``, ``registry``, ``context_service``,
     ``prompt_manager``, ``context_prompt_mapper``, ``tool_registry``, or
     ``tool_service`` (handy for tests/apps that need a shared instance).
+
+    ``tool_authorizer`` (P0 confused-deputy fix) is the run principal's tool-capability
+    gate. When provided it is threaded into the built :class:`ToolService` so the
+    deny-by-default capability check bites before tool dispatch — used by the
+    team/workflow orchestration path so member tools are gated by the launching
+    principal's grants, exactly as the single-agent path is. ``None`` (the default, and
+    every offline / zero-config caller) leaves tool dispatch byte-unchanged.
     """
     configure_observability()
 
@@ -169,7 +176,9 @@ def build_runtime(
         entity_registry=registry
     )
     tool_service: ToolService = overrides.get("tool_service") or ToolService(
-        tool_registry, event_sink=storage
+        tool_registry,
+        event_sink=storage,
+        tool_authorizer=overrides.get("tool_authorizer"),
     )
 
     runtime = SingleAgentRuntime(

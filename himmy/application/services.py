@@ -2701,6 +2701,12 @@ class RunAppService:
                         checkpoint_store=self._checkpoint_store,
                         approve_member=approved,
                         actor=actor,
+                        # P0 confused-deputy fix: re-thread the launching principal's
+                        # tool-capability gate from the run's persisted actor on resume too,
+                        # so a HITL resume cannot regain tool reach the launcher lacked.
+                        tool_authorizer=self._build_tool_authorizer(
+                            (run.metadata or {}).get("actor")
+                        ),
                     ),
                     timeout=self._run_timeout_seconds,
                 )
@@ -3122,6 +3128,15 @@ class RunAppService:
                             # graph/workflow member calling an approval-gated tool pauses
                             # to a durable member checkpoint (None disables nested HITL).
                             checkpoint_store=self._checkpoint_store,
+                            # P0 confused-deputy fix: rebuild the LAUNCHING principal's
+                            # tool-capability gate from the run's persisted actor and thread
+                            # it into every member runtime, so a team/workflow can only
+                            # invoke tools the launcher's own role was granted (no-op
+                            # offline / when no RBAC policy is wired). Mirrors the
+                            # single-agent path's _resolve_runtime/_build_tool_authorizer.
+                            tool_authorizer=self._build_tool_authorizer(
+                                (run.metadata or {}).get("actor")
+                            ),
                         ),
                         timeout=self._run_timeout_seconds,
                     )

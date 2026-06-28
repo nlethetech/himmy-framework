@@ -139,6 +139,82 @@ def test_is_multi_tenant_none_mode_is_false(monkeypatch: pytest.MonkeyPatch) -> 
     assert is_multi_tenant() is False
 
 
+def test_is_multi_tenant_via_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Red-team r3: HIMMY_MULTI_TENANT=on MUST engage the posture.
+
+    'on' is the natural on/off convention and is already accepted by the consuming
+    sanitizers (apikey._env_truthy / spec_sanitizer._truthy). A divergent detector that
+    missed 'on' silently left a shared key a cross-tenant super-admin and skipped the
+    startup refusal.
+    """
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "on")
+    assert is_multi_tenant() is True
+
+
+def test_multi_tenant_on_shared_key_only_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIMMY_MULTI_TENANT=on + shared-key-only is refused (posture engages for 'on')."""
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "on")
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "shared-secret")
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "bind callers to tenants" in str(exc.value)
+
+
+def test_multi_tenant_on_demotes_shared_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """HIMMY_MULTI_TENANT=on demotes a co-configured shared key (G1) just like '1'."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "on")
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "shared-secret")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    auth = build_authenticator()
+    assert isinstance(auth, ApiKeyAuthenticator)
+    assert auth._shared_key_roles == DEMOTED_SHARED_KEY_ROLES
+
+
+def test_multi_tenant_rejects_operator_spec_tools_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Red-team r3: HIMMY_ALLOW_OPERATOR_SPEC_TOOLS=on must ALSO trip the startup refusal.
+
+    The consuming sanitizer (spec_sanitizer._truthy) treats 'on' as enabled, so the
+    posture check must use the SAME truthy vocabulary or the RCE/SSRF opt-in slips past
+    the fail-closed guard.
+    """
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "on")
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_ALLOW_OPERATOR_SPEC_TOOLS" in str(exc.value)
+
+
+def test_multi_tenant_rejects_allow_unauthenticated_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """HIMMY_ALLOW_UNAUTHENTICATED=on trips the startup refusal (truthy-parity)."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_ALLOW_UNAUTHENTICATED", "on")
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_ALLOW_UNAUTHENTICATED" in str(exc.value)
+
+
 def test_build_authenticator_demotes_shared_key_under_multi_tenant(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

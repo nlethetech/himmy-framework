@@ -315,3 +315,44 @@ async def test_resolving_run_projects_without_keyerror() -> None:
 
     detail = await get_studio_run_unified(storage, "resolving-1")
     assert detail is not None and detail.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_cache_only_run_not_served_to_tenant_bound_reader(tmp_path: Path) -> None:
+    """Red-team r3: a cache-only Studio run is NOT served to a tenant-bound reader.
+
+    The studio.db presentation cache carries no tenant stamp. When a canonical record is
+    absent (a cache row written before / outliving its canonical mirror) the by-id reader
+    must NOT fall back to the cache for a tenant-bound principal — that would bypass the
+    workspace allow-list and leak an unattributable run cross-tenant. An unscoped
+    (single-box) reader still gets the cache row.
+    """
+    import os
+
+    from himmy.api.studio_canonical import get_studio_run_unified
+    from himmy.api.studio_runs import StudioRun, get_run_store, reset_run_store
+
+    prev_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    reset_run_store()
+    try:
+        # Seed a cache-only row (no canonical record exists for it).
+        get_run_store().save(
+            StudioRun(id="cache-only-1", created_at="2026-01-01T00:00:00Z", output="X")
+        )
+        storage = StorageService()  # canonical store has NO record for cache-only-1
+
+        # Tenant-bound reader (a non-None allow-list) must read it as not-found.
+        scoped = await get_studio_run_unified(
+            storage, "cache-only-1", accessible_workspaces=frozenset({"acme"})
+        )
+        assert scoped is None
+
+        # The unscoped (single-box) reader still gets the cache row (byte-unchanged).
+        unscoped = await get_studio_run_unified(
+            storage, "cache-only-1", accessible_workspaces=None
+        )
+        assert unscoped is not None and unscoped.id == "cache-only-1"
+    finally:
+        reset_run_store()
+        os.chdir(prev_cwd)

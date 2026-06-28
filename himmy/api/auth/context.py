@@ -41,7 +41,12 @@ def is_multi_tenant() -> bool:
     ANY non-empty auth mode (incl. the ``apikey`` example in values.yaml) engages
     strictness. Default (no env) is single-box, byte-unchanged.
     """
-    if os.environ.get("HIMMY_MULTI_TENANT", "").lower() in ("1", "true", "yes"):
+    if os.environ.get("HIMMY_MULTI_TENANT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
         return True
     return os.environ.get("HIMMY_AUTH_MODE", "").lower() not in ("", "none")
 
