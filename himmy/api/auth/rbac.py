@@ -217,17 +217,68 @@ class AccessPolicy:
         return cls(role_permissions)
 
     def authorize(self, principal: Principal, resource: str, action: str) -> bool:
-        """Whether any of the principal's roles grants ``(resource, action)``."""
-        for role in principal.roles:
-            perms = self.role_permissions.get(role)
-            if perms and _covers(perms, resource, action):
-                return True
-        return False
+        """Whether the principal may perform ``(resource, action)``.
+
+        The verdict is the role-derived grant **intersected with the token's
+        scopes** — scopes can only NARROW, never widen, the reach a role confers
+        (delegated least-privilege, the OAuth contract: a token chooses to act with
+        a SUBSET of its bearer's authority). Concretely:
+
+        1. The principal must hold a role granting ``(resource, action)`` (the
+           historical check) — a scope alone never grants anything a role does not.
+        2. THEN, when the principal carries a non-empty, *recognizable* scope set
+           (at least one scope parses as the ``resource:action`` permission grammar,
+           wildcards allowed), that grant must ALSO be covered by a scope.
+
+        Empty scopes ⇒ NO narrowing: the principal keeps its full role reach (the
+        existing behavior — every API-key / ANONYMOUS / role-only principal is
+        byte-unchanged, since those carry no scopes). Scopes that do not parse as
+        ``resource:action`` (the standard OIDC ``openid`` / ``profile`` / ``email``,
+        etc.) are NOT part of this grammar and are ignored for narrowing; a token
+        carrying ONLY such scopes therefore narrows nothing (it keeps full role
+        reach) rather than being locked out of every resource.
+        """
+        granted_by_role = any(
+            (perms := self.role_permissions.get(role)) is not None
+            and _covers(perms, resource, action)
+            for role in principal.roles
+        )
+        if not granted_by_role:
+            return False
+        scope_perms = _scope_permissions(principal.scopes)
+        if not scope_perms:
+            return True  # no recognizable scopes → no narrowing (full role reach)
+        return _covers(scope_perms, resource, action)
 
 
 def _covers(perms: frozenset[tuple[str, str]], resource: str, action: str) -> bool:
     """Whether ``perms`` grants ``(resource, action)`` (``*`` wildcards match)."""
     return any(r in (resource, "*") and a in (action, "*") for (r, a) in perms)
+
+
+def _scope_permissions(scopes: frozenset[str]) -> frozenset[tuple[str, str]]:
+    """Parse a token's ``scopes`` into the ``(resource, action)`` pairs they grant.
+
+    Scopes are intersected with the role grant in :meth:`AccessPolicy.authorize` to
+    realise delegated least-privilege (a scope can only NARROW). They use the SAME
+    ``resource:action`` grammar as a role permission (wildcards allowed), so each is
+    parsed via the strict :func:`_parse_perm`.
+
+    A scope that does NOT parse as ``resource:action`` — the standard OIDC ``openid``
+    / ``profile`` / ``email`` and any other non-grammar token — is DROPPED, not
+    treated as an error and not allowed to narrow anything: enforcement is fail-open
+    *per-scope* here so an unrelated standard scope cannot silently lock a caller out
+    of every resource (the deny decision still rests on the role check in
+    :meth:`AccessPolicy.authorize`). An all-unrecognized scope set therefore yields
+    the empty set, which the caller reads as "no narrowing".
+    """
+    parsed: set[tuple[str, str]] = set()
+    for scope in scopes:
+        try:
+            parsed.add(_parse_perm(scope))
+        except RbacPolicyError:
+            continue  # not a resource:action grant (e.g. 'openid') → ignore
+    return frozenset(parsed)
 
 
 #: The role name that is *expected* to hold the ``*:*`` super-grant; a wildcard on

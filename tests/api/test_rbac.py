@@ -67,6 +67,69 @@ def test_wildcard_action_and_resource() -> None:
     assert not pol.authorize(_p("a"), "context", "write")
 
 
+# ------------------------------------- scopes NARROW role grants (least-privilege)
+def _ps(*, roles: list[str], scopes: list[str]) -> Principal:
+    return Principal.build("u", tenant_ids=["t"], roles=roles, scopes=scopes)
+
+
+def test_scope_narrows_role_grant() -> None:
+    """A token scoped to 'run:read' cannot 'run:write' even though its role grants it."""
+    pol = DEFAULT_POLICY
+    p = _ps(roles=["operator"], scopes=["run:read"])
+    # role alone would allow run:write...
+    assert pol.authorize(_p("operator"), "run", "write")
+    # ...but the scope narrows it to read-only.
+    assert pol.authorize(p, "run", "read")
+    assert not pol.authorize(p, "run", "write")
+    # a resource the scope never mentions is also denied (intersection, not union).
+    assert not pol.authorize(p, "context", "write")
+
+
+def test_empty_scopes_keep_full_role_reach() -> None:
+    """An empty-scope token keeps its full role reach (no narrowing) — unchanged."""
+    pol = DEFAULT_POLICY
+    p = _ps(roles=["operator"], scopes=[])
+    assert pol.authorize(p, "run", "write")
+    assert pol.authorize(p, "context", "write")
+
+
+def test_scope_cannot_widen_beyond_role() -> None:
+    """A scope grants nothing the role lacks — it can only narrow."""
+    pol = DEFAULT_POLICY
+    # viewer has no run:write; a run:write SCOPE must not confer it.
+    p = _ps(roles=["viewer"], scopes=["run:write"])
+    assert not pol.authorize(p, "run", "write")
+    # and the read the role does grant, scoped to write, is now also gone.
+    assert not pol.authorize(p, "run", "read")
+
+
+def test_unrecognized_scopes_do_not_narrow() -> None:
+    """Standard OIDC scopes (openid/profile/email) are ignored → no narrowing."""
+    pol = DEFAULT_POLICY
+    p = _ps(roles=["operator"], scopes=["openid", "profile", "email"])
+    # none of these parse as resource:action, so role reach is preserved.
+    assert pol.authorize(p, "run", "write")
+    assert pol.authorize(p, "context", "write")
+
+
+def test_scope_wildcard_narrowing() -> None:
+    """A wildcard scope ('run:*') narrows to a resource while keeping its actions."""
+    pol = DEFAULT_POLICY
+    p = _ps(roles=["operator"], scopes=["run:*"])
+    assert pol.authorize(p, "run", "read")
+    assert pol.authorize(p, "run", "write")
+    # other resources the operator role grants are narrowed away.
+    assert not pol.authorize(p, "context", "write")
+
+
+def test_scope_mixed_recognized_and_standard() -> None:
+    """A token mixing 'openid' with 'run:read' narrows on the grammar scope only."""
+    pol = DEFAULT_POLICY
+    p = _ps(roles=["operator"], scopes=["openid", "run:read"])
+    assert pol.authorize(p, "run", "read")
+    assert not pol.authorize(p, "run", "write")
+
+
 # --------------------------------------------- fail-closed permission parsing (P0)
 def test_trailing_colon_no_longer_widens() -> None:
     """A typo 'run:' must FAIL CLOSED, not silently widen to ('run', '*')."""
