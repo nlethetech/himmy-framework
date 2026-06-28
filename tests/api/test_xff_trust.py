@@ -36,8 +36,10 @@ def test_xff_ignored_when_peer_untrusted(monkeypatch: Any) -> None:
 
 def test_xff_honored_when_peer_trusted(monkeypatch: Any) -> None:
     monkeypatch.setenv("HIMMY_TRUSTED_PROXIES", "203.0.113.9")
+    # A conformant proxy APPENDS the real client; the right-most non-trusted entry
+    # (here ``5.6.7.8``) is the genuine client, NOT the attacker-controlled left-most.
     r = _req("203.0.113.9", "1.2.3.4, 5.6.7.8")
-    assert client_ip(r) == "1.2.3.4"  # first hop behind the trusted proxy
+    assert client_ip(r) == "5.6.7.8"
 
 
 def test_xff_ignored_when_peer_not_in_allowlist(monkeypatch: Any) -> None:
@@ -70,3 +72,37 @@ def test_rate_limit_key_not_bypassable_via_xff(monkeypatch: Any) -> None:
     # Two requests from the same peer with different forged XFF must share a key.
     assert default_key(same_peer_a) == default_key(same_peer_b)
     assert default_key(same_peer_a) == "ip:198.51.100.7"
+
+
+def test_leftmost_xff_forgery_does_not_mint_fresh_key(monkeypatch: Any) -> None:
+    """A client behind a trusted proxy cannot rotate the LEFT-most XFF to bypass.
+
+    Regression for the leftmost-XFF trust pitfall: a real proxy appends the genuine
+    client to the right, so two requests from the SAME client that prepend a different
+    forged left-most token must still resolve to the same client IP (one bucket), not a
+    fresh bucket each time.
+    """
+    monkeypatch.setenv("HIMMY_TRUSTED_PROXIES", "203.0.113.9")
+    from himmy.api.ratelimit import default_key
+
+    # Same genuine client (198.51.100.7), incrementing forged left-most entries.
+    forged_a = _req("203.0.113.9", "10.0.0.1, 198.51.100.7")
+    forged_b = _req("203.0.113.9", "10.0.0.2, 198.51.100.7")
+    assert client_ip(forged_a) == "198.51.100.7"
+    assert client_ip(forged_b) == "198.51.100.7"
+    assert default_key(forged_a) == default_key(forged_b) == "ip:198.51.100.7"
+
+
+def test_multiple_trusted_proxy_hops_are_peeled(monkeypatch: Any) -> None:
+    """Trailing trusted-proxy hops are peeled; the right-most non-trusted is the client."""
+    monkeypatch.setenv("HIMMY_TRUSTED_PROXIES", "203.0.113.9, 203.0.113.10")
+    # client -> edge(203.0.113.10) -> inner(203.0.113.9 = peer). Both proxies appended.
+    r = _req("203.0.113.9", "198.51.100.7, 203.0.113.10")
+    assert client_ip(r) == "198.51.100.7"
+
+
+def test_all_forwarded_entries_trusted_falls_back_to_peer(monkeypatch: Any) -> None:
+    """When every XFF entry is a trusted proxy, fall back to the real peer."""
+    monkeypatch.setenv("HIMMY_TRUSTED_PROXIES", "203.0.113.9, 203.0.113.10")
+    r = _req("203.0.113.9", "203.0.113.10")
+    assert client_ip(r) == "203.0.113.9"

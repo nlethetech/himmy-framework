@@ -104,6 +104,55 @@ def test_durable_run_survives_restart(tmp_path: Any, monkeypatch: Any) -> None:
         assert run_id in ids
 
 
+def test_durable_rebind_rewires_tool_capability_gate(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """The per-run tool-capability gate survives the in-memory→durable rebind.
+
+    Regression for the confused-deputy hole where the P0 tool-capability authorizer was
+    wired ONLY onto the throwaway in-memory container's ``run_app`` in the ``create_app``
+    body, while the durable container the lifespan rebinds to (``build_default_async``)
+    is built WITHOUT an access policy. With an authenticator configured, ``_rebind_container``
+    must re-wire ``run_app._access_policy`` so the gate stays live; otherwise any caller
+    authorized merely to start a run could invoke every tool the agent declares.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.setenv("HIMMY_DURABLE_STORAGE", "1")
+    # Configure an authenticator (a shared API key) so enforcement engages — the
+    # offline/zero-config path leaves the policy unwired by design.
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "rebind-test-key")
+    app = create_app()
+    with TestClient(app):
+        # After the lifespan rebinds to the durable container, the gate must be wired
+        # onto the run_app that actually serves traffic — not left None (inert gate).
+        assert app.state.authenticator is not None
+        run_app = app.state.container.run_app
+        assert run_app._access_policy is app.state.access_policy
+        assert run_app._access_policy is not None
+
+
+def test_durable_rebind_leaves_gate_unwired_offline(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Offline (no authenticator) the rebind leaves the gate unwired — byte-unchanged.
+
+    The capability gate engages exactly when auth does. With no authenticator the durable
+    auto-upgrade path must NOT wire ``_access_policy`` (no per-run authorizer is built), so
+    tool dispatch is byte-identical to the historical offline behavior.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    monkeypatch.delenv("HIMMY_INTERNAL_API_KEY", raising=False)
+    monkeypatch.delenv("HIMMY_AUTH_MODE", raising=False)
+    monkeypatch.delenv("HIMMY_API_KEYS_FILE", raising=False)
+    monkeypatch.setenv("HIMMY_DURABLE_STORAGE", "1")
+    app = create_app()
+    with TestClient(app):
+        assert app.state.authenticator is None
+        assert app.state.container.run_app._access_policy is None
+
+
 # ----------------------------------------------------------------- Q3: dispatcher wiring
 def test_q3_dispatcher_executes_a_run_under_durable_store(
     tmp_path: Any, monkeypatch: Any

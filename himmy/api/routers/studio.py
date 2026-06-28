@@ -204,12 +204,18 @@ async def _authorize_run(request: Request, run_id: str) -> bool:
     cache carries none) and applies :func:`authorize_studio_object`.
 
     Returns True — i.e. allow — for an unrestricted principal (offline / ``all_tenants``,
-    where the tenant stamp is irrelevant), when no canonical storage is attached (the
-    bare/single-box test app), and for a run that is unknown canonically (no tenant to
-    violate). So the zero-config path is a NO-OP and byte-unchanged; enforcement engages
-    only for a tenant-bound principal reading a run that canonically belongs to a
-    workspace it may not access. Callers fold a False verdict into a **404** so existence
-    is never leaked — mirroring ``get_studio_run_unified``.
+    where the tenant stamp is irrelevant) and when no canonical storage is attached (the
+    bare/single-box test app). So the zero-config path is a NO-OP and byte-unchanged.
+
+    For a TENANT-BOUND principal, enforcement engages: a run whose canonical record is
+    absent (cache-only — erased/crypto-shredded or aged out while the process-wide
+    studio.db presentation cache row lingers) is REFUSED (returns False → 404), because
+    the cache carries no ``workspace_id`` to attribute it to the caller's tenant and
+    serving it would leak another tenant's feedback/lineage by id (a cross-tenant IDOR).
+    This mirrors the sibling ``get_studio_run_unified``, which also folds a cache-only row
+    to not-found for a tenant-bound reader. A canonically-known run is allowed only when
+    its ``workspace_id`` passes :func:`authorize_studio_object`. Callers fold a False
+    verdict into a **404** so existence is never leaked.
     """
     if get_principal(request).all_tenants:
         return True
@@ -218,7 +224,15 @@ async def _authorize_run(request: Request, run_id: str) -> bool:
         return True
     rec = await storage.get_run(run_id)
     if rec is None:
-        return True
+        # Cache-only run (the canonical RunRecord is absent — erased/crypto-shredded or
+        # aged out — while the process-wide studio.db presentation cache row lingers).
+        # A tenant-bound reader cannot be served it: the cache carries NO workspace_id to
+        # attribute it to the caller's tenant, so allowing it would leak another tenant's
+        # feedback/lineage by id (a cross-tenant IDOR). Fold to 404, mirroring the sibling
+        # ``get_studio_run_unified`` which also refuses a cache-only row to a tenant-bound
+        # reader. The ``all_tenants`` short-circuit above keeps the offline/admin path a
+        # no-op, so the zero-config surface is byte-unchanged.
+        return False
     return authorize_studio_object(request, getattr(rec, "workspace_id", None))
 
 

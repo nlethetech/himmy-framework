@@ -77,15 +77,32 @@ def client_ip(request: Request) -> str | None:
     controllable and is ignored in favour of the real ``request.client.host``. This
     closes the rate-limit-bypass / audit-IP-spoofing hole where any client could
     forge a fresh source by rotating the header.
+
+    **Why the right-most non-trusted token, not the left-most.** A conformant reverse
+    proxy *appends* the real client IP to the END of ``X-Forwarded-For`` (it adds the
+    address of the host it received the connection from). So the chain reads, left to
+    right, ``<client-claimed forgeries...>, <real client>, <proxy hops...>`` — the
+    LEFT-most entry is whatever the un-trusted client sent and is fully attacker-
+    controllable, while the genuine client address is the right-most entry that is NOT
+    itself a trusted proxy. Trusting the left-most (the classic XFF pitfall) lets an
+    anonymous caller behind the proxy rotate it to mint a fresh rate-limit bucket per
+    request and to poison the audit ``source_ip``. So we peel hops from the RIGHT:
+    starting at the genuine peer (a trusted proxy), we skip any trailing entries that
+    are themselves trusted proxies and return the first one that is not — the closest
+    real client we can attribute. If every forwarded entry is a trusted proxy (or the
+    header is empty) we fall back to the real transport peer.
     """
     peer = peer_ip(request)
     trusted = _trusted_proxies()
     if peer in trusted and trusted:
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
-            first = forwarded.split(",")[0].strip()
-            if first:
-                return first
+            tokens = [tok.strip() for tok in forwarded.split(",") if tok.strip()]
+            # Walk from the right (closest to the genuine peer outward), peeling
+            # trusted-proxy hops; the first non-trusted token is the real client.
+            for token in reversed(tokens):
+                if token not in trusted:
+                    return token
     return peer
 
 

@@ -380,6 +380,22 @@ def _rebind_container(app: FastAPI, container: ApiContainer) -> None:
     app.state.consent_ledger = getattr(container, "consent_ledger", None)
     app.state.consent_policy = getattr(container, "consent_policy", None)
     app.state.retention_service = getattr(container, "retention_service", None)
+    # P0 tool authz (confused-deputy fix): re-wire the per-run tool-capability gate onto
+    # the NEW container's run_app, mirroring the wiring ``create_app`` did onto the
+    # throwaway in-memory container's run_app. The durable run_app rebuilt here in the
+    # lifespan (``ApiContainer.build_default_async``) is constructed WITHOUT an access
+    # policy, so without this re-wire its ``_access_policy`` stays ``None`` and
+    # ``_build_tool_authorizer`` returns ``None`` — silently disabling the entire
+    # capability authorizer for the durable auto-upgrade server path (the standard
+    # multi-tenant production shape), letting any caller authorized merely to START a run
+    # invoke EVERY tool the agent declares. We wire it ONLY when an authenticator is
+    # configured, exactly as ``create_app`` does, so the offline/zero-config path is
+    # byte-identical (no authenticator → no policy wired → no per-run authorizer).
+    if getattr(app.state, "authenticator", None) is not None:
+        policy = getattr(app.state, "access_policy", None)
+        run_app = getattr(container, "run_app", None)
+        if policy is not None and run_app is not None:
+            run_app._access_policy = policy
     # Re-emit the policy_loaded marker into the NEW (durable) audit registry, so the
     # forensic record of the active policy survives the in-memory→durable swap. No-op
     # offline (no authenticator) — see :func:`_record_policy_loaded`.

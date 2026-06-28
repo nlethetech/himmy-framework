@@ -228,6 +228,23 @@ DEFAULT_RBAC: dict[str, list[str]] = {
 }
 
 
+#: The reserved RBAC *resources* of the built-in catalogue (:data:`DEFAULT_RBAC`),
+#: excluding the ``*`` wildcard. These are ALWAYS recognized for scope-narrowing
+#: (:meth:`AccessPolicy.known_resources`) regardless of whether the active custom policy
+#: enumerates them, so a deliberately-attenuated token scope naming a built-in resource
+#: (notably ``tool:<name>:invoke``) always narrows — closing the fail-open where a custom
+#: ``HIMMY_RBAC_FILE`` that grants tools ONLY via admin ``*:*`` would silently disable
+#: tool-scope attenuation. Derived from :data:`DEFAULT_RBAC` so it stays in lock-step with
+#: the built-in vocabulary (``tool``/``run``/``context``/``model``/… ). Splitting on the
+#: FIRST colon mirrors :func:`_parse_perm`'s grammar.
+_BUILTIN_RESOURCES: frozenset[str] = frozenset(
+    spec.split(":", 1)[0]
+    for perms in DEFAULT_RBAC.values()
+    for spec in perms
+    if spec.split(":", 1)[0] != "*"
+)
+
+
 class RbacPolicyError(HimmyError):
     """A malformed or unsafe RBAC policy (bad shape, bad permission spec).
 
@@ -320,23 +337,37 @@ class AccessPolicy:
         return cls(role_permissions)
 
     def known_resources(self) -> frozenset[str]:
-        """The set of RBAC *resources* this policy actually names (excluding ``*``).
+        """The set of RBAC *resources* recognized for scope-narrowing (excluding ``*``).
 
-        Used to gate scope-narrowing: only a scope whose parsed resource is one this
-        policy recognizes is allowed to engage narrowing (see :func:`_scope_permissions`),
-        so a colon-bearing OIDC resource-scope an IdP emits (``api://…`` parses to
-        resource ``api``, ``urn:…`` to ``urn``, ``https://…`` to ``https``) — none of
-        which are RBAC resources — cannot masquerade as a permission-scope and zero out
-        the grant. The wildcard ``*`` is excluded because a *scope* of ``*:<action>``
-        is, by the OAuth attenuation contract, never something a real IdP issues as a
-        narrowing token and we do not want a stray ``*`` to re-admit garbage.
+        Used to gate scope-narrowing: only a scope whose parsed resource is one we
+        recognize is allowed to engage narrowing (see :func:`_scope_permissions`), so a
+        colon-bearing OIDC resource-scope an IdP emits (``api://…`` parses to resource
+        ``api``, ``urn:…`` to ``urn``, ``https://…`` to ``https``) — none of which are RBAC
+        resources — cannot masquerade as a permission-scope and zero out the grant. The
+        wildcard ``*`` is excluded because a *scope* of ``*:<action>`` is, by the OAuth
+        attenuation contract, never something a real IdP issues as a narrowing token and we
+        do not want a stray ``*`` to re-admit garbage.
+
+        The recognized set is the union of (a) the resources THIS policy actually names
+        and (b) the BUILT-IN reserved resources of :data:`DEFAULT_RBAC`
+        (:data:`_BUILTIN_RESOURCES`). Including the built-ins closes a fail-open in
+        scope-narrowing: a custom :data:`HIMMY_RBAC_FILE` whose tool reach comes ONLY
+        through admin's ``*:*`` (no role names a ``tool:…`` permission) names no ``tool``
+        resource, so a deliberately-attenuated ``tool:<name>:invoke`` scope would parse but
+        be DROPPED — leaving the admin ``*:*`` un-narrowed and the token able to invoke
+        EVERY tool, the opposite of the operator's intent. By treating the reserved RBAC
+        resources (``tool``/``run``/``context``/… from the built-in catalogue) as always
+        recognized, a colon-bearing scope naming one of them always narrows, regardless of
+        whether the active custom policy happens to enumerate it. Genuinely foreign IdP
+        resource-scopes (``api``/``urn``/``https``/…) are still dropped — they are neither
+        named by the policy nor reserved built-ins.
         """
         return frozenset(
             res
             for perms in self.role_permissions.values()
             for (res, _action) in perms
             if res != "*"
-        )
+        ) | _BUILTIN_RESOURCES
 
     def authorize(self, principal: Principal, resource: str, action: str) -> bool:
         """Whether the principal may perform ``(resource, action)``.

@@ -184,16 +184,51 @@ def test_unknown_resource_scope_is_dropped() -> None:
     assert pol.authorize(p, "run", "write")  # full reach preserved
 
 
-def test_known_resources_reflects_custom_policy() -> None:
-    """known_resources() drives narrowing off the ACTIVE policy, not the default."""
+def test_known_resources_includes_custom_and_builtin() -> None:
+    """known_resources() = the custom policy's own resources ∪ the built-in catalogue.
+
+    The policy's own resources drive narrowing for custom surfaces, and the reserved
+    built-in resources (``run``/``tool``/… from :data:`DEFAULT_RBAC`) are ALWAYS
+    recognized so a colon-bearing scope naming one of them cannot silently fail to
+    narrow under a custom policy that does not enumerate it (red-team r5 fail-open).
+    """
     pol = AccessPolicy.from_mapping({"editor": ["doc:read", "doc:write"]})
-    assert pol.known_resources() == frozenset({"doc"})
+    known = pol.known_resources()
+    assert "doc" in known  # the custom policy's own resource
+    assert "run" in known and "tool" in known  # built-in reserved resources
     p = _ps(roles=["editor"], scopes=["doc:read"])
     assert pol.authorize(p, "doc", "read")
-    assert not pol.authorize(p, "doc", "write")  # narrowed
-    # A scope naming a resource this custom policy never defines is dropped.
+    assert not pol.authorize(p, "doc", "write")  # narrowed by the custom resource
+    # A scope naming a BUILT-IN resource now narrows even under this custom policy:
+    # 'run:read' is recognized (built-in), so it does NOT cover ('doc','write').
     p2 = _ps(roles=["editor"], scopes=["run:read"])
-    assert pol.authorize(p2, "doc", "write")  # 'run' unknown here → no narrowing
+    assert not pol.authorize(p2, "doc", "write")  # built-in scope recognized → narrows
+    # A genuinely foreign resource (neither named nor built-in) is still dropped.
+    p3 = _ps(roles=["editor"], scopes=["billing:read"])
+    assert pol.authorize(p3, "doc", "write")  # 'billing' unknown → no narrowing
+
+
+def test_tool_scope_narrows_under_admin_only_tool_policy() -> None:
+    """Red-team r5: a deliberately-attenuated tool scope narrows even when the policy
+    grants tools ONLY via admin ``*:*`` and no role names a ``tool:…`` permission.
+
+    Previously ``known_resources()`` came solely from the named permissions, so under
+    this custom shape ``tool`` was not recognized — a ``tool:report:invoke`` scope parsed
+    but was DROPPED, leaving the admin ``*:*`` un-narrowed so the token could invoke EVERY
+    tool (a fail-open contradicting the operator's attenuation intent). ``tool`` is now an
+    always-recognized built-in resource, so the scope narrows.
+    """
+    pol = AccessPolicy.from_mapping(
+        {"admin": ["*:*"], "agent_runner": ["run:read", "run:write"]}
+    )
+    # An admin token deliberately attenuated to a single tool.
+    p = _ps(roles=["admin"], scopes=["tool:report:invoke"])
+    assert pol.authorize(p, "tool", "report:invoke")  # the one tool it was scoped to
+    # ...but NOT any other tool — the scope narrows the admin '*:*' grant.
+    assert not pol.authorize(p, "tool", "send_email:invoke")
+    assert not pol.authorize(p, "tool", "report:write")
+    # And the scope-narrowing also bites non-tool reach (it is a real attenuation).
+    assert not pol.authorize(p, "run", "write")
 
 
 # --------------------------------------------- fail-closed permission parsing (P0)
