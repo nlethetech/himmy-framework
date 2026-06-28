@@ -92,6 +92,16 @@ OnEvent = Callable[[RunEvent], Awaitable[None]]
 # is unaffected.
 HARD_MAX_TURNS = 100
 
+# How many characters of a tool's result text ride on the TOOL_COMPLETED event payload (for
+# observers / live UIs). Default 2000 keeps event logs small; a consumer that wants to reconstruct
+# the FULL structured result from the event (e.g. to render a rich card) can raise it via
+# ``HIMMY_TOOL_RESULT_EVENT_MAX``. The model context is unaffected — this only bounds the event.
+try:
+    _TOOL_RESULT_EVENT_MAX = max(200, int(os.environ.get("HIMMY_TOOL_RESULT_EVENT_MAX", "2000")))
+except ValueError:
+    _TOOL_RESULT_EVENT_MAX = 2000
+
+
 
 def _validate_max_turns(max_turns: int, entry_point: str) -> None:
     """Reject an out-of-range ``max_turns`` before any loop work starts.
@@ -3436,8 +3446,8 @@ class SingleAgentRuntime:
             ret_meta = (ret.metadata or {}) if ret is not None else {}
             result_text = (
                 content_text
-                if len(content_text) <= 2000
-                else (content_text[:1999] + "…")
+                if len(content_text) <= _TOOL_RESULT_EVENT_MAX
+                else (content_text[: _TOOL_RESULT_EVENT_MAX - 1] + "…")
             )
             await self._emit(
                 RunEvent(
