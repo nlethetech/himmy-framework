@@ -24,7 +24,15 @@ Lifecycle hardening (P1):
 * A **live-consulted revocation file** (``HIMMY_API_KEY_REVOCATION_FILE``) lets a
   leaked key die WITHOUT a restart: it is a JSON list of revoked ``key_id`` strings
   re-read (mtime-cached) on each authenticate, so dropping a key_id into it kills the
-  key on the next request.
+  key on the next request. If a CONFIGURED file later becomes unreadable (deleted,
+  truncated, corrupted, or ``0600`` and written by a different user than the server —
+  e.g. ``himmy apikey revoke`` run as another account), the control does NOT silently
+  disarm: the LAST-KNOWN revoked set is retained (a transient blip can never
+  un-revoke a key) and a loud ``WARNING`` is logged. Set
+  ``HIMMY_API_KEY_REVOCATION_FAIL_CLOSED=1`` to instead 401 all key auth while the
+  configured file is unreadable. NOTE: the revocation file must be readable by the
+  server process — if the CLI writes it ``0600`` as another user, either run the CLI
+  as the server user or relax the file mode.
 
 INVARIANT — offline path unchanged: when no key is configured ``build_authenticator``
 returns ``None`` and every request is ANONYMOUS (all-tenants); none of this engages.
@@ -35,6 +43,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -46,6 +56,8 @@ from himmy.api.auth.principal import Principal
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from fastapi import Request
+
+logger = logging.getLogger("himmy.api.auth.apikey")
 
 #: Default header carrying the API key.
 DEFAULT_HEADER = "x-himmy-internal-key"
@@ -59,6 +71,17 @@ PEPPER_SECRET = "HIMMY_API_KEY_PEPPER"  # noqa: S105 - secret NAME, not a value
 
 #: Env var naming the live-consulted revocation file (a JSON list of revoked key_ids).
 REVOCATION_FILE_ENV = "HIMMY_API_KEY_REVOCATION_FILE"
+
+#: Opt-in env flag: when truthy AND a revocation file IS configured but cannot be
+#: read/parsed, key authentication FAILS CLOSED (every key 401s) instead of falling
+#: back to the last-known revoked set. Off by default so the historical behavior
+#: (transient blips do not lock everyone out) is preserved unless an operator opts in.
+REVOCATION_FAIL_CLOSED_ENV = "HIMMY_API_KEY_REVOCATION_FAIL_CLOSED"
+
+
+def _env_truthy(name: str) -> bool:
+    """Whether env var ``name`` is set to a truthy value (1/true/yes/on)."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 #: Default roles a DEMOTED shared key receives under the multi-tenant posture (G1).
@@ -167,45 +190,101 @@ class _RevocationList:
 
     Re-reads the file only when its mtime changes (so the hot path is a stat, not a
     parse), giving "kill a key without a restart": appending a key_id to the file
-    revokes it on the next authenticate. A missing/empty/unparseable file ⇒ nothing
-    revoked (fail-open on the FILE, not on the keys themselves — a key still has to be
-    valid to authenticate). When no file is configured this is inert.
+    revokes it on the next authenticate. When no file is configured this is inert
+    (``is_revoked`` is always ``False``).
+
+    Fail behavior when a file IS configured but a refresh fails (deleted, truncated,
+    corrupted, or unreadable to the server process — e.g. ``himmy apikey revoke`` ran
+    as another user and wrote it ``0600``):
+
+    * The control NO LONGER silently disarms. The LAST-KNOWN revoked set is RETAINED
+      across the failure, so a transient blip (or a cross-user read error) can never
+      un-revoke an already-revoked key. (A file that has NEVER been read successfully
+      has an empty last-known set, so a configured-but-absent file is still inert —
+      a key still has to be otherwise valid to authenticate.)
+    * The failure is logged loudly ONCE per distinct error (deduplicated so the hot
+      path does not spam the log every request), so operators notice that the
+      configured revocation file is unavailable instead of it being swallowed.
+    * If :data:`REVOCATION_FAIL_CLOSED_ENV` is opted in, :meth:`is_revoked` RAISES
+      :class:`AuthError` while the configured file is unreadable, so key auth fails
+      CLOSED (every key 401s) rather than relying on the last-known set.
     """
 
     def __init__(self, path: str | Path | None) -> None:
         self._path = Path(path).expanduser() if path else None
         self._mtime: float | None = None
         self._revoked: frozenset[str] = frozenset()
+        #: True once the file has been read+parsed successfully at least once.
+        self._ever_loaded = False
+        #: Last error string surfaced, so we log a given failure loudly only once.
+        self._last_error: str | None = None
 
     def is_revoked(self, key_id: str) -> bool:
-        """Whether ``key_id`` is in the current (freshly re-read) revocation set."""
+        """Whether ``key_id`` is in the current (freshly re-read) revocation set.
+
+        Raises :class:`AuthError` (fail-closed) when the configured file is currently
+        unreadable AND :data:`REVOCATION_FAIL_CLOSED_ENV` is opted in; otherwise the
+        last-known revoked set is consulted (fail-static, never fail-open).
+        """
         if self._path is None:
             return False
-        self._refresh()
+        ok = self._refresh()
+        if not ok and _env_truthy(REVOCATION_FAIL_CLOSED_ENV):
+            raise AuthError("revocation list unavailable")
         return key_id in self._revoked
 
-    def _refresh(self) -> None:
+    def _refresh(self) -> bool:
+        """Re-read the file if its mtime changed. Returns whether the list is trusted.
+
+        ``True`` ⇒ the current ``_revoked`` reflects a successful read (or an unchanged
+        mtime since the last success). ``False`` ⇒ a stat/read/parse failure on a
+        CONFIGURED file; ``_revoked`` is left at its last-known value (NOT cleared) and
+        the failure is logged once.
+        """
         assert self._path is not None
         try:
             mtime = self._path.stat().st_mtime
-        except OSError:
-            self._mtime = None
-            self._revoked = frozenset()
-            return
-        if mtime == self._mtime:
-            return
-        self._mtime = mtime
+        except OSError as exc:
+            return self._on_failure(f"cannot stat revocation file {self._path}: {exc}")
+        if mtime == self._mtime and self._ever_loaded:
+            return True
         try:
             raw = json.loads(self._path.read_text())
-        except (OSError, json.JSONDecodeError):
-            self._revoked = frozenset()
-            return
+        except (OSError, json.JSONDecodeError) as exc:
+            return self._on_failure(
+                f"cannot read/parse revocation file {self._path}: {exc}"
+            )
         if isinstance(raw, dict):  # tolerate {"revoked": [...]} as well as a bare list
             raw = raw.get("revoked", [])
         if isinstance(raw, list):
             self._revoked = frozenset(str(item) for item in raw)
         else:
             self._revoked = frozenset()
+        self._mtime = mtime
+        self._ever_loaded = True
+        if self._last_error is not None:
+            logger.warning("revocation file recovered: %s", self._path)
+            self._last_error = None
+        return True
+
+    def _on_failure(self, message: str) -> bool:
+        """Retain the last-known set, log the failure once, and report 'not trusted'.
+
+        Emits a loud ``WARNING`` the first time a given error message is seen (and on
+        every distinct new error) so an operator notices the security control is
+        degraded, without spamming the per-request hot path. The last-known revoked
+        set is deliberately NOT cleared — a transient failure must not un-revoke a key.
+        """
+        if message != self._last_error:
+            logger.warning(
+                "API-key revocation list unavailable (retaining last-known %d "
+                "revoked id(s); set %s=1 to fail closed): %s",
+                len(self._revoked),
+                REVOCATION_FAIL_CLOSED_ENV,
+                message,
+            )
+            self._last_error = message
+        return False
 
 
 class ApiKeyAuthenticator:
@@ -275,8 +354,6 @@ class ApiKeyAuthenticator:
             self._records.append(KeyRecord.from_secret(key, shared_principal))
 
         if revocation_path is None:
-            import os
-
             revocation_path = os.environ.get(REVOCATION_FILE_ENV)
         self._revocations = _RevocationList(revocation_path)
 
@@ -419,4 +496,5 @@ __all__ = [
     "DEMOTED_SHARED_KEY_ROLES",
     "PEPPER_SECRET",
     "REVOCATION_FILE_ENV",
+    "REVOCATION_FAIL_CLOSED_ENV",
 ]

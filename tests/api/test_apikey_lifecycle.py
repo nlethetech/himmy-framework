@@ -14,10 +14,12 @@ from pathlib import Path
 import pytest
 
 from himmy.api.auth.apikey import (
+    REVOCATION_FAIL_CLOSED_ENV,
     REVOCATION_FILE_ENV,
     ApiKeyAuthenticator,
     KeyRecord,
     _fingerprint,
+    _RevocationList,
     hash_key,
     load_key_records,
 )
@@ -203,6 +205,116 @@ def test_revocation_file_from_env(
 def test_missing_revocation_file_is_inert(tmp_path: Path) -> None:
     rec = KeyRecord.from_secret("rk", Principal.build("svc", tenant_ids=["t1"]))
     auth = ApiKeyAuthenticator(records=[rec], revocation_path=tmp_path / "nope.json")
+    assert run_async(auth.authenticate(_hdr("rk"))).subject == "svc"
+
+
+# ----------------- revocation fail-static (does NOT silently disarm) ---------
+def _bump_mtime(path: Path) -> None:
+    """Force a future mtime so the live re-read picks the change up immediately."""
+    import os
+
+    future = time.time() + 10
+    os.utime(path, (future, future))
+
+
+def test_revocation_retained_when_file_deleted(tmp_path: Path) -> None:
+    """A configured file going away must NOT un-revoke an already-revoked key."""
+    revfile = tmp_path / "revoked.json"
+    revfile.write_text(json.dumps([_fingerprint("rk")]))
+    rec = KeyRecord.from_secret("rk", Principal.build("svc", tenant_ids=["t1"]))
+    auth = ApiKeyAuthenticator(records=[rec], revocation_path=revfile)
+    # Revoked while the file is present.
+    with pytest.raises(AuthError, match="revoked"):
+        run_async(auth.authenticate(_hdr("rk")))
+    # Delete it (simulate a transient blip / cross-user unreadability).
+    revfile.unlink()
+    # Still revoked — the last-known set is retained, not cleared (no fail-open).
+    with pytest.raises(AuthError, match="revoked"):
+        run_async(auth.authenticate(_hdr("rk")))
+
+
+def test_revocation_retained_when_file_corrupted(tmp_path: Path) -> None:
+    revfile = tmp_path / "revoked.json"
+    revfile.write_text(json.dumps([_fingerprint("rk")]))
+    rec = KeyRecord.from_secret("rk", Principal.build("svc", tenant_ids=["t1"]))
+    auth = ApiKeyAuthenticator(records=[rec], revocation_path=revfile)
+    with pytest.raises(AuthError, match="revoked"):
+        run_async(auth.authenticate(_hdr("rk")))
+    # Corrupt the JSON and bump mtime so the refresh actually re-reads it.
+    revfile.write_text("{ this is not json")
+    _bump_mtime(revfile)
+    with pytest.raises(AuthError, match="revoked"):
+        run_async(auth.authenticate(_hdr("rk")))
+
+
+def test_revocation_failure_logged_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    revfile = tmp_path / "revoked.json"
+    revfile.write_text(json.dumps([_fingerprint("rk")]))
+    rl = _RevocationList(revfile)
+    assert rl.is_revoked(_fingerprint("rk"))
+    revfile.unlink()
+    with caplog.at_level("WARNING", logger="himmy.api.auth.apikey"):
+        # Many consults of an unreadable file...
+        for _ in range(5):
+            assert rl.is_revoked(_fingerprint("rk"))  # still revoked (retained)
+    # ...emit exactly ONE loud warning (deduplicated), not one per request.
+    warnings = [r for r in caplog.records if "revocation list unavailable" in r.message]
+    assert len(warnings) == 1
+
+
+def test_revocation_recovery_clears_error_and_relogs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    revfile = tmp_path / "revoked.json"
+    revfile.write_text(json.dumps([_fingerprint("rk")]))
+    rl = _RevocationList(revfile)
+    assert rl.is_revoked(_fingerprint("rk"))
+    revfile.unlink()
+    assert rl.is_revoked(_fingerprint("rk"))  # degraded
+    # Restore the file (now revoking nothing); a fresh failure later should re-log.
+    revfile.write_text(json.dumps([]))
+    _bump_mtime(revfile)
+    with caplog.at_level("WARNING", logger="himmy.api.auth.apikey"):
+        assert not rl.is_revoked(_fingerprint("rk"))  # recovered, empty list
+    assert any("recovered" in r.message for r in caplog.records)
+
+
+def test_configured_absent_file_stays_inert_not_failclosed(tmp_path: Path) -> None:
+    """A file that NEVER loaded has an empty last-known set, so it stays inert."""
+    rec = KeyRecord.from_secret("rk", Principal.build("svc", tenant_ids=["t1"]))
+    auth = ApiKeyAuthenticator(records=[rec], revocation_path=tmp_path / "never.json")
+    # No fail-closed env → an absent-from-the-start file must not lock the key out.
+    assert run_async(auth.authenticate(_hdr("rk"))).subject == "svc"
+
+
+# ------------------------------------ revocation FAIL-CLOSED opt-in -----------
+def test_fail_closed_401s_when_file_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revfile = tmp_path / "revoked.json"
+    revfile.write_text(json.dumps([]))  # revokes nothing while present
+    rec = KeyRecord.from_secret("rk", Principal.build("svc", tenant_ids=["t1"]))
+    auth = ApiKeyAuthenticator(records=[rec], revocation_path=revfile)
+    # Healthy: authenticates.
+    assert run_async(auth.authenticate(_hdr("rk"))).subject == "svc"
+    monkeypatch.setenv(REVOCATION_FAIL_CLOSED_ENV, "1")
+    revfile.unlink()
+    # Configured file now unreadable + fail-closed opted in → 401 even though the
+    # key is otherwise valid and was not on the (last-known empty) revoked list.
+    with pytest.raises(AuthError, match="unavailable"):
+        run_async(auth.authenticate(_hdr("rk")))
+
+
+def test_fail_closed_inert_when_no_file_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail-closed only engages for a CONFIGURED file — no file ⇒ never raises."""
+    monkeypatch.setenv(REVOCATION_FAIL_CLOSED_ENV, "1")
+    rec = KeyRecord.from_secret("rk", Principal.build("svc", tenant_ids=["t1"]))
+    auth = ApiKeyAuthenticator(records=[rec])  # no revocation_path, env unset
+    monkeypatch.delenv(REVOCATION_FILE_ENV, raising=False)
     assert run_async(auth.authenticate(_hdr("rk"))).subject == "svc"
 
 
