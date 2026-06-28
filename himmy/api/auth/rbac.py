@@ -54,6 +54,56 @@ logger = logging.getLogger("himmy.api.auth.rbac")
 #: (``audit:run``). ``data_subject`` is a self-scoped role for a person exercising
 #: their own consent/erasure rights (the router additionally restricts it to its own
 #: ``subject_id``). Operators ship their own via ``HIMMY_RBAC_FILE``.
+#: The Studio console's per-surface RBAC resources (mirroring the ``/v1`` per-resource
+#: pattern). Each maps to one Studio surface/sub-router (see
+#: :mod:`himmy.api.routers.studio_common`); a read-only role is granted ``read`` on ALL
+#: of them so it can browse the whole console, while every ``write`` / ``manage`` action
+#: stays admin-only (the single-colon ``studio.*`` wildcard the grammar would need
+#: cannot be expressed, so reads are enumerated explicitly here — a deployment adding a
+#: NEW Studio surface lists its ``studio.<surface>:read`` here or via ``HIMMY_RBAC_FILE``).
+#: ``console`` is the low-privilege "may open Studio at all" baseline the main router
+#: carries; the rest are the granular surfaces.
+STUDIO_READ_RESOURCES: tuple[str, ...] = (
+    "studio.console",
+    "studio.runs",
+    "studio.connections",
+    "studio.google",
+    "studio.approvals",
+    "studio.models",
+    "studio.agents",
+    "studio.tasks",
+    "studio.chats",
+    "studio.cookbook",
+    "studio.notes",
+    "studio.calendar",
+    "studio.memory",
+    "studio.knowledge",
+    "studio.evals",
+    "studio.workflows",
+    "studio.files",
+    "studio.mcp",
+    "studio.eval",
+    "studio.guardrails",
+    "studio.kb",
+    "studio.learning",
+    "studio.lineage",
+    "studio.missions",
+    "studio.notify",
+    "studio.privacy",
+    "studio.projects",
+    "studio.routines",
+    "studio.seclog",
+    "studio.teams",
+    "studio.telegram",
+)
+
+#: The read grants every browse-capable role (viewer/operator/auditor) holds on Studio:
+#: ``studio.<surface>:read`` for each surface above. Spliced into those roles below so
+#: the read-only console works once an authenticator is configured, while mutating
+#: ``studio.*:write`` / ``studio.mcp:manage`` permissions remain exclusively ``admin``.
+_STUDIO_READ_PERMS: list[str] = [f"{res}:read" for res in STUDIO_READ_RESOURCES]
+
+
 DEFAULT_RBAC: dict[str, list[str]] = {
     "viewer": [
         "run:read",
@@ -67,6 +117,7 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "routine:read",
         "model:read",
         "diagnostics:read",
+        *_STUDIO_READ_PERMS,
     ],
     "operator": [
         "run:read",
@@ -98,6 +149,7 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         # both. (``res='tool'`` here, so the non-admin wildcard lint — which flags a
         # wildcard RESOURCE ``*:...`` — does not fire.)
         "tool:*",
+        *_STUDIO_READ_PERMS,
     ],
     "auditor": [
         "run:read",
@@ -114,6 +166,7 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "routine:read",
         "model:read",
         "diagnostics:read",
+        *_STUDIO_READ_PERMS,
     ],
     # Self-scoped: holds only consent:read (so it can read its own decision/history and
     # exercise withdrawal/erasure). The /v1/consent router enforces it may touch ONLY its

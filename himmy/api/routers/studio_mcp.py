@@ -33,10 +33,10 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import HTTPException, Response
+from fastapi import Depends, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.api.routers.studio_notify import record_notification
 from himmy.api.studio_service import list_agents, project_root, resolve_spec_path
 from himmy.config.mcp_spec import MCPServerConfig
@@ -44,6 +44,12 @@ from himmy.config.secrets import get_secret
 from himmy.core.ids import utc_now_iso
 
 router = build_studio_router("mcp", tag="studio-mcp")
+
+#: MCP server registration mutates which external tool servers an agent can reach (an
+#: RCE-adjacent surface) — write/registration routes require the dedicated
+#: ``studio.mcp:manage`` permission (admin-only by default), additively on top of the
+#: router's ``studio.mcp:read`` baseline.
+_mcp_manage = Depends(studio_permission("studio.mcp", "manage"))
 
 
 # ---- bounds ----------------------------------------------------------------
@@ -281,7 +287,7 @@ async def list_servers() -> dict[str, list[ServerOut]]:
     return {"servers": [_to_out(s) for s in servers]}
 
 
-@router.post("/servers", status_code=201)
+@router.post("/servers", status_code=201, dependencies=[_mcp_manage])
 async def create_server(body: ServerIn) -> ServerOut:
     """Register a new server definition (409 on a name collision)."""
     with _LOCK:
@@ -309,7 +315,7 @@ async def create_server(body: ServerIn) -> ServerOut:
     return _to_out(record)
 
 
-@router.put("/servers/{name}")
+@router.put("/servers/{name}", dependencies=[_mcp_manage])
 async def update_server(name: str, body: ServerIn) -> ServerOut:
     """Update (or rename) a server. A changed launch config invalidates the
     cached tool list — the old test result no longer describes this server."""
@@ -332,7 +338,7 @@ async def update_server(name: str, body: ServerIn) -> ServerOut:
     return _to_out(record)
 
 
-@router.delete("/servers/{name}", status_code=204)
+@router.delete("/servers/{name}", status_code=204, dependencies=[_mcp_manage])
 async def delete_server(name: str) -> Response:
     """Remove a server from the registry (specs that embed it are untouched)."""
     with _LOCK:
@@ -513,7 +519,7 @@ def _load_raw_spec(path: Path) -> dict[str, Any]:
     return raw
 
 
-@router.post("/attach")
+@router.post("/attach", dependencies=[_mcp_manage])
 async def attach_server(body: AttachRequest) -> AttachResult:
     """Add/remove one registered server in an agent spec's ``mcp_servers``.
 

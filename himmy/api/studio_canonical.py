@@ -345,16 +345,27 @@ def _summary_of(run: StudioRun) -> StudioRunSummary:
 
 
 async def list_studio_runs_unified(
-    storage: Any, *, limit: int, offset: int
+    storage: Any,
+    *,
+    limit: int,
+    offset: int,
+    accessible_workspaces: frozenset[str] | None = None,
 ) -> tuple[list[StudioRunSummary], int]:
     """List runs for the Studio runs screen from the ONE canonical store (T2.2).
 
-    Studio is single-user-local, so it shows EVERY canonical run (no tenant scope) —
-    including runs created by ``/v1`` and the CLI ``--persist`` path — so "all
+    Studio is single-user-local, so by default it shows EVERY canonical run (no tenant
+    scope) — including runs created by ``/v1`` and the CLI ``--persist`` path — so "all
     interfaces, one store" is visible in the GUI. Each canonical run is rendered via
     :func:`record_to_studio_run`; when a matching studio.db presentation-cache row
     exists it supplies the richer fields + human feedback (which lives only on the
     cache). Returns ``(summaries, total)`` newest-first, windowed by offset/limit.
+
+    ``accessible_workspaces`` is the tenant allow-list (from
+    :func:`himmy.api.auth.context.studio_tenant_filter`): ``None`` (the default) means
+    NO filtering — the byte-unchanged single-box behavior — while a set restricts the
+    result to runs in those workspaces so a tenant-bound principal cannot read another
+    tenant's runs through Studio. The filter is applied BEFORE the total/window so the
+    count + pagination describe only the visible slice.
 
     Falls back to the studio.db cache alone when ``storage`` is None (a bare test app
     with no container) so the screen never errors.
@@ -367,6 +378,8 @@ async def list_studio_runs_unified(
         return items, cache.count()
 
     records: list[RunRecord] = await storage.list_runs()
+    if accessible_workspaces is not None:
+        records = [r for r in records if r.workspace_id in accessible_workspaces]
     # Newest first, run_id tiebreak (stable ordering across equal timestamps).
     records.sort(key=lambda r: (r.created_at, r.run_id), reverse=True)
     total = len(records)
@@ -384,13 +397,27 @@ async def list_studio_runs_unified(
     return summaries, total
 
 
-async def get_studio_run_unified(storage: Any, run_id: str) -> StudioRun | None:
+async def get_studio_run_unified(
+    storage: Any,
+    run_id: str,
+    *,
+    accessible_workspaces: frozenset[str] | None = None,
+) -> StudioRun | None:
     """Fetch one run in full for the Studio detail view from the canonical store.
 
     Prefers the studio.db presentation cache (richest fields + feedback) but reflects
     the canonical status, and falls back to projecting the canonical RunRecord when no
     cache row exists (a ``/v1``- or CLI-authored run). Returns None when the run is
     unknown in BOTH stores.
+
+    ``accessible_workspaces`` is the tenant allow-list (from
+    :func:`himmy.api.auth.context.studio_tenant_filter`): ``None`` (the default) means
+    NO scoping — byte-unchanged single-box behavior — while a set makes a run whose
+    canonical ``workspace_id`` is outside it read as **not found** (``None``), so a
+    tenant-bound principal cannot fetch — or even confirm the existence of — another
+    tenant's run by id. The cache-only fallback (no canonical ``storage``) is left
+    unscoped because the studio.db cache carries no tenant stamp; it is only reachable
+    on the bare/single-box path where ``accessible_workspaces`` is ``None`` anyway.
     """
     from himmy.api.studio_runs import get_run_store
 
@@ -401,6 +428,11 @@ async def get_studio_run_unified(storage: Any, run_id: str) -> StudioRun | None:
     rec = await storage.get_run(run_id)
     if rec is None:
         return cached
+    if (
+        accessible_workspaces is not None
+        and rec.workspace_id not in accessible_workspaces
+    ):
+        return None  # cross-tenant → not found (never leak existence)
     if cached is not None:
         cached.status = _RUN_STATUS_TO_STUDIO[rec.status]
         return cached

@@ -5,11 +5,16 @@ Studio is the no-code front door to himmy: chat with an agent, build/edit an
 router is intentionally GUI-shaped (not the tenant-scoped ``/v1`` surface): it is
 meant to be served on loopback by ``himmy studio`` for a single local user.
 
-When an authenticator IS configured (API keys / OIDC), every Studio route
-additionally requires the ``studio:use`` permission — Studio holds credentials
-(SMTP/Telegram), approvals, and run triggers, so a tenant-scoped key without that
-grant must not reach it once the app is proxied beyond loopback. The zero-config
-(no-auth) loopback default is unchanged.
+When an authenticator IS configured (API keys / OIDC), every Studio route requires a
+PER-SURFACE permission (the coarse ``studio:use`` is gone): the main router carries a
+``studio.console:read`` baseline ("may open Studio"), each read route is covered by
+it, and each mutating route additionally declares its ``studio.<surface>:write`` /
+``studio.mcp:manage`` grant — so a read-only role browses while only ``admin`` mutates.
+Studio holds credentials (SMTP/Telegram), approvals, and run triggers, so a
+tenant-scoped key without those grants must not reach the write surface once the app
+is proxied beyond loopback. The zero-config (no-auth) loopback default is unchanged.
+A tenant-bound principal additionally sees only its own workspace's runs (the global
+run readers are tenant-filtered via :func:`himmy.api.auth.context.studio_tenant_filter`).
 
 Endpoints:
   * ``GET  /api/studio/doctor``  — environment diagnostics as JSON.
@@ -34,7 +39,8 @@ from himmy.api import (
     studio_feedback,
     studio_service,
 )
-from himmy.api.auth import get_principal, require_permission
+from himmy.api.auth import get_principal, studio_tenant_filter
+from himmy.api.routers.studio_common import studio_permission
 from himmy.api.studio_approvals import ApprovalDetail, ApprovalSummary
 from himmy.api.studio_connections import (
     ConnectionStatus,
@@ -50,29 +56,34 @@ from himmy.api.studio_runs import (
     get_run_store,
 )
 
-
-async def _studio_permission(request: Request) -> None:
-    """Require ``studio:use`` on every Studio route once auth is configured.
-
-    No authenticator configured ⇒ no-op (the zero-config loopback default is
-    unchanged). With auth on, the principal must hold a role granting
-    ``studio:use`` (``admin`` — including the shared ``HIMMY_INTERNAL_API_KEY``
-    boundary — qualifies via its ``*:*`` wildcard; grant it to other roles via
-    ``HIMMY_RBAC_FILE``). Escape hatch: ``HIMMY_STUDIO_AUTH=off`` skips this
-    check — DANGEROUS, as it re-opens connections/approvals/run triggers to any
-    authenticated principal; only for a trusted single-user deployment.
-    """
-    import os
-
-    if os.environ.get("HIMMY_STUDIO_AUTH", "on").lower() in ("off", "0", "false", "no"):
-        return
-    await require_permission("studio", "use")(request)
+# Granular Studio RBAC resources (mirroring the ``/v1`` per-surface pattern). The main
+# router carries a low-privilege ``studio.console:read`` BASELINE — "may open Studio at
+# all" — so a read-only role can browse the console; each MUTATING route below declares
+# its stronger ``:write`` / ``:manage`` permission additively (FastAPI runs router- and
+# route-level dependencies together, so a mutator requires the baseline read AND the
+# write/manage grant, both of which ``admin`` holds via ``*:*``). The granular surfaces:
+_RES_CONSOLE = "studio.console"  # baseline: open Studio + read diagnostics/health
+_RES_RUNS = "studio.runs"  # run history, analytics, feedback, lineage
+_RES_CONNECTIONS = "studio.connections"  # email/telegram/web connection secrets
+_RES_GOOGLE = "studio.google"  # Gmail/Calendar OAuth credentials + send
+_RES_APPROVALS = "studio.approvals"  # HITL checkpoint approve/reject
+_RES_MODELS = "studio.models"  # provider API keys, Ollama pulls, model compare
+_RES_AGENTS = "studio.agents"  # agent.yaml edit/validate
+_RES_TASKS = "studio.tasks"  # task board CRUD
+_RES_CHATS = "studio.chats"  # chat session CRUD
+_RES_COOKBOOK = "studio.cookbook"  # saved recipes CRUD
+_RES_NOTES = "studio.notes"  # notes CRUD
+_RES_CALENDAR = "studio.calendar"  # local calendar CRUD
+_RES_MEMORY = "studio.memory"  # subject memory CRUD/recall
+_RES_KNOWLEDGE = "studio.knowledge"  # KB create/ingest/search/delete
+_RES_EVALS = "studio.evals"  # eval suite runs
+_RES_WORKFLOWS = "studio.workflows"  # workflow runs
 
 
 router = APIRouter(
     prefix="/api/studio",
     tags=["studio"],
-    dependencies=[Depends(_studio_permission)],
+    dependencies=[Depends(studio_permission(_RES_CONSOLE, "read"))],
 )
 
 
@@ -174,7 +185,7 @@ def _canonical_storage(request: Request) -> Any | None:
     return getattr(container, "storage", None) if container is not None else None
 
 
-@router.post("/run")
+@router.post("/run", dependencies=[Depends(studio_permission(_RES_RUNS, "write"))])
 async def run(body: RunRequest, request: Request) -> StreamingResponse:
     """Run an agent for one user turn, streaming GUI events over SSE.
 
@@ -225,7 +236,9 @@ class RunTeamRequest(BaseModel):
     prompt: str = Field(..., max_length=100_000)
 
 
-@router.post("/run-team")
+@router.post(
+    "/run-team", dependencies=[Depends(studio_permission(_RES_RUNS, "write"))]
+)
 async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
     """Run a multi-agent team, streaming the live routing/delegate/tool trail (SSE).
 
@@ -289,7 +302,9 @@ class ResearchRequest(BaseModel):
     deep: bool = True  # deep → also allow fetching pages, not just search
 
 
-@router.post("/research")
+@router.post(
+    "/research", dependencies=[Depends(studio_permission(_RES_RUNS, "write"))]
+)
 async def research(body: ResearchRequest, request: Request) -> StreamingResponse:
     """Run a deep-research agent (web search + fetch) for one question over SSE.
 
@@ -350,7 +365,10 @@ async def list_runs(
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     items, total = await list_studio_runs_unified(
-        _canonical_storage(request), limit=limit, offset=offset
+        _canonical_storage(request),
+        limit=limit,
+        offset=offset,
+        accessible_workspaces=studio_tenant_filter(request),
     )
     return StudioRunListResponse(
         items=items,
@@ -377,7 +395,11 @@ async def get_run(run_id: str, request: Request) -> StudioRun:
     """
     from himmy.api.studio_canonical import get_studio_run_unified
 
-    run = await get_studio_run_unified(_canonical_storage(request), run_id)
+    run = await get_studio_run_unified(
+        _canonical_storage(request),
+        run_id,
+        accessible_workspaces=studio_tenant_filter(request),
+    )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run
@@ -390,7 +412,11 @@ class RunFeedbackRequest(BaseModel):
     note: str | None = Field(default=None, max_length=4000)
 
 
-@router.post("/runs/{run_id}/feedback", response_model=RunFeedback)
+@router.post(
+    "/runs/{run_id}/feedback",
+    response_model=RunFeedback,
+    dependencies=[Depends(studio_permission(_RES_RUNS, "write"))],
+)
 async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback:
     """Record human feedback on a run (the cheapest, least-noisy learning signal).
 
@@ -447,7 +473,11 @@ async def connection(ctype: str) -> ConnectionStatus:
     return status
 
 
-@router.put("/connections/{ctype}", response_model=ConnectionStatus)
+@router.put(
+    "/connections/{ctype}",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def set_connection(ctype: str, body: ConnectionSetRequest) -> ConnectionStatus:
     """Store a connection's fields (secrets → the writable backend; never echoed)."""
     try:
@@ -458,7 +488,11 @@ async def set_connection(ctype: str, body: ConnectionSetRequest) -> ConnectionSt
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.delete("/connections/{ctype}", response_model=ConnectionStatus)
+@router.delete(
+    "/connections/{ctype}",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def delete_connection(ctype: str) -> ConnectionStatus:
     try:
         return studio_connections.delete_connection(ctype)
@@ -468,7 +502,11 @@ async def delete_connection(ctype: str) -> ConnectionStatus:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.put("/connections/{ctype}/enable", response_model=ConnectionStatus)
+@router.put(
+    "/connections/{ctype}/enable",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def enable_connection(ctype: str) -> ConnectionStatus:
     """Enable a connector-managed connection for its surface (outbound tool / inbound mount).
 
@@ -486,7 +524,11 @@ async def enable_connection(ctype: str) -> ConnectionStatus:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.put("/connections/{ctype}/disable", response_model=ConnectionStatus)
+@router.put(
+    "/connections/{ctype}/disable",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def disable_connection(ctype: str) -> ConnectionStatus:
     """Disable a connector-managed connection (its tool/mount stops being wired)."""
     try:
@@ -499,7 +541,11 @@ async def disable_connection(ctype: str) -> ConnectionStatus:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("/connections/{ctype}/test", response_model=ConnectionTestResult)
+@router.post(
+    "/connections/{ctype}/test",
+    response_model=ConnectionTestResult,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def test_connection(ctype: str) -> ConnectionTestResult:
     """Live-validate a connection (SMTP login / Telegram getMe / search ping)."""
     try:
@@ -512,7 +558,11 @@ class SendRequest(BaseModel):
     payload: dict[str, Any]
 
 
-@router.post("/connections/{ctype}/send", response_model=SendResult)
+@router.post(
+    "/connections/{ctype}/send",
+    response_model=SendResult,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def send_via_connection(ctype: str, body: SendRequest) -> SendResult:
     """Send a user-composed message directly (a Home quick action)."""
     try:
@@ -555,7 +605,10 @@ async def google_status() -> Any:
     return studio_google.status()
 
 
-@router.put("/google/client")
+@router.put(
+    "/google/client",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_set_client(body: GoogleClientRequest) -> Any:
     from himmy.api import studio_google
 
@@ -621,7 +674,9 @@ def _oauth_page(title: str, detail: str) -> str:
     )
 
 
-@router.delete("/google")
+@router.delete(
+    "/google", dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))]
+)
 async def google_disconnect() -> Any:
     from himmy.api import studio_google
 
@@ -631,7 +686,10 @@ async def google_disconnect() -> Any:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.delete("/google/client")
+@router.delete(
+    "/google/client",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_forget_client() -> Any:
     from himmy.api import studio_google
 
@@ -653,7 +711,10 @@ async def google_gmail_list(max_results: int = 20) -> Any:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@router.post("/google/gmail/send")
+@router.post(
+    "/google/gmail/send",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_gmail_send(body: GmailSendRequest) -> Any:
     from himmy.api import studio_google
 
@@ -675,7 +736,10 @@ async def google_calendar_list(max_results: int = 20) -> Any:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@router.post("/google/calendar")
+@router.post(
+    "/google/calendar",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_calendar_create(body: CalendarCreateRequest) -> Any:
     from himmy.api import studio_google
 
@@ -729,13 +793,19 @@ def _resolve_stream(
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
-@router.post("/approvals/{checkpoint_id}/approve")
+@router.post(
+    "/approvals/{checkpoint_id}/approve",
+    dependencies=[Depends(studio_permission(_RES_APPROVALS, "write"))],
+)
 async def approve(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Approve the pending tool call and stream the resumed run."""
     return _resolve_stream(checkpoint_id, True, _approval_actor(request))
 
 
-@router.post("/approvals/{checkpoint_id}/reject")
+@router.post(
+    "/approvals/{checkpoint_id}/reject",
+    dependencies=[Depends(studio_permission(_RES_APPROVALS, "write"))],
+)
 async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Reject the pending tool call and stream the resumed run."""
     return _resolve_stream(checkpoint_id, False, _approval_actor(request))
@@ -790,7 +860,11 @@ class CompareResult(BaseModel):
     latency_ms: float | None = None
 
 
-@router.post("/compare", response_model=list[CompareResult])
+@router.post(
+    "/compare",
+    response_model=list[CompareResult],
+    dependencies=[Depends(studio_permission(_RES_MODELS, "write"))],
+)
 async def compare(body: CompareRequest) -> list[CompareResult]:
     """Run one prompt across several models concurrently; return outputs + usage.
 
@@ -844,21 +918,25 @@ async def tasks_list() -> list[Any]:
     return get_tasks_store().list()
 
 
-@router.post("/tasks")
+@router.post("/tasks", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))])
 async def tasks_add(body: TaskAddRequest) -> Any:
     from himmy.api.studio_tasks import get_tasks_store
 
     return get_tasks_store().add(body.title, due=body.due)
 
 
-@router.patch("/tasks/{task_id}")
+@router.patch(
+    "/tasks/{task_id}", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))]
+)
 async def tasks_done(task_id: str, body: TaskDoneRequest) -> dict[str, bool]:
     from himmy.api.studio_tasks import get_tasks_store
 
     return {"ok": get_tasks_store().set_done(task_id, body.done)}
 
 
-@router.delete("/tasks/{task_id}")
+@router.delete(
+    "/tasks/{task_id}", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))]
+)
 async def tasks_delete(task_id: str) -> dict[str, bool]:
     from himmy.api.studio_tasks import get_tasks_store
 
@@ -903,7 +981,7 @@ async def chats_get(session_id: str) -> Any:
     return detail
 
 
-@router.post("/chats")
+@router.post("/chats", dependencies=[Depends(studio_permission(_RES_CHATS, "write"))])
 async def chats_save(body: ChatSaveRequest) -> Any:
     from himmy.api.studio_chats import ChatMessage, get_chats_store
 
@@ -917,14 +995,20 @@ async def chats_save(body: ChatSaveRequest) -> Any:
     )
 
 
-@router.patch("/chats/{session_id}")
+@router.patch(
+    "/chats/{session_id}",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
+)
 async def chats_rename(session_id: str, body: ChatRenameRequest) -> dict[str, bool]:
     from himmy.api.studio_chats import get_chats_store
 
     return {"ok": get_chats_store().rename(session_id, body.title)}
 
 
-@router.delete("/chats/{session_id}")
+@router.delete(
+    "/chats/{session_id}",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
+)
 async def chats_delete(session_id: str) -> dict[str, bool]:
     from himmy.api.studio_chats import get_chats_store
 
@@ -949,7 +1033,9 @@ async def cookbook_list() -> list[Any]:
     return get_cookbook_store().list()
 
 
-@router.put("/cookbook")
+@router.put(
+    "/cookbook", dependencies=[Depends(studio_permission(_RES_COOKBOOK, "write"))]
+)
 async def cookbook_upsert(body: RecipeUpsertRequest) -> Any:
     from himmy.api.studio_cookbook import Recipe, get_cookbook_store
 
@@ -964,7 +1050,10 @@ async def cookbook_upsert(body: RecipeUpsertRequest) -> Any:
     return get_cookbook_store().upsert(r)
 
 
-@router.delete("/cookbook/{recipe_id}")
+@router.delete(
+    "/cookbook/{recipe_id}",
+    dependencies=[Depends(studio_permission(_RES_COOKBOOK, "write"))],
+)
 async def cookbook_delete(recipe_id: str) -> dict[str, bool]:
     from himmy.api.studio_cookbook import get_cookbook_store
 
@@ -997,7 +1086,7 @@ async def notes_get(note_id: str) -> Any:
     return note
 
 
-@router.put("/notes")
+@router.put("/notes", dependencies=[Depends(studio_permission(_RES_NOTES, "write"))])
 async def notes_upsert(body: NoteUpsertRequest) -> Any:
     from himmy.api.studio_notes import Note, get_notes_store
 
@@ -1007,7 +1096,9 @@ async def notes_upsert(body: NoteUpsertRequest) -> Any:
     return get_notes_store().upsert(note)
 
 
-@router.delete("/notes/{note_id}")
+@router.delete(
+    "/notes/{note_id}", dependencies=[Depends(studio_permission(_RES_NOTES, "write"))]
+)
 async def notes_delete(note_id: str) -> dict[str, bool]:
     from himmy.api.studio_notes import get_notes_store
 
@@ -1031,7 +1122,9 @@ async def calendar_list(month: str | None = None) -> list[Any]:
     return get_calendar_store().list(month=month)
 
 
-@router.post("/calendar")
+@router.post(
+    "/calendar", dependencies=[Depends(studio_permission(_RES_CALENDAR, "write"))]
+)
 async def calendar_add(body: CalendarAddRequest) -> Any:
     from himmy.api.studio_calendar import CalendarEvent, get_calendar_store
 
@@ -1041,7 +1134,10 @@ async def calendar_add(body: CalendarAddRequest) -> Any:
     return get_calendar_store().add(ev)
 
 
-@router.delete("/calendar/{event_id}")
+@router.delete(
+    "/calendar/{event_id}",
+    dependencies=[Depends(studio_permission(_RES_CALENDAR, "write"))],
+)
 async def calendar_delete(event_id: str) -> dict[str, bool]:
     from himmy.api.studio_calendar import get_calendar_store
 
@@ -1079,7 +1175,7 @@ async def memory_list(subject: str = "default") -> list[Any]:
     return studio_memory.list_memories(subject)
 
 
-@router.post("/memory")
+@router.post("/memory", dependencies=[Depends(studio_permission(_RES_MEMORY, "write"))])
 async def memory_add(body: MemoryAddRequest) -> Any:
     from himmy.api import studio_memory
 
@@ -1088,7 +1184,10 @@ async def memory_add(body: MemoryAddRequest) -> Any:
     )
 
 
-@router.delete("/memory/{memory_id}")
+@router.delete(
+    "/memory/{memory_id}",
+    dependencies=[Depends(studio_permission(_RES_MEMORY, "write"))],
+)
 async def memory_forget(memory_id: str) -> dict[str, bool]:
     from himmy.api import studio_memory
 
@@ -1131,14 +1230,19 @@ async def kb_list() -> list[Any]:
     return studio_knowledge.list_kbs()
 
 
-@router.post("/knowledge")
+@router.post(
+    "/knowledge", dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))]
+)
 async def kb_create(body: KbCreateRequest) -> Any:
     from himmy.api import studio_knowledge
 
     return await studio_knowledge.create_kb(body.name)
 
 
-@router.post("/knowledge/{kb_id}/ingest")
+@router.post(
+    "/knowledge/{kb_id}/ingest",
+    dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))],
+)
 async def kb_ingest(kb_id: str, body: KbIngestRequest) -> Any:
     from himmy.api import studio_knowledge
 
@@ -1152,7 +1256,10 @@ async def kb_search(kb_id: str, body: KbSearchRequest) -> list[Any]:
     return await studio_knowledge.search(kb_id, body.query, top_k=body.top_k)
 
 
-@router.delete("/knowledge/{kb_id}")
+@router.delete(
+    "/knowledge/{kb_id}",
+    dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))],
+)
 async def kb_delete(kb_id: str) -> dict[str, bool]:
     from himmy.api import studio_knowledge
 
@@ -1176,7 +1283,9 @@ async def eval_suites() -> list[Any]:
     return studio_eval.discover_suites()
 
 
-@router.post("/evals/run")
+@router.post(
+    "/evals/run", dependencies=[Depends(studio_permission(_RES_EVALS, "write"))]
+)
 async def eval_run(body: EvalRunRequest) -> Any:
     import asyncio
 
@@ -1216,7 +1325,10 @@ async def workflows() -> list[Any]:
     return studio_workflows.discover_workflows()
 
 
-@router.post("/workflows/run")
+@router.post(
+    "/workflows/run",
+    dependencies=[Depends(studio_permission(_RES_WORKFLOWS, "write"))],
+)
 async def workflow_run(body: WorkflowRunRequest) -> Any:
     import asyncio
 
@@ -1285,7 +1397,11 @@ async def validate_agent(spec: dict[str, Any]) -> studio_agents.ValidationResult
     return studio_agents.ValidationResult(ok=not errors, errors=errors)
 
 
-@router.put("/agents", response_model=studio_service.AgentSummary)
+@router.put(
+    "/agents",
+    response_model=studio_service.AgentSummary,
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "write"))],
+)
 async def save_agent(
     body: studio_agents.SaveAgentRequest,
 ) -> studio_service.AgentSummary:

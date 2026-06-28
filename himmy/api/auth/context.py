@@ -188,6 +188,45 @@ def narrow_subject(request: Request, requested: str | None) -> str | None:
     return principal.subject
 
 
+def studio_tenant_filter(request: Request) -> frozenset[str] | None:
+    """The set of workspaces a Studio LIST reader may surface, or ``None`` for ALL.
+
+    Studio's global run/thread/file readers historically showed EVERY canonical
+    object regardless of tenant (it was a single-user-local console). Once an
+    authenticator binds a caller to specific tenants, that becomes a cross-tenant
+    read: a tenant-bound principal could browse another tenant's runs in the Studio
+    GUI. This returns the allow-list a list-reader must intersect against:
+
+    * ``None`` for an unrestricted principal (offline default / ANONYMOUS / trusted
+      shared key) — meaning "no filtering, show everything", so the zero-config /
+      single-box path is **byte-unchanged**; and
+    * the principal's own ``tenant_ids`` for a tenant-bound principal, so it sees only
+      runs in workspaces it is entitled to.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return None
+    return principal.tenant_ids
+
+
+def authorize_studio_object(request: Request, workspace_id: str | None) -> bool:
+    """By-id (BOLA-style) gate for a Studio object: may this caller read ``workspace_id``?
+
+    The by-id companion to :func:`studio_tenant_filter` (the list path). Returns True
+    for an unrestricted principal (offline / ``all_tenants``) so the single-box path is
+    a NO-OP, and otherwise the principal's :meth:`~Principal.may_access` verdict on the
+    object's owning workspace. A ``None`` workspace (a legacy/uncategorized run with no
+    tenant stamp) is allowed — it predates tenant binding and belongs to no tenant.
+
+    Callers fold a False verdict into a **404** (not 403) so a tenant cannot even probe
+    the existence of another tenant's run by id — mirroring the not-found-on-cross-tenant
+    convention of the ``/v1`` :func:`get_run` reader.
+    """
+    if workspace_id is None:
+        return True
+    return get_principal(request).may_access(workspace_id)
+
+
 def require_workspace(request: Request, requested: str) -> str:
     """Like :func:`resolve_workspace` for write paths that always carry a workspace.
 
@@ -209,4 +248,6 @@ __all__ = [
     "require_workspace",
     "authorize_object",
     "narrow_subject",
+    "studio_tenant_filter",
+    "authorize_studio_object",
 ]

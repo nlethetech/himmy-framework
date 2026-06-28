@@ -2,8 +2,9 @@
 
 Covers the two halves of the Studio trust boundary once the app leaves loopback:
 
-* With an authenticator configured, every Studio route requires ``studio:use``
-  (admin's ``*:*`` qualifies); without one, the zero-config behavior is unchanged.
+* With an authenticator configured, every Studio route requires its per-surface
+  permission (``studio.console:read``, ``studio.connections:write``, …; admin's
+  ``*:*`` qualifies for all); without one, the zero-config behavior is unchanged.
 * :func:`resolve_spec_path` rejects any symlinked component below the project
   root, in addition to the existing ``..``/containment check.
 """
@@ -58,8 +59,15 @@ def test_auth_configured_unauthenticated_is_401() -> None:
 
 
 def test_auth_configured_role_without_studio_grant_is_403() -> None:
-    """An authenticated principal lacking ``studio:use`` is denied everywhere."""
-    c = _client_with_key(_app_with_key("viewer"))
+    """An authenticated principal with NO Studio grant is denied everywhere.
+
+    Studio is now gated per-surface (``studio.console:read``, ``studio.runs:read``,
+    …) rather than by one coarse ``studio:use``; a custom role holding only a ``/v1``
+    grant carries none of those, so every Studio route 403s.
+    """
+    app = _app_with_key("v1_only")
+    app.state.access_policy = AccessPolicy.from_mapping({"v1_only": ["run:read"]})
+    c = _client_with_key(app)
     assert c.get("/api/studio/health").status_code == 403
     assert c.get("/api/studio/connections").status_code == 403
     assert c.get("/api/studio/agents").status_code == 403
@@ -80,14 +88,26 @@ def test_shared_internal_key_passes() -> None:
     assert r.status_code == 200
 
 
-def test_custom_policy_can_grant_studio_use() -> None:
-    """An operator-defined role granting ``studio:use`` unlocks Studio."""
+def test_custom_policy_can_grant_studio_read() -> None:
+    """An operator-defined role granting ``studio.console:read`` unlocks the console.
+
+    The granular replacement for the old coarse ``studio:use``: the read baseline the
+    main router carries is ``studio.console:read``, so a role holding it can browse
+    Studio's read surfaces (but not the ``/v1`` resource, nor any mutating route).
+    """
     app = _app_with_key("studio_user")
-    app.state.access_policy = AccessPolicy.from_mapping({"studio_user": ["studio:use"]})
+    app.state.access_policy = AccessPolicy.from_mapping(
+        {"studio_user": ["studio.console:read", "studio.connections:read"]}
+    )
     c = _client_with_key(app)
     assert c.get("/api/studio/health").status_code == 200
+    assert c.get("/api/studio/connections").status_code == 200
     # …but not the /v1 surface (no other grants).
     assert c.get("/v1/runs", params={"workspace_id": "t"}).status_code == 403
+    # …and not a mutating Studio route (no studio.connections:write).
+    assert (
+        c.put("/api/studio/connections/email", json={"fields": {}}).status_code == 403
+    )
 
 
 def test_escape_hatch_disables_studio_rbac(monkeypatch: pytest.MonkeyPatch) -> None:

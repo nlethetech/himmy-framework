@@ -352,3 +352,134 @@ def test_offline_default_bypasses_rbac() -> None:
     """No authenticator configured → RBAC off → zero-config behavior unchanged."""
     c = TestClient(create_app(ApiContainer.build_default()))
     assert c.post("/v1/runs", json=_create_body()).status_code == 200
+
+
+# ---------------------------------------------- WP p1-studio-granular: Studio RBAC
+@pytest.fixture
+def studio_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Isolate Studio's on-disk stores (``.himmy/``) in a fresh tmp cwd per test."""
+    from himmy.api.studio_runs import reset_run_store
+
+    monkeypatch.chdir(tmp_path)
+    reset_run_store()  # the run-store cache is keyed on cwd
+    return tmp_path
+
+
+def _studio_client(
+    *roles: str, tenant_ids: list[str] | None = None
+) -> tuple[TestClient, object]:
+    """A Studio client bound to ``roles`` (+ tenants); returns ``(client, app)``.
+
+    Default-policy roles are used so the granular ``studio.*:read`` grants under test
+    are the ones shipped in :data:`DEFAULT_RBAC`, not a hand-rolled fixture policy.
+    """
+    app = create_app(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "k": Principal.build(
+                "u",
+                tenant_ids=tenant_ids if tenant_ids is not None else ["t"],
+                roles=list(roles),
+                auth_method="apikey",
+            )
+        }
+    )
+    c = TestClient(app)
+    c.headers.update({"x-himmy-internal-key": "k"})
+    return c, app
+
+
+def test_readonly_studio_role_can_read(studio_cwd: Path) -> None:
+    """A default read-only role (``viewer``) can browse Studio read surfaces."""
+    c, _ = _studio_client("viewer")
+    assert c.get("/api/studio/health").status_code == 200
+    assert c.get("/api/studio/connections").status_code == 200
+    assert c.get("/api/studio/mcp/servers").status_code == 200
+
+
+def test_readonly_studio_role_is_403_on_mcp_mutation(studio_cwd: Path) -> None:
+    """``viewer`` holds ``studio.mcp:read`` but NOT ``studio.mcp:manage`` → 403."""
+    c, _ = _studio_client("viewer")
+    body = {"name": "srv", "command": "echo"}
+    assert c.post("/api/studio/mcp/servers", json=body).status_code == 403
+    assert c.delete("/api/studio/mcp/servers/srv").status_code == 403
+
+
+def test_readonly_studio_role_is_403_on_key_mutation(studio_cwd: Path) -> None:
+    """``viewer`` cannot save a provider API key (``studio.models:write``)."""
+    c, _ = _studio_client("viewer")
+    body = {"provider": "openrouter", "api_key": "sk-x"}
+    assert c.post("/api/studio/models/keys", json=body).status_code == 403
+
+
+def test_readonly_studio_role_is_403_on_connection_mutation(studio_cwd: Path) -> None:
+    """``viewer`` cannot write a connection's secrets (``studio.connections:write``)."""
+    c, _ = _studio_client("viewer")
+    r = c.put("/api/studio/connections/email", json={"fields": {}})
+    assert r.status_code == 403
+
+
+def test_admin_can_mutate_studio(studio_cwd: Path) -> None:
+    """``admin`` (``*:*``) clears every granular Studio write/manage guard."""
+    c, _ = _studio_client("admin")
+    body = {"name": "srv", "command": "echo"}
+    assert c.post("/api/studio/mcp/servers", json=body).status_code == 201
+
+
+def test_auditor_can_read_studio_but_not_mutate(studio_cwd: Path) -> None:
+    """``auditor`` is read-only: ``studio.*:read`` yes, ``:manage`` no."""
+    c, _ = _studio_client("auditor")
+    assert c.get("/api/studio/mcp/servers").status_code == 200
+    body = {"name": "srv", "command": "echo"}
+    assert c.post("/api/studio/mcp/servers", json=body).status_code == 403
+
+
+def _seed_run(app: object, *, workspace_id: str, run_id: str) -> None:
+    """Persist one canonical run in ``workspace_id`` via the app's container storage."""
+    import asyncio
+
+    from himmy.services.storage.models import RunRecord, RunStatus
+
+    storage = app.state.container.storage  # type: ignore[attr-defined]
+    rec = RunRecord(
+        run_id=run_id,
+        workspace_id=workspace_id,
+        subject_id="s",
+        status=RunStatus.SUCCEEDED,
+        output_text="hi",
+    )
+    asyncio.run(storage.save_run(rec))
+
+
+def test_tenant_bound_principal_cannot_list_cross_tenant_runs(studio_cwd: Path) -> None:
+    """A tenant-bound principal sees only its own workspace's runs in Studio."""
+    c, app = _studio_client("admin", tenant_ids=["t"])
+    _seed_run(app, workspace_id="t", run_id="run-mine")
+    _seed_run(app, workspace_id="other", run_id="run-theirs")
+
+    listing = c.get("/api/studio/runs").json()
+    ids = {item["id"] for item in listing["items"]}
+    assert "run-mine" in ids
+    assert "run-theirs" not in ids
+    assert listing["total"] == 1
+
+
+def test_tenant_bound_principal_cannot_get_cross_tenant_run(studio_cwd: Path) -> None:
+    """Fetching another tenant's run by id is 404 (never leak existence)."""
+    c, app = _studio_client("admin", tenant_ids=["t"])
+    _seed_run(app, workspace_id="t", run_id="run-mine")
+    _seed_run(app, workspace_id="other", run_id="run-theirs")
+
+    assert c.get("/api/studio/runs/run-mine").status_code == 200
+    assert c.get("/api/studio/runs/run-theirs").status_code == 404
+
+
+def test_offline_studio_runs_unscoped(studio_cwd: Path) -> None:
+    """No authenticator → Studio shows ALL runs (byte-unchanged single-box path)."""
+    app = create_app(ApiContainer.build_default())
+    _seed_run(app, workspace_id="t", run_id="run-a")
+    _seed_run(app, workspace_id="other", run_id="run-b")
+    c = TestClient(app)
+
+    ids = {item["id"] for item in c.get("/api/studio/runs").json()["items"]}
+    assert ids == {"run-a", "run-b"}

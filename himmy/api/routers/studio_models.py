@@ -28,14 +28,19 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.config.secrets import get_secret, get_writable_provider
 
 router = build_studio_router("models", tag="studio-models")
+
+#: Saving a provider API key (or probing one, or pulling an Ollama model) is a
+#: credential/state mutation — these routes require ``studio.models:write`` (admin-only
+#: by default), additively on the router's ``studio.models:read`` browse baseline.
+_models_write = Depends(studio_permission("studio.models", "write"))
 
 
 # ---- provider catalog ----------------------------------------------------
@@ -387,7 +392,7 @@ async def providers() -> ProvidersResponse:
     )
 
 
-@router.post("/keys", response_model=ProviderInfo)
+@router.post("/keys", response_model=ProviderInfo, dependencies=[_models_write])
 async def save_key(body: SaveKeyRequest) -> ProviderInfo:
     """Save a provider API key to the writable secrets backend (never echoed)."""
     p = _require_key_provider(body.provider)
@@ -404,7 +409,9 @@ async def save_key(body: SaveKeyRequest) -> ProviderInfo:
     return await _provider_info(p, ollama_up=False)
 
 
-@router.post("/keys/validate", response_model=ValidateKeyResult)
+@router.post(
+    "/keys/validate", response_model=ValidateKeyResult, dependencies=[_models_write]
+)
 async def validate_key(body: ValidateKeyRequest) -> ValidateKeyResult:
     """Cheap live check of a key (the given one, else the saved one).
 
@@ -546,7 +553,7 @@ def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-@router.post("/ollama/pull")
+@router.post("/ollama/pull", dependencies=[_models_write])
 async def ollama_pull(body: OllamaPullRequest) -> StreamingResponse:
     """Pull a model through the local Ollama server, streaming progress over SSE."""
     model = body.model.strip()
