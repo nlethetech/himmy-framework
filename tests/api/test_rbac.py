@@ -425,10 +425,14 @@ def _studio_client(
 
 
 def test_readonly_studio_role_can_read(studio_cwd: Path) -> None:
-    """A default read-only role (``viewer``) can browse Studio read surfaces."""
+    """A default read-only role (``viewer``) can browse Studio read surfaces.
+
+    red-team r6: ``connections`` is now an operator-only surface (withheld from default
+    browse roles — see :data:`_STUDIO_GLOBAL_STORE_RESOURCES`), so the browse-readable
+    examples here are ``health`` (console baseline) + ``mcp/servers`` (a granted surface).
+    """
     c, _ = _studio_client("viewer")
     assert c.get("/api/studio/health").status_code == 200
-    assert c.get("/api/studio/connections").status_code == 200
     assert c.get("/api/studio/mcp/servers").status_code == 200
 
 
@@ -468,6 +472,13 @@ def test_readonly_studio_role_is_403_on_connection_mutation(studio_cwd: Path) ->
 # ``seclog``/``lineage``/``privacy``. They were missing from the r1 withheld set, so a
 # tenant-facing role could read every other tenant's data through them (a cross-tenant
 # IDOR/BOLA). They are now in :data:`_STUDIO_GLOBAL_STORE_RESOURCES` (admin-only).
+# red-team r6 extends the withheld set with the deployment's OWN operator-connector
+# surfaces — the process-wide CONNECTIONS store (operator SMTP/Telegram/web creds) and the
+# process-wide GOOGLE OAuth connection (operator's connected Gmail/Calendar). Neither has a
+# per-tenant partition, and both are operator-only (Studio is a network-isolated operator
+# console); they are now in :data:`_STUDIO_GLOBAL_STORE_RESOURCES` (admin-only) and their
+# main-router GET routes carry the per-surface ``studio.connections:read`` / ``studio.google:read``
+# guard (previously they collapsed to the coarse ``studio.console:read`` baseline).
 _GLOBAL_STORE_READS = [
     "/api/studio/memory/subjects",
     "/api/studio/notes",
@@ -482,6 +493,12 @@ _GLOBAL_STORE_READS = [
     "/api/studio/privacy/consents",
     "/api/studio/lineage/graph",
     "/api/studio/lineage/entity/anyid",
+    "/api/studio/connections",
+    "/api/studio/connections/email",
+    "/api/studio/google",
+    "/api/studio/google/gmail",
+    "/api/studio/google/calendar",
+    "/api/studio/google/auth-url",
 ]
 
 

@@ -96,7 +96,10 @@ def test_principal_without_capability_is_denied() -> None:
     # Denied the write tool it has no grant for — deny-by-default.
     denied = run_async(svc.execute(ToolInvocation(tool_name="send_email")))
     assert denied.outcome == "denied"
-    assert denied.error_code is ToolErrorCode.POLICY_BLOCKED
+    # red-team r6: a capability/RBAC denial carries the DISTINCT ``CAPABILITY_DENIED`` code
+    # (not the approval gate's ``POLICY_BLOCKED``), so the runtime never mistakes it for a
+    # resumable human-approval checkpoint.
+    assert denied.error_code is ToolErrorCode.CAPABILITY_DENIED
 
 
 def test_invoke_without_write_grant_denies_write_tool() -> None:
@@ -111,7 +114,7 @@ def test_invoke_without_write_grant_denies_write_tool() -> None:
     )
     denied = run_async(svc.execute(ToolInvocation(tool_name="send_email")))
     assert denied.outcome == "denied"
-    assert denied.error_code is ToolErrorCode.POLICY_BLOCKED
+    assert denied.error_code is ToolErrorCode.CAPABILITY_DENIED
 
 
 def test_full_grant_allows_write_tool() -> None:

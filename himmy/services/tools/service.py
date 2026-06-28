@@ -550,10 +550,19 @@ class ToolService:
         if self._tool_authorizer is not None and not self._tool_authorizer.authorize_definition(
             definition
         ):
+            # red-team r6: emit the DISTINCT ``CAPABILITY_DENIED`` (not ``POLICY_BLOCKED``).
+            # Both the approval gate above and this capability gate used to ``_fail`` with the
+            # SAME ``(outcome="denied", POLICY_BLOCKED)`` tuple, so the runtime's pending-
+            # approval selector (which keys on exactly that tuple) misread a capability denial
+            # as a pending HUMAN-APPROVAL checkpoint. Approving it re-ran the tool, which this
+            # gate re-denied (the persisted actor's roles are unchanged), re-pausing — wedging
+            # the run until ``max_turns`` and misleading the operator. A capability denial is a
+            # HARD failure the model sees and must route around; only the ``requires_approval``
+            # gate (POLICY_BLOCKED) is a resumable checkpoint.
             return await self._fail(
                 invocation,
                 start,
-                ToolErrorCode.POLICY_BLOCKED,
+                ToolErrorCode.CAPABILITY_DENIED,
                 f"tool {definition.name!r} is not permitted for this caller "
                 "(missing tool capability)",
                 outcome="denied",

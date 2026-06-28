@@ -138,6 +138,20 @@ _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
         "studio.seclog",
         "studio.lineage",
         "studio.privacy",
+        # red-team r6: the deployment's OWN operator-connector surfaces — there is one
+        # process-wide connection store (the operator's SMTP/Telegram/web creds) and one
+        # process-wide Google OAuth connection (the operator's connected Gmail/Calendar),
+        # neither of which has a per-tenant partition to intersect against. Granting their
+        # ``:read`` to a TENANT-FACING browse role (viewer/operator/auditor — the roles a
+        # mapped API key binds) let a paying tenant read the operator's connection status +
+        # masked field hints and drive/read the operator's connected Google account through
+        # the Studio console (documented as a network-isolated OPERATOR surface, never
+        # tenant-facing). Withheld from the default browse roles and kept ``admin``-only,
+        # same rationale as the global stores above; a deployment that deliberately exposes
+        # one to a tenant role can still grant it explicitly via ``HIMMY_RBAC_FILE``. The
+        # OFFLINE path is unaffected (``require_permission`` no-ops without an authenticator).
+        "studio.connections",
+        "studio.google",
     }
 )
 

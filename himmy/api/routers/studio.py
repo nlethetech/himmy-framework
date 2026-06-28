@@ -7,9 +7,16 @@ meant to be served on loopback by ``himmy studio`` for a single local user.
 
 When an authenticator IS configured (API keys / OIDC), every Studio route requires a
 PER-SURFACE permission (the coarse ``studio:use`` is gone): the main router carries a
-``studio.console:read`` baseline ("may open Studio"), each read route is covered by
-it, and each mutating route additionally declares its ``studio.<surface>:write`` /
-``studio.mcp:manage`` grant — so a read-only role browses while only ``admin`` mutates.
+``studio.console:read`` baseline ("may open Studio"), and each read route on this main
+router ADDITIONALLY declares its own per-surface ``studio.<surface>:read`` (a higher-value
+read — connections/google/approvals/models — therefore needs both the console baseline AND
+that surface's read grant, NOT just the baseline), while each mutating route declares its
+``studio.<surface>:write`` / ``studio.mcp:manage`` grant — so a least-privilege role that
+holds only the console baseline cannot read a surface it was not granted, and only ``admin``
+mutates. (red-team r6: before, these reads collapsed to the coarse console baseline, so any
+console-read role reached connections/google/approvals/models — fixed by the per-route read
+guards above + withholding the operator connections/google surfaces from default browse
+roles in :data:`himmy.api.auth.rbac._STUDIO_GLOBAL_STORE_RESOURCES`.)
 Studio holds credentials (SMTP/Telegram), approvals, and run triggers, so a
 tenant-scoped key without those grants must not reach the write surface once the app
 is proxied beyond loopback. The zero-config (no-auth) loopback default is unchanged.
@@ -110,12 +117,22 @@ async def health() -> dict[str, Any]:
     }
 
 
-@router.get("/doctor")
+@router.get(
+    "/doctor",
+    dependencies=[Depends(studio_permission(_RES_CONSOLE, "write"))],
+)
 async def doctor() -> dict[str, Any]:
     """Environment diagnostics: extras, providers, keys, and the next step.
 
     The JSON twin of ``himmy doctor`` — same
     :func:`himmy.runtime.diagnostics.collect_doctor_report` snapshot the CLI prints.
+
+    red-team r6: this leaks DEPLOYMENT TOPOLOGY (installed extras, which provider keys are
+    configured, the storage backend + a password-masked DSN host) — an OPERATOR concern,
+    not a tenant one. Inheriting only the ``studio.console:read`` baseline made it reachable
+    by every tenant-facing browse role; it now additionally requires ``studio.console:write``
+    (admin-only, like the ``benchmarks/probe`` operator action), so a tenant browse role is
+    403'd. OFFLINE is unaffected (``studio_permission`` no-ops without an authenticator).
     """
     from himmy.runtime.diagnostics import collect_doctor_report
 
@@ -528,13 +545,26 @@ class ConnectionSetRequest(BaseModel):
     fields: dict[str, Any]
 
 
-@router.get("/connections", response_model=list[ConnectionStatus])
+@router.get(
+    "/connections",
+    response_model=list[ConnectionStatus],
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "read"))],
+)
 async def connections() -> list[ConnectionStatus]:
-    """List connectable account types + their configured/writable status."""
+    """List connectable account types + their configured/writable status.
+
+    red-team r6: requires the per-surface ``studio.connections:read`` (not just the coarse
+    ``studio.console:read`` baseline), so a tenant browse role that does NOT hold the
+    connections grant cannot read the operator's connection status + masked field hints.
+    """
     return studio_connections.list_connections()
 
 
-@router.get("/connections/{ctype}", response_model=ConnectionStatus)
+@router.get(
+    "/connections/{ctype}",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "read"))],
+)
 async def connection(ctype: str) -> ConnectionStatus:
     status = studio_connections.get_connection(ctype)
     if status is None:
@@ -667,8 +697,17 @@ def _google_redirect_uri(request: Any) -> str:
     return f"{base}/api/studio/google/callback"
 
 
-@router.get("/google")
+@router.get(
+    "/google",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "read"))],
+)
 async def google_status() -> Any:
+    """The operator's Google OAuth connection state (connected account, client status).
+
+    red-team r6: requires the per-surface ``studio.google:read`` rather than collapsing to
+    the ``studio.console:read`` baseline, so a tenant browse role without the Google grant
+    cannot read the operator's connected-account state.
+    """
     from himmy.api import studio_google
 
     return studio_google.status()
@@ -687,8 +726,18 @@ async def google_set_client(body: GoogleClientRequest) -> Any:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/google/auth-url")
+@router.get(
+    "/google/auth-url",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_auth_url(request: Request) -> dict[str, str]:
+    """Mint a Google OAuth authorization URL (and a pending CSRF ``state``).
+
+    red-team r6: this is a STATE-CHANGING step of the OAuth connect lifecycle (it registers
+    a pending ``state``), so it is gated identically to its PUT/DELETE mutator siblings with
+    ``studio.google:write`` (admin-only) — NOT the read baseline. A read-only browse role can
+    no longer initiate the operator deployment's Google connect flow.
+    """
     from himmy.api import studio_google
 
     try:
@@ -698,13 +747,23 @@ async def google_auth_url(request: Request) -> dict[str, str]:
     return {"url": url}
 
 
-@router.get("/google/callback")
+@router.get(
+    "/google/callback",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_callback(
     request: Request,
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
 ) -> HTMLResponse:
+    """Complete the Google OAuth exchange and PERSIST the operator's tokens.
+
+    red-team r6: exchanging the ``code`` writes ACCESS/REFRESH tokens into the deployment's
+    writable secrets backend — a connection-state mutation. Gated with ``studio.google:write``
+    (admin-only) like the rest of the OAuth lifecycle, so a read-only browse role cannot
+    complete a token exchange via this GET.
+    """
     from himmy.api import studio_google
 
     if error or not code:
@@ -768,8 +827,17 @@ async def google_forget_client() -> Any:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/google/gmail")
+@router.get(
+    "/google/gmail",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "read"))],
+)
 async def google_gmail_list(max_results: int = 20) -> Any:
+    """Read the operator's connected Gmail inbox.
+
+    red-team r6: requires the per-surface ``studio.google:read`` rather than the coarse
+    console baseline, so a tenant browse role without the Google grant cannot read the
+    operator's inbox.
+    """
     from himmy.api import studio_google
 
     try:
@@ -793,8 +861,16 @@ async def google_gmail_send(body: GmailSendRequest) -> Any:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/google/calendar")
+@router.get(
+    "/google/calendar",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "read"))],
+)
 async def google_calendar_list(max_results: int = 20) -> Any:
+    """Read the operator's connected Google Calendar.
+
+    red-team r6: requires ``studio.google:read`` rather than the coarse console baseline,
+    so a tenant browse role without the Google grant cannot read the operator's calendar.
+    """
     from himmy.api import studio_google
 
     try:
@@ -825,13 +901,25 @@ async def google_calendar_create(body: CalendarCreateRequest) -> Any:
 # ---- Approvals (human-in-the-loop inbox) --------------------------------
 
 
-@router.get("/approvals", response_model=list[ApprovalSummary])
+@router.get(
+    "/approvals",
+    response_model=list[ApprovalSummary],
+    dependencies=[Depends(studio_permission(_RES_APPROVALS, "read"))],
+)
 async def approvals() -> list[ApprovalSummary]:
-    """List runs paused awaiting a human decision."""
+    """List runs paused awaiting a human decision.
+
+    red-team r6: requires the per-surface ``studio.approvals:read`` rather than collapsing
+    to the coarse ``studio.console:read`` baseline, so the HITL inbox honors its own grant.
+    """
     return studio_approvals.list_pending()
 
 
-@router.get("/approvals/{checkpoint_id}", response_model=ApprovalDetail)
+@router.get(
+    "/approvals/{checkpoint_id}",
+    response_model=ApprovalDetail,
+    dependencies=[Depends(studio_permission(_RES_APPROVALS, "read"))],
+)
 async def approval(checkpoint_id: str) -> ApprovalDetail:
     detail = studio_approvals.get_detail(checkpoint_id)
     if detail is None:
@@ -883,9 +971,15 @@ async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
 # ---- Models (available providers + models) ------------------------------
 
 
-@router.get("/models")
+@router.get(
+    "/models",
+    dependencies=[Depends(studio_permission(_RES_MODELS, "read"))],
+)
 async def models() -> list[dict[str, Any]]:
     """Available providers + their models, with any cached benchmark stats.
+
+    red-team r6: requires the per-surface ``studio.models:read`` rather than collapsing to
+    the coarse ``studio.console:read`` baseline, so the model catalog honors its own grant.
 
     Delegates to the shared :func:`himmy.services.inference.compare.build_model_catalog`
     seam (T3d) — the SAME catalog ``GET /v1/models`` and ``himmy models`` render, so the

@@ -186,6 +186,12 @@ class ToolErrorCode(str, Enum):
 
     NOT_FOUND = "NOT_FOUND"
     POLICY_BLOCKED = "POLICY_BLOCKED"
+    #: A capability/RBAC denial: the run principal does NOT hold the tool's capability
+    #: (``tool:<name>:invoke`` / ``:write``). DISTINCT from ``POLICY_BLOCKED`` — which the
+    #: ``requires_approval`` gate uses — so a capability denial is a HARD failure the model
+    #: sees, never mistaken for a resumable human-approval checkpoint (a re-run would deny it
+    #: again with the same unchanged principal, wedging the run; red-team r6).
+    CAPABILITY_DENIED = "CAPABILITY_DENIED"
     TIMEOUT = "TIMEOUT"
     RATE_LIMITED = "RATE_LIMITED"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"

@@ -2072,7 +2072,15 @@ class SingleAgentRuntime:
 
     @staticmethod
     def _pending_approvals(result: RunResult) -> list[PendingToolCall]:
-        """The tool calls in a turn that were denied for lack of approval."""
+        """The tool calls in a turn that were denied for lack of HUMAN APPROVAL.
+
+        Keys on the ``requires_approval`` gate's signature ONLY — ``outcome == 'denied'``
+        AND ``error_code == 'POLICY_BLOCKED'``. A CAPABILITY/RBAC denial carries the distinct
+        ``CAPABILITY_DENIED`` code (red-team r6) and is deliberately EXCLUDED: re-running it
+        after an "approval" would deny it again (the run principal's roles are unchanged),
+        wedging the run and misleading the operator — so a missing-capability call is a hard
+        failure the model sees, never a resumable approval checkpoint.
+        """
         denied = {
             r.tool_call_id
             for r in result.tool_returns
