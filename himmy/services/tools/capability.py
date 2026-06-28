@@ -123,11 +123,13 @@ class ToolCapabilityAuthorizer:
         """Whether the principal may invoke tool ``name`` (deny-by-default when enforcing).
 
         Non-enforcing (offline / unrestricted) → always ``True``. Enforcing → the
-        principal must hold ``tool:<name>:invoke`` and, when the tool is a WRITE
-        (``read_only`` is ``False``, or inferred ``False`` from the name), additionally
-        ``tool:<name>:write``. An ``admin``-style ``*:*`` grant covers both via the
-        policy's own wildcard matching. With no policy wired (a misconfiguration) an
-        enforcing authorizer denies — fail CLOSED.
+        principal must hold ``tool:<name>:invoke`` and, unless the tool is PROVABLY
+        read-only (``read_only`` is ``True``, or inferred ``True`` from the name),
+        additionally ``tool:<name>:write`` — so an ambiguously-named tool whose intent
+        cannot be inferred fails CLOSED to writer (requires the write grant too). An
+        ``admin``-style ``*:*`` grant covers both via the policy's own wildcard matching.
+        With no policy wired (a misconfiguration) an enforcing authorizer denies — fail
+        CLOSED.
         """
         if not self.enforce:
             return True
@@ -136,7 +138,14 @@ class ToolCapabilityAuthorizer:
         if not self._grants(name, INVOKE_ACTION):
             return False
         intent = read_only if read_only is not None else classify_read_only(name)
-        if intent is False and not self._grants(name, WRITE_ACTION):
+        # Fail CLOSED on the write sub-grant: require ``tool:<name>:write`` for anything
+        # NOT provably read-only. ``intent`` is ``True`` only for a tool flagged
+        # ``read_only=True`` or inferred read-only from its name; an AMBIGUOUS name
+        # (``classify_read_only`` -> ``None``, e.g. ``process_payment``, ``submit_order``)
+        # is treated as a writer so an operator granting a per-tool ``:invoke`` for a
+        # read-only reach cannot unknowingly hand a writer write reach. Tool authors should
+        # set explicit ``read_only=True`` on look-up tools to avoid needing the write grant.
+        if intent is not True and not self._grants(name, WRITE_ACTION):
             return False
         return True
 

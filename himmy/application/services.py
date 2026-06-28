@@ -2516,6 +2516,13 @@ class RunAppService:
                     checkpoint_store=self._checkpoint_store,
                     plan_mode=plan_mode,
                     workspace_id=run.workspace_id,
+                    # Carry the PERSISTED launch actor (stamped at create into
+                    # run.metadata['actor']) into the rebuilt runtime, mirroring the drive
+                    # path above. Without it the tool-capability gate would rebuild
+                    # NON-enforcing and the now-approved, side-effecting tool would execute
+                    # with the gate DISABLED — re-opening the confused-deputy hole on the
+                    # highest-value path (the approved write).
+                    actor=(run.metadata or {}).get("actor"),
                 )
             except Exception as exc:  # noqa: BLE001 - spec rebuild failure is terminal
                 run.status = RunStatus.FAILED

@@ -42,7 +42,14 @@ logger = logging.getLogger("himmy.api.auth.rbac")
 
 #: The built-in role catalogue. ``admin`` is unrestricted; ``viewer`` reads
 #: operational data (incl. the read-only model catalog + global diagnostics);
-#: ``operator`` reads + writes it (``model:write`` covers the run-fanning compare);
+#: ``operator`` reads + writes it (``model:write`` covers the run-fanning compare) AND
+#: holds ``tool:*`` — the every-tool, read+write capability an autonomous agent run
+#: needs, so the tool-capability gate (see :mod:`himmy.services.tools.capability`) keeps
+#: today's behavior for operator humans AND the routine/connector SERVICE principals
+#: (which run as ``operator``) once an authenticator is configured. Read-only roles
+#: (``viewer``/``auditor``) carry NO ``tool:*`` because the single-colon wildcard grammar
+#: cannot express "every tool, read-only"; a deployment that wants those roles to invoke
+#: look-up tools lists them explicitly (``tool:<name>:invoke``) via ``HIMMY_RBAC_FILE``.
 #: ``auditor`` additionally reads the audit surface AND runs the WS4.7 privacy audit
 #: (``audit:run``). ``data_subject`` is a self-scoped role for a person exercising
 #: their own consent/erasure rights (the router additionally restricts it to its own
@@ -83,6 +90,14 @@ DEFAULT_RBAC: dict[str, list[str]] = {
         "model:read",
         "model:write",
         "diagnostics:read",
+        # Every-tool, read+write capability for autonomous agent/service runs: without it,
+        # enabling an authenticator would deny EVERY tool call to operator humans AND to
+        # the routine/connector SERVICE principals (which run as ``operator``). The
+        # tool-capability gate folds the tool name + intent into the action under the
+        # ``tool`` resource (``tool:<name>:invoke`` / ``:write``), so ``tool:*`` covers
+        # both. (``res='tool'`` here, so the non-admin wildcard lint — which flags a
+        # wildcard RESOURCE ``*:...`` — does not fire.)
+        "tool:*",
     ],
     "auditor": [
         "run:read",

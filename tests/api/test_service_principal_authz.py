@@ -7,7 +7,8 @@ the connector inbound handler builds an enforcing gate only when auth is configu
 
 from __future__ import annotations
 
-from himmy.api.auth.rbac import AccessPolicy
+from himmy.api.auth.principal import Principal
+from himmy.api.auth.rbac import DEFAULT_POLICY
 from himmy.api.auth.service_principal import (
     CONNECTOR_SERVICE_SUBJECT,
     ROUTINE_SERVICE_SUBJECT,
@@ -16,6 +17,7 @@ from himmy.api.auth.service_principal import (
 )
 from himmy.api.connector_inbound import _connector_tool_authorizer
 from himmy.services.storage.models import LOCAL_WORKSPACE
+from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
 
 def test_service_principals_are_tenant_bound_and_named() -> None:
@@ -59,8 +61,13 @@ class _App:
 
 
 def test_connector_gate_engages_only_with_authenticator() -> None:
-    """The connector tool gate is enforcing iff an authenticator is configured."""
-    policy = AccessPolicy.from_mapping({"operator": ["tool:*"]})
+    """The connector tool gate is enforcing iff an authenticator is configured.
+
+    Uses the REAL shipped DEFAULT_POLICY (not a fabricated one) so this also pins that
+    the default operator role actually carries ``tool:*`` — without it the connector
+    service principal would be denied every tool the moment auth is on.
+    """
+    policy = DEFAULT_POLICY
 
     # No app / no authenticator → no gate (offline byte-unchanged).
     assert _connector_tool_authorizer(None) is None
@@ -71,4 +78,20 @@ def test_connector_gate_engages_only_with_authenticator() -> None:
     assert gate is not None
     assert gate.enforce is True
     # The default operator role holds ``tool:*`` so the connector may invoke any tool.
+    assert gate.is_authorized("send_email", False) is True
+
+
+def test_default_policy_operator_authorizes_read_and_write_tools() -> None:
+    """REGRESSION: the shipped DEFAULT_POLICY authorizes operator for a read AND a write tool.
+
+    The routine/connector SERVICE principals run as ``operator``; if the default policy
+    lost its ``tool:*`` grant, enabling an authenticator would deny every tool to both
+    side-doors. Asserting against DEFAULT_POLICY (not a fabricated mapping) keeps this
+    honest.
+    """
+    op = Principal(
+        subject="u", roles=frozenset({"operator"}), tenant_ids=frozenset({"ws1"})
+    )
+    gate = ToolCapabilityAuthorizer.from_principal(op, DEFAULT_POLICY)
+    assert gate.is_authorized("weather_get", True) is True
     assert gate.is_authorized("send_email", False) is True

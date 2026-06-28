@@ -11,7 +11,7 @@ Covers the four guarantees the work package introduces:
 from __future__ import annotations
 
 from himmy.api.auth.principal import ANONYMOUS, Principal
-from himmy.api.auth.rbac import AccessPolicy
+from himmy.api.auth.rbac import DEFAULT_POLICY, AccessPolicy
 from himmy.services.tools import (
     ToolErrorCode,
     ToolInvocation,
@@ -149,6 +149,56 @@ def test_attenuate_returns_subset_gate() -> None:
     assert child.roles == parent.roles
     assert child.is_authorized("weather_get", True) is True
     assert child.is_authorized("send_email", False) is False
+
+
+def test_default_policy_operator_holds_tool_capability() -> None:
+    """REGRESSION: the SHIPPED DEFAULT_POLICY must authorize operator for read+write tools.
+
+    The routine/connector SERVICE principals AND operator humans run as ``operator``; if
+    the default policy carried no ``tool:*`` grant, enabling an authenticator would deny
+    EVERY tool to all of them. This pins the real policy (not a fabricated one) so the
+    regression can never silently return.
+    """
+    op = Principal(
+        subject="u", roles=frozenset({"operator"}), tenant_ids=frozenset({"ws1"})
+    )
+    authz = ToolCapabilityAuthorizer.from_principal(op, DEFAULT_POLICY)
+    assert authz.enforce is True
+    # A read tool and a (side-effecting) write tool are BOTH authorized for operator.
+    assert authz.is_authorized("weather_get", True) is True
+    assert authz.is_authorized("send_email", False) is True
+
+
+def test_ambiguously_named_writer_requires_write_grant() -> None:
+    """An ambiguously-named tool fails CLOSED to writer: invoke-only is NOT enough.
+
+    ``process_payment`` has no ``read_only`` flag and a name ``classify_read_only`` cannot
+    classify (-> None). An invoke-only grant must NOT reach it — it additionally requires
+    ``tool:process_payment:write`` — so an operator granting a per-tool ``:invoke`` for a
+    read-only reach cannot unknowingly hand write reach to an ambiguously-named writer.
+    """
+    invoke_only = AccessPolicy.from_mapping(
+        {"halfgrant": ["tool:process_payment:invoke"]}
+    )
+    p = Principal(
+        subject="u", roles=frozenset({"halfgrant"}), tenant_ids=frozenset({"ws1"})
+    )
+    gate = ToolCapabilityAuthorizer.from_principal(p, invoke_only)
+    # read_only=None (no flag) + ambiguous name → treated as a writer → DENIED on invoke-only.
+    assert gate.is_authorized("process_payment", None) is False
+    # Granting the write capability too lets it through.
+    full = AccessPolicy.from_mapping(
+        {"full": ["tool:process_payment:invoke", "tool:process_payment:write"]}
+    )
+    pf = Principal(
+        subject="u", roles=frozenset({"full"}), tenant_ids=frozenset({"ws1"})
+    )
+    assert (
+        ToolCapabilityAuthorizer.from_principal(pf, full).is_authorized(
+            "process_payment", None
+        )
+        is True
+    )
 
 
 def test_from_actor_rebuilds_enforcing_gate() -> None:
