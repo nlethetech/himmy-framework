@@ -74,7 +74,7 @@ from himmy.api.runtime_bootstrap import (
 )
 from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.core.errors import HimmyError
-from himmy.services.audit import SecurityAuditLog
+from himmy.services.audit import SecurityAuditLog, SecurityEvent
 from himmy.services.observability.logging import (
     bind_request_id,
     configure_logging,
@@ -312,6 +312,48 @@ def _record_durability_truth(
     app.state.active_backend = _active_backend_name(container)
 
 
+def _record_policy_loaded(app: FastAPI) -> None:
+    """Emit a 'policy_loaded' audit event for the active RBAC policy (P1 observability).
+
+    Captures the policy SOURCE (file path or ``<built-in>``) + a non-reversible content
+    HASH + role count, so the forensic question "did the running authorization policy
+    change?" is answerable from the trail — while the verbatim grants are NEVER copied
+    into the (possibly wider-read) audit log.
+
+    A NO-OP when no authenticator is configured, mirroring ``require_permission`` /
+    ``audit_event``: the offline/zero-config path records nothing and is byte-unchanged.
+    Called from the ``create_app`` body AND after a lifespan ``_rebind_container`` (which
+    swaps the audit log onto the durable registry), so the event lands in whichever
+    registry actually serves requests. Best-effort: a logging hiccup never blocks
+    startup.
+    """
+    if getattr(app.state, "authenticator", None) is None:
+        return
+    audit = getattr(app.state, "security_audit", None)
+    policy = getattr(app.state, "access_policy", None)
+    if audit is None or policy is None:  # pragma: no cover - both wired together
+        return
+    try:
+        from himmy.api.auth import policy_fingerprint, policy_source
+
+        audit.record(
+            SecurityEvent(
+                event_type="policy_loaded",
+                outcome="allow",
+                actor={"subject": "system", "auth_method": "startup"},
+                resource="rbac_policy",
+                action="load",
+                detail=(
+                    f"source={policy_source()} "
+                    f"hash={policy_fingerprint(policy)} "
+                    f"roles={len(policy.role_permissions)}"
+                ),
+            )
+        )
+    except Exception:  # pragma: no cover - audit is best-effort, never fatal
+        logger.warning("recording policy_loaded audit event failed", exc_info=True)
+
+
 def _rebind_container(app: FastAPI, container: ApiContainer) -> None:
     """Point ``app.state`` at a (re)built container's services.
 
@@ -325,6 +367,10 @@ def _rebind_container(app: FastAPI, container: ApiContainer) -> None:
     app.state.consent_ledger = getattr(container, "consent_ledger", None)
     app.state.consent_policy = getattr(container, "consent_policy", None)
     app.state.retention_service = getattr(container, "retention_service", None)
+    # Re-emit the policy_loaded marker into the NEW (durable) audit registry, so the
+    # forensic record of the active policy survives the in-memory→durable swap. No-op
+    # offline (no authenticator) — see :func:`_record_policy_loaded`.
+    _record_policy_loaded(app)
 
 
 def _build_lifespan(
@@ -613,6 +659,10 @@ def create_app(
             run_app._access_policy = app.state.access_policy
     # Security audit: auth/authz/access events as tamper-evident entities (WS1.4).
     app.state.security_audit = SecurityAuditLog(container.entity_registry)
+    # P1 observability: record a 'policy_loaded' audit event for the active RBAC policy
+    # (source + non-reversible content hash + role count). No-op offline. Re-emitted by
+    # _rebind_container if the lifespan later swaps in a durable audit registry.
+    _record_policy_loaded(app)
     # Rate limiting: per-principal/IP token bucket (WS3.2), off unless configured.
     app.state.rate_limiter = build_rate_limiter()
     # Consent governance (WS4.6): only present in a governed deployment (HIMMY_CONSENT on).

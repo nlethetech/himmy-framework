@@ -540,6 +540,44 @@ def build_access_policy() -> AccessPolicy:
     return load_policy(path) if path else DEFAULT_POLICY
 
 
+def policy_fingerprint(policy: AccessPolicy) -> str:
+    """A stable, non-reversible content HASH of a policy's grants (for the audit log).
+
+    The audit/forensic question "did the running policy change?" needs a content
+    digest, NOT the permission strings themselves — emitting the verbatim grants into
+    the audit trail would copy the deployment's whole authorization matrix into a log
+    that may have wider read access than the policy file, an information-disclosure
+    footgun (which roles can do what, where the wildcards are). So we hash a
+    canonicalized, order-independent serialization of the ``role → {(resource, action)}``
+    map (roles + their perm tuples both sorted, so two equal policies always hash
+    identically regardless of source ordering) and surface only the first 16 hex chars
+    of a SHA-256 — enough to detect drift, impossible to invert into the grants.
+    """
+    import hashlib
+
+    canonical = sorted(
+        (role, sorted(perms))
+        for role, perms in policy.role_permissions.items()
+    )
+    digest = hashlib.sha256(
+        json.dumps(canonical, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest[:16]}"
+
+
+def policy_source() -> str:
+    """A human-readable label for WHERE the active policy came from (no secrets).
+
+    Either the configured ``HIMMY_RBAC_FILE`` path or the literal ``"<built-in>"`` for
+    the default catalogue. Surfaced in the ``policy_loaded`` audit event so an operator
+    can correlate a content-hash change with a file edit; the path is config, never a
+    secret.
+    """
+    import os
+
+    return os.environ.get("HIMMY_RBAC_FILE") or "<built-in>"
+
+
 def require_permission(
     resource: str, action: str
 ) -> Callable[[Request], Awaitable[None]]:
@@ -555,7 +593,15 @@ def require_permission(
         policy: AccessPolicy = (
             getattr(request.app.state, "access_policy", None) or DEFAULT_POLICY
         )
-        if not policy.authorize(get_principal(request), resource, action):
+        # Observability (P1): record the verdict into the process-wide metrics. This
+        # runs ONLY past the offline bypass above, so the zero-config path is
+        # untouched. A DENY is always counted; a GRANT is sampled for privileged
+        # resources (see :func:`record_authz_decision`). Best-effort and never raises.
+        from himmy.services.observability.metrics import record_authz_decision
+
+        granted = policy.authorize(get_principal(request), resource, action)
+        record_authz_decision(resource, action, granted=granted)
+        if not granted:
             from himmy.api.security_audit import audit_event
 
             audit_event(
@@ -572,6 +618,11 @@ def require_permission(
                 detail=f"permission denied: {resource}:{action}",
             )
 
+    # Tag the closure so the route-coverage gate (tests/api/test_rbac_route_coverage.py)
+    # can recognise — at runtime, by walking each route's dependency tree — that a route
+    # carries a require_permission guard, and which (resource, action) it enforces. This
+    # is purely introspection metadata; it never affects the dependency's behavior.
+    _dep._rbac_permission = (resource, action)  # type: ignore[attr-defined]
     return _dep
 
 
@@ -583,5 +634,7 @@ __all__ = [
     "lint_policy",
     "load_policy",
     "build_access_policy",
+    "policy_fingerprint",
+    "policy_source",
     "require_permission",
 ]

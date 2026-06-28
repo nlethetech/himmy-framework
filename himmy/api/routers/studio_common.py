@@ -85,6 +85,10 @@ def studio_permission(
             return
         await require_permission(resource, action)(request)
 
+    # Mark the closure (like the underlying require_permission ``_dep``) so the
+    # route-coverage gate recognises a Studio route as RBAC-guarded by walking its
+    # dependency tree. Introspection metadata only; never affects behavior.
+    _dep._rbac_permission = (resource, action)  # type: ignore[attr-defined]
     return _dep
 
 

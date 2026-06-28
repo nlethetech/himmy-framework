@@ -28,6 +28,8 @@ from himmy.api.auth.rbac import (
     DEFAULT_POLICY,
     AccessPolicy,
     build_access_policy,
+    policy_fingerprint,
+    policy_source,
     require_permission,
 )
 from himmy.api.auth.service_principal import (
@@ -54,6 +56,8 @@ __all__ = [
     "AccessPolicy",
     "DEFAULT_POLICY",
     "build_access_policy",
+    "policy_fingerprint",
+    "policy_source",
     "require_permission",
     "connector_service_principal",
     "routine_service_principal",

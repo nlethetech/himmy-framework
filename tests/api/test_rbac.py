@@ -668,3 +668,131 @@ def test_offline_analytics_and_lineage_unscoped(studio_cwd: Path) -> None:
 
     assert c.get("/api/studio/runs/run-b/feedback").status_code == 200
     assert c.get("/api/studio/runs/run-b/lineage").status_code == 200
+
+
+# ---------------------------------- WP p1-observability-gate: policy_loaded + metrics
+def _authed_app_via_env(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Build an app whose authenticator is configured AT create_app time (via env).
+
+    The route-enforcement fixtures above set ``app.state.authenticator`` AFTER
+    ``create_app`` returns, so the startup ``policy_loaded`` emit (which only fires when
+    ``build_authenticator()`` is non-None inside ``create_app``) is intentionally NOT
+    exercised by them. Here we configure a shared internal key via the environment so
+    ``create_app`` builds the authenticator itself and the startup event fires.
+    """
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "k")
+    app = create_app(ApiContainer.build_default())
+    assert app.state.authenticator is not None  # auth really is configured
+    c = TestClient(app)
+    c.headers.update({"x-himmy-internal-key": "k"})
+    return c
+
+
+def test_policy_loaded_event_fires_with_a_hash_not_raw_perms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup records a 'policy_loaded' audit event with a content HASH + role count."""
+    c = _authed_app_via_env(monkeypatch)
+    events = c.app.state.security_audit.recent(event_type="policy_loaded")  # type: ignore[attr-defined]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.outcome == "allow"
+    assert ev.resource == "rbac_policy"
+    assert ev.action == "load"
+    # The detail carries source + a sha256 fingerprint + role count.
+    assert "source=<built-in>" in ev.detail
+    assert "hash=sha256:" in ev.detail
+    assert "roles=" in ev.detail
+    # CRITICAL: no verbatim permission string is leaked into the audit trail.
+    from himmy.api.auth.rbac import DEFAULT_RBAC
+
+    for perms in DEFAULT_RBAC.values():
+        for perm in perms:
+            assert perm not in ev.detail
+
+
+def test_policy_loaded_records_the_file_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A custom HIMMY_RBAC_FILE is named (config, not secret) as the policy source."""
+    f = tmp_path / "rbac.json"
+    f.write_text(json.dumps({"viewer": ["run:read"]}))
+    monkeypatch.setenv("HIMMY_RBAC_FILE", str(f))
+    c = _authed_app_via_env(monkeypatch)
+    ev = c.app.state.security_audit.recent(event_type="policy_loaded")[0]  # type: ignore[attr-defined]
+    assert f"source={f}" in ev.detail
+    assert "roles=1" in ev.detail
+
+
+def test_policy_loaded_is_noop_offline() -> None:
+    """No authenticator → no policy_loaded event (offline/zero-config is unchanged)."""
+    app = create_app(ApiContainer.build_default())
+    assert app.state.authenticator is None
+    # Query INSIDE the lifespan (the registry is closed on exit); no policy_loaded
+    # event is ever recorded on the offline path.
+    with TestClient(app):
+        assert app.state.security_audit.recent(event_type="policy_loaded") == []
+
+
+def test_policy_fingerprint_is_stable_and_order_independent() -> None:
+    """The fingerprint is a non-reversible digest, identical for equal policies."""
+    from himmy.api.auth.rbac import policy_fingerprint
+
+    a = AccessPolicy.from_mapping({"x": ["run:read", "context:write"], "y": ["run:*"]})
+    b = AccessPolicy.from_mapping({"y": ["run:*"], "x": ["context:write", "run:read"]})
+    fp = policy_fingerprint(a)
+    assert fp.startswith("sha256:")
+    assert fp == policy_fingerprint(b)  # order-independent
+    # A different policy yields a different fingerprint (drift is detectable).
+    c = AccessPolicy.from_mapping({"x": ["run:read"]})
+    assert policy_fingerprint(c) != fp
+    # And it never embeds a verbatim permission (non-reversible).
+    assert "run:read" not in fp
+
+
+def test_authz_denied_metric_increments_on_403(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 increments the himmy_authz_denied_total counter for that resource:action."""
+    from himmy.services.observability.metrics import get_registry, reset_registry
+
+    reset_registry()
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "k")
+    app = create_app(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "k": Principal.build("u", tenant_ids=["t"], roles=["viewer"], auth_method="apikey")
+        }
+    )
+    c = TestClient(app)
+    c.headers.update({"x-himmy-internal-key": "k"})
+    # viewer cannot create a run (run:write) → 403 → denied counter ticks.
+    assert c.post("/v1/runs", json=_create_body()).status_code == 403
+    assert get_registry().authz_denied_total.value(("run", "write")) >= 1.0
+
+
+def test_authz_granted_metric_sampled_for_privileged_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A grant on a privileged resource (audit) is sampled; an ordinary read is not."""
+    from himmy.services.observability.metrics import get_registry, reset_registry
+
+    reset_registry()
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "k")
+    app = create_app(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "k": Principal.build(
+                "u", tenant_ids=["t"], roles=["auditor"], auth_method="apikey"
+            )
+        }
+    )
+    c = TestClient(app)
+    c.headers.update({"x-himmy-internal-key": "k"})
+    reg = get_registry()
+    # An ordinary high-volume read (run:read) is granted but NOT sampled into grants.
+    assert c.get("/v1/runs", params={"workspace_id": "t"}).status_code == 200
+    assert reg.authz_granted_total.value(("run", "read")) == 0.0
+    # A grant on the PRIVILEGED 'audit' resource IS sampled.
+    assert c.get("/v1/audit/events").status_code in (200, 404)
+    assert reg.authz_granted_total.value(("audit", "read")) >= 1.0
