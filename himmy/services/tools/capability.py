@@ -36,8 +36,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from himmy.services.tools.access import classify_read_only
-
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.api.auth.principal import Principal
     from himmy.api.auth.rbac import AccessPolicy
@@ -142,12 +140,26 @@ class ToolCapabilityAuthorizer:
 
         Non-enforcing (offline / unrestricted) → always ``True``. Enforcing → the
         principal must hold ``tool:<name>:invoke`` and, unless the tool is PROVABLY
-        read-only (``read_only`` is ``True``, or inferred ``True`` from the name),
-        additionally ``tool:<name>:write`` — so an ambiguously-named tool whose intent
-        cannot be inferred fails CLOSED to writer (requires the write grant too). An
-        ``admin``-style ``*:*`` grant covers both via the policy's own wildcard matching.
-        With no policy wired (a misconfiguration) an enforcing authorizer denies — fail
-        CLOSED.
+        read-only, additionally ``tool:<name>:write``. An ``admin``-style ``*:*`` grant
+        covers both via the policy's own wildcard matching. With no policy wired (a
+        misconfiguration) an enforcing authorizer denies — fail CLOSED.
+
+        **What counts as "provably read-only" (and why name-inference does NOT).**
+        ONLY an EXPLICIT author flag ``read_only=True`` waives the ``:write`` sub-grant.
+        Name-inference (:func:`classify_read_only`) is deliberately NOT trusted to waive
+        it: that classifier is first-token-wins, so a side-effecting tool whose name
+        merely STARTS with a read verb — ``get_or_create_invoice`` (first token ``get``),
+        ``check_payment`` (``check``) — is inferred read-only even though it mutates state
+        (``create`` is literally a later token in the first example). Were inference
+        allowed to waive ``:write``, a least-privilege role granted only
+        ``tool:<name>:invoke`` (expecting a look-up) could fire that write tool it was
+        never meant to. So the gate fails CLOSED for everything that is not EXPLICITLY
+        flagged read-only — both an ambiguous name (``process_payment`` →
+        :func:`classify_read_only` ``None``) AND a name merely inferred read-only require
+        the ``:write`` grant. Name-inference still feeds the model-facing description hint
+        (:func:`himmy.services.tools.access.describe_for_model`); it just never relaxes a
+        capability check. Tool authors set ``read_only=True`` on genuine look-up tools to
+        grant invoke-only reach.
         """
         if not self.enforce:
             return True
@@ -155,15 +167,12 @@ class ToolCapabilityAuthorizer:
             return False
         if not self._grants(name, INVOKE_ACTION):
             return False
-        intent = read_only if read_only is not None else classify_read_only(name)
-        # Fail CLOSED on the write sub-grant: require ``tool:<name>:write`` for anything
-        # NOT provably read-only. ``intent`` is ``True`` only for a tool flagged
-        # ``read_only=True`` or inferred read-only from its name; an AMBIGUOUS name
-        # (``classify_read_only`` -> ``None``, e.g. ``process_payment``, ``submit_order``)
-        # is treated as a writer so an operator granting a per-tool ``:invoke`` for a
-        # read-only reach cannot unknowingly hand a writer write reach. Tool authors should
-        # set explicit ``read_only=True`` on look-up tools to avoid needing the write grant.
-        if intent is not True and not self._grants(name, WRITE_ACTION):
+        # Waive the ``:write`` sub-grant ONLY for an EXPLICIT author ``read_only=True``
+        # flag — never for a name-inferred verdict (see docstring: first-token-wins
+        # mis-classifies read-verb-prefixed writers like ``get_or_create``). So anything
+        # whose intent is not the explicit-True flag (ambiguous, inferred-read, or write)
+        # additionally requires ``tool:<name>:write`` — fail CLOSED.
+        if read_only is not True and not self._grants(name, WRITE_ACTION):
             return False
         return True
 

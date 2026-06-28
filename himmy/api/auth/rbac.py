@@ -97,18 +97,29 @@ STUDIO_READ_RESOURCES: tuple[str, ...] = (
     "studio.telegram",
 )
 
-#: Studio surfaces backed by a PROCESS-WIDE, single-user-local store that has NO tenant
-#: or subject axis (the memory/notes/tasks/chats/cookbook/calendar/knowledge/projects
-#: readers all enumerate one cwd-keyed store shared across every tenant). Unlike the run
-#: readers — which were retrofitted with ``studio_tenant_filter`` — these readers cannot
-#: intersect against the caller's tenant because the store has no workspace partition to
-#: intersect ON. Granting ``studio.<surface>:read`` to a TENANT-FACING role
+#: Studio surfaces backed by a PROCESS-WIDE store that has NO tenant or subject axis
+#: the reader can intersect against. Two flavours, same exposure:
+#:
+#: * the *single-user-local* stores (memory/notes/tasks/chats/cookbook/calendar/
+#:   knowledge/projects/files readers all enumerate one cwd-keyed store shared across
+#:   every tenant); and
+#: * the *process-wide spine readers* (``seclog``/``lineage``/``privacy``) that walk the
+#:   shared ``.himmy/spine.db`` entity registry / security-audit log by id or kind with
+#:   no tenant filter — ``seclog`` returns EVERY tenant's actor subjects, source IPs and
+#:   denied actions; ``lineage`` resolves any run/entity payload + metadata by id;
+#:   ``privacy`` lists every data subject and their consent chains/actors across all
+#:   tenants.
+#:
+#: Unlike the run readers — which were retrofitted with ``studio_tenant_filter`` — none
+#: of these can intersect against the caller's tenant because the store has no workspace
+#: partition to intersect ON. Granting ``studio.<surface>:read`` to a TENANT-FACING role
 #: (viewer/operator/auditor — the roles a mapped API key is bound with) would therefore
 #: let any paying tenant read every OTHER tenant's/subject's private memory, transcripts,
-#: notes, and files via the Studio console (a cross-tenant/cross-subject BOLA). So these
-#: surfaces are withheld from the default browse roles and remain ``admin``-only (Studio
-#: is documented as a network-isolated OPERATOR console); a deployment that deliberately
-#: exposes one to a tenant role can still grant it explicitly via ``HIMMY_RBAC_FILE``.
+#: notes, files, security-audit events, lineage payloads, and privacy/consent records via
+#: the Studio console (a cross-tenant/cross-subject BOLA / IDOR). So these surfaces are
+#: withheld from the default browse roles and remain ``admin``-only (Studio is documented
+#: as a network-isolated OPERATOR console); a deployment that deliberately exposes one to
+#: a tenant role can still grant it explicitly via ``HIMMY_RBAC_FILE``.
 #: The OFFLINE path is unaffected — ``require_permission`` no-ops without an authenticator,
 #: so the single-box console reads everything byte-unchanged.
 _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
@@ -122,6 +133,11 @@ _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
         "studio.knowledge",
         "studio.projects",
         "studio.files",
+        # Process-wide spine readers exposing cross-tenant security/PII/lineage data
+        # (no per-tenant partition to filter on) — admin-only, same rationale as above.
+        "studio.seclog",
+        "studio.lineage",
+        "studio.privacy",
     }
 )
 

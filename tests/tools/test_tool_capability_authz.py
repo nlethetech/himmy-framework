@@ -33,8 +33,15 @@ def _registry() -> ToolRegistry:
     def send(args: dict) -> dict:
         return {"sent": True}
 
+    # ``read_only=True`` is the EXPLICIT author flag — the only thing that waives the
+    # ``:write`` sub-grant under the r2-hardened gate (name-inference no longer waives it,
+    # since first-token-wins mis-classifies read-verb-prefixed writers like get_or_create).
     register_local_tool(
-        registry, name="weather_get", handler=weather, description="reads weather"
+        registry,
+        name="weather_get",
+        handler=weather,
+        description="reads weather",
+        read_only=True,
     )
     register_local_tool(
         registry,
@@ -199,6 +206,47 @@ def test_ambiguously_named_writer_requires_write_grant() -> None:
         )
         is True
     )
+
+
+def test_read_verb_prefixed_writer_requires_write_grant() -> None:
+    """red-team r2: a read-verb-PREFIXED writer must NOT be waived to invoke-only.
+
+    ``classify_read_only`` is first-token-wins, so a side-effecting tool whose name merely
+    STARTS with a read verb is INFERRED read-only even though it mutates state:
+    ``get_or_create_invoice`` (first token ``get``, but ``create`` is a later token) →
+    ``True``; ``check_payment`` (first token ``check``) → ``True``. Before the fix the gate
+    trusted that inference to waive the ``:write`` sub-grant, so a role holding only
+    ``tool:<name>:invoke`` (expecting a look-up) could fire the write tool. After the fix
+    ONLY an explicit author ``read_only=True`` waives ``:write``; a name-inferred verdict
+    never does, so these fail CLOSED on invoke-only and require the ``:write`` grant.
+    """
+    from himmy.services.tools.access import classify_read_only
+
+    # Sanity: these names ARE inferred read-only by the classifier (the mis-classification).
+    assert classify_read_only("get_or_create_invoice") is True
+    assert classify_read_only("check_payment") is True
+
+    for name in ("get_or_create_invoice", "check_payment"):
+        invoke_only = AccessPolicy.from_mapping({"halfgrant": [f"tool:{name}:invoke"]})
+        p = Principal(
+            subject="u", roles=frozenset({"halfgrant"}), tenant_ids=frozenset({"ws1"})
+        )
+        gate = ToolCapabilityAuthorizer.from_principal(p, invoke_only)
+        # read_only=None (no explicit flag) → name-inference does NOT waive → DENIED.
+        assert gate.is_authorized(name, None) is False, name
+        # The write sub-grant lets it through.
+        full = AccessPolicy.from_mapping(
+            {"full": [f"tool:{name}:invoke", f"tool:{name}:write"]}
+        )
+        pf = Principal(
+            subject="u", roles=frozenset({"full"}), tenant_ids=frozenset({"ws1"})
+        )
+        assert (
+            ToolCapabilityAuthorizer.from_principal(pf, full).is_authorized(name, None)
+            is True
+        ), name
+        # An EXPLICIT author read_only=True DOES waive the write grant (invoke-only OK).
+        assert gate.is_authorized(name, True) is True, name
 
 
 def test_from_actor_rebuilds_enforcing_gate() -> None:

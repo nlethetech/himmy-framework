@@ -426,6 +426,13 @@ def test_readonly_studio_role_is_403_on_connection_mutation(studio_cwd: Path) ->
 # read every OTHER tenant's/subject's private data (cross-tenant/cross-subject BOLA).
 # These surfaces are withheld from the default browse roles (admin-only) once an
 # authenticator is configured; the offline path is untouched (require_permission no-ops).
+#
+# red-team r2 extends the list with three PROCESS-WIDE SPINE readers that walk the shared
+# ``.himmy/spine.db`` registry / security-audit log with no tenant filter and thus leak
+# cross-tenant security events, lineage payloads, and privacy/consent records:
+# ``seclog``/``lineage``/``privacy``. They were missing from the r1 withheld set, so a
+# tenant-facing role could read every other tenant's data through them (a cross-tenant
+# IDOR/BOLA). They are now in :data:`_STUDIO_GLOBAL_STORE_RESOURCES` (admin-only).
 _GLOBAL_STORE_READS = [
     "/api/studio/memory/subjects",
     "/api/studio/notes",
@@ -435,6 +442,11 @@ _GLOBAL_STORE_READS = [
     "/api/studio/calendar",
     "/api/studio/projects",
     "/api/studio/files",
+    "/api/studio/seclog",
+    "/api/studio/privacy/subjects",
+    "/api/studio/privacy/consents",
+    "/api/studio/lineage/graph",
+    "/api/studio/lineage/entity/anyid",
 ]
 
 

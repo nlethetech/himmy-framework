@@ -309,6 +309,79 @@ def test_auth_mode_apikey_without_tenant_keys_refuses(
         create_app()
 
 
+# ----------------------- red-team r2: keys-file-only (no env flag) engages the posture
+# A per-tenant HIMMY_API_KEYS_FILE is multi-tenant IN FACT even with NO HIMMY_MULTI_TENANT
+# / HIMMY_AUTH_MODE set. The env-flag-only detector silently skipped the whole posture for
+# such a deploy, so (a) a co-configured shared key stayed an all-tenants admin (the G1 hole
+# re-opened) and (b) HIMMY_STUDIO_AUTH=off was NOT refused. Both must now engage off the
+# authenticator's binds_tenants capability.
+
+
+def test_keys_file_only_demotes_shared_key_without_env_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A mapped keys file alone (no HIMMY_MULTI_TENANT) still DEMOTES a shared key (G1)."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    # Deliberately NO HIMMY_MULTI_TENANT / HIMMY_AUTH_MODE — only a tenant-mapped keys file.
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "shared-secret")
+    assert is_multi_tenant() is False  # the env flag is genuinely absent
+    auth = build_authenticator()
+    assert isinstance(auth, ApiKeyAuthenticator)
+    assert auth.binds_tenants is True
+    # The shared key must be demoted (NOT an all-tenants admin) purely off binds_tenants.
+    assert auth._shared_key_roles == DEMOTED_SHARED_KEY_ROLES
+
+
+def test_keys_file_only_refuses_studio_auth_off_without_env_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A mapped keys file alone makes HIMMY_STUDIO_AUTH=off a startup refusal (BOLA fix)."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_STUDIO_AUTH", "off")
+    assert is_multi_tenant() is False
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_STUDIO_AUTH" in str(exc.value)
+
+
+def test_keys_file_only_refuses_allow_unauthenticated_without_env_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A mapped keys file alone makes HIMMY_ALLOW_UNAUTHENTICATED a startup refusal."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_ALLOW_UNAUTHENTICATED", "1")
+    assert is_multi_tenant() is False
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_ALLOW_UNAUTHENTICATED" in str(exc.value)
+
+
+def test_keys_file_only_clean_deploy_still_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A mapped keys file with no kill-switches starts cleanly (the posture is not over-broad)."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    app = create_app()
+    assert app.state.authenticator is not None
+    assert app.state.authenticator.binds_tenants is True
+
+
 class _Req:
     """A minimal stand-in for a Starlette Request carrying just the key header."""
 

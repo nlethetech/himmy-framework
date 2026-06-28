@@ -505,7 +505,14 @@ def build_runtime_for_spec(
             from himmy.skills import build_skill_registry, register_skill_dispatch_tool
 
             register_skill_dispatch_tool(
-                registry, inference=inference, skill_registry=build_skill_registry()
+                registry,
+                inference=inference,
+                skill_registry=build_skill_registry(),
+                # P0: propagate the parent run's capability gate into the dispatched
+                # skill's sub-agent (attenuate-never-amplify), exactly like the spawn
+                # path above — otherwise a narrowed caller could route WITHHELD write
+                # tools through a skill's tool-packs (a confused-deputy bypass).
+                tool_authorizer=tool_authorizer,
             )
         if reputation_provider is not None:
             # Prime the sync reputation snapshot from history ONCE, here at build time

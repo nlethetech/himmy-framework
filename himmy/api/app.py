@@ -159,14 +159,22 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
     values.yaml) now engages strictness — a previously-working shared-key-ONLY deploy
     that also sets an auth mode will be refused until it configures tenant-binding auth
     (a mapped-keys file or OIDC).
+
+    The posture also engages when the authenticator BINDS TENANTS even with NO env flag
+    set: a per-tenant ``HIMMY_API_KEYS_FILE`` is multi-tenant IN FACT, so every guard
+    below (the ``HIMMY_STUDIO_AUTH=off`` / ``HIMMY_ALLOW_UNAUTHENTICATED`` /
+    ``HIMMY_ALLOW_OPERATOR_SPEC_TOOLS`` refusals) must fire for it too — otherwise a
+    keys-file-only deploy that also flips one of those kill-switches would silently skip
+    them (a fail-open the env-flag-only detector missed).
     """
     import os
 
     from himmy.api.auth import build_access_policy, is_multi_tenant
 
-    if not is_multi_tenant():
+    binds_tenants = bool(getattr(authenticator, "binds_tenants", False))
+    if not (is_multi_tenant() or binds_tenants):
         return
-    if not getattr(authenticator, "binds_tenants", False):
+    if not binds_tenants:
         raise HimmyError(
             "refusing to start: a multi-tenant posture is configured "
             "(HIMMY_MULTI_TENANT / HIMMY_AUTH_MODE) but the authenticator does not "

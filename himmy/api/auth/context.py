@@ -53,10 +53,14 @@ def build_authenticator() -> Authenticator | None:
     ``HIMMY_INTERNAL_API_KEY``) ▸ none. Mapped keys (``HIMMY_API_KEYS_FILE``) and a
     shared key can coexist.
 
-    Under the multi-tenant posture (:func:`is_multi_tenant`) a *shared* key is built
-    DEMOTED to operator-only (no tenant reach) so a shared-key match can no longer act
-    as a cross-tenant admin (G1); a shared-key-ONLY deploy is then additionally refused
-    at startup because it still binds nobody.
+    Under the multi-tenant posture a *shared* key is built DEMOTED to operator-only (no
+    tenant reach) so a shared-key match can no longer act as a cross-tenant admin (G1); a
+    shared-key-ONLY deploy is then additionally refused at startup because it still binds
+    nobody. The posture engages when EITHER the operator declared it explicitly via env
+    (:func:`is_multi_tenant`) OR a tenant-mapped keys file is present (``bool(records)``)
+    — a per-tenant ``HIMMY_API_KEYS_FILE`` is multi-tenant IN FACT even without the env
+    flag, so the demotion must not silently skip it (else a co-configured shared key would
+    stay a cross-tenant super-admin — the exact G1 hole this closes).
     """
     mode = os.environ.get("HIMMY_AUTH_MODE", "").lower()
     if mode == "oidc":
@@ -86,12 +90,16 @@ def build_authenticator() -> Authenticator | None:
     if keys_file:
         records = load_key_records(keys_file)
     if shared or records:
+        # A tenant-mapped keys file makes the deploy multi-tenant IN FACT (binds_tenants),
+        # so engage the demotion even when the env flag is absent — never trust the env
+        # flag alone to detect a multi-tenant posture (G1/G2 fail-open fix).
+        multi_tenant = is_multi_tenant() or bool(records)
         return ApiKeyAuthenticator(
             shared_keys=shared,
             records=records,
             header_name=header,
             shared_key_roles=(
-                DEMOTED_SHARED_KEY_ROLES if is_multi_tenant() else None
+                DEMOTED_SHARED_KEY_ROLES if multi_tenant else None
             ),
         )
     return None
