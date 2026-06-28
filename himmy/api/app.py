@@ -148,9 +148,12 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
     than ``AttributeError``. We additionally HARD-REJECT the two unsafe escape hatches:
     ``HIMMY_ALLOW_UNAUTHENTICATED`` (would re-open the ANONYMOUS all-tenants surface)
     and a truthy ``HIMMY_ALLOW_OPERATOR_SPEC_TOOLS`` (would un-fail-close the RCE/SSRF
-    spec sanitizer for tenant-submitted specs). RBAC is on-by-construction once an
-    authenticator exists, but we also require ``build_access_policy()`` to resolve a
-    non-None policy so a broken ``HIMMY_RBAC_FILE`` can't silently disarm authz.
+    spec sanitizer for tenant-submitted specs), plus ``HIMMY_STUDIO_AUTH=off`` (the
+    Studio auth kill-switch — would re-open the network-isolated operator console to any
+    authenticated principal instead of gating it behind ``studio:use``). RBAC is
+    on-by-construction once an authenticator exists, but we also require
+    ``build_access_policy()`` to resolve a non-None policy so a broken
+    ``HIMMY_RBAC_FILE`` can't silently disarm authz.
 
     Note: ANY non-empty ``HIMMY_AUTH_MODE`` (incl. the ``apikey`` example in
     values.yaml) now engages strictness — a previously-working shared-key-ONLY deploy
@@ -172,6 +175,20 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
             "auth (HIMMY_API_KEYS_FILE with per-tenant keys, or HIMMY_AUTH_MODE=oidc)."
         )
     truthy = ("1", "true", "yes")
+    # Studio is a network-isolated OPERATOR console (lineage, privacy, governance,
+    # raw run inspection) — never a tenant-facing surface. ``HIMMY_STUDIO_AUTH=off``
+    # is its auth kill-switch (intended only for a trusted single-user box); under a
+    # multi-tenant posture it would re-open every Studio surface to any authenticated
+    # principal, regardless of role. Refuse to start: the operator console MUST stay
+    # behind ``studio:use`` when callers are mutually-untrusted tenants.
+    if os.environ.get("HIMMY_STUDIO_AUTH", "on").lower() in ("off", "0", "false", "no"):
+        raise HimmyError(
+            "refusing to start: HIMMY_STUDIO_AUTH is disabled under a multi-tenant "
+            "posture — that kill-switch re-opens the Studio operator console (lineage, "
+            "privacy/governance, raw run inspection) to any authenticated principal "
+            "instead of gating it behind the studio:use permission. Remove it for a "
+            "multi-tenant deployment; Studio is a network-isolated operator surface."
+        )
     if os.environ.get("HIMMY_ALLOW_UNAUTHENTICATED", "").lower() in truthy:
         raise HimmyError(
             "refusing to start: HIMMY_ALLOW_UNAUTHENTICATED is set under a "
@@ -507,10 +524,22 @@ def create_app(
         else os.environ.get("HIMMY_BIND_HOST", "127.0.0.1")
     )
     _enforce_auth_posture(authenticator, effective_host)
+    # Docs gate: once auth is configured (or a multi-tenant posture is declared) the
+    # interactive auto-docs (/docs, /redoc) and the raw schema (/openapi.json) are an
+    # unauthenticated map of every route + model for an attacker, so we suppress them by
+    # passing ``None`` URLs to FastAPI. ``/health`` and ``/readyz`` stay open (they are
+    # added as explicit routes, unaffected by these knobs). In the offline zero-config
+    # default (no authenticator, single-box) the docs stay ENABLED — byte-unchanged.
+    from himmy.api.auth import is_multi_tenant as _is_multi_tenant
+
+    _docs_locked = authenticator is not None or _is_multi_tenant()
     app = FastAPI(
         title="Himmy API",
         version=__version__,
         description="Backend-for-frontend over the Himmy application services.",
+        docs_url=None if _docs_locked else "/docs",
+        redoc_url=None if _docs_locked else "/redoc",
+        openapi_url=None if _docs_locked else "/openapi.json",
         # Authenticate first (so the limiter can key on the principal), then throttle.
         dependencies=[
             Depends(principal_dependency),

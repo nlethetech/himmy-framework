@@ -36,6 +36,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HIMMY_API_KEYS_FILE",
         "HIMMY_ALLOW_UNAUTHENTICATED",
         "HIMMY_ALLOW_OPERATOR_SPEC_TOOLS",
+        "HIMMY_STUDIO_AUTH",
         "HIMMY_DATABASE_URL",
         "HIMMY_DURABLE_STORAGE",
         "HIMMY_BIND_HOST",
@@ -232,6 +233,69 @@ def test_single_box_default_starts_byte_identically(
     app = create_app()
     assert app.state.authenticator is None
     assert TestClient(app).get("/health").status_code == 200
+
+
+# --------------------------------------- P0 #4: Studio auth kill-switch lockdown
+
+
+def test_multi_tenant_rejects_studio_auth_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # Even with tenant-binding auth, HIMMY_STUDIO_AUTH=off under a multi-tenant posture
+    # re-opens the operator console to any authenticated principal → refused at startup.
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_STUDIO_AUTH", "off")
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_STUDIO_AUTH" in str(exc.value)
+
+
+def test_single_box_studio_auth_off_still_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No multi-tenant posture → HIMMY_STUDIO_AUTH=off is the documented single-user
+    # escape hatch and MUST NOT block startup.
+    monkeypatch.setenv("HIMMY_STUDIO_AUTH", "off")
+    app = create_app()
+    assert app.state.authenticator is None
+    assert TestClient(app).get("/health").status_code == 200
+
+
+# ------------------------------------------- P0 #4: OpenAPI auto-docs lockdown gate
+
+
+def test_docs_open_on_offline_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Zero-config offline default: the interactive docs + schema stay ENABLED.
+    app = create_app()
+    client = TestClient(app)
+    assert client.get("/openapi.json").status_code == 200
+    assert client.get("/docs").status_code == 200
+
+
+def test_docs_locked_when_authenticator_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # With auth configured, /openapi.json + /docs are suppressed (404) but /health stays open.
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    app = create_app()
+    client = TestClient(app)
+    assert client.get("/openapi.json").status_code == 404
+    assert client.get("/docs").status_code == 404
+    # /health is still a registered route (the docs gate only drops the schema/docs
+    # routes); it answers 200 to an authenticated caller rather than 404.
+    assert client.get("/health", headers={"x-himmy-internal-key": "mapped"}).status_code == 200
 
 
 def test_auth_mode_apikey_without_tenant_keys_refuses(
