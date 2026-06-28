@@ -87,6 +87,12 @@ def _cmd_rbac(args: argparse.Namespace) -> int:
     return cmd_rbac(args)
 
 
+def _cmd_apikey(args: argparse.Namespace) -> int:
+    from himmy.cli.apikey_cmd import cmd_apikey
+
+    return cmd_apikey(args)
+
+
 def _cmd_mcp(args: argparse.Namespace) -> int:
     from himmy.cli.mcp_cmd import cmd_mcp
 
@@ -622,6 +628,45 @@ def build_parser() -> argparse.ArgumentParser:
         "file", help="path to the JSON RBAC policy ({role: ['resource:action', ...]})"
     )
     p_rbac.set_defaults(func=_cmd_rbac)
+
+    # apikey — mint / rotate / revoke / list lifecycle-managed API keys.
+    p_apikey = sub.add_parser(
+        "apikey", help="mint/rotate/revoke/list API keys (hashed, expiring, revocable)"
+    )
+    apikey_sub = p_apikey.add_subparsers(dest="action", required=True)
+    for _name, _help in (
+        ("mint", "generate a new key and print the secret once"),
+        ("rotate", "mint a replacement for a key_id and disable the old one"),
+        ("revoke", "revoke a key_id live (no restart)"),
+        ("list", "list key_ids + non-secret metadata"),
+    ):
+        _sp = apikey_sub.add_parser(_name, help=_help)
+        _sp.add_argument(
+            "-f", "--file", help="keys file (else HIMMY_API_KEYS_FILE / .himmy/api_keys.json)"
+        )
+        _sp.add_argument(
+            "--revocation-file",
+            help="revocation list (else HIMMY_API_KEY_REVOCATION_FILE / sibling of keys file)",
+        )
+        if _name == "mint":
+            _sp.add_argument("--subject", help="principal subject id for the key")
+            _sp.add_argument(
+                "--tenant", action="append", help="bind to a tenant id; repeat for several"
+            )
+            _sp.add_argument(
+                "--role", action="append", help="grant a role; repeat for several"
+            )
+            _sp.add_argument(
+                "--all-tenants",
+                action="store_true",
+                help="mint an unrestricted all-tenants key (use sparingly)",
+            )
+            _sp.add_argument(
+                "--ttl-days", type=int, help="expire the key this many days from now"
+            )
+        if _name in ("rotate", "revoke"):
+            _sp.add_argument("key_id", help="the non-secret key_id (from `apikey list`)")
+    p_apikey.set_defaults(func=_cmd_apikey)
 
     # mcp — manage the stdio MCP servers wired into an agent.yaml.
     p_mcp = sub.add_parser(

@@ -68,7 +68,7 @@ def build_authenticator() -> Authenticator | None:
         DEFAULT_HEADER,
         DEMOTED_SHARED_KEY_ROLES,
         ApiKeyAuthenticator,
-        load_key_principals,
+        load_key_records,
     )
     from himmy.config.secrets import get_secret
 
@@ -78,14 +78,17 @@ def build_authenticator() -> Authenticator | None:
         for k in (get_secret("HIMMY_INTERNAL_API_KEY") or "").split(",")
         if k.strip()
     }
-    mapped = {}
+    # Mapped keys are loaded as lifecycle-aware records (hashed in-memory, carrying any
+    # per-key expires_at/disabled) rather than bare principals, so the file's expiry +
+    # disabled metadata is enforced at authenticate time.
+    records = []
     keys_file = os.environ.get("HIMMY_API_KEYS_FILE")
     if keys_file:
-        mapped = load_key_principals(keys_file)
-    if shared or mapped:
+        records = load_key_records(keys_file)
+    if shared or records:
         return ApiKeyAuthenticator(
             shared_keys=shared,
-            key_principals=mapped,
+            records=records,
             header_name=header,
             shared_key_roles=(
                 DEMOTED_SHARED_KEY_ROLES if is_multi_tenant() else None

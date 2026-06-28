@@ -1,6 +1,7 @@
-"""API-key authentication: a header key → a Principal (constant-time, rotatable).
+"""API-key authentication: a header key → a Principal (hashed, expiring, revocable).
 
-Two modes, both timing-safe:
+Two modes, both timing-safe and both stored as a salted HASH in memory (never the
+plaintext key — a heap/core dump or a logged repr leaks no usable credential):
 
 * **Shared trusted-boundary key** (back-compat): one or more keys in
   ``HIMMY_INTERNAL_API_KEY`` (comma-separated for rotation) each map to an
@@ -9,12 +10,34 @@ Two modes, both timing-safe:
 * **Mapped keys** (closes the cross-tenant hole): a JSON map of key → tenants/roles
   (``HIMMY_API_KEYS_FILE``) yields a Principal *bound* to specific tenants, so a key
   scoped to tenant A cannot read tenant B.
+
+Lifecycle hardening (P1):
+
+* Every configured key is reduced at construction to a :class:`KeyRecord` carrying a
+  non-secret ``key_id`` (a short fingerprint prefix for O(1) lookup + logs) and an
+  ``hmac-sha256`` of the secret under a server *pepper* (``HIMMY_API_KEY_PEPPER``,
+  resolved through the secrets provider). The raw key is never retained — only its
+  hash, compared with :func:`hmac.compare_digest` so the match stays constant-time.
+* Per-key metadata (``expires_at`` / ``disabled``) is enforced at
+  :meth:`ApiKeyAuthenticator.authenticate`: an expired or disabled key is a 401, not
+  a silent pass.
+* A **live-consulted revocation file** (``HIMMY_API_KEY_REVOCATION_FILE``) lets a
+  leaked key die WITHOUT a restart: it is a JSON list of revoked ``key_id`` strings
+  re-read (mtime-cached) on each authenticate, so dropping a key_id into it kills the
+  key on the next request.
+
+INVARIANT — offline path unchanged: when no key is configured ``build_authenticator``
+returns ``None`` and every request is ANONYMOUS (all-tenants); none of this engages.
 """
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
+import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,6 +50,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: Default header carrying the API key.
 DEFAULT_HEADER = "x-himmy-internal-key"
 
+#: Secret name resolved through the secrets provider for the HMAC pepper. A pepper is
+#: a server-side secret mixed into every key hash so a stolen hash store is useless
+#: without ALSO stealing the pepper (which lives in env/keychain/vault, not the key
+#: file). When unset the hash falls back to an unkeyed digest — still non-reversible,
+#: just without the extra defense — so the offline/zero-config path needs no setup.
+PEPPER_SECRET = "HIMMY_API_KEY_PEPPER"  # noqa: S105 - secret NAME, not a value
+
+#: Env var naming the live-consulted revocation file (a JSON list of revoked key_ids).
+REVOCATION_FILE_ENV = "HIMMY_API_KEY_REVOCATION_FILE"
+
 
 #: Default roles a DEMOTED shared key receives under the multi-tenant posture (G1).
 #: ``operator`` reads + writes the operational surface (run/agent/knowledge/model/…)
@@ -37,8 +70,151 @@ DEFAULT_HEADER = "x-himmy-internal-key"
 DEMOTED_SHARED_KEY_ROLES: tuple[str, ...] = ("operator",)
 
 
+def _pepper() -> bytes:
+    """The server HMAC pepper (``HIMMY_API_KEY_PEPPER``) as bytes, or empty if unset.
+
+    Resolved lazily (not at import) through the secrets provider so keychain/vault
+    backends and test monkeypatching both work. Empty ⇒ unkeyed digest fallback.
+    """
+    from himmy.config.secrets import get_secret
+
+    return (get_secret(PEPPER_SECRET) or "").encode("utf-8")
+
+
+def hash_key(secret: str) -> str:
+    """Return the salted, non-reversible hash stored for ``secret`` (hex).
+
+    ``hmac-sha256(pepper, secret)`` when a pepper is configured, else a plain
+    ``sha256(secret)`` digest. Either way the result is one-way: the stored value can
+    verify a presented key (constant-time) but cannot reconstruct it.
+    """
+    pepper = _pepper()
+    if pepper:
+        return hmac.new(pepper, secret.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _fingerprint(key: str) -> str:
+    """A short, non-reversible tag for a key (for the subject id / key_id / logs)."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def _parse_expiry(value: object) -> float | None:
+    """Coerce an ``expires_at`` spec (ISO-8601 string or epoch number) to epoch seconds.
+
+    Returns ``None`` for a missing/empty value (no expiry). Accepts a trailing ``Z``
+    and naive ISO strings (treated as UTC) so hand-written key files are forgiving.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if text.isdigit():
+        return float(text)
+    iso = text[:-1] + "+00:00" if text.endswith("Z") else text
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
+@dataclass(frozen=True)
+class KeyRecord:
+    """A configured key reduced to non-secret metadata + a one-way hash.
+
+    The raw key is never stored: ``key_hash`` is the salted ``hmac-sha256`` digest
+    (see :func:`hash_key`) and ``key_id`` is a short non-secret fingerprint used for
+    O(1) revocation lookups and logs. ``principal`` is the verified identity minted on
+    a match; ``expires_at`` (epoch seconds, ``None`` = never) and ``disabled`` are the
+    lifecycle gates enforced at authenticate time.
+    """
+
+    key_id: str
+    key_hash: str
+    principal: Principal
+    created_at: float = field(default_factory=time.time)
+    expires_at: float | None = None
+    disabled: bool = False
+
+    def is_expired(self, *, now: float | None = None) -> bool:
+        """Whether the key's ``expires_at`` is in the past (``None`` ⇒ never)."""
+        if self.expires_at is None:
+            return False
+        return (now if now is not None else time.time()) >= self.expires_at
+
+    @classmethod
+    def from_secret(
+        cls,
+        secret: str,
+        principal: Principal,
+        *,
+        expires_at: float | None = None,
+        disabled: bool = False,
+    ) -> KeyRecord:
+        """Build a record from a raw ``secret`` (hashed here; the secret is not kept)."""
+        return cls(
+            key_id=_fingerprint(secret),
+            key_hash=hash_key(secret),
+            principal=principal,
+            expires_at=expires_at,
+            disabled=disabled,
+        )
+
+
+class _RevocationList:
+    """A live-consulted set of revoked ``key_id`` strings backed by a JSON file.
+
+    Re-reads the file only when its mtime changes (so the hot path is a stat, not a
+    parse), giving "kill a key without a restart": appending a key_id to the file
+    revokes it on the next authenticate. A missing/empty/unparseable file ⇒ nothing
+    revoked (fail-open on the FILE, not on the keys themselves — a key still has to be
+    valid to authenticate). When no file is configured this is inert.
+    """
+
+    def __init__(self, path: str | Path | None) -> None:
+        self._path = Path(path).expanduser() if path else None
+        self._mtime: float | None = None
+        self._revoked: frozenset[str] = frozenset()
+
+    def is_revoked(self, key_id: str) -> bool:
+        """Whether ``key_id`` is in the current (freshly re-read) revocation set."""
+        if self._path is None:
+            return False
+        self._refresh()
+        return key_id in self._revoked
+
+    def _refresh(self) -> None:
+        assert self._path is not None
+        try:
+            mtime = self._path.stat().st_mtime
+        except OSError:
+            self._mtime = None
+            self._revoked = frozenset()
+            return
+        if mtime == self._mtime:
+            return
+        self._mtime = mtime
+        try:
+            raw = json.loads(self._path.read_text())
+        except (OSError, json.JSONDecodeError):
+            self._revoked = frozenset()
+            return
+        if isinstance(raw, dict):  # tolerate {"revoked": [...]} as well as a bare list
+            raw = raw.get("revoked", [])
+        if isinstance(raw, list):
+            self._revoked = frozenset(str(item) for item in raw)
+        else:
+            self._revoked = frozenset()
+
+
 class ApiKeyAuthenticator:
-    """Authenticate a request by a header API key (shared or tenant-mapped)."""
+    """Authenticate a request by a header API key (shared or tenant-mapped).
+
+    Keys are held only as :class:`KeyRecord` hashes; the match is constant-time and
+    each authenticate consults per-key expiry/disabled state plus a live revocation
+    file, so a key can be aged out or killed without restarting the process.
+    """
 
     def __init__(
         self,
@@ -47,6 +223,8 @@ class ApiKeyAuthenticator:
         key_principals: dict[str, Principal] | None = None,
         header_name: str = DEFAULT_HEADER,
         shared_key_roles: tuple[str, ...] | None = None,
+        records: list[KeyRecord] | None = None,
+        revocation_path: str | Path | None = None,
     ) -> None:
         """Wire shared keys (→ all-tenants) and/or mapped keys (→ bound principals).
 
@@ -63,12 +241,46 @@ class ApiKeyAuthenticator:
 
         Mapped keys (``key_principals``) are unaffected by this — they always bind to
         their declared tenants.
+
+        ``records`` lets a caller supply pre-built :class:`KeyRecord`\\ s carrying
+        lifecycle metadata (expiry/disabled) — the mapped-key file loader uses this to
+        thread per-key ``expires_at`` / ``disabled`` through. ``revocation_path`` names
+        the live-consulted revocation file (defaults to ``HIMMY_API_KEY_REVOCATION_FILE``
+        when omitted).
         """
-        self._shared = set(shared_keys or set())
-        self._mapped = dict(key_principals or {})
         self._header = header_name
         self._shared_key_roles = shared_key_roles
-        if not self._shared and not self._mapped:
+        self._records: list[KeyRecord] = list(records or [])
+        # ``binds_tenants`` is True iff any non-shared (mapped/record) key is present —
+        # matching the historical ``bool(self._mapped)``: it does NOT inspect tenant_ids
+        # (an all-tenants admin mapped key still counts as a binding authenticator).
+        self._mapped_present = bool(key_principals) or bool(records)
+
+        # Mapped keys first (a key bound to tenants is more specific than a shared one),
+        # mirroring the historical lookup order. Each is reduced to a hashed record.
+        for key, principal in (key_principals or {}).items():
+            self._records.append(KeyRecord.from_secret(key, principal))
+
+        # Shared keys mint a posture-appropriate principal on match (built once here so
+        # the per-request path only does a hash compare + lifecycle check).
+        roles = self._shared_key_roles
+        demoted = roles is not None
+        for key in shared_keys or set():
+            shared_principal = Principal.build(
+                subject=f"apikey:{_fingerprint(key)}",
+                all_tenants=not demoted,
+                roles=roles if roles is not None else ("admin",),
+                auth_method="apikey",
+            )
+            self._records.append(KeyRecord.from_secret(key, shared_principal))
+
+        if revocation_path is None:
+            import os
+
+            revocation_path = os.environ.get(REVOCATION_FILE_ENV)
+        self._revocations = _RevocationList(revocation_path)
+
+        if not self._records:
             raise AuthError("ApiKeyAuthenticator needs at least one configured key")
 
     @property
@@ -81,7 +293,7 @@ class ApiKeyAuthenticator:
         demoted, tenant-LESS), so it returns ``False`` and the multi-tenant posture
         (G2) refuses to start on it.
         """
-        return bool(self._mapped)
+        return self._mapped_present
 
     def openapi_security_scheme(self) -> dict[str, dict[str, object]]:
         """Advertise the API-key header as an OpenAPI security scheme (for docs)."""
@@ -94,38 +306,30 @@ class ApiKeyAuthenticator:
         }
 
     async def authenticate(self, request: Request) -> Principal:
-        """Resolve the key header to a Principal (raises AuthError if invalid)."""
+        """Resolve the key header to a Principal (raises AuthError if invalid).
+
+        Beyond the constant-time hash match, each candidate is gated on its lifecycle:
+        a disabled, expired, or live-revoked key is rejected with a 401 even though the
+        secret itself is correct — so a leaked key dies the moment it is revoked/ages
+        out, with no process restart.
+        """
         provided = request.headers.get(self._header)
         if not provided:
             raise AuthError("missing api key")
         ip = client_ip(request)
-        # Mapped keys first (a key bound to tenants is more specific than a shared one).
-        for key, principal in self._mapped.items():
-            if hmac.compare_digest(provided, key):
-                return _with_ip(principal, ip)
-        for key in self._shared:
-            if hmac.compare_digest(provided, key):
-                # Default (shared_key_roles is None): the historical unrestricted
-                # all-tenants admin. Demoted (a role tuple supplied, e.g. under the
-                # G2 multi-tenant posture): NO tenant_ids, all_tenants=False, only the
-                # given roles — so resolve_workspace 403s it off any tenant's data.
-                roles = self._shared_key_roles
-                demoted = roles is not None
-                return Principal.build(
-                    subject=f"apikey:{_fingerprint(key)}",
-                    all_tenants=not demoted,
-                    roles=roles if roles is not None else ("admin",),
-                    auth_method="apikey",
-                    source_ip=ip,
-                )
+        provided_hash = hash_key(provided)
+        now = time.time()
+        for record in self._records:
+            if not hmac.compare_digest(provided_hash, record.key_hash):
+                continue
+            if record.disabled:
+                raise AuthError("api key disabled")
+            if record.is_expired(now=now):
+                raise AuthError("api key expired")
+            if self._revocations.is_revoked(record.key_id):
+                raise AuthError("api key revoked")
+            return _with_ip(record.principal, ip)
         raise AuthError("invalid api key")
-
-
-def _fingerprint(key: str) -> str:
-    """A short, non-reversible tag for a key (for the subject id / logs)."""
-    import hashlib
-
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
 def _with_ip(principal: Principal, ip: str | None) -> Principal:
@@ -146,18 +350,49 @@ def _with_ip(principal: Principal, ip: str | None) -> Principal:
 
 
 def load_key_principals(path: str | Path) -> dict[str, Principal]:
-    """Load a key→Principal map from a JSON file.
+    """Load a key→Principal map from a JSON file (back-compat surface).
 
     Schema: ``{"<key>": {"subject": str, "tenant_ids": [..], "roles": [..]}}``. Each
-    entry yields a Principal bound to those tenants (auth_method ``apikey``).
+    entry yields a Principal bound to those tenants (auth_method ``apikey``). This
+    drops any lifecycle metadata; :func:`load_key_records` is the lifecycle-aware
+    loader the authenticator uses. Kept for callers/tests that only want the mapping.
     """
+    out: dict[str, Principal] = {}
+    for key, record in _load_records(path).items():
+        out[key] = record[0]
+    return out
+
+
+def load_key_records(path: str | Path) -> list[KeyRecord]:
+    """Load lifecycle-aware :class:`KeyRecord`\\ s from a JSON key file.
+
+    Extends the back-compat schema with optional per-key ``expires_at`` (ISO-8601 or
+    epoch seconds) and ``disabled`` (bool). The plaintext key in the file is hashed
+    here and never retained in the returned records — only its hash + non-secret
+    ``key_id``. The file itself should be ``chmod 0600`` and, ideally, sourced from a
+    secrets manager; the hashing protects the IN-MEMORY copy regardless.
+    """
+    records: list[KeyRecord] = []
+    for key, (principal, expires_at, disabled) in _load_records(path).items():
+        records.append(
+            KeyRecord.from_secret(
+                key, principal, expires_at=expires_at, disabled=disabled
+            )
+        )
+    return records
+
+
+def _load_records(
+    path: str | Path,
+) -> dict[str, tuple[Principal, float | None, bool]]:
+    """Parse the JSON key file into ``{key: (principal, expires_at, disabled)}``."""
     raw = json.loads(Path(path).expanduser().read_text())
     if not isinstance(raw, dict):
         raise AuthError(f"api-keys file {path} must be a JSON object")
-    out: dict[str, Principal] = {}
+    out: dict[str, tuple[Principal, float | None, bool]] = {}
     for key, spec in raw.items():
         spec = spec or {}
-        out[str(key)] = Principal.build(
+        principal = Principal.build(
             subject=str(spec.get("subject") or f"apikey:{_fingerprint(str(key))}"),
             tenant_ids=[str(t) for t in (spec.get("tenant_ids") or [])],
             roles=[str(r) for r in (spec.get("roles") or [])],
@@ -166,12 +401,22 @@ def load_key_principals(path: str | Path) -> dict[str, Principal]:
             auth_method="apikey",
             subject_scoped=bool(spec.get("subject_scoped", False)),
         )
+        out[str(key)] = (
+            principal,
+            _parse_expiry(spec.get("expires_at")),
+            bool(spec.get("disabled", False)),
+        )
     return out
 
 
 __all__ = [
     "ApiKeyAuthenticator",
+    "KeyRecord",
     "load_key_principals",
+    "load_key_records",
+    "hash_key",
     "DEFAULT_HEADER",
     "DEMOTED_SHARED_KEY_ROLES",
+    "PEPPER_SECRET",
+    "REVOCATION_FILE_ENV",
 ]
