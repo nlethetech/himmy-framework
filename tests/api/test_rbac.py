@@ -130,6 +130,72 @@ def test_scope_mixed_recognized_and_standard() -> None:
     assert not pol.authorize(p, "run", "write")
 
 
+def test_oidc_resource_scopes_do_not_lock_out() -> None:
+    """Real colon-BEARING IdP resource scopes must NOT engage narrowing (no lock-out).
+
+    Entra ID / Keycloak / ZITADEL emit scopes like ``api://himmy/access_as_user``,
+    ``urn:zitadel:iam:org:project:role`` or ``https://graph.microsoft.com/User.Read``.
+    These parse on the first colon (``('api','//…')`` etc.) but name no RBAC resource,
+    so they must be dropped — a token carrying them keeps full role reach rather than
+    being denied EVERYTHING.
+    """
+    pol = DEFAULT_POLICY
+    p = _ps(
+        roles=["operator"],
+        scopes=[
+            "openid",
+            "profile",
+            "api://himmy/access_as_user",
+            "urn:zitadel:iam:org:project:role",
+            "https://graph.microsoft.com/User.Read",
+        ],
+    )
+    # No permission-scope is recognized → no narrowing → full operator reach.
+    assert pol.authorize(p, "run", "read")
+    assert pol.authorize(p, "run", "write")
+    assert pol.authorize(p, "context", "write")
+
+
+def test_admin_not_locked_out_by_oidc_resource_scope() -> None:
+    """An admin token carrying a custom-API scope keeps its '*:*' reach (no lock-out)."""
+    pol = DEFAULT_POLICY
+    p = _ps(roles=["admin"], scopes=["api://himmy/access_as_user"])
+    assert pol.authorize(p, "run", "write")
+    assert pol.authorize(p, "anything", "at_all")
+
+
+def test_oidc_resource_scope_mixed_with_real_perm_scope_narrows() -> None:
+    """A garbage IdP scope alongside a real 'run:read' narrows on the real one only."""
+    pol = DEFAULT_POLICY
+    p = _ps(
+        roles=["operator"],
+        scopes=["api://himmy/access_as_user", "run:read"],
+    )
+    assert pol.authorize(p, "run", "read")
+    assert not pol.authorize(p, "run", "write")  # narrowed by the real scope
+    assert not pol.authorize(p, "context", "write")
+
+
+def test_unknown_resource_scope_is_dropped() -> None:
+    """A grammar-valid scope naming a resource NO policy defines is ignored (no narrow)."""
+    pol = DEFAULT_POLICY
+    # 'billing' is not an RBAC resource in DEFAULT_RBAC → dropped, not honored.
+    p = _ps(roles=["operator"], scopes=["billing:read"])
+    assert pol.authorize(p, "run", "write")  # full reach preserved
+
+
+def test_known_resources_reflects_custom_policy() -> None:
+    """known_resources() drives narrowing off the ACTIVE policy, not the default."""
+    pol = AccessPolicy.from_mapping({"editor": ["doc:read", "doc:write"]})
+    assert pol.known_resources() == frozenset({"doc"})
+    p = _ps(roles=["editor"], scopes=["doc:read"])
+    assert pol.authorize(p, "doc", "read")
+    assert not pol.authorize(p, "doc", "write")  # narrowed
+    # A scope naming a resource this custom policy never defines is dropped.
+    p2 = _ps(roles=["editor"], scopes=["run:read"])
+    assert pol.authorize(p2, "doc", "write")  # 'run' unknown here → no narrowing
+
+
 # --------------------------------------------- fail-closed permission parsing (P0)
 def test_trailing_colon_no_longer_widens() -> None:
     """A typo 'run:' must FAIL CLOSED, not silently widen to ('run', '*')."""

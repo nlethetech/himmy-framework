@@ -212,3 +212,69 @@ def test_from_actor_rebuilds_enforcing_gate() -> None:
     offline = ToolCapabilityAuthorizer.from_actor({"subject": "anon"}, _policy())
     assert offline.enforce is False
     assert offline.is_authorized("send_email", False) is True
+
+
+# ------------------------------------------- scope narrowing follows into the gate
+def test_scope_narrows_tool_capability() -> None:
+    """A token scoped to a single tool's invoke cannot reach OTHER tools its role grants.
+
+    The operator role holds ``tool:*`` (every tool). A token whose OAuth scope is
+    ``tool:weather_get:invoke`` must narrow that down to JUST the read tool — it can no
+    longer invoke ``send_email``, exactly mirroring the route-layer narrowing. Before the
+    fix the synthetic probe carried no scopes, so the gate ignored them (fail-open).
+    """
+    op = Principal(
+        subject="u",
+        roles=frozenset({"operator"}),
+        tenant_ids=frozenset({"ws1"}),
+        scopes=frozenset({"tool:weather_get:invoke"}),
+    )
+    gate = ToolCapabilityAuthorizer.from_principal(op, DEFAULT_POLICY)
+    assert gate.scopes == frozenset({"tool:weather_get:invoke"})
+    assert gate.is_authorized("weather_get", True) is True
+    # The write tool the operator role WOULD reach is narrowed away by the scope.
+    assert gate.is_authorized("send_email", False) is False
+
+
+def test_read_scope_cannot_invoke_any_tool() -> None:
+    """A 'run:read'-scoped operator token cannot invoke ANY tool (scope omits 'tool')."""
+    op = Principal(
+        subject="u",
+        roles=frozenset({"operator"}),
+        tenant_ids=frozenset({"ws1"}),
+        scopes=frozenset({"run:read"}),
+    )
+    gate = ToolCapabilityAuthorizer.from_principal(op, DEFAULT_POLICY)
+    # Route layer narrows run:write away; the tool gate must ALSO deny side-effecting tools.
+    assert gate.is_authorized("send_email", False) is False
+    assert gate.is_authorized("weather_get", True) is False
+
+
+def test_oidc_resource_scope_does_not_lock_out_tools() -> None:
+    """A garbage IdP resource scope must NOT lock the operator out of every tool."""
+    op = Principal(
+        subject="u",
+        roles=frozenset({"operator"}),
+        tenant_ids=frozenset({"ws1"}),
+        scopes=frozenset({"openid", "api://himmy/access_as_user"}),
+    )
+    gate = ToolCapabilityAuthorizer.from_principal(op, DEFAULT_POLICY)
+    # No permission-scope recognized → no narrowing → operator keeps its tool:* reach.
+    assert gate.is_authorized("weather_get", True) is True
+    assert gate.is_authorized("send_email", False) is True
+
+
+def test_scope_survives_actor_roundtrip() -> None:
+    """Scopes serialize into actor_metadata and rebuild the gate (dispatch-recovery)."""
+    op = Principal(
+        subject="u",
+        roles=frozenset({"operator"}),
+        tenant_ids=frozenset({"ws1"}),
+        scopes=frozenset({"tool:weather_get:invoke"}),
+    )
+    actor = op.actor_metadata()
+    assert actor["scopes"] == ["tool:weather_get:invoke"]
+    rebuilt = ToolCapabilityAuthorizer.from_actor(actor, DEFAULT_POLICY)
+    assert rebuilt.scopes == frozenset({"tool:weather_get:invoke"})
+    assert rebuilt.is_authorized("weather_get", True) is True
+    assert rebuilt.is_authorized("send_email", False) is False

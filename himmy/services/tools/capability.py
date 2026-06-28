@@ -73,6 +73,12 @@ class ToolCapabilityAuthorizer:
     enforce: bool
     roles: frozenset[str]
     policy: AccessPolicy | None = None
+    #: The token's OAuth scopes, carried so the synthetic probe in :meth:`_grants`
+    #: reflects the SAME scope-narrowing the route layer applies (delegated
+    #: least-privilege). Empty for every offline / ANONYMOUS / API-key principal, so the
+    #: gate is byte-unchanged for them; a scoped OIDC token narrows its tool reach here
+    #: exactly as it narrows its ``/v1`` route reach. See :func:`himmy.api.auth.rbac`.
+    scopes: frozenset[str] = frozenset()
 
     @classmethod
     def from_principal(
@@ -84,11 +90,17 @@ class ToolCapabilityAuthorizer:
         ``None`` principal (no auth seam) or an unrestricted ``all_tenants`` principal
         (the ANONYMOUS offline default, or a trusted shared key) yields a NON-enforcing
         authorizer — every tool is allowed, byte-identical to before. A tenant-bound
-        principal yields an enforcing one carrying its roles + the policy.
+        principal yields an enforcing one carrying its roles + scopes + the policy, so a
+        scope-narrowed token narrows its TOOL reach exactly as it narrows its route reach.
         """
         if principal is None or principal.all_tenants:
             return cls(enforce=False, roles=frozenset())
-        return cls(enforce=True, roles=frozenset(principal.roles), policy=policy)
+        return cls(
+            enforce=True,
+            roles=frozenset(principal.roles),
+            policy=policy,
+            scopes=frozenset(principal.scopes),
+        )
 
     @classmethod
     def from_actor(
@@ -107,7 +119,13 @@ class ToolCapabilityAuthorizer:
         if not actor or not actor.get("tool_authz_enforce"):
             return cls(enforce=False, roles=frozenset())
         roles = actor.get("roles") or []
-        return cls(enforce=True, roles=frozenset(str(r) for r in roles), policy=policy)
+        scopes = actor.get("scopes") or []
+        return cls(
+            enforce=True,
+            roles=frozenset(str(r) for r in roles),
+            policy=policy,
+            scopes=frozenset(str(s) for s in scopes),
+        )
 
     def attenuate(self) -> ToolCapabilityAuthorizer:
         """Return the authorizer a spawned sub-agent inherits (never wider than ``self``).
@@ -163,7 +181,9 @@ class ToolCapabilityAuthorizer:
         assert self.policy is not None  # guarded by is_authorized
         from himmy.api.auth.principal import Principal
 
-        probe = Principal(subject="__tool_authz__", roles=self.roles)
+        probe = Principal(
+            subject="__tool_authz__", roles=self.roles, scopes=self.scopes
+        )
         return self.policy.authorize(probe, TOOL_RESOURCE, f"{name}:{action}")
 
 

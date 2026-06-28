@@ -216,6 +216,25 @@ class AccessPolicy:
             logger.warning("%s", message)
         return cls(role_permissions)
 
+    def known_resources(self) -> frozenset[str]:
+        """The set of RBAC *resources* this policy actually names (excluding ``*``).
+
+        Used to gate scope-narrowing: only a scope whose parsed resource is one this
+        policy recognizes is allowed to engage narrowing (see :func:`_scope_permissions`),
+        so a colon-bearing OIDC resource-scope an IdP emits (``api://…`` parses to
+        resource ``api``, ``urn:…`` to ``urn``, ``https://…`` to ``https``) — none of
+        which are RBAC resources — cannot masquerade as a permission-scope and zero out
+        the grant. The wildcard ``*`` is excluded because a *scope* of ``*:<action>``
+        is, by the OAuth attenuation contract, never something a real IdP issues as a
+        narrowing token and we do not want a stray ``*`` to re-admit garbage.
+        """
+        return frozenset(
+            res
+            for perms in self.role_permissions.values()
+            for (res, _action) in perms
+            if res != "*"
+        )
+
     def authorize(self, principal: Principal, resource: str, action: str) -> bool:
         """Whether the principal may perform ``(resource, action)``.
 
@@ -226,17 +245,28 @@ class AccessPolicy:
 
         1. The principal must hold a role granting ``(resource, action)`` (the
            historical check) — a scope alone never grants anything a role does not.
-        2. THEN, when the principal carries a non-empty, *recognizable* scope set
-           (at least one scope parses as the ``resource:action`` permission grammar,
-           wildcards allowed), that grant must ALSO be covered by a scope.
+        2. THEN, when the principal carries a non-empty set of *permission-scopes*
+           (scopes naming a resource this policy recognizes, see below), that grant
+           must ALSO be covered by one of them.
 
-        Empty scopes ⇒ NO narrowing: the principal keeps its full role reach (the
-        existing behavior — every API-key / ANONYMOUS / role-only principal is
-        byte-unchanged, since those carry no scopes). Scopes that do not parse as
-        ``resource:action`` (the standard OIDC ``openid`` / ``profile`` / ``email``,
-        etc.) are NOT part of this grammar and are ignored for narrowing; a token
-        carrying ONLY such scopes therefore narrows nothing (it keeps full role
-        reach) rather than being locked out of every resource.
+        **What counts as a permission-scope (and why it is opt-in, not guessed).**
+        A scope engages narrowing ONLY when it parses as the ``resource:action``
+        grammar AND its resource is one the active policy actually names
+        (:meth:`known_resources`) — e.g. ``run:read``, ``context:write``, ``tool:*``.
+        This is deliberately strict: mainstream IdPs (Entra ID / Keycloak / ZITADEL)
+        emit colon-BEARING resource scopes such as ``api://himmy/access_as_user``,
+        ``urn:zitadel:iam:org:project:role`` or ``https://graph.microsoft.com/User.Read``
+        which DO parse on the first colon (``('api', '//…')`` etc.) but name no RBAC
+        resource — were we to honor them, a single such scope would make the
+        permission-scope set non-empty and narrow EVERY real grant to nothing,
+        locking out every role (admin included). Gating on known resources drops them,
+        so they narrow nothing.
+
+        Empty (or all-unrecognized) permission-scopes ⇒ NO narrowing: the principal
+        keeps its full role reach (the existing behavior — every API-key / ANONYMOUS /
+        role-only principal is byte-unchanged, since those carry no scopes; a token
+        carrying ONLY standard/garbage scopes likewise keeps full reach rather than
+        being locked out).
         """
         granted_by_role = any(
             (perms := self.role_permissions.get(role)) is not None
@@ -245,7 +275,7 @@ class AccessPolicy:
         )
         if not granted_by_role:
             return False
-        scope_perms = _scope_permissions(principal.scopes)
+        scope_perms = _scope_permissions(principal.scopes, self.known_resources())
         if not scope_perms:
             return True  # no recognizable scopes → no narrowing (full role reach)
         return _covers(scope_perms, resource, action)
@@ -256,28 +286,47 @@ def _covers(perms: frozenset[tuple[str, str]], resource: str, action: str) -> bo
     return any(r in (resource, "*") and a in (action, "*") for (r, a) in perms)
 
 
-def _scope_permissions(scopes: frozenset[str]) -> frozenset[tuple[str, str]]:
+def _scope_permissions(
+    scopes: frozenset[str], known_resources: frozenset[str]
+) -> frozenset[tuple[str, str]]:
     """Parse a token's ``scopes`` into the ``(resource, action)`` pairs they grant.
 
     Scopes are intersected with the role grant in :meth:`AccessPolicy.authorize` to
-    realise delegated least-privilege (a scope can only NARROW). They use the SAME
-    ``resource:action`` grammar as a role permission (wildcards allowed), so each is
-    parsed via the strict :func:`_parse_perm`.
+    realise delegated least-privilege (a scope can only NARROW). A scope is honored as
+    a permission-scope ONLY when BOTH hold:
 
-    A scope that does NOT parse as ``resource:action`` — the standard OIDC ``openid``
-    / ``profile`` / ``email`` and any other non-grammar token — is DROPPED, not
-    treated as an error and not allowed to narrow anything: enforcement is fail-open
-    *per-scope* here so an unrelated standard scope cannot silently lock a caller out
-    of every resource (the deny decision still rests on the role check in
-    :meth:`AccessPolicy.authorize`). An all-unrecognized scope set therefore yields
-    the empty set, which the caller reads as "no narrowing".
+    1. it parses as the strict ``resource:action`` grammar (:func:`_parse_perm`,
+       wildcards allowed); AND
+    2. its resource is one the active policy actually names (``known_resources``,
+       from :meth:`AccessPolicy.known_resources`), so it is an *opt-in*, recognized
+       RBAC resource — never guessed from the colon grammar alone.
+
+    Everything else is DROPPED, not treated as an error and not allowed to narrow
+    anything. This drops TWO classes of scope that would otherwise be catastrophic or
+    inert:
+
+    * the standard OIDC ``openid`` / ``profile`` / ``email`` (no colon → fail
+      :func:`_parse_perm`); and
+    * mainstream IdP resource-scopes that DO parse on the first colon but name no RBAC
+      resource — ``api://himmy/access_as_user`` → ``('api', '//…')``,
+      ``urn:zitadel:…`` → ``('urn', '…')``, ``https://graph…`` → ``('https', '//…')``.
+
+    Were the second class honored, one such scope would make the set non-empty and
+    narrow every real grant to nothing — a total authorization lock-out (admin
+    included). Enforcement is therefore fail-open *per-scope*: an unrelated/garbage
+    scope cannot silently lock a caller out of every resource (the deny decision still
+    rests on the role check in :meth:`AccessPolicy.authorize`). An all-unrecognized
+    scope set yields the empty set, which the caller reads as "no narrowing".
     """
     parsed: set[tuple[str, str]] = set()
     for scope in scopes:
         try:
-            parsed.add(_parse_perm(scope))
+            resource, action = _parse_perm(scope)
         except RbacPolicyError:
             continue  # not a resource:action grant (e.g. 'openid') → ignore
+        if resource not in known_resources:
+            continue  # parses, but names no RBAC resource (e.g. OIDC 'api://…') → ignore
+        parsed.add((resource, action))
     return frozenset(parsed)
 
 

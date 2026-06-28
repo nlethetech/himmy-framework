@@ -123,12 +123,15 @@ class Principal:
     def actor_metadata(self) -> dict[str, Any]:
         """Compact, log-safe descriptor of the actor (for run/entity stamping).
 
-        Carries the actor's ``roles`` and — for a tenant-bound principal — a
-        ``tool_authz_enforce`` flag (P0). The flag is what lets a run's tool-capability
-        gate be REBUILT from the persisted descriptor on the leased-dispatch recovery path
-        (a fresh process has no live :class:`Principal`); an unrestricted / ANONYMOUS
-        principal (``all_tenants``) omits it, so the rebuilt authorizer is a non-enforcing
-        pass-through and the offline path is byte-unchanged.
+        Carries the actor's ``roles`` (and ``scopes``, when present) and — for a
+        tenant-bound principal — a ``tool_authz_enforce`` flag (P0). The flag is what
+        lets a run's tool-capability gate be REBUILT from the persisted descriptor on the
+        leased-dispatch recovery path (a fresh process has no live :class:`Principal`);
+        ``scopes`` is serialized so that rebuilt gate applies the SAME delegated
+        scope-narrowing the live gate did (a read-only-scoped token cannot regain write
+        tools across a process boundary). An unrestricted / ANONYMOUS principal
+        (``all_tenants``) omits the enforce flag, so the rebuilt authorizer is a
+        non-enforcing pass-through and the offline path is byte-unchanged.
         """
         meta: dict[str, Any] = {
             "subject": self.subject,
@@ -136,6 +139,8 @@ class Principal:
         }
         if self.roles:
             meta["roles"] = sorted(self.roles)
+        if self.scopes:
+            meta["scopes"] = sorted(self.scopes)
         if self.source_ip:
             meta["source_ip"] = self.source_ip
         if not self.all_tenants:
