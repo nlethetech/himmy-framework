@@ -483,3 +483,188 @@ def test_offline_studio_runs_unscoped(studio_cwd: Path) -> None:
 
     ids = {item["id"] for item in c.get("/api/studio/runs").json()["items"]}
     assert ids == {"run-a", "run-b"}
+
+
+# ---- review fix: every mutating sub-router rejects a read-only role -----------
+#: One representative mutation per sub-router annotated in this review pass. A
+#: read-only ``viewer`` holds ``studio.<seg>:read`` but NOT the route's ``:write``/
+#: ``:manage`` permission, so each MUST 403 (never reach the handler for a 404/422).
+_VIEWER_DENIED_MUTATIONS = [
+    ("post", "/api/studio/routines", {"name": "r", "agent_path": "a", "schedule": "@daily"}),
+    ("delete", "/api/studio/routines/x", None),
+    ("post", "/api/studio/routines/x/run-now", None),
+    ("post", "/api/studio/projects", {"name": "p"}),
+    ("delete", "/api/studio/projects/x", None),
+    ("post", "/api/studio/privacy/erase", {"subject_id": "s", "confirm": "s"}),
+    ("post", "/api/studio/telegram/start", {}),
+    ("post", "/api/studio/telegram/stop", {}),
+    ("post", "/api/studio/missions", {}),
+    ("post", "/api/studio/missions/x/steer", {}),
+    ("post", "/api/studio/missions/x/interrupt", {}),
+    ("post", "/api/studio/notify/read-all", {}),
+    ("post", "/api/studio/notify/settings", {}),
+    ("post", "/api/studio/learning/overrides", {}),
+    ("post", "/api/studio/learning/trust-feedback", {}),
+    ("patch", "/api/studio/memory/x", {"text": "x"}),
+    ("post", "/api/studio/eval/run", {}),
+    ("post", "/api/studio/teams", {}),
+    ("post", "/api/studio/workflows/run-stream", {}),
+    ("post", "/api/studio/kb/x/upload", None),
+    ("post", "/api/studio/benchmarks/probe", None),
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    _VIEWER_DENIED_MUTATIONS,
+    ids=[f"{m}-{p}" for m, p, _ in _VIEWER_DENIED_MUTATIONS],
+)
+def test_readonly_role_is_403_on_every_studio_mutation(
+    studio_cwd: Path, method: str, path: str, body: object
+) -> None:
+    """A ``viewer`` is 403 (not 404/422) on a representative mutation per sub-router.
+
+    Guards the deny-by-default regression: before this pass these POST/PUT/PATCH/DELETE
+    routes carried only the router-level ``:read`` baseline, so the read grant alone
+    authorized the mutation. A 403 proves RBAC rejects BEFORE the handler runs.
+    """
+    c, _ = _studio_client("viewer")
+    resp = c.request(method, path, json=body)
+    assert resp.status_code == 403, f"{method} {path} -> {resp.status_code}"
+
+
+def test_admin_passes_studio_mutation_rbac(studio_cwd: Path) -> None:
+    """``admin`` (``*:*``) clears the write/manage guard — reaches the handler.
+
+    The complement to the viewer-403 sweep: a representative mutation per newly-annotated
+    sub-router must NOT 403 for admin (it may 404/422 on missing data/validation, proving
+    the request passed RBAC and entered the handler).
+    """
+    c, _ = _studio_client("admin")
+    for method, path, body in _VIEWER_DENIED_MUTATIONS:
+        resp = c.request(method, path, json=body)
+        assert resp.status_code != 403, f"admin blocked on {method} {path}"
+
+
+def test_every_studio_non_get_route_carries_a_write_guard() -> None:
+    """Structural: every Studio non-GET route declares a non-``read`` studio permission.
+
+    The deny-by-default backstop — a future mutating route added without a write/manage
+    dependency would be authorized by the router's read baseline alone (the exact gap
+    this pass closed). Read-style POST helpers (search/recall/validate) are exempted by
+    name since they mutate nothing.
+    """
+    from himmy.api.routers.studio_common import STUDIO_RESOURCE_PREFIX
+
+    app = create_app(ApiContainer.build_default())
+    #: POST routes that are reads in disguise (a body-carrying query), so a read guard
+    #: is correct for them.
+    read_post_suffixes = (
+        "/memory/recall",
+        "/knowledge/{kb_id}/search",
+        "/agents/validate",
+        "/teams/validate",
+    )
+    offenders: list[str] = []
+    for route in app.routes:
+        methods = getattr(route, "methods", None) or set()
+        path = getattr(route, "path", "")
+        if not path.startswith("/api/studio/"):
+            continue
+        if methods <= {"GET", "HEAD", "OPTIONS"}:
+            continue
+        if path.endswith(read_post_suffixes):
+            continue
+        # Walk the route's dependant tree for a studio_permission with a non-read action.
+        deps = getattr(getattr(route, "dependant", None), "dependencies", [])
+
+        def _names(dependant: object) -> list[str]:
+            out: list[str] = []
+            call = getattr(dependant, "call", None)
+            if call is not None:
+                out.append(getattr(call, "__qualname__", repr(call)))
+            for sub in getattr(dependant, "dependencies", []) or []:
+                out.extend(_names(sub))
+            return out
+
+        all_names = []
+        for d in deps:
+            all_names.extend(_names(d))
+        # studio_permission's inner closure is named ``studio_permission.<locals>._dep``.
+        has_write_guard = any(
+            "studio_permission" in n and "_dep" in n for n in all_names
+        )
+        if not has_write_guard:
+            offenders.append(f"{sorted(methods)} {path}")
+    assert not offenders, (
+        "Studio non-GET routes missing a write/manage "
+        f"{STUDIO_RESOURCE_PREFIX} permission dep: {offenders}"
+    )
+
+
+# ---- review fix: cross-tenant feedback/lineage/analytics readers -------------
+def _seed_cache_row(workspace_id: str, run_id: str) -> None:
+    """Insert a studio.db presentation-cache row (the leak surface) for ``run_id``."""
+    from himmy.api.studio_runs import StudioRun, get_run_store
+
+    get_run_store().save(
+        StudioRun(id=run_id, created_at="2026-06-28T00:00:00Z", prompt="hi")
+    )
+
+
+def test_tenant_bound_principal_cannot_read_cross_tenant_feedback(
+    studio_cwd: Path,
+) -> None:
+    """Reading another tenant's run feedback by id is 404 (cache row notwithstanding)."""
+    c, app = _studio_client("admin", tenant_ids=["t"])
+    _seed_run(app, workspace_id="other", run_id="run-theirs")
+    _seed_cache_row("other", "run-theirs")
+
+    assert c.get("/api/studio/runs/run-theirs/feedback").status_code == 404
+    assert (
+        c.post(
+            "/api/studio/runs/run-theirs/feedback", json={"verdict": "up"}
+        ).status_code
+        == 404
+    )
+
+
+def test_tenant_bound_principal_cannot_read_cross_tenant_lineage(
+    studio_cwd: Path,
+) -> None:
+    """Reading another tenant's run lineage by id is 404 (cache row notwithstanding)."""
+    c, app = _studio_client("admin", tenant_ids=["t"])
+    _seed_run(app, workspace_id="other", run_id="run-theirs")
+    _seed_cache_row("other", "run-theirs")
+
+    assert c.get("/api/studio/runs/run-theirs/lineage").status_code == 404
+
+
+def test_tenant_bound_principal_can_read_own_feedback(studio_cwd: Path) -> None:
+    """The gate does not over-block: a principal's OWN run feedback is reachable (200)."""
+    c, app = _studio_client("admin", tenant_ids=["t"])
+    _seed_run(app, workspace_id="t", run_id="run-mine")
+    _seed_cache_row("t", "run-mine")
+
+    assert c.get("/api/studio/runs/run-mine/feedback").status_code == 200
+
+
+def test_tenant_bound_principal_gets_empty_analytics(studio_cwd: Path) -> None:
+    """Analytics returns empty (not a cross-tenant total) for a tenant-bound principal."""
+    c, app = _studio_client("admin", tenant_ids=["t"])
+    _seed_run(app, workspace_id="other", run_id="run-theirs")
+    _seed_cache_row("other", "run-theirs")
+
+    data = c.get("/api/studio/runs/analytics").json()
+    assert data["total_runs"] == 0
+
+
+def test_offline_analytics_and_lineage_unscoped(studio_cwd: Path) -> None:
+    """No authenticator → by-id readers and analytics are unscoped (byte-unchanged)."""
+    app = create_app(ApiContainer.build_default())
+    _seed_run(app, workspace_id="other", run_id="run-b")
+    _seed_cache_row("other", "run-b")
+    c = TestClient(app)
+
+    assert c.get("/api/studio/runs/run-b/feedback").status_code == 200
+    assert c.get("/api/studio/runs/run-b/lineage").status_code == 200

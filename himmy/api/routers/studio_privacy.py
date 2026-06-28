@@ -21,11 +21,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import HTTPException, Query, Request
+from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
 
 from himmy.api.auth import get_principal
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.api.security_audit import audit_event
 from himmy.core.ids import utc_now_iso
 from himmy.entities.integrity import AuditBundle
@@ -38,6 +38,12 @@ from himmy.services.governance.consent import (
 from himmy.services.governance.retention import ERASURE_KIND
 
 router = build_studio_router("privacy", tag="studio-privacy")
+
+#: Subject erasure (irreversible crypto-shred) and audit-ledger export/verify are
+#: privileged governance mutations gated by ``studio.privacy:manage`` (admin-only by
+#: default), additively on top of the router's ``studio.privacy:read`` baseline. A
+#: read-only auditor can browse consent state but can NEVER crypto-shred a subject.
+_privacy_manage = Depends(studio_permission("studio.privacy", "manage"))
 
 #: Subject-bearing spine kinds counted per subject — mirrors the consent-gated set
 #: wired in :mod:`himmy.api.deps` (``_GATED_SPINE_KINDS``).
@@ -273,7 +279,9 @@ class EraseResponse(BaseModel):
     erased_at: str | None = None
 
 
-@router.post("/erase", response_model=EraseResponse)
+@router.post(
+    "/erase", response_model=EraseResponse, dependencies=[_privacy_manage]
+)
 async def erase_subject(body: EraseRequest, request: Request) -> EraseResponse:
     """Withdraw every consent and crypto-shred the subject (typed confirmation).
 
@@ -353,7 +361,11 @@ def _evidence_records(registry: Any, kinds: tuple[str, ...]) -> list[Any]:
     return records
 
 
-@router.post("/audit/export", response_model=AuditExportResponse)
+@router.post(
+    "/audit/export",
+    response_model=AuditExportResponse,
+    dependencies=[_privacy_manage],
+)
 async def export_audit(request: Request) -> AuditExportResponse:
     """Export a signed, tamper-evident bundle over the governance evidence.
 
@@ -482,7 +494,11 @@ def _ids_detail(ids: list[str], verb: str) -> str:
     return f"{len(ids)} {verb}: {head}{more}"
 
 
-@router.post("/audit/verify", response_model=AuditVerifyResponse)
+@router.post(
+    "/audit/verify",
+    response_model=AuditVerifyResponse,
+    dependencies=[_privacy_manage],
+)
 async def verify_audit(
     body: AuditVerifyRequest, request: Request
 ) -> AuditVerifyResponse:

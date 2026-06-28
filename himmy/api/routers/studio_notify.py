@@ -45,12 +45,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException, Query
+from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("notify", tag="studio-notify")
+
+#: Marking notifications read and updating notification settings are mutations gated by
+#: ``studio.notify:write`` (admin-only by default), additively on top of the router's
+#: ``studio.notify:read`` baseline so a read-only role can view but not mutate state.
+_notify_write = Depends(studio_permission("studio.notify", "write"))
 
 
 # ---- in-process notification sink ------------------------------------------
@@ -439,7 +444,7 @@ async def list_notifications(
     }
 
 
-@router.post("/read-all")
+@router.post("/read-all", dependencies=[_notify_write])
 async def mark_all_read() -> dict[str, Any]:
     """Mark every notification read (idempotent)."""
     with _LOCK:
@@ -453,7 +458,7 @@ async def mark_all_read() -> dict[str, Any]:
     return {"ok": True, "marked": changed}
 
 
-@router.post("/{notification_id}/read")
+@router.post("/{notification_id}/read", dependencies=[_notify_write])
 async def mark_read(notification_id: int) -> dict[str, Any]:
     """Mark one notification read; 404 when the id is unknown (or rolled off)."""
     with _LOCK:
@@ -466,7 +471,7 @@ async def mark_read(notification_id: int) -> dict[str, Any]:
     raise HTTPException(status_code=404, detail="unknown notification")
 
 
-@router.post("/settings")
+@router.post("/settings", dependencies=[_notify_write])
 async def set_settings(settings: NotifySettings) -> dict[str, Any]:
     """Persist the notify settings (currently just Telegram forwarding)."""
     global _FORWARD_TELEGRAM

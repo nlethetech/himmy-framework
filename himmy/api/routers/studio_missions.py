@@ -21,7 +21,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -33,9 +33,15 @@ from himmy.api.missions import (
     MissionRegistry,
     get_registry,
 )
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("missions", tag="studio-missions")
+
+#: Launching/steering/interrupting an autonomous mission is a privileged mutation gated
+#: by ``studio.missions:write`` (admin-only by default), additively on top of the
+#: router's ``studio.missions:read`` baseline so a read-only role can watch a mission's
+#: progress but never start, redirect, or interrupt one.
+_missions_write = Depends(studio_permission("studio.missions", "write"))
 
 
 # ---- request/response models ---------------------------------------------
@@ -110,7 +116,7 @@ def _view(mission: Any) -> MissionView:
 # ---- endpoints -------------------------------------------------------------
 
 
-@router.post("", response_model=dict[str, str])
+@router.post("", response_model=dict[str, str], dependencies=[_missions_write])
 async def start_mission(body: MissionStartRequest, request: Request) -> dict[str, str]:
     """Start a background agent run; returns immediately with the mission id."""
     registry = _registry(request)
@@ -187,7 +193,9 @@ async def stream_mission(mission_id: str, request: Request) -> StreamingResponse
     )
 
 
-@router.post("/{mission_id}/steer", response_model=MissionView)
+@router.post(
+    "/{mission_id}/steer", response_model=MissionView, dependencies=[_missions_write]
+)
 async def steer_mission(
     mission_id: str, body: SteerRequest, request: Request
 ) -> MissionView:
@@ -201,7 +209,11 @@ async def steer_mission(
     return _view(mission)
 
 
-@router.post("/{mission_id}/interrupt", response_model=InterruptResponse)
+@router.post(
+    "/{mission_id}/interrupt",
+    response_model=InterruptResponse,
+    dependencies=[_missions_write],
+)
 async def interrupt_mission(mission_id: str, request: Request) -> InterruptResponse:
     """Stop a mission — honestly reporting checkpoint-pause vs cooperative cancel."""
     registry = _registry(request)

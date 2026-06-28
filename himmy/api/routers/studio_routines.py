@@ -16,13 +16,19 @@ from __future__ import annotations
 
 import os
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from himmy.api import routines as svc
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("routines", tag="studio-routines")
+
+#: Creating/editing/deleting/firing a routine schedules an autonomous agent run — a
+#: privileged mutation gated by ``studio.routines:write`` (admin-only by default),
+#: additively on top of the router's ``studio.routines:read`` baseline so a read-only
+#: role can browse routines but never mutate one.
+_routines_write = Depends(studio_permission("studio.routines", "write"))
 
 
 def _wake_scheduler() -> None:
@@ -141,7 +147,7 @@ async def list_routines() -> list[RoutineView]:
     return [_view(r) for r in rows]
 
 
-@router.post("", response_model=RoutineView)
+@router.post("", response_model=RoutineView, dependencies=[_routines_write])
 async def create_routine(body: RoutineCreate) -> RoutineView:
     """Create a routine. The agent path must resolve inside the project root."""
     _validate_agent_path(body.agent_path)
@@ -168,7 +174,9 @@ async def get_routine(routine_id: str) -> RoutineView:
     return _view(routine)
 
 
-@router.patch("/{routine_id}", response_model=RoutineView)
+@router.patch(
+    "/{routine_id}", response_model=RoutineView, dependencies=[_routines_write]
+)
 async def update_routine(routine_id: str, body: RoutineUpdate) -> RoutineView:
     """Partial update; the schedule (when given) is re-validated as a whole."""
     store = svc.get_routines_store()
@@ -190,7 +198,7 @@ async def update_routine(routine_id: str, body: RoutineUpdate) -> RoutineView:
     return _view(stored)
 
 
-@router.delete("/{routine_id}")
+@router.delete("/{routine_id}", dependencies=[_routines_write])
 async def delete_routine(routine_id: str) -> dict[str, bool]:
     if not svc.get_routines_store().delete(routine_id):
         raise HTTPException(status_code=404, detail="routine not found")
@@ -201,7 +209,9 @@ async def delete_routine(routine_id: str) -> dict[str, bool]:
 # ---- manual trigger -------------------------------------------------------------
 
 
-@router.post("/{routine_id}/run-now", response_model=RoutineView)
+@router.post(
+    "/{routine_id}/run-now", response_model=RoutineView, dependencies=[_routines_write]
+)
 async def run_now(routine_id: str) -> RoutineView:
     """Run a routine immediately through the same unattended rails.
 

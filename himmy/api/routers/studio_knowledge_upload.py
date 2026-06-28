@@ -27,15 +27,21 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.core.errors import HimmyError
 
 router = build_studio_router("kb", tag="studio-knowledge-upload")
+
+#: Uploading a document into a knowledge base mutates retrieval state — a privileged
+#: mutation gated by ``studio.kb:write`` (admin-only by default), additively on top of
+#: the router's ``studio.kb:read`` baseline so a read-only role can browse but not
+#: ingest documents.
+_kb_write = Depends(studio_permission("studio.kb", "write"))
 
 #: Hard cap on the uploaded file body (15 MB).
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
@@ -219,7 +225,7 @@ def _validated_file_part(form: Any) -> tuple[UploadFile, str, str]:
     return upload, filename, ext
 
 
-@router.post("/{kb_id}/upload")
+@router.post("/{kb_id}/upload", dependencies=[_kb_write])
 async def kb_upload(kb_id: str, request: Request) -> UploadResult:
     """Upload one file into a KB: validate → extract text → chunk + embed."""
     _check_kb_id(kb_id)

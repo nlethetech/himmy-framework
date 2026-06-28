@@ -11,12 +11,17 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import HTTPException, Path
+from fastapi import Depends, HTTPException, Path
 from pydantic import BaseModel, Field
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("memory", tag="studio-memory")
+
+#: Editing a memory in place is a mutation gated by ``studio.memory:write`` (admin-only
+#: by default), additively on top of the router's ``studio.memory:read`` baseline so a
+#: read-only role can recall memories but never rewrite one.
+_memory_write = Depends(studio_permission("studio.memory", "write"))
 
 
 class MemoryEditRequest(BaseModel):
@@ -25,7 +30,7 @@ class MemoryEditRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=20_000)
 
 
-@router.patch("/{memory_id}")
+@router.patch("/{memory_id}", dependencies=[_memory_write])
 async def memory_edit(
     memory_id: Annotated[str, Path(min_length=1, max_length=200)],
     body: MemoryEditRequest,

@@ -39,7 +39,11 @@ from himmy.api import (
     studio_feedback,
     studio_service,
 )
-from himmy.api.auth import get_principal, studio_tenant_filter
+from himmy.api.auth import (
+    authorize_studio_object,
+    get_principal,
+    studio_tenant_filter,
+)
 from himmy.api.routers.studio_common import studio_permission
 from himmy.api.studio_approvals import ApprovalDetail, ApprovalSummary
 from himmy.api.studio_connections import (
@@ -126,7 +130,10 @@ async def benchmarks() -> dict[str, Any]:
     return {"entries": studio_bench.list_cached()}
 
 
-@router.post("/benchmarks/probe")
+@router.post(
+    "/benchmarks/probe",
+    dependencies=[Depends(studio_permission(_RES_CONSOLE, "write"))],
+)
 async def benchmarks_probe() -> dict[str, Any]:
     """Run a quick tool-focused reliability check against detected local models.
 
@@ -183,6 +190,36 @@ def _canonical_storage(request: Request) -> Any | None:
     """
     container = getattr(request.app.state, "container", None)
     return getattr(container, "storage", None) if container is not None else None
+
+
+async def _authorize_run(request: Request, run_id: str) -> bool:
+    """May this request's principal read run ``run_id`` (BOLA gate for by-id readers)?
+
+    The by-id companion the sibling run readers (``analytics``/``feedback``/``lineage``)
+    were missing: ``get_studio_run_unified`` already 404s a cross-tenant fetch, but the
+    feedback and lineage readers hit the studio.db presentation cache directly with no
+    tenant check, so a tenant-bound principal could pull another tenant's run
+    feedback/lineage by id whenever a cache row existed. This resolves the run's
+    **canonical** ``workspace_id`` (the authoritative tenant stamp — the presentation
+    cache carries none) and applies :func:`authorize_studio_object`.
+
+    Returns True — i.e. allow — for an unrestricted principal (offline / ``all_tenants``,
+    where the tenant stamp is irrelevant), when no canonical storage is attached (the
+    bare/single-box test app), and for a run that is unknown canonically (no tenant to
+    violate). So the zero-config path is a NO-OP and byte-unchanged; enforcement engages
+    only for a tenant-bound principal reading a run that canonically belongs to a
+    workspace it may not access. Callers fold a False verdict into a **404** so existence
+    is never leaked — mirroring ``get_studio_run_unified``.
+    """
+    if get_principal(request).all_tenants:
+        return True
+    storage = _canonical_storage(request)
+    if storage is None:
+        return True
+    rec = await storage.get_run(run_id)
+    if rec is None:
+        return True
+    return authorize_studio_object(request, getattr(rec, "workspace_id", None))
 
 
 @router.post("/run", dependencies=[Depends(studio_permission(_RES_RUNS, "write"))])
@@ -380,8 +417,20 @@ async def list_runs(
 
 
 @router.get("/runs/analytics", response_model=RunAnalytics)
-async def runs_analytics() -> RunAnalytics:
-    """Aggregate cost/token/latency stats across runs (the analytics dashboard)."""
+async def runs_analytics(request: Request) -> RunAnalytics:
+    """Aggregate cost/token/latency stats across runs (the analytics dashboard).
+
+    The studio.db presentation cache these aggregates are computed over carries NO
+    per-run tenant stamp (only the canonical store does), so a global aggregate would
+    sum another tenant's cost/tokens into a tenant-bound principal's dashboard. For an
+    unrestricted principal (offline / ``all_tenants``) the full aggregate is returned —
+    byte-unchanged single-box behavior — while a tenant-bound principal gets EMPTY
+    analytics rather than a cross-tenant total (the cache cannot be safely attributed to
+    a workspace; per-tenant analytics is a follow-up that requires a tenant-stamped
+    aggregate over the canonical store).
+    """
+    if studio_tenant_filter(request) is not None:
+        return RunAnalytics()
     return get_run_store().analytics()
 
 
@@ -417,13 +466,17 @@ class RunFeedbackRequest(BaseModel):
     response_model=RunFeedback,
     dependencies=[Depends(studio_permission(_RES_RUNS, "write"))],
 )
-async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback:
+async def set_run_feedback(
+    run_id: str, body: RunFeedbackRequest, request: Request
+) -> RunFeedback:
     """Record human feedback on a run (the cheapest, least-noisy learning signal).
 
     Writes the verdict to the run row and appends an immutable, versioned
     ``run_feedback`` record to the entity spine. Re-rating is allowed and produces
     a new spine version (a full audit of every verdict change).
     """
+    if not await _authorize_run(request, run_id):
+        raise HTTPException(status_code=404, detail="run not found")
     try:
         fb = studio_feedback.record_feedback(
             run_id, verdict=body.verdict, note=body.note
@@ -445,9 +498,11 @@ async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback
 
 
 @router.get("/runs/{run_id}/feedback", response_model=RunFeedback | None)
-async def get_run_feedback(run_id: str) -> RunFeedback | None:
+async def get_run_feedback(run_id: str, request: Request) -> RunFeedback | None:
     """Current feedback on a run (latest verdict), or ``null`` if none yet."""
-    if get_run_store().get(run_id) is None:
+    if get_run_store().get(run_id) is None or not await _authorize_run(
+        request, run_id
+    ):
         raise HTTPException(status_code=404, detail="run not found")
     return studio_feedback.get_feedback(run_id)
 
@@ -1355,11 +1410,11 @@ async def workflow_run(body: WorkflowRunRequest) -> Any:
 
 
 @router.get("/runs/{run_id}/lineage")
-async def run_lineage(run_id: str) -> Any:
+async def run_lineage(run_id: str, request: Request) -> Any:
     from himmy.api import studio_lineage
 
     view = studio_lineage.run_lineage(run_id)
-    if view is None:
+    if view is None or not await _authorize_run(request, run_id):
         raise HTTPException(status_code=404, detail="run not found")
     return view
 

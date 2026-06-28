@@ -25,17 +25,24 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from himmy.api import studio_service
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.core.events import EventType
 
 router = APIRouter()
 _teams = build_studio_router("teams", tag="studio-teams")
 _workflows = build_studio_router("workflows", tag="studio-workflows")
+
+#: Saving a team spec writes a ``.team.yaml`` to disk; running a workflow executes
+#: agents. Both are privileged mutations gated by the respective surface's ``:write``
+#: permission (admin-only by default), additively on top of each router's ``:read``
+#: baseline so a read-only role can browse/validate but never persist or execute.
+_teams_write = Depends(studio_permission("studio.teams", "write"))
+_workflows_write = Depends(studio_permission("studio.workflows", "write"))
 
 
 # ---- Team builder: request/response shapes -------------------------------
@@ -212,7 +219,9 @@ async def validate_team(form: TeamForm) -> TeamValidationResult:
     return TeamValidationResult(ok=not errors, errors=errors)
 
 
-@_teams.post("", response_model=studio_service.TeamSummary)
+@_teams.post(
+    "", response_model=studio_service.TeamSummary, dependencies=[_teams_write]
+)
 async def save_team(body: SaveTeamRequest) -> studio_service.TeamSummary:
     """Create or update a ``<name>.team.yaml`` (validated via the team loader).
 
@@ -499,7 +508,7 @@ async def _workflow_stream(
         yield _sse({"type": "error", "message": str(exc)})
 
 
-@_workflows.post("/run-stream")
+@_workflows.post("/run-stream", dependencies=[_workflows_write])
 async def run_workflow_stream(body: WorkflowStreamRequest) -> StreamingResponse:
     """Run a workflow with the chosen agent, streaming node-level events (SSE).
 

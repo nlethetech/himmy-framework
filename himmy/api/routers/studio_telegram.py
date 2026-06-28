@@ -21,13 +21,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from himmy.api import studio_telegram as svc
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("telegram", tag="studio-telegram")
+
+#: Starting/stopping the Telegram bridge is a privileged lifecycle mutation gated by
+#: ``studio.telegram:write`` (admin-only by default), additively on top of the router's
+#: ``studio.telegram:read`` baseline so a read-only role can view status but not toggle.
+_telegram_write = Depends(studio_permission("studio.telegram", "write"))
 
 
 # ---- request/response models -------------------------------------------------
@@ -90,7 +95,9 @@ async def get_status() -> TelegramStatus:
     return _view(svc.get_listener_manager().status())
 
 
-@router.post("/start", response_model=TelegramStatus)
+@router.post(
+    "/start", response_model=TelegramStatus, dependencies=[_telegram_write]
+)
 async def start(body: TelegramStart) -> TelegramStatus:
     """Start the inbound listener for ``agent_path``.
 
@@ -113,7 +120,9 @@ async def start(body: TelegramStart) -> TelegramStatus:
     return _view(status)
 
 
-@router.post("/stop", response_model=TelegramStatus)
+@router.post(
+    "/stop", response_model=TelegramStatus, dependencies=[_telegram_write]
+)
 async def stop() -> TelegramStatus:
     """Stop the listener (idempotent — stopping a stopped listener is fine)."""
     status = await svc.get_listener_manager().stop()

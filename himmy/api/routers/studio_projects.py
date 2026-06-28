@@ -17,13 +17,18 @@ Offline-first notes:
 
 from __future__ import annotations
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.api.studio_chats import ChatSession, ChatsStore, Project, get_chats_store
 
 router = build_studio_router("projects", tag="studio-projects")
+
+#: Creating/renaming/deleting a project and (un)assigning chats are mutations gated by
+#: ``studio.projects:write`` (admin-only by default), additively on top of the router's
+#: ``studio.projects:read`` baseline so a read-only role can browse but not mutate.
+_projects_write = Depends(studio_permission("studio.projects", "write"))
 
 
 # ---- request / response models ----------------------------------------------
@@ -122,7 +127,7 @@ async def projects_list() -> list[Project]:
     return get_chats_store().list_projects()
 
 
-@router.post("", response_model=Project)
+@router.post("", response_model=Project, dependencies=[_projects_write])
 async def projects_create(body: ProjectCreateRequest) -> Project:
     store = get_chats_store()
     project = store.create_project(
@@ -144,7 +149,9 @@ async def projects_get(project_id: str) -> ProjectDetail:
     return _detail(store, project)
 
 
-@router.patch("/{project_id}", response_model=Project)
+@router.patch(
+    "/{project_id}", response_model=Project, dependencies=[_projects_write]
+)
 async def projects_update(project_id: str, body: ProjectUpdateRequest) -> Project:
     store = get_chats_store()
     if store.get_project(project_id) is None:
@@ -159,7 +166,7 @@ async def projects_update(project_id: str, body: ProjectUpdateRequest) -> Projec
     return updated
 
 
-@router.delete("/{project_id}")
+@router.delete("/{project_id}", dependencies=[_projects_write])
 async def projects_delete(project_id: str) -> dict[str, bool]:
     store = get_chats_store()
     project = store.get_project(project_id)
@@ -175,7 +182,7 @@ async def projects_delete(project_id: str) -> dict[str, bool]:
     return {"ok": ok}
 
 
-@router.post("/{project_id}/assign")
+@router.post("/{project_id}/assign", dependencies=[_projects_write])
 async def projects_assign(project_id: str, body: ChatAssignRequest) -> dict[str, bool]:
     store = get_chats_store()
     if store.get_project(project_id) is None:
@@ -185,7 +192,7 @@ async def projects_assign(project_id: str, body: ChatAssignRequest) -> dict[str,
     return {"ok": True}
 
 
-@router.post("/{project_id}/unassign")
+@router.post("/{project_id}/unassign", dependencies=[_projects_write])
 async def projects_unassign(
     project_id: str, body: ChatAssignRequest
 ) -> dict[str, bool]:
