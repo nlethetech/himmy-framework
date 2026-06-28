@@ -1269,7 +1269,20 @@ async def _run_headless_agent_id(routine: Routine) -> tuple[str, str, str | None
     # create_run (HitlRequiresAgentError). Run it plainly in that case — it cannot reach a
     # gated tool anyway, so the unattended-safety contract is preserved.
     hitl = bool(agent_spec.builds_tool_registry())
-    actor = {"source": "routine", "routine_id": routine.id}
+    # P0 #2: stamp a least-privilege SERVICE principal as the run's audit actor + identity.
+    # ``actor_metadata`` carries the routine's roles + (for a tenant-bound principal under a
+    # configured authenticator) the ``tool_authz_enforce`` flag, so the routine's tools are
+    # gated deny-by-default to its allow-list roles instead of running with the agent's full
+    # authority. Offline (no authenticator) the flag is inert — byte-unchanged. The routine
+    # source/id is preserved alongside for routine<->run lineage.
+    from himmy.api.auth.service_principal import routine_service_principal
+
+    principal = routine_service_principal(workspace_id=workspace_id)
+    actor = {
+        **principal.actor_metadata(),
+        "source": "routine",
+        "routine_id": routine.id,
+    }
     try:
         run = await run_app.create_run(
             workspace_id=workspace_id,

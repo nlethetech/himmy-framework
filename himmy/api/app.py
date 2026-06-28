@@ -601,6 +601,16 @@ def create_app(
     # Authorization: role → permission policy (data-driven via HIMMY_RBAC_FILE).
     # Enforced per-route via require_permission; bypassed when auth is off.
     app.state.access_policy = build_access_policy()
+    # P0 tool authz (confused-deputy fix): hand the run service the RBAC policy ONLY when an
+    # authenticator is configured, so it rebuilds a per-run tool-capability gate from each
+    # run's actor metadata. With no authenticator (the offline/zero-config default) the
+    # policy is NOT wired, so no per-run authorizer is built and tool dispatch is
+    # byte-identical to before — enforcement engages exactly when auth does, mirroring
+    # ``require_permission``. Best-effort: a missing run_app never blocks startup.
+    if authenticator is not None:
+        run_app = getattr(container, "run_app", None)
+        if run_app is not None:
+            run_app._access_policy = app.state.access_policy
     # Security audit: auth/authz/access events as tamper-evident entities (WS1.4).
     app.state.security_audit = SecurityAuditLog(container.entity_registry)
     # Rate limiting: per-principal/IP token bucket (WS3.2), off unless configured.

@@ -58,6 +58,7 @@ _SAFE_HTTP_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from himmy.core.events import EventSink
     from himmy.services.inference.models import BoundTool, ToolExecutor
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
 PreExecutionHook = Callable[
     [ToolInvocation, ToolDefinition], Awaitable[ToolPolicyDecision]
@@ -338,12 +339,21 @@ class ToolService:
         lenient_args: bool = True,
         reputation_provider: ToolReputationLike | None = None,
         event_workspace_id: str | None = None,
+        tool_authorizer: ToolCapabilityAuthorizer | None = None,
     ) -> None:
         self._registry = registry
         self._pre_hook = pre_execution_hook
         self._post_hook = post_execution_hook
         self.event_sink = event_sink
         self._default_timeout_seconds = default_timeout_seconds
+        # P0 tool authz (confused-deputy fix): the run principal's capability gate,
+        # consulted deny-by-default just before dispatch so a caller can only invoke
+        # tools their roles grant. ``None`` (the default, every offline/CLI path) and a
+        # NON-enforcing authorizer (ANONYMOUS / all_tenants principal) are both exact
+        # no-ops — every tool is allowed, byte-identical to before. Enforcement engages
+        # ONLY for a tenant-bound principal under a configured authenticator, mirroring
+        # the ``require_permission`` route-dependency bypass.
+        self._tool_authorizer = tool_authorizer
         # P1 tenancy: the owning workspace stamped onto every tool event this service
         # emits, so the self-learning reputation miner can scope its read to ONE tenant
         # on a shared event store (``list_events(workspace_id=...)``). ``None`` (the
@@ -527,6 +537,25 @@ class ToolService:
                 start,
                 ToolErrorCode.POLICY_BLOCKED,
                 f"tool {definition.name!r} requires approval (no approval granted)",
+                outcome="denied",
+            )
+
+        # --- capability authz (deny-by-default; offline no-op) -------------
+        # P0 confused-deputy fix: the run principal must hold the tool's capability
+        # (``tool:<name>:invoke``, plus ``tool:<name>:write`` for a side-effecting tool).
+        # A NON-enforcing authorizer (ANONYMOUS / all_tenants — the offline default) and a
+        # ``None`` authorizer both pass unconditionally, so this is a pure no-op until an
+        # authenticator is configured. A denied tool is refused BEFORE any arg validation
+        # or handler dispatch, so an unauthorized call never reaches the world.
+        if self._tool_authorizer is not None and not self._tool_authorizer.authorize_definition(
+            definition
+        ):
+            return await self._fail(
+                invocation,
+                start,
+                ToolErrorCode.POLICY_BLOCKED,
+                f"tool {definition.name!r} is not permitted for this caller "
+                "(missing tool capability)",
                 outcome="denied",
             )
 

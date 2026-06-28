@@ -47,8 +47,17 @@ def register_spawn_tool(
     *,
     inference: Any,
     requires_approval: bool = False,
+    tool_authorizer: Any = None,
 ) -> None:
-    """Register ``spawn_agent`` bound to ``inference`` (the parent's backend)."""
+    """Register ``spawn_agent`` bound to ``inference`` (the parent's backend).
+
+    ``tool_authorizer`` (P0) is the PARENT run's tool-capability gate. A spawned
+    sub-agent inherits it VERBATIM (via :meth:`ToolCapabilityAuthorizer.attenuate`,
+    which returns the same frozen authorizer) so the sub-agent's capability set is always
+    a subset of the parent's — capability can only ATTENUATE down a spawn chain, never
+    amplify. ``None`` / a NON-enforcing authorizer is a no-op (the offline default), so
+    the sub-runtime's tool dispatch is byte-identical to before.
+    """
 
     async def spawn_agent(args: dict[str, Any]) -> dict[str, Any]:
         from himmy.agents.base_agent.task import Task
@@ -67,7 +76,18 @@ def register_spawn_tool(
 
             sub_registry = ToolRegistry()
             register_packs(sub_registry, packs, ToolkitConfig.from_env())
-            sub_overrides["tool_registry"] = sub_registry
+            # Propagate the parent's capability gate so the sub-agent can only invoke tools
+            # the parent could (attenuate-never-amplify). Build the sub tool service here so
+            # the authorizer reaches the sub-runtime's dispatch (a bare ``tool_registry``
+            # override would otherwise get an un-gated default ToolService).
+            if tool_authorizer is not None:
+                from himmy.services.tools.service import ToolService
+
+                sub_overrides["tool_service"] = ToolService(
+                    sub_registry, tool_authorizer=tool_authorizer.attenuate()
+                )
+            else:
+                sub_overrides["tool_registry"] = sub_registry
 
         sub_runtime, _inf, _tools = build_runtime(**sub_overrides)
         persona = Persona(

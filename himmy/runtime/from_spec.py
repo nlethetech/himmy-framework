@@ -211,6 +211,7 @@ def build_runtime_for_spec(
     durable_defaults: bool | None = None,
     storage: Any = None,
     subject: str | None = None,
+    tool_authorizer: Any = None,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring provider/model overrides + tools.
 
@@ -242,6 +243,15 @@ def build_runtime_for_spec(
     another's learned reputation. ``None`` (the one-shot CLI / offline path, which already
     uses an isolated in-memory store per process, and every pre-existing caller) leaves
     learning unscoped — byte-identical to before. Inert unless ``spec.self_learning``.
+
+    ``tool_authorizer`` (P0 confused-deputy fix) is the run principal's tool-capability
+    gate (:class:`~himmy.services.tools.capability.ToolCapabilityAuthorizer`). It is
+    threaded onto the per-run :class:`ToolService` so a tool call is authorized
+    deny-by-default against the caller's roles just before dispatch, AND propagated into
+    ``spawn_agent`` so a sub-agent's capabilities can only ATTENUATE (never exceed the
+    parent's). ``None`` (every offline/CLI caller) and a NON-enforcing authorizer (the
+    ANONYMOUS / all_tenants offline default) are exact no-ops — every tool is allowed,
+    byte-identical to before. Enforcement engages ONLY for a tenant-bound principal.
     """
     from himmy import build_runtime
     from himmy.cli.provider import build_inference_for
@@ -486,7 +496,9 @@ def build_runtime_for_spec(
             # worker's runtime has no spawn_agent tool, capping recursion at one level.
             from himmy.toolkit.spawn import register_spawn_tool
 
-            register_spawn_tool(registry, inference=inference)
+            register_spawn_tool(
+                registry, inference=inference, tool_authorizer=tool_authorizer
+            )
         if spec.allow_skill_dispatch:
             # dispatch_skill runs a named capability as a tool-scoped sub-agent; the
             # sub-runtime lacks the tool, so a dispatched skill can't dispatch again.
@@ -563,6 +575,8 @@ def build_runtime_for_spec(
                 # Stamp the run's workspace onto emitted tool events so the reputation
                 # miner reads them back tenant-scoped (P1). None when self-learning is off.
                 event_workspace_id=subject if reputation_provider is not None else None,
+                # P0: the run principal's deny-by-default tool-capability gate (no-op offline).
+                tool_authorizer=tool_authorizer,
             )
         elif reputation_provider is not None:
             # No guardrails, but self-learning is on: build the ToolService here (instead
@@ -578,6 +592,20 @@ def build_runtime_for_spec(
                 # Stamp the run's workspace onto emitted tool events so the reputation
                 # miner reads them back tenant-scoped (P1).
                 event_workspace_id=subject,
+                # P0: the run principal's deny-by-default tool-capability gate (no-op offline).
+                tool_authorizer=tool_authorizer,
+            )
+        elif tool_authorizer is not None:
+            # No guardrails and no self-learning, but a tool authorizer IS wired: build the
+            # ToolService here (rather than letting ``build_runtime`` make a bare one from the
+            # bare ``tool_registry``) so the capability gate actually reaches dispatch.
+            # ``event_sink`` mirrors ``build_runtime``'s default so tool events still flow.
+            from himmy.services.tools.service import ToolService
+
+            overrides["tool_service"] = ToolService(
+                registry,
+                event_sink=storage,
+                tool_authorizer=tool_authorizer,
             )
         else:
             overrides["tool_registry"] = registry

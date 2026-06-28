@@ -674,6 +674,7 @@ class RunAppService:
         agent_resolver: Callable[..., Any] | None = None,
         conversation_sink: Callable[..., Any] | None = None,
         graph_checkpoint_store_provider: Callable[[], Any] | None = None,
+        access_policy: Any = None,
     ) -> None:
         """Wire the runtime, store, optional registry, and recommendation service.
 
@@ -724,6 +725,14 @@ class RunAppService:
         self._checkpoint_store = checkpoint_store
         self._agent_resolver = agent_resolver
         self._conversation_sink = conversation_sink
+        # P0 tool authz: the RBAC policy used to rebuild a run's tool-capability gate from
+        # the persisted ``actor`` metadata at runtime-build time. ``None`` (the offline /
+        # zero-config default, and every programmatic caller that doesn't wire RBAC) means
+        # NO per-run tool authorizer is built — tool dispatch is byte-identical to before.
+        # The server container passes the active :class:`AccessPolicy` so a tenant-bound
+        # run's tools are gated deny-by-default; an ANONYMOUS / all_tenants actor still
+        # yields a NON-enforcing authorizer (pass-through), preserving offline behavior.
+        self._access_policy = access_policy
         # HITL orchestration resume needs the SAME durable graph checkpoint store the
         # team/workflow run paused into. The surface provides it lazily (a getter, so a
         # path/env change is honoured); ``None`` means orchestration HITL resume falls
@@ -1732,6 +1741,7 @@ class RunAppService:
                 checkpoint_store=checkpoint_store,
                 plan_mode=plan,
                 workspace_id=run.workspace_id,
+                actor=(run.metadata or {}).get("actor"),
             )
         except Exception as exc:  # noqa: BLE001 - spec wiring failure is terminal
             run.status = RunStatus.FAILED
@@ -2035,6 +2045,25 @@ class RunAppService:
                 return normalize_plan_steps((pending.args or {}).get("steps"))
         return []
 
+    def _build_tool_authorizer(self, actor: dict[str, Any] | None) -> Any:
+        """Rebuild this run's tool-capability gate from its persisted actor (P0).
+
+        Returns ``None`` when no RBAC policy is wired (the offline / zero-config default
+        and every programmatic caller) so ``build_runtime_for_spec`` builds a per-run
+        runtime with NO authorizer — tool dispatch byte-identical to before. When a policy
+        IS wired the gate is rebuilt from the actor descriptor: an actor carrying
+        ``tool_authz_enforce`` yields an ENFORCING authorizer over its recorded roles; the
+        ANONYMOUS / all_tenants offline actor (no flag) yields a NON-enforcing pass-through.
+        Building from the persisted actor (not a live Principal) is what lets the gate
+        survive the leased-dispatch recovery path, where a fresh process re-executes the
+        run with no in-memory principal.
+        """
+        if self._access_policy is None:
+            return None
+        from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+        return ToolCapabilityAuthorizer.from_actor(actor, self._access_policy)
+
     async def _resolve_runtime(
         self,
         agent_spec: AgentSpec | None,
@@ -2042,6 +2071,7 @@ class RunAppService:
         checkpoint_store: Any = None,
         plan_mode: bool = False,
         workspace_id: str | None = None,
+        actor: dict[str, Any] | None = None,
     ) -> SingleAgentRuntime:
         """Pick the runtime for a run: shared tool-less, or a per-run tool-bearing one.
 
@@ -2085,6 +2115,10 @@ class RunAppService:
         )
         from himmy.runtime.from_spec import build_runtime_for_spec
 
+        # P0: rebuild the run principal's tool-capability gate from the persisted actor and
+        # thread it into the per-run runtime (no-op offline / when no RBAC policy is wired).
+        tool_authorizer = self._build_tool_authorizer(actor)
+
         runtime, registry = await asyncio.to_thread(
             build_runtime_for_spec,
             agent_spec,
@@ -2092,6 +2126,7 @@ class RunAppService:
             storage=self._storage,
             checkpoint_store=checkpoint_store,
             subject=workspace_id,
+            tool_authorizer=tool_authorizer,
         )
         runtime = cast("SingleAgentRuntime", runtime)
         if plan_mode:

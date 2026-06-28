@@ -73,7 +73,15 @@ class Principal:
         return role in self.roles
 
     def actor_metadata(self) -> dict[str, Any]:
-        """Compact, log-safe descriptor of the actor (for run/entity stamping)."""
+        """Compact, log-safe descriptor of the actor (for run/entity stamping).
+
+        Carries the actor's ``roles`` and — for a tenant-bound principal — a
+        ``tool_authz_enforce`` flag (P0). The flag is what lets a run's tool-capability
+        gate be REBUILT from the persisted descriptor on the leased-dispatch recovery path
+        (a fresh process has no live :class:`Principal`); an unrestricted / ANONYMOUS
+        principal (``all_tenants``) omits it, so the rebuilt authorizer is a non-enforcing
+        pass-through and the offline path is byte-unchanged.
+        """
         meta: dict[str, Any] = {
             "subject": self.subject,
             "auth_method": self.auth_method,
@@ -82,6 +90,8 @@ class Principal:
             meta["roles"] = sorted(self.roles)
         if self.source_ip:
             meta["source_ip"] = self.source_ip
+        if not self.all_tenants:
+            meta["tool_authz_enforce"] = True
         return meta
 
 
