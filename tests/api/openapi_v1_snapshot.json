@@ -7039,7 +7039,7 @@
     },
     "/v1/runs/{run_id}/lineage": {
       "get": {
-        "description": "Trace a run's provenance subgraph: the persona, prompt, and evidence snapshot.\n\nReturns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.\n404 when the run is unknown / out-of-workspace or has no projected lineage.",
+        "description": "Trace a run's provenance subgraph: the persona, prompt, and evidence snapshot.\n\nReturns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.\n404 when the run is unknown / out-of-workspace or has no projected lineage.\n\nBOLA (WS-bola): lineage exposes a run's persona, prompt text, and context/evidence\nsnapshot, so it is a read sibling of ``/events`` and ``/thread`` and is gated the same\nway \u2014 a ``subject_scoped`` principal cannot read another data subject's run lineage\nwithin a shared tenant (clean 404 via :func:`_bola_blocked`). Other callers take the\nlegacy path byte-unchanged.",
         "operationId": "get_run_lineage_v1_runs__run_id__lineage_get",
         "parameters": [
           {

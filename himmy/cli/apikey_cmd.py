@@ -25,6 +25,7 @@ import json
 import os
 import secrets
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -221,14 +222,14 @@ def cmd_apikey_list(args: argparse.Namespace) -> int:
 
 def cmd_apikey(args: argparse.Namespace) -> int:
     """``himmy apikey <action>`` dispatcher."""
-    action = getattr(args, "action", None)
-    dispatch = {
+    action: str | None = getattr(args, "action", None)
+    dispatch: dict[str, Callable[[argparse.Namespace], int]] = {
         "mint": cmd_apikey_mint,
         "rotate": cmd_apikey_rotate,
         "revoke": cmd_apikey_revoke,
         "list": cmd_apikey_list,
     }
-    fn = dispatch.get(action)
+    fn = dispatch.get(action) if action is not None else None
     if fn is None:
         return _err(
             f"unknown apikey action: {action!r} (expected: mint/rotate/revoke/list)"
