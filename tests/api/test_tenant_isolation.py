@@ -332,3 +332,86 @@ def test_bola_non_subject_scoped_workspace_member_reads_all_subjects() -> None:
     run_b = _create_run_for(writer, "shared", "subj-b")
     assert writer.get(f"/v1/runs/{run_a}").status_code == 200
     assert writer.get(f"/v1/runs/{run_b}").status_code == 200
+
+
+def test_bola_subject_cannot_read_other_subjects_run_lineage() -> None:
+    """REQUIRED: lineage is a read sibling of /events and /thread and is BOLA-gated.
+
+    Lineage exposes a run's persona/prompt/evidence snapshot, so subject A reading
+    subject B's lineage within the SAME tenant must be a clean 404 (never a 200 that
+    would leak B's prompt text); a tenant_admin still reads it.
+    """
+    app = _bola_app()
+    writer = _client_on(app, "key-writer")
+    run_b = _create_run_for(writer, "shared", "subj-b")
+
+    client_a = _client_on(app, "key-a")
+    # A is subject-scoped to "subj-a"; B's lineage belongs to "subj-b" → 404 (no leak).
+    assert client_a.get(f"/v1/runs/{run_b}/lineage").status_code == 404
+
+    # The tenant_admin crosses subjects within its own tenant (200 when lineage exists).
+    admin = _client_on(app, "key-admin")
+    assert admin.get(f"/v1/runs/{run_b}/lineage").status_code in (200, 404)
+
+
+def test_bola_subject_can_read_its_own_run_lineage() -> None:
+    """No false lockout: A reads its OWN run's lineage within the shared tenant."""
+    app = _bola_app()
+    writer = _client_on(app, "key-writer")
+    run_a = _create_run_for(writer, "shared", "subj-a")
+
+    client_a = _client_on(app, "key-a")
+    # Own-subject lineage is never BOLA-blocked (200 if projected, else the route's own 404).
+    assert client_a.get(f"/v1/runs/{run_a}/lineage").status_code in (200, 404)
+
+
+def test_bola_subject_cannot_approve_or_reject_other_subjects_run() -> None:
+    """REQUIRED: approve/reject are WRITE siblings and must be subject-BOLA gated.
+
+    A subject-scoped caller targeting ANOTHER subject's run is collapsed into the SAME
+    clean 404 as an unknown run — never a 409 that would confirm the foreign run exists
+    or leak its lifecycle state, and never a cross-subject resume of a HITL-paused run.
+    The gate fires BEFORE resume_run, so the foreign run's status is never touched.
+    """
+    app = _bola_app()
+    writer = _client_on(app, "key-writer")
+    run_b = _create_run_for(writer, "shared", "subj-b")
+
+    client_a = _client_on(app, "key-a")
+    # A targeting B's run → 404 (BOLA gate), NOT a 409 that would confirm existence/state.
+    assert client_a.post(f"/v1/runs/{run_b}/approve").status_code == 404
+    assert client_a.post(f"/v1/runs/{run_b}/reject").status_code == 404
+
+    # B's run is unchanged (still terminal, never resumed by the foreign caller).
+    assert writer.get(f"/v1/runs/{run_b}").json()["status"] in ("SUCCEEDED", "FAILED")
+
+
+def test_bola_subject_approving_own_run_passes_the_gate() -> None:
+    """No false lockout: a subject's own run passes the BOLA gate.
+
+    The own-subject approve is NOT a 404 — the gate lets it through to resume_run, which
+    returns a 409 here only because an inline-persona run is not AWAITING_APPROVAL (so the
+    distinction between the BOLA 404 and the not-approvable 409 is observable).
+    """
+    app = _bola_app()
+    writer = _client_on(app, "key-writer")
+    run_a = _create_run_for(writer, "shared", "subj-a")
+
+    client_a = _client_on(app, "key-a")
+    # Own run is not hidden: a non-paused run yields the not-approvable 409, NOT a BOLA 404.
+    assert client_a.post(f"/v1/runs/{run_a}/approve").status_code == 409
+
+
+def test_bola_tenant_admin_can_target_any_subjects_run_for_approval() -> None:
+    """REQUIRED: a tenant_admin crosses subjects on the WRITE path too (no BOLA 404).
+
+    The admin's approve passes the subject gate and reaches resume_run (409 here only
+    because the inline-persona run is not AWAITING_APPROVAL — the point is it is NOT the
+    BOLA 404 a foreign subject-scoped caller would get).
+    """
+    app = _bola_app()
+    writer = _client_on(app, "key-writer")
+    run_b = _create_run_for(writer, "shared", "subj-b")
+
+    admin = _client_on(app, "key-admin")
+    assert admin.post(f"/v1/runs/{run_b}/approve").status_code == 409

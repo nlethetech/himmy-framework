@@ -237,8 +237,20 @@ async def _resume_run(
     no-op, never a second firing of the gated tool). Stamps the approver actor and audits
     the decision. The actual gated-tool execution + continuation happen on a fresh tracked
     background task; the response is the RUNNING record (fire-and-forget, like create).
+
+    Object-level (BOLA, WS-bola): these are the WRITE siblings of the gated read surfaces
+    (``get_run`` / ``/events`` / ``/thread`` / ``/pending-approvals``), and resuming another
+    data subject's HITL-paused run is a strictly worse hole than a read leak — it would FIRE
+    (approve) or permanently BLOCK (reject) that subject's gated tool. So a ``subject_scoped``
+    principal targeting a run that belongs to ANOTHER subject is collapsed into the SAME clean
+    404 as an unknown/out-of-workspace run (never a 409 that would confirm the foreign run
+    exists or leak its lifecycle state). The check runs BEFORE ``resume_run`` so the gated
+    tool is never touched. Non-subject-scoped / ``all_tenants`` / offline callers are
+    unaffected (:func:`_bola_blocked` short-circuits to ``False``).
     """
     workspace_id = resolve_workspace(request, body.workspace_id)
+    if await _bola_blocked(request, run_id, workspace_id):
+        raise HTTPException(status_code=404, detail="run not found")
     principal = get_principal(request)
     try:
         run = cast(
@@ -466,9 +478,17 @@ async def get_run_lineage(
 
     Returns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.
     404 when the run is unknown / out-of-workspace or has no projected lineage.
+
+    BOLA (WS-bola): lineage exposes a run's persona, prompt text, and context/evidence
+    snapshot, so it is a read sibling of ``/events`` and ``/thread`` and is gated the same
+    way — a ``subject_scoped`` principal cannot read another data subject's run lineage
+    within a shared tenant (clean 404 via :func:`_bola_blocked`). Other callers take the
+    legacy path byte-unchanged.
     """
     rel = [r.strip() for r in relations.split(",") if r.strip()] if relations else None
     workspace_id = resolve_workspace(request, workspace_id)
+    if await _bola_blocked(request, run_id, workspace_id):
+        raise HTTPException(status_code=404, detail="run lineage not found")
     graph = await _container(request).run_app.get_run_lineage(
         run_id, workspace_id=workspace_id, max_depth=max_depth, relations=rel
     )
