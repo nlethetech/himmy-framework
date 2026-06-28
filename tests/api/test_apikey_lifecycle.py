@@ -281,6 +281,36 @@ def test_revocation_recovery_clears_error_and_relogs(
     assert any("recovered" in r.message for r in caplog.records)
 
 
+def test_revocation_same_mtime_rewrite_is_observed(tmp_path: Path) -> None:
+    """A content rewrite that PRESERVES the file mtime must still be picked up.
+
+    Red-team r1: the refresh short-circuited on an unchanged ``st_mtime`` alone, so an
+    mtime-preserving sync/restore (rsync --times / cp -p / git checkout) or two edits
+    within the filesystem's mtime granularity left an already-revoked key authenticating
+    forever. The freshness key is now a composite ``(st_mtime_ns, st_size, st_ino)``, so
+    the size/inode delta of the rewrite is observed even with an identical mtime.
+    """
+    import os
+
+    revfile = tmp_path / "revoked.json"
+    # Prime the cache with an EMPTY revoked set (key "rk" is NOT yet revoked).
+    revfile.write_text(json.dumps([]))
+    primed_ns = revfile.stat().st_mtime_ns
+
+    rl = _RevocationList(revfile)
+    assert rl.is_revoked(_fingerprint("rk")) is False  # loads + caches the empty set
+
+    # Revoke the key by rewriting the file, then PIN the mtime back to the primed value
+    # (simulating an mtime-preserving restore). Only st_size/st_ino changed.
+    revfile.write_text(json.dumps([_fingerprint("rk")]))
+    os.utime(revfile, ns=(primed_ns, primed_ns))
+    assert revfile.stat().st_mtime_ns == primed_ns  # mtime truly unchanged
+
+    # Before the fix this returned False (stale empty set); now the composite fingerprint
+    # caught the rewrite and the key is seen as revoked.
+    assert rl.is_revoked(_fingerprint("rk")) is True
+
+
 def test_configured_absent_file_stays_inert_not_failclosed(tmp_path: Path) -> None:
     """A file that NEVER loaded has an empty last-known set, so it stays inert."""
     rec = KeyRecord.from_secret("rk", Principal.build("svc", tenant_ids=["t1"]))

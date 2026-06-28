@@ -97,11 +97,45 @@ STUDIO_READ_RESOURCES: tuple[str, ...] = (
     "studio.telegram",
 )
 
+#: Studio surfaces backed by a PROCESS-WIDE, single-user-local store that has NO tenant
+#: or subject axis (the memory/notes/tasks/chats/cookbook/calendar/knowledge/projects
+#: readers all enumerate one cwd-keyed store shared across every tenant). Unlike the run
+#: readers — which were retrofitted with ``studio_tenant_filter`` — these readers cannot
+#: intersect against the caller's tenant because the store has no workspace partition to
+#: intersect ON. Granting ``studio.<surface>:read`` to a TENANT-FACING role
+#: (viewer/operator/auditor — the roles a mapped API key is bound with) would therefore
+#: let any paying tenant read every OTHER tenant's/subject's private memory, transcripts,
+#: notes, and files via the Studio console (a cross-tenant/cross-subject BOLA). So these
+#: surfaces are withheld from the default browse roles and remain ``admin``-only (Studio
+#: is documented as a network-isolated OPERATOR console); a deployment that deliberately
+#: exposes one to a tenant role can still grant it explicitly via ``HIMMY_RBAC_FILE``.
+#: The OFFLINE path is unaffected — ``require_permission`` no-ops without an authenticator,
+#: so the single-box console reads everything byte-unchanged.
+_STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
+    {
+        "studio.memory",
+        "studio.notes",
+        "studio.tasks",
+        "studio.chats",
+        "studio.cookbook",
+        "studio.calendar",
+        "studio.knowledge",
+        "studio.projects",
+        "studio.files",
+    }
+)
+
 #: The read grants every browse-capable role (viewer/operator/auditor) holds on Studio:
-#: ``studio.<surface>:read`` for each surface above. Spliced into those roles below so
-#: the read-only console works once an authenticator is configured, while mutating
-#: ``studio.*:write`` / ``studio.mcp:manage`` permissions remain exclusively ``admin``.
-_STUDIO_READ_PERMS: list[str] = [f"{res}:read" for res in STUDIO_READ_RESOURCES]
+#: ``studio.<surface>:read`` for each surface above EXCEPT the un-partitionable global-store
+#: surfaces (:data:`_STUDIO_GLOBAL_STORE_RESOURCES`, which stay admin-only). Spliced into
+#: those roles below so the read-only console works once an authenticator is configured,
+#: while mutating ``studio.*:write`` / ``studio.mcp:manage`` permissions remain exclusively
+#: ``admin``.
+_STUDIO_READ_PERMS: list[str] = [
+    f"{res}:read"
+    for res in STUDIO_READ_RESOURCES
+    if res not in _STUDIO_GLOBAL_STORE_RESOURCES
+]
 
 
 DEFAULT_RBAC: dict[str, list[str]] = {

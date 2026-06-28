@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from himmy.api.auth import (
     authorize_object,
+    enforce_subject_write,
     get_principal,
     require_permission,
     require_workspace,
@@ -210,6 +211,10 @@ async def post_message(
     ``thread_id`` is a 404; a thread with no resolvable agent is a 422.
     """
     workspace_id = require_workspace(request, body.workspace_id or "")
+    # BOLA write gate (WS-bola): a subject_scoped principal may only post a turn under its
+    # OWN subject — else it could author conversation history / lineage under a foreign data
+    # subject. A no-op for offline / all_tenants / tenant_admin callers.
+    enforce_subject_write(request, body.subject_id)
     try:
         run = cast(
             RunRecord,

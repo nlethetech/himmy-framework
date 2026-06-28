@@ -212,7 +212,14 @@ class _RevocationList:
 
     def __init__(self, path: str | Path | None) -> None:
         self._path = Path(path).expanduser() if path else None
-        self._mtime: float | None = None
+        #: The composite freshness fingerprint of the last successful read. Keyed on
+        #: ``(st_mtime_ns, st_size, st_ino)`` rather than ``st_mtime`` alone so a content
+        #: rewrite that PRESERVES the mtime — an atomic replace that copies the source
+        #: mtime, an ``rsync --times`` / ``cp -p`` / ``git checkout``, or two writes within
+        #: the filesystem's coarse mtime granularity — still changes the size or inode and
+        #: is therefore observed, instead of silently serving the stale revoked set (which
+        #: would let an already-revoked, leaked key keep authenticating).
+        self._fingerprint: tuple[int, int, int] | None = None
         self._revoked: frozenset[str] = frozenset()
         #: True once the file has been read+parsed successfully at least once.
         self._ever_loaded = False
@@ -234,19 +241,25 @@ class _RevocationList:
         return key_id in self._revoked
 
     def _refresh(self) -> bool:
-        """Re-read the file if its mtime changed. Returns whether the list is trusted.
+        """Re-read the file if its stat fingerprint changed. Returns whether trusted.
 
         ``True`` ⇒ the current ``_revoked`` reflects a successful read (or an unchanged
-        mtime since the last success). ``False`` ⇒ a stat/read/parse failure on a
-        CONFIGURED file; ``_revoked`` is left at its last-known value (NOT cleared) and
-        the failure is logged once.
+        ``(st_mtime_ns, st_size, st_ino)`` fingerprint since the last success). ``False`` ⇒
+        a stat/read/parse failure on a CONFIGURED file; ``_revoked`` is left at its
+        last-known value (NOT cleared) and the failure is logged once.
+
+        The fingerprint is composite (not bare ``st_mtime``) so a same-mtime content rewrite
+        — an mtime-preserving sync/restore, or two edits within the filesystem's mtime
+        granularity — still flips ``st_size``/``st_ino`` and is re-read, instead of serving
+        a stale revoked set that would keep an already-revoked key authenticating.
         """
         assert self._path is not None
         try:
-            mtime = self._path.stat().st_mtime
+            st = self._path.stat()
+            fingerprint = (st.st_mtime_ns, st.st_size, st.st_ino)
         except OSError as exc:
             return self._on_failure(f"cannot stat revocation file {self._path}: {exc}")
-        if mtime == self._mtime and self._ever_loaded:
+        if fingerprint == self._fingerprint and self._ever_loaded:
             return True
         try:
             raw = json.loads(self._path.read_text())
@@ -260,7 +273,7 @@ class _RevocationList:
             self._revoked = frozenset(str(item) for item in raw)
         else:
             self._revoked = frozenset()
-        self._mtime = mtime
+        self._fingerprint = fingerprint
         self._ever_loaded = True
         if self._last_error is not None:
             logger.warning("revocation file recovered: %s", self._path)

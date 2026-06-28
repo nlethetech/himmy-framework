@@ -188,6 +188,41 @@ def narrow_subject(request: Request, requested: str | None) -> str | None:
     return principal.subject
 
 
+def enforce_subject_write(request: Request, subject_id: str | None) -> None:
+    """Object-level (BOLA) WRITE gate: may this principal CREATE/MUTATE under ``subject_id``?
+
+    The write-path companion to :func:`authorize_object` (by-id read) and
+    :func:`narrow_subject` (list read). The read gates were applied symmetrically across
+    the runs/threads readers, but the CREATE/UPSERT paths took ``subject_id`` straight from
+    the request body — letting an opt-in ``subject_scoped`` principal STAMP a run/thread/PII
+    field under ANOTHER data subject (an attribution / lineage / erasure-scope poisoning
+    BOLA). This closes that asymmetry: a ``subject_scoped`` principal WITHOUT the
+    ``tenant_admin`` role may only write under its OWN ``subject``; a mismatch is **403**.
+
+    Like every other gate here this is a strict NO-OP for the offline / ``all_tenants`` /
+    historical-multi-user-workspace / ``tenant_admin`` path — those principals are not
+    ``subject_scoped``, so the check short-circuits and the zero-config write path is
+    byte-unchanged. A ``None`` subject (a subject-less legacy write) is always allowed.
+    """
+    principal = get_principal(request)
+    if principal.may_access_subject(subject_id):
+        return
+    from himmy.api.security_audit import audit_event
+
+    audit_event(
+        request,
+        event_type="authz_denied",
+        outcome="deny",
+        resource="subject",
+        action="write",
+        detail="subject_scoped principal may only write under its own subject_id",
+    )
+    raise HTTPException(
+        status_code=403,
+        detail="subject access denied",
+    )
+
+
 def studio_tenant_filter(request: Request) -> frozenset[str] | None:
     """The set of workspaces a Studio LIST reader may surface, or ``None`` for ALL.
 
@@ -248,6 +283,7 @@ __all__ = [
     "require_workspace",
     "authorize_object",
     "narrow_subject",
+    "enforce_subject_write",
     "studio_tenant_filter",
     "authorize_studio_object",
 ]

@@ -419,6 +419,68 @@ def test_readonly_studio_role_is_403_on_connection_mutation(studio_cwd: Path) ->
     assert r.status_code == 403
 
 
+# ---- red-team r1: un-partitionable global-store Studio readers are admin-only -----
+# The memory/notes/tasks/chats/cookbook/calendar/knowledge/projects/files readers all
+# enumerate ONE process-wide, single-user-local store with NO tenant/subject axis, so a
+# tenant-facing role (viewer/operator/auditor) granted ``studio.<surface>:read`` would
+# read every OTHER tenant's/subject's private data (cross-tenant/cross-subject BOLA).
+# These surfaces are withheld from the default browse roles (admin-only) once an
+# authenticator is configured; the offline path is untouched (require_permission no-ops).
+_GLOBAL_STORE_READS = [
+    "/api/studio/memory/subjects",
+    "/api/studio/notes",
+    "/api/studio/tasks",
+    "/api/studio/chats",
+    "/api/studio/cookbook",
+    "/api/studio/calendar",
+    "/api/studio/projects",
+    "/api/studio/files",
+]
+
+
+@pytest.mark.parametrize("role", ["viewer", "operator", "auditor"])
+@pytest.mark.parametrize("path", _GLOBAL_STORE_READS)
+def test_tenant_role_is_403_on_global_store_reader(
+    studio_cwd: Path, role: str, path: str
+) -> None:
+    """A configured tenant-facing role is 403 reading an un-partitionable global store."""
+    c, _ = _studio_client(role)
+    assert c.get(path).status_code == 403, f"{role} reached {path}"
+
+
+@pytest.mark.parametrize("path", _GLOBAL_STORE_READS)
+def test_admin_can_read_global_store_reader(studio_cwd: Path, path: str) -> None:
+    """``admin`` (``*:*``) still reads the operator-console global stores (not 403)."""
+    c, _ = _studio_client("admin")
+    assert c.get(path).status_code != 403, f"admin blocked on {path}"
+
+
+@pytest.mark.parametrize("path", _GLOBAL_STORE_READS)
+def test_offline_reads_global_store_reader(studio_cwd: Path, path: str) -> None:
+    """INVARIANT: offline / no-auth reads every global-store surface (byte-unchanged)."""
+    c = TestClient(create_app(ApiContainer.build_default()))
+    assert c.get(path).status_code != 403, f"offline blocked on {path}"
+
+
+def test_tenant_role_is_403_on_mcp_test_launch(studio_cwd: Path) -> None:
+    """``viewer`` cannot launch an MCP server subprocess via /test (now studio.mcp:manage).
+
+    Probing /test spawns the server with admin secrets resolved into env AND mutates the
+    persisted registry — both privileged. Previously it rode only the ``studio.mcp:read``
+    baseline; a read-only role must now be 403'd BEFORE any subprocess is spawned.
+    """
+    c, _ = _studio_client("viewer")
+    assert c.post("/api/studio/mcp/servers/any/test").status_code == 403
+    op, _ = _studio_client("operator")
+    assert op.post("/api/studio/mcp/servers/any/test").status_code == 403
+
+
+def test_admin_passes_mcp_test_rbac(studio_cwd: Path) -> None:
+    """``admin`` clears the /test manage guard (404 on a missing server, not 403)."""
+    c, _ = _studio_client("admin")
+    assert c.post("/api/studio/mcp/servers/missing/test").status_code == 404
+
+
 def test_admin_can_mutate_studio(studio_cwd: Path) -> None:
     """``admin`` (``*:*``) clears every granular Studio write/manage guard."""
     c, _ = _studio_client("admin")

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from himmy.api.auth import (
     authorize_object,
+    enforce_subject_write,
     get_principal,
     narrow_subject,
     require_permission,
@@ -151,6 +152,10 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
         )
 
     workspace_id = require_workspace(request, body.workspace_id)
+    # BOLA write gate (WS-bola): a subject_scoped principal may only create a run under its
+    # OWN subject — else it could stamp a run (and its lineage / erasure linkage) under a
+    # foreign data subject. A no-op for offline / all_tenants / tenant_admin callers.
+    enforce_subject_write(request, body.subject_id)
     task = Task(
         title=body.task.title,
         prompt=body.task.prompt,

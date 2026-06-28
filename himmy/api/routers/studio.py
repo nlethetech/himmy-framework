@@ -966,7 +966,7 @@ class TaskDoneRequest(BaseModel):
     done: bool = True
 
 
-@router.get("/tasks")
+@router.get("/tasks", dependencies=[Depends(studio_permission(_RES_TASKS, "read"))])
 async def tasks_list() -> list[Any]:
     from himmy.api.studio_tasks import get_tasks_store
 
@@ -1019,14 +1019,17 @@ class ChatRenameRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
 
 
-@router.get("/chats")
+@router.get("/chats", dependencies=[Depends(studio_permission(_RES_CHATS, "read"))])
 async def chats_list() -> Any:
     from himmy.api.studio_chats import get_chats_store
 
     return get_chats_store().list()
 
 
-@router.get("/chats/{session_id}")
+@router.get(
+    "/chats/{session_id}",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "read"))],
+)
 async def chats_get(session_id: str) -> Any:
     from himmy.api.studio_chats import get_chats_store
 
@@ -1081,7 +1084,9 @@ class RecipeUpsertRequest(BaseModel):
     notes: str = Field("", max_length=4000)
 
 
-@router.get("/cookbook")
+@router.get(
+    "/cookbook", dependencies=[Depends(studio_permission(_RES_COOKBOOK, "read"))]
+)
 async def cookbook_list() -> list[Any]:
     from himmy.api.studio_cookbook import get_cookbook_store
 
@@ -1124,14 +1129,17 @@ class NoteUpsertRequest(BaseModel):
     body: str = Field("", max_length=200_000)
 
 
-@router.get("/notes")
+@router.get("/notes", dependencies=[Depends(studio_permission(_RES_NOTES, "read"))])
 async def notes_list() -> list[Any]:
     from himmy.api.studio_notes import get_notes_store
 
     return get_notes_store().list()
 
 
-@router.get("/notes/{note_id}")
+@router.get(
+    "/notes/{note_id}",
+    dependencies=[Depends(studio_permission(_RES_NOTES, "read"))],
+)
 async def notes_get(note_id: str) -> Any:
     from himmy.api.studio_notes import get_notes_store
 
@@ -1170,7 +1178,9 @@ class CalendarAddRequest(BaseModel):
     notes: str = Field("", max_length=4000)
 
 
-@router.get("/calendar")
+@router.get(
+    "/calendar", dependencies=[Depends(studio_permission(_RES_CALENDAR, "read"))]
+)
 async def calendar_list(month: str | None = None) -> list[Any]:
     from himmy.api.studio_calendar import get_calendar_store
 
@@ -1216,14 +1226,18 @@ class MemoryRecallRequest(BaseModel):
     similarity_threshold: float | None = Field(None, ge=0.0, le=1.0)
 
 
-@router.get("/memory/subjects", response_model=list[str])
+@router.get(
+    "/memory/subjects",
+    response_model=list[str],
+    dependencies=[Depends(studio_permission(_RES_MEMORY, "read"))],
+)
 async def memory_subjects() -> list[str]:
     from himmy.api import studio_memory
 
     return studio_memory.list_subjects()
 
 
-@router.get("/memory")
+@router.get("/memory", dependencies=[Depends(studio_permission(_RES_MEMORY, "read"))])
 async def memory_list(subject: str = "default") -> list[Any]:
     from himmy.api import studio_memory
 
@@ -1249,7 +1263,10 @@ async def memory_forget(memory_id: str) -> dict[str, bool]:
     return {"ok": studio_memory.forget(memory_id)}
 
 
-@router.post("/memory/recall")
+@router.post(
+    "/memory/recall",
+    dependencies=[Depends(studio_permission(_RES_MEMORY, "read"))],
+)
 async def memory_recall(body: MemoryRecallRequest) -> list[Any]:
     from himmy.api import studio_memory
 
@@ -1278,7 +1295,9 @@ class KbSearchRequest(BaseModel):
     top_k: int = Field(5, ge=1, le=50)
 
 
-@router.get("/knowledge")
+@router.get(
+    "/knowledge", dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "read"))]
+)
 async def kb_list() -> list[Any]:
     from himmy.api import studio_knowledge
 
@@ -1304,7 +1323,10 @@ async def kb_ingest(kb_id: str, body: KbIngestRequest) -> Any:
     return await studio_knowledge.ingest_text(kb_id, body.text, title=body.title)
 
 
-@router.post("/knowledge/{kb_id}/search")
+@router.post(
+    "/knowledge/{kb_id}/search",
+    dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "read"))],
+)
 async def kb_search(kb_id: str, body: KbSearchRequest) -> list[Any]:
     from himmy.api import studio_knowledge
 

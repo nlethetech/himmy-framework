@@ -385,13 +385,20 @@ async def _probe(record: dict[str, Any], env: dict[str, str]) -> TestResult:
         await client.aclose()
 
 
-@router.post("/servers/{name}/test")
+@router.post("/servers/{name}/test", dependencies=[_mcp_manage])
 async def test_server(name: str) -> TestResult:
     """Launch the server briefly and return its tool list (or a clear failure).
 
     Always answers 200 with a verdict — a server that fails to start is an
     expected, reportable outcome, not an API error. The verdict (and on
     success the tool list) is cached on the registry entry.
+
+    Requires ``studio.mcp:manage`` (NOT the router's ``:read`` baseline): probing a
+    server SPAWNS its subprocess with admin-provisioned secrets resolved into the env,
+    and MUTATES persisted registry state (``last_test``/``tools``/``tools_at``) — both
+    privileged side effects (subprocess execution + a write), not a read. Leaving it at
+    ``:read`` let a low-privilege console role (viewer/operator/auditor) execute an
+    admin-registered server on demand and poison its cached state.
     """
     with _LOCK:
         record = dict(_must_find(_load_servers(), name))

@@ -5152,7 +5152,7 @@
     },
     "/v1/context/fields": {
       "get": {
-        "description": "List the stored context fields for a subject (workspace-scoped, AAEO-4).",
+        "description": "List the stored context fields for a subject (workspace-scoped, AAEO-4).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal reading ANOTHER data\nsubject's PII fields within its own tenant gets an empty list (the same not-found-shaped\nresponse a foreign subject yields) \u2014 :func:`authorize_object` is a no-op for offline /\n``all_tenants`` / ``tenant_admin`` callers, so the zero-config read is byte-unchanged.",
         "operationId": "list_fields_v1_context_fields_get",
         "parameters": [
           {
@@ -5215,7 +5215,7 @@
     },
     "/v1/context/fields:upsert": {
       "post": {
-        "description": "Bulk-upsert context fields for a subject; returns the saved count.",
+        "description": "Bulk-upsert context fields for a subject; returns the saved count.\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal may only write under its\nOWN ``subject_id`` (a foreign subject is 403 via :func:`enforce_subject_write`), so a\nsubject-scoped tenant can never overwrite/poison another data subject's PII fields in a\nshared workspace. The gate is a no-op for the offline / ``all_tenants`` / ``tenant_admin``\npath, so the zero-config write is byte-unchanged.",
         "operationId": "upsert_fields_v1_context_fields_upsert_post",
         "requestBody": {
           "content": {
@@ -5257,7 +5257,7 @@
     },
     "/v1/context/snapshots/{snapshot_id}": {
       "get": {
-        "description": "Load one context snapshot by id (404 when unknown/out-of-workspace, AAEO-4).",
+        "description": "Load one context snapshot by id (404 when unknown/out-of-workspace, AAEO-4).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal resolving a snapshot built\nfor ANOTHER data subject within its own tenant gets a clean 404 \u2014 the workspace scope is\nchecked first, then the snapshot's ``subject_id`` is gated via :func:`authorize_object`.\nA no-op for offline / ``all_tenants`` / ``tenant_admin`` callers (byte-unchanged).",
         "operationId": "get_snapshot_v1_context_snapshots__snapshot_id__get",
         "parameters": [
           {
@@ -5326,7 +5326,7 @@
     },
     "/v1/context/snapshots:build": {
       "post": {
-        "description": "Build, persist, and return a context snapshot (stamping workspace scope).",
+        "description": "Build, persist, and return a context snapshot (stamping workspace scope).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal may only build a snapshot\nfor its OWN ``subject_id`` (403 otherwise via :func:`enforce_subject_write`) \u2014 a no-op\nfor offline / ``all_tenants`` / ``tenant_admin`` callers.",
         "operationId": "build_snapshot_v1_context_snapshots_build_post",
         "requestBody": {
           "content": {
