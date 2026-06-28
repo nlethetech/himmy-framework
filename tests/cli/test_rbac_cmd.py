@@ -385,5 +385,81 @@ def test_prompt_approval_admin_default_prompts(monkeypatch):
     assert any("approval required" in line for line in lines)
 
 
+# --- `himmy rbac validate` CLI -------------------------------------------------
+
+
+def _validate(file_path) -> int:
+    return rbac_cmd.cmd_rbac(_ns(action="validate", file=str(file_path)))
+
+
+def test_rbac_validate_happy_path(monkeypatch, tmp_path, capsys):
+    _clean_env(monkeypatch)
+    f = tmp_path / "rbac.json"
+    f.write_text(json.dumps({"viewer": ["run:read"], "admin": ["*:*"]}))
+    rc = _validate(f)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "policy OK" in out
+
+
+def test_rbac_validate_trailing_colon_errors(monkeypatch, tmp_path, capsys):
+    """A hand-edited 'run:' is rejected (exit non-zero), naming the role."""
+    _clean_env(monkeypatch)
+    f = tmp_path / "rbac.json"
+    f.write_text(json.dumps({"oops": ["run:"]}))
+    rc = _validate(f)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "oops" in out
+    assert "1 error" in out
+
+
+def test_rbac_validate_empty_policy_warns(monkeypatch, tmp_path, capsys):
+    """An empty {} validates (no error) but warns about the lock-out."""
+    _clean_env(monkeypatch)
+    f = tmp_path / "rbac.json"
+    f.write_text(json.dumps({}))
+    rc = _validate(f)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "EMPTY" in out
+
+
+def test_rbac_validate_nonadmin_wildcard_warns(monkeypatch, tmp_path, capsys):
+    _clean_env(monkeypatch)
+    f = tmp_path / "rbac.json"
+    f.write_text(json.dumps({"weak": ["*:read"]}))
+    rc = _validate(f)
+    out = capsys.readouterr().out
+    assert rc == 0  # warning, not an error
+    assert "wildcard" in out
+    assert "weak" in out
+
+
+def test_rbac_validate_missing_file(monkeypatch, tmp_path, capsys):
+    _clean_env(monkeypatch)
+    rc = _validate(tmp_path / "nope.json")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "no such file" in out
+
+
+def test_rbac_validate_bad_json(monkeypatch, tmp_path, capsys):
+    _clean_env(monkeypatch)
+    f = tmp_path / "rbac.json"
+    f.write_text("{not json")
+    rc = _validate(f)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "invalid JSON" in out
+
+
+def test_rbac_validate_unknown_action(monkeypatch, tmp_path, capsys):
+    rc = rbac_cmd.cmd_rbac(_ns(action="bogus"))
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "unknown rbac action" in out
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

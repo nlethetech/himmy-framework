@@ -81,6 +81,12 @@ def _cmd_whoami(args: argparse.Namespace) -> int:
     return cmd_whoami(args)
 
 
+def _cmd_rbac(args: argparse.Namespace) -> int:
+    from himmy.cli.rbac_cmd import cmd_rbac
+
+    return cmd_rbac(args)
+
+
 def _cmd_mcp(args: argparse.Namespace) -> int:
     from himmy.cli.mcp_cmd import cmd_mcp
 
@@ -602,6 +608,20 @@ def build_parser() -> argparse.ArgumentParser:
         "/ admin)",
     )
     p_whoami.set_defaults(func=_cmd_whoami)
+
+    # rbac — validate/lint an RBAC policy file before it ships (fail-closed gate).
+    p_rbac = sub.add_parser(
+        "rbac", help="validate an RBAC policy file (HIMMY_RBAC_FILE format)"
+    )
+    rbac_sub = p_rbac.add_subparsers(dest="action", required=True)
+    p_rbac_validate = rbac_sub.add_parser(
+        "validate",
+        help="load + lint a policy file; print errors/warnings, exit non-zero on error",
+    )
+    p_rbac_validate.add_argument(
+        "file", help="path to the JSON RBAC policy ({role: ['resource:action', ...]})"
+    )
+    p_rbac.set_defaults(func=_cmd_rbac)
 
     # mcp — manage the stdio MCP servers wired into an agent.yaml.
     p_mcp = sub.add_parser(

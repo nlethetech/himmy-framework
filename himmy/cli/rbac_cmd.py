@@ -380,6 +380,78 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rbac_validate(args: argparse.Namespace) -> int:
+    """``himmy rbac validate <file>`` — load + lint a policy file (exit non-zero on error).
+
+    Loads the JSON policy at ``args.file`` and runs the same strict validation the
+    server applies at startup, but in a NON-raising, report-everything mode
+    (:func:`~himmy.api.auth.rbac.lint_policy`): it prints every FATAL error (bad shape,
+    malformed ``resource:action`` specs — each naming the offending role) and every
+    non-fatal WARNING (empty lock-out, a non-``admin`` wildcard, unknown-token typos),
+    then exits ``1`` iff there were errors. So an operator can catch a hand-edit that
+    would silently widen access (or lock everyone out) BEFORE it reaches production.
+    """
+    import json
+
+    from himmy.api.auth.rbac import RbacPolicyError, lint_policy
+
+    out = sys.stdout
+    c = styles(out)
+    path = Path(args.file).expanduser()
+    if not path.is_file():
+        print(f"{c['crimson']}✗ no such file: {path}{c['reset']}", file=out)
+        return 1
+    try:
+        raw = json.loads(path.read_text())
+    except OSError as exc:
+        print(f"{c['crimson']}✗ cannot read {path}: {exc}{c['reset']}", file=out)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"{c['crimson']}✗ invalid JSON in {path}: {exc}{c['reset']}", file=out)
+        return 1
+
+    try:
+        _policy, errors, warnings = lint_policy(raw)
+    except RbacPolicyError as exc:  # pragma: no cover - lint_policy collects, never raises
+        print(f"{c['crimson']}✗ {exc}{c['reset']}", file=out)
+        return 1
+
+    for warning in warnings:
+        print(f"{c['gold']}⚠ {warning}{c['reset']}", file=out)
+    for error in errors:
+        print(f"{c['crimson']}✗ {error}{c['reset']}", file=out)
+
+    if errors:
+        n = len(errors)
+        print(
+            f"{c['crimson']}✗ {path}: {n} error{'s' if n != 1 else ''}"
+            f"{c['reset']}",
+            file=out,
+        )
+        return 1
+    nw = len(warnings)
+    suffix = (
+        f" {c['faint']}({nw} warning{'s' if nw != 1 else ''}){c['reset']}"
+        if nw
+        else ""
+    )
+    print(f"{c['green']}✓ {path}: policy OK{c['reset']}{suffix}", file=out)
+    return 0
+
+
+def cmd_rbac(args: argparse.Namespace) -> int:
+    """``himmy rbac <action>`` dispatcher (currently only ``validate``)."""
+    action = getattr(args, "action", None)
+    if action == "validate":
+        return cmd_rbac_validate(args)
+    print(
+        f"{styles(sys.stdout)['crimson']}unknown rbac action: {action!r} "
+        f"(expected: validate){styles(sys.stdout)['reset']}",
+        file=sys.stdout,
+    )
+    return 2
+
+
 __all__ = [
     "CLI_RBAC",
     "CLI_DEFAULT_POLICY",
@@ -391,4 +463,6 @@ __all__ = [
     "enforce_role_on_registry",
     "deny_message",
     "cmd_whoami",
+    "cmd_rbac",
+    "cmd_rbac_validate",
 ]
