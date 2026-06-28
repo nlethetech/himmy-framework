@@ -698,7 +698,7 @@ class DiscordGatewayListener:
         client = discord.Client(intents=intents)
         listener = self
 
-        @client.event
+        @client.event  # type: ignore[untyped-decorator]
         async def on_message(message: Any) -> None:
             if message.author.bot:
                 return  # never act on another bot (incl. ourselves) — loop guard

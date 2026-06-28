@@ -26,6 +26,7 @@ PROVIDERS = (
     "stub",
     "claude-cli",
     "ollama",
+    "himalayagpt",
     "pydantic-ai",
     "openrouter",
     "openai-compatible",
@@ -69,6 +70,56 @@ def _default_ollama_model() -> str:
     return "llama3.2"
 
 
+#: Default model id for the in-house HimalayaGPT provider (HF repo id + GGUF basename).
+HIMALAYAGPT_DEFAULT_MODEL = "himalaya-ai/himalayagpt-0.5b-it"
+
+
+def _build_himalayagpt_manager(model: str | None) -> ClientManager:
+    """Build the HimalayaGPT-0.5b manager backed by a local ``llama-server`` bridge.
+
+    The bridge attaches to a server at ``HIMMY_HIMALAYA_BASE_URL`` (e.g.
+    ``http://127.0.0.1:8081``) when set, otherwise spawns and owns its own from the
+    nanochat llama.cpp fork (``HIMMY_HIMALAYA_SERVER_BIN`` + ``HIMMY_HIMALAYA_MODEL_PATH``,
+    Metal-safe ``-ngl 11``). Tunables: ``HIMMY_HIMALAYA_MAX_TOKENS`` (reply cap).
+
+    A missing binary/GGUF or an unreachable server is surfaced as an actionable
+    :class:`ProviderError` (the bridge's ``start`` raises before the first turn) so the
+    operator sees the runbook hint instead of a per-turn apology.
+    """
+    import os
+
+    from himmy.services.inference.himalaya_bridge import HimalayaGptFastBridge
+    from himmy.services.inference.local import HimalayaGptClientManager
+
+    base_url = (os.environ.get("HIMMY_HIMALAYA_BASE_URL") or "").strip() or None
+    kwargs: dict[str, object] = {}
+    if base_url:
+        kwargs["base_url"] = base_url
+    if server_bin := (os.environ.get("HIMMY_HIMALAYA_SERVER_BIN") or "").strip():
+        kwargs["server_bin"] = server_bin
+    if model_path := (os.environ.get("HIMMY_HIMALAYA_MODEL_PATH") or "").strip():
+        kwargs["model_path"] = model_path
+    bridge = HimalayaGptFastBridge(**kwargs)  # type: ignore[arg-type]
+    try:
+        bridge.start()
+    except Exception as exc:  # noqa: BLE001 - surface as an actionable provider error
+        raise ProviderError(
+            "provider 'himalayagpt' could not reach a llama-server: "
+            f"{exc}. Either start one (see experiments/himalayagpt/"
+            "FAST_RUNTIME_RUNBOOK.md) and set HIMMY_HIMALAYA_BASE_URL, or build the "
+            "GGUF + nanochat llama.cpp fork at ~/himalaya-runtime/ so the bridge can "
+            "spawn its own."
+        ) from exc
+    try:
+        max_tokens = int(os.environ.get("HIMMY_HIMALAYA_MAX_TOKENS") or "256")
+    except ValueError:
+        max_tokens = 256
+    return HimalayaGptClientManager(
+        model_name=model or HIMALAYAGPT_DEFAULT_MODEL,
+        generate_fn=bridge.generate_fn(max_new_tokens=max_tokens, temperature=0.0),
+    )
+
+
 class ProviderError(HimmyError):
     """Raised when a requested provider cannot be constructed (e.g. missing extra)."""
 
@@ -100,6 +151,9 @@ def build_manager_for(
         from himmy.services.inference.local import OllamaClientManager
 
         return OllamaClientManager(model=model or _default_ollama_model())
+
+    if provider == "himalayagpt":
+        return _build_himalayagpt_manager(model)
 
     if provider == "pydantic-ai":
         try:

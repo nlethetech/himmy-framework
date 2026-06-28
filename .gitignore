@@ -77,3 +77,18 @@ scripts/tau2/workdir/
 scripts/real_bfcl/proj/.file_locks/
 scripts/real_bfcl/proj/score/
 scripts/real_bfcl/proj/result/
+
+# --- local research/benchmark scaffolding + artifacts (kept on disk, not committed) ---
+# Heavy/third-party benchmark harness checkouts + their run data:
+scripts/real_bfcl/
+scripts/tau2/
+scripts/bfcl/
+scripts/gemma4_server/
+scripts/BENCHMARKING.md
+# Generated benchmark result dumps:
+benchmarks/results/
+# Local red-team report notes + double-click launchers:
+REDTEAM_FINAL_2026-06-25.md
+REDTEAM_REPORT_2026-06-25.md
+REDTEAM_STAGE2_REATTACK_2026-06-25.md
+chat-himalaya.command

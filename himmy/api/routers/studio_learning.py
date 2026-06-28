@@ -13,11 +13,13 @@ onto the SAME ``.himmy/spine.db`` the runtime reads, so an override the operator
 panel is the override the runtime honours (and the table can never disagree with
 ``bound_tools``). The GET and each write return the refreshed :class:`LearningResponse`.
 
-Single-operator-local: like the seclog viewer the panel does not filter by workspace (the
-``ws=None`` default scopes to the operator's own learning). TODO(multi-tenant): a multi-tenant
-deployment MUST thread the request's resolved ``workspace_id`` into BOTH the GET ``load`` /
-``build_learning_report`` AND the POST write paths (``set_override`` / ``set_trust_feedback``)
-— otherwise one tenant could read or set another tenant's overrides.
+Multi-tenant: the effective workspace is resolved from the request's verified principal
+via :func:`~himmy.api.auth.context.resolve_workspace` and threaded into BOTH the GET
+``load`` / ``build_learning_report`` read path AND the POST write paths
+(``set_override`` / ``set_trust_feedback``), so one tenant can never read or mutate
+another tenant's learning data. With no authenticator configured (the offline
+single-operator default) the principal is unrestricted and the resolved workspace is
+``None`` — byte-for-byte the legacy ``default``-subject behaviour.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from typing import Any
 from fastapi import HTTPException, Query, Request
 from pydantic import BaseModel
 
+from himmy.api.auth import resolve_workspace
 from himmy.api.routers.studio_common import build_studio_router
 from himmy.services.learning.overrides import (
     OverrideKind,
@@ -37,10 +40,18 @@ from himmy.services.learning.report import LearningReport, build_learning_report
 
 router = build_studio_router("learning", tag="studio-learning")
 
-#: The workspace the single-operator-local panel scopes to. ``None`` -> the ``default``
-#: subject on the spine (parity with the CLI / Sprint-1 read path). TODO(multi-tenant):
-#: resolve from the request principal and thread into every load / build / write below.
-_PANEL_WORKSPACE: str | None = None
+
+def _panel_workspace(request: Request) -> str | None:
+    """Resolve the effective ``workspace_id`` for this request from its principal.
+
+    Delegates to the BFF's single tenant-isolation choke point
+    (:func:`~himmy.api.auth.context.resolve_workspace`): an unrestricted principal
+    (offline default / trusted shared key) yields ``None`` (legacy ``default`` subject),
+    while a tenant-bound principal is pinned to its own workspace (and a multi-tenant
+    principal with no single default gets a 400) — so a tenant only ever reads/writes
+    its own learning data.
+    """
+    return resolve_workspace(request, None)
 
 
 class LearningToolModel(BaseModel):
@@ -141,8 +152,8 @@ def _to_response(report: LearningReport) -> LearningResponse:
     )
 
 
-def _load_override_set() -> OverrideSet:
-    """Load the operator overrides for the panel workspace (best-effort).
+def _load_override_set(workspace_id: str | None) -> OverrideSet:
+    """Load the operator overrides for ``workspace_id`` (best-effort).
 
     Reaches the SAME ``.himmy/spine.db`` the runtime reads via
     :meth:`OverrideStore.for_context` (``server=True`` — this is the server entrypoint), so
@@ -151,7 +162,7 @@ def _load_override_set() -> OverrideSet:
     rather than 500-ing.
     """
     try:
-        return OverrideStore.for_context(server=True).load(_PANEL_WORKSPACE)
+        return OverrideStore.for_context(server=True).load(workspace_id)
     except Exception:  # pragma: no cover - defensive: overrides never break the panel
         return OverrideSet()
 
@@ -159,12 +170,17 @@ def _load_override_set() -> OverrideSet:
 async def _build_response(
     request: Request, *, outcome_weight: float = 0.0
 ) -> LearningResponse:
-    """Build the override-aware learning response (shared by GET + both POST writes)."""
+    """Build the override-aware learning response (shared by GET + both POST writes).
+
+    Scoped to the request principal's workspace so a tenant only ever sees its own
+    learned reputation + overrides.
+    """
+    workspace_id = _panel_workspace(request)
     report = await build_learning_report(
         _event_log(request),
-        workspace_id=_PANEL_WORKSPACE,
+        workspace_id=workspace_id,
         outcome_weight=outcome_weight,
-        override_set=_load_override_set(),
+        override_set=_load_override_set(workspace_id),
     )
     return _to_response(report)
 
@@ -186,17 +202,18 @@ async def set_override(
     """Pin / mute / reset / clear a tool, then return the refreshed learning report.
 
     Writes through :class:`OverrideStore` (``actor=human``, ``source=studio``) onto the
-    shared spine the runtime reads. Best-effort: a swallowed store error still returns the
-    (unchanged) refreshed report. TODO(multi-tenant): scope the write to the request's
-    resolved ``workspace_id`` — today every write lands on the single-operator ``default``.
+    shared spine the runtime reads, scoped to the request principal's workspace so a tenant
+    can only mutate its own overrides. Best-effort: a swallowed store error still returns
+    the (unchanged) refreshed report.
     """
+    workspace_id = _panel_workspace(request)
     try:
         kind = OverrideKind(body.action.strip().lower())
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
             detail=f"unknown override action {body.action!r} (expected pin|mute|reset|clear)",
-        )
+        ) from exc
     tool = body.tool_name.strip()
     if not tool:
         raise HTTPException(status_code=422, detail="tool_name must not be empty")
@@ -204,11 +221,11 @@ async def set_override(
         store = OverrideStore.for_context(server=True)
         if kind is OverrideKind.CLEAR:
             store.clear_override(
-                tool, workspace_id=_PANEL_WORKSPACE, actor="human", source="studio"
+                tool, workspace_id=workspace_id, actor="human", source="studio"
             )
         else:
             store.set_override(
-                tool, kind, workspace_id=_PANEL_WORKSPACE, actor="human", source="studio"
+                tool, kind, workspace_id=workspace_id, actor="human", source="studio"
             )
     except Exception:  # pragma: no cover - defensive: overrides never break the panel
         pass
@@ -222,13 +239,14 @@ async def set_trust_feedback(
 ) -> LearningResponse:
     """Flip the per-workspace 👍/👎 trust gate, then return the refreshed learning report.
 
-    Best-effort write through :class:`OverrideStore` (``actor=human``, ``source=studio``).
-    TODO(multi-tenant): scope the write to the request's resolved ``workspace_id``.
+    Best-effort write through :class:`OverrideStore` (``actor=human``, ``source=studio``),
+    scoped to the request principal's workspace so a tenant can only flip its own gate.
     """
+    workspace_id = _panel_workspace(request)
     try:
         OverrideStore.for_context(server=True).set_trust_feedback(
             bool(body.enabled),
-            workspace_id=_PANEL_WORKSPACE,
+            workspace_id=workspace_id,
             actor="human",
             source="studio",
         )

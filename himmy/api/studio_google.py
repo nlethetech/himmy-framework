@@ -15,6 +15,8 @@ APIs with the connected account's token. HTTP goes through a module-level
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import re
 import secrets as _secrets
 import time
@@ -43,6 +45,8 @@ SCOPES = (
     "profile",
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
+    # gmail.compose is required to SAVE DRAFTS (gmail.send only allows sending, not drafts.create).
+    "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.readonly",
 )
@@ -58,6 +62,44 @@ _TRANSPORT: httpx.AsyncBaseTransport | None = None
 
 #: Outstanding CSRF ``state`` tokens issued by :func:`auth_url`, consumed on callback.
 _PENDING_STATES: set[str] = set()
+
+#: Per-process secret keying the signed-state HMAC. Regenerated each start so an
+#: attacker can never mint a valid state; the in-memory ``_PENDING_STATES`` set
+#: covers the same process, while the signature makes a forged/unknown state
+#: detectable even before it is looked up.
+_STATE_SIGNING_KEY: bytes = _secrets.token_bytes(32)
+
+#: A signed state is only honoured for this many seconds after issuance.
+_STATE_TTL_SECONDS = 600
+
+
+def _sign_state(nonce: str, issued_at: int) -> str:
+    """Return ``nonce.issued_at.hexmac`` — a self-verifying, short-TTL CSRF state."""
+    payload = f"{nonce}.{issued_at}"
+    mac = hmac.new(
+        _STATE_SIGNING_KEY, payload.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"{payload}.{mac}"
+
+
+def _state_is_valid(state: str | None) -> bool:
+    """True iff ``state`` carries an unexpired, untampered signature we issued."""
+    if not state:
+        return False
+    parts = state.split(".")
+    if len(parts) != 3:
+        return False
+    nonce, issued_raw, mac = parts
+    try:
+        issued_at = int(issued_raw)
+    except ValueError:
+        return False
+    expected = hmac.new(
+        _STATE_SIGNING_KEY, f"{nonce}.{issued_at}".encode(), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        return False
+    return 0 <= (int(time.time()) - issued_at) <= _STATE_TTL_SECONDS
 
 
 class GoogleError(RuntimeError):
@@ -138,7 +180,7 @@ def auth_url(redirect_uri: str) -> str:
     client_id = get_secret(CLIENT_ID)
     if not client_id:
         raise GoogleError("set the Google client_id/secret before connecting")
-    state = _secrets.token_urlsafe(24)
+    state = _sign_state(_secrets.token_urlsafe(24), int(time.time()))
     _PENDING_STATES.add(state)
     params = {
         "client_id": client_id,
@@ -156,11 +198,18 @@ def auth_url(redirect_uri: str) -> str:
 async def exchange_code(
     code: str, redirect_uri: str, state: str | None
 ) -> GoogleStatus:
-    """Exchange an authorization ``code`` for tokens and persist them."""
-    if state is not None:
-        # Best-effort CSRF check; a restart drops pending states, so don't hard-fail
-        # solely on absence, but do consume a known one.
+    """Exchange an authorization ``code`` for tokens and persist them.
+
+    CSRF defence: the ``state`` MUST be one we issued. We accept it if it is a
+    currently-pending in-memory token *or* carries a valid, unexpired HMAC
+    signature (restart-resilient). A missing, unknown, forged, or expired state is
+    rejected *before* the code is exchanged, so an attacker cannot complete the
+    flow with their own auth code and graft their mailbox onto this Studio.
+    """
+    if state is not None and state in _PENDING_STATES:
         _PENDING_STATES.discard(state)
+    elif not _state_is_valid(state):
+        raise GoogleError("invalid or missing OAuth state (possible CSRF); aborted")
     client_id = get_secret(CLIENT_ID)
     client_secret = get_secret(CLIENT_SECRET)
     if not client_id or not client_secret:
@@ -242,6 +291,18 @@ class GmailMessage(BaseModel):
     subject: str = "(no subject)"
     snippet: str = ""
     date: str = ""
+    # Populated only by the full fetch (:func:`gmail_get`); list/metadata leaves them blank.
+    to: str = ""
+    cc: str = ""
+    message_id_header: str = ""  # the RFC 5322 Message-ID — needed to thread a reply
+    references: str = ""
+    body: str = ""  # decoded plain-text body
+    # Gmail's own labels on the message (e.g. INBOX, UNREAD, IMPORTANT, STARRED,
+    # CATEGORY_PROMOTIONS/SOCIAL/UPDATES/FORUMS). Populated by both the metadata and
+    # full fetches — the messages.get response carries top-level "labelIds" for either
+    # format. Additive: existing consumers that ignore these keep working unchanged.
+    label_ids: list[str] = []
+    unread: bool = False  # derived: "UNREAD" present in label_ids
 
 
 async def gmail_list(max_results: int = 20) -> list[GmailMessage]:
@@ -277,6 +338,7 @@ def _parse_message(msg: dict[str, Any]) -> GmailMessage:
         h.get("name", "").lower(): h.get("value", "")
         for h in msg.get("payload", {}).get("headers", [])
     }
+    label_ids = msg.get("labelIds", [])
     return GmailMessage(
         id=msg.get("id", ""),
         thread_id=msg.get("threadId"),
@@ -284,7 +346,77 @@ def _parse_message(msg: dict[str, Any]) -> GmailMessage:
         subject=headers.get("subject", "(no subject)"),
         snippet=msg.get("snippet", ""),
         date=headers.get("date", ""),
+        label_ids=label_ids,
+        unread="UNREAD" in label_ids,
     )
+
+
+def _b64url_decode(data: str) -> str:
+    """Decode Gmail's base64url body data (tolerant of missing padding)."""
+    try:
+        pad = "=" * (-len(data) % 4)
+        return base64.urlsafe_b64decode(data + pad).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_plain_body(payload: dict[str, Any]) -> str:
+    """Walk a Gmail MIME tree and return the first text/plain body (else stripped text/html)."""
+
+    def walk(part: dict[str, Any], want: str) -> str:
+        if part.get("mimeType") == want:
+            data = part.get("body", {}).get("data")
+            if data:
+                return _b64url_decode(data)
+        for sub in part.get("parts") or []:
+            found = walk(sub, want)
+            if found:
+                return found
+        return ""
+
+    text = walk(payload, "text/plain")
+    if text:
+        return text.strip()
+    html = walk(payload, "text/html")
+    if html:
+        # crude de-HTML: drop tags + collapse whitespace (a plain-text reply doesn't need fidelity)
+        return re.sub(r"\s+\n", "\n", re.sub(r"<[^>]+>", "", html)).strip()
+    return ""
+
+
+def _parse_message_full(msg: dict[str, Any]) -> GmailMessage:
+    payload = msg.get("payload", {})
+    headers = {
+        h.get("name", "").lower(): h.get("value", "")
+        for h in payload.get("headers", [])
+    }
+    return GmailMessage(
+        id=msg.get("id", ""),
+        thread_id=msg.get("threadId"),
+        sender=headers.get("from", ""),
+        subject=headers.get("subject", "(no subject)"),
+        snippet=msg.get("snippet", ""),
+        date=headers.get("date", ""),
+        to=headers.get("to", ""),
+        cc=headers.get("cc", ""),
+        message_id_header=headers.get("message-id", ""),
+        references=headers.get("references", ""),
+        body=_extract_plain_body(payload),
+        label_ids=msg.get("labelIds", []),
+        unread="UNREAD" in msg.get("labelIds", []),
+    )
+
+
+async def gmail_get(message_id: str) -> GmailMessage:
+    """Fetch ONE message in full — headers (incl. Message-ID) + decoded plain-text body."""
+    token = await _access_token()
+    async with _http() as client:
+        resp = await client.get(
+            f"{_GMAIL_BASE}/messages/{message_id}",
+            params={"format": "full"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    return _parse_message_full(_json_or_raise(resp, "gmail get"))
 
 
 class GmailSendResult(BaseModel):
@@ -293,8 +425,23 @@ class GmailSendResult(BaseModel):
     detail: str = ""
 
 
-async def gmail_send(to: str, subject: str, body: str) -> GmailSendResult:
-    """Send a plain-text email as the connected account."""
+async def gmail_send(
+    to: str,
+    subject: str,
+    body: str,
+    *,
+    cc: str | None = None,
+    thread_id: str | None = None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    draft: bool = False,
+) -> GmailSendResult:
+    """Send (or, with ``draft=True``, save a draft of) a plain-text email as the connected account.
+
+    Pass ``thread_id`` + ``in_reply_to`` (the original message's RFC Message-ID) to thread a reply
+    correctly. ``draft=True`` saves it to Gmail Drafts instead of sending — nothing leaves the
+    mailbox, so it's the safe way to prepare a reply for the user to review and send.
+    """
     to = to.strip()
     if not to:
         return GmailSendResult(ok=False, detail="recipient required")
@@ -302,20 +449,42 @@ async def gmail_send(to: str, subject: str, body: str) -> GmailSendResult:
     email = get_secret(ACCOUNT_EMAIL)
     msg = EmailMessage()
     msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
     if email:
         msg["From"] = email
     msg["Subject"] = subject
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        # References chains the whole thread; append the parent if it isn't already there.
+        chain = (references or "").strip()
+        msg["References"] = (
+            f"{chain} {in_reply_to}".strip() if in_reply_to not in chain else chain
+        )
     msg.set_content(body)
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+    message_obj: dict[str, Any] = {"raw": raw}
+    if thread_id:
+        message_obj["threadId"] = thread_id
     async with _http() as client:
-        resp = await client.post(
-            f"{_GMAIL_BASE}/messages/send",
-            json={"raw": raw},
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        if draft:
+            resp = await client.post(
+                f"{_GMAIL_BASE}/drafts",
+                json={"message": message_obj},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        else:
+            resp = await client.post(
+                f"{_GMAIL_BASE}/messages/send",
+                json=message_obj,
+                headers={"Authorization": f"Bearer {token}"},
+            )
     if resp.status_code not in (200, 201):
         return GmailSendResult(ok=False, detail=_error_detail(resp))
-    return GmailSendResult(ok=True, id=resp.json().get("id"), detail=f"sent to {to}")
+    rj = resp.json()
+    if draft:
+        return GmailSendResult(ok=True, id=rj.get("id"), detail=f"draft saved for {to}")
+    return GmailSendResult(ok=True, id=rj.get("id"), detail=f"sent to {to}")
 
 
 # ---- Calendar -----------------------------------------------------------
@@ -373,7 +542,9 @@ def _time_field(value: str, all_day: bool) -> dict[str, Any]:
     if v.endswith("Z"):
         v = v[:-1]
     else:
-        v = re.sub(r"[+-]\d{2}:?\d{2}$", "", v)  # strip a trailing +05:45 / -04:00 offset
+        v = re.sub(
+            r"[+-]\d{2}:?\d{2}$", "", v
+        )  # strip a trailing +05:45 / -04:00 offset
     return {"dateTime": v, "timeZone": _local_tz()}
 
 
@@ -392,8 +563,13 @@ def _parse_event(e: dict[str, Any]) -> CalendarEvent:
 
 
 async def calendar_create(
-    summary: str, start: str, end: str, *, all_day: bool = False,
-    location: str | None = None, recurrence: list[str] | None = None,
+    summary: str,
+    start: str,
+    end: str,
+    *,
+    all_day: bool = False,
+    location: str | None = None,
+    recurrence: list[str] | None = None,
 ) -> CalendarEvent:
     """Create an event on the primary calendar.
 
@@ -430,8 +606,11 @@ async def calendar_range(
         resp = await client.get(
             _CAL_BASE,
             params={
-                "timeMin": time_min, "timeMax": time_max,
-                "maxResults": max_results, "singleEvents": "true", "orderBy": "startTime",
+                "timeMin": time_min,
+                "timeMax": time_max,
+                "maxResults": max_results,
+                "singleEvents": "true",
+                "orderBy": "startTime",
             },
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -440,8 +619,13 @@ async def calendar_range(
 
 
 async def calendar_update(
-    event_id: str, *, summary: str | None = None, start: str | None = None,
-    end: str | None = None, all_day: bool = False, location: str | None = None,
+    event_id: str,
+    *,
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    all_day: bool = False,
+    location: str | None = None,
 ) -> CalendarEvent:
     """Patch fields of an existing event on the primary calendar (only given fields change)."""
     token = await _access_token()
@@ -517,6 +701,7 @@ __all__ = [
     "auth_url",
     "exchange_code",
     "gmail_list",
+    "gmail_get",
     "gmail_send",
     "calendar_list",
     "calendar_create",

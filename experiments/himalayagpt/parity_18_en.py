@@ -152,7 +152,7 @@ async def main() -> None:
     print(f"FAST Q8/Metal absolute correctness (EN, n={n}):")
     print(f"  selection {f_sel}/{n} = {100*f_sel/n:.1f}%   args {f_arg}/{n} = {100*f_arg/n:.1f}%")
     print("transformers fp32 reference (boosted, EN): selection 10/18, args 8/18")
-    print(f"PARITY vs transformers fp32 reference (same-tool / same-args):")
+    print("PARITY vs transformers fp32 reference (same-tool / same-args):")
     print(f"  selection agreement {agree_sel}/{n} = {100*agree_sel/n:.1f}%")
     print(f"  args agreement      {agree_arg}/{n} = {100*agree_arg/n:.1f}%")
     print(f"latency/tool-call: avg={sum(lats)/n:.0f} ms  min={min(lats):.0f}  max={max(lats):.0f}")

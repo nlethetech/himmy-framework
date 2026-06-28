@@ -25,11 +25,27 @@ CREATE TABLE IF NOT EXISTS tasks (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive, idempotent column adds so old DBs (and other consumers) keep working.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, so we guard each ALTER on ``pragma
+    table_info`` — adding a column only when it's absent. Every column is nullable / has a
+    default, so the shared ``tasks`` tool pack and any existing row keep reading + writing
+    unchanged. New planner columns land here so the store never has to be forked.
+    """
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    # priority: higher = more urgent (0 = none); drives the app's "what to do next" sort.
+    if "priority" not in have:
+        conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+
 class Task(BaseModel):
     id: str = Field(default_factory=new_uuid)
     title: str
     done: bool = False
     due: str | None = None
+    priority: int = 0
     created_at: str = Field(default_factory=utc_now_iso)
 
 
@@ -41,27 +57,33 @@ class TasksStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        _migrate(self._conn)
+
+    def _row(self, r: sqlite3.Row) -> Task:
+        # ``priority`` is read via .keys() membership so a row from a not-yet-migrated
+        # connection (defensive) still yields a valid Task with the default.
+        keys = r.keys()
+        return Task(
+            id=r["id"],
+            title=r["title"],
+            done=bool(r["done"]),
+            due=r["due"],
+            priority=int(r["priority"]) if "priority" in keys and r["priority"] is not None else 0,
+            created_at=r["created_at"],
+        )
 
     def list(self) -> list[Task]:
         rows = self._conn.execute(
             "SELECT * FROM tasks ORDER BY done, created_at DESC"
         ).fetchall()
-        return [
-            Task(
-                id=r["id"],
-                title=r["title"],
-                done=bool(r["done"]),
-                due=r["due"],
-                created_at=r["created_at"],
-            )
-            for r in rows
-        ]
+        return [self._row(r) for r in rows]
 
-    def add(self, title: str, *, due: str | None = None) -> Task:
-        t = Task(title=title, due=due)
+    def add(self, title: str, *, due: str | None = None, priority: int = 0) -> Task:
+        t = Task(title=title, due=due, priority=priority)
         self._conn.execute(
-            "INSERT INTO tasks (id, title, done, due, created_at) VALUES (?,?,?,?,?)",
-            (t.id, t.title, int(t.done), t.due, t.created_at),
+            "INSERT INTO tasks (id, title, done, due, priority, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (t.id, t.title, int(t.done), t.due, t.priority, t.created_at),
         )
         self._conn.commit()
         return t
@@ -72,6 +94,44 @@ class TasksStore:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def update(
+        self,
+        task_id: str,
+        *,
+        due: str | None = None,
+        priority: int | None = None,
+        done: bool | None = None,
+    ) -> Task | None:
+        """Edit a task's due / priority / done in place; returns the updated row or None.
+
+        Only the fields explicitly passed (non-None) are written, so a caller can patch one
+        field without clobbering the others. ``due`` cannot be cleared through this method
+        (None means "leave as is") — that's deliberate parity with the add() signature.
+        """
+        sets: list[str] = []
+        vals: list[object] = []
+        if due is not None:
+            sets.append("due = ?")
+            vals.append(due)
+        if priority is not None:
+            sets.append("priority = ?")
+            vals.append(int(priority))
+        if done is not None:
+            sets.append("done = ?")
+            vals.append(int(done))
+        if sets:
+            vals.append(task_id)
+            cur = self._conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals
+            )
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+        row = self._conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return self._row(row) if row is not None else None
 
     def complete_by_title(self, title: str) -> bool:
         cur = self._conn.execute(

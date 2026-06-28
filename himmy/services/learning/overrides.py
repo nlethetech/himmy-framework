@@ -367,8 +367,8 @@ class OverrideStore:
             prev = latest_by_stable.get(rec.stable_id)
             if prev is None or rec.version > prev.version:  # type: ignore[attr-defined]
                 latest_by_stable[rec.stable_id] = rec
-        for rec in latest_by_stable.values():
-            payload = getattr(rec, "payload", {}) or {}
+        for current in latest_by_stable.values():
+            payload = getattr(current, "payload", {}) or {}
             tool_name = payload.get("tool_name")
             kind_raw = payload.get("kind")
             if not isinstance(tool_name, str) or not tool_name:

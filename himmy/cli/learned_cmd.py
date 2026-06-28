@@ -13,7 +13,7 @@ import argparse
 import asyncio
 import json
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from himmy.cli.ui import styles
 from himmy.services.learning.overrides import (
@@ -21,8 +21,15 @@ from himmy.services.learning.overrides import (
     OverrideSet,
     OverrideStore,
 )
-from himmy.services.learning.report import LearningReport, build_learning_report
+from himmy.services.learning.report import (
+    LearningReport,
+    LearningToolRow,
+    build_learning_report,
+)
 from himmy.services.storage.factory import StoreFactory
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from himmy.services.storage.protocols import EventLog
 
 
 def _load_override_set(workspace: str | None) -> OverrideSet:
@@ -44,7 +51,7 @@ def _load_report(workspace: str | None, outcome_weight: float) -> LearningReport
     into :func:`build_learning_report`, so the table reflects pins/mutes/resets/the
     trust-feedback gate exactly as the runtime acts on them. Best-effort throughout.
     """
-    store = StoreFactory.for_cli_durable()
+    store = cast("EventLog", StoreFactory.for_cli_durable())
     override_set = _load_override_set(workspace)
     return asyncio.run(
         build_learning_report(
@@ -102,7 +109,9 @@ def render_learning_report(
     out = stream or sys.stdout
     c = styles(out)
     lines: list[str] = []
-    lines.append(f"{c['bold']}{c['snow']}Himmy — what it's learned about its tools{c['reset']}")
+    lines.append(
+        f"{c['bold']}{c['snow']}Himmy — what it's learned about its tools{c['reset']}"
+    )
 
     if not report.has_data:
         lines.append("")
@@ -117,7 +126,9 @@ def render_learning_report(
     floor_pct = _pct(report.floor)
     flaky = report.flaky_count
     flaky_txt = (
-        f"{c['crimson']}{flaky} flaky{c['reset']}" if flaky else f"{c['green']}0 flaky{c['reset']}"
+        f"{c['crimson']}{flaky} flaky{c['reset']}"
+        if flaky
+        else f"{c['green']}0 flaky{c['reset']}"
     )
     lines.append(
         f"{c['dim']}{len(report.tools)} tool(s) tracked · {flaky_txt}{c['dim']} "
@@ -158,7 +169,7 @@ def render_learning_report(
             f"{c['dim']} Pass {c['reset']}{c['gold']}--all{c['reset']}"
             f"{c['dim']} to see every tool's score.{c['reset']}"
         )
-        rows: list = []
+        rows: list[LearningToolRow] = []
     else:
         rows = report.tools if show_all else needs_attention
 
@@ -230,7 +241,9 @@ def _render_after_mutation(workspace: str | None) -> None:
         report = _load_report(workspace, 0.0)
         print()
         print(render_learning_report(report, show_all=False))
-    except Exception:  # pragma: no cover - defensive: never let a re-render fail the verb
+    except (
+        Exception
+    ):  # pragma: no cover - defensive: never let a re-render fail the verb
         pass
 
 
@@ -357,9 +370,13 @@ def add_learned_parser(sub: Any) -> None:
     # The bare ``himmy learned`` (no verb) still renders the report — verbs are optional.
     p.set_defaults(func=cmd_learned)
 
-    verbs = p.add_subparsers(dest="learned_verb", metavar="{pin,mute,reset,clear,trust-feedback}")
+    verbs = p.add_subparsers(
+        dest="learned_verb", metavar="{pin,mute,reset,clear,trust-feedback}"
+    )
 
-    def _add_tool_verb(name: str, handler: Any, help_text: str, *, aliases: list[str] | None = None) -> None:
+    def _add_tool_verb(
+        name: str, handler: Any, help_text: str, *, aliases: list[str] | None = None
+    ) -> None:
         vp = verbs.add_parser(name, help=help_text, aliases=aliases or [])
         vp.add_argument("tool_name", help="the tool to act on")
         vp.add_argument(
@@ -396,7 +413,9 @@ def add_learned_parser(sub: Any) -> None:
         "trust-feedback",
         help="gate the 👍/👎 outcome blend for this workspace {on|off}",
     )
-    tf.add_argument("state", choices=["on", "off"], help="turn the feedback blend on or off")
+    tf.add_argument(
+        "state", choices=["on", "off"], help="turn the feedback blend on or off"
+    )
     tf.add_argument(
         "--workspace",
         dest="workspace",

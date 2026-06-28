@@ -140,7 +140,7 @@ async def main() -> None:
     print(f"ABSOLUTE correctness (EN, n={n}, pure argmax):")
     print(f"  fast Q8/Metal : selection {fsel}/{n} ({100*fsel/n:.0f}%)  args {farg}/{n} ({100*farg/n:.0f}%)")
     print(f"  slow fp32 ref : selection {ssel}/{n} ({100*ssel/n:.0f}%)  args {sarg}/{n} ({100*sarg/n:.0f}%)")
-    print(f"PARITY (fast vs slow, identical decode):")
+    print("PARITY (fast vs slow, identical decode):")
     print(f"  selection agreement {agree_sel}/{n} = {100*agree_sel/n:.1f}%")
     print(f"  args agreement      {agree_arg}/{n} = {100*agree_arg/n:.1f}%")
     print(f"LATENCY: fast avg {favg:.0f} ms/call   slow avg {savg:.0f} ms/call   speedup {savg/favg:.0f}x")

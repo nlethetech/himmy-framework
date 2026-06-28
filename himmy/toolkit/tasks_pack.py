@@ -17,6 +17,12 @@ _ADD_SCHEMA = {
     "properties": {
         "title": {"type": "string", "description": "The task to add."},
         "due": {"type": "string", "description": "Optional due date (YYYY-MM-DD)."},
+        "priority": {
+            "type": "integer",
+            "description": "Optional priority 0–3 (0 none, 1 low, 2 medium, 3 high).",
+            "minimum": 0,
+            "maximum": 3,
+        },
     },
     "required": ["title"],
     "additionalProperties": False,
@@ -37,14 +43,22 @@ def register_tasks_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     def list_tasks(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "tasks": [
-                {"title": t.title, "done": t.done, "due": t.due}
+                {"title": t.title, "done": t.done, "due": t.due, "priority": t.priority}
                 for t in get_tasks_store().list()
             ]
         }
 
     def add_task(args: dict[str, Any]) -> dict[str, Any]:
-        t = get_tasks_store().add(str(args["title"]), due=args.get("due"))
-        return {"added": True, "title": t.title}
+        # ``priority`` is optional + best-effort: a non-int value falls back to 0 so a model
+        # that emits "high" instead of 3 can't break the add.
+        try:
+            priority = int(args.get("priority") or 0)
+        except (TypeError, ValueError):
+            priority = 0
+        t = get_tasks_store().add(
+            str(args["title"]), due=args.get("due"), priority=priority
+        )
+        return {"added": True, "title": t.title, "due": t.due, "priority": t.priority}
 
     def complete_task(args: dict[str, Any]) -> dict[str, Any]:
         return {"completed": get_tasks_store().complete_by_title(str(args["title"]))}

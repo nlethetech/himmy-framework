@@ -54,13 +54,13 @@ for line in ENV.read_text().splitlines():
 
 sys.path.insert(0, str(REPO / "experiments" / "outcome_learning_ab"))
 
+import _search_tools  # noqa: E402
+
 from himmy.benchmark.stats import mcnemar_from_outcomes, wilson_interval  # noqa: E402
 from himmy.config.agent_spec import AgentSpec  # noqa: E402
 from himmy.core.events import EventType, RunEvent  # noqa: E402
 from himmy.runtime.from_spec import build_runtime_for_spec  # noqa: E402
 from himmy.services.storage.service import StorageService  # noqa: E402
-
-import _search_tools  # noqa: E402
 
 TOOLS_MODULE = "_search_tools"
 PROVIDER = "openrouter"

@@ -1,5 +1,11 @@
 """FAST himmy-side bridge to HimalayaGPT-0.5b via the nanochat llama.cpp fork.
 
+Library home of the bridge first proven out in
+``experiments/himalayagpt/hgpt_fast_bridge.py``. It is the ``generate_fn`` backend the
+``himalayagpt`` provider (see ``himmy.cli.provider.build_manager_for``) hands to
+:class:`HimalayaGptClientManager`, so ``himmy chat/run --provider himalayagpt`` talks to
+a local ``llama-server`` serving the Q8_0 GGUF. stdlib-only, no heavy deps.
+
 Drop-in replacement for :class:`hgpt_bridge.HimalayaGptWorker`: it exposes the
 exact same ``generate(prompt, **overrides) -> str`` / ``generate_fn(**overrides)
 -> Callable[[str], str]`` surface that ``HimalayaGptClientManager(generate_fn=...)``
@@ -34,6 +40,7 @@ CRITICAL — ``n_gpu_layers`` is capped at 11 (NOT 99), measured on M3 Pro:
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import subprocess
@@ -42,6 +49,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 _HOME = os.path.expanduser("~")
 _DEFAULT_SERVER = f"{_HOME}/himalaya-runtime/llama.cpp/build/bin/llama-server"
@@ -66,7 +74,7 @@ class HimalayaGptFastBridge:
         port: int = 8081,
         n_gpu_layers: int = 11,
         ctx_size: int = 4096,
-        default_kwargs: dict | None = None,
+        default_kwargs: dict[str, object] | None = None,
     ) -> None:
         # If base_url is given we attach to an existing server and never spawn one.
         self._external = base_url is not None
@@ -77,7 +85,7 @@ class HimalayaGptFastBridge:
         self._port = port
         self._n_gpu_layers = n_gpu_layers
         self._ctx_size = ctx_size
-        self._proc: subprocess.Popen | None = None
+        self._proc: subprocess.Popen[bytes] | None = None
         # nanochat squared-ReLU overflows F16 -> NaN; the Q8_0 weights are fine, but
         # generation is greedy (temp 0) to match the transformers reference exactly.
         self._default_kwargs = default_kwargs or {
@@ -94,17 +102,28 @@ class HimalayaGptFastBridge:
             return
         if self._proc is not None:
             return
+        # If a server is ALREADY serving this URL (e.g. a prior himmy invocation, or one
+        # the operator started), attach to it instead of spawning a duplicate that would
+        # fail to bind the port. Keeps repeated `himmy run` calls fast + orphan-free.
+        if self._is_healthy():
+            self._external = True
+            return
         if not Path(self._server_bin).exists():
             raise FileNotFoundError(f"llama-server not found: {self._server_bin}")
         if not Path(self._model_path).exists():
             raise FileNotFoundError(f"GGUF not found: {self._model_path}")
         argv = [
             self._server_bin,
-            "-m", self._model_path,
-            "--host", self._host,
-            "--port", str(self._port),
-            "-ngl", str(self._n_gpu_layers),
-            "-c", str(self._ctx_size),
+            "-m",
+            self._model_path,
+            "--host",
+            self._host,
+            "--port",
+            str(self._port),
+            "-ngl",
+            str(self._n_gpu_layers),
+            "-c",
+            str(self._ctx_size),
             "--no-warmup",
         ]
         self._proc = subprocess.Popen(
@@ -112,7 +131,20 @@ class HimalayaGptFastBridge:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        # Tear the spawned server down when THIS process exits, so a `himmy chat/run`
+        # that owns its server does not leave an orphan llama-server behind.
+        atexit.register(self.close)
         self._wait_healthy(timeout_s)
+
+    def _is_healthy(self, timeout: float = 1.0) -> bool:
+        """True when ``/health`` already returns 200 (a server is up at this URL)."""
+        try:
+            with urllib.request.urlopen(
+                self._base_url + "/health", timeout=timeout
+            ) as r:
+                return bool(r.status == 200)
+        except Exception:  # noqa: BLE001 - no server / not ready yet
+            return False
 
     def _wait_healthy(self, timeout_s: float) -> None:
         deadline = time.time() + timeout_s
@@ -143,7 +175,9 @@ class HimalayaGptFastBridge:
             self._proc = None
 
     # -- generation ----------------------------------------------------------
-    def generate(self, prompt: str, *, grammar: str | None = None, **overrides) -> str:
+    def generate(
+        self, prompt: str, *, grammar: str | None = None, **overrides: Any
+    ) -> str:
         """POST the RAW prompt to /completion (parse_special) and return the text.
 
         The kwargs match the transformers worker's vocabulary
@@ -187,7 +221,7 @@ class HimalayaGptFastBridge:
             raise RuntimeError(f"llama-server /completion failed: {exc}") from exc
         return str(body.get("content", ""))
 
-    def generate_fn(self, **overrides) -> Callable[..., str]:
+    def generate_fn(self, **overrides: Any) -> Callable[..., str]:
         """Return a ``(prompt, *, grammar=None) -> str`` callable for the manager.
 
         The optional ``grammar`` keyword is what lets the manager pass a compiled
@@ -204,7 +238,7 @@ class HimalayaGptFastBridge:
 _SHARED: HimalayaGptFastBridge | None = None
 
 
-def shared_fast_bridge(**kwargs) -> HimalayaGptFastBridge:
+def shared_fast_bridge(**kwargs: Any) -> HimalayaGptFastBridge:
     """Process-wide singleton fast bridge (one server per python process)."""
     global _SHARED
     if _SHARED is None:

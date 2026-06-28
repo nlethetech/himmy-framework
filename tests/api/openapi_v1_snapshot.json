@@ -2236,7 +2236,7 @@
         "type": "object"
       },
       "PrivacyAuditReport": {
-        "description": "The rolled-up scorecard for one audit run \u2014 the WS4.7 signed evidence artefact.\n\nBoth halves (the live ``probe`` run and the ``recorded``-data scan) roll into one\nreport. ``posture_score`` is the weighted aggregate over the *non-skipped*\nmetrics; ``passed`` is the overall verdict (every veto metric passed AND the\naggregate cleared its bar \u2014 the service computes this). The report is registered\nas its own :class:`~himmy.entities.records.EntityRecord`\n(:data:`PRIVACY_AUDIT_REPORT_KIND`) so it inherits the tamper-evident signed\nbundle (must_fix #3 \u2014 an ``EvaluationRun`` is not in the registry).\n\nAttributes:\n    report_id: This report's id.\n    suite_name: The probe suite that was run (``\"\"`` for a recorded-only audit).\n    posture_score: Weighted aggregate over non-skipped metrics (``0.0..1.0``).\n    passed: The overall posture verdict.\n    metrics: Every :class:`PrivacyMetricResult` (probe + recorded).\n    lookback_seconds: The recorded-data scan window used (``None`` \u21d2 unbounded).\n    metadata: Derived diagnostics (e.g. counts of records scanned).\n    created_at: When the audit ran.",
+        "description": "The rolled-up scorecard for one audit run \u2014 the WS4.7 signed evidence artefact.\n\nBoth halves (the live ``probe`` run and the ``recorded``-data scan) roll into one\nreport. ``posture_score`` is the weighted aggregate over the *non-skipped*\nmetrics; ``passed`` is the overall verdict (every veto metric passed AND the\naggregate cleared its bar \u2014 the service computes this). The report is registered\nas its own :class:`~himmy.entities.records.EntityRecord`\n(:data:`PRIVACY_AUDIT_REPORT_KIND`) so it inherits the tamper-evident signed\nbundle (must_fix #3 \u2014 an ``EvaluationRun`` is not in the registry).\n\nAttributes:\n    report_id: This report's id.\n    suite_name: The probe suite that was run (``\"\"`` for a recorded-only audit).\n    posture_score: Weighted aggregate over non-skipped metrics (``0.0..1.0``).\n    passed: The overall posture verdict.\n    metrics: Every :class:`PrivacyMetricResult` (probe + recorded).\n    lookback_seconds: The recorded-data scan window used (``None`` \u21d2 unbounded).\n    workspace_id: Tenant scope this report was run for (``None`` \u21d2 global/ops). It\n        is projected into the record metadata so the tenant-scoped audit bundle\n        filter can exclude another tenant's reports.\n    metadata: Derived diagnostics (e.g. counts of records scanned).\n    created_at: When the audit ran.",
         "properties": {
           "created_at": {
             "title": "Created At",
@@ -2283,6 +2283,17 @@
             "default": "",
             "title": "Suite Name",
             "type": "string"
+          },
+          "workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Id"
           }
         },
         "title": "PrivacyAuditReport",
@@ -4817,6 +4828,22 @@
             "schema": {
               "$ref": "#/components/schemas/Purpose"
             }
+          },
+          {
+            "in": "query",
+            "name": "workspace_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace Id"
+            }
           }
         ],
         "responses": {
@@ -4952,6 +4979,22 @@
             "schema": {
               "$ref": "#/components/schemas/Purpose"
             }
+          },
+          {
+            "in": "query",
+            "name": "workspace_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace Id"
+            }
           }
         ],
         "responses": {
@@ -5006,6 +5049,22 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/Purpose"
+            }
+          },
+          {
+            "in": "query",
+            "name": "workspace_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace Id"
             }
           }
         ],

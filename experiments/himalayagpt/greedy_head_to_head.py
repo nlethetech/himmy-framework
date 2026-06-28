@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
 from pathlib import Path
 
@@ -108,7 +107,7 @@ async def main() -> None:
             flag = "OK " if a_ok else ("sel" if s_ok else "XXX")
             print(f"  [{flag}] {task['id']:<22}{lang}  {task['expect_tool']:<13} "
                   f"{str(ft):<20} {str(st)}")
-    print(f"\n=== PURE-GREEDY agreement (fast Q8/Metal vs slow transformers-fp32) ===")
+    print("\n=== PURE-GREEDY agreement (fast Q8/Metal vs slow transformers-fp32) ===")
     print(f"selection: {sel}/{total} = {100*sel/total:.1f}%")
     print(f"args     : {argm}/{total} = {100*argm/total:.1f}%")
 

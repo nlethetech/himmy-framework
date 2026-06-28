@@ -1321,6 +1321,36 @@ MISTRAL_V3 = ToolCallFormat(
 )
 
 
+# --------------------------------------------------------------------------- #
+# GEMMA4 — himalaya-ai/himalaya-gemma-4-e2b-it native grammar.
+#
+# Gemma 4 advertises tools as ``<|tool>declaration:NAME{...}<tool|>``, emits calls as
+# ``<|tool_call>call:NAME{arg:value,...}<tool_call|>`` (string values wrapped in the
+# ``<|"|>`` delimiter; parallel = N back-to-back blocks), and threads results as
+# ``<|tool_response>response:NAME{...}<tool_response|>``. The render/parse callables
+# live in :mod:`_gemma4_grammar` — a 1:1 port of the model's ``chat_template.jinja``,
+# byte-checked against the real tokenizer template in the tests. Prompting/text path
+# (``use_text_tool_path``) so the FORMAT is the only A/B variable vs the native arm.
+# --------------------------------------------------------------------------- #
+from himmy.services.inference import _gemma4_grammar as _gemma4  # noqa: E402
+
+_GEMMA4_FLAGS = ToolCallGrammarFlags(
+    result_role="user",
+    batch_consecutive_results=True,
+    parallel_supported=True,
+    use_text_tool_path=True,
+)
+
+GEMMA4 = ToolCallFormat(
+    name="gemma4",
+    render_system_manifest=_gemma4.render_system_manifest,
+    parse=_gemma4.parse,
+    render_tool_results=_gemma4.render_tool_results,
+    model_tags=frozenset({"gemma4", "gemma-4", "gemma_4", "gemma 4"}),
+    flags=_GEMMA4_FLAGS,
+)
+
+
 class ToolCallFormatRegistry:
     """Resolve a :class:`ToolCallFormat` from a model tag + optional override.
 
@@ -1386,6 +1416,7 @@ _REGISTRY.register_format(HERMES_CHATML_XML_FEWSHOT)
 _REGISTRY.register_format(HERMES_CHATML_XML_FEWSHOT_BASELINE)
 _REGISTRY.register_format(LLAMA3_JSON)
 _REGISTRY.register_format(MISTRAL_V3)
+_REGISTRY.register_format(GEMMA4)
 
 
 def register_format(fmt: ToolCallFormat) -> ToolCallFormat:
@@ -1420,6 +1451,7 @@ __all__ = [
     "HERMES_CHATML_XML_FEWSHOT_BASELINE",
     "LLAMA3_JSON",
     "MISTRAL_V3",
+    "GEMMA4",
     "mint_mistral_tool_call_id",
     "register_format",
     "get_format",

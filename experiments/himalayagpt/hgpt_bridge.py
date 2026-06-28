@@ -16,8 +16,8 @@ import json
 import os
 import subprocess
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 _VENV_PY = os.path.expanduser("~/.himalayagpt-venv/bin/python")
 _WORKER = str(Path(__file__).with_name("hgpt_worker.py"))

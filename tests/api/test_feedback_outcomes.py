@@ -10,7 +10,6 @@ from __future__ import annotations
 import pytest
 
 from himmy.api.studio_canonical import (
-    resolve_canonical_storage,
     set_canonical_storage_provider,
 )
 from himmy.api.studio_feedback import attribute_feedback_outcomes

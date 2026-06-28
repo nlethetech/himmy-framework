@@ -1983,10 +1983,13 @@ class _AsyncTasksStore:
             for r in rows
         ]
 
-    async def add(self, title: str, due: str | None) -> Any:
+    async def add(self, title: str, due: str | None, priority: int = 0) -> Any:
         from himmy.api.studio_tasks import Task
 
-        t = Task(title=title, due=due)
+        # ``priority`` rides along on the in-memory Task so callers see it back; the PG
+        # mirror table isn't migrated for it (priority is a SQLite-path planner feature),
+        # so it isn't persisted here — keeps the mirror forward-compatible, never breaks.
+        t = Task(title=title, due=due, priority=priority)
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO aux_tasks (tenant, id, title, done, due, created_at) "
@@ -2009,6 +2012,55 @@ class _AsyncTasksStore:
                 task_id,
             )
         return _rowcount(result) > 0
+
+    async def update(
+        self,
+        task_id: str,
+        due: str | None = None,
+        priority: int | None = None,
+        done: bool | None = None,
+    ) -> Any:
+        from himmy.api.studio_tasks import Task
+
+        # Patch only the supplied fields; ``priority`` is not a column in the mirror table
+        # so it's accepted-and-ignored for persistence (parity with add()).
+        sets: list[str] = []
+        vals: list[Any] = []
+        idx = 1
+        if due is not None:
+            sets.append(f"due = ${idx}")
+            vals.append(due)
+            idx += 1
+        if done is not None:
+            sets.append(f"done = ${idx}")
+            vals.append(done)
+            idx += 1
+        if sets:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE aux_tasks SET {', '.join(sets)} "
+                    f"WHERE tenant = ${idx} AND id = ${idx + 1}",
+                    *vals,
+                    self._tenant,
+                    task_id,
+                )
+        async with self._pool.acquire() as conn:
+            r = await conn.fetchrow(
+                "SELECT * FROM aux_tasks WHERE tenant = $1 AND id = $2",
+                self._tenant,
+                task_id,
+            )
+        if r is None:
+            return None
+        t = Task(
+            id=r["id"],
+            title=r["title"],
+            done=bool(r["done"]),
+            due=r["due"],
+            priority=int(priority) if priority is not None else 0,
+            created_at=_norm_ts(r["created_at"]),
+        )
+        return t
 
     async def complete_by_title(self, title: str) -> bool:
         async with self._pool.acquire() as conn:
@@ -2041,11 +2093,21 @@ class PostgresTasksStore:
     def list(self) -> list[Any]:
         return self._pool.run(self._async.list())  # type: ignore[no-any-return]
 
-    def add(self, title: str, *, due: str | None = None) -> Any:
-        return self._pool.run(self._async.add(title, due))
+    def add(self, title: str, *, due: str | None = None, priority: int = 0) -> Any:
+        return self._pool.run(self._async.add(title, due, priority))
 
     def set_done(self, task_id: str, done: bool) -> bool:
         return bool(self._pool.run(self._async.set_done(task_id, done)))
+
+    def update(
+        self,
+        task_id: str,
+        *,
+        due: str | None = None,
+        priority: int | None = None,
+        done: bool | None = None,
+    ) -> Any:
+        return self._pool.run(self._async.update(task_id, due, priority, done))
 
     def complete_by_title(self, title: str) -> bool:
         return bool(self._pool.run(self._async.complete_by_title(title)))
