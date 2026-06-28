@@ -472,3 +472,84 @@ def test_viewer_cannot_continue_thread_with_403(
             headers={"x-himmy-internal-key": "viewer"},
         )
         assert denied.status_code == 403, denied.text
+
+
+def _seed_thread_for_subject(
+    container: object, *, conversation_id: str, workspace_id: str, subject_id: str
+) -> None:
+    """Persist a thread owned by ``workspace_id`` + linked to ``subject_id`` (BOLA setup).
+
+    Drives the same ``ThreadAppService._persist`` the agentic continuation uses, so the
+    thread carries the workspace ownership metadata AND the conversation store records the
+    ``subject_id`` linkage — without needing a live model turn.
+    """
+    from himmy.agents.base_agent.thread import ChatThread
+    from himmy.application.services import THREAD_WORKSPACE_KEY
+
+    thread = ChatThread(metadata={THREAD_WORKSPACE_KEY: workspace_id})
+    container.thread_app._persist(  # type: ignore[attr-defined]
+        conversation_id, thread, workspace_id, subject_id=subject_id
+    )
+
+
+def test_bola_subject_scoped_thread_read_is_isolated() -> None:
+    """WS-bola: a subject-scoped principal cannot read another subject's thread (404).
+
+    Both subjects share ONE tenant, so workspace isolation does NOT separate them — only
+    the subject axis does. A tenant_admin crosses subjects; the un-scoped owner reads all.
+    """
+    from himmy.api.auth.apikey import ApiKeyAuthenticator
+    from himmy.api.auth.principal import Principal
+
+    app = create_app(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "key-a": Principal.build(
+                "subj-a",
+                tenant_ids=["shared"],
+                roles=["operator"],
+                auth_method="apikey",
+                subject_scoped=True,
+            ),
+            "key-admin": Principal.build(
+                "admin-user",
+                tenant_ids=["shared"],
+                roles=["operator", "tenant_admin"],
+                auth_method="apikey",
+                subject_scoped=True,
+            ),
+        }
+    )
+    _seed_thread_for_subject(
+        app.state.container,
+        conversation_id="conv-b",
+        workspace_id="shared",
+        subject_id="subj-b",
+    )
+    with TestClient(app) as client:
+        # Subject A (scoped to subj-a) reading subj-b's thread → clean 404.
+        as_a = client.get(
+            "/v1/threads/conv-b",
+            params={"workspace_id": "shared"},
+            headers={"x-himmy-internal-key": "key-a"},
+        )
+        assert as_a.status_code == 404, as_a.text
+        # The tenant_admin crosses subjects within its tenant → 200.
+        as_admin = client.get(
+            "/v1/threads/conv-b",
+            params={"workspace_id": "shared"},
+            headers={"x-himmy-internal-key": "key-admin"},
+        )
+        assert as_admin.status_code == 200, as_admin.text
+
+
+def test_bola_offline_thread_read_is_unnarrowed(client: TestClient) -> None:
+    """INVARIANT: offline (no auth) reads a subject-attributed thread (no narrowing)."""
+    _seed_thread_for_subject(
+        client.app.state.container,  # type: ignore[attr-defined]
+        conversation_id="conv-x",
+        workspace_id="acme",
+        subject_id="someone",
+    )
+    res = client.get("/v1/threads/conv-x", params={"workspace_id": "acme"})
+    assert res.status_code == 200, res.text

@@ -11,6 +11,16 @@ default (``ANONYMOUS``) and the trusted shared-key boundary — so the framework
 stays zero-config and offline-first. A principal bound to specific ``tenant_ids``
 (a mapped API key or an OIDC token with a tenant claim) is what actually closes
 the cross-tenant (IDOR) hole.
+
+``subject_scoped`` is the OPT-IN object-level (BOLA) narrowing within a shared
+tenant (WS-bola): by default a workspace is the trust boundary — its members read
+each other's runs/threads (``subject_scoped=False``, the historical behavior, so
+every existing principal is byte-unchanged). When a deployment marks a principal
+``subject_scoped=True``, the principal may only read resources whose data subject
+matches its own ``subject`` — UNLESS it also holds the ``tenant_admin`` role, which
+crosses subjects WITHIN its own tenant (the tenant axis is still enforced
+separately via :func:`~himmy.api.auth.context.resolve_workspace`). ANONYMOUS /
+``all_tenants`` principals are never subject-scoped, so the offline path is unaffected.
 """
 
 from __future__ import annotations
@@ -18,6 +28,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
+
+#: The role permitted to cross data subjects WITHIN its own tenant (BOLA). A
+#: ``subject_scoped`` principal holding this role reads every subject's runs/threads
+#: in the tenant it is bound to (the tenant axis is still enforced by
+#: ``resolve_workspace``); without it, a subject-scoped principal sees only its OWN.
+TENANT_ADMIN_ROLE = "tenant_admin"
 
 
 @dataclass(frozen=True)
@@ -32,6 +48,11 @@ class Principal:
     auth_method: str = "anonymous"
     source_ip: str | None = None
     claims: dict[str, Any] = field(default_factory=dict)
+    #: Opt-in object-level (BOLA) narrowing: when True, the principal may read only
+    #: resources whose data subject matches its own ``subject`` (unless it holds the
+    #: ``tenant_admin`` role). Defaults False so a workspace stays the trust boundary and
+    #: every existing/ANONYMOUS principal is byte-unchanged. See :meth:`may_access_subject`.
+    subject_scoped: bool = False
 
     @classmethod
     def build(
@@ -45,6 +66,7 @@ class Principal:
         auth_method: str = "anonymous",
         source_ip: str | None = None,
         claims: dict[str, Any] | None = None,
+        subject_scoped: bool = False,
     ) -> Principal:
         """Construct a Principal from plain iterables (frozen sets are built here)."""
         return cls(
@@ -56,11 +78,37 @@ class Principal:
             auth_method=auth_method,
             source_ip=source_ip,
             claims=dict(claims or {}),
+            subject_scoped=subject_scoped,
         )
 
     def may_access(self, workspace_id: str) -> bool:
         """Whether this principal is entitled to the given workspace/tenant."""
         return self.all_tenants or workspace_id in self.tenant_ids
+
+    def may_access_subject(self, subject_id: str | None) -> bool:
+        """Whether this principal may read a resource owned by ``subject_id`` (BOLA).
+
+        The object-level (BOLA) counterpart of :meth:`may_access` (which is the
+        tenant/workspace axis). Returns True — i.e. NO narrowing — for every
+        principal except an opt-in ``subject_scoped`` one, so a workspace stays the
+        trust boundary by default and the offline / ``all_tenants`` / existing path
+        is byte-unchanged:
+
+        * ``all_tenants`` (ANONYMOUS / trusted shared key) → always True;
+        * not ``subject_scoped`` (the historical multi-user-workspace default) → True;
+        * holds the ``tenant_admin`` role → True (crosses subjects within its tenant —
+          the tenant axis is enforced separately by ``resolve_workspace``);
+        * a resource with no recorded subject (``subject_id is None``, legacy / pre-
+          subject-binding data) → True (no subject to narrow on);
+        * otherwise the resource's ``subject_id`` must equal this principal's ``subject``.
+        """
+        if self.all_tenants or not self.subject_scoped:
+            return True
+        if TENANT_ADMIN_ROLE in self.roles:
+            return True
+        if subject_id is None:
+            return True
+        return subject_id == self.subject
 
     def default_tenant(self) -> str | None:
         """The implied tenant when a request omits one (only if exactly one)."""
@@ -100,4 +148,4 @@ class Principal:
 ANONYMOUS = Principal(subject="anonymous", all_tenants=True, auth_method="anonymous")
 
 
-__all__ = ["Principal", "ANONYMOUS"]
+__all__ = ["Principal", "ANONYMOUS", "TENANT_ADMIN_ROLE"]

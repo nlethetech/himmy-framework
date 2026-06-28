@@ -146,6 +146,45 @@ def resolve_workspace(request: Request, requested: str | None) -> str | None:
     return requested
 
 
+def authorize_object(request: Request, subject_id: str | None) -> bool:
+    """Object-level (BOLA) gate: may this request's principal read ``subject_id``?
+
+    The subject-axis companion to :func:`resolve_workspace` (the tenant axis). Returns
+    the principal's :meth:`~himmy.api.auth.principal.Principal.may_access_subject`
+    verdict, which is **True for every principal except an opt-in ``subject_scoped``
+    one** — so the offline / ``all_tenants`` / historical multi-user-workspace path is a
+    NO-OP and byte-unchanged. A ``subject_scoped`` principal is True only for its OWN
+    ``subject`` (or any subject when it holds ``tenant_admin``, or a subject-less legacy
+    resource).
+
+    Callers fold a False verdict into a **404** (not 403) so a subject-scoped tenant
+    cannot even probe the existence of another subject's object — mirroring the
+    not-found-on-cross-tenant convention of :func:`get_run` / :func:`load_owned_thread`.
+    """
+    return get_principal(request).may_access_subject(subject_id)
+
+
+def narrow_subject(request: Request, requested: str | None) -> str | None:
+    """Pin a LIST query to the caller's own subject when it is ``subject_scoped`` (BOLA).
+
+    The list-path companion to :func:`authorize_object` (the by-id gate). For a
+    ``subject_scoped`` principal WITHOUT the ``tenant_admin`` role, the effective
+    ``subject_id`` filter is forced to the principal's own ``subject`` (a requested value
+    for ANOTHER subject is ignored, never honored — so a subject-scoped tenant cannot
+    enumerate another subject's runs). Every other principal — ``all_tenants`` / offline /
+    the historical multi-user-workspace default / a ``tenant_admin`` — keeps the
+    caller-supplied ``requested`` as-is, so the zero-config path is byte-unchanged.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants or not principal.subject_scoped:
+        return requested
+    from himmy.api.auth.principal import TENANT_ADMIN_ROLE
+
+    if TENANT_ADMIN_ROLE in principal.roles:
+        return requested
+    return principal.subject
+
+
 def require_workspace(request: Request, requested: str) -> str:
     """Like :func:`resolve_workspace` for write paths that always carry a workspace.
 
@@ -165,4 +204,6 @@ __all__ = [
     "get_principal",
     "resolve_workspace",
     "require_workspace",
+    "authorize_object",
+    "narrow_subject",
 ]

@@ -141,6 +141,7 @@ def _with_ip(principal: Principal, ip: str | None) -> Principal:
         auth_method=principal.auth_method,
         source_ip=ip,
         claims=principal.claims,
+        subject_scoped=principal.subject_scoped,
     )
 
 
@@ -163,6 +164,7 @@ def load_key_principals(path: str | Path) -> dict[str, Principal]:
             scopes=[str(s) for s in (spec.get("scopes") or [])],
             all_tenants=bool(spec.get("all_tenants", False)),
             auth_method="apikey",
+            subject_scoped=bool(spec.get("subject_scoped", False)),
         )
     return out
 

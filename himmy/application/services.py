@@ -3533,6 +3533,25 @@ class ThreadAppService:
         self.load_owned_thread(conversation_id, workspace_id=workspace_id)
         return cast("list[Any]", self._store.flat_messages(conversation_id))
 
+    def owned_subject_id(
+        self, conversation_id: str, *, workspace_id: str
+    ) -> str | None:
+        """The data subject linked to an OWNED thread, for object-level (BOLA) gating.
+
+        Resolves the thread under its workspace owner FIRST (so a cross-tenant id is a
+        clean 404 before any subject is revealed), then returns the conversation's stored
+        ``subject_id`` (the S3 erasure-linkage column) via the store's ``subject_of`` —
+        or ``None`` when the store does not expose it or the thread is un-attributed. The
+        router folds this into :func:`~himmy.api.auth.authorize_object`; ``None`` means
+        "no subject to narrow on", so an un-attributed thread (and the offline path) is
+        unaffected.
+        """
+        self.load_owned_thread(conversation_id, workspace_id=workspace_id)
+        subject_of = getattr(self._store, "subject_of", None)
+        if subject_of is None:
+            return None
+        return cast("str | None", subject_of(conversation_id))
+
     # -- continue -----------------------------------------------------------
 
     async def append_message(

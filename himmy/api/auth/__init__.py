@@ -12,14 +12,16 @@ from __future__ import annotations
 
 from himmy.api.auth.base import Authenticator, AuthError
 from himmy.api.auth.context import (
+    authorize_object,
     build_authenticator,
     get_principal,
     is_multi_tenant,
+    narrow_subject,
     principal_dependency,
     require_workspace,
     resolve_workspace,
 )
-from himmy.api.auth.principal import ANONYMOUS, Principal
+from himmy.api.auth.principal import ANONYMOUS, TENANT_ADMIN_ROLE, Principal
 from himmy.api.auth.rbac import (
     DEFAULT_POLICY,
     AccessPolicy,
@@ -36,12 +38,15 @@ __all__ = [
     "AuthError",
     "Principal",
     "ANONYMOUS",
+    "TENANT_ADMIN_ROLE",
     "build_authenticator",
     "is_multi_tenant",
     "principal_dependency",
     "get_principal",
     "resolve_workspace",
     "require_workspace",
+    "authorize_object",
+    "narrow_subject",
     "AccessPolicy",
     "DEFAULT_POLICY",
     "build_access_policy",

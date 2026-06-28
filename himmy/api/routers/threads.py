@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from himmy.api.auth import (
+    authorize_object,
     get_principal,
     require_permission,
     require_workspace,
@@ -163,11 +164,21 @@ async def create_thread(body: CreateThreadRequest, request: Request) -> ThreadVi
 async def get_thread(
     thread_id: str, request: Request, workspace_id: str | None = None
 ) -> ThreadMessagesView:
-    """Replay the flat (user/agent) projection of an owned thread (404 cross-tenant)."""
+    """Replay the flat (user/agent) projection of an owned thread (404 cross-tenant).
+
+    Object-level (BOLA, WS-bola): a ``subject_scoped`` principal reading a thread that
+    belongs to ANOTHER data subject within its own tenant gets a clean 404 — the workspace
+    ownership check runs first, then the thread's stored ``subject_id`` is gated via
+    :func:`authorize_object`. Non-subject-scoped / ``all_tenants`` / offline callers are
+    unaffected (the gate is a no-op for them).
+    """
     workspace_id = resolve_workspace(request, workspace_id)
     thread_app = _thread_app(request)
     try:
         thread = thread_app.load_owned_thread(thread_id, workspace_id=workspace_id)
+        subject_id = thread_app.owned_subject_id(thread_id, workspace_id=workspace_id)
+        if not authorize_object(request, subject_id):
+            raise HTTPException(status_code=404, detail="thread not found")
         flat = thread_app.flat_messages(thread_id, workspace_id=workspace_id)
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="thread not found") from exc

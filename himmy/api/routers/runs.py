@@ -14,7 +14,9 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from himmy.api.auth import (
+    authorize_object,
     get_principal,
+    narrow_subject,
     require_permission,
     require_workspace,
     resolve_workspace,
@@ -100,6 +102,24 @@ class CreateRunRequest(BaseModel):
 def _container(request: Request) -> Any:
     """Pull the wired :class:`ApiContainer` off the app state."""
     return request.app.state.container
+
+
+async def _bola_blocked(request: Request, run_id: str, workspace_id: str | None) -> bool:
+    """Whether object-level (BOLA, WS-bola) narrowing hides this run from the caller.
+
+    Returns True ONLY for an opt-in ``subject_scoped`` principal reading a run that belongs
+    to ANOTHER data subject (so the caller-facing route renders a clean 404). For every
+    other caller — offline / ``all_tenants`` / the historical multi-user-workspace default
+    / a ``tenant_admin`` — :meth:`~himmy.api.auth.principal.Principal.subject_scoped` is
+    falsy, so this short-circuits WITHOUT touching the run-resolution path and the legacy
+    behavior (e.g. ``/events`` returning ``[]`` for a foreign workspace) is byte-unchanged.
+    """
+    if not get_principal(request).subject_scoped:
+        return False
+    run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
+    if run is None:
+        return False  # unknown/out-of-workspace is handled by the route's own lookup
+    return not authorize_object(request, run.subject_id)
 
 
 @router.post("", response_model=RunRecord, dependencies=_WRITE)
@@ -305,7 +325,7 @@ async def get_pending_approvals(
     """
     workspace_id = resolve_workspace(request, workspace_id)
     run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
-    if run is None:
+    if run is None or not authorize_object(request, run.subject_id):
         raise HTTPException(status_code=404, detail="run not found")
     pending = await _container(request).run_app.pending_approvals(
         run_id, workspace_id=workspace_id
@@ -329,8 +349,15 @@ async def list_runs(
     limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(0, ge=0),
 ) -> RunListResponse:
-    """List runs (created_at desc), paginated. Returns a paged envelope (AAEO-8)."""
+    """List runs (created_at desc), paginated. Returns a paged envelope (AAEO-8).
+
+    Object-level (BOLA, WS-bola): a ``subject_scoped`` principal's list is pinned to its
+    OWN subject via :func:`narrow_subject` (a ``tenant_admin`` and every non-subject-scoped
+    / offline caller keep the caller-supplied filter), so a subject-scoped tenant can never
+    enumerate another data subject's runs within a shared workspace.
+    """
     workspace_id = resolve_workspace(request, workspace_id)
+    subject_id = narrow_subject(request, subject_id)
     run_app = _container(request).run_app
     items = await run_app.list_runs(
         workspace_id=workspace_id,
@@ -362,10 +389,18 @@ async def get_run(
     request: Request,
     workspace_id: str | None = None,
 ) -> RunRecord:
-    """Read one run record by id (404 when unknown/out-of-workspace, AAEO-4)."""
+    """Read one run record by id (404 when unknown/out-of-workspace, AAEO-4).
+
+    Object-level (BOLA, WS-bola) narrowing rides on top of the workspace scope: a
+    ``subject_scoped`` principal that resolves a run belonging to ANOTHER data subject
+    within its own tenant gets a clean 404 (not-found, never a 403 that would confirm the
+    run exists). Non-subject-scoped / ``all_tenants`` / offline callers are unaffected —
+    :func:`authorize_object` is a no-op for them, so a shared multi-user workspace and the
+    zero-config path keep reading every run byte-for-byte.
+    """
     workspace_id = resolve_workspace(request, workspace_id)
     run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
-    if run is None:
+    if run is None or not authorize_object(request, run.subject_id):
         raise HTTPException(status_code=404, detail="run not found")
     return cast(RunRecord, run)
 
@@ -376,8 +411,15 @@ async def get_run_events(
     request: Request,
     workspace_id: str | None = None,
 ) -> list[Any]:
-    """Replay the canonical event stream for one run (tenant-scoped, AAEO-4)."""
+    """Replay the canonical event stream for one run (tenant-scoped, AAEO-4).
+
+    BOLA (WS-bola): a ``subject_scoped`` principal reading another data subject's run gets
+    a clean 404 (:func:`_bola_blocked`). For every other caller that guard short-circuits
+    without touching the legacy path — a foreign workspace still returns ``[]`` (AAEO-4).
+    """
     workspace_id = resolve_workspace(request, workspace_id)
+    if await _bola_blocked(request, run_id, workspace_id):
+        raise HTTPException(status_code=404, detail="run not found")
     return cast(
         list[Any],
         await _container(request).run_app.get_run_events(
@@ -392,8 +434,14 @@ async def get_run_thread(
     request: Request,
     workspace_id: str | None = None,
 ) -> Any:
-    """Replay the full conversation thread for one run (404 when absent, AAEO-4)."""
+    """Replay the full conversation thread for one run (404 when absent, AAEO-4).
+
+    BOLA (WS-bola): a ``subject_scoped`` principal cannot replay another data subject's
+    thread (clean 404 via :func:`_bola_blocked`); other callers take the legacy path.
+    """
     workspace_id = resolve_workspace(request, workspace_id)
+    if await _bola_blocked(request, run_id, workspace_id):
+        raise HTTPException(status_code=404, detail="thread not found")
     thread = await _container(request).run_app.get_run_thread(
         run_id, workspace_id=workspace_id
     )
