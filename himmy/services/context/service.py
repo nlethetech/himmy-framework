@@ -67,15 +67,19 @@ class ContextService:
         through to storage except under ``TOOL_ONLY``. Required keys with no value
         land in ``missing_required_keys``.
 
-        Tenant isolation (red-team reattack-r1): ``context_fields`` are stored
+        Tenant isolation (red-team reattack-r1/r6): ``context_fields`` are stored
         globally by ``(subject_id, key)`` with NO workspace column, so a stored field
         resolved on the build path could leak ACROSS tenants that share a free-form
-        ``subject_id``. When ``workspace_id`` is supplied, any STORAGE-sourced field
-        whose ``metadata.workspace_id`` does not match is treated as not present
-        (mirroring :meth:`list_fields`' existing metadata filter), so a snapshot built
-        in workspace A can never surface workspace B's stored value. ``workspace_id``
-        of ``None`` (offline / zero-config / all-tenants) keeps resolution byte-for-byte
-        unchanged — every stored field is eligible, exactly as before.
+        ``subject_id`` (notably the default ``persona.agent_id``, identical across tenants
+        running the same agent spec). When ``workspace_id`` is supplied, a STORAGE-sourced
+        field is eligible ONLY when its ``metadata.workspace_id`` EXACTLY matches — an
+        unstamped or differently-stamped field is treated as not present, matching
+        :meth:`ApplicationServices.list_fields`' exact metadata filter, so a snapshot built
+        in workspace A can never surface workspace B's (or an ambiguous unstamped) stored
+        value. Adapter-sourced fields are stamped with ``workspace_id`` on write-through so
+        they too are tenant-attributable. ``workspace_id`` of ``None`` (offline / zero-config
+        / all-tenants) keeps resolution byte-for-byte unchanged — every stored field is
+        eligible, exactly as before.
         """
         spec = (
             build_spec
@@ -152,7 +156,7 @@ class ContextService:
                 return stored
             field = await adapter.fetch(key, key_scope)
             if field is not None:
-                await self._write_through(field, subject_id)
+                await self._write_through(field, subject_id, workspace_id)
                 return field
             # Adapter could not produce a fresh value; fall back to the stale cache.
             return stored
@@ -161,7 +165,7 @@ class ContextService:
         if adapter is not None:
             field = await adapter.fetch(key, key_scope)
             if field is not None:
-                await self._write_through(field, subject_id)
+                await self._write_through(field, subject_id, workspace_id)
                 return field
         return await self._stored_field(subject_id, key, workspace_id)
 
@@ -173,30 +177,50 @@ class ContextService:
         The ``context_fields`` store is keyed globally by ``(subject_id, key)`` with no
         workspace column, so a field written by tenant B under a shared ``subject_id`` is
         physically retrievable by tenant A. When ``workspace_id`` is supplied, a stored
-        field whose ``metadata.workspace_id`` differs is treated as absent — closing the
-        cross-tenant IDOR on the snapshot-build resolution path (the read/list paths
-        already apply this same metadata filter). ``None`` is byte-unchanged (offline /
+        field is eligible ONLY when its ``metadata.workspace_id`` EXACTLY matches (an
+        unstamped or differently-stamped field is treated as absent) — closing the
+        cross-tenant IDOR on the snapshot-build resolution path with the SAME exact-match
+        semantics the read/list paths already apply. ``None`` is byte-unchanged (offline /
         all-tenants): every stored field is eligible.
         """
         stored = await self._storage.get_context_field(subject_id, key)
         if stored is None or workspace_id is None:
             return stored
         stamped = (getattr(stored, "metadata", {}) or {}).get("workspace_id")
-        # An unstamped (legacy / hand-seeded storage-only) field has no workspace to
-        # contradict the caller's, so it stays eligible — only a DIFFERENT stamp is
-        # rejected, matching ``_snapshot_in_workspace``'s lenient-when-unstamped rule.
-        if stamped is not None and stamped != workspace_id:
+        # Tenant isolation (red-team reattack-r6): when a ``workspace_id`` IS supplied, a
+        # stored field must carry the SAME stamp to be eligible — an UNSTAMPED field is
+        # dropped, not admitted. This matches :meth:`ApplicationServices.list_fields`' exact
+        # ``metadata.workspace_id == workspace_id`` filter (the HTTP read path) so the
+        # snapshot-build resolution path can never surface a field the list path would hide.
+        # The previous lenient-when-unstamped rule (mirroring ``_snapshot_in_workspace``)
+        # was a cross-tenant IDOR: ``_write_through`` historically cached adapter-sourced
+        # fields WITHOUT a workspace stamp, so an unstamped cached value written by tenant B
+        # was admitted to tenant A's snapshot even WITH a workspace filter. Cached fields are
+        # now stamped (see :meth:`_write_through`), and any genuinely workspace-less field is
+        # a foreign/ambiguous value a tenant-scoped build must not surface. ``workspace_id``
+        # of ``None`` (offline / all-tenants) is byte-unchanged — every stored field eligible.
+        if stamped != workspace_id:
             return None
         return stored
 
-    async def _write_through(self, field: ContextField, subject_id: str) -> None:
+    async def _write_through(
+        self, field: ContextField, subject_id: str, workspace_id: str | None = None
+    ) -> None:
         """Cache an adapter-sourced field back to storage under (subject_id, key).
 
-        Persists a *copy* with ``subject_id`` stamped into its metadata rather than
-        mutating the field the adapter returned (which is also the object stored in
-        ``snapshot.fields`` and may be a cached/shared instance). This keeps the
-        snapshot's field metadata free of the internal ``subject_id`` smuggling key
-        and prevents an adapter's shared field from being silently rewritten.
+        Persists a *copy* with ``subject_id`` (and, when the build is tenant-scoped, the
+        run's ``workspace_id``) stamped into its metadata rather than mutating the field the
+        adapter returned (which is also the object stored in ``snapshot.fields`` and may be a
+        cached/shared instance). This keeps the snapshot's field metadata free of the
+        internal ``subject_id`` smuggling key and prevents an adapter's shared field from
+        being silently rewritten.
+
+        Tenant isolation (red-team reattack-r6): a tenant-scoped build stamps
+        ``workspace_id`` so the cached field is tenant-ATTRIBUTABLE on every later read —
+        :meth:`_stored_field` and :meth:`ApplicationServices.list_fields` both require an
+        exact ``metadata.workspace_id`` match, so an adapter value cached by tenant B can
+        never be resolved into tenant A's snapshot. ``workspace_id`` of ``None`` (offline /
+        single-tenant) writes no workspace stamp — byte-unchanged.
         """
         # Stamp the cache time so STORAGE_FIRST freshness checks have a reference,
         # alongside the subject scope the storage key is derived from. Always a copy
@@ -206,6 +230,8 @@ class ContextService:
             "subject_id": subject_id,
             "cached_at": utc_now_iso(),
         }
+        if workspace_id is not None:
+            new_metadata["workspace_id"] = workspace_id
         to_store = field.model_copy(update={"metadata": new_metadata})
         await self._storage.save_context_field(to_store)
 

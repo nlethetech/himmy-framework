@@ -122,12 +122,15 @@ def test_per_surface_read_isolates_models_from_gmail() -> None:
 
     The Studio main-router GET routes no longer collapse to one coarse
     ``studio.console:read``: each carries its OWN ``studio.<surface>:read``. A role
-    holding the console baseline + ``studio.models:read`` (but NOT the Google grant the
-    Gmail/Calendar reads require) is 200 on the model catalog yet 403 on the Gmail and
-    Calendar reads — proving the surfaces are independently gated, not a single bucket.
+    holding the console baseline + ``studio.modelcatalog:read`` (but NOT the Google grant
+    the Gmail/Calendar reads require) is 200 on the benign model catalog yet 403 on the
+    Gmail and Calendar reads — proving the surfaces are independently gated, not a single
+    bucket. (reattack-r6: the catalog moved off ``studio.models`` to the tenant-grantable
+    ``studio.modelcatalog`` so the catalog stays readable while the operator
+    provider-credential surface ``studio.models`` is withheld — see the dedicated test.)
     """
     app = _app_with_policy(
-        "models_only", ["studio.console:read", "studio.models:read"]
+        "models_only", ["studio.console:read", "studio.modelcatalog:read"]
     )
     c = _client_with_key(app)
     # Granted surface → 200.
@@ -136,13 +139,72 @@ def test_per_surface_read_isolates_models_from_gmail() -> None:
     assert c.get("/api/studio/google/gmail").status_code == 403
     assert c.get("/api/studio/google/calendar").status_code == 403
     assert c.get("/api/studio/google").status_code == 403
-    # …and the inverse: a connections-read role cannot read models.
+    # …and the inverse: a connections-read role cannot read the model catalog.
     app2 = _app_with_policy(
         "conn_only", ["studio.console:read", "studio.connections:read"]
     )
     c2 = _client_with_key(app2)
     assert c2.get("/api/studio/connections").status_code == 200
     assert c2.get("/api/studio/models").status_code == 403
+
+
+def test_models_providers_credential_surface_withheld_from_browse_roles() -> None:
+    """reattack-r6: the operator provider-CREDENTIAL surface is admin-only, not browse.
+
+    GET /api/studio/models/providers (gated by ``studio.models:read``) enumerates every
+    key-based provider's ``configured`` + ``detected_via`` ('secret'|'env'), plus
+    ``secrets_writable`` and the default provider — operator deployment posture, the same
+    reconnaissance class withheld for ``studio.connections``/``studio.google``. It must be
+    403 for the default browse roles (viewer/operator/auditor) while the BENIGN model
+    catalog GET /api/studio/models (now ``studio.modelcatalog:read``) stays 200, and admin
+    reads both.
+    """
+    for role in ("viewer", "operator", "auditor"):
+        c = _client_with_key(_app_with_key(role))
+        # Benign catalog stays readable…
+        assert c.get("/api/studio/models").status_code == 200, role
+        # …but the provider credential-status surface is withheld (admin-only).
+        assert c.get("/api/studio/models/providers").status_code == 403, role
+    # A role explicitly granted ``studio.models:read`` (the credential surface) is NOT
+    # granted the benign catalog by that alone — the two are independent resources now.
+    app = _app_with_policy(
+        "creds_only", ["studio.console:read", "studio.models:read"]
+    )
+    c = _client_with_key(app)
+    assert c.get("/api/studio/models/providers").status_code == 200
+    assert c.get("/api/studio/models").status_code == 403
+    # admin (``*:*``) reads both surfaces.
+    ca = _client_with_key(_app_with_key("admin"))
+    assert ca.get("/api/studio/models").status_code == 200
+    assert ca.get("/api/studio/models/providers").status_code == 200
+
+
+def test_health_posture_fields_withheld_from_browse_roles() -> None:
+    """reattack-r6: GET /api/studio/health withholds operator posture from browse roles.
+
+    The bare readiness fields (``status``/``version``) stay readable under the console
+    baseline, but ``secrets_writable`` + the ``providers`` presence map (which LLM binaries
+    are installed) are operator deployment posture, included ONLY for a caller that also
+    holds ``studio.console:write`` (admin). A tenant browse role gets a clean 200 probe with
+    NO posture; admin gets the full payload; OFFLINE (no auth) keeps the full payload.
+    """
+    for role in ("viewer", "operator", "auditor"):
+        c = _client_with_key(_app_with_key(role))
+        body = c.get("/api/studio/health").json()
+        assert body["status"] == "ok", role
+        assert "secrets_writable" not in body, role
+        assert "providers" not in body, role
+    # admin sees the operator posture.
+    ca = _client_with_key(_app_with_key("admin"))
+    abody = ca.get("/api/studio/health").json()
+    assert "secrets_writable" in abody
+    assert "providers" in abody
+    # OFFLINE (no authenticator) is byte-unchanged: full posture payload.
+    offline = TestClient(create_app(ApiContainer.build_default())).get(
+        "/api/studio/health"
+    ).json()
+    assert "secrets_writable" in offline
+    assert "providers" in offline
 
 
 def test_per_surface_runs_read_split() -> None:
@@ -202,8 +264,12 @@ def test_default_browse_roles_grant_benign_reads_not_sensitive() -> None:
         # Benign tenant-facing reads granted by default.
         assert c.get("/api/studio/models").status_code == 200, role
         assert c.get("/api/studio/runs").status_code == 200, role
-        assert c.get("/api/studio/approvals").status_code == 200, role
-        # Sensitive operator surfaces withheld by default (admin-only).
+        # Sensitive operator surfaces withheld by default (admin-only). ``approvals``
+        # (reattack-r4: process-wide HITL checkpoint store, no per-tenant partition) and the
+        # operator provider-credential surface ``/models/providers`` (reattack-r6) are both
+        # in ``_STUDIO_GLOBAL_STORE_RESOURCES``.
+        assert c.get("/api/studio/approvals").status_code == 403, role
+        assert c.get("/api/studio/models/providers").status_code == 403, role
         assert c.get("/api/studio/connections").status_code == 403, role
         assert c.get("/api/studio/google").status_code == 403, role
         assert c.get("/api/studio/google/gmail").status_code == 403, role

@@ -70,6 +70,13 @@ STUDIO_READ_RESOURCES: tuple[str, ...] = (
     "studio.google",
     "studio.approvals",
     "studio.models",
+    # red-team reattack-r6: the BENIGN model CATALOG (the tenant-facing "model picker",
+    # GET /api/studio/models -> build_model_catalog) split off ``studio.models`` so the
+    # catalog can stay tenant-grantable while ``studio.models`` (the operator
+    # credential-status surface — GET /api/studio/models/providers) is withheld to
+    # admin-only via :data:`_STUDIO_GLOBAL_STORE_RESOURCES`. Same catalog ``GET /v1/models``
+    # (``model:read``) and ``himmy models`` render; carries NO provider key posture.
+    "studio.modelcatalog",
     "studio.agents",
     "studio.tasks",
     "studio.chats",
@@ -199,6 +206,26 @@ _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
         # ``require_permission`` no-ops without an authenticator.
         "studio.mcp",
         "studio.approvals",
+        # red-team reattack-r6: ``studio.models`` is the operator PROVIDER-CREDENTIAL
+        # posture surface, NOT a tenant model picker. GET /api/studio/models/providers
+        # (build_studio_router("models"), gated only by ``studio.models:read``) enumerates
+        # every key-based provider (openrouter/anthropic/openai/pydantic-ai) with
+        # ``configured`` + ``detected_via`` ('secret'|'env'), plus ``secrets_writable`` and
+        # the default provider — disclosing WHICH paid LLM providers the operator has wired
+        # and whether each key lives in the secret store vs an env var. This is the SAME
+        # operator-infrastructure-reconnaissance class deliberately withheld for the sibling
+        # ``studio.connections`` (SMTP/Telegram/web creds status) and ``studio.google``
+        # (Gmail/Calendar connection status) surfaces above, but it slipped the r6 sweep
+        # because it looked like a benign "model picker". No key bytes leak (presence only)
+        # and writes already require ``studio.models:write`` (admin), so this was
+        # disclosure-only — but it is operator deployment posture a tenant must not read.
+        # Withheld from the default browse roles (admin-only, Studio is a network-isolated
+        # operator console); a deployment that deliberately exposes it to a tenant role can
+        # still grant ``studio.models:read`` explicitly via ``HIMMY_RBAC_FILE``. The BENIGN
+        # model catalog stays tenant-readable under the separate ``studio.modelcatalog``
+        # resource (see :data:`STUDIO_READ_RESOURCES`). The OFFLINE path is unaffected
+        # (``require_permission`` no-ops without an authenticator).
+        "studio.models",
     }
 )
 

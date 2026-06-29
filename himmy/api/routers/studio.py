@@ -79,6 +79,10 @@ _RES_CONNECTIONS = "studio.connections"  # email/telegram/web connection secrets
 _RES_GOOGLE = "studio.google"  # Gmail/Calendar OAuth credentials + send
 _RES_APPROVALS = "studio.approvals"  # HITL checkpoint approve/reject
 _RES_MODELS = "studio.models"  # provider API keys, Ollama pulls, model compare
+# red-team reattack-r6: the BENIGN model catalog (the tenant-facing picker) is split off
+# ``studio.models`` so it stays tenant-grantable while ``studio.models`` (the operator
+# provider-credential posture surface) is withheld to admin-only.
+_RES_MODEL_CATALOG = "studio.modelcatalog"  # read-only model picker (no key posture)
 _RES_AGENTS = "studio.agents"  # agent.yaml edit/validate
 _RES_TASKS = "studio.tasks"  # task board CRUD
 _RES_CHATS = "studio.chats"  # chat session CRUD
@@ -99,22 +103,59 @@ router = APIRouter(
 
 
 @router.get("/health")
-async def health() -> dict[str, Any]:
-    """Fast readiness probe: version, writable secrets, and provider availability."""
+async def health(request: Request) -> dict[str, Any]:
+    """Fast readiness probe: status + version, plus operator deployment posture for admins.
+
+    red-team reattack-r6: the ``secrets_writable`` flag and the ``providers`` presence map
+    (which LLM binaries — claude/ollama — are installed) are OPERATOR deployment posture,
+    the same reconnaissance class withheld from tenant browse roles for ``/doctor`` and the
+    provider credential-status surface. The bare readiness fields (``status``/``version``)
+    stay readable by every browse role (and load balancers) under the ``studio.console:read``
+    baseline; the posture fields are included ONLY when the caller also passes
+    ``studio.console:write`` (admin-only), so a tenant browse role gets a clean probe without
+    the operator topology. OFFLINE is unaffected — :func:`_caller_holds_console_write`
+    returns True when no authenticator is configured, so the single-box console sees the full
+    payload byte-unchanged.
+    """
     import shutil
 
     from himmy import __version__
-    from himmy.config.secrets import get_writable_provider
 
-    return {
-        "status": "ok",
-        "version": __version__,
-        "secrets_writable": get_writable_provider() is not None,
-        "providers": {
+    payload: dict[str, Any] = {"status": "ok", "version": __version__}
+    if _caller_holds_console_write(request):
+        from himmy.config.secrets import get_writable_provider
+
+        payload["secrets_writable"] = get_writable_provider() is not None
+        payload["providers"] = {
             "claude_cli": shutil.which("claude") is not None,
             "ollama": shutil.which("ollama") is not None,
-        },
-    }
+        }
+    return payload
+
+
+def _caller_holds_console_write(request: Request) -> bool:
+    """Whether the request may see operator deployment posture (``studio.console:write``).
+
+    Mirrors the offline bypass + escape-hatch of :func:`studio_permission`/
+    :func:`require_permission` so the posture-field gate can never diverge from the route
+    guards: returns True when no authenticator is configured (offline-first — the zero-config
+    console is byte-unchanged), when the ``HIMMY_STUDIO_AUTH`` kill-switch is off, and
+    otherwise iff the principal's roles grant ``studio.console:write`` (admin holds it via
+    ``*:*``). Best-effort: any error fails CLOSED (posture withheld).
+    """
+    from himmy.api.routers.studio_common import _studio_auth_off
+
+    if _studio_auth_off():
+        return True
+    if getattr(request.app.state, "authenticator", None) is None:
+        return True  # offline-first → no RBAC → full posture (byte-unchanged)
+    try:
+        from himmy.api.auth.rbac import DEFAULT_POLICY
+
+        policy = getattr(request.app.state, "access_policy", None) or DEFAULT_POLICY
+        return policy.authorize(get_principal(request), "studio.console", "write")
+    except Exception:  # noqa: BLE001 - posture is non-essential; fail closed
+        return False
 
 
 @router.get(
@@ -1041,13 +1082,20 @@ async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
 
 @router.get(
     "/models",
-    dependencies=[Depends(studio_permission(_RES_MODELS, "read"))],
+    dependencies=[Depends(studio_permission(_RES_MODEL_CATALOG, "read"))],
 )
 async def models() -> list[dict[str, Any]]:
     """Available providers + their models, with any cached benchmark stats.
 
-    red-team r6: requires the per-surface ``studio.models:read`` rather than collapsing to
-    the coarse ``studio.console:read`` baseline, so the model catalog honors its own grant.
+    red-team r6: requires the per-surface ``studio.modelcatalog:read`` rather than
+    collapsing to the coarse ``studio.console:read`` baseline, so the catalog honors its
+    own grant.
+
+    red-team reattack-r6: this BENIGN model picker is gated by ``studio.modelcatalog:read``
+    (a tenant-grantable browse read), split off ``studio.models`` — which now guards ONLY
+    the operator provider-credential posture surface (GET /api/studio/models/providers) and
+    is admin-only. The catalog carries NO provider-key configured/detected_via posture, so a
+    tenant browse role keeps the picker while losing the credential reconnaissance.
 
     Delegates to the shared :func:`himmy.services.inference.compare.build_model_catalog`
     seam (T3d) — the SAME catalog ``GET /v1/models`` and ``himmy models`` render, so the

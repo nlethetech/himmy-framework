@@ -270,6 +270,23 @@ def _cache_scope_metadata(ctx: dict[str, Any]) -> dict[str, Any]:
     return meta
 
 
+def _context_workspace_id(ctx: dict[str, Any]) -> str | None:
+    """The run's owning ``workspace_id`` (for tenant-scoping the context build), if any.
+
+    Read from ``context_metadata`` — the same place :func:`_cache_scope_metadata` reads it
+    for cache partitioning — so the per-run context-snapshot build can tenant-scope its
+    STORAGE reads exactly as the HTTP ``/v1/context/snapshot`` route does. Returns ``None``
+    for an unscoped run (offline / single-tenant / CLI — no ``workspace_id`` carried), which
+    keeps :meth:`ContextService.build_snapshot` resolution byte-for-byte unchanged.
+    """
+    context_metadata = ctx.get("context_metadata")
+    if isinstance(context_metadata, dict):
+        value = context_metadata.get("workspace_id")
+        if value:
+            return str(value)
+    return None
+
+
 # WS4.6 — the human data subject participating in the *current* run, set ONLY when a
 # ``consent_decider`` is wired (governed deployments) and the task carries a
 # ``context_subject_id``. It is published by ``_subject_scope`` around EVERY public entry
@@ -2898,12 +2915,22 @@ class SingleAgentRuntime:
         # Otherwise build one from a declared build spec.
         if snapshot is None and ctx.get("context_build_spec") is not None:
             subject_id = ctx.get("context_subject_id") or persona.agent_id
+            # Tenant isolation (red-team reattack-r6): thread the run's workspace_id into
+            # the per-run context build so STORAGE-sourced fields are tenant-scoped, exactly
+            # as the HTTP /v1/context/snapshot route does. Without it, ContextService
+            # resolved every stored field for a free-form ``subject_id`` (which defaults to
+            # the SHARED ``persona.agent_id`` across tenants running the same spec) with NO
+            # tenant filter, so tenant A's run could surface tenant B's cached context field
+            # (a cross-tenant IDOR). ``None`` (offline / single-tenant / CLI — no
+            # workspace_id on context_metadata) keeps resolution byte-for-byte unchanged.
+            workspace_id = _context_workspace_id(ctx)
             try:
                 snapshot = await self.context_service.build_snapshot(
                     subject_id=subject_id,
                     task_id=task.task_id,
                     build_spec=ctx["context_build_spec"],
                     metadata=ctx.get("context_metadata"),
+                    workspace_id=workspace_id,
                 )
                 resolved_id = snapshot.snapshot_id
                 snapshot_error = None
