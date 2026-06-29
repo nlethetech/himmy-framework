@@ -1111,20 +1111,27 @@ def resolve_routine_container() -> Any | None:
         return None
 
 
-def _routine_access_policy() -> Any | None:
+def active_access_policy() -> Any | None:
     """The active RBAC :class:`AccessPolicy`, or ``None`` when auth is not configured.
 
-    centralize-tool-gate: the ``agent_path`` routine seam runs off any HTTP request, so it
-    cannot read ``app.state.access_policy``; it reads it from the wired run service instead
-    (the SAME policy the ``/v1`` paths use, set in ``create_app`` ONLY when an authenticator
-    is configured). ``None`` offline (no server / no authenticator) so the routine's ambient
-    gate is inert — byte-unchanged.
+    centralize-tool-gate: the off-request background seams (the ``agent_path`` routine fire,
+    a background Mission, a Telegram-triggered run) run off any HTTP request, so they cannot
+    read ``app.state.access_policy``; they read it from the wired run service instead (the
+    SAME policy the ``/v1`` paths use, set in ``create_app`` ONLY when an authenticator is
+    configured). ``None`` offline (no server / no authenticator) so the caller's ambient
+    gate is inert — byte-unchanged. Shared by routines / missions / studio_telegram via the
+    :func:`himmy.api.auth.service_principal.bind_service_authorizer` seam.
     """
     container = resolve_routine_container()
     if container is None:
         return None
     run_app = getattr(container, "run_app", None)
     return getattr(run_app, "_access_policy", None)
+
+
+def _routine_access_policy() -> Any | None:
+    """Back-compat alias for :func:`active_access_policy` (the routine drain's gate policy)."""
+    return active_access_policy()
 
 
 # ---- headless execution ------------------------------------------------------

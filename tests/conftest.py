@@ -95,6 +95,32 @@ def _isolated_keyvault(
     monkeypatch.setenv("HIMMY_KEYVAULT_PATH", str(keyvault_db))
 
 
+@pytest.fixture(autouse=True)
+def _reset_ambient_auth_flag() -> Any:
+    """Reset the process-global tool-gate fail-closed flag around EVERY test.
+
+    ``himmy.services.tools.ambient._auth_configured`` is a deliberate PROCESS-level posture
+    (set once at ``create_app`` via :func:`mark_auth_configured` when an authenticator is
+    wired): when ``True``, a tool reaching the chokepoint with no authorizer in scope FAILS
+    CLOSED. That is exactly right for a single live server, but it makes the flag sticky in a
+    shared test process — once ANY API-builder test constructs an app WITH an authenticator,
+    the flag stays ``True`` and every SUBSEQUENT offline tool call (runtime/tools suites that
+    build a ``ToolService`` with no authorizer) would deny-by-default instead of the
+    byte-unchanged pure-pass, turning a monolithic ``pytest tests/`` run order-dependent.
+
+    Resetting to ``False`` in setup AND teardown keeps each test's posture hermetic: the
+    offline default for tests that never configure auth, and a clean slate for the next test
+    after one that did. The dedicated ambient suite already resets it; this generalises that
+    so the whole suite is order-independent. (Production is unaffected — one process, one
+    ``create_app``, one fixed posture.)
+    """
+    from himmy.services.tools.ambient import mark_auth_configured
+
+    mark_auth_configured(False)
+    yield
+    mark_auth_configured(False)
+
+
 # Guard-focused suites that deliberately drive the cross-site / CSRF middleware with
 # bespoke (or absent) Origin/Referer/Host headers — they must see the RAW guard
 # behaviour, so the same-origin default below is NOT injected for them.

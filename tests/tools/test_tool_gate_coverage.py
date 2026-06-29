@@ -56,6 +56,9 @@ _GATE_MARKERS = frozenset(
         "resolve_effective_authorizer",
         "from_request",  # ToolCapabilityAuthorizer.from_request(...)
         "tool_authorizer",  # explicit threading (ToolService(...)/overrides forwarding)
+        # The off-request service-principal seam (missions / studio_telegram bind their
+        # least-privilege ambient gate through it; it sets ``_active_authorizer`` inside).
+        "bind_service_authorizer",
     }
 )
 
@@ -74,12 +77,19 @@ _OFFLINE_ALLOW: frozenset[str] = frozenset(
         "himmy/cli/orchestrate.py",
         # Dev/bench/eval-harness tooling: no RBAC policy in scope, inert by design.
         "himmy/benchmark/runner.py",
-        # Background off-request service surfaces whose control is the chokepoint's
-        # process-level FAIL-CLOSED default (they run with no live principal; under a
-        # configured authenticator a tool reaching the chokepoint with no authorizer in
-        # scope is DENIED, not run un-gated). They are listed (not silently skipped) so a
-        # future change that should bind a real least-privilege principal here is a visible,
-        # reasoned decision rather than an accidental gap.
+    }
+)
+
+#: Off-request background SERVER surfaces that drive a run via ``stream_agent_run`` (an
+#: ``_AMBIENT_BY_CALLER`` builder, so they have no ``build_runtime`` call site of their own
+#: for the analyzer to flag) and now bind their OWN least-privilege service-principal gate
+#: ambiently (``bind_service_authorizer``), exactly as the routine ``agent_path`` drain
+#: does. They are NOT offline no-ops — they DO run under a configured authenticator — so
+#: :func:`test_off_request_service_surfaces_bind_a_gate` asserts they reference the gate,
+#: i.e. a tool they dispatch is GATED to the service role rather than (a) un-gated or
+#: (b) wholesale-denied by the chokepoint's fail-closed default.
+_OFF_REQUEST_SERVICE_SURFACES: frozenset[str] = frozenset(
+    {
         "himmy/api/missions.py",
         "himmy/api/studio_telegram.py",
     }
@@ -226,6 +236,26 @@ def test_known_server_surfaces_are_recognised_as_covered() -> None:
     ):
         tree = ast.parse((root / Path(module).relative_to("himmy")).read_text("utf-8"))
         assert _module_references_gate(tree), f"{module} lost its ambient gate threading"
+
+
+def test_off_request_service_surfaces_bind_a_gate() -> None:
+    """Missions + Telegram drive runs off-request and bind their OWN service-principal gate.
+
+    These two are first-class server execution surfaces (not CLI/bench), so they MUST put a
+    least-privilege authorizer in scope around their ``stream_agent_run`` drive — otherwise,
+    under a configured authenticator, every tool they dispatch is wholesale-denied by the
+    chokepoint's fail-closed default (non-functional) or, worse, were the default ever
+    relaxed, runs un-gated with the agent's full authority. The assertion guards against a
+    future change dropping the ``bind_service_authorizer`` wrap.
+    """
+    root = _himmy_root()
+    for module in _OFF_REQUEST_SERVICE_SURFACES:
+        tree = ast.parse((root / Path(module).relative_to("himmy")).read_text("utf-8"))
+        assert _module_references_gate(tree), (
+            f"{module} drives an agent run off-request but no longer binds a "
+            "tool-capability gate (bind_service_authorizer) — its tools would be "
+            "wholesale-denied under a configured authenticator"
+        )
 
 
 def test_ambient_by_caller_callers_are_wrapped() -> None:

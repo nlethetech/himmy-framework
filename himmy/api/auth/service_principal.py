@@ -22,6 +22,9 @@ built — so the offline connector/routine path is byte-unchanged.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
+
 from himmy.api.auth.principal import Principal
 from himmy.services.storage.models import LOCAL_WORKSPACE
 
@@ -79,10 +82,56 @@ def routine_service_principal(
     )
 
 
+@contextlib.contextmanager
+def bind_service_authorizer(
+    principal: Principal,
+    policy: object | None,
+) -> Iterator[None]:
+    """Bind ``principal``'s least-privilege tool-capability gate AMBIENTLY for a run drive.
+
+    centralize-tool-gate: the off-request background surfaces (a scheduled routine fire, a
+    background Mission, a Telegram-triggered run) drive an agent via
+    ``studio_service.stream_agent_run`` with NO HTTP request in scope, so the request
+    -boundary seam cannot reach them. Each must therefore bind the tool gate itself or it
+    inherits the chokepoint's process-level FAIL-CLOSED default — which, under a configured
+    authenticator, denies EVERY tool (``CAPABILITY_DENIED``) and makes the surface
+    non-functional rather than merely safe.
+
+    This wraps that drive so its tools run under ``principal``'s least-privilege SERVICE
+    role (deny-by-default to a named service identity) instead of the agent's full
+    authority. The contextvar binding propagates into the ``to_thread`` /
+    ``create_task`` children the runtime uses (the property the ambient design relies on)
+    and is reset on exit.
+
+    **Offline invariant — byte-unchanged.** ``policy`` is the active RBAC ``AccessPolicy``,
+    which is ``None`` whenever no authenticator is configured (CLI / single box / offline
+    server). With ``policy is None`` :meth:`ToolCapabilityAuthorizer.from_principal` returns
+    a NON-enforcing authorizer (or the offline pure-pass), so the ambient binding is inert
+    and the historical path is untouched. Were a future caller to forget this wrap entirely,
+    the chokepoint's fail-closed default still denies under a configured deployment.
+    """
+    if policy is None:
+        # No RBAC policy wired (offline): nothing to enforce, stay byte-unchanged. We still
+        # enter the contextmanager so callers can use it unconditionally.
+        yield
+        return
+
+    from himmy.services.tools.ambient import _active_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    authorizer = ToolCapabilityAuthorizer.from_principal(principal, policy)
+    token = _active_authorizer.set(authorizer)
+    try:
+        yield
+    finally:
+        _active_authorizer.reset(token)
+
+
 __all__ = [
     "CONNECTOR_SERVICE_SUBJECT",
     "ROUTINE_SERVICE_SUBJECT",
     "DEFAULT_SERVICE_ROLES",
     "connector_service_principal",
     "routine_service_principal",
+    "bind_service_authorizer",
 ]

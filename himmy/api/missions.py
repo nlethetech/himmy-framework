@@ -233,42 +233,67 @@ class MissionRegistry:
         (interrupt) is recorded honestly as an error with an explicit message.
         """
         from himmy.api import studio_service
+        from himmy.api.auth.service_principal import (
+            bind_service_authorizer,
+            connector_service_principal,
+        )
         from himmy.api.routers.studio_notify import record_notification
+        from himmy.api.routines import active_access_policy
         from himmy.api.studio_canonical import resolve_canonical_storage
+        from himmy.services.storage.models import LOCAL_WORKSPACE
 
+        # centralize-tool-gate: a background Mission drives the agent off any HTTP request,
+        # so it binds the tool-capability gate AMBIENTLY itself (the request boundary cannot
+        # reach this task). Under a CONFIGURED authenticator the gate is a least-privilege
+        # SERVICE principal (deny-by-default to a named service role), so a mission's tools
+        # are gated rather than running with the agent's full authority — AND rather than
+        # being denied wholesale by the chokepoint's fail-closed default. Offline (no
+        # server / no authenticator) ``active_access_policy()`` is ``None`` → the binding is
+        # inert and the path is byte-unchanged. A mission is single-box / ``__local__``, like
+        # the routine ``agent_path`` seam, so it reuses the connector service principal shape.
         status = _DONE
         cancelled = False
         try:
-            async for frame in studio_service.stream_agent_run(
-                spec,
-                mission.prompt,
-                history=mission.history,
-                provider=mission.provider,
-                model=mission.model,
-                agent_path=mission.agent_path,
-                steer_queue=mission.steer_queue,
-                plan_mode=mission.plan_mode,
-                canonical_storage=resolve_canonical_storage(),
+            with bind_service_authorizer(
+                connector_service_principal(workspace_id=LOCAL_WORKSPACE),
+                active_access_policy(),
             ):
-                await self._append(mission, frame)
-                ftype = frame.get("type")
-                if ftype == "done":
-                    status = _DONE
-                    mission.run_id = str(frame.get("run_id") or "") or mission.run_id
-                    mission.result_preview = _cap(
-                        str(frame.get("output_text") or ""), RESULT_PREVIEW_MAX
-                    )
-                elif ftype == "error":
-                    status = _ERROR
-                    mission.error = str(frame.get("message") or "run failed")
-                    mission.run_id = str(frame.get("run_id") or "") or mission.run_id
-                elif ftype == "paused":
-                    status = _PAUSED
-                    mission.checkpoint_id = frame.get("checkpoint_id")
-                    mission.run_id = str(frame.get("run_id") or "") or mission.run_id
-                    mission.result_preview = (
-                        "paused at an approval gate — resume from Approvals"
-                    )
+                async for frame in studio_service.stream_agent_run(
+                    spec,
+                    mission.prompt,
+                    history=mission.history,
+                    provider=mission.provider,
+                    model=mission.model,
+                    agent_path=mission.agent_path,
+                    steer_queue=mission.steer_queue,
+                    plan_mode=mission.plan_mode,
+                    canonical_storage=resolve_canonical_storage(),
+                ):
+                    await self._append(mission, frame)
+                    ftype = frame.get("type")
+                    if ftype == "done":
+                        status = _DONE
+                        mission.run_id = (
+                            str(frame.get("run_id") or "") or mission.run_id
+                        )
+                        mission.result_preview = _cap(
+                            str(frame.get("output_text") or ""), RESULT_PREVIEW_MAX
+                        )
+                    elif ftype == "error":
+                        status = _ERROR
+                        mission.error = str(frame.get("message") or "run failed")
+                        mission.run_id = (
+                            str(frame.get("run_id") or "") or mission.run_id
+                        )
+                    elif ftype == "paused":
+                        status = _PAUSED
+                        mission.checkpoint_id = frame.get("checkpoint_id")
+                        mission.run_id = (
+                            str(frame.get("run_id") or "") or mission.run_id
+                        )
+                        mission.result_preview = (
+                            "paused at an approval gate — resume from Approvals"
+                        )
         except asyncio.CancelledError:
             cancelled = True
             status = _ERROR

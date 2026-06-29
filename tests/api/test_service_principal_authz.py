@@ -12,11 +12,13 @@ from himmy.api.auth.rbac import DEFAULT_POLICY
 from himmy.api.auth.service_principal import (
     CONNECTOR_SERVICE_SUBJECT,
     ROUTINE_SERVICE_SUBJECT,
+    bind_service_authorizer,
     connector_service_principal,
     routine_service_principal,
 )
 from himmy.api.connector_inbound import _connector_tool_authorizer
 from himmy.services.storage.models import LOCAL_WORKSPACE
+from himmy.services.tools.ambient import current_authorizer
 from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
 
@@ -79,6 +81,38 @@ def test_connector_gate_engages_only_with_authenticator() -> None:
     assert gate.enforce is True
     # The default operator role holds ``tool:*`` so the connector may invoke any tool.
     assert gate.is_authorized("send_email", False) is True
+
+
+def test_bind_service_authorizer_enforces_under_configured_auth() -> None:
+    """The shared off-request seam binds an ENFORCING ambient gate when a policy is wired.
+
+    Missions + studio_telegram drive ``stream_agent_run`` off any request; this is the
+    helper they wrap that drive in. Under a real policy it must put an enforcing
+    least-privilege authorizer in the ambient contextvar so the chokepoint gates the run's
+    tools to the SERVICE role (rather than wholesale-denying via the fail-closed default).
+    """
+    principal = connector_service_principal(workspace_id=LOCAL_WORKSPACE)
+    assert current_authorizer() is None  # nothing bound outside the block
+    with bind_service_authorizer(principal, DEFAULT_POLICY):
+        gate = current_authorizer()
+        assert gate is not None
+        assert gate.enforce is True
+        # operator holds tool:* in the default policy, so the service role may invoke tools.
+        assert gate.is_authorized("send_email", False) is True
+    assert current_authorizer() is None  # reset on exit
+
+
+def test_bind_service_authorizer_is_inert_offline() -> None:
+    """With NO policy wired (offline) the helper binds NOTHING — byte-unchanged pure pass.
+
+    The mission / Telegram drive reads ``active_access_policy()`` which is ``None`` whenever
+    no authenticator is configured, so the ambient contextvar stays unset and the offline
+    single-box path is untouched.
+    """
+    principal = connector_service_principal(workspace_id=LOCAL_WORKSPACE)
+    with bind_service_authorizer(principal, None):
+        assert current_authorizer() is None
+    assert current_authorizer() is None
 
 
 def test_default_policy_operator_authorizes_read_and_write_tools() -> None:
