@@ -573,3 +573,194 @@ def test_bola_offline_context_reads_and_writes_any_subject() -> None:
     )
     assert listed.status_code == 200
     assert any(f["key"] == "email" for f in listed.json())
+
+
+# --------------------------------------------------------------------------- #
+# Subject-axis BOLA on /v1/recommendations + /v1/dashboard (red-team reattack-r2)
+#
+# Recommendations are subject-attributed (created with subject_id=run.subject_id),
+# so a ``subject_scoped`` principal must read/mutate ONLY its own subject's recs —
+# exactly like runs. The dashboard summary is a per-subject aggregate and is gated
+# the same way. Offline / non-subject-scoped / tenant_admin keep reading everything.
+# --------------------------------------------------------------------------- #
+
+
+def _seed_recommendation(app: Any, *, workspace: str, subject_id: str) -> str:
+    """Save a recommendation directly in the app's canonical store for a subject."""
+    from himmy.services.storage.models import RecommendationItem
+    from tests.conftest import run_async
+
+    storage = app.state.container.storage
+    item = RecommendationItem(
+        run_id="run-" + subject_id,
+        workspace_id=workspace,
+        subject_id=subject_id,
+        kind="advice",
+        title="secret for " + subject_id,
+        summary="confidential",
+    )
+    run_async(storage.save_recommendation(item))
+    return item.recommendation_id
+
+
+def test_bola_subject_cannot_list_other_subjects_recommendations() -> None:
+    """REQUIRED: a subject-scoped list is pinned to the caller's own subject's recs.
+
+    Regression: list_recommendations omitted ``narrow_subject``, so subject A could
+    enumerate every subject's recs (no filter) or directly target subject B's.
+    """
+    app = _bola_app()
+    rec_a = _seed_recommendation(app, workspace="shared", subject_id="subj-a")
+    rec_b = _seed_recommendation(app, workspace="shared", subject_id="subj-b")
+
+    client_a = _client_on(app, "key-a")
+    # Unfiltered list: B's rec is NEVER surfaced to A (pinned to own subject).
+    ids = {
+        it["recommendation_id"]
+        for it in client_a.get(
+            "/v1/recommendations", params={"workspace_id": "shared"}
+        ).json()["items"]
+    }
+    assert rec_a in ids
+    assert rec_b not in ids
+    # Even explicitly asking for B's subject is ignored.
+    forced = {
+        it["recommendation_id"]
+        for it in client_a.get(
+            "/v1/recommendations",
+            params={"workspace_id": "shared", "subject_id": "subj-b"},
+        ).json()["items"]
+    }
+    assert rec_b not in forced
+
+
+def test_bola_subject_cannot_read_other_subjects_recommendation_provenance() -> None:
+    """REQUIRED: A cannot trace B's recommendation provenance — a clean 404."""
+    app = _bola_app()
+    rec_b = _seed_recommendation(app, workspace="shared", subject_id="subj-b")
+    client_a = _client_on(app, "key-a")
+    resp = client_a.get(
+        f"/v1/recommendations/{rec_b}/provenance", params={"workspace_id": "shared"}
+    )
+    assert resp.status_code == 404
+
+
+def test_bola_subject_cannot_mutate_other_subjects_recommendation() -> None:
+    """REQUIRED: A cannot transition B's recommendation status — a clean 404, no write."""
+    app = _bola_app()
+    rec_b = _seed_recommendation(app, workspace="shared", subject_id="subj-b")
+    client_a = _client_on(app, "key-a")
+    resp = client_a.patch(
+        f"/v1/recommendations/{rec_b}",
+        params={"workspace_id": "shared"},
+        json={"status": "DISMISSED"},
+    )
+    assert resp.status_code == 404
+
+
+def test_bola_subject_can_read_and_mutate_its_own_recommendation() -> None:
+    """No false lockout: A reads + mutates its OWN recommendation."""
+    app = _bola_app()
+    rec_a = _seed_recommendation(app, workspace="shared", subject_id="subj-a")
+    client_a = _client_on(app, "key-a")
+    listed = {
+        it["recommendation_id"]
+        for it in client_a.get(
+            "/v1/recommendations", params={"workspace_id": "shared"}
+        ).json()["items"]
+    }
+    assert rec_a in listed
+    patched = client_a.patch(
+        f"/v1/recommendations/{rec_a}",
+        params={"workspace_id": "shared"},
+        json={"status": "DISMISSED"},
+    )
+    assert patched.status_code == 200
+
+
+def test_bola_tenant_admin_can_target_any_subjects_recommendation() -> None:
+    """A tenant_admin crosses subjects on recs within its own tenant."""
+    app = _bola_app()
+    rec_b = _seed_recommendation(app, workspace="shared", subject_id="subj-b")
+    admin = _client_on(app, "key-admin")
+    ids = {
+        it["recommendation_id"]
+        for it in admin.get(
+            "/v1/recommendations", params={"workspace_id": "shared"}
+        ).json()["items"]
+    }
+    assert rec_b in ids
+    assert (
+        admin.patch(
+            f"/v1/recommendations/{rec_b}",
+            params={"workspace_id": "shared"},
+            json={"status": "DISMISSED"},
+        ).status_code
+        == 200
+    )
+
+
+def test_bola_offline_recommendations_un_narrowed() -> None:
+    """INVARIANT: offline / ANONYMOUS reads recs of ANY subject (no narrowing)."""
+    app = create_app(ApiContainer.build_default())
+    rec_a = _seed_recommendation(app, workspace="w1", subject_id="subj-a")
+    rec_b = _seed_recommendation(app, workspace="w1", subject_id="subj-b")
+    client = TestClient(app)
+    ids = {
+        it["recommendation_id"]
+        for it in client.get(
+            "/v1/recommendations", params={"workspace_id": "w1"}
+        ).json()["items"]
+    }
+    assert {rec_a, rec_b} <= ids
+
+
+def test_bola_subject_cannot_read_other_subjects_dashboard_summary() -> None:
+    """REQUIRED: A cannot read B's dashboard aggregate — a clean 404.
+
+    Regression: dashboard_summary enforced only the tenant axis (require_workspace),
+    leaking another subject's context/run/recommendation aggregate metadata.
+    """
+    app = _bola_app()
+    _seed_recommendation(app, workspace="shared", subject_id="subj-b")
+    client_a = _client_on(app, "key-a")
+    resp = client_a.get(
+        "/v1/dashboard/summary",
+        params={"workspace_id": "shared", "subject_id": "subj-b"},
+    )
+    assert resp.status_code == 404
+
+
+def test_bola_subject_can_read_its_own_dashboard_summary() -> None:
+    """No false lockout: A reads its OWN dashboard aggregate."""
+    app = _bola_app()
+    client_a = _client_on(app, "key-a")
+    resp = client_a.get(
+        "/v1/dashboard/summary",
+        params={"workspace_id": "shared", "subject_id": "subj-a"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["subject_id"] == "subj-a"
+
+
+def test_bola_tenant_admin_reads_any_subjects_dashboard_summary() -> None:
+    """A tenant_admin reads every subject's dashboard aggregate within its tenant."""
+    app = _bola_app()
+    admin = _client_on(app, "key-admin")
+    assert (
+        admin.get(
+            "/v1/dashboard/summary",
+            params={"workspace_id": "shared", "subject_id": "subj-b"},
+        ).status_code
+        == 200
+    )
+
+
+def test_bola_offline_dashboard_summary_un_narrowed() -> None:
+    """INVARIANT: offline / ANONYMOUS reads any subject's dashboard aggregate."""
+    client = TestClient(create_app(ApiContainer.build_default()))
+    resp = client.get(
+        "/v1/dashboard/summary",
+        params={"workspace_id": "w1", "subject_id": "anyone"},
+    )
+    assert resp.status_code == 200

@@ -1454,11 +1454,13 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
     import logging
     import signal
 
+    from himmy.api.auth import build_authenticator
     from himmy.api.routines import get_routines_store, get_scheduler
     from himmy.api.runtime_bootstrap import (
         build_durable_container,
         start_run_substrate,
         stop_run_substrate,
+        wire_tool_authz,
     )
     from himmy.api.scheduler_leader import acquire_scheduler_leadership
     from himmy.config.flags import env_falsy, env_truthy
@@ -1483,11 +1485,28 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
     leadership = None
     watchdog: _asyncio.Task[None] | None = None
     try:
+        # 1b) multi-tenant fail-closed posture (G2), BEFORE anything executes: a worker
+        #     draining a tenant queue / ticking tenant routines must refuse to start on an
+        #     authenticator that mints every caller an all-tenants admin, EXACTLY like the
+        #     FastAPI server (app._enforce_multi_tenant_posture). Without this a multi-tenant
+        #     worker that cannot bind tenants would silently run every claimed run as admin.
+        from himmy.api.app import _enforce_multi_tenant_posture
+
+        _enforce_multi_tenant_posture(build_authenticator())
+
         # 2) build the durable container (Postgres / file-backed SQLite) + bring up the run
         #    substrate (publish store, enable dispatch BEFORE the sweep, sweep + reconcile,
         #    start dispatcher AFTER recovery, start dedup GC, install both providers).
         container, built_durable = await build_durable_container()
         substrate = await start_run_substrate(container, install_providers=True)
+
+        # 2b) P0 tool-capability gate across the process boundary: wire the SAME two lines
+        #     create_app's body wires (mark_auth_configured + run_app._access_policy). The
+        #     worker dispatches claimed runs / fires routines through this run_app; without
+        #     this the chokepoint sentinel stays OFF and a least-privilege tenant's work runs
+        #     with the agent's FULL toolset (a cross-process confused-deputy escalation). A
+        #     strict NO-OP with no authenticator configured (offline byte-unchanged).
+        wire_tool_authz(getattr(substrate.active, "run_app", None))
 
         backend = substrate.backend
         if run_dispatcher and not substrate.dispatch_on:

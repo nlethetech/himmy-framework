@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import os
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from himmy.api import routines as svc
+from himmy.api.auth import authorize_studio_object
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("routines", tag="studio-routines")
@@ -120,6 +121,29 @@ def _view(routine: svc.Routine) -> RoutineView:
     )
 
 
+def _load_owned_routine(request: Request, routine_id: str) -> svc.Routine:
+    """Resolve a routine by id and gate it on the caller's tenant entitlement (BOLA).
+
+    The single by-id choke point for every Studio routine reader/mutator. The Studio LIST
+    is scoped to the ``__local__`` workspace, but the by-id paths share ``.himmy/routines.db``
+    with the ``/v1`` surface, where tenants create rows stamped with their OWN ``workspace_id``
+    (POST /v1/routines). Without this gate a tenant-bound principal could read/mutate another
+    tenant's routine row by id — a cross-tenant BOLA over routine definitions (prompt, agent
+    binding, provider/model, last run preview/error). This intersects the routine's owning
+    ``workspace_id`` against the caller's tenants via :func:`authorize_studio_object`, folding
+    a foreign / unknown row into a uniform **404** (existence is never leaked), mirroring the
+    ``/v1`` ``store.get(routine_id, workspace_id=...)`` sibling.
+
+    A NO-OP for an unrestricted principal (offline / ``all_tenants`` / ANONYMOUS): every row
+    is allowed and the zero-config single-box Studio path is byte-unchanged. A ``None``
+    routine ``workspace_id`` (a legacy/uncategorized row predating tenant binding) is allowed.
+    """
+    routine = svc.get_routines_store().get(routine_id)
+    if routine is None or not authorize_studio_object(request, routine.workspace_id):
+        raise HTTPException(status_code=404, detail="routine not found")
+    return routine
+
+
 def _validate_agent_path(rel_path: str) -> None:
     """Reject a routine pointing at a missing/escaping agent spec up front."""
     from himmy.api.studio_service import resolve_spec_path
@@ -167,22 +191,25 @@ async def create_routine(body: RoutineCreate) -> RoutineView:
 
 
 @router.get("/{routine_id}", response_model=RoutineView)
-async def get_routine(routine_id: str) -> RoutineView:
-    routine = svc.get_routines_store().get(routine_id)
-    if routine is None:
-        raise HTTPException(status_code=404, detail="routine not found")
+async def get_routine(routine_id: str, request: Request) -> RoutineView:
+    """Read one routine by id (404 when unknown / out-of-tenant, BOLA-gated)."""
+    routine = _load_owned_routine(request, routine_id)
     return _view(routine)
 
 
 @router.patch(
     "/{routine_id}", response_model=RoutineView, dependencies=[_routines_write]
 )
-async def update_routine(routine_id: str, body: RoutineUpdate) -> RoutineView:
-    """Partial update; the schedule (when given) is re-validated as a whole."""
+async def update_routine(
+    routine_id: str, body: RoutineUpdate, request: Request
+) -> RoutineView:
+    """Partial update; the schedule (when given) is re-validated as a whole.
+
+    BOLA-gated: a tenant-bound principal may only mutate a routine in a workspace it is
+    entitled to (:func:`_load_owned_routine`); a foreign row is a 404, never mutated.
+    """
     store = svc.get_routines_store()
-    routine = store.get(routine_id)
-    if routine is None:
-        raise HTTPException(status_code=404, detail="routine not found")
+    routine = _load_owned_routine(request, routine_id)
     patch = body.model_dump(exclude_unset=True)
     # Non-nullable fields: an explicit null means "leave unchanged", never None.
     for key in ("name", "agent_path", "prompt", "schedule", "deliver", "enabled"):
@@ -199,7 +226,9 @@ async def update_routine(routine_id: str, body: RoutineUpdate) -> RoutineView:
 
 
 @router.delete("/{routine_id}", dependencies=[_routines_write])
-async def delete_routine(routine_id: str) -> dict[str, bool]:
+async def delete_routine(routine_id: str, request: Request) -> dict[str, bool]:
+    """Delete a routine (404 when unknown / out-of-tenant, BOLA-gated)."""
+    _load_owned_routine(request, routine_id)
     if not svc.get_routines_store().delete(routine_id):
         raise HTTPException(status_code=404, detail="routine not found")
     _wake_scheduler()
@@ -212,15 +241,17 @@ async def delete_routine(routine_id: str) -> dict[str, bool]:
 @router.post(
     "/{routine_id}/run-now", response_model=RoutineView, dependencies=[_routines_write]
 )
-async def run_now(routine_id: str) -> RoutineView:
+async def run_now(routine_id: str, request: Request) -> RoutineView:
     """Run a routine immediately through the same unattended rails.
 
     Same pipeline, same timeout, same approval pause — the response carries the
     refreshed routine once the run finishes (or pauses/fails). A routine that is
     already executing is refused with a 409, never run twice concurrently.
+
+    BOLA-gated: a tenant-bound principal may only fire a routine in a workspace it is
+    entitled to (:func:`_load_owned_routine`); a foreign row is a 404, never executed.
     """
-    if svc.get_routines_store().get(routine_id) is None:
-        raise HTTPException(status_code=404, detail="routine not found")
+    _load_owned_routine(request, routine_id)
     try:
         routine = await svc.get_scheduler().run_now(routine_id)
     except svc.RoutineBusyError as exc:

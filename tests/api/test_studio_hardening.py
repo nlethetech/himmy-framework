@@ -252,6 +252,88 @@ def test_tenant_bound_runs_reader_cannot_cross_tenants() -> None:
     assert all(item["run_id"] != "other-tenant-run" for item in body["items"])
 
 
+def test_tenant_bound_studio_routine_reader_cannot_cross_tenants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tenant-bound principal with ``studio.routines:read`` cannot read a foreign routine.
+
+    Regression (red-team reattack-r2): the Studio by-id routine readers
+    (get/update/delete/run-now) called ``store.get(routine_id)`` with NO workspace filter,
+    while the ``/v1`` sibling carries ``store.get(routine_id, workspace_id=...)``. Both
+    surfaces share ``.himmy/routines.db``, so a tenant could read another tenant's routine
+    row (prompt, agent binding, provider/model, last run preview/error) by id. The by-id
+    readers now intersect the routine's owning ``workspace_id`` against the caller's tenants
+    via ``authorize_studio_object`` and fold a foreign row into a uniform 404.
+    """
+    from himmy.api import routines as svc
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HIMMY_ROUTINES_PATH", str(tmp_path / "routines.db"))
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "off")
+    (tmp_path / "agent.yaml").write_text("name: helper\ndescription: A helper.\n")
+    svc.reset_routines_store()
+    svc.reset_scheduler()
+    try:
+        # Seed a routine stamped to ANOTHER tenant's workspace (as POST /v1/routines would).
+        foreign = svc.Routine(
+            name="victim",
+            agent_id="agt_other",
+            prompt="another tenant's secret prompt",
+            schedule=svc.Schedule(kind="every", hours=6),
+            workspace_id="other",
+        )
+        svc.get_routines_store().upsert(foreign)
+
+        app = create_app(ApiContainer.build_default())
+        app.state.authenticator = ApiKeyAuthenticator(
+            key_principals={
+                "k": Principal.build(
+                    "u", tenant_ids=["t"], roles=["viewer"], auth_method="apikey"
+                )
+            }
+        )
+        c = _client_with_key(app)
+        # The granted reader is 404 (not 200, not 403) on the cross-tenant routine by id.
+        assert c.get(f"/api/studio/routines/{foreign.id}").status_code == 404
+        # Mutating by-id paths fold the same way (gated additionally by :write, but the
+        # read-level BOLA must already 404 a viewer before any role check on a foreign row).
+        assert c.post(f"/api/studio/routines/{foreign.id}/run-now").status_code in (
+            403,
+            404,
+        )
+    finally:
+        svc.reset_routines_store()
+        svc.reset_scheduler()
+
+
+def test_offline_studio_routine_reader_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INVARIANT: offline / no-auth Studio reads a routine by id regardless of workspace."""
+    from himmy.api import routines as svc
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HIMMY_ROUTINES_PATH", str(tmp_path / "routines.db"))
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "off")
+    svc.reset_routines_store()
+    svc.reset_scheduler()
+    try:
+        foreign = svc.Routine(
+            name="any",
+            agent_id="agt_x",
+            prompt="p",
+            schedule=svc.Schedule(kind="every", hours=6),
+            workspace_id="other",
+        )
+        svc.get_routines_store().upsert(foreign)
+        c = TestClient(create_app(ApiContainer.build_default()))
+        # No authenticator → ANONYMOUS all-tenants → the by-id read is byte-unchanged.
+        assert c.get(f"/api/studio/routines/{foreign.id}").status_code == 200
+    finally:
+        svc.reset_routines_store()
+        svc.reset_scheduler()
+
+
 def test_escape_hatch_disables_studio_rbac(monkeypatch: pytest.MonkeyPatch) -> None:
     """HIMMY_STUDIO_AUTH=off (dangerous) skips the permission check, not authn."""
     monkeypatch.setenv("HIMMY_STUDIO_AUTH", "off")
