@@ -24,9 +24,13 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 from himmy.api.auth.principal import Principal
 from himmy.services.storage.models import LOCAL_WORKSPACE
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
+    from himmy.api.auth.rbac import AccessPolicy
 
 #: The subject stamped on a run launched by an inbound connector delivery.
 CONNECTOR_SERVICE_SUBJECT = "service:connector-inbound"
@@ -85,7 +89,7 @@ def routine_service_principal(
 @contextlib.contextmanager
 def bind_service_authorizer(
     principal: Principal,
-    policy: object | None,
+    policy: AccessPolicy | None,
 ) -> Iterator[None]:
     """Bind ``principal``'s least-privilege tool-capability gate AMBIENTLY for a run drive.
 

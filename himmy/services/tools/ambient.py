@@ -52,11 +52,36 @@ from __future__ import annotations
 import contextlib
 import contextvars
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
     from himmy.services.tools.capability import ToolCapabilityAuthorizer
     from himmy.services.tools.models import ToolDefinition
+
+
+@runtime_checkable
+class ToolAuthorizer(Protocol):
+    """The structural gate interface the chokepoint consumes.
+
+    Three concrete shapes satisfy it — the real
+    :class:`~himmy.services.tools.capability.ToolCapabilityAuthorizer`, the fail-closed
+    :class:`_DenyAllAuthorizer` sentinel, and the :class:`_IntersectionAuthorizer`
+    combinator — none of which subclass each other (the last two are deliberately
+    standalone duck-types so the capability module need not depend on this one). Typing
+    :func:`resolve_effective_authorizer`'s RETURN as this protocol lets all three flow to
+    the chokepoint's ``authorize_definition`` call without a nominal base class, while the
+    explicit/ambient INPUTS stay the concrete ``ToolCapabilityAuthorizer`` (the only shape
+    ever bound into the contextvar). Purely a typing seam; it adds no runtime behaviour.
+    """
+
+    @property
+    def enforce(self) -> bool: ...
+
+    def is_authorized(self, name: str, read_only: bool | None) -> bool: ...
+
+    def authorize_definition(self, definition: ToolDefinition) -> bool: ...
+
+    def attenuate(self) -> ToolAuthorizer: ...
 
 #: The ambient authorizer for the current execution context. ``None`` (the default, and
 #: every offline / CLI / eval path that never sets it) means "no ambient gate" — the
@@ -120,7 +145,7 @@ def use_tool_authorizer(
 
 def resolve_effective_authorizer(
     explicit: ToolCapabilityAuthorizer | None,
-) -> ToolCapabilityAuthorizer | None:
+) -> ToolAuthorizer | None:
     """The authorizer the chokepoint must actually enforce, given the explicit arg.
 
     Combines the per-``ToolService`` ``explicit`` arg with the :data:`ambient
@@ -221,6 +246,7 @@ class _IntersectionAuthorizer:
 
 
 __all__ = [
+    "ToolAuthorizer",
     "use_tool_authorizer",
     "current_authorizer",
     "resolve_effective_authorizer",
