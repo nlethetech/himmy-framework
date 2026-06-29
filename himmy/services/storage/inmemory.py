@@ -127,7 +127,7 @@ class InMemoryContextStore:
         # context_fields keyed by (workspace_id, subject_id, key) — the workspace
         # component (blank offline / single-tenant) partitions the store by tenant so a
         # tenant's upsert can never clobber another tenant's row under a shared subject_id.
-        self._context_fields: dict[tuple[str, str, str], Any] = {}
+        self._context_fields: dict[tuple[str, str, str], ContextField] = {}
         self._snapshots: dict[str, Any] = {}
         self._evidence: list[Any] = []
 

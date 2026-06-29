@@ -142,7 +142,7 @@ def _load_owned_routine(request: Request, routine_id: str) -> svc.Routine:
     is allowed and the zero-config single-box Studio path is byte-unchanged. A ``None``
     routine ``workspace_id`` (a legacy/uncategorized row predating tenant binding) is allowed.
     """
-    routine = svc.get_routines_store().get(routine_id)
+    routine: svc.Routine | None = svc.get_routines_store().get(routine_id)
     if routine is None or not authorize_studio_object(request, routine.workspace_id):
         raise HTTPException(status_code=404, detail="routine not found")
     return routine
