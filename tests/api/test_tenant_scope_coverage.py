@@ -136,9 +136,9 @@ _PUBLIC: frozenset[str] = frozenset(
 #: ``/v1`` guard's ``_AUTHZ_ONLY_READS``).
 _AUTHZ_ONLY: frozenset[str] = frozenset(
     {
-        "/v1/consent/decision",  # subject-keyed; _enforce_self_scope
-        "/v1/consent/latest",  # subject-keyed; _enforce_self_scope
-        "/v1/consent/history",  # subject-keyed; _enforce_self_scope
+        "/v1/consent/decision",  # subject-keyed; _enforce_self_scope + _authorize_subject_read
+        "/v1/consent/latest",  # subject-keyed; _enforce_self_scope + _authorize_subject_read
+        "/v1/consent/history",  # subject-keyed; _enforce_self_scope + _authorize_subject_read
     }
 )
 

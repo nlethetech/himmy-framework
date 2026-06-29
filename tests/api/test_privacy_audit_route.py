@@ -177,6 +177,51 @@ def test_admin_all_tenants_still_sees_every_report() -> None:
     assert {a_id, b_id} <= ids
 
 
+# -------------------------------- scope-r1#5: None-stamped report fail-closed for tenant
+def test_unscoped_report_is_not_admitted_to_tenant_bound_auditor() -> None:
+    """A ``None``-stamped (unscoped) report must NOT leak into a tenant-bound trend.
+
+    Vuln scope-r1#5: ``trend()`` admitted ``metadata['workspace_id'] in (None, workspace_id)``
+    — so a report produced by an all-tenants/admin UNSCOPED run (no ``workspace_id``), whose
+    ``subject_refs`` span EVERY tenant's scanned subjects, was returned to EVERY tenant-bound
+    auditor. The filter now fails closed: a tenant-bound caller sees ONLY reports stamped with
+    its own workspace; the ``None``-stamped global/ops report is visible only to an all-tenants
+    caller.
+    """
+    client = _app()
+    # The all-tenants admin runs an UNSCOPED audit → its report is stamped workspace_id=None.
+    glob = client.post("/v1/audit/privacy", headers={"x-himmy-internal-key": "admin"})
+    assert glob.status_code == 200, glob.text
+    global_id = glob.json()["report"]["report_id"]
+
+    # A tenant-bound auditor's own run (so its trend is non-empty for the right reason).
+    own = client.post(
+        "/v1/audit/privacy?workspace_id=t", headers={"x-himmy-internal-key": "auditor"}
+    )
+    own_id = own.json()["report"]["report_id"]
+
+    trend = client.get(
+        "/v1/audit/privacy?workspace_id=t", headers={"x-himmy-internal-key": "auditor"}
+    )
+    assert trend.status_code == 200
+    ids = {r["report_id"] for r in trend.json()}
+    assert own_id in ids
+    assert global_id not in ids, "unscoped None-stamped report leaked to tenant auditor"
+
+    # Fetch-by-id of the None-stamped report by the tenant auditor is a clean 404.
+    by_id = client.get(
+        f"/v1/audit/privacy/{global_id}?workspace_id=t",
+        headers={"x-himmy-internal-key": "auditor"},
+    )
+    assert by_id.status_code == 404
+
+    # INVARIANT: the all-tenants admin still sees the global/ops (None-stamped) report.
+    admin_trend = client.get(
+        "/v1/audit/privacy", headers={"x-himmy-internal-key": "admin"}
+    )
+    assert global_id in {r["report_id"] for r in admin_trend.json()}
+
+
 # --------------------------------------------------------------- bundle (503 / union)
 def test_run_with_bundle_503_without_key(monkeypatch: Any) -> None:
     """Requesting a per-report bundle with no signing key configured ⇒ 503."""

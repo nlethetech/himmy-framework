@@ -350,6 +350,7 @@ async def list_studio_runs_unified(
     limit: int,
     offset: int,
     accessible_workspaces: frozenset[str] | None = None,
+    accessible_subject: str | None = None,
 ) -> tuple[list[StudioRunSummary], int]:
     """List runs for the Studio runs screen from the ONE canonical store (T2.2).
 
@@ -367,6 +368,15 @@ async def list_studio_runs_unified(
     tenant's runs through Studio. The filter is applied BEFORE the total/window so the
     count + pagination describe only the visible slice.
 
+    ``accessible_subject`` is the object-level (BOLA) subject narrowing (from
+    :func:`himmy.api.auth.context.studio_subject_filter`): ``None`` (the default) means NO
+    subject filtering — byte-unchanged — while a value pins the result to runs attributed to
+    that data subject (plus the reserved ``__local__`` single-user runs, which belong to no
+    end subject), so a ``subject_scoped`` principal cannot read another subject's runs through
+    Studio the way the ``/v1`` reader and missions already prevent. This closes the alternate-
+    surface BOLA where a subject-scoped caller blocked on ``/v1/runs`` and missions read the
+    same run via ``/api/studio/runs``.
+
     Falls back to the studio.db cache alone when ``storage`` is None (a bare test app
     with no container) so the screen never errors.
     """
@@ -380,6 +390,12 @@ async def list_studio_runs_unified(
     records: list[RunRecord] = await storage.list_runs()
     if accessible_workspaces is not None:
         records = [r for r in records if r.workspace_id in accessible_workspaces]
+    if accessible_subject is not None:
+        records = [
+            r
+            for r in records
+            if r.subject_id in (accessible_subject, LOCAL_SUBJECT)
+        ]
     # Newest first, run_id tiebreak (stable ordering across equal timestamps).
     records.sort(key=lambda r: (r.created_at, r.run_id), reverse=True)
     total = len(records)
@@ -402,6 +418,7 @@ async def get_studio_run_unified(
     run_id: str,
     *,
     accessible_workspaces: frozenset[str] | None = None,
+    accessible_subject: str | None = None,
 ) -> StudioRun | None:
     """Fetch one run in full for the Studio detail view from the canonical store.
 
@@ -423,6 +440,15 @@ async def get_studio_run_unified(
     tenant-bound principal (``accessible_workspaces`` is a set) a cache-only row is read as
     **not found** rather than leaked cross-tenant, since its owning tenant cannot be
     verified against the allow-list.
+
+    ``accessible_subject`` is the object-level (BOLA) subject narrowing (from
+    :func:`himmy.api.auth.context.studio_subject_filter`): ``None`` (the default) means NO
+    subject scoping — byte-unchanged — while a value makes a run whose canonical
+    ``subject_id`` is neither that subject nor the reserved ``__local__`` single-user subject
+    read as **not found** (``None``), so a ``subject_scoped`` principal cannot fetch — or even
+    confirm the existence of — another data subject's run by id through Studio. A cache-only
+    row (no canonical record) is likewise refused to a subject-scoped reader, since the cache
+    carries no subject stamp to attribute it to the caller.
     """
     from himmy.api.studio_runs import get_run_store
 
@@ -432,10 +458,10 @@ async def get_studio_run_unified(
         return cached
     rec = await storage.get_run(run_id)
     if rec is None:
-        # No canonical record to attribute to a tenant. An unscoped (single-box) reader
-        # still gets the cache row; a tenant-bound reader must NOT — the cache has no
-        # tenant stamp, so serving it would bypass the workspace allow-list.
-        if accessible_workspaces is not None:
+        # No canonical record to attribute to a tenant/subject. An unscoped (single-box)
+        # reader still gets the cache row; a tenant-bound OR subject-scoped reader must NOT —
+        # the cache has no tenant/subject stamp, so serving it would bypass the allow-lists.
+        if accessible_workspaces is not None or accessible_subject is not None:
             return None
         return cached
     if (
@@ -443,6 +469,11 @@ async def get_studio_run_unified(
         and rec.workspace_id not in accessible_workspaces
     ):
         return None  # cross-tenant → not found (never leak existence)
+    if accessible_subject is not None and rec.subject_id not in (
+        accessible_subject,
+        LOCAL_SUBJECT,
+    ):
+        return None  # cross-subject → not found (never leak existence)
     if cached is not None:
         cached.status = _RUN_STATUS_TO_STUDIO[rec.status]
         return cached

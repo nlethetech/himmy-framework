@@ -22,6 +22,7 @@ from himmy.api.auth.context import (
     principal_dependency,
     require_workspace,
     resolve_workspace,
+    studio_subject_filter,
     studio_tenant_filter,
 )
 from himmy.api.auth.principal import ANONYMOUS, TENANT_ADMIN_ROLE, Principal
@@ -55,6 +56,7 @@ __all__ = [
     "narrow_subject",
     "enforce_subject_write",
     "studio_tenant_filter",
+    "studio_subject_filter",
     "authorize_studio_object",
     "scoped_read",
     "AccessPolicy",

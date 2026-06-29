@@ -24,7 +24,13 @@ from typing import Any, cast
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from himmy.api.auth import get_principal, require_permission, resolve_workspace
+from himmy.api.auth import (
+    authorize_object,
+    enforce_subject_write,
+    get_principal,
+    require_permission,
+    resolve_workspace,
+)
 from himmy.api.security_audit import audit_event
 from himmy.services.governance.consent import (
     ConsentRecord,
@@ -115,6 +121,12 @@ def _enforce_self_scope(request: Request, subject_id: str) -> None:
     Other roles (operator/admin/auditor) are unrestricted on the subject axis here; the
     tenant axis is enforced separately via :func:`resolve_workspace`. Offline (no auth) the
     principal is ANONYMOUS without the role, so this is a no-op — zero-config unchanged.
+
+    This guards the ``data_subject`` ROLE only. The orthogonal ``subject_scoped`` Principal
+    FLAG (the object-level/BOLA axis a multi-user-per-tenant deployment opts into) is NOT a
+    role, so it is enforced separately by :func:`_authorize_subject_read` /
+    :func:`enforce_subject_write` below — a principal holding ``operator`` + ``subject_scoped``
+    is privileged here (skips this check) yet still pinned to its OWN subject by that axis.
     """
     principal = get_principal(request)
     if not principal.has_role(_DATA_SUBJECT_ROLE):
@@ -137,10 +149,30 @@ def _enforce_self_scope(request: Request, subject_id: str) -> None:
         )
 
 
+def _authorize_subject_read(request: Request, subject_id: str) -> None:
+    """Object-level (BOLA) READ gate: a ``subject_scoped`` principal may read only its OWN.
+
+    The subject-axis companion to :func:`resolve_workspace` (the tenant axis) and to
+    :func:`_enforce_self_scope` (the ``data_subject`` ROLE). A ``subject_scoped`` principal
+    holding ``consent:read`` (e.g. an operator in a multi-user-per-tenant SaaS) could
+    otherwise read ANOTHER data subject's full consent chain WITHIN its own tenant — the
+    structural BOLA hole, because ``_enforce_self_scope`` keys on a role this principal does
+    not have. A False :func:`authorize_object` verdict is folded into a **404** (never 403)
+    so a subject-scoped tenant cannot even probe the existence of another subject's consent —
+    mirroring every sibling by-id reader (recommendations/context/runs).
+
+    A strict NO-OP for the offline / ``all_tenants`` / ``tenant_admin`` / non-subject-scoped
+    path (``may_access_subject`` returns True), so the zero-config surface is byte-unchanged.
+    """
+    if not authorize_object(request, subject_id):
+        raise HTTPException(status_code=404, detail="consent record not found")
+
+
 @router.post("/grant", response_model=ConsentRecord, dependencies=_WRITE)
 async def grant_consent(body: ConsentWriteRequest, request: Request) -> ConsentRecord:
     """Record a GRANTED consent for ``(subject_id, purpose)`` (operator/admin)."""
     _enforce_self_scope(request, body.subject_id)
+    enforce_subject_write(request, body.subject_id)
     workspace_id = _require_workspace(request, body.workspace_id)
     ledger = _ledger(request)
     record = ledger.grant(
@@ -168,6 +200,7 @@ async def grant_consent(body: ConsentWriteRequest, request: Request) -> ConsentR
 async def deny_consent(body: ConsentWriteRequest, request: Request) -> ConsentRecord:
     """Record a DENIED consent for ``(subject_id, purpose)`` (operator/admin)."""
     _enforce_self_scope(request, body.subject_id)
+    enforce_subject_write(request, body.subject_id)
     workspace_id = _require_workspace(request, body.workspace_id)
     ledger = _ledger(request)
     record = ledger.deny(
@@ -239,6 +272,7 @@ async def withdraw_consent(
     subject's consent.
     """
     _enforce_self_scope(request, body.subject_id)
+    enforce_subject_write(request, body.subject_id)
     await _authorize_withdraw(request, body.subject_id)
     workspace_id = _require_workspace(request, body.workspace_id)
     ledger = _ledger(request)
@@ -271,6 +305,7 @@ async def get_decision(
 ) -> DecisionResponse:
     """Resolve the PDP decision for ``(subject_id, purpose)`` (self-scoped allowed)."""
     _enforce_self_scope(request, subject_id)
+    _authorize_subject_read(request, subject_id)
     workspace_id = _require_workspace(request, workspace_id)
     ledger = _ledger(request)
     record = ledger.latest(subject_id, purpose, workspace_id=workspace_id)
@@ -295,6 +330,7 @@ async def get_latest(
 ) -> ConsentRecord | None:
     """Return the latest :class:`ConsentRecord` for the pair, or ``null``."""
     _enforce_self_scope(request, subject_id)
+    _authorize_subject_read(request, subject_id)
     workspace_id = _require_workspace(request, workspace_id)
     record = _ledger(request).latest(subject_id, purpose, workspace_id=workspace_id)
     _assert_same_tenant(record, workspace_id)
@@ -310,6 +346,7 @@ async def get_history(
 ) -> list[ConsentRecord]:
     """Return the full append-only version chain for ``(subject_id, purpose)``."""
     _enforce_self_scope(request, subject_id)
+    _authorize_subject_read(request, subject_id)
     workspace_id = _require_workspace(request, workspace_id)
     records = _ledger(request).history(subject_id, purpose, workspace_id=workspace_id)
     for record in records:

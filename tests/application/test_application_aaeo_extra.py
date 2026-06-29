@@ -257,7 +257,15 @@ def test_validate_structured_passes_and_fails() -> None:
 
 # ------------------------------------------------------------------- AAEO-4
 def test_snapshot_workspace_isolation() -> None:
-    """get_snapshot rejects a foreign workspace and stays lenient for unstamped."""
+    """get_snapshot rejects a foreign workspace AND fails closed on unstamped (scope-r1).
+
+    ``context_snapshots`` is keyed by snapshot_id alone (no workspace column), so the
+    in-Python ``_snapshot_in_workspace`` check is the SOLE tenant boundary. It now FAILS
+    CLOSED: a tenant-bound caller (one that supplies a ``workspace_id``) may read a snapshot
+    only when it carries a MATCHING workspace stamp — an unstamped snapshot (built by the
+    offline/CLI/all-tenants/routine path) is NOT readable cross-tenant by guessing its id.
+    The offline path (``workspace_id=None``) keeps reading any snapshot, byte-unchanged.
+    """
     storage = StorageService()
     ctx = ContextService(storage_service=storage)
     app = ContextAppService(context_service=ctx, storage=storage)
@@ -269,16 +277,24 @@ def test_snapshot_workspace_isolation() -> None:
         )
         same = await app.get_snapshot(stamped.snapshot_id, workspace_id="w1")
         foreign = await app.get_snapshot(stamped.snapshot_id, workspace_id="w2")
-        # An unstamped (legacy) snapshot is allowed for any workspace.
+        # An unstamped (offline/CLI-built) snapshot is NOT readable by a tenant-bound caller
+        # (fail closed) — it belongs to no workspace, so a tenant cannot claim it by id.
         legacy = await app.build_snapshot(subject_id="s2", build_spec=spec)
-        legacy_ok = await app.get_snapshot(legacy.snapshot_id, workspace_id="w9")
+        legacy_tenant_bound = await app.get_snapshot(
+            legacy.snapshot_id, workspace_id="w9"
+        )
+        # ...but the offline path (no workspace supplied) still reads it — byte-unchanged.
+        legacy_offline = await app.get_snapshot(legacy.snapshot_id, workspace_id=None)
         missing = await app.get_snapshot("nope", workspace_id="w1")
-        return same, foreign, legacy_ok, missing
+        return same, foreign, legacy_tenant_bound, legacy_offline, missing
 
-    same, foreign, legacy_ok, missing = run_async(_scenario())
+    same, foreign, legacy_tenant_bound, legacy_offline, missing = run_async(
+        _scenario()
+    )
     assert same is not None
     assert foreign is None
-    assert legacy_ok is not None
+    assert legacy_tenant_bound is None  # fail closed: unstamped not readable cross-tenant
+    assert legacy_offline is not None  # offline path unchanged
     assert missing is None
 
 

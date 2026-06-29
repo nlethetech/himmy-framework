@@ -81,3 +81,31 @@ async def test_other_tenant_run_denied() -> None:
     rec = SimpleNamespace(workspace_id="evilcorp")
     request = _request(principal, storage=_Storage(rec=rec))
     assert await _authorize_run(request, "r1") is False
+
+
+# ----------------------------------------------- subject axis (BOLA, scope-r1#3)
+@pytest.mark.asyncio
+async def test_other_subject_run_denied_to_subject_scoped_reader() -> None:
+    """A subject_scoped reader is denied another subject's run even in its OWN tenant.
+
+    The Studio by-id run gate now ANDs the subject/BOLA axis (``authorize_object`` on
+    ``rec.subject_id``) onto the tenant axis, mirroring ``/v1/runs`` and missions — so a
+    subject_scoped principal cannot read/poison another subject's run feedback via Studio.
+    """
+    principal = Principal(
+        subject="alice", tenant_ids=frozenset({"t"}), subject_scoped=True
+    )
+    rec = SimpleNamespace(workspace_id="t", subject_id="bob")
+    request = _request(principal, storage=_Storage(rec=rec))
+    assert await _authorize_run(request, "bob-run") is False
+
+
+@pytest.mark.asyncio
+async def test_own_subject_run_allowed_to_subject_scoped_reader() -> None:
+    """A subject_scoped reader CAN read its OWN subject's run in its tenant."""
+    principal = Principal(
+        subject="alice", tenant_ids=frozenset({"t"}), subject_scoped=True
+    )
+    rec = SimpleNamespace(workspace_id="t", subject_id="alice")
+    request = _request(principal, storage=_Storage(rec=rec))
+    assert await _authorize_run(request, "alice-run") is True

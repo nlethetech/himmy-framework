@@ -443,19 +443,21 @@ class PrivacyAuditService:
         posture-over-time view of the deployment's audits.
 
         When ``workspace_id`` is provided (a tenant-bound HTTP caller resolved to a single
-        authorized workspace) the trend is tenant-scoped at the ROOT: only reports whose
-        stamped ``metadata['workspace_id']`` is the caller's workspace OR ``None`` (a
-        global/ops report with no tenant axis) are admitted. ``None`` (an all-tenants /
-        offline caller) keeps the full posture trend unchanged — byte-for-byte the legacy
-        behaviour. This closes the cross-tenant IDOR where a tenant-bound auditor read
-        every OTHER tenant's report (its ``workspace_id`` + the affected ``subject_refs``).
+        authorized workspace) the trend is tenant-scoped at the ROOT and FAILS CLOSED: ONLY
+        reports whose stamped ``metadata['workspace_id']`` EQUALS the caller's workspace are
+        admitted. A ``None``-stamped report is NOT admitted to a tenant-bound caller — such a
+        report is produced by an all-tenants/admin UNSCOPED run, whose ``subject_refs`` span
+        EVERY tenant's scanned subjects, so admitting it would disclose other tenants' subject
+        identifiers (the cross-tenant IDOR this closes). ``None`` (an all-tenants / offline
+        caller) keeps the full posture trend unchanged — byte-for-byte the legacy behaviour —
+        and is the only caller that sees the global/ops (``None``-stamped) reports.
         """
         records = self._registry.list_by_kind(PRIVACY_AUDIT_REPORT_KIND)
         if workspace_id is not None:
             records = [
                 r
                 for r in records
-                if r.metadata.get("workspace_id") in (None, workspace_id)
+                if r.metadata.get("workspace_id") == workspace_id
             ]
         records.sort(
             key=lambda r: str(r.metadata.get("created_at") or ""), reverse=True

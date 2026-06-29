@@ -47,9 +47,11 @@ from himmy.api import (
     studio_service,
 )
 from himmy.api.auth import (
+    authorize_object,
     authorize_studio_object,
     get_principal,
     scoped_read,
+    studio_subject_filter,
     studio_tenant_filter,
 )
 from himmy.api.routers.studio_common import studio_permission
@@ -315,17 +317,21 @@ async def _authorize_run(request: Request, run_id: str) -> bool:
     where the tenant stamp is irrelevant) and when no canonical storage is attached (the
     bare/single-box test app). So the zero-config path is a NO-OP and byte-unchanged.
 
-    For a TENANT-BOUND principal, enforcement engages: a run whose canonical record is
-    absent (cache-only — erased/crypto-shredded or aged out while the process-wide
-    studio.db presentation cache row lingers) is REFUSED (returns False → 404), because
-    the cache carries no ``workspace_id`` to attribute it to the caller's tenant and
-    serving it would leak another tenant's feedback/lineage by id (a cross-tenant IDOR).
-    This mirrors the sibling ``get_studio_run_unified``, which also folds a cache-only row
-    to not-found for a tenant-bound reader. A canonically-known run is allowed only when
-    its ``workspace_id`` passes :func:`authorize_studio_object`. Callers fold a False
-    verdict into a **404** so existence is never leaked.
+    For a TENANT-BOUND or ``subject_scoped`` principal, enforcement engages on BOTH axes: a
+    run whose canonical record is absent (cache-only — erased/crypto-shredded or aged out
+    while the process-wide studio.db presentation cache row lingers) is REFUSED (returns False
+    → 404), because the cache carries no ``workspace_id``/``subject_id`` to attribute it and
+    serving it would leak another tenant's/subject's feedback/lineage by id (an IDOR/BOLA).
+    This mirrors the sibling ``get_studio_run_unified``, which also folds a cache-only row to
+    not-found for a scoped reader. A canonically-known run is allowed only when its
+    ``workspace_id`` passes :func:`authorize_studio_object` (tenant axis) AND its
+    ``subject_id`` passes :func:`authorize_object` (subject/BOLA axis) — closing the
+    alternate-surface BOLA where a subject-scoped caller could read/poison another subject's
+    run feedback through Studio. Callers fold a False verdict into a **404** so existence is
+    never leaked.
     """
-    if get_principal(request).all_tenants:
+    principal = get_principal(request)
+    if principal.all_tenants:
         return True
     storage = _canonical_storage(request)
     if storage is None:
@@ -334,14 +340,16 @@ async def _authorize_run(request: Request, run_id: str) -> bool:
     if rec is None:
         # Cache-only run (the canonical RunRecord is absent — erased/crypto-shredded or
         # aged out — while the process-wide studio.db presentation cache row lingers).
-        # A tenant-bound reader cannot be served it: the cache carries NO workspace_id to
-        # attribute it to the caller's tenant, so allowing it would leak another tenant's
-        # feedback/lineage by id (a cross-tenant IDOR). Fold to 404, mirroring the sibling
-        # ``get_studio_run_unified`` which also refuses a cache-only row to a tenant-bound
-        # reader. The ``all_tenants`` short-circuit above keeps the offline/admin path a
-        # no-op, so the zero-config surface is byte-unchanged.
+        # A scoped reader cannot be served it: the cache carries NO workspace_id/subject_id
+        # to attribute it, so allowing it would leak another tenant's/subject's
+        # feedback/lineage by id (an IDOR/BOLA). A purely tenant-bound but NOT subject-scoped
+        # principal still refuses (the workspace stamp is missing); a subject-scoped one
+        # refuses on the same grounds. The ``all_tenants`` short-circuit above keeps the
+        # offline/admin path a no-op, so the zero-config surface is byte-unchanged.
         return False
-    return authorize_studio_object(request, getattr(rec, "workspace_id", None))
+    return authorize_studio_object(
+        request, getattr(rec, "workspace_id", None)
+    ) and authorize_object(request, getattr(rec, "subject_id", None))
 
 
 @router.post("/run", dependencies=[Depends(studio_permission(_RES_RUNS, "write"))])
@@ -565,6 +573,7 @@ async def list_runs(
         limit=limit,
         offset=offset,
         accessible_workspaces=studio_tenant_filter(request),
+        accessible_subject=studio_subject_filter(request),
     )
     return StudioRunListResponse(
         items=items,
@@ -621,6 +630,7 @@ async def get_run(run_id: str, request: Request) -> StudioRun:
         _canonical_storage(request),
         run_id,
         accessible_workspaces=studio_tenant_filter(request),
+        accessible_subject=studio_subject_filter(request),
     )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")

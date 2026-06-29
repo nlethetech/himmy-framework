@@ -253,6 +253,32 @@ def studio_tenant_filter(request: Request) -> frozenset[str] | None:
     return principal.tenant_ids
 
 
+def studio_subject_filter(request: Request) -> str | None:
+    """The data subject a Studio LIST reader must pin to, or ``None`` for ALL (BOLA).
+
+    The subject-axis companion to :func:`studio_tenant_filter` (the tenant axis) for the
+    Studio run/list readers. Studio historically showed EVERY run regardless of data
+    subject; once a deployment opts a principal into ``subject_scoped``, that becomes a
+    cross-subject read WITHIN the tenant — the exact BOLA the ``/v1`` and missions readers
+    already close via :func:`narrow_subject` / :func:`authorize_object`. Returns:
+
+    * ``None`` for every principal except an opt-in ``subject_scoped`` one (offline /
+      ``all_tenants`` / the historical multi-user-workspace default / a ``tenant_admin``),
+      meaning "no subject filtering, show everything" — so the zero-config / single-box
+      path is **byte-unchanged**; and
+    * the principal's own ``subject`` for a ``subject_scoped`` principal WITHOUT the
+      ``tenant_admin`` role, so it sees only runs attributed to its own data subject.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants or not principal.subject_scoped:
+        return None
+    from himmy.api.auth.principal import TENANT_ADMIN_ROLE
+
+    if TENANT_ADMIN_ROLE in principal.roles:
+        return None
+    return principal.subject
+
+
 def authorize_studio_object(request: Request, workspace_id: str | None) -> bool:
     """By-id (BOLA-style) gate for a Studio object: may this caller read ``workspace_id``?
 
@@ -294,5 +320,6 @@ __all__ = [
     "narrow_subject",
     "enforce_subject_write",
     "studio_tenant_filter",
+    "studio_subject_filter",
     "authorize_studio_object",
 ]

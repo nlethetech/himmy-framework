@@ -358,11 +358,21 @@ class ContextAppService:
 
 
 def _snapshot_in_workspace(snapshot: Any, workspace_id: str) -> bool:
-    """Whether a snapshot belongs to ``workspace_id`` (lenient when unstamped).
+    """Whether a snapshot belongs to ``workspace_id`` (FAILS CLOSED on unstamped).
 
-    A snapshot stamped with a different workspace is rejected; an unstamped
-    snapshot (legacy/no workspace metadata) is allowed so existing callers don't
-    break. New snapshots built via the app layer carry the workspace.
+    The only tenant boundary for a snapshot read: ``load_snapshot`` is keyed by
+    ``snapshot_id`` alone (the ``context_snapshots`` table has no ``workspace_id`` column),
+    so a lenient verdict here is the sole gate. This is reached ONLY when a concrete
+    ``workspace_id`` was supplied — i.e. a tenant-bound caller (an unrestricted /
+    ``all_tenants`` caller resolves to ``workspace_id is None`` and never calls this; see
+    :meth:`ContextAppService.get_snapshot`). For such a tenant-bound caller it FAILS CLOSED:
+    the snapshot must carry a workspace stamp (its own ``metadata['workspace_id']`` or a
+    field-level stamp) that EQUALS the caller's workspace. An UNSTAMPED snapshot — built by
+    the offline/CLI/``all_tenants``/routine path that does not stamp a workspace — is treated
+    as NOT in any tenant's workspace and is refused, closing the cross-tenant IDOR where any
+    tenant-bound principal could read an unstamped snapshot by guessing its id. The offline /
+    ``all_tenants`` path is byte-unchanged because it never supplies a workspace and so never
+    reaches this gate.
     """
     meta = getattr(snapshot, "metadata", {}) or {}
     stamped = meta.get("workspace_id")
@@ -374,7 +384,9 @@ def _snapshot_in_workspace(snapshot: Any, workspace_id: str) -> bool:
             if ws is not None:
                 stamped = ws
                 break
-    return stamped is None or stamped == workspace_id
+    # Fail CLOSED: a tenant-bound caller (workspace_id is non-None to even reach here) may
+    # read a snapshot ONLY if it carries a matching workspace stamp. Unstamped → refused.
+    return stamped == workspace_id
 
 
 class RecommendationAppService:
