@@ -1461,6 +1461,7 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
         stop_run_substrate,
     )
     from himmy.api.scheduler_leader import acquire_scheduler_leadership
+    from himmy.config.flags import env_falsy, env_truthy
     from himmy.services.storage.factory import (
         reset_server_context,
         set_server_context,
@@ -1468,9 +1469,11 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
 
     log = logging.getLogger("himmy.worker")
 
-    scheduler_enabled = os.environ.get(
-        "HIMMY_ROUTINES_SCHEDULER", "on"
-    ).lower() not in ("off", "0", "false", "no")
+    # Default-ON kill-switch: stay enabled unless the operator wrote a recognised OFF token.
+    # Routed through the canonical reader so the worker (the primary surface routines fire on)
+    # honors the SAME HIMMY_ROUTINES_SCHEDULER vocabulary as studio_routines.py — e.g.
+    # ``=n`` disables in both, never enabled here while disabled there.
+    scheduler_enabled = not env_falsy("HIMMY_ROUTINES_SCHEDULER")
 
     # 1) server context FIRST so the container's spine + any in-process agent resolve the
     #    durable backend (the bootstrap relies on this being set before it builds).
@@ -1508,9 +1511,9 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
         #    the topology guard (same-host single-scheduler flock + cross-host warning).
         n_routines = 0
         if run_scheduler and scheduler_enabled:
-            require_ack = os.environ.get(
-                "HIMMY_SCHEDULER_REQUIRE_ACK", ""
-            ).strip().lower() in ("1", "true", "yes", "on")
+            # Canonical truthy reader so ``=y`` requires-ack here exactly as it does via
+            # env_truthy in studio_routines.py (the divergence the WP exists to kill).
+            require_ack = env_truthy("HIMMY_SCHEDULER_REQUIRE_ACK")
             leadership = await acquire_scheduler_leadership(
                 substrate.active, require_single_scheduler_ack=require_ack
             )

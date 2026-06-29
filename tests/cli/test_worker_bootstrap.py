@@ -297,6 +297,105 @@ def test_worker_acquires_sqlite_host_leadership_and_starts_scheduler(
     assert get_scheduler().active is False  # stopped on teardown
 
 
+def test_worker_scheduler_disabled_by_edge_falsy_token_n(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``HIMMY_ROUTINES_SCHEDULER=n`` disables the worker scheduler (canonical vocabulary).
+
+    Regression for the two-readers/two-vocabularies bypass: the ad-hoc worker parse honored
+    only ``off/0/false/no`` so ``=n`` left the scheduler ENABLED here while
+    studio_routines.py's ``not env_falsy(...)`` (which recognises ``n``) DISABLED it. Now the
+    worker routes through ``env_falsy`` too, so ``=n`` disables the scheduler in both — the
+    leadership bid is never even attempted.
+    """
+    import asyncio as _asyncio
+
+    import himmy.cli.commands as commands_mod
+    from himmy.api.routines import get_scheduler, reset_scheduler
+
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "n")
+    reset_scheduler()
+
+    started = {"n": 0}
+    real_start = type(get_scheduler()).start
+
+    def _spy_start(self: Any) -> None:
+        started["n"] += 1
+        return real_start(self)
+
+    monkeypatch.setattr(type(get_scheduler()), "start", _spy_start)
+    reset_scheduler()
+
+    acquired = {"n": 0}
+    import himmy.api.scheduler_leader as leader_mod
+
+    async def _never_acquire(*_a: Any, **_k: Any) -> Any:  # pragma: no cover - must not run
+        acquired["n"] += 1
+        raise AssertionError("leadership must not be bid when scheduler is disabled")
+
+    monkeypatch.setattr(leader_mod, "acquire_scheduler_leadership", _never_acquire)
+
+    class _InstantEvent(_asyncio.Event):
+        async def wait(self) -> bool:
+            return True
+
+    monkeypatch.setattr(_asyncio, "Event", _InstantEvent)
+
+    run_async(commands_mod._run_worker(run_scheduler=True, run_dispatcher=True))
+
+    assert started["n"] == 0, "=n must DISABLE the scheduler (canonical falsy vocabulary)"
+    assert acquired["n"] == 0, "no leadership bid when the scheduler is disabled"
+
+
+def test_worker_require_ack_honored_for_edge_truthy_token_y(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``HIMMY_SCHEDULER_REQUIRE_ACK=y`` requires single-scheduler ack in the worker.
+
+    Regression for the ad-hoc truthy vocabulary (``1/true/yes/on`` only) that silently
+    dropped ``y`` — diverging from studio_routines.py's ``env_truthy`` which recognises it.
+    We capture the ``require_single_scheduler_ack`` kwarg the worker passes to
+    ``acquire_scheduler_leadership`` and assert it is ``True`` for ``=y``.
+    """
+    import asyncio as _asyncio
+
+    import himmy.api.scheduler_leader as leader_mod
+    import himmy.cli.commands as commands_mod
+    from himmy.api.routines import reset_scheduler
+
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "on")
+    monkeypatch.setenv("HIMMY_SCHEDULER_REQUIRE_ACK", "y")
+    reset_scheduler()
+
+    captured: dict[str, Any] = {}
+
+    class _Leadership:
+        is_leader = False
+        mode = "stub"
+        reason = "stubbed for ack-vocabulary assertion"
+
+        async def release(self) -> None:
+            return None
+
+    async def _spy_acquire(active: Any, *, require_single_scheduler_ack: bool = False) -> Any:
+        captured["require_ack"] = require_single_scheduler_ack
+        return _Leadership()
+
+    monkeypatch.setattr(leader_mod, "acquire_scheduler_leadership", _spy_acquire)
+
+    class _InstantEvent(_asyncio.Event):
+        async def wait(self) -> bool:
+            return True
+
+    monkeypatch.setattr(_asyncio, "Event", _InstantEvent)
+
+    run_async(commands_mod._run_worker(run_scheduler=True, run_dispatcher=True))
+
+    assert captured.get("require_ack") is True, (
+        "=y must require single-scheduler ack (canonical truthy vocabulary)"
+    )
+
+
 def test_sqlite_second_scheduler_refused_but_first_runs(
     workspace: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

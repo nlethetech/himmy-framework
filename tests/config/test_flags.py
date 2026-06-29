@@ -213,6 +213,10 @@ GUARDED_MODULES = [
     _REPO_ROOT / "himmy" / "api" / "routers" / "studio_routines.py",
     _REPO_ROOT / "himmy" / "api" / "scheduler_leader.py",
     _REPO_ROOT / "himmy" / "config" / "spec_sanitizer.py",
+    # The CLI worker is a DOCUMENTED parity path: it gates the routine scheduler on
+    # HIMMY_ROUTINES_SCHEDULER / HIMMY_SCHEDULER_REQUIRE_ACK and is the primary surface
+    # routines actually fire on, so its reads must be canonicalised too.
+    _REPO_ROOT / "himmy" / "cli" / "commands.py",
 ]
 
 # Matches an inline truthy/falsy comparison on a security flag, e.g.:
