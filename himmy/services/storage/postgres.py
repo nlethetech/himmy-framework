@@ -709,6 +709,32 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "WHERE workspace_id IS NULL AND payload ? 'workspace_id'",
         ],
     ),
+    # v10 (red-team reattack-r9): tenant-PARTITION the context_fields store. It was keyed
+    # by ``(subject_id, key)`` ONLY — workspace_id lived solely inside the ``metadata``
+    # JSONB — so a tenant-bound upsert under a SHARED subject_id collided with another
+    # tenant's row via ``ON CONFLICT (subject_id, key)``, a cross-tenant BOLA write that
+    # destroyed the victim's value and re-stamped it into the attacker's workspace. The
+    # read-side workspace filter never covered the WRITE. The fix promotes ``workspace_id``
+    # to a first-class NOT NULL column included in the PRIMARY KEY so the ON CONFLICT target
+    # becomes ``(workspace_id, subject_id, key)`` and a write can only ever touch the
+    # writer's own tenant partition. Existing rows backfill ``workspace_id`` from the
+    # ``metadata`` JSONB (blank for the offline / single-tenant partition — byte-unchanged,
+    # since every legacy row shares the blank workspace). The PK is dropped and recreated on
+    # the wider tuple; ``IF EXISTS``/``IF NOT EXISTS`` keep the migration idempotent.
+    (
+        10,
+        "context_fields_workspace_partition",
+        [
+            "ALTER TABLE context_fields "
+            "ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT ''",
+            "UPDATE context_fields SET workspace_id = "
+            "COALESCE(metadata->>'workspace_id', '') "
+            "WHERE workspace_id = '' AND metadata ? 'workspace_id'",
+            "ALTER TABLE context_fields DROP CONSTRAINT IF EXISTS context_fields_pkey",
+            "ALTER TABLE context_fields "
+            "ADD PRIMARY KEY (workspace_id, subject_id, key)",
+        ],
+    ),
 ]
 
 
@@ -1146,47 +1172,74 @@ class PostgresContextStore(_PgStoreBase):
     """Postgres-backed context fields, snapshots, and evidence."""
 
     async def save_context_field(self, field: Any) -> Any:
-        """Upsert a context field keyed by ``(subject_id, key)``."""
+        """Upsert a context field keyed by ``(workspace_id, subject_id, key)``.
+
+        ``subject_id`` and the owning ``workspace_id`` are read from the field metadata
+        (blank for the offline / single-tenant partition). Including ``workspace_id`` in
+        the ON CONFLICT target tenant-PARTITIONS the store (red-team reattack-r9), so a
+        tenant's upsert under a SHARED subject_id can never overwrite another tenant's row.
+        """
         pool = self._require_pool()
         from himmy.core.ids import utc_now_iso
 
-        subject_id = str(getattr(field, "metadata", {}).get("subject_id", ""))
+        meta = dict(getattr(field, "metadata", {}) or {})
+        subject_id = str(meta.get("subject_id", ""))
+        workspace_id = str(meta.get("workspace_id", "") or "")
         async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO context_fields
-                    (subject_id, key, payload, metadata, updated_at)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (subject_id, key) DO UPDATE SET
+                    (workspace_id, subject_id, key, payload, metadata, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (workspace_id, subject_id, key) DO UPDATE SET
                     payload = EXCLUDED.payload,
                     metadata = EXCLUDED.metadata,
                     updated_at = EXCLUDED.updated_at
                 """,
+                workspace_id,
                 subject_id,
                 field.key,
                 field.model_dump(mode="json"),
-                dict(getattr(field, "metadata", {}) or {}),
+                meta,
                 utc_now_iso(),
             )
         return field
 
-    async def get_context_field(self, subject_id: str, key: str) -> Any | None:
-        """Return the context field for ``(subject_id, key)``, or None."""
+    async def get_context_field(
+        self, subject_id: str, key: str, *, workspace_id: str | None = None
+    ) -> Any | None:
+        """Return the context field for ``(subject_id, key)``, tenant-scoped on workspace.
+
+        When ``workspace_id`` is supplied, ONLY that tenant's partition row is returned
+        (so the snapshot-resolution path cannot pick up a sibling tenant's row). The
+        offline path (``None``) applies NO workspace filter — byte-identical to the
+        historical ``WHERE subject_id=? AND key=?`` lookup.
+        """
         from himmy.services.context.models import ContextField
 
         pool = self._require_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT payload FROM context_fields WHERE subject_id = $1 AND key = $2",
-                subject_id,
-                key,
-            )
+            if workspace_id is None:
+                row = await conn.fetchrow(
+                    "SELECT payload FROM context_fields "
+                    "WHERE subject_id = $1 AND key = $2",
+                    subject_id,
+                    key,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "SELECT payload FROM context_fields "
+                    "WHERE workspace_id = $1 AND subject_id = $2 AND key = $3",
+                    str(workspace_id),
+                    subject_id,
+                    key,
+                )
         if row is None:
             return None
         return ContextField.model_validate(row["payload"])
 
     async def list_context_fields(self, subject_id: str) -> list[Any]:
-        """Return all context fields for a subject."""
+        """Return all context fields for a subject (across every workspace partition)."""
         from himmy.services.context.models import ContextField
 
         pool = self._require_pool()
@@ -2858,15 +2911,19 @@ class PostgresStorageService:
 
     # ------------------------------------------------------------------ context
     async def save_context_field(self, field: Any) -> Any:
-        """Upsert a context field keyed by ``(subject_id, key)``."""
+        """Upsert a context field keyed by ``(workspace_id, subject_id, key)``."""
         return await self._context_store.save_context_field(field)
 
-    async def get_context_field(self, subject_id: str, key: str) -> Any | None:
-        """Return the context field for ``(subject_id, key)``, or None."""
-        return await self._context_store.get_context_field(subject_id, key)
+    async def get_context_field(
+        self, subject_id: str, key: str, *, workspace_id: str | None = None
+    ) -> Any | None:
+        """Return the context field for ``(subject_id, key)``, tenant-scoped on workspace."""
+        return await self._context_store.get_context_field(
+            subject_id, key, workspace_id=workspace_id
+        )
 
     async def list_context_fields(self, subject_id: str) -> list[Any]:
-        """Return all context fields for a subject."""
+        """Return all context fields for a subject (across every workspace partition)."""
         return await self._context_store.list_context_fields(subject_id)
 
     async def save_snapshot(self, snapshot: Any) -> Any:

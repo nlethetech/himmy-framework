@@ -124,30 +124,51 @@ class InMemoryContextStore:
     """Process-local context fields, snapshots, and evidence."""
 
     def __init__(self) -> None:
-        # context_fields keyed by (subject_id, key)
-        self._context_fields: dict[tuple[str, str], Any] = {}
+        # context_fields keyed by (workspace_id, subject_id, key) — the workspace
+        # component (blank offline / single-tenant) partitions the store by tenant so a
+        # tenant's upsert can never clobber another tenant's row under a shared subject_id.
+        self._context_fields: dict[tuple[str, str, str], Any] = {}
         self._snapshots: dict[str, Any] = {}
         self._evidence: list[Any] = []
 
     async def save_context_field(self, field: ContextField) -> ContextField:
-        """Upsert a context field keyed by ``(subject_id, key)``.
+        """Upsert a context field keyed by ``(workspace_id, subject_id, key)``.
 
-        ``subject_id`` is read from the field metadata when present, falling back
-        to a blank scope so storage-only fields still round-trip.
+        ``subject_id`` and the owning ``workspace_id`` are read from the field metadata
+        when present, falling back to a blank scope so storage-only / single-tenant fields
+        still round-trip (the blank workspace is the offline partition). Including
+        ``workspace_id`` in the key tenant-PARTITIONS the store (red-team reattack-r9): two
+        tenants sharing a ``subject_id`` write to DISTINCT rows, so a cross-tenant upsert
+        can never overwrite/poison another tenant's field.
         """
-        subject_id = str(getattr(field, "metadata", {}).get("subject_id", ""))
-        self._context_fields[(subject_id, field.key)] = field
+        meta = getattr(field, "metadata", {}) or {}
+        subject_id = str(meta.get("subject_id", ""))
+        workspace_id = str(meta.get("workspace_id", "") or "")
+        self._context_fields[(workspace_id, subject_id, field.key)] = field
         return field
 
-    async def get_context_field(self, subject_id: str, key: str) -> ContextField | None:
-        """Return the context field for ``(subject_id, key)``, or None."""
-        return self._context_fields.get((subject_id, key))
+    async def get_context_field(
+        self, subject_id: str, key: str, *, workspace_id: str | None = None
+    ) -> ContextField | None:
+        """Return the context field for ``(subject_id, key)``, tenant-scoped on workspace.
+
+        When ``workspace_id`` is supplied, ONLY that tenant's partition is consulted (so
+        the snapshot-resolution path cannot pick up a sibling tenant's row). The offline
+        path (``None``) applies NO workspace filter — byte-identical to the historical
+        ``(subject_id, key)`` lookup (a single-tenant store holds one such row).
+        """
+        if workspace_id is None:
+            for (_, sid, k), field in self._context_fields.items():
+                if sid == subject_id and k == key:
+                    return field
+            return None
+        return self._context_fields.get((str(workspace_id), subject_id, key))
 
     async def list_context_fields(self, subject_id: str) -> list[ContextField]:
-        """Return all context fields for a subject."""
+        """Return all context fields for a subject (across every workspace partition)."""
         return [
             field
-            for (sid, _), field in self._context_fields.items()
+            for (_, sid, _), field in self._context_fields.items()
             if sid == subject_id
         ]
 

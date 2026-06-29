@@ -177,34 +177,61 @@ def _bench_stats() -> dict[str, dict[str, object]]:
 _CLAUDE_CLI_MODELS: tuple[str, ...] = ("haiku", "sonnet", "opus")
 
 
-async def build_model_catalog() -> list[dict[str, object]]:
+async def build_model_catalog(
+    *, reveal_host_posture: bool = True
+) -> list[dict[str, object]]:
     """Available local providers + their models, decorated with cached bench stats.
 
     Returns one entry per provider: ``{provider, available, models}`` where each model is
     ``{name, accuracy?, latency?}``. This is the single catalog the Studio ``/models``
     endpoint, ``GET /v1/models`` and ``himmy models`` all render. It carries NO secret
     material — only provider availability + model names + reliability numbers.
+
+    ``reveal_host_posture`` (default ``True``) controls whether the catalog discloses
+    OPERATOR DEPLOYMENT POSTURE — the host-derived ``available`` booleans (``shutil.which``
+    / a running Ollama probe == "is this LLM binary installed on the host") and the live
+    LOCAL Ollama model inventory. That is the same reconnaissance class red-team
+    reattack-r6 withheld from tenant browse roles on ``GET /api/studio/health``
+    (the ``providers`` presence map). When ``True`` the result is byte-identical to the
+    historical catalog — preserved for OFFLINE/CLI (``himmy models``) and the GLOBAL
+    ``GET /v1/models`` (an infra surface), and granted to admins (``studio.console:write``)
+    on the Studio ``/models`` route. When ``False`` (a tenant browse role calling
+    ``GET /api/studio/models``) the catalog becomes POSTURE-FREE: ``available`` reports
+    that the provider is SUPPORTED (a static ``True`` — not "installed here"), the live
+    Ollama inventory is dropped, and only the static ``claude-cli`` tier aliases remain —
+    enough for a model picker, nothing about the operator's binaries or local models.
     """
     stats = _bench_stats()
     out: list[dict[str, object]] = []
 
-    ollama = await _ollama_catalog_models()
+    if reveal_host_posture:
+        ollama = await _ollama_catalog_models()
+        ollama_available = bool(ollama)
+        ollama_models = [{"name": m, **stats.get(m, {})} for m in ollama]
+        claude_available = shutil.which("claude") is not None
+    else:
+        # Posture-free: do NOT probe the host. ``available`` advertises that the
+        # provider is SUPPORTED by the framework (static True), never "installed on
+        # this host"; the live local Ollama inventory is withheld entirely.
+        ollama_available = True
+        ollama_models = []
+        claude_available = True
+
     out.append(
         {
             "provider": "ollama",
-            "available": bool(ollama),
-            "models": [{"name": m, **stats.get(m, {})} for m in ollama],
+            "available": ollama_available,
+            "models": ollama_models,
         }
     )
 
-    claude = shutil.which("claude") is not None
     out.append(
         {
             "provider": "claude-cli",
-            "available": claude,
+            "available": claude_available,
             "models": (
                 [{"name": n, **stats.get(n, {})} for n in _CLAUDE_CLI_MODELS]
-                if claude
+                if claude_available
                 else []
             ),
         }

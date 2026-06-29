@@ -1101,7 +1101,7 @@ async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
     "/models",
     dependencies=[Depends(studio_permission(_RES_MODEL_CATALOG, "read"))],
 )
-async def models() -> list[dict[str, Any]]:
+async def models(request: Request) -> list[dict[str, Any]]:
     """Available providers + their models, with any cached benchmark stats.
 
     red-team r6: requires the per-surface ``studio.modelcatalog:read`` rather than
@@ -1114,13 +1114,26 @@ async def models() -> list[dict[str, Any]]:
     is admin-only. The catalog carries NO provider-key configured/detected_via posture, so a
     tenant browse role keeps the picker while losing the credential reconnaissance.
 
+    red-team reattack-r9: the catalog's host-derived ``available`` booleans (which LLM
+    binaries are installed/running) and live LOCAL Ollama model inventory are the SAME
+    operator deployment posture r6 withheld from tenant browse roles on ``GET /health``.
+    They are now disclosed ONLY to a caller that also holds ``studio.console:write``
+    (admin) — :func:`_caller_holds_console_write`, the same gate ``/health`` uses. A tenant
+    browse role gets a POSTURE-FREE picker (providers advertised as SUPPORTED, no live
+    inventory); OFFLINE is byte-unchanged (``_caller_holds_console_write`` returns True with
+    no authenticator) so the single-box console keeps the full catalog.
+
     Delegates to the shared :func:`himmy.services.inference.compare.build_model_catalog`
     seam (T3d) — the SAME catalog ``GET /v1/models`` and ``himmy models`` render, so the
     three surfaces never drift. The response shape is unchanged.
     """
     from himmy.services.inference.compare import build_model_catalog
 
-    return cast(list[dict[str, Any]], await build_model_catalog())
+    posture = _caller_holds_console_write(request)
+    return cast(
+        list[dict[str, Any]],
+        await build_model_catalog(reveal_host_posture=posture),
+    )
 
 
 # ---- Compare (one prompt, N models, side-by-side) -----------------------

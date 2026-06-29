@@ -131,12 +131,26 @@ class StorageService:
 
     # ------------------------------------------------------------------ context
     async def save_context_field(self, field: ContextField) -> ContextField:
-        """Upsert a context field keyed by ``(subject_id, key)``."""
+        """Upsert a context field keyed by ``(workspace_id, subject_id, key)``.
+
+        The owning ``workspace_id`` is read from the field metadata (blank for the
+        offline / single-tenant path), so two tenants sharing a ``subject_id`` write to
+        DISTINCT rows — a tenant's upsert can never overwrite another tenant's field.
+        """
         return await self._context_store.save_context_field(field)
 
-    async def get_context_field(self, subject_id: str, key: str) -> ContextField | None:
-        """Return the context field for ``(subject_id, key)``, or None."""
-        return await self._context_store.get_context_field(subject_id, key)
+    async def get_context_field(
+        self, subject_id: str, key: str, *, workspace_id: str | None = None
+    ) -> ContextField | None:
+        """Return the context field for ``(subject_id, key)``, tenant-scoped on workspace.
+
+        ``workspace_id`` selects the owning tenant's row (the store partitions on it);
+        ``None`` is the offline / single-tenant path (the unstamped/blank partition),
+        byte-unchanged.
+        """
+        return await self._context_store.get_context_field(
+            subject_id, key, workspace_id=workspace_id
+        )
 
     async def list_context_fields(self, subject_id: str) -> list[ContextField]:
         """Return all context fields for a subject."""

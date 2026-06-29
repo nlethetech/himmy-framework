@@ -183,7 +183,9 @@ class ContextService:
         semantics the read/list paths already apply. ``None`` is byte-unchanged (offline /
         all-tenants): every stored field is eligible.
         """
-        stored = await self._storage.get_context_field(subject_id, key)
+        stored = await self._storage.get_context_field(
+            subject_id, key, workspace_id=workspace_id
+        )
         if stored is None or workspace_id is None:
             return stored
         stamped = (getattr(stored, "metadata", {}) or {}).get("workspace_id")
