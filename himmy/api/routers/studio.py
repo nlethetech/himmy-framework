@@ -55,6 +55,7 @@ from himmy.api.auth import (
     scoped_read,
     studio_subject_filter,
     studio_tenant_filter,
+    subject_write,
 )
 from himmy.api.routers.studio_common import studio_permission
 from himmy.api.studio_approvals import ApprovalDetail, ApprovalSummary
@@ -1594,7 +1595,13 @@ async def memory_list(request: Request, subject: str = "default") -> list[Any]:
     return studio_memory.list_memories(_scoped_memory_subject(request, subject))
 
 
-@router.post("/memory", dependencies=[Depends(studio_permission(_RES_MEMORY, "write"))])
+@router.post(
+    "/memory",
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "write")),
+        Depends(subject_write),
+    ],
+)
 async def memory_add(body: MemoryAddRequest, request: Request) -> Any:
     """Persist a memory — STAMPED under the principal's own subject when subject-scoped.
 
@@ -1612,7 +1619,10 @@ async def memory_add(body: MemoryAddRequest, request: Request) -> Any:
 
 @router.delete(
     "/memory/{memory_id}",
-    dependencies=[Depends(studio_permission(_RES_MEMORY, "write"))],
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "write")),
+        Depends(subject_write),
+    ],
 )
 async def memory_forget(memory_id: str, request: Request) -> dict[str, bool]:
     """Forget one memory — a ``subject_scoped`` caller may only forget its OWN subject's.
@@ -1866,21 +1876,52 @@ async def run_lineage(run_id: str, request: Request) -> Any:
 # ---- Agent authoring (the no-code builder) ------------------------------
 
 
-@router.get("/tools", response_model=list[studio_agents.PackInfo])
+@router.get(
+    "/tools",
+    response_model=list[studio_agents.PackInfo],
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "read"))],
+)
 async def tool_packs() -> list[studio_agents.PackInfo]:
-    """The built-in tool packs an agent can switch on."""
+    """The built-in tool packs an agent can switch on.
+
+    Part of the agent-authoring surface, so gated with ``studio.agents:read``
+    (admin-only by default) rather than the open ``studio.console:read``
+    baseline — the same r10 bar that locked the agent/team inventory. NO-OP
+    offline / ``all_tenants``.
+    """
     return studio_agents.list_tool_packs()
 
 
-@router.get("/skills", response_model=list[studio_agents.SkillInfo])
+@router.get(
+    "/skills",
+    response_model=list[studio_agents.SkillInfo],
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "read"))],
+)
 async def skills() -> list[studio_agents.SkillInfo]:
-    """Available skills (built-in + project-local)."""
+    """Available skills (built-in + project-local).
+
+    Authoring-surface inventory, gated with ``studio.agents:read`` (admin-only
+    by default) like the tool packs and the agent/team lists. NO-OP offline /
+    ``all_tenants``.
+    """
     return studio_agents.list_skill_infos()
 
 
-@router.get("/agent", response_model=studio_agents.AgentDetail)
+@router.get(
+    "/agent",
+    response_model=studio_agents.AgentDetail,
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "read"))],
+)
 async def get_agent(path: str) -> studio_agents.AgentDetail:
-    """Load one agent's full editable spec (by project-relative path)."""
+    """Load one agent's full editable spec (by project-relative path).
+
+    The detail view discloses strictly more than the (admin-locked) ``/agents``
+    list — the full system-prompt body, provider/model, tool packs, skills and
+    the project-relative spec path — so it carries the same ``studio.agents:read``
+    bar (admin-only by default) the r10 round applied to the inventory list,
+    rather than the open ``studio.console:read`` baseline a tenant browse role
+    holds. NO-OP offline / ``all_tenants``.
+    """
     try:
         return studio_agents.load_agent_detail(path)
     except FileNotFoundError as exc:

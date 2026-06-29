@@ -62,4 +62,36 @@ async def scoped_read() -> None:
 scoped_read._scoped_read = True  # type: ignore[attr-defined]
 
 
-__all__ = ["scoped_read"]
+async def subject_write() -> None:
+    """A no-op dependency that STAMPS a WRITE route as enforcing subject(+tenant) scope.
+
+    The write-path companion to :func:`scoped_read`. Where ``scoped_read`` asserts a GET /
+    read-shaped POST derives its scope from the verified principal, this asserts a MUTATION
+    (``PATCH`` / ``DELETE`` / ``PUT`` / write ``POST``) on a subject-keyed surface gates the
+    target ``subject_id`` against the principal — via
+    :func:`~himmy.api.auth.context.enforce_subject_write` (create/upsert, 403 on a foreign
+    subject in the body) or :func:`~himmy.api.auth.context.authorize_object` (by-id mutate,
+    404 on a foreign owning subject) — so a ``subject_scoped`` caller can only write under
+    its OWN subject.
+
+    This closes the recurrence class the round-3 ``memory_edit`` bypass exposed: the GET
+    coverage gate and the read-shaped-POST gate never inspect ``PATCH`` / ``DELETE`` write
+    leaves, so an in-place edit that forgot the object-axis gate was structurally invisible.
+    The subject-write coverage gate (``tests/api/test_tenant_scope_coverage.py``) now
+    enumerates the write leaves on subject-keyed surfaces and requires each to EITHER carry
+    this marker OR sit on a documented allow-list.
+
+    Declared on a write route (``Depends(subject_write)``) or its router
+    (``dependencies=[Depends(subject_write)]``). Parameterless on purpose (adds no
+    query/path parameter, OpenAPI shape byte-unchanged). A strict NO-OP at runtime — the
+    real gating is the handler's ``enforce_subject_write`` / ``authorize_object`` calls,
+    themselves no-ops for an ANONYMOUS / ``all_tenants`` principal, so the single-box
+    zero-config path is byte-unchanged.
+    """
+    return None
+
+
+subject_write._subject_write = True  # type: ignore[attr-defined]
+
+
+__all__ = ["scoped_read", "subject_write"]

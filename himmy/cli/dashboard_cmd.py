@@ -40,7 +40,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         subject = getattr(args, "subject", None) or container.subject_id
         summary = asyncio.run(
             container.dashboard.summary(
-                subject_id=subject, workspace_id=container.workspace_id
+                subject_id=subject,
+                workspace_id=container.workspace_id,
+                # The local CLI is the offline / single-tenant path: keep the lenient
+                # eval-tile filter so an unstamped run stays visible (byte-unchanged).
+                all_tenants=True,
             )
         )
     finally:

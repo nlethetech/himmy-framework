@@ -126,3 +126,46 @@ def test_tenant_auditor_bundle_excludes_other_tenants_privacy_report(
     assert resp.status_code == 200
     record_ids = set(AuditBundle.model_validate(resp.json()).records)
     assert {alpha_report, beta_report} <= record_ids
+
+
+def test_tenant_auditor_bundle_excludes_none_stamped_privacy_report(
+    monkeypatch: Any,
+) -> None:
+    """scope-r3: a None-stamped privacy_audit_report (an ADMIN all-tenants UNSCOPED run
+    whose subject_refs span every tenant) must NOT leak to a tenant-bound auditor.
+
+    The bundle reader used the LENIENT ``in (None, workspace_id)`` filter that scope-r1
+    hardened to STRICT ``== workspace_id`` for the sibling ``trend()`` reader — so the
+    None-stamped report slipped through to tenant alpha, disclosing other tenants'
+    subject_refs. Privacy reports are now scoped strictly: only an ``all_tenants``
+    principal sees the None-stamped report; a tenant auditor never does.
+    """
+    client, _ = _seed(monkeypatch)
+    none_report = _seed_privacy_report(client, None)
+
+    resp = client.get("/v1/audit/bundle", headers={"x-himmy-internal-key": "alpha"})
+    assert resp.status_code == 200
+    record_ids = set(AuditBundle.model_validate(resp.json()).records)
+    assert none_report not in record_ids
+
+    # The all_tenants principal still exports it (admin cross-workspace export intact).
+    resp = client.get("/v1/audit/bundle", headers={"x-himmy-internal-key": "root"})
+    assert resp.status_code == 200
+    record_ids = set(AuditBundle.model_validate(resp.json()).records)
+    assert none_report in record_ids
+
+
+def test_tenant_auditor_bundle_keeps_global_security_events(monkeypatch: Any) -> None:
+    """scope-r3: the asymmetric fix preserves the benign global-event allowance.
+
+    A None-stamped SECURITY_EVENT is a GLOBAL/ops event (no tenant dimension, no
+    cross-tenant subject_refs) — it must STAY visible to a tenant auditor (matching
+    ``/events``). Only the privacy-report half of the lenient filter was the IDOR; the
+    security-event half is benign and is deliberately kept.
+    """
+    client, ids = _seed(monkeypatch)
+    resp = client.get("/v1/audit/bundle", headers={"x-himmy-internal-key": "alpha"})
+    assert resp.status_code == 200
+    record_ids = set(AuditBundle.model_validate(resp.json()).records)
+    assert ids["global"] in record_ids
+    assert ids["beta"] not in record_ids

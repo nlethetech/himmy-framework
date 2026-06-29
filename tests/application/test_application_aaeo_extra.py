@@ -381,7 +381,13 @@ def test_dashboard_folds_evaluation_scores() -> None:
         await eval_svc.run_suite(
             suite=suite, actual_outputs={case.case_id: {"answer": "yes"}}
         )
-        return await dashboard.summary(subject_id="s1", workspace_id="w1")
+        # The offline / single-tenant path (no tenant-bound principal) keeps the lenient
+        # eval-tile filter, so the unstamped run scored above stays visible — the
+        # byte-unchanged zero-config behaviour. (A tenant-bound caller passes
+        # all_tenants=False and would strict-scope it out; see scope-r3.)
+        return await dashboard.summary(
+            subject_id="s1", workspace_id="w1", all_tenants=True
+        )
 
     summary = run_async(_scenario())
     assert summary["evaluation"]["total"] == 1

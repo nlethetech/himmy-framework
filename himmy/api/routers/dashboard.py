@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from himmy.api.auth import (
     authorize_object,
+    get_principal,
     require_permission,
     require_workspace,
     scoped_read,
@@ -41,8 +42,14 @@ async def dashboard_summary(
     workspace_id = require_workspace(request, workspace_id)
     if not authorize_object(request, subject_id):
         raise HTTPException(status_code=404, detail="subject not found")
+    # An ``all_tenants`` principal (offline / admin) keeps the lenient eval-tile filter so
+    # an unstamped run it explicitly asks for stays visible — byte-unchanged zero-config.
+    # A tenant-bound principal gets the STRICT eval filter (scope-r3): a None-stamped
+    # admin/offline run never leaks into its tile.
     summary = await _container(request).dashboard.summary(
-        subject_id=subject_id, workspace_id=workspace_id
+        subject_id=subject_id,
+        workspace_id=workspace_id,
+        all_tenants=get_principal(request).all_tenants,
     )
     return DashboardSummary.model_validate(summary)
 

@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import Depends, HTTPException, Path
+from fastapi import Depends, HTTPException, Path, Request
 from pydantic import BaseModel, Field
 
+from himmy.api.auth.context import authorize_object
+from himmy.api.auth.scope_marker import subject_write
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("memory", tag="studio-memory")
@@ -30,10 +32,11 @@ class MemoryEditRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=20_000)
 
 
-@router.patch("/{memory_id}", dependencies=[_memory_write])
+@router.patch("/{memory_id}", dependencies=[_memory_write, Depends(subject_write)])
 async def memory_edit(
     memory_id: Annotated[str, Path(min_length=1, max_length=200)],
     body: MemoryEditRequest,
+    request: Request,
 ) -> Any:
     """Rewrite a memory's text in place, keeping its identity and history.
 
@@ -42,6 +45,14 @@ async def memory_edit(
     ``tier``, ``stable_key`` and the bi-temporal validity window — is
     preserved. The cached embedding for the record is dropped so the next
     recall re-embeds the new text instead of ranking against the old one.
+
+    A ``subject_scoped`` caller may only edit its OWN subject's memory: the
+    fetched record's owning ``subject_id`` is checked against the principal and
+    a cross-subject edit folds to a uniform 404 (existence never leaked),
+    mirroring the by-id ``memory_forget`` reader. Without this gate the
+    in-place edit was the one cross-subject memory WRITE left ungated while
+    ``memory_add`` (``enforce_subject_write``) and ``memory_forget``
+    (``authorize_object``) were both closed. NO-OP offline / ``all_tenants``.
     """
     from himmy.api import studio_memory
 
@@ -51,6 +62,8 @@ async def memory_edit(
     service = studio_memory.get_memory_service()
     record = service.get(memory_id)
     if record is None:
+        raise HTTPException(status_code=404, detail="memory not found")
+    if not authorize_object(request, record.subject_id):
         raise HTTPException(status_code=404, detail="memory not found")
     updated = record.model_copy(update={"text": text})
     service.store.save(updated)

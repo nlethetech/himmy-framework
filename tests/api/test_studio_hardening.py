@@ -486,6 +486,41 @@ def test_studio_routines_list_offline_unchanged(
         svc.reset_scheduler()
 
 
+def test_studio_agent_detail_withheld_from_browse_roles() -> None:
+    """reattack-r3: GET /api/studio/agent (DETAIL) leaked the full operator spec.
+
+    The r10 round locked the agent/team INVENTORY (``GET /api/studio/agents`` /
+    ``/teams``) to admin-only ``studio.agents:read`` / ``studio.teams:read`` because it
+    leaks project-relative server paths. But the DETAIL route ``GET /api/studio/agent?path=``
+    carried no route-level dependency, so it inherited only the ``studio.console:read``
+    baseline every tenant browse role holds — disclosing strictly MORE than the locked list
+    (the full system-prompt body, provider/model, tool packs, skills, the spec path). The
+    sibling tool-pack / skill inventories had the same gap. All three now require
+    ``studio.agents:read``, so a viewer/operator/auditor is 403 (the RBAC dependency fires
+    before any filesystem resolution); admin still reads them.
+    """
+    for role in ("viewer", "operator", "auditor"):
+        c = _client_with_key(_app_with_key(role))
+        assert c.get("/api/studio/agents").status_code == 403, role  # r10 list (control)
+        assert (
+            c.get("/api/studio/agent", params={"path": "agent.yaml"}).status_code == 403
+        ), role
+        assert c.get("/api/studio/tools").status_code == 403, role
+        assert c.get("/api/studio/skills").status_code == 403, role
+    ca = _client_with_key(_app_with_key("admin"))
+    # admin reaches the gate (200 for the catalogs; 404 only if no agent.yaml on disk).
+    assert ca.get("/api/studio/tools").status_code == 200
+    assert ca.get("/api/studio/skills").status_code == 200
+    assert ca.get("/api/studio/agent", params={"path": "agent.yaml"}).status_code in (
+        200,
+        404,
+    )
+    # OFFLINE (no authenticator) reads them byte-unchanged.
+    offline = TestClient(create_app(ApiContainer.build_default()))
+    assert offline.get("/api/studio/tools").status_code == 200
+    assert offline.get("/api/studio/skills").status_code == 200
+
+
 def test_studio_eval_suites_withheld_from_browse_roles() -> None:
     """reattack-r7: GET /api/studio/eval/suites (LIST) is admin-only, not browse.
 

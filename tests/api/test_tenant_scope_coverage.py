@@ -76,6 +76,25 @@ def _route_is_scoped(route: Any) -> bool:
     return any(getattr(call, "_scoped_read", None) is not None for call in calls)
 
 
+def _route_is_subject_write_scoped(route: Any) -> bool:
+    """Whether ``route``'s dependency graph carries the ``subject_write`` marker.
+
+    The write-path companion to :func:`_route_is_scoped`. True iff some callable in the
+    route's resolved dependant tree was stamped with the ``_subject_write`` attribute —
+    set on :func:`himmy.api.auth.subject_write` — asserting the mutation gates its target
+    ``subject_id`` against the verified principal (``enforce_subject_write`` /
+    ``authorize_object``) so a ``subject_scoped`` caller may write only under its OWN
+    subject. Catches both a route-level ``Depends(subject_write)`` and a router-level
+    baseline, at any nesting depth.
+    """
+    dependant = getattr(route, "dependant", None)
+    if dependant is None:
+        return False
+    calls: list[Any] = []
+    _walk_dependency_calls(dependant, calls)
+    return any(getattr(call, "_subject_write", None) is not None for call in calls)
+
+
 def _iter_api_routes(routes: list[Any], prefix: str = "") -> Any:
     """Yield ``(path, route)`` for every concrete leaf route on the app.
 
@@ -128,6 +147,52 @@ _NON_GET_READS: frozenset[str] = frozenset(
         "/api/studio/knowledge/{kb_id}/search",  # POST KB search (project-local, not tenant)
     }
 )
+
+
+#: Path prefixes whose data store is keyed by ``subject_id`` (the BOLA axis), so EVERY
+#: mutation under them (``POST`` / ``PUT`` / ``PATCH`` / ``DELETE``) must gate the target
+#: subject against the verified principal. The memory store (``himmy.services.memory``) is
+#: keyed by ``subject_id`` only — the subject axis is the sole isolation boundary — so an
+#: ungated write is a cross-subject poisoning BOLA. The GET gate and the read-shaped-POST
+#: gate are structurally BLIND to a ``PATCH`` / ``DELETE`` write (that is exactly how the
+#: round-3 ``memory_edit`` in-place edit shipped ungated while ``memory_add`` /
+#: ``memory_forget`` were closed). The subject-write gate below enumerates these write
+#: leaves and requires each to carry the ``subject_write`` marker (its target gated via
+#: ``enforce_subject_write`` / ``authorize_object``).
+_SUBJECT_KEYED_WRITE_PREFIXES: tuple[str, ...] = ("/api/studio/memory",)
+
+#: Subject-keyed write leaves that legitimately need NO per-subject gate — e.g. a bulk
+#: admin-only purge already locked behind an elevated RBAC grant, or a write whose body
+#: carries no subject selector. Empty today: every memory write is subject-gated. A NEW
+#: subject-keyed write that cannot carry the marker must be added here WITH A REASON, so
+#: the omission is a visible, reviewed decision rather than a silent BOLA.
+_SUBJECT_WRITE_EXEMPT: frozenset[str] = frozenset()
+
+
+def _subject_keyed_write_routes() -> list[tuple[str, Any]]:
+    """Every non-GET (write) leaf under a subject-keyed surface (:data:`_SUBJECT_KEYED_WRITE_PREFIXES`).
+
+    Mirrors :func:`_non_get_read_routes` but for the WRITE axis the read gates never see:
+    ``POST`` / ``PUT`` / ``PATCH`` / ``DELETE`` leaves under a ``subject_id``-keyed store.
+    Each must carry the ``subject_write`` marker so a ``subject_scoped`` caller cannot
+    mutate another data subject's object — the recurrence class ``memory_edit`` exposed.
+    """
+    app = create_app()
+    out: list[tuple[str, Any]] = []
+    for path, route in _iter_api_routes(app.routes):
+        if getattr(route, "dependant", None) is None:
+            continue
+        methods = getattr(route, "methods", None) or set()
+        if "GET" in methods:
+            continue
+        if not any(path.startswith(p) for p in _SUBJECT_KEYED_WRITE_PREFIXES):
+            continue
+        # A read-shaped POST (e.g. semantic recall) is a READ, not a mutation — it is
+        # guarded by the scoped_read gate (:data:`_NON_GET_READS`), not the write gate.
+        if path in _NON_GET_READS:
+            continue
+        out.append((path, route))
+    return out
 
 
 def _non_get_read_routes() -> list[tuple[str, Any]]:
@@ -373,6 +438,70 @@ def test_memory_recall_post_read_is_detected_as_scoped() -> None:
     assert _route_is_scoped(routes["/api/studio/memory/recall"]), (
         "/api/studio/memory/recall is subject-scoped (narrow_subject) and must carry the "
         "scoped_read marker so the non-GET gate enforces it"
+    )
+
+
+def test_every_subject_keyed_write_route_is_subject_scoped() -> None:
+    """No write on a ``subject_id``-keyed store ships WITHOUT a per-subject gate.
+
+    The read gates (:func:`test_every_get_read_route_is_scoped_or_documented` and the
+    read-shaped-POST gate) are structurally blind to a ``PATCH`` / ``DELETE`` mutation —
+    which is exactly how the round-3 ``PATCH /api/studio/memory/{id}`` in-place edit shipped
+    able to rewrite ANOTHER data subject's memory while the sibling ``DELETE`` and ``POST``
+    were gated. This gate closes that recurrence class by construction: every non-GET leaf
+    under a subject-keyed surface (:data:`_SUBJECT_KEYED_WRITE_PREFIXES`) must carry the
+    ``subject_write`` marker (asserting it gates the target ``subject_id`` via
+    ``enforce_subject_write`` / ``authorize_object``) OR sit on the reasoned
+    :data:`_SUBJECT_WRITE_EXEMPT` list. A future ungated subject write fails the build.
+    """
+    routes = _subject_keyed_write_routes()
+    seen = {path for path, _route in routes}
+    # The gate genuinely reaches the memory writes (not vacuously empty after a nesting
+    # change): the add (POST), forget (DELETE) and the round-3 edit (PATCH) are all present.
+    for path in (
+        "/api/studio/memory",
+        "/api/studio/memory/{memory_id}",
+    ):
+        assert path in seen, (
+            f"expected subject-keyed write route {path} to be enumerated; a FastAPI "
+            "nesting change must not make this gate silently empty"
+        )
+
+    offenders: list[str] = []
+    for path, route in routes:
+        if _route_is_subject_write_scoped(route):
+            continue
+        if path in _SUBJECT_WRITE_EXEMPT:
+            continue
+        methods = sorted(getattr(route, "methods", None) or [])
+        offenders.append(f"{methods} {path}")
+    assert not offenders, (
+        "these writes on a subject-keyed store carry no subject_write marker and are not on "
+        "_SUBJECT_WRITE_EXEMPT (gate the target subject via enforce_subject_write / "
+        f"authorize_object and add Depends(subject_write), or document an exemption): {offenders}"
+    )
+
+
+def test_memory_edit_patch_is_subject_write_scoped() -> None:
+    """Regression (round-3 BOLA): the in-place memory edit gates the target subject.
+
+    ``PATCH /api/studio/memory/{memory_id}`` rewrites a memory's text in place. Before the
+    round-3 fix it called ``service.store.save`` with ZERO object-axis check, so a
+    ``subject_scoped`` caller holding ``studio.memory:write`` could rewrite another data
+    subject's memory by id. It now folds a cross-subject edit to 404 (``authorize_object``)
+    and carries the ``subject_write`` marker so the coverage gate enforces it by construction.
+    """
+    routes = {path: route for path, route in _subject_keyed_write_routes()}
+    edit = [
+        route
+        for path, route in routes.items()
+        if path == "/api/studio/memory/{memory_id}"
+        and "PATCH" in (getattr(route, "methods", None) or set())
+    ]
+    assert edit, "expected PATCH /api/studio/memory/{memory_id} present"
+    assert all(_route_is_subject_write_scoped(r) for r in edit), (
+        "PATCH /api/studio/memory/{memory_id} is subject-keyed (authorize_object) and must "
+        "carry the subject_write marker so the subject-write gate enforces it"
     )
 
 

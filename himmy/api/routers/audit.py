@@ -69,14 +69,35 @@ async def export_audit_bundle_route(request: Request) -> AuditBundle:
         *registry.list_by_kind(SECURITY_EVENT_KIND),
         *registry.list_by_kind(PRIVACY_AUDIT_REPORT_KIND),
     ]
-    # Tenant-scope the export exactly like /events: a tenant-bound auditor only sees
-    # its own workspace's records (plus global/ops records with no workspace_id),
-    # never another tenant's trail. An all_tenants principal resolves to None and
-    # keeps the full export.
+    # Tenant-scope the export: a tenant-bound auditor only sees its own workspace's
+    # records, never another tenant's trail. An all_tenants principal resolves to None
+    # and keeps the full export.
+    #
+    # The two record kinds are scoped ASYMMETRICALLY, because a None ``workspace_id``
+    # means different things for each:
+    #   * SECURITY_EVENT_KIND — a None stamp is a GLOBAL/ops security event (no tenant
+    #     dimension, no cross-tenant subject_refs), benign to surface to any auditor;
+    #     keep the lenient ``in (None, workspace_id)`` allowance, matching /events'
+    #     global-event behaviour.
+    #   * PRIVACY_AUDIT_REPORT_KIND — a None stamp is produced by an ADMIN all-tenants
+    #     UNSCOPED privacy run whose subject_refs span EVERY tenant. Admitting it to a
+    #     tenant-bound auditor leaks other tenants' subject identifiers (scope-r3 IDOR).
+    #     Require STRICT ``== workspace_id`` here, matching PrivacyAuditService.trend()
+    #     (scope-r1) — only an all_tenants principal (workspace_id is None, filter
+    #     skipped) ever sees the None-stamped report.
     workspace_id = resolve_workspace(request, None)
     if workspace_id is not None:
         records = [
-            r for r in records if r.metadata.get("workspace_id") in (None, workspace_id)
+            r
+            for r in records
+            if (
+                r.kind == PRIVACY_AUDIT_REPORT_KIND
+                and r.metadata.get("workspace_id") == workspace_id
+            )
+            or (
+                r.kind != PRIVACY_AUDIT_REPORT_KIND
+                and r.metadata.get("workspace_id") in (None, workspace_id)
+            )
         ]
     private_pem = get_secret("HIMMY_AUDIT_PRIVATE_KEY")
     if private_pem:

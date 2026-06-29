@@ -221,6 +221,63 @@ def test_dashboard_summary_aggregates_counts() -> None:
     assert "recommendations" in summary
 
 
+def test_dashboard_eval_summary_excludes_none_stamped_run() -> None:
+    """scope-r3: a tenant's eval tile must NOT fold a None-stamped (admin/offline) run.
+
+    ``_evaluation_summary`` listed ALL eval runs and re-filtered with the LENIENT
+    ``in (None, workspace_id)`` predicate, so an offline/admin run with ``workspace_id``
+    NULL leaked into a tenant's dashboard tile (aggregate_score, suite_name, latest_run_id)
+    — a cross-tenant metadata disclosure. The filter is now STRICT ``== workspace_id``
+    (matching the context-field tile and the GET-by-id IDOR path): a tenant sees only its
+    own runs; an all_tenants (``workspace_id=None``) caller still sees everything.
+    """
+    from himmy.services.evaluation.models import EvaluationRun
+
+    storage, _registry, _rt, _run_app, _rec = _stack()
+    dashboard = DashboardQueryService(storage=storage)
+
+    async def _scenario():
+        # A None-stamped run (admin all-tenants / offline) and a tenant-w1 run.
+        await storage.save_evaluation_run(
+            EvaluationRun(
+                suite_id="admin",
+                suite_name="admin-suite",
+                workspace_id=None,
+                aggregate_score=0.99,
+                created_at="2999-01-01T00:00:00Z",  # newest, so it would win `max`
+            )
+        )
+        await storage.save_evaluation_run(
+            EvaluationRun(
+                suite_id="w1",
+                suite_name="w1-suite",
+                workspace_id="w1",
+                aggregate_score=0.10,
+                created_at="2000-01-01T00:00:00Z",
+            )
+        )
+        tenant = await dashboard.summary(subject_id="s1", workspace_id="w1")
+        admin = await dashboard.summary(subject_id="s1", workspace_id=None)
+        # Offline / all_tenants caller explicitly scoping to w1 keeps the None-stamped
+        # run visible — byte-unchanged zero-config (the lenient filter is retained).
+        offline = await dashboard.summary(
+            subject_id="s1", workspace_id="w1", all_tenants=True
+        )
+        return tenant, admin, offline
+
+    tenant, admin, offline = run_async(_scenario())
+    # Tenant w1 sees ONLY its own run — not the newer None-stamped admin run.
+    assert tenant["evaluation"]["total"] == 1
+    assert tenant["evaluation"]["latest_suite_name"] == "w1-suite"
+    assert tenant["evaluation"]["latest_aggregate"] == 0.10
+    # The all_tenants view (workspace=None) still folds every run.
+    assert admin["evaluation"]["total"] == 2
+    assert admin["evaluation"]["latest_suite_name"] == "admin-suite"
+    # Offline invariant: all_tenants + explicit w1 keeps BOTH (the None-stamped run too).
+    assert offline["evaluation"]["total"] == 2
+    assert offline["evaluation"]["latest_suite_name"] == "admin-suite"
+
+
 def test_get_run_events_and_thread() -> None:
     """A completed run exposes its event stream and conversation thread."""
     storage, _registry, _rt, run_app, _rec = _stack()

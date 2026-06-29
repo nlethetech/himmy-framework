@@ -43,10 +43,12 @@ def memory_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     studio_memory.reset_memory_service()
 
 
-def _seed(subject_id: str, text: str) -> None:
+def _seed(subject_id: str, text: str) -> str:
     from himmy.api import studio_memory
 
-    studio_memory.add_memory(text, subject_id=subject_id, kind="semantic")
+    return studio_memory.add_memory(
+        text, subject_id=subject_id, kind="semantic"
+    ).memory_id
 
 
 def _subject_scoped_client(subject: str) -> TestClient:
@@ -118,6 +120,65 @@ def test_recall_does_not_honor_a_foreign_subject_id_in_the_body(
     hits = resp.json()
     assert all("tea" not in h["text"] for h in hits), hits
     assert all("xyz" not in h["text"] for h in hits), hits
+
+
+# ----------------------------------------- the in-place edit BOLA write is closed (scope-r3)
+
+
+def test_edit_cannot_rewrite_another_subjects_memory(memory_project: Path) -> None:
+    """PATCH /api/studio/memory/{victim_id} by a subject-scoped caller returns 404, no write.
+
+    The round-3 BOLA: ``memory_edit`` fetched the victim record and saved an updated copy
+    with ZERO object-axis gate, so a ``subject_scoped`` caller holding ``studio.memory:write``
+    could rewrite ANOTHER data subject's memory in place. It now folds a cross-subject edit
+    to a uniform 404 (existence never leaked) and leaves the victim's text untouched.
+    """
+    from himmy.api import studio_memory
+
+    _seed("alice", "alice loves espresso")
+    victim_id = _seed("bob", "bob secret tea blend xyz")
+
+    client = _subject_scoped_client("alice")
+    resp = client.patch(f"/api/studio/memory/{victim_id}", json={"text": "poisoned"})
+    assert resp.status_code == 404, resp.text
+
+    # The victim's record is byte-unchanged: not poisoned, still its own subject/text.
+    rec = studio_memory.get_memory(victim_id)
+    assert rec is not None
+    assert rec.subject_id == "bob"
+    assert rec.text == "bob secret tea blend xyz"
+
+
+def test_edit_can_rewrite_own_subjects_memory(memory_project: Path) -> None:
+    """A subject-scoped caller CAN still edit its OWN subject's memory (gate is not over-broad)."""
+    from himmy.api import studio_memory
+
+    own_id = _seed("alice", "alice loves espresso")
+
+    client = _subject_scoped_client("alice")
+    resp = client.patch(f"/api/studio/memory/{own_id}", json={"text": "alice loves tea"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["subject_id"] == "alice"
+
+    rec = studio_memory.get_memory(own_id)
+    assert rec is not None
+    assert rec.text == "alice loves tea"
+
+
+def test_offline_edit_rewrites_any_memory(memory_project: Path) -> None:
+    """With NO authenticator the edit gate is a NO-OP — any memory is editable (byte-unchanged)."""
+    from himmy.api import studio_memory
+
+    victim_id = _seed("bob", "bob secret tea blend xyz")
+
+    app = create_app(ApiContainer.build_default())
+    client = TestClient(app)
+    resp = client.patch(f"/api/studio/memory/{victim_id}", json={"text": "rewritten"})
+    assert resp.status_code == 200, resp.text
+
+    rec = studio_memory.get_memory(victim_id)
+    assert rec is not None
+    assert rec.text == "rewritten"
 
 
 # --------------------------------------------------------------- offline byte-unchanged

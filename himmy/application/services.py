@@ -3800,12 +3800,24 @@ class DashboardQueryService:
         """Wire the backing store."""
         self._storage = storage
 
-    async def summary(self, *, subject_id: str, workspace_id: str) -> dict[str, Any]:
+    async def summary(
+        self,
+        *,
+        subject_id: str,
+        workspace_id: str,
+        all_tenants: bool = False,
+    ) -> dict[str, Any]:
         """Return one summary object: context stats + run/recommendation/eval counts.
 
         Context fields are scoped to ``workspace_id`` (AAEO-4) and the latest
         evaluation aggregate is folded in (AAEO-15) so the documented "scorecards
         on a dashboard" story is real.
+
+        ``all_tenants`` is the caller principal's cross-tenant flag (True for the
+        offline / admin all-tenants path). It is threaded into the eval-tile scoping so
+        a None-stamped (unstamped) run an ``all_tenants`` caller explicitly asks for stays
+        visible — byte-unchanged zero-config — while a tenant-bound caller gets strict
+        ``== workspace_id`` and never folds another tenant's / an admin run (scope-r3).
         """
         all_fields = await self._storage.list_context_fields(subject_id)
         fields = [
@@ -3843,7 +3855,9 @@ class DashboardQueryService:
         for rec in recs:
             rec_counts[rec.status.value] = rec_counts.get(rec.status.value, 0) + 1
 
-        evaluation = await self._evaluation_summary(workspace_id=workspace_id)
+        evaluation = await self._evaluation_summary(
+            workspace_id=workspace_id, all_tenants=all_tenants
+        )
 
         return {
             "subject_id": subject_id,
@@ -3865,15 +3879,23 @@ class DashboardQueryService:
         }
 
     async def _evaluation_summary(
-        self, *, workspace_id: str | None = None
+        self, *, workspace_id: str | None = None, all_tenants: bool = False
     ) -> dict[str, Any]:
         """Fold the latest evaluation run's aggregate into the dashboard (AAEO-15).
 
         Scoped to ``workspace_id`` (AAEO-4) so the tile never leaks ANOTHER tenant's
-        evaluation runs. The same inclusive rule the context-field tile uses applies:
-        a run stamped with a *different* workspace is excluded, but a legacy/offline
-        run with no stamped workspace stays visible (it belongs to no tenant). The
-        strict-equality filter lives on the GET-by-id IDOR path, not this overview.
+        evaluation runs. A TENANT-BOUND caller sees ONLY runs stamped with its own
+        workspace — STRICT ``== workspace_id`` (matching the GET-by-id IDOR path): a
+        None-stamped run (produced by an offline / admin all-tenants run) was previously
+        folded into a tenant tile via the lenient ``in (None, workspace_id)`` filter,
+        surfacing another tenant's / an admin run's aggregate_score, suite_name and
+        run_id — a cross-tenant metadata leak (scope-r3). It is now EXCLUDED for a
+        tenant-bound caller.
+
+        For the ``all_tenants`` principal (offline / admin) the filter is SKIPPED entirely
+        when ``workspace_id`` is None, and otherwise stays LENIENT (a None-stamped run the
+        caller explicitly scoped to a workspace stays visible) — so the zero-config /
+        admin path is byte-unchanged.
         """
         lister = getattr(self._storage, "list_evaluation_runs", None)
         if lister is None:
@@ -3883,11 +3905,19 @@ class DashboardQueryService:
         except Exception:  # pragma: no cover - eval persistence optional
             return {"total": 0, "latest_aggregate": None}
         if workspace_id is not None:
-            runs = [
-                r
-                for r in runs
-                if getattr(r, "workspace_id", None) in (None, workspace_id)
-            ]
+            if all_tenants:
+                # Byte-unchanged offline/admin behaviour: an unstamped run scoped to a
+                # workspace stays visible alongside that workspace's own runs.
+                runs = [
+                    r
+                    for r in runs
+                    if getattr(r, "workspace_id", None) in (None, workspace_id)
+                ]
+            else:
+                # Tenant-bound: strict — a None-stamped admin/offline run never leaks.
+                runs = [
+                    r for r in runs if getattr(r, "workspace_id", None) == workspace_id
+                ]
         if not runs:
             return {"total": 0, "latest_aggregate": None}
         latest = max(runs, key=lambda r: getattr(r, "created_at", "") or "")
