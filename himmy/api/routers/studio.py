@@ -1617,7 +1617,10 @@ async def workflow_run(body: WorkflowRunRequest, request: Request) -> Any:
 # ---- Lineage (provenance of a run's answer) -----------------------------
 
 
-@router.get("/runs/{run_id}/lineage")
+@router.get(
+    "/runs/{run_id}/lineage",
+    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+)
 async def run_lineage(run_id: str, request: Request) -> Any:
     from himmy.api import studio_lineage
 

@@ -157,6 +157,8 @@ def test_per_surface_runs_read_split() -> None:
     assert c.get("/api/studio/runs").status_code == 403
     assert c.get("/api/studio/runs/analytics").status_code == 403
     assert c.get("/api/studio/runs/does-not-exist").status_code == 403
+    # Lineage is run data too: console baseline alone must NOT reach it.
+    assert c.get("/api/studio/runs/does-not-exist/lineage").status_code == 403
 
     app2 = _app_with_policy(
         "runs_reader", ["studio.console:read", "studio.runs:read"]
@@ -166,6 +168,10 @@ def test_per_surface_runs_read_split() -> None:
     assert c2.get("/api/studio/runs/analytics").status_code == 200
     # A missing run is 404 (past the 403 guard), never 403, for a granted reader.
     assert c2.get("/api/studio/runs/does-not-exist").status_code == 404
+    # The runs reader passes the lineage guard too (404 = past it, run not found).
+    assert (
+        c2.get("/api/studio/runs/does-not-exist/lineage").status_code == 404
+    )
 
 
 def test_admin_reads_every_studio_surface() -> None:
