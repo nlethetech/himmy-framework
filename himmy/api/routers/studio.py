@@ -440,7 +440,11 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
     )
 
 
-@router.get("/runs", response_model=StudioRunListResponse)
+@router.get(
+    "/runs",
+    response_model=StudioRunListResponse,
+    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+)
 async def list_runs(
     request: Request, limit: int = 50, offset: int = 0
 ) -> StudioRunListResponse:
@@ -450,6 +454,13 @@ async def list_runs(
     the CLI ``--persist`` path appear here too (Studio is the single-user-local browse
     over the unified store). studio.db is a presentation cache that enriches matching
     rows + supplies human feedback.
+
+    red-team r6: requires the per-surface ``studio.runs:read`` rather than collapsing to
+    the coarse ``studio.console:read`` baseline, so a role holding only the console
+    baseline (but not the runs grant) cannot browse run history. The rows are still
+    tenant-filtered (``studio_tenant_filter``) so a tenant-bound principal sees only its
+    own workspace's runs — this guard is the additional surface gate, NOT the tenant
+    boundary. OFFLINE is unaffected (``studio_permission`` no-ops without an authenticator).
     """
     from himmy.api.studio_canonical import list_studio_runs_unified
 
@@ -470,7 +481,11 @@ async def list_runs(
     )
 
 
-@router.get("/runs/analytics", response_model=RunAnalytics)
+@router.get(
+    "/runs/analytics",
+    response_model=RunAnalytics,
+    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+)
 async def runs_analytics(request: Request) -> RunAnalytics:
     """Aggregate cost/token/latency stats across runs (the analytics dashboard).
 
@@ -488,7 +503,11 @@ async def runs_analytics(request: Request) -> RunAnalytics:
     return get_run_store().analytics()
 
 
-@router.get("/runs/{run_id}", response_model=StudioRun)
+@router.get(
+    "/runs/{run_id}",
+    response_model=StudioRun,
+    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+)
 async def get_run(run_id: str, request: Request) -> StudioRun:
     """Fetch one run in full from the canonical store: transcript, tools, timeline.
 
@@ -551,7 +570,11 @@ async def set_run_feedback(
     return fb
 
 
-@router.get("/runs/{run_id}/feedback", response_model=RunFeedback | None)
+@router.get(
+    "/runs/{run_id}/feedback",
+    response_model=RunFeedback | None,
+    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+)
 async def get_run_feedback(run_id: str, request: Request) -> RunFeedback | None:
     """Current feedback on a run (latest verdict), or ``null`` if none yet."""
     if get_run_store().get(run_id) is None or not await _authorize_run(
