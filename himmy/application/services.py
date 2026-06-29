@@ -320,13 +320,21 @@ class ContextAppService:
         task_id: str | None = None,
         build_spec: Any,
         metadata: dict[str, Any] | None = None,
+        workspace_id: str | None = None,
     ) -> Any:
-        """Build and persist an evidenced context snapshot."""
+        """Build and persist an evidenced context snapshot.
+
+        ``workspace_id`` (AAEO-4) tenant-scopes the field-RESOLUTION path so a snapshot
+        built in one workspace cannot surface another workspace's stored ``context_fields``
+        value under a shared ``subject_id`` (the store is keyed globally by
+        ``(subject_id, key)``). ``None`` keeps resolution unscoped (offline/all-tenants).
+        """
         return await self._context.build_snapshot(
             subject_id=subject_id,
             task_id=task_id,
             build_spec=build_spec,
             metadata=metadata,
+            workspace_id=workspace_id,
         )
 
     async def get_snapshot(

@@ -55,6 +55,7 @@ class ContextService:
         task_id: str | None = None,
         build_spec: ContextBuildSpec | dict[str, Any],
         metadata: dict[str, Any] | None = None,
+        workspace_id: str | None = None,
     ) -> ContextSnapshot:
         """Build, persist, and return an immutable context snapshot.
 
@@ -65,6 +66,16 @@ class ContextService:
         ``TOOL_ONLY`` never reads storage. Adapter-sourced fields are written
         through to storage except under ``TOOL_ONLY``. Required keys with no value
         land in ``missing_required_keys``.
+
+        Tenant isolation (red-team reattack-r1): ``context_fields`` are stored
+        globally by ``(subject_id, key)`` with NO workspace column, so a stored field
+        resolved on the build path could leak ACROSS tenants that share a free-form
+        ``subject_id``. When ``workspace_id`` is supplied, any STORAGE-sourced field
+        whose ``metadata.workspace_id`` does not match is treated as not present
+        (mirroring :meth:`list_fields`' existing metadata filter), so a snapshot built
+        in workspace A can never surface workspace B's stored value. ``workspace_id``
+        of ``None`` (offline / zero-config / all-tenants) keeps resolution byte-for-byte
+        unchanged — every stored field is eligible, exactly as before.
         """
         spec = (
             build_spec
@@ -82,7 +93,9 @@ class ContextService:
         missing_required_keys: list[str] = []
 
         for spec_key in spec.keys:
-            field = await self._resolve_key(spec_key, subject_id, scope)
+            field = await self._resolve_key(
+                spec_key, subject_id, scope, workspace_id=workspace_id
+            )
             if field is not None:
                 fields[spec_key.key] = field
             elif spec_key.required:
@@ -102,9 +115,20 @@ class ContextService:
         return snapshot
 
     async def _resolve_key(
-        self, spec_key: ContextSpecKey, subject_id: str, scope: dict[str, Any]
+        self,
+        spec_key: ContextSpecKey,
+        subject_id: str,
+        scope: dict[str, Any],
+        *,
+        workspace_id: str | None = None,
     ) -> ContextField | None:
-        """Resolve one spec key honoring its source preference; write through."""
+        """Resolve one spec key honoring its source preference; write through.
+
+        ``workspace_id`` (when supplied) tenant-scopes every STORAGE read: a stored
+        field stamped with a different workspace is treated as absent, so a cross-tenant
+        ``(subject_id, key)`` collision in the global ``context_fields`` store can never
+        be surfaced here. ``None`` keeps resolution unscoped (offline/all-tenants).
+        """
         pref = spec_key.source_preference
         key = spec_key.key
         adapter = (
@@ -120,7 +144,7 @@ class ContextService:
             return await adapter.fetch(key, key_scope)
 
         if pref == ContextSourcePreference.STORAGE_FIRST:
-            stored = await self._storage.get_context_field(subject_id, key)
+            stored = await self._stored_field(subject_id, key, workspace_id)
             if stored is not None and not self._is_stale(stored):
                 return stored
             if adapter is None:
@@ -139,7 +163,31 @@ class ContextService:
             if field is not None:
                 await self._write_through(field, subject_id)
                 return field
-        return await self._storage.get_context_field(subject_id, key)
+        return await self._stored_field(subject_id, key, workspace_id)
+
+    async def _stored_field(
+        self, subject_id: str, key: str, workspace_id: str | None
+    ) -> ContextField | None:
+        """Fetch a stored field, tenant-scoping it when ``workspace_id`` is supplied.
+
+        The ``context_fields`` store is keyed globally by ``(subject_id, key)`` with no
+        workspace column, so a field written by tenant B under a shared ``subject_id`` is
+        physically retrievable by tenant A. When ``workspace_id`` is supplied, a stored
+        field whose ``metadata.workspace_id`` differs is treated as absent — closing the
+        cross-tenant IDOR on the snapshot-build resolution path (the read/list paths
+        already apply this same metadata filter). ``None`` is byte-unchanged (offline /
+        all-tenants): every stored field is eligible.
+        """
+        stored = await self._storage.get_context_field(subject_id, key)
+        if stored is None or workspace_id is None:
+            return stored
+        stamped = (getattr(stored, "metadata", {}) or {}).get("workspace_id")
+        # An unstamped (legacy / hand-seeded storage-only) field has no workspace to
+        # contradict the caller's, so it stays eligible — only a DIFFERENT stamp is
+        # rejected, matching ``_snapshot_in_workspace``'s lenient-when-unstamped rule.
+        if stamped is not None and stamped != workspace_id:
+            return None
+        return stored
 
     async def _write_through(self, field: ContextField, subject_id: str) -> None:
         """Cache an adapter-sourced field back to storage under (subject_id, key).

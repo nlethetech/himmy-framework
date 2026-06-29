@@ -152,6 +152,30 @@ _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
         # OFFLINE path is unaffected (``require_permission`` no-ops without an authenticator).
         "studio.connections",
         "studio.google",
+        # red-team reattack-r1: four more PROCESS-WIDE operator surfaces missed by the
+        # r1/r2/r6 sweep — same class (a single app.state/module-level singleton with NO
+        # tenant axis to intersect on), so granting their ``:read`` to a tenant-facing
+        # browse role (viewer/operator/auditor) was a cross-tenant BOLA/IDOR:
+        #   * ``studio.missions`` — the process-wide mission registry
+        #     (:func:`himmy.api.missions.get_registry`); Mission objects carry NO
+        #     workspace_id, so list/by-id/SSE-stream leaked every other tenant's prompt
+        #     and live agent output.
+        #   * ``studio.notify`` — the module-level notification ring
+        #     (:mod:`himmy.api.routers.studio_notify`) accumulating every tenant's
+        #     routine/mission/project run-output previews.
+        #   * ``studio.kb`` — the knowledge-UPLOAD sub-router backing the SAME
+        #     process-wide ``studio_knowledge._service()`` singleton as the (already
+        #     withheld) ``studio.knowledge`` twin; leaked cross-tenant document metadata.
+        #   * ``studio.telegram`` — the process-wide Telegram listener singleton's
+        #     operator config metadata (agent_path, provider/model, allowed chat ids).
+        # Withheld from the default browse roles (admin-only, Studio is a network-isolated
+        # operator console); a deployment that deliberately exposes one to a tenant role
+        # can still grant it explicitly via ``HIMMY_RBAC_FILE``. The OFFLINE path is
+        # unaffected — ``require_permission`` no-ops without an authenticator.
+        "studio.missions",
+        "studio.notify",
+        "studio.kb",
+        "studio.telegram",
     }
 )
 

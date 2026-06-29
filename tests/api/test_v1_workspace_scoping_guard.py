@@ -300,6 +300,113 @@ def _create_eval_run(client: TestClient, workspace: str) -> str:
     return str(resp.json()["run_id"])
 
 
+def _app_with_operator_keys() -> object:
+    """An app binding two operator-role API keys to two tenants (attacker class).
+
+    ``operator`` holds ``context:read`` + ``context:write`` (the perms the
+    ``/v1/context`` field-upsert + snapshot-build routes require) and is NOT
+    ``subject_scoped``, so ``enforce_subject_write``/``authorize_object`` are no-ops —
+    exactly the principal in the cross-tenant context-field IDOR PoC. Returns the app
+    (not a client) so both tenants share ONE backing store.
+    """
+    app = create_app(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "op-a": Principal.build(
+                "user-a",
+                tenant_ids=["tenant-a"],
+                roles=["operator"],
+                auth_method="apikey",
+            ),
+            "op-b": Principal.build(
+                "user-b",
+                tenant_ids=["tenant-b"],
+                roles=["operator"],
+                auth_method="apikey",
+            ),
+        }
+    )
+    return app
+
+
+def test_cross_tenant_context_field_not_leaked_via_snapshot_build() -> None:
+    """red-team reattack-r1: snapshots:build must not resolve another tenant's field.
+
+    ``context_fields`` are keyed globally by ``(subject_id, key)`` with no workspace
+    column, and ``subject_id`` is a free-form attacker-chosen string. Tenant B writes
+    a secret field; tenant A builds a snapshot for the SAME ``subject_id`` requesting
+    that key. Before the fix, field RESOLUTION ignored the caller's workspace and
+    returned tenant B's value (cross-tenant IDOR); after the fix the build path
+    tenant-scopes resolution, so the foreign field is absent and lands in
+    ``missing_required_keys`` instead of leaking.
+    """
+    app = _app_with_operator_keys()
+
+    client_b = TestClient(app)
+    client_b.headers.update({"x-himmy-internal-key": "op-b"})
+    upsert = client_b.post(
+        "/v1/context/fields:upsert",
+        json={
+            "workspace_id": "tenant-b",
+            "subject_id": "alice@corp.com",
+            "fields": [{"key": "ssn", "value": "123-45-6789"}],
+        },
+    )
+    assert upsert.status_code == 200, upsert.text
+
+    client_a = TestClient(app)
+    client_a.headers.update({"x-himmy-internal-key": "op-a"})
+    snap = client_a.post(
+        "/v1/context/snapshots:build",
+        json={
+            "workspace_id": "tenant-a",
+            "subject_id": "alice@corp.com",
+            "build_spec": {"keys": [{"key": "ssn", "required": True}]},
+        },
+    )
+    assert snap.status_code == 200, snap.text
+    body = snap.json()
+    # The foreign tenant's value must NOT be resolved into the snapshot.
+    assert "ssn" not in body["fields"], body["fields"]
+    assert "ssn" in body["missing_required_keys"]
+    # And the persistent re-read path must not surface it either.
+    snapshot_id = body["snapshot_id"]
+    reread = client_a.get(
+        f"/v1/context/snapshots/{snapshot_id}", params={"workspace_id": "tenant-a"}
+    ).json()
+    assert "ssn" not in reread.get("fields", {})
+
+
+def test_same_tenant_context_field_still_resolves_in_snapshot_build() -> None:
+    """The workspace-scoped build resolution still surfaces the caller's OWN field."""
+    app = _app_with_operator_keys()
+    client_a = TestClient(app)
+    client_a.headers.update({"x-himmy-internal-key": "op-a"})
+
+    up = client_a.post(
+        "/v1/context/fields:upsert",
+        json={
+            "workspace_id": "tenant-a",
+            "subject_id": "bob@corp.com",
+            "fields": [{"key": "tier", "value": "gold"}],
+        },
+    )
+    assert up.status_code == 200, up.text
+
+    snap = client_a.post(
+        "/v1/context/snapshots:build",
+        json={
+            "workspace_id": "tenant-a",
+            "subject_id": "bob@corp.com",
+            "build_spec": {"keys": [{"key": "tier", "required": True}]},
+        },
+    )
+    assert snap.status_code == 200, snap.text
+    body = snap.json()
+    assert body["fields"].get("tier", {}).get("value") == "gold"
+    assert "tier" not in body["missing_required_keys"]
+
+
 def test_cross_tenant_eval_run_is_invisible() -> None:
     """T1.1 acceptance: a cross-workspace GET of an eval run is 404 (was a leak)."""
     client_a = _client_as("key-a")

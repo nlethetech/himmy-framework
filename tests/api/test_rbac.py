@@ -499,6 +499,18 @@ _GLOBAL_STORE_READS = [
     "/api/studio/google/gmail",
     "/api/studio/google/calendar",
     "/api/studio/google/auth-url",
+    # red-team reattack-r1: four more process-wide operator singletons (no tenant axis)
+    # that the r1/r2/r6 sweep missed — now withheld from browse roles (admin-only):
+    #   * missions registry (list + by-id IDOR + SSE stream leaked other tenants' prompts)
+    #   * notify ring (other tenants' routine/mission/project run-output previews)
+    #   * kb-upload documents (twin of the withheld studio.knowledge singleton)
+    #   * telegram listener status (operator config metadata)
+    "/api/studio/missions",
+    "/api/studio/missions/anyid",
+    "/api/studio/missions/anyid/stream",
+    "/api/studio/notify",
+    "/api/studio/kb/anyid/documents",
+    "/api/studio/telegram/status",
 ]
 
 

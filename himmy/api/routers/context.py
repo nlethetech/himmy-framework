@@ -109,6 +109,13 @@ async def build_snapshot(
     Object-level (BOLA, WS-bola): a ``subject_scoped`` principal may only build a snapshot
     for its OWN ``subject_id`` (403 otherwise via :func:`enforce_subject_write`) — a no-op
     for offline / ``all_tenants`` / ``tenant_admin`` callers.
+
+    Tenant isolation (red-team reattack-r1): the resolved ``workspace_id`` is also threaded
+    into field RESOLUTION, so a STORAGE-sourced field stamped with a DIFFERENT workspace is
+    never surfaced in the snapshot — closing the cross-tenant IDOR where two tenants sharing
+    a free-form ``subject_id`` could read each other's stored ``context_fields`` (the store
+    is keyed globally by ``(subject_id, key)``). ``workspace_id`` of ``None`` (offline /
+    all-tenants) keeps resolution byte-for-byte unchanged.
     """
     workspace_id = resolve_workspace(request, body.workspace_id)
     enforce_subject_write(request, body.subject_id)
@@ -122,6 +129,7 @@ async def build_snapshot(
             task_id=body.task_id,
             build_spec=body.build_spec,
             metadata=metadata or None,
+            workspace_id=workspace_id,
         ),
     )
 
