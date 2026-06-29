@@ -112,6 +112,71 @@ def test_get_report_by_id() -> None:
     assert got.json()["report_id"] == rid
 
 
+# ------------------------------------------------- red-team reattack-r4: cross-tenant IDOR
+def test_list_does_not_leak_other_tenants_reports() -> None:
+    """A 't'-bound auditor's trend NEVER includes a report run for tenant 'other'.
+
+    Regression for the cross-tenant IDOR where the read paths called
+    ``resolve_workspace`` but discarded the result and returned the GLOBAL ``trend()`` —
+    leaking every other tenant's report (its stamped ``workspace_id`` + the affected
+    ``subject_refs``). ``trend()`` is now tenant-scoped at the root.
+    """
+    client = _app()
+    # The all-tenant admin runs an audit scoped to a foreign tenant 'other'.
+    foreign = client.post(
+        "/v1/audit/privacy?workspace_id=other",
+        headers={"x-himmy-internal-key": "admin"},
+    )
+    assert foreign.status_code == 200, foreign.text
+    foreign_id = foreign.json()["report"]["report_id"]
+
+    # The 't'-bound auditor's own run (so its trend is non-empty for the right reason).
+    own = client.post(
+        "/v1/audit/privacy?workspace_id=t", headers={"x-himmy-internal-key": "auditor"}
+    )
+    own_id = own.json()["report"]["report_id"]
+
+    trend = client.get(
+        "/v1/audit/privacy?workspace_id=t", headers={"x-himmy-internal-key": "auditor"}
+    )
+    assert trend.status_code == 200
+    ids = {r["report_id"] for r in trend.json()}
+    assert own_id in ids
+    assert foreign_id not in ids, "cross-tenant report leaked into 't' auditor's trend"
+
+
+def test_get_by_id_foreign_report_is_404() -> None:
+    """Fetching a foreign tenant's report by id is a clean 404 (no existence leak)."""
+    client = _app()
+    foreign = client.post(
+        "/v1/audit/privacy?workspace_id=other",
+        headers={"x-himmy-internal-key": "admin"},
+    )
+    foreign_id = foreign.json()["report"]["report_id"]
+    got = client.get(
+        f"/v1/audit/privacy/{foreign_id}?workspace_id=t",
+        headers={"x-himmy-internal-key": "auditor"},
+    )
+    assert got.status_code == 404
+
+
+def test_admin_all_tenants_still_sees_every_report() -> None:
+    """INVARIANT: an all-tenants principal keeps the full, unfiltered posture trend."""
+    client = _app()
+    a = client.post(
+        "/v1/audit/privacy?workspace_id=t", headers={"x-himmy-internal-key": "auditor"}
+    )
+    b = client.post(
+        "/v1/audit/privacy?workspace_id=other",
+        headers={"x-himmy-internal-key": "admin"},
+    )
+    a_id, b_id = a.json()["report"]["report_id"], b.json()["report"]["report_id"]
+    trend = client.get("/v1/audit/privacy", headers={"x-himmy-internal-key": "admin"})
+    assert trend.status_code == 200
+    ids = {r["report_id"] for r in trend.json()}
+    assert {a_id, b_id} <= ids
+
+
 # --------------------------------------------------------------- bundle (503 / union)
 def test_run_with_bundle_503_without_key(monkeypatch: Any) -> None:
     """Requesting a per-report bundle with no signing key configured ⇒ 503."""

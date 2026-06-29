@@ -428,16 +428,18 @@ def test_readonly_studio_role_can_read(studio_cwd: Path) -> None:
     """A default read-only role (``viewer``) can browse Studio read surfaces.
 
     red-team r6: ``connections`` is now an operator-only surface (withheld from default
-    browse roles — see :data:`_STUDIO_GLOBAL_STORE_RESOURCES`), so the browse-readable
-    examples here are ``health`` (console baseline) + ``mcp/servers`` (a granted surface).
+    browse roles — see :data:`_STUDIO_GLOBAL_STORE_RESOURCES`). red-team reattack-r4 moved
+    ``mcp`` into that withheld set too (process-wide MCP registry, no tenant axis), so the
+    browse-readable examples here are ``health`` (console baseline) + ``runs`` (a genuinely
+    tenant-filterable, granted surface).
     """
     c, _ = _studio_client("viewer")
     assert c.get("/api/studio/health").status_code == 200
-    assert c.get("/api/studio/mcp/servers").status_code == 200
+    assert c.get("/api/studio/runs").status_code == 200
 
 
 def test_readonly_studio_role_is_403_on_mcp_mutation(studio_cwd: Path) -> None:
-    """``viewer`` holds ``studio.mcp:read`` but NOT ``studio.mcp:manage`` → 403."""
+    """``viewer`` holds neither ``studio.mcp:read`` (reattack-r4) nor ``:manage`` → 403."""
     c, _ = _studio_client("viewer")
     body = {"name": "srv", "command": "echo"}
     assert c.post("/api/studio/mcp/servers", json=body).status_code == 403
@@ -511,6 +513,17 @@ _GLOBAL_STORE_READS = [
     "/api/studio/notify",
     "/api/studio/kb/anyid/documents",
     "/api/studio/telegram/status",
+    # red-team reattack-r4: two more process-wide operator stores (no tenant axis) missed
+    # by the prior sweep — now withheld from browse roles (admin-only):
+    #   * mcp registry (.himmy/mcp_servers.json): leaked every server's command/args/cwd
+    #     absolute paths, env_keys (operator secret NAMES) and cached tool schemas.
+    #   * approvals/HITL checkpoint store (.himmy/approvals.db): leaked every paused run's
+    #     prompt, agent, pending tool-call names + redacted args and thread preview.
+    "/api/studio/mcp/servers",
+    "/api/studio/mcp/servers/any/tools",
+    "/api/studio/mcp/servers/any/agents",
+    "/api/studio/approvals",
+    "/api/studio/approvals/anyid",
 ]
 
 
@@ -565,9 +578,14 @@ def test_admin_can_mutate_studio(studio_cwd: Path) -> None:
 
 
 def test_auditor_can_read_studio_but_not_mutate(studio_cwd: Path) -> None:
-    """``auditor`` is read-only: ``studio.*:read`` yes, ``:manage`` no."""
+    """``auditor`` is read-only on tenant-filterable surfaces, never mutating.
+
+    reattack-r4: ``mcp`` is now an admin-only process-wide surface, so the read example
+    is ``runs`` (a genuinely tenant-scoped surface). The ``mcp`` write/manage guard still
+    correctly 403s the auditor.
+    """
     c, _ = _studio_client("auditor")
-    assert c.get("/api/studio/mcp/servers").status_code == 200
+    assert c.get("/api/studio/runs").status_code == 200
     body = {"name": "srv", "command": "echo"}
     assert c.post("/api/studio/mcp/servers", json=body).status_code == 403
 

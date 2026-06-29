@@ -48,10 +48,11 @@ _AUTHZ_ONLY_READS: dict[tuple[str, str], str] = {
     ("consent", "get_decision"): "subject-keyed; self-scope enforced",
     ("consent", "get_latest"): "subject-keyed; self-scope enforced",
     ("consent", "get_history"): "subject-keyed; self-scope enforced",
-    # privacy audit reports are a global posture trend, not tenant-keyed;
-    # resolve_workspace enforces access (auditor/admin), not row filtering.
-    ("privacy_audit", "list_privacy_audits"): "reports not tenant-keyed; authz only",
-    ("privacy_audit", "get_privacy_audit"): "reports not tenant-keyed; authz only",
+    # red-team reattack-r4: the privacy_audit list/by-id readers were exempted here as
+    # "reports not tenant-keyed; authz only" — but reports ARE tenant-stamped
+    # (metadata['workspace_id'] + subject_refs), so discarding the resolved workspace was a
+    # cross-tenant IDOR. They now THREAD the resolved workspace into trend(workspace_id=...)
+    # and are caught by the threads_workspace branch above (no exemption needed).
 }
 
 #: Admin-only reads that DELIBERATELY span all workspaces and therefore do not (and

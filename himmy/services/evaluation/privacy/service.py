@@ -432,15 +432,31 @@ class PrivacyAuditService:
         return report.to_record().stable_id
 
     # --------------------------------------------------------------- trend
-    def trend(self, *, limit: int = 20) -> list[PrivacyAuditReport]:
+    def trend(
+        self, *, limit: int = 20, workspace_id: str | None = None
+    ) -> list[PrivacyAuditReport]:
         """Return the most recent registered audit reports, newest first.
 
         Reads every ``privacy_audit_report`` record from the registry and projects each
         back into a (read-only) :class:`PrivacyAuditReport`, ordered by ``created_at``
         descending and capped at ``limit``. This is the CLI/HTTP trend surface — a
         posture-over-time view of the deployment's audits.
+
+        When ``workspace_id`` is provided (a tenant-bound HTTP caller resolved to a single
+        authorized workspace) the trend is tenant-scoped at the ROOT: only reports whose
+        stamped ``metadata['workspace_id']`` is the caller's workspace OR ``None`` (a
+        global/ops report with no tenant axis) are admitted. ``None`` (an all-tenants /
+        offline caller) keeps the full posture trend unchanged — byte-for-byte the legacy
+        behaviour. This closes the cross-tenant IDOR where a tenant-bound auditor read
+        every OTHER tenant's report (its ``workspace_id`` + the affected ``subject_refs``).
         """
         records = self._registry.list_by_kind(PRIVACY_AUDIT_REPORT_KIND)
+        if workspace_id is not None:
+            records = [
+                r
+                for r in records
+                if r.metadata.get("workspace_id") in (None, workspace_id)
+            ]
         records.sort(
             key=lambda r: str(r.metadata.get("created_at") or ""), reverse=True
         )

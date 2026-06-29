@@ -176,6 +176,29 @@ _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
         "studio.notify",
         "studio.kb",
         "studio.telegram",
+        # red-team reattack-r4: two more PROCESS-WIDE operator surfaces of the SAME class
+        # the r1/r2/r6/reattack-r1 sweep was closing — a single cwd-keyed store with NO
+        # per-tenant axis to intersect on, so granting their ``:read`` to a tenant-facing
+        # browse role (viewer/operator/auditor) was a cross-tenant BOLA/IDOR disclosure of
+        # operator infrastructure:
+        #   * ``studio.mcp`` — the process-wide MCP server registry
+        #     (``.himmy/mcp_servers.json`` under :func:`project_root`, no workspace field);
+        #     its ``ServerOut`` readers leaked every registered server's ``command``/``args``/
+        #     ``cwd`` (absolute filesystem paths), ``env_keys`` (the operator's secret NAMES),
+        #     ``prefix`` and cached tool schemas — operator-infrastructure reconnaissance a
+        #     tenant must never see. (Write/manage stay ``studio.mcp:manage`` = admin-only.)
+        #   * ``studio.approvals`` — the process-wide HITL checkpoint store
+        #     (``.himmy/approvals.db`` via :func:`get_checkpoint_store`, single shared
+        #     ``"studio"`` tenant on Postgres, no per-caller partition); its readers leaked
+        #     every paused Studio run's prompt, agent name, pending tool-call names + redacted
+        #     args and a 4-message thread preview across tenants. (Approve/reject/write stay
+        #     ``studio.approvals:write`` = admin-only, so this was disclosure-only.)
+        # Withheld from the default browse roles (admin-only, Studio is a network-isolated
+        # operator console); a deployment that deliberately exposes one to a tenant role can
+        # still grant it explicitly via ``HIMMY_RBAC_FILE``. The OFFLINE path is unaffected —
+        # ``require_permission`` no-ops without an authenticator.
+        "studio.mcp",
+        "studio.approvals",
     }
 )
 
