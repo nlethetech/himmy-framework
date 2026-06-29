@@ -340,9 +340,40 @@ async def _authorize_entity_subgraph(
     return graph
 
 
-def _shape_graph(graph: LineageGraph) -> GraphResponse:
-    """Project a traced graph into the wire shape, node-capped in BFS order."""
-    ids = list(graph.nodes)
+def _node_visible(record: EntityRecord, tenants: frozenset[str] | None) -> bool:
+    """Whether a single graph node may be disclosed to the caller (per-NODE scope-r6).
+
+    The subgraph-level gate (:func:`_authorize_entity_subgraph`) authorizes the WHOLE
+    traced neighborhood on one matching anchor; but a cross-tenant edge can pull a
+    foreign-tenant record into that neighborhood, whose label/kind would then leak. This
+    per-node check closes that: for a tenant-bound caller (``tenants`` is a set) a node is
+    visible only when its OWN owning workspace is in the allow-list — a node carrying NO
+    workspace stamp is allowed (it predates tenant binding / belongs to no tenant, matching
+    the by-id ``authorize_studio_object`` ``None``-is-allowed convention), and any node
+    stamped to a workspace OUTSIDE the allow-list is dropped. For an unrestricted principal
+    (``tenants is None``) every node is visible — byte-unchanged.
+    """
+    if tenants is None:
+        return True
+    ws = _record_workspace(record)
+    return ws is None or ws in tenants
+
+
+def _shape_graph(
+    graph: LineageGraph, tenants: frozenset[str] | None = None
+) -> GraphResponse:
+    """Project a traced graph into the wire shape, node-capped in BFS order.
+
+    ``tenants`` (red-team scope-r6) is the caller's :func:`studio_tenant_filter` allow-list:
+    ``None`` (unrestricted / offline) keeps every node — byte-unchanged — while a set drops
+    any node stamped to a workspace outside it, so a cross-tenant edge cannot disclose a
+    foreign record's kind/label even though the subgraph as a whole was anchor-authorized.
+    """
+    ids = [
+        rid
+        for rid, rec in graph.nodes.items()
+        if _node_visible(rec, tenants)
+    ]
     pruned = len(ids) > MAX_GRAPH_NODES
     keep = set(ids[:MAX_GRAPH_NODES])
     nodes = [
@@ -373,19 +404,32 @@ def _shape_graph(graph: LineageGraph) -> GraphResponse:
 
 
 async def _link_summaries(
-    registry: Any, links: list[Any], *, other_side: str
+    registry: Any,
+    links: list[Any],
+    *,
+    other_side: str,
+    tenants: frozenset[str] | None = None,
 ) -> list[LinkSummary]:
-    """Summarise incident links, resolving the far record for display."""
+    """Summarise incident links, resolving the far record for display.
+
+    ``tenants`` (red-team scope-r6) is the caller's :func:`studio_tenant_filter` allow-list.
+    When set (a tenant-bound caller), a far-side record stamped to a workspace OUTSIDE the
+    allow-list has its kind/label WITHHELD (the link is still listed by id + relation, but
+    the foreign record's content is not disclosed) — closing the cross-tenant edge that let
+    a caller read the label of a record it was never authorized for. ``None`` (unrestricted /
+    offline) discloses every far record — byte-unchanged.
+    """
     out: list[LinkSummary] = []
     for link in links[:_MAX_DETAIL_LINKS]:
         other_id = getattr(link, other_side)
         other = await _maybe_await(registry.get(other_id))
+        disclose = other is not None and _node_visible(other, tenants)
         out.append(
             LinkSummary(
                 relation=link.relation,
                 other_id=other_id,
-                other_kind=other.kind if other is not None else None,
-                other_label=_label_of(other) if other is not None else None,
+                other_kind=other.kind if disclose else None,
+                other_label=_label_of(other) if disclose else None,
             )
         )
     return out
@@ -435,7 +479,9 @@ async def lineage_graph(
         raise HTTPException(
             status_code=404, detail="the traced entity has no lineage records"
         )
-    return _shape_graph(graph)
+    # Per-node tenant scope (scope-r6): drop any cross-tenant node a wide trace pulled in,
+    # so a cross-tenant edge cannot disclose a foreign record's kind/label. NO-OP offline.
+    return _shape_graph(graph, studio_tenant_filter(request))
 
 
 @router.get(
@@ -467,6 +513,10 @@ async def lineage_entity(
     )
     links_in = await _maybe_await(registry.links_to(record.record_id))
     links_out = await _maybe_await(registry.links_from(record.record_id))
+    # Per-link tenant scope (scope-r6): withhold a far-side record's kind/label when it is
+    # stamped to a workspace outside the caller's allow-list, so a cross-tenant edge can't
+    # disclose a foreign record's label. NO-OP for an unrestricted principal (filter None).
+    tenants = studio_tenant_filter(request)
     return EntityDetail(
         id=record.record_id,
         stable_id=record.stable_id,
@@ -477,10 +527,10 @@ async def lineage_entity(
         payload=_bounded(record.payload),
         metadata=_bounded(record.metadata),
         links_in=await _link_summaries(
-            registry, list(links_in), other_side="from_record_id"
+            registry, list(links_in), other_side="from_record_id", tenants=tenants
         ),
         links_out=await _link_summaries(
-            registry, list(links_out), other_side="to_record_id"
+            registry, list(links_out), other_side="to_record_id", tenants=tenants
         ),
     )
 

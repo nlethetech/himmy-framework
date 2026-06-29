@@ -15,6 +15,20 @@ empty ledgers (the screen renders its empty state) and the destructive ``/erase`
 is 404-inert, mirroring :mod:`himmy.api.routers.consent`. Audit export/verify only
 need a signing key (``HIMMY_AUDIT_PRIVATE_KEY`` / ``HIMMY_AUDIT_SECRET``) — without
 one they answer a clear 503, never an import error.
+
+Tenant scoping (red-team scope-r6). ``studio.privacy:read`` is withheld to admin-only,
+but a TENANT-BOUND ``admin`` key (``roles:["admin"], tenant_ids:["A"], all_tenants:false``)
+holds it — so the subjects/consents readers MUST refuse cross-tenant rows, not trust the
+admin-only gate. The governance spine is a single process-wide store shared across tenants;
+its consent records carry a ``metadata['workspace_id']`` stamp (the tenant that recorded
+them). Every read here intersects each record's owning workspace against the caller's
+:func:`~himmy.api.auth.context.studio_tenant_filter` allow-list via :func:`_visible_records`
+— **failing closed** (dropping the row) for a tenant-bound caller when a record carries no
+workspace stamp, so an unstamped governance row can never leak across tenants. The
+``/subjects`` and ``/consents`` readers, the per-subject footprint counters, and the audit
+bundle's evidence set all route through this one choke point, so a new privacy read cannot
+forget the filter. Every check is a strict NO-OP for an unrestricted (``all_tenants`` /
+offline) principal (filter ``None``), so the single-box path is byte-unchanged.
 """
 
 from __future__ import annotations
@@ -24,7 +38,7 @@ from typing import Any
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
 
-from himmy.api.auth import get_principal
+from himmy.api.auth import get_principal, studio_tenant_filter
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.api.security_audit import audit_event
 from himmy.core.ids import utc_now_iso
@@ -99,21 +113,59 @@ def _subject_of(record: Any) -> str | None:
     return str(subject) if subject else None
 
 
-def _tombstones_by_subject(registry: Any) -> dict[str, list[Any]]:
-    """Erasure tombstones grouped by subject id."""
+def _record_workspace(record: Any) -> str | None:
+    """The owning ``workspace_id`` stamped on a governance record, or ``None``.
+
+    Checks the record's own ``metadata['workspace_id']`` first (consent records are
+    stamped there by :meth:`ConsentLedger.set`), then a ``payload['workspace_id']``
+    fallback. ``None`` means the record carries no tenant stamp (an erasure tombstone,
+    a legacy/global consent, or an unstamped data record) — a tenant-bound caller treats
+    that as out-of-scope (fail closed).
+    """
+    stamped = record.metadata.get("workspace_id")
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    payload_ws = record.payload.get("workspace_id")
+    if isinstance(payload_ws, str) and payload_ws:
+        return payload_ws
+    return None
+
+
+def _visible_records(request: Request, records: Any) -> list[Any]:
+    """Narrow ``records`` to the caller's tenant allow-list (the scope-r6 choke point).
+
+    The single tenant-isolation gate every privacy read routes through. Intersects each
+    record's owning :func:`_record_workspace` against the caller's
+    :func:`~himmy.api.auth.context.studio_tenant_filter`:
+
+    * an unrestricted principal (offline / ``all_tenants`` / trusted shared key) gets the
+      filter ``None`` ⇒ the list is returned UNCHANGED — so the zero-config / single-box
+      path is byte-unchanged; and
+    * a tenant-bound principal sees only records whose stamped workspace is in its
+      allow-list — **failing closed** (dropping the row) when a record carries no workspace
+      stamp, so an unstamped cross-tenant governance row can never leak.
+    """
+    allowed = studio_tenant_filter(request)
+    if allowed is None:
+        return list(records)
+    return [r for r in records if _record_workspace(r) in allowed]
+
+
+def _tombstones_by_subject(request: Request, registry: Any) -> dict[str, list[Any]]:
+    """Erasure tombstones grouped by subject id (tenant-scoped)."""
     out: dict[str, list[Any]] = {}
-    for record in registry.list_by_kind(ERASURE_KIND):
+    for record in _visible_records(request, registry.list_by_kind(ERASURE_KIND)):
         subject = _subject_of(record)
         if subject:
             out.setdefault(subject, []).append(record)
     return out
 
 
-def _data_record_counts(registry: Any) -> dict[str, int]:
-    """How many subject-bearing spine records each subject owns."""
+def _data_record_counts(request: Request, registry: Any) -> dict[str, int]:
+    """How many subject-bearing spine records each subject owns (tenant-scoped)."""
     counts: dict[str, int] = {}
     for kind in _SUBJECT_KINDS:
-        for record in registry.list_by_kind(kind):
+        for record in _visible_records(request, registry.list_by_kind(kind)):
             subject = _subject_of(record)
             if subject:
                 counts[subject] = counts.get(subject, 0) + 1
@@ -150,7 +202,7 @@ async def list_subjects(request: Request) -> SubjectsResponse:
     consent_count: dict[str, int] = {}
     purposes: dict[str, set[str]] = {}
     last_seen: dict[str, str] = {}
-    for record in registry.list_by_kind(CONSENT_KIND):
+    for record in _visible_records(request, registry.list_by_kind(CONSENT_KIND)):
         subject = _subject_of(record)
         if not subject:
             continue
@@ -162,14 +214,14 @@ async def list_subjects(request: Request) -> SubjectsResponse:
         if recorded and recorded > last_seen.get(subject, ""):
             last_seen[subject] = recorded
 
-    tombstones = _tombstones_by_subject(registry)
+    tombstones = _tombstones_by_subject(request, registry)
     for subject, stones in tombstones.items():
         for stone in stones:
             erased_at = str(stone.payload.get("erased_at") or "")
             if erased_at and erased_at > last_seen.get(subject, ""):
                 last_seen[subject] = erased_at
 
-    data_counts = _data_record_counts(registry)
+    data_counts = _data_record_counts(request, registry)
     all_subjects = sorted(set(consent_count) | set(tombstones) | set(data_counts))[
         :_MAX_SUBJECTS
     ]
@@ -225,7 +277,7 @@ async def list_consents(
     policy = getattr(request.app.state, "consent_policy", None)
 
     items: list[ConsentEntry] = []
-    for record in registry.list_by_kind(CONSENT_KIND):
+    for record in _visible_records(request, registry.list_by_kind(CONSENT_KIND)):
         sid = _subject_of(record)
         if not sid or (subject and sid != subject):
             continue
@@ -299,10 +351,11 @@ async def erase_subject(body: EraseRequest, request: Request) -> EraseResponse:
     subject = body.subject_id
 
     has_consents = any(
-        _subject_of(r) == subject for r in registry.list_by_kind(CONSENT_KIND)
+        _subject_of(r) == subject
+        for r in _visible_records(request, registry.list_by_kind(CONSENT_KIND))
     )
-    data_records = _data_record_counts(registry).get(subject, 0)
-    already_erased = subject in _tombstones_by_subject(registry)
+    data_records = _data_record_counts(request, registry).get(subject, 0)
+    already_erased = subject in _tombstones_by_subject(request, registry)
     if not has_consents and data_records == 0 and not already_erased:
         raise HTTPException(
             status_code=404, detail=f"no data recorded for subject {subject!r}"
@@ -316,7 +369,7 @@ async def erase_subject(body: EraseRequest, request: Request) -> EraseResponse:
     )
 
     # The freshest tombstone is the proof of THIS erasure.
-    stones = _tombstones_by_subject(registry).get(subject, [])
+    stones = _tombstones_by_subject(request, registry).get(subject, [])
     latest = max(
         stones, key=lambda s: str(s.payload.get("erased_at") or ""), default=None
     )

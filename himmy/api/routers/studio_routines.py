@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from himmy.api import routines as svc
 from himmy.api.auth import authorize_studio_object, scoped_read
+from himmy.api.auth.service_principal import require_no_capability_amplification
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("routines", tag="studio-routines")
@@ -176,8 +177,19 @@ async def list_routines() -> list[RoutineView]:
 
 
 @router.post("", response_model=RoutineView, dependencies=[_routines_write])
-async def create_routine(body: RoutineCreate) -> RoutineView:
-    """Create a routine. The agent path must resolve inside the project root."""
+async def create_routine(body: RoutineCreate, request: Request) -> RoutineView:
+    """Create a routine. The agent path must resolve inside the project root.
+
+    Capability-amplification gate (scope-r6): a routine fires under the FIXED operator
+    SERVICE identity (``tool:*``) regardless of the creator's roles, so a caller granted
+    ``studio.routines:write`` but NOT the broad tool reach the routine would exercise is
+    refused (403) — mirroring the ``/v1`` routines twin and the Studio missions router. A
+    strict NO-OP for the offline / ``all_tenants`` principal, so the single-box arm path is
+    byte-unchanged.
+    """
+    require_no_capability_amplification(
+        request, resource="routine", action="create"
+    )
     _validate_agent_path(body.agent_path)
     routine = svc.Routine(
         name=body.name,
@@ -211,7 +223,14 @@ async def update_routine(
 
     BOLA-gated: a tenant-bound principal may only mutate a routine in a workspace it is
     entitled to (:func:`_load_owned_routine`); a foreign row is a 404, never mutated.
+
+    Capability-amplification gated (scope-r6): re-pointing/re-prompting a routine re-arms an
+    autonomous run under the operator SERVICE identity (``tool:*``), so a caller lacking that
+    broad tool reach is refused (403), mirroring the ``/v1`` twin. NO-OP offline.
     """
+    require_no_capability_amplification(
+        request, resource="routine", action="update"
+    )
     store = svc.get_routines_store()
     routine = _load_owned_routine(request, routine_id)
     patch = body.model_dump(exclude_unset=True)
@@ -254,7 +273,15 @@ async def run_now(routine_id: str, request: Request) -> RoutineView:
 
     BOLA-gated: a tenant-bound principal may only fire a routine in a workspace it is
     entitled to (:func:`_load_owned_routine`); a foreign row is a 404, never executed.
+
+    Capability-amplification gated (scope-r6): the fire executes the agent's tools under the
+    operator SERVICE identity (``tool:*``), so a caller lacking that broad tool reach is
+    refused (403) — closing the confused-deputy the ``/v1`` ``run-now`` twin already refuses.
+    NO-OP for the offline / ``all_tenants`` principal, byte-unchanged.
     """
+    require_no_capability_amplification(
+        request, resource="routine", action="run_now"
+    )
     _load_owned_routine(request, routine_id)
     try:
         routine = await svc.get_scheduler().run_now(routine_id)

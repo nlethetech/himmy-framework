@@ -52,6 +52,7 @@ from himmy.api.auth import (
     enforce_subject_write,
     get_principal,
     narrow_subject,
+    resolve_workspace,
     scoped_read,
     studio_subject_filter,
     studio_tenant_filter,
@@ -305,6 +306,26 @@ def _canonical_storage(request: Request) -> Any | None:
     return getattr(container, "storage", None) if container is not None else None
 
 
+def _run_owner(request: Request) -> tuple[str | None, str | None]:
+    """The (workspace_id, subject_id) a Studio run should be STAMPED with (scope-r6).
+
+    Mirrors :func:`himmy.api.routers.studio_missions.start_mission`: an interactive Studio
+    chat / deep-research run is attributed to the LAUNCHING tenant + data subject derived
+    from the verified principal — never the global ``__local__`` bucket
+    :func:`studio_run_to_record` would otherwise default to. Without this, a real
+    subject-scoped user's interactive run was stamped ``subject='__local__'`` and pooled
+    into the cross-subject ``__local__`` slice every other subject-scoped reader of the
+    tenant can see (an alternate-surface BOLA the ``/v1`` narrow-subject path forbids).
+
+    Both are ``None`` for an unrestricted offline / ``all_tenants`` caller — leaving the run
+    unowned (``__local__``), so the zero-config single-box path is byte-unchanged.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return None, None
+    return resolve_workspace(request, None), principal.subject
+
+
 async def _authorize_run(request: Request, run_id: str) -> bool:
     """May this request's principal read run ``run_id`` (BOLA gate for by-id readers)?
 
@@ -384,6 +405,7 @@ async def run(body: RunRequest, request: Request) -> StreamingResponse:
     from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
     tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    owner_workspace, owner_subject = _run_owner(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
@@ -396,6 +418,8 @@ async def run(body: RunRequest, request: Request) -> StreamingResponse:
                     model=body.model,
                     agent_path=body.agent_path,
                     canonical_storage=canonical,
+                    owner_workspace_id=owner_workspace,
+                    owner_subject_id=owner_subject,
                 ):
                     yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - surface as a terminal error frame
@@ -519,6 +543,7 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
     from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
     tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    owner_workspace, owner_subject = _run_owner(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
@@ -530,6 +555,8 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
                     model=body.model,
                     agent_path="(deep-research)",
                     canonical_storage=canonical,
+                    owner_workspace_id=owner_workspace,
+                    owner_subject_id=owner_subject,
                 ):
                     yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
