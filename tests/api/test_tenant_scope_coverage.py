@@ -182,7 +182,6 @@ _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
         "/api/studio/google/gmail",
         "/api/studio/benchmarks",
         "/api/studio/guardrails",
-        "/api/studio/learning",
         # Studio project-local SPEC reads (off the filesystem, not tenant data objects)
         "/api/studio/agents",
         "/api/studio/agent",
@@ -327,6 +326,24 @@ def test_studio_runs_surface_is_detected_as_scoped() -> None:
     for path in ("/api/studio/runs", "/api/studio/runs/{run_id}"):
         assert path in routes, f"expected {path} present"
         assert _route_is_scoped(routes[path]), f"{path} should be a scoped reader"
+
+
+def test_studio_learning_surface_is_detected_as_scoped() -> None:
+    """Regression: ``/api/studio/learning`` is detected as a scoped reader, not exempt.
+
+    The learning report read scopes via ``_panel_workspace`` / ``resolve_workspace`` (a
+    tenant only reads its own learned reputation), so it carries the ``scoped_read`` marker
+    and must NOT sit on ``_GLOBAL_NOT_TENANT_KEYED`` (whose rationale — "no tenant
+    dimension" — is false for this route). This pins the correct classification.
+    """
+    routes = {path: route for path, route in _get_read_routes()}
+    assert "/api/studio/learning" in routes, "expected /api/studio/learning present"
+    assert _route_is_scoped(routes["/api/studio/learning"]), (
+        "/api/studio/learning is tenant-scoped (resolve_workspace) and must carry the "
+        "scoped_read marker, not be exempted as global"
+    )
+    # And it is no longer hiding on the global-not-tenant-keyed allow-list.
+    assert "/api/studio/learning" not in _GLOBAL_NOT_TENANT_KEYED
 
 
 def test_gate_flags_a_deliberately_unscoped_studio_route() -> None:
