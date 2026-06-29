@@ -26,6 +26,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only when the API se
 
 from himmy.api.auth.base import AuthError
 from himmy.api.auth.principal import ANONYMOUS, Principal
+from himmy.config.flags import env_truthy
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.api.auth.base import Authenticator
@@ -41,12 +42,7 @@ def is_multi_tenant() -> bool:
     ANY non-empty auth mode (incl. the ``apikey`` example in values.yaml) engages
     strictness. Default (no env) is single-box, byte-unchanged.
     """
-    if os.environ.get("HIMMY_MULTI_TENANT", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
+    if env_truthy("HIMMY_MULTI_TENANT"):
         return True
     return os.environ.get("HIMMY_AUTH_MODE", "").lower() not in ("", "none")
 

@@ -26,12 +26,12 @@ two load-bearing invariants are preserved BY CONSTRUCTION:
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, Request
 
 from himmy.api.auth import require_permission
+from himmy.config.flags import env_falsy
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Awaitable, Callable
@@ -52,12 +52,12 @@ def _studio_auth_off() -> bool:
     DANGEROUS (re-opens the operator console to any authenticated principal); refused
     at startup under a multi-tenant posture.
     """
-    return os.environ.get("HIMMY_STUDIO_AUTH", "on").lower() in (
-        "off",
-        "0",
-        "false",
-        "no",
-    )
+    # ``HIMMY_STUDIO_AUTH`` is an ON/OFF switch defaulting to ON: Studio guards are
+    # active unless the operator EXPLICITLY disables them. We fail-closed on unknown
+    # tokens — only the canonical falsy spellings disable auth; an unset var or any
+    # unrecognised value keeps guards on. :func:`himmy.config.flags.env_falsy` is the
+    # one shared reader so this "off?" test can never diverge from the startup refusal.
+    return env_falsy("HIMMY_STUDIO_AUTH")
 
 
 def studio_permission(

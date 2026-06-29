@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING
 
 from himmy.api.auth.base import AuthError, client_ip
 from himmy.api.auth.principal import Principal
+from himmy.config.flags import env_truthy
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from fastapi import Request
@@ -80,8 +81,13 @@ REVOCATION_FAIL_CLOSED_ENV = "HIMMY_API_KEY_REVOCATION_FAIL_CLOSED"
 
 
 def _env_truthy(name: str) -> bool:
-    """Whether env var ``name`` is set to a truthy value (1/true/yes/on)."""
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    """Whether env var ``name`` is set to a truthy value (1/true/yes/on/y).
+
+    Thin alias over the canonical :func:`himmy.config.flags.env_truthy` so this
+    module's fail-closed switch (``HIMMY_API_KEY_REVOCATION_FAIL_CLOSED``) shares the
+    one accepted truthy vocabulary with every other posture flag.
+    """
+    return env_truthy(name)
 
 
 #: Default roles a DEMOTED shared key receives under the multi-tenant posture (G1).

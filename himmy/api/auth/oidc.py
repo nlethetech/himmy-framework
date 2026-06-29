@@ -214,6 +214,8 @@ class OidcAuthenticator:
         """Build from ``HIMMY_OIDC_*`` env vars (JWKS fetched + cached from the IdP)."""
         import os
 
+        from himmy.config.flags import env_truthy
+
         issuer = os.environ.get("HIMMY_OIDC_ISSUER")
         audience = os.environ.get("HIMMY_OIDC_AUDIENCE")
         if not issuer or not audience:
@@ -248,10 +250,7 @@ class OidcAuthenticator:
             all_tenants_roles=admin_roles,
             # Opt-in per-subject (BOLA) isolation under OIDC — default OFF (workspace is
             # the trust boundary, mirroring the documented model + the mapped-key path).
-            subject_scoped=(
-                os.environ.get("HIMMY_OIDC_SUBJECT_SCOPED", "").strip().lower()
-                in ("1", "true", "yes", "on")
-            ),
+            subject_scoped=env_truthy("HIMMY_OIDC_SUBJECT_SCOPED"),
         )
 
     def openapi_security_scheme(self) -> dict[str, dict[str, object]]:

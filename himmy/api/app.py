@@ -167,9 +167,8 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
     keys-file-only deploy that also flips one of those kill-switches would silently skip
     them (a fail-open the env-flag-only detector missed).
     """
-    import os
-
     from himmy.api.auth import build_access_policy, is_multi_tenant
+    from himmy.config.flags import env_falsy, env_truthy
 
     binds_tenants = bool(getattr(authenticator, "binds_tenants", False))
     if not (is_multi_tenant() or binds_tenants):
@@ -183,18 +182,20 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
             "auth (HIMMY_API_KEYS_FILE with per-tenant keys, or HIMMY_AUTH_MODE=oidc)."
         )
     # Use the SAME truthy vocabulary as the consuming sanitizers / authenticator
-    # (apikey._env_truthy, spec_sanitizer._truthy) so a posture kill-switch can never be
+    # (apikey._env_truthy, spec_sanitizer._truthy) — all now route through
+    # himmy.config.flags.env_truthy — so a posture kill-switch can never be
     # half-honored: a value like ``on`` that enables the dangerous opt-in downstream MUST
     # also trip the startup refusal here. Diverging the detector from the consumer
     # silently fails the guard open (it accepts ``on`` but the refusal misses it).
-    truthy = ("1", "true", "yes", "on")
     # Studio is a network-isolated OPERATOR console (lineage, privacy, governance,
     # raw run inspection) — never a tenant-facing surface. ``HIMMY_STUDIO_AUTH=off``
     # is its auth kill-switch (intended only for a trusted single-user box); under a
     # multi-tenant posture it would re-open every Studio surface to any authenticated
     # principal, regardless of role. Refuse to start: the operator console MUST stay
-    # behind ``studio:use`` when callers are mutually-untrusted tenants.
-    if os.environ.get("HIMMY_STUDIO_AUTH", "on").lower() in ("off", "0", "false", "no"):
+    # behind ``studio:use`` when callers are mutually-untrusted tenants. The off-switch
+    # uses the canonical falsy reader (env_falsy) so this refusal and the runtime
+    # ``_studio_auth_off`` reader recognise exactly the same off tokens.
+    if env_falsy("HIMMY_STUDIO_AUTH"):
         raise HimmyError(
             "refusing to start: HIMMY_STUDIO_AUTH is disabled under a multi-tenant "
             "posture — that kill-switch re-opens the Studio operator console (lineage, "
@@ -202,13 +203,13 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
             "instead of gating it behind the studio:use permission. Remove it for a "
             "multi-tenant deployment; Studio is a network-isolated operator surface."
         )
-    if os.environ.get("HIMMY_ALLOW_UNAUTHENTICATED", "").lower() in truthy:
+    if env_truthy("HIMMY_ALLOW_UNAUTHENTICATED"):
         raise HimmyError(
             "refusing to start: HIMMY_ALLOW_UNAUTHENTICATED is set under a "
             "multi-tenant posture — that override would re-expose the ANONYMOUS "
             "all-tenants admin surface. Remove it for a multi-tenant deployment."
         )
-    if os.environ.get("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "").lower() in truthy:
+    if env_truthy("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS"):
         raise HimmyError(
             "refusing to start: HIMMY_ALLOW_OPERATOR_SPEC_TOOLS is set under a "
             "multi-tenant posture — that override un-fail-closes the RCE/SSRF spec "
@@ -238,17 +239,16 @@ def _enforce_auth_posture(authenticator: object | None, bind_host: str) -> None:
     off-loopback shortcut below — so a shared-key-only deploy (which would otherwise
     satisfy ``authenticator is not None`` and return early) is still refused.
     """
-    import os
+    from himmy.config.flags import env_truthy
 
     _enforce_multi_tenant_posture(authenticator)
 
     if authenticator is not None or _is_loopback_host(bind_host):
         return
-    opt_in = os.environ.get("HIMMY_ALLOW_UNAUTHENTICATED", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    # Canonical truthy parse: the same vocabulary the multi-tenant refusal uses for this
+    # exact flag, so ``HIMMY_ALLOW_UNAUTHENTICATED=on`` cannot be honored in one check
+    # and ignored in the other (the prior ad-hoc tuple here omitted ``on``).
+    opt_in = env_truthy("HIMMY_ALLOW_UNAUTHENTICATED")
     if opt_in:
         logger.warning(
             "binding to non-loopback host %r with NO authenticator configured: the "

@@ -35,10 +35,10 @@ only bites once an authenticator (and thus a tenant boundary) is configured.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 
 from himmy.config.agent_spec import AgentSpec
+from himmy.config.flags import env_truthy
 from himmy.core.errors import HimmyError
 
 #: The RCE/SSRF/process-spawn fields a tenant spec must never carry. ``tools_module`` =
@@ -112,8 +112,13 @@ class SanitizationResult:
 
 
 def _truthy(name: str) -> bool:
-    """Whether an env flag is set to a truthy value (1/true/yes/on)."""
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    """Whether an env flag is set to a truthy value (1/true/yes/on/y).
+
+    Thin alias over the canonical :func:`himmy.config.flags.env_truthy` so the
+    RCE/SSRF fail-closed switches (``HIMMY_ALLOW_OPERATOR_SPEC_TOOLS``,
+    ``HIMMY_SANITIZE_SPEC_STRIP``) share the one truthy vocabulary.
+    """
+    return env_truthy(name)
 
 
 def operator_specs_allowed() -> bool:

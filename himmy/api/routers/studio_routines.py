@@ -238,8 +238,12 @@ async def run_now(routine_id: str) -> RoutineView:
 
 
 def _scheduler_enabled() -> bool:
-    raw = os.environ.get("HIMMY_ROUTINES_SCHEDULER", "on").lower()
-    return raw not in ("off", "0", "false", "no")
+    from himmy.config.flags import env_falsy
+
+    # Default-ON off-switch: enabled unless an explicit falsy token disables it. Shares
+    # the canonical falsy vocabulary (env_falsy) with HIMMY_STUDIO_AUTH so a typo can
+    # never silently disable it.
+    return not env_falsy("HIMMY_ROUTINES_SCHEDULER")
 
 
 #: Module-scoped leadership lease + failover watchdog for the FastAPI-hosted scheduler.
@@ -269,10 +273,9 @@ async def _start_scheduler() -> None:
         import asyncio
 
         from himmy.api.scheduler_leader import acquire_scheduler_leadership
+        from himmy.config.flags import env_truthy
 
-        require_ack = os.environ.get(
-            "HIMMY_SCHEDULER_REQUIRE_ACK", ""
-        ).strip().lower() in ("1", "true", "yes", "on")
+        require_ack = env_truthy("HIMMY_SCHEDULER_REQUIRE_ACK")
         leadership = await acquire_scheduler_leadership(
             container, require_single_scheduler_ack=require_ack
         )
