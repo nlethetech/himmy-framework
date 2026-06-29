@@ -41,6 +41,7 @@ from himmy.api.auth import (
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import NOT_FOUND_RESPONSE
 from himmy.api.security_audit import audit_event
@@ -52,7 +53,9 @@ from himmy.application.services import (
 )
 from himmy.services.storage.models import RunRecord
 
-router = APIRouter(prefix="/v1/threads", tags=["threads"])
+router = APIRouter(
+    prefix="/v1/threads", tags=["threads"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("run", "read"))]
 _WRITE = [Depends(require_permission("run", "write"))]

@@ -49,6 +49,7 @@ from himmy.api import (
 from himmy.api.auth import (
     authorize_studio_object,
     get_principal,
+    scoped_read,
     studio_tenant_filter,
 )
 from himmy.api.routers.studio_common import studio_permission
@@ -533,7 +534,10 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
 @router.get(
     "/runs",
     response_model=StudioRunListResponse,
-    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
 )
 async def list_runs(
     request: Request, limit: int = 50, offset: int = 0
@@ -574,7 +578,10 @@ async def list_runs(
 @router.get(
     "/runs/analytics",
     response_model=RunAnalytics,
-    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
 )
 async def runs_analytics(request: Request) -> RunAnalytics:
     """Aggregate cost/token/latency stats across runs (the analytics dashboard).
@@ -596,7 +603,10 @@ async def runs_analytics(request: Request) -> RunAnalytics:
 @router.get(
     "/runs/{run_id}",
     response_model=StudioRun,
-    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
 )
 async def get_run(run_id: str, request: Request) -> StudioRun:
     """Fetch one run in full from the canonical store: transcript, tools, timeline.
@@ -663,7 +673,10 @@ async def set_run_feedback(
 @router.get(
     "/runs/{run_id}/feedback",
     response_model=RunFeedback | None,
-    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
 )
 async def get_run_feedback(run_id: str, request: Request) -> RunFeedback | None:
     """Current feedback on a run (latest verdict), or ``null`` if none yet."""
@@ -1757,7 +1770,10 @@ async def workflow_run(body: WorkflowRunRequest, request: Request) -> Any:
 
 @router.get(
     "/runs/{run_id}/lineage",
-    dependencies=[Depends(studio_permission(_RES_RUNS, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
 )
 async def run_lineage(run_id: str, request: Request) -> Any:
     from himmy.api import studio_lineage

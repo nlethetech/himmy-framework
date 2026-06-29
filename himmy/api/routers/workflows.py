@@ -35,13 +35,16 @@ from himmy.api.auth import (
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import NOT_FOUND_RESPONSE
 from himmy.api.security_audit import audit_event
 from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.services.storage.models import RunRecord
 
-router = APIRouter(prefix="/v1/workflows", tags=["workflows"])
+router = APIRouter(
+    prefix="/v1/workflows", tags=["workflows"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("run", "read"))]
 _WRITE = [Depends(require_permission("run", "write"))]

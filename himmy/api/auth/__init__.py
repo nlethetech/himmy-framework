@@ -33,6 +33,7 @@ from himmy.api.auth.rbac import (
     policy_source,
     require_permission,
 )
+from himmy.api.auth.scope_marker import scoped_read
 from himmy.api.auth.service_principal import (
     connector_service_principal,
     routine_service_principal,
@@ -55,6 +56,7 @@ __all__ = [
     "enforce_subject_write",
     "studio_tenant_filter",
     "authorize_studio_object",
+    "scoped_read",
     "AccessPolicy",
     "DEFAULT_POLICY",
     "build_access_policy",

@@ -6,12 +6,19 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from himmy.api.auth import authorize_object, require_permission, require_workspace
+from himmy.api.auth import (
+    authorize_object,
+    require_permission,
+    require_workspace,
+    scoped_read,
+)
 from himmy.api.models import DashboardSummary
 
 _READ = [Depends(require_permission("dashboard", "read"))]
 
-router = APIRouter(prefix="/v1/dashboard", tags=["dashboard"])
+router = APIRouter(
+    prefix="/v1/dashboard", tags=["dashboard"], dependencies=[Depends(scoped_read)]
+)
 
 
 def _container(request: Request) -> Any:

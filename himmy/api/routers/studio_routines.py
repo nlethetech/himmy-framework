@@ -20,10 +20,14 @@ from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from himmy.api import routines as svc
-from himmy.api.auth import authorize_studio_object
+from himmy.api.auth import authorize_studio_object, scoped_read
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("routines", tag="studio-routines")
+# Every routine read is tenant-scoped (LIST pinned to ``__local__``; by-id gated by
+# ``authorize_studio_object``), so stamp the router as a scoped reader for the whole-app
+# tenant-scope coverage gate. A no-op marker; the real scoping is the handlers above.
+router.dependencies.append(Depends(scoped_read))
 
 #: Creating/editing/deleting/firing a routine schedules an autonomous agent run — a
 #: privileged mutation gated by ``studio.routines:write`` (admin-only by default),

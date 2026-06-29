@@ -17,6 +17,7 @@ from himmy.api.auth import (
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import NOT_FOUND_RESPONSE, UpsertResult
 from himmy.services.context.models import (
@@ -25,7 +26,9 @@ from himmy.services.context.models import (
     ContextSnapshot,
 )
 
-router = APIRouter(prefix="/v1/context", tags=["context"])
+router = APIRouter(
+    prefix="/v1/context", tags=["context"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("context", "read"))]
 _WRITE = [Depends(require_permission("context", "write"))]

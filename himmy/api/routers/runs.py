@@ -21,6 +21,7 @@ from himmy.api.auth import (
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
@@ -37,7 +38,9 @@ from himmy.application.services import (
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import RunRecord, RunStatus
 
-router = APIRouter(prefix="/v1/runs", tags=["runs"])
+router = APIRouter(
+    prefix="/v1/runs", tags=["runs"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("run", "read"))]
 _WRITE = [Depends(require_permission("run", "write"))]

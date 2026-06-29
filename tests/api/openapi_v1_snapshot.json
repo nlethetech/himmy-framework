@@ -4527,7 +4527,7 @@
     },
     "/v1/audit/privacy": {
       "get": {
-        "description": "Return the posture trend: registered audit reports newest-first (auditor/admin).\n\n``workspace_id`` is resolved against the principal (tenant scoping) so a multi-tenant\nprincipal must name an authorized workspace, like the rest of the BFF; reports are not\nthemselves tenant-keyed, so this enforces access, not filtering.",
+        "description": "Return the posture trend: registered audit reports newest-first (auditor/admin).\n\n``workspace_id`` is resolved against the principal (tenant scoping) and the resolved\nworkspace is pushed into ``trend()`` so a tenant-bound caller sees ONLY its own\nworkspace's reports (plus global/ops reports with no ``workspace_id``) \u2014 never another\ntenant's report, its stamped workspace or the affected ``subject_refs`` (closes the\ncross-tenant IDOR). An all-tenants / offline principal resolves to ``None`` and keeps\nthe full posture trend, byte-for-byte unchanged.",
         "operationId": "list_privacy_audits_v1_audit_privacy_get",
         "parameters": [
           {
@@ -4671,7 +4671,7 @@
     },
     "/v1/audit/privacy/{report_id}": {
       "get": {
-        "description": "Return one registered audit report by id, or 404 (auditor/admin).",
+        "description": "Return one registered audit report by id, or 404 (auditor/admin).\n\nThe lookup is tenant-scoped: ``trend()`` is filtered to the caller's resolved\nworkspace, so a foreign ``report_id`` (another tenant's report) is a clean **404** with\nno existence leak \u2014 never the foreign report's workspace or ``subject_refs``. An\nall-tenants / offline principal resolves to ``None`` and may read any report by id.",
         "operationId": "get_privacy_audit_v1_audit_privacy__report_id__get",
         "parameters": [
           {
@@ -5326,7 +5326,7 @@
     },
     "/v1/context/snapshots:build": {
       "post": {
-        "description": "Build, persist, and return a context snapshot (stamping workspace scope).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal may only build a snapshot\nfor its OWN ``subject_id`` (403 otherwise via :func:`enforce_subject_write`) \u2014 a no-op\nfor offline / ``all_tenants`` / ``tenant_admin`` callers.",
+        "description": "Build, persist, and return a context snapshot (stamping workspace scope).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal may only build a snapshot\nfor its OWN ``subject_id`` (403 otherwise via :func:`enforce_subject_write`) \u2014 a no-op\nfor offline / ``all_tenants`` / ``tenant_admin`` callers.\n\nTenant isolation (red-team reattack-r1): the resolved ``workspace_id`` is also threaded\ninto field RESOLUTION, so a STORAGE-sourced field stamped with a DIFFERENT workspace is\nnever surfaced in the snapshot \u2014 closing the cross-tenant IDOR where two tenants sharing\na free-form ``subject_id`` could read each other's stored ``context_fields`` (the store\nis keyed globally by ``(subject_id, key)``). ``workspace_id`` of ``None`` (offline /\nall-tenants) keeps resolution byte-for-byte unchanged.",
         "operationId": "build_snapshot_v1_context_snapshots_build_post",
         "requestBody": {
           "content": {
@@ -5368,7 +5368,7 @@
     },
     "/v1/dashboard/summary": {
       "get": {
-        "description": "Return the operator overview: context + run/recommendation/eval counts.",
+        "description": "Return the operator overview: context + run/recommendation/eval counts.\n\nObject-level (BOLA, WS-bola): the summary aggregates a single data subject's\ncontext/run/recommendation counts, so a ``subject_scoped`` principal requesting ANOTHER\ndata subject's aggregate within its own tenant gets a clean 404 (never an\nexistence-confirming response) \u2014 :func:`authorize_object` is a no-op for offline /\n``all_tenants`` / ``tenant_admin`` callers, so the zero-config path is byte-unchanged.",
         "operationId": "dashboard_summary_v1_dashboard_summary_get",
         "parameters": [
           {
@@ -6015,7 +6015,7 @@
     },
     "/v1/recommendations": {
       "get": {
-        "description": "List recommendations (created_at desc), paginated into an envelope (AAEO-8).",
+        "description": "List recommendations (created_at desc), paginated into an envelope (AAEO-8).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal's list is pinned to its\nOWN subject via :func:`narrow_subject` (a ``tenant_admin`` and every non-subject-scoped\n/ offline / ``all_tenants`` caller keep the caller-supplied filter), so a subject-scoped\ntenant can never enumerate another data subject's subject-attributed recommendations\nwithin a shared workspace \u2014 mirroring the runs router. No-op for the zero-config path.",
         "operationId": "list_recommendations_v1_recommendations_get",
         "parameters": [
           {
@@ -6152,7 +6152,7 @@
     },
     "/v1/recommendations/{recommendation_id}": {
       "patch": {
-        "description": "Transition a recommendation's status (404 when unknown/out-of-workspace).",
+        "description": "Transition a recommendation's status (404 when unknown/out-of-workspace).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal that targets a\nrecommendation attributed to ANOTHER data subject within its own tenant gets a clean\n404 (never a mutation, never an existence-confirming 403) \u2014 the workspace scope is\nchecked first, then the recommendation's ``subject_id`` is gated via\n:func:`authorize_object`. No-op for offline / ``all_tenants`` / ``tenant_admin``.",
         "operationId": "update_recommendation_v1_recommendations__recommendation_id__patch",
         "parameters": [
           {
@@ -6231,7 +6231,7 @@
     },
     "/v1/recommendations/{recommendation_id}/provenance": {
       "get": {
-        "description": "Trace a recommendation back to its run, persona, prompt, and cited evidence.\n\nReturns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.\n404 when the recommendation is unknown / out-of-workspace or was never graphed.",
+        "description": "Trace a recommendation back to its run, persona, prompt, and cited evidence.\n\nReturns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.\n404 when the recommendation is unknown / out-of-workspace or was never graphed.\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal that requests the\nprovenance subgraph (persona/prompt/cited-evidence) of a recommendation attributed to\nANOTHER data subject within its own tenant gets a clean 404 \u2014 the recommendation's\n``subject_id`` is resolved and gated via :func:`authorize_object` before any lineage is\ntraced. No-op for offline / ``all_tenants`` / ``tenant_admin`` callers.",
         "operationId": "get_recommendation_provenance_v1_recommendations__recommendation_id__provenance_get",
         "parameters": [
           {

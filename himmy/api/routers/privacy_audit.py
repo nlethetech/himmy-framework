@@ -28,11 +28,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from himmy.api.auth import require_permission, resolve_workspace
+from himmy.api.auth import require_permission, resolve_workspace, scoped_read
 from himmy.entities.integrity import AuditBundle
 from himmy.services.evaluation.privacy import PrivacyAuditReport
 
-router = APIRouter(prefix="/v1/audit/privacy", tags=["audit"])
+router = APIRouter(
+    prefix="/v1/audit/privacy", tags=["audit"], dependencies=[Depends(scoped_read)]
+)
 
 _AUDIT_READ = [Depends(require_permission("audit", "read"))]
 _AUDIT_RUN = [Depends(require_permission("audit", "run"))]

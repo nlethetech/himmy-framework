@@ -17,6 +17,7 @@ from himmy.api.auth import (
     narrow_subject,
     require_permission,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
@@ -26,7 +27,11 @@ from himmy.application.services import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import RecommendationItem, RecommendationStatus
 
-router = APIRouter(prefix="/v1/recommendations", tags=["recommendations"])
+router = APIRouter(
+    prefix="/v1/recommendations",
+    tags=["recommendations"],
+    dependencies=[Depends(scoped_read)],
+)
 
 _READ = [Depends(require_permission("recommendation", "read"))]
 _WRITE = [Depends(require_permission("recommendation", "write"))]
