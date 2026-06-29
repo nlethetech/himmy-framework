@@ -32,6 +32,7 @@ from himmy.api.auth.context import (
     get_principal,
     resolve_workspace,
 )
+from himmy.api.auth.service_principal import require_no_capability_amplification
 from himmy.api.missions import (
     STEER_TEXT_MAX,
     Mission,
@@ -169,7 +170,15 @@ async def start_mission(body: MissionStartRequest, request: Request) -> dict[str
     principal (``resolve_workspace`` / ``get_principal``), never from the request body, so a
     later read can be scoped to it. Both are ``None`` for an unrestricted offline /
     ``all_tenants`` caller, leaving the mission unowned and visible to all — byte-unchanged.
+
+    Capability-amplification gate (scope-r4): a mission's tools run under the operator
+    SERVICE identity (``tool:*``), so a caller granted ``studio.missions:write`` but NOT the
+    broad tool reach the mission would exercise is refused (403) — mirroring the routines
+    arm-and-fire gate. NO-OP offline (unrestricted principal), byte-unchanged.
     """
+    require_no_capability_amplification(
+        request, resource="mission", action="start"
+    )
     registry = _registry(request)
     principal = get_principal(request)
     owner_workspace = None if principal.all_tenants else resolve_workspace(request, None)
@@ -252,6 +261,13 @@ async def steer_mission(
     mission_id: str, body: SteerRequest, request: Request
 ) -> MissionView:
     """Queue guidance the loop injects as a USER message before its next turn."""
+    # Steering re-drives the mission's agent loop (which executes tools under the operator
+    # service identity), so it carries the same capability-amplification gate as start
+    # (scope-r4): a least-privilege ``studio.missions:write`` caller cannot redirect a
+    # mission into broader tool authority than it holds. NO-OP offline.
+    require_no_capability_amplification(
+        request, resource="mission", action="steer"
+    )
     _owned_or_404(request, mission_id)  # cross-scope mission is an opaque 404
     try:
         mission = await _registry(request).steer(mission_id, body.text)

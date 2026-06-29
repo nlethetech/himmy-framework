@@ -730,6 +730,8 @@ async def stream_agent_run(
     plan_mode: bool = False,
     canonical_storage: Any | None = None,
     extra_metadata: dict[str, Any] | None = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_id: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run an agent for one user turn, yielding GUI events.
 
@@ -762,6 +764,14 @@ async def stream_agent_run(
     studio.db`` is then just a presentation cache. The canonical write happens on
     THIS (main) event loop after the worker-thread studio.db write returns; we never
     nest a loop inside ``to_thread`` (an asyncpg pool is bound to its creating loop).
+
+    ``owner_workspace_id`` / ``owner_subject_id`` (scope-r4) stamp the canonical
+    :class:`RunRecord` with the LAUNCHING tenant + data subject. They are threaded by the
+    callers that resolve a real owner from a verified principal (e.g. a background Mission
+    started by a tenant-bound caller) so the run lands in that tenant/subject's partition —
+    not the global ``__local__`` bucket :func:`studio_run_to_record` defaults to. ``None``
+    (the offline / interactive single-box default) keeps the byte-unchanged ``__local__``
+    stamping, so the zero-config path is untouched.
     """
     history = history or []
     collected_events: list[Any] = []
@@ -960,7 +970,13 @@ async def stream_agent_run(
         )
     except Exception:  # noqa: BLE001 - persistence must never break the stream
         pass
-    await _record_canonical(canonical_storage, built, extra_metadata=extra_metadata)
+    await _record_canonical(
+        canonical_storage,
+        built,
+        extra_metadata=extra_metadata,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_id=owner_subject_id,
+    )
 
     if interrupted:
         # An interrupted (cancelled) consumer must observe the cancellation, not
@@ -1062,6 +1078,8 @@ async def _record_canonical(
     built: Any | None,
     *,
     extra_metadata: dict[str, Any] | None = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_id: str | None = None,
 ) -> None:
     """Mirror a Studio run into the ONE canonical RunRecord store (T2.2, main loop).
 
@@ -1077,13 +1095,28 @@ async def _record_canonical(
     "routine_id": ...}, "source": "routine"}`` here so a scheduled/run-now run is
     attributable to its routine in ``GET /v1/runs`` + ``himmy runs`` + Studio, with the
     same RUN_* lineage every canonical run carries.
+
+    ``owner_workspace_id`` / ``owner_subject_id`` (scope-r4), when supplied, stamp the
+    canonical record's tenant + subject so a run launched by a tenant-bound caller (a
+    background Mission) lands in THAT partition rather than the global ``__local__`` bucket —
+    closing the mis-scoped-write / cross-subject-pooling gap. ``None`` keeps the
+    byte-unchanged ``__local__`` default for the offline / interactive single-box path.
     """
     if canonical_storage is None or built is None:
         return
     try:
-        from himmy.api.studio_canonical import save_canonical_run, studio_run_to_record
+        from himmy.api.studio_canonical import (
+            LOCAL_SUBJECT,
+            LOCAL_WORKSPACE,
+            save_canonical_run,
+            studio_run_to_record,
+        )
 
-        record = studio_run_to_record(built)
+        record = studio_run_to_record(
+            built,
+            workspace_id=owner_workspace_id or LOCAL_WORKSPACE,
+            subject_id=owner_subject_id or LOCAL_SUBJECT,
+        )
         if extra_metadata:
             merged = dict(record.metadata or {})
             merged.update(extra_metadata)

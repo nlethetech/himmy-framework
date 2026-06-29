@@ -3814,21 +3814,36 @@ class DashboardQueryService:
         on a dashboard" story is real.
 
         ``all_tenants`` is the caller principal's cross-tenant flag (True for the
-        offline / admin all-tenants path). It is threaded into the eval-tile scoping so
-        a None-stamped (unstamped) run an ``all_tenants`` caller explicitly asks for stays
-        visible — byte-unchanged zero-config — while a tenant-bound caller gets strict
-        ``== workspace_id`` and never folds another tenant's / an admin run (scope-r3).
+        offline / admin all-tenants path). It is threaded into BOTH the context-tile and
+        eval-tile scoping so a None-stamped (unstamped) field/run an ``all_tenants`` caller
+        explicitly asks for stays visible — byte-unchanged zero-config — while a tenant-bound
+        caller gets strict ``== workspace_id`` and never folds another tenant's / an admin
+        run (scope-r3) or a None-stamped context field for a shared subject (scope-r4).
         """
         all_fields = await self._storage.list_context_fields(subject_id)
-        fields = [
-            f
-            for f in all_fields
-            if (getattr(f, "metadata", {}) or {}).get("workspace_id")
-            in (
-                None,
-                workspace_id,
-            )
-        ]
+        # Scope the context tile exactly like the dedicated reader
+        # ContextAppService.list_fields() and the eval tile (scope-r3): a
+        # TENANT-BOUND caller gets STRICT ``== workspace_id`` so a None-stamped
+        # (unstamped) context field written for this subject by an offline / admin /
+        # other-tenant unstamped path never inflates its aggregate count. Only the
+        # ``all_tenants`` (offline / admin) principal keeps the lenient
+        # ``in (None, workspace_id)`` branch — byte-unchanged zero-config (scope-r4).
+        if all_tenants:
+            fields = [
+                f
+                for f in all_fields
+                if (getattr(f, "metadata", {}) or {}).get("workspace_id")
+                in (
+                    None,
+                    workspace_id,
+                )
+            ]
+        else:
+            fields = [
+                f
+                for f in all_fields
+                if (getattr(f, "metadata", {}) or {}).get("workspace_id") == workspace_id
+            ]
         confidences = [getattr(f, "confidence", 0.0) for f in fields]
         freshness = [
             getattr(f, "freshness_seconds", None)

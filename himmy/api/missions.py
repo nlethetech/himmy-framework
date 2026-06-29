@@ -290,6 +290,12 @@ class MissionRegistry:
                     steer_queue=mission.steer_queue,
                     plan_mode=mission.plan_mode,
                     canonical_storage=resolve_canonical_storage(),
+                    # scope-r4: stamp the canonical RunRecord with the LAUNCHING tenant +
+                    # subject (resolved from the verified principal at start_mission time)
+                    # so the run lands in that partition, not the global ``__local__``
+                    # bucket. ``None`` (offline / unowned) keeps the byte-unchanged default.
+                    owner_workspace_id=mission.workspace_id,
+                    owner_subject_id=mission.subject_id,
                 ):
                     await self._append(mission, frame)
                     ftype = frame.get("type")

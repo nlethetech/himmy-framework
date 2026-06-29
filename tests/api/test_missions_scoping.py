@@ -24,6 +24,10 @@ from himmy.api.auth.apikey import ApiKeyAuthenticator
 from himmy.api.auth.principal import Principal
 from himmy.api.auth.rbac import AccessPolicy
 from himmy.api.missions import Mission, MissionRegistry
+from himmy.api.studio_service import _record_canonical
+from himmy.core.ids import utc_now_iso
+from himmy.services.storage.service import StorageService
+from tests.conftest import run_async
 
 
 @pytest.fixture
@@ -205,6 +209,136 @@ def test_started_mission_is_stamped_with_caller_scope(project: Path) -> None:
     mission = registry.get(r.json()["mission_id"])
     assert mission.workspace_id == "t"
     assert mission.subject_id == "alice"
+
+
+# ------------------------------------------------------ capability amplification (r4)
+
+
+def test_mission_start_blocked_when_caller_lacks_service_tool_reach(
+    project: Path,
+) -> None:
+    """scope-r4: a ``studio.missions:write`` caller WITHOUT ``tool:*`` cannot start a mission.
+
+    A mission's tools run under the operator SERVICE identity (``tool:*``), regardless of the
+    launcher's own tool grants — a confused deputy. A custom RBAC role that grants
+    ``studio.missions:write`` but only a single narrow tool (the least-privilege scenario the
+    routines gate already defends) would amplify the caller's authority. The launch is now
+    refused (403), mirroring the routines arm-and-fire gate. Steering folds the same way.
+    """
+    client, registry = _tenant_app(
+        tenant_ids=["t"],
+        roles=["tenant_ops"],
+        grants={
+            # The custom RBAC file still DEFINES the operator service role (the mission
+            # service identity uses it); tenant_ops simply does not HOLD it.
+            "operator": ["tool:*"],
+            "tenant_ops": [
+                "studio.console:read",
+                "studio.missions:read",
+                "studio.missions:write",
+                "tool:lookup_weather:invoke",
+            ],
+        },
+    )
+    r = client.post(
+        "/api/studio/missions",
+        json={"agent_path": "agent.yaml", "prompt": "exfiltrate", "provider": "stub"},
+    )
+    assert r.status_code == 403, r.text
+    assert "amplification" in r.text
+    # No mission was registered (the gate fires BEFORE start).
+    assert registry.list() == []
+    # Steering a (seeded) mission is gated the same way — the caller cannot redirect a
+    # mission into broader tool authority than it holds.
+    _seed(registry, mid="m", workspace_id="t", subject_id="u", status="running")
+    s = client.post("/api/studio/missions/m/steer", json={"text": "go"})
+    assert s.status_code == 403, s.text
+
+
+def test_mission_start_allowed_when_caller_holds_service_tool_reach(
+    project: Path,
+) -> None:
+    """A caller that DOES hold the operator tool reach the mission runs with may start it.
+
+    The amplification gate is an attenuation check, not a blanket block: an ``operator``
+    (whose ``tool:*`` already covers the service identity's reach) is unaffected — the
+    default-RBAC posture is byte-unchanged.
+    """
+    client, registry = _tenant_app(
+        tenant_ids=["t"],
+        roles=["operator"],
+        grants={
+            "operator": [
+                "studio.console:read",
+                "studio.missions:read",
+                "studio.missions:write",
+                "tool:*",
+            ]
+        },
+    )
+    r = client.post(
+        "/api/studio/missions",
+        json={"agent_path": "agent.yaml", "prompt": "hi", "provider": "stub"},
+    )
+    assert r.status_code == 200, r.text
+    assert len(registry.list()) == 1
+
+
+# ------------------------------------------------ canonical owner stamping (r4)
+
+
+def test_mission_canonical_run_stamped_with_launching_owner() -> None:
+    """scope-r4: a mission's canonical RunRecord lands in the LAUNCHING tenant/subject.
+
+    ``stream_agent_run`` recorded the canonical RunRecord with the ``__local__`` default
+    workspace/subject (``studio_run_to_record``'s defaults), so a tenant-bound caller's
+    mission run persisted into the global ``__local__`` bucket — invisible to the launcher in
+    ``GET /v1/runs`` and pooled under the catch-all ``__local__`` subject. ``_record_canonical``
+    now threads the mission's resolved owner workspace/subject through, so the run is bound to
+    the launcher. ``None`` (offline / interactive single-box) keeps the ``__local__`` default —
+    byte-unchanged.
+    """
+    from himmy.api.studio_runs import StudioRun
+
+    storage = StorageService()
+
+    async def _scenario():
+        built = StudioRun(
+            id="mission-run",
+            created_at=utc_now_iso(),
+            agent_name="helper",
+            status="ok",
+            output="done",
+            prompt="hi",
+        )
+        # The mission seam stamps the resolved owner (tenant t / subject alice).
+        await _record_canonical(
+            storage, built, owner_workspace_id="t", owner_subject_id="alice"
+        )
+        owned = await storage.get_run("mission-run")
+        # Interactive/offline path (no owner) keeps the byte-unchanged __local__ default.
+        offline_built = StudioRun(
+            id="offline-run",
+            created_at=utc_now_iso(),
+            agent_name="helper",
+            status="ok",
+            output="done",
+            prompt="hi",
+        )
+        await _record_canonical(storage, offline_built)
+        offline = await storage.get_run("offline-run")
+        return owned, offline
+
+    owned, offline = run_async(_scenario())
+    # The mission run is attributed to the launching tenant + subject (not __local__).
+    assert owned.workspace_id == "t"
+    assert owned.subject_id == "alice"
+    # It is now visible to the launcher's tenant-scoped run reader.
+    tenant_runs = run_async(storage.list_runs(workspace_id="t", subject_id="alice"))
+    assert {r.run_id for r in tenant_runs} == {"mission-run"}
+    # Offline invariant: unowned runs still land in __local__ (byte-unchanged).
+    assert offline.workspace_id == "__local__"
+    assert offline.subject_id == "__local__"
 
 
 # --------------------------------------------------------------------- offline no-op

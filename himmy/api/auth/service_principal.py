@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from himmy.api.auth.principal import Principal
 from himmy.services.storage.models import LOCAL_WORKSPACE
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
+    from fastapi import Request
+
     from himmy.api.auth.rbac import AccessPolicy
 
 #: The subject stamped on a run launched by an inbound connector delivery.
@@ -131,6 +133,71 @@ def bind_service_authorizer(
         _active_authorizer.reset(token)
 
 
+def require_no_capability_amplification(
+    request: Request,
+    *,
+    resource: str,
+    action: str,
+    service_roles: frozenset[str] = DEFAULT_SERVICE_ROLES,
+) -> None:
+    """Reject an arm-and-fire request whose FIRE-TIME authority would EXCEED the caller's.
+
+    The shared confused-deputy / capability-amplification gate for every side-door that
+    drives an agent under a FIXED service identity (a scheduled routine fire, a background
+    Mission), not under the caller's own gate. Such a run's tools execute under
+    ``service_roles`` (default :data:`DEFAULT_SERVICE_ROLES` ⇒ ``operator`` ⇒ ``tool:*``)
+    regardless of the launcher's roles. Under the shipped :data:`DEFAULT_RBAC` the only
+    holders of the launch permission already hold ``tool:*``, so the service identity never
+    exceeds them. But a CUSTOM ``HIMMY_RBAC_FILE`` can decouple the launch permission (e.g.
+    ``studio.missions:write`` or ``routine:write``) from broad tool reach — then the run
+    would invoke EVERY tool the launcher was never granted (AMPLIFICATION, not attenuation).
+
+    Because the run's tool authority is not creator-derived (no launcher roles are persisted
+    on the mission/routine), we close the gap at the arm-and-fire surface itself: a principal
+    that does not ALREADY hold every (resource, action) grant the service identity holds may
+    not launch (403). The check is computed against the SERVICE identity's actual roles, so
+    it stays correct if :data:`DEFAULT_SERVICE_ROLES` is ever retuned.
+
+    Strict NO-OP on the offline path: with no authenticator the principal is the
+    unrestricted operator (``all_tenants``), so the gate short-circuits and the zero-config
+    launch is byte-unchanged. ``resource`` / ``action`` name the launching surface for the
+    audit trail.
+    """
+    from fastapi import HTTPException
+
+    from himmy.api.auth.context import get_principal
+    from himmy.api.auth.rbac import DEFAULT_POLICY
+    from himmy.api.security_audit import audit_event
+
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return  # offline / unrestricted: RBAC inert, byte-unchanged
+    policy: Any = getattr(request.app.state, "access_policy", None) or DEFAULT_POLICY
+    service_perms: set[tuple[str, str]] = set()
+    for role in service_roles:
+        service_perms |= set(policy.role_permissions.get(role, frozenset()))
+    for svc_resource, svc_action in sorted(service_perms):
+        if not policy.authorize(principal, svc_resource, svc_action):
+            audit_event(
+                request,
+                event_type="authz_denied",
+                outcome="deny",
+                resource=resource,
+                action=action,
+                detail=(
+                    f"{resource} launch denied: caller lacks the "
+                    f"{svc_resource}:{svc_action} authority the run would execute with"
+                ),
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"{resource} denied: it would run with broader authority than "
+                    "you hold (capability amplification)"
+                ),
+            )
+
+
 __all__ = [
     "CONNECTOR_SERVICE_SUBJECT",
     "ROUTINE_SERVICE_SUBJECT",
@@ -138,4 +205,5 @@ __all__ = [
     "connector_service_principal",
     "routine_service_principal",
     "bind_service_authorizer",
+    "require_no_capability_amplification",
 ]
