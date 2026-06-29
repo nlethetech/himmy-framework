@@ -330,6 +330,11 @@ def test_tenant_bound_studio_routine_reader_cannot_cross_tenants(
     row (prompt, agent binding, provider/model, last run preview/error) by id. The by-id
     readers now intersect the routine's owning ``workspace_id`` against the caller's tenants
     via ``authorize_studio_object`` and fold a foreign row into a uniform 404.
+
+    reattack-r7: ``studio.routines:read`` is no longer a default browse grant (it was
+    withheld to admin-only via ``_STUDIO_GLOBAL_STORE_RESOURCES``), so this test binds a
+    role explicitly granted that read — otherwise the router guard would 403 before the
+    by-id BOLA filter ran, masking the behaviour under test (the BOLA 404 PAST the guard).
     """
     from himmy.api import routines as svc
 
@@ -354,9 +359,12 @@ def test_tenant_bound_studio_routine_reader_cannot_cross_tenants(
         app.state.authenticator = ApiKeyAuthenticator(
             key_principals={
                 "k": Principal.build(
-                    "u", tenant_ids=["t"], roles=["viewer"], auth_method="apikey"
+                    "u", tenant_ids=["t"], roles=["rt_reader"], auth_method="apikey"
                 )
             }
+        )
+        app.state.access_policy = AccessPolicy.from_mapping(
+            {"rt_reader": ["studio.console:read", "studio.routines:read"]}
         )
         c = _client_with_key(app)
         # The granted reader is 404 (not 200, not 403) on the cross-tenant routine by id.
@@ -398,6 +406,120 @@ def test_offline_studio_routine_reader_unchanged(
     finally:
         svc.reset_routines_store()
         svc.reset_scheduler()
+
+
+def test_studio_routines_list_withheld_from_browse_roles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reattack-r7: GET /api/studio/routines (LIST) is admin-only, not browse.
+
+    The LIST endpoint hard-scopes to the ``__local__`` workspace and has NO
+    ``authorize_studio_object`` / ``studio_tenant_filter`` gate (unlike the by-id paths),
+    so it returned EVERY operator-local routine's ``agent_path`` (server filesystem path),
+    ``prompt``, provider/model and ``last_preview`` (run output) to any tenant-facing browse
+    role. ``studio.routines`` is now in ``_STUDIO_GLOBAL_STORE_RESOURCES`` (single-user-local
+    store with no per-tenant axis to intersect on), so ``studio.routines:read`` drops out of
+    the default browse roles → 403 for viewer/operator/auditor; admin still reads it.
+    """
+    from himmy.api import routines as svc
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HIMMY_ROUTINES_PATH", str(tmp_path / "routines.db"))
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "off")
+    svc.reset_routines_store()
+    svc.reset_scheduler()
+    try:
+        # Seed an operator-local routine carrying infrastructure recon (agent_path/prompt).
+        local = svc.Routine(
+            name="ops-secret",
+            agent_path="/srv/operator/secret-agent.yaml",
+            prompt="the operator's private routine prompt",
+            schedule=svc.Schedule(kind="every", hours=6),
+            workspace_id=svc.LOCAL_WORKSPACE,
+        )
+        svc.get_routines_store().upsert(local)
+
+        for role in ("viewer", "operator", "auditor"):
+            c = _client_with_key(_app_with_key(role))
+            assert c.get("/api/studio/routines").status_code == 403, role
+        # admin (``*:*``) still lists, and the local row is visible to it.
+        ca = _client_with_key(_app_with_key("admin"))
+        resp = ca.get("/api/studio/routines")
+        assert resp.status_code == 200
+        assert any(r["agent_path"] == "/srv/operator/secret-agent.yaml" for r in resp.json())
+        # A deployment can still opt a role back in via an explicit policy grant.
+        app = _app_with_policy(
+            "rt_reader", ["studio.console:read", "studio.routines:read"]
+        )
+        assert _client_with_key(app).get("/api/studio/routines").status_code == 200
+    finally:
+        svc.reset_routines_store()
+        svc.reset_scheduler()
+
+
+def test_studio_routines_list_offline_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INVARIANT: offline / no-auth Studio lists local routines byte-unchanged."""
+    from himmy.api import routines as svc
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HIMMY_ROUTINES_PATH", str(tmp_path / "routines.db"))
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "off")
+    svc.reset_routines_store()
+    svc.reset_scheduler()
+    try:
+        local = svc.Routine(
+            name="r",
+            agent_path="/srv/x.yaml",
+            prompt="p",
+            schedule=svc.Schedule(kind="every", hours=6),
+            workspace_id=svc.LOCAL_WORKSPACE,
+        )
+        svc.get_routines_store().upsert(local)
+        c = TestClient(create_app(ApiContainer.build_default()))
+        resp = c.get("/api/studio/routines")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 1
+    finally:
+        svc.reset_routines_store()
+        svc.reset_scheduler()
+
+
+def test_studio_eval_suites_withheld_from_browse_roles() -> None:
+    """reattack-r7: GET /api/studio/eval/suites (LIST) is admin-only, not browse.
+
+    ``list_suites`` enumerates the operator's local filesystem eval-suite NAMES and PATHS
+    (``RunnableSuite.path``/``source``), operator-local FS reconnaissance. ``studio.eval`` is
+    now withheld from the default browse roles (in ``_STUDIO_GLOBAL_STORE_RESOURCES``), so a
+    viewer/operator/auditor is 403; admin still reads it.
+    """
+    for role in ("viewer", "operator", "auditor"):
+        c = _client_with_key(_app_with_key(role))
+        assert c.get("/api/studio/eval/suites").status_code == 403, role
+    ca = _client_with_key(_app_with_key("admin"))
+    assert ca.get("/api/studio/eval/suites").status_code == 200
+    # OFFLINE (no authenticator) reads it byte-unchanged.
+    offline = TestClient(create_app(ApiContainer.build_default()))
+    assert offline.get("/api/studio/eval/suites").status_code == 200
+
+
+def test_studio_benchmarks_withheld_from_browse_roles() -> None:
+    """reattack-r7: GET /api/studio/benchmarks raised to ``studio.console:write`` (admin).
+
+    Consistency with its operator-topology siblings (``/doctor``, ``/benchmarks/probe``)
+    raised in r6: a tenant browse role holding only ``studio.console:read`` is 403, while
+    admin (and the benign per-model accuracy/latency summary via the model catalog under
+    ``studio.modelcatalog:read``) is unaffected.
+    """
+    for role in ("viewer", "operator", "auditor"):
+        c = _client_with_key(_app_with_key(role))
+        assert c.get("/api/studio/benchmarks").status_code == 403, role
+    ca = _client_with_key(_app_with_key("admin"))
+    assert ca.get("/api/studio/benchmarks").status_code == 200
+    # OFFLINE (no authenticator) reads it byte-unchanged.
+    offline = TestClient(create_app(ApiContainer.build_default()))
+    assert offline.get("/api/studio/benchmarks").status_code == 200
 
 
 def test_escape_hatch_disables_studio_rbac(monkeypatch: pytest.MonkeyPatch) -> None:

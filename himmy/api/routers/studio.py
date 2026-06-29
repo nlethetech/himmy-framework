@@ -180,9 +180,26 @@ async def doctor() -> dict[str, Any]:
     return collect_doctor_report().to_dict()
 
 
-@router.get("/benchmarks")
+@router.get(
+    "/benchmarks",
+    dependencies=[Depends(studio_permission(_RES_CONSOLE, "write"))],
+)
 async def benchmarks() -> dict[str, Any]:
-    """Cached per-model reliability scorecards (from `himmy bench` / the probe)."""
+    """Cached per-model reliability scorecards (from `himmy bench` / the probe).
+
+    red-team reattack-r7: this returns the raw cached scorecards
+    (``studio_bench.list_cached()``) — finer-grained operator-topology reliability detail
+    (``model_id``, ``suite``, run timestamp, accuracy CIs, tool-call accuracy, p50/p95
+    latency, error rate, trial counts) about the deployment's LOCAL models. Its
+    operator-topology siblings on this router (``GET /doctor`` and ``POST
+    /benchmarks/probe``) were raised to ``studio.console:write`` (admin-only) in r6 to keep
+    deployment reconnaissance away from tenant browse roles, but this read was left at the
+    ``studio.console:read`` baseline. Raised to ``studio.console:write`` for consistency so
+    a tenant browse role is 403'd here too. (The BENIGN per-model accuracy/latency summary
+    a tenant model picker needs stays tenant-readable via ``GET /api/studio/models`` ->
+    ``build_model_catalog``, gated by the separate ``studio.modelcatalog:read``.) OFFLINE is
+    unaffected (``studio_permission`` no-ops without an authenticator).
+    """
     from himmy.api import studio_bench
 
     return {"entries": studio_bench.list_cached()}

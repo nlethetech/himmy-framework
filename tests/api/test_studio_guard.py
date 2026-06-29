@@ -57,3 +57,36 @@ def test_guard_disabled_via_env(tmp_path, monkeypatch) -> None:
         ).status_code
         == 200
     )
+
+
+@pytest.mark.parametrize("token", ["off", "OFF", "no", "n", "false", "0"])
+def test_guard_disabled_via_canonical_falsy_tokens(tmp_path, monkeypatch, token) -> None:
+    """reattack-r7: HIMMY_STUDIO_GUARD routes through the canonical falsy parser.
+
+    The prior ad-hoc tuple ``("0","false","no")`` omitted the canonical ``off``/``n``
+    tokens, so ``HIMMY_STUDIO_GUARD=off`` silently kept the guard ON — a posture-vocabulary
+    divergence from the sibling ``HIMMY_STUDIO_AUTH`` switch. Every canonical falsy spelling
+    must now disable the guard (the non-loopback Host that is otherwise 403'd is allowed).
+    """
+    monkeypatch.setenv("HIMMY_STUDIO_GUARD", token)
+    monkeypatch.chdir(tmp_path)
+    c = TestClient(create_app())
+    assert (
+        c.get(
+            "/api/studio/connections", headers={"host": "evil.example.com"}
+        ).status_code
+        == 200
+    )
+
+
+def test_guard_stays_on_for_unrecognised_token(tmp_path, monkeypatch) -> None:
+    """An unrecognised value (typo) must keep the default-ON guard active (fail-closed)."""
+    monkeypatch.setenv("HIMMY_STUDIO_GUARD", "of")  # typo for 'off'
+    monkeypatch.chdir(tmp_path)
+    c = TestClient(create_app())
+    assert (
+        c.get(
+            "/api/studio/connections", headers={"host": "evil.example.com"}
+        ).status_code
+        == 403
+    )

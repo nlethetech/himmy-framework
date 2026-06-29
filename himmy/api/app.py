@@ -1056,7 +1056,14 @@ def _install_studio_guard(app: FastAPI) -> None:
     """
     import os
 
-    if os.environ.get("HIMMY_STUDIO_GUARD", "1").lower() in ("0", "false", "no"):
+    from himmy.config.flags import env_falsy
+
+    # red-team reattack-r7: this default-ON DNS-rebinding/CSRF kill-switch must share the
+    # canonical falsy vocabulary so ``HIMMY_STUDIO_GUARD=off``/``=n`` is honored exactly like
+    # the sibling ``HIMMY_STUDIO_AUTH`` switch (the prior ad-hoc ``("0","false","no")`` tuple
+    # silently kept the guard ON for those tokens — a posture-vocabulary divergence the
+    # flags module exists to prevent). Unset/unrecognised keeps the guard ON (fail-closed).
+    if env_falsy("HIMMY_STUDIO_GUARD"):
         return
     # "testserver" is Starlette's TestClient default Host. Browsers cannot forge a
     # Host header via fetch (it's a forbidden header), so allowing it opens no hole

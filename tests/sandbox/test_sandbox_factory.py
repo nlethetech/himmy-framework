@@ -145,6 +145,23 @@ def test_require_sandbox_env_refuses_subprocess(monkeypatch) -> None:
     assert isinstance(build_sandbox("container"), ContainerSandbox)
 
 
+def test_require_sandbox_env_honors_canonical_truthy_tokens(monkeypatch) -> None:
+    """reattack-r7: HIMMY_REQUIRE_SANDBOX routes through the canonical truthy parser.
+
+    The prior ad-hoc tuple ``("1","true","yes","on")`` omitted the ``y`` shorthand the
+    canonical ``TRUTHY_TOKENS`` honors, so ``HIMMY_REQUIRE_SANDBOX=y`` was silently treated
+    as OFF — a fail-OPEN divergence from operator intent on the non-server CLI path. Every
+    canonical truthy spelling must now opt a non-server caller into the hardened posture.
+    """
+    for token in ("y", "Y", "on", "ON", " yes "):
+        monkeypatch.setenv("HIMMY_REQUIRE_SANDBOX", token)
+        with pytest.raises(HimmyError):
+            build_sandbox("subprocess")
+    # And an unrecognised token stays OFF (subprocess allowed on the dev/CLI path).
+    monkeypatch.setenv("HIMMY_REQUIRE_SANDBOX", "maybe")
+    assert isinstance(build_sandbox("subprocess"), SubprocessSandbox)
+
+
 def test_dev_default_subprocess_unchanged(monkeypatch) -> None:
     """The dev/CLI default (no server context, no env) keeps the subprocess backend."""
     monkeypatch.delenv("HIMMY_REQUIRE_SANDBOX", raising=False)

@@ -226,6 +226,35 @@ _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
         # resource (see :data:`STUDIO_READ_RESOURCES`). The OFFLINE path is unaffected
         # (``require_permission`` no-ops without an authenticator).
         "studio.models",
+        # red-team reattack-r7: two more SINGLE-USER-LOCAL operator surfaces of the SAME
+        # class the r1/r4/r6 sweep was closing — a process-wide store hard-scoped to the
+        # operator's ``__local__`` workspace with NO per-tenant axis the Studio list can
+        # intersect on, so granting their ``:read`` to a tenant-facing browse role
+        # (viewer/operator/auditor — the roles a mapped API key binds) was a cross-boundary
+        # disclosure of operator infrastructure:
+        #   * ``studio.routines`` — the routines store (``.himmy/routines.db``). The Studio
+        #     LIST (GET /api/studio/routines -> list_routines) hard-codes
+        #     ``workspace_id=LOCAL_WORKSPACE`` and has NO ``studio_tenant_filter`` /
+        #     ``authorize_studio_object`` gate (unlike the by-id paths, which 404 a foreign
+        #     ``__local__`` row), so it returned EVERY operator-local routine's ``name``,
+        #     ``agent_path`` (an absolute server filesystem path = infrastructure recon),
+        #     ``prompt``, ``provider``/``model``, ``last_status``/``last_error`` and
+        #     ``last_preview`` (up to 400 chars of the routine RUN OUTPUT). The list cannot
+        #     intersect on a tenant axis (it is hard-scoped to ``__local__``), so the fix is
+        #     to withhold the resource rather than retrofit a filter. (Write/manage stay
+        #     ``studio.routines:write`` = admin, so this was disclosure-only.)
+        #   * ``studio.eval`` — the eval-suite discovery surface (GET /api/studio/eval/suites
+        #     -> list_suites). ``discover_suites()`` enumerates the operator's local
+        #     filesystem eval-suite NAMES and PATHS (``RunnableSuite.path``/``source`` =
+        #     absolute/project paths), the same operator-local FS reconnaissance class.
+        #     (Run/write stay ``studio.eval:write`` = admin, so this was disclosure-only.)
+        # Withheld from the default browse roles (admin-only, Studio is a network-isolated
+        # operator console); a deployment that deliberately exposes one to a tenant role can
+        # still grant ``studio.routines:read`` / ``studio.eval:read`` explicitly via
+        # ``HIMMY_RBAC_FILE``. The OFFLINE path is unaffected — ``require_permission``
+        # no-ops without an authenticator.
+        "studio.routines",
+        "studio.eval",
     }
 )
 

@@ -27,9 +27,9 @@ backend at startup and raises a clear :class:`HimmyError` if the runtime is unav
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
+from himmy.config.flags import env_truthy
 from himmy.core.errors import HimmyError
 from himmy.services.sandbox.models import SandboxResult
 
@@ -76,12 +76,11 @@ def _require_hardened_backend(*, server_context: bool) -> bool:
     """
     if server_context:
         return True
-    return os.environ.get("HIMMY_REQUIRE_SANDBOX", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    # red-team reattack-r7: route through the canonical truthy reader so this opt-in shares
+    # the posture vocabulary (``HIMMY_REQUIRE_SANDBOX=y`` is now honored, where the prior
+    # ad-hoc ``("1","true","yes","on")`` tuple treated it as off and failed OPEN vs operator
+    # intent on the CLI path). The server surface already returns True above unconditionally.
+    return env_truthy("HIMMY_REQUIRE_SANDBOX")
 
 
 def _verify_runtime_requested() -> bool:
@@ -92,12 +91,9 @@ def _verify_runtime_requested() -> bool:
     recommended production setting so a misconfigured deployment (e.g. ``gvisor`` without
     ``runsc``, or ``firecracker`` without KVM) fails to start instead of on first run.
     """
-    return os.environ.get("HIMMY_SANDBOX_VERIFY_RUNTIME", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    # red-team reattack-r7: route through the canonical truthy reader so this shares the
+    # posture vocabulary (``=y`` is now honored, where the prior ad-hoc tuple ignored it).
+    return env_truthy("HIMMY_SANDBOX_VERIFY_RUNTIME")
 
 
 def build_sandbox(
