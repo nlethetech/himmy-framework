@@ -524,6 +524,13 @@ _GLOBAL_STORE_READS = [
     "/api/studio/mcp/servers/any/agents",
     "/api/studio/approvals",
     "/api/studio/approvals/anyid",
+    # red-team reattack-r10: two operator-local DISCOVERY surfaces missed by the r7/r8
+    # sweep — ``project_root()``-globbing lists with no tenant axis that returned each
+    # spec's project-relative server filesystem path + name + provider/model + tool/team
+    # topology. Now withheld from browse roles (admin-only) and their GET routes carry the
+    # per-surface ``studio.agents:read`` / ``studio.teams:read`` guard.
+    "/api/studio/agents",
+    "/api/studio/teams",
 ]
 
 
@@ -549,6 +556,44 @@ def test_offline_reads_global_store_reader(studio_cwd: Path, path: str) -> None:
     """INVARIANT: offline / no-auth reads every global-store surface (byte-unchanged)."""
     c = TestClient(create_app(ApiContainer.build_default()))
     assert c.get(path).status_code != 403, f"offline blocked on {path}"
+
+
+def test_reattack_r10_agents_teams_withheld_from_browse_roles() -> None:
+    """red-team reattack-r10: ``studio.agents``/``studio.teams`` are NOT browse-readable.
+
+    The two operator-local spec-discovery surfaces are the same ``project_root()``-globbing
+    filesystem-inventory class withheld in r7/r8. They must be in the withheld set so their
+    ``:read`` never lands in a tenant-facing browse role's default grants.
+    """
+    from himmy.api.auth.rbac import _STUDIO_GLOBAL_STORE_RESOURCES, DEFAULT_RBAC
+
+    assert "studio.agents" in _STUDIO_GLOBAL_STORE_RESOURCES
+    assert "studio.teams" in _STUDIO_GLOBAL_STORE_RESOURCES
+    for role in ("viewer", "operator", "auditor"):
+        grants = DEFAULT_RBAC[role]
+        assert "studio.agents:read" not in grants, role
+        assert "studio.teams:read" not in grants, role
+
+
+@pytest.mark.parametrize("role", ["viewer", "operator", "auditor"])
+@pytest.mark.parametrize("path", ["/api/studio/agents", "/api/studio/teams"])
+def test_reattack_r10_tenant_role_cannot_discover_operator_specs(
+    studio_cwd: Path, role: str, path: str
+) -> None:
+    """red-team reattack-r10: a tenant role can't read the operator's spec inventory.
+
+    Seeds a real spec under the operator project root (so the list would otherwise leak its
+    server filesystem path) and asserts the configured tenant-facing role is 403'd at the
+    per-surface guard BEFORE the glob runs. OFFLINE reads it byte-unchanged (covered by
+    ``test_offline_reads_global_store_reader``).
+    """
+    # A spec the discovery glob would surface (its rel path is operator-FS recon).
+    (studio_cwd / "agent.yaml").write_text(
+        "name: secret-ops-agent\ndescription: d\nprovider: openrouter\nmodel: x\n",
+        encoding="utf-8",
+    )
+    c, _ = _studio_client(role)
+    assert c.get(path).status_code == 403, f"{role} discovered operator specs via {path}"
 
 
 def test_tenant_role_is_403_on_mcp_test_launch(studio_cwd: Path) -> None:

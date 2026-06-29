@@ -275,6 +275,29 @@ _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
         # unaffected — ``require_permission`` no-ops without an authenticator.
         "studio.evals",
         "studio.workflows",
+        # red-team reattack-r10: two more operator-local DISCOVERY surfaces of the EXACT
+        # class the r7/r8 sweep closed for ``studio.eval``/``studio.evals``/
+        # ``studio.workflows``/``studio.routines`` — a ``project_root()``-globbing read with
+        # NO per-tenant axis to intersect on — that slipped because they "looked like" benign
+        # spec pickers:
+        #   * ``studio.agents`` — GET /api/studio/agents (studio_service.list_agents) globs
+        #     the single operator project root and returns each ``AgentSummary``'s
+        #     project-relative server filesystem ``path`` (= infrastructure recon), ``name``,
+        #     ``provider``/``model`` and tool/skill presence. (Edit/validate stay
+        #     ``studio.agents:write`` = admin.)
+        #   * ``studio.teams`` — GET /api/studio/teams (studio_service.list_teams) returns
+        #     each ``TeamSummary``'s project-relative ``path``, ``name``, ``entry`` and the
+        #     member graph (providers/models/delegates/handoffs = orchestration topology).
+        # Both lists are hard-scoped to the operator project root with NO tenant partition,
+        # so the fix is to WITHHOLD the resource (admin-only) — and their main-router GET
+        # routes were retrofitted with the per-surface ``studio.agents:read`` /
+        # ``studio.teams:read`` guard (previously they collapsed to the coarse
+        # ``studio.console:read`` baseline every browse role holds). A deployment that
+        # deliberately exposes one to a tenant role can still grant ``studio.agents:read`` /
+        # ``studio.teams:read`` explicitly via ``HIMMY_RBAC_FILE``. The OFFLINE path is
+        # unaffected — ``studio_permission`` no-ops without an authenticator.
+        "studio.agents",
+        "studio.teams",
     }
 )
 

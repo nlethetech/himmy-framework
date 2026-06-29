@@ -83,7 +83,8 @@ _RES_MODELS = "studio.models"  # provider API keys, Ollama pulls, model compare
 # ``studio.models`` so it stays tenant-grantable while ``studio.models`` (the operator
 # provider-credential posture surface) is withheld to admin-only.
 _RES_MODEL_CATALOG = "studio.modelcatalog"  # read-only model picker (no key posture)
-_RES_AGENTS = "studio.agents"  # agent.yaml edit/validate
+_RES_AGENTS = "studio.agents"  # agent.yaml edit/validate + project-root spec discovery
+_RES_TEAMS = "studio.teams"  # team.yaml project-root spec discovery
 _RES_TASKS = "studio.tasks"  # task board CRUD
 _RES_CHATS = "studio.chats"  # chat session CRUD
 _RES_COOKBOOK = "studio.cookbook"  # saved recipes CRUD
@@ -220,15 +221,46 @@ async def benchmarks_probe() -> dict[str, Any]:
     return await studio_bench.run_probe()
 
 
-@router.get("/agents", response_model=list[studio_service.AgentSummary])
+@router.get(
+    "/agents",
+    response_model=list[studio_service.AgentSummary],
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "read"))],
+)
 async def list_agents() -> list[studio_service.AgentSummary]:
-    """Discover single-agent specs under the project root."""
+    """Discover single-agent specs under the project root.
+
+    red-team reattack-r10: this list globs the single operator ``project_root()`` and
+    returns each spec's project-relative server filesystem ``path`` (infrastructure recon),
+    ``name``, ``provider``/``model`` and tool/skill presence — operator-local filesystem
+    inventory with NO per-tenant axis to intersect on, the SAME class withheld for
+    ``studio.eval``/``studio.evals``/``studio.workflows``/``studio.routines`` in r7/r8.
+    Previously it carried only the coarse ``studio.console:read`` baseline (held by every
+    browse role), so a tenant-facing viewer/operator/auditor could read the operator's
+    agent inventory. It now requires the per-surface ``studio.agents:read``, which is
+    withheld from the default browse roles (see :data:`himmy.api.auth.rbac._STUDIO_GLOBAL_STORE_RESOURCES`)
+    and remains admin-only. OFFLINE is unaffected (``studio_permission`` no-ops without an
+    authenticator).
+    """
     return studio_service.list_agents()
 
 
-@router.get("/teams", response_model=list[studio_service.TeamSummary])
+@router.get(
+    "/teams",
+    response_model=list[studio_service.TeamSummary],
+    dependencies=[Depends(studio_permission(_RES_TEAMS, "read"))],
+)
 async def list_teams() -> list[studio_service.TeamSummary]:
-    """Discover multi-agent team specs (manager + workers) under the project root."""
+    """Discover multi-agent team specs (manager + workers) under the project root.
+
+    red-team reattack-r10: like :func:`list_agents`, this globs the single operator
+    ``project_root()`` and returns each team's project-relative filesystem ``path``,
+    ``name``, ``entry`` and the member graph (providers/models/delegates/handoffs =
+    orchestration topology) — operator-local inventory with NO tenant axis, the same class
+    closed for the sibling discovery surfaces in r7/r8. It now requires the per-surface
+    ``studio.teams:read`` (withheld from browse roles, admin-only) instead of collapsing to
+    ``studio.console:read``. OFFLINE is unaffected (``studio_permission`` no-ops without an
+    authenticator).
+    """
     return studio_service.list_teams()
 
 
