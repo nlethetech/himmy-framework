@@ -21,7 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
-from himmy.api.auth import require_permission, require_workspace
+from himmy.api.auth import require_permission, require_workspace, reveal_host_posture
 
 router = APIRouter(prefix="/v1/models", tags=["models"])
 
@@ -49,11 +49,23 @@ class CatalogProvider(BaseModel):
 
 
 @router.get("", response_model=list[CatalogProvider], dependencies=_READ)
-async def list_models() -> list[CatalogProvider]:
-    """The available local providers + models (with cached bench stats). Secrets-free."""
+async def list_models(request: Request) -> list[CatalogProvider]:
+    """The available local providers + models (with cached bench stats). Secrets-free.
+
+    red-team scope-r5: the catalog's host-derived ``available`` booleans (which LLM binaries
+    are installed/running) and the live LOCAL Ollama model inventory are OPERATOR DEPLOYMENT
+    POSTURE — the SAME reconnaissance class the hardened Studio twin ``GET /api/studio/models``
+    withholds from tenant browse roles. ``model:read`` is held by every tenant browse role, so
+    a tenant-bound caller now gets the POSTURE-FREE picker (providers advertised as SUPPORTED,
+    no live inventory) via ``reveal_host_posture=False``; the offline / ``all_tenants`` / CLI
+    path keeps the full host-probed catalog byte-unchanged via
+    :func:`~himmy.api.auth.context.reveal_host_posture`.
+    """
     from himmy.services.inference.compare import build_model_catalog
 
-    catalog = await build_model_catalog()
+    catalog = await build_model_catalog(
+        reveal_host_posture=reveal_host_posture(request)
+    )
     return [CatalogProvider.model_validate(entry) for entry in catalog]
 
 

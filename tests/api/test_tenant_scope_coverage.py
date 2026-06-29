@@ -257,8 +257,9 @@ _ADMIN_CROSS_WORKSPACE: frozenset[str] = frozenset(
 #: Process-global / project-local OPERATOR resources with NO tenant dimension: the same
 #: for every workspace (model/provider catalog, infra health, connector catalog, the MCP
 #: server registry, the project-local agent/team/skill/tool specs read off disk, the file
-#: sandbox, benchmarks, the eval-history operator store, the seclog console). RBAC-gated,
-#: never tenant-keyed, never echoes secret material. Each is the models/connectors class.
+#: sandbox, benchmarks, the eval-history operator store). RBAC-gated, never tenant-keyed,
+#: never echoes secret material. Each is the models/connectors class. (The seclog console is
+#: NOT here: its events carry a ``workspace_id`` and it now tenant-scopes via ``scoped_read``.)
 _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
     {
         # /v1 process-global (already documented in the /v1 AST guard)
@@ -302,7 +303,6 @@ _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
         "/api/studio/kb/{kb_id}/documents",
         "/api/studio/files",
         "/api/studio/files/download",
-        "/api/studio/seclog",
     }
 )
 
@@ -323,11 +323,9 @@ _STUDIO_TENANT_PENDING: frozenset[str] = frozenset(
     {
         # process-local registries (no tenant stamp on the in-memory record)
         "/api/studio/notify",
-        # entity-spine governance + lineage (registry.list_by_kind/get has no tenant axis)
+        # entity-spine governance (registry.list_by_kind/get has no tenant axis)
         "/api/studio/privacy/subjects",
         "/api/studio/privacy/consents",
-        "/api/studio/lineage/graph",
-        "/api/studio/lineage/entity/{record_id}",
         # cwd-keyed singleton SQLite stores (no tenant/subject column)
         "/api/studio/tasks",
         "/api/studio/chats",

@@ -51,15 +51,27 @@ class SecurityAuditLog:
         *,
         limit: int = 100,
         workspace_id: str | None = None,
+        workspace_ids: frozenset[str] | set[str] | None = None,
         event_type: str | None = None,
     ) -> list[SecurityEvent]:
-        """Return recent events (newest first), optionally filtered."""
+        """Return recent events (newest first), optionally filtered.
+
+        ``workspace_id`` pins to a single tenant; ``workspace_ids`` (red-team scope-r5)
+        pins to an ALLOW-LIST of tenants — the shape a tenant-bound principal's
+        :func:`~himmy.api.auth.context.studio_tenant_filter` returns — so the seclog
+        viewer surfaces only events stamped to a workspace the caller is entitled to.
+        Both default to ``None`` (no tenant filter — the single-box / unrestricted path),
+        and both are applied BEFORE the ``limit`` slice so scoping never silently drops
+        in-window rows. Passing both intersects them.
+        """
         events = [
             SecurityEvent.model_validate(r.payload)
             for r in self._registry.list_by_kind(SECURITY_EVENT_KIND)
         ]
         if workspace_id is not None:
             events = [e for e in events if e.workspace_id == workspace_id]
+        if workspace_ids is not None:
+            events = [e for e in events if e.workspace_id in workspace_ids]
         if event_type is not None:
             events = [e for e in events if e.event_type == event_type]
         events.sort(key=lambda e: e.created_at, reverse=True)

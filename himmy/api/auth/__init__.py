@@ -22,6 +22,7 @@ from himmy.api.auth.context import (
     principal_dependency,
     require_workspace,
     resolve_workspace,
+    reveal_host_posture,
     studio_subject_filter,
     studio_tenant_filter,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "studio_tenant_filter",
     "studio_subject_filter",
     "authorize_studio_object",
+    "reveal_host_posture",
     "scoped_read",
     "subject_write",
     "AccessPolicy",

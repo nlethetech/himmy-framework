@@ -19,9 +19,16 @@ and this viewer's rows are IDENTICAL to ``himmy seclog --limit N --type T`` for 
 same project — NOT the old per-process in-memory registry that would have shown a
 different event set and falsely claimed parity.
 
-Single-user-local: no workspace filter (the seclog is the operator's own audit
-trail). Offline-first: a clean trail simply returns ``[]`` (the table renders its
-empty state); reading is never the access gate, so this endpoint never 500s on an
+Tenant scoping (red-team scope-r5): ``studio.seclog:read`` is withheld to admin-only, but a
+TENANT-BOUND ``admin`` key (``roles:["admin"], tenant_ids:["A"], all_tenants:false``) holds it
+— and the events ARE tenant-stamped (each :class:`SecurityEvent` carries a ``workspace_id``).
+So this reader scopes to the principal's tenant allow-list via
+:func:`~himmy.api.auth.context.studio_tenant_filter`: an unrestricted (``all_tenants`` / offline)
+principal sees EVERY event (filter ``None`` ⇒ byte-unchanged single-box behavior), while a
+tenant-bound admin sees only events stamped to a workspace it is entitled to — closing the
+cross-tenant security-posture/recon disclosure (other tenants' actors, denied resources/actions,
+request paths, detail strings). Offline-first: a clean trail simply returns ``[]`` (the table
+renders its empty state); reading is never the access gate, so this endpoint never 500s on an
 empty/odd spine.
 """
 
@@ -29,9 +36,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import HTTPException, Query, Request
+from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from himmy.api.auth import scoped_read, studio_tenant_filter
 from himmy.api.routers.studio_common import build_studio_router
 
 router = build_studio_router("seclog", tag="studio-seclog")
@@ -96,7 +104,7 @@ def _actor_label(actor: dict[str, Any]) -> str:
     return str(subject) if subject else "-"
 
 
-@router.get("", response_model=SeclogResponse)
+@router.get("", response_model=SeclogResponse, dependencies=[Depends(scoped_read)])
 async def seclog(
     request: Request,
     limit: int = Query(_LIMIT_DEFAULT, ge=1, le=_LIMIT_MAX),
@@ -111,9 +119,14 @@ async def seclog(
     byte-for-byte the rows the CLI prints for the same project.
     """
     audit = _security_audit(request)
-    # The CLI's render_seclog passes event_type/limit straight to ``recent`` with no
-    # workspace filter for the local viewer; mirror that exactly (single-user-local).
-    events = audit.recent(limit=limit, event_type=type, workspace_id=None)
+    # red-team scope-r5: scope to the principal's tenant allow-list. ``None`` for an
+    # unrestricted (all_tenants / offline) principal ⇒ NO filter ⇒ the single-box viewer is
+    # byte-unchanged (same rows the CLI ``himmy seclog`` prints); a tenant-bound admin sees
+    # only events stamped to a workspace it is entitled to.
+    tenants = studio_tenant_filter(request)
+    events = audit.recent(
+        limit=limit, event_type=type, workspace_ids=tenants
+    )
     items = [
         SeclogEvent(
             event_id=e.event_id,
@@ -129,9 +142,10 @@ async def seclog(
         )
         for e in events
     ]
-    # Distinct types over the SAME recent window (unfiltered) so the GUI filter
-    # offers the event types actually present, not a hardcoded list.
-    window = audit.recent(limit=limit, event_type=None, workspace_id=None)
+    # Distinct types over the SAME recent window (tenant-scoped, type-unfiltered) so the GUI
+    # filter offers the event types actually present TO THIS CALLER, not a hardcoded list and
+    # not types that only appear in other tenants' events.
+    window = audit.recent(limit=limit, event_type=None, workspace_ids=tenants)
     types = sorted({e.event_type for e in window if e.event_type})
     return SeclogResponse(items=items, total=len(items), types=types)
 

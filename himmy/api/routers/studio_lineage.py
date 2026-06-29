@@ -14,6 +14,18 @@ Mounted under ``/api/studio/lineage`` with the shared ``studio:use`` guard
 Offline-first: when nothing was projected into the registry the endpoints
 answer with a clear 404 (the Studio GUI then falls back to the cognition-trace
 provenance view), never a 500.
+
+Tenant scoping (red-team scope-r5). ``studio.lineage:read`` is withheld to admin-only, but a
+TENANT-BOUND ``admin`` key (``roles:["admin"], tenant_ids:["A"], all_tenants:false``) holds it
+— so the lineage readers MUST refuse cross-tenant payloads, not trust the admin-only gate. The
+run path threads the principal's :func:`~himmy.api.auth.context.resolve_workspace` scope into
+:meth:`RunAppService.get_run_lineage` (run-level tenant scope, exactly the ``/v1``
+``/runs/{id}/lineage`` reader). The entity path derives a traced subgraph's OWNING workspace
+from its ``chat_thread`` hub (the only reliably workspace-stamped node) and refuses it (clean
+404) unless the principal's :func:`~himmy.api.auth.context.studio_tenant_filter` allows it —
+**failing closed** for a tenant-bound caller when no owning workspace can be established, so an
+unstamped record can never leak. Every check is a strict NO-OP for an unrestricted
+(``all_tenants`` / offline) principal (filter ``None``), so the single-box path is byte-unchanged.
 """
 
 from __future__ import annotations
@@ -22,14 +34,22 @@ import inspect
 import re
 from typing import Any
 
-from fastapi import HTTPException, Path, Query, Request
+from fastapi import Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel, Field
 
+from himmy.api.auth import resolve_workspace, scoped_read, studio_tenant_filter
 from himmy.api.routers.studio_common import build_studio_router
 from himmy.entities.lineage import LineageGraph
 from himmy.entities.records import EntityRecord, stable_id_for
 
 router = build_studio_router("lineage", tag="studio-lineage")
+
+#: The entity kind whose record reliably carries the owning ``workspace_id`` — the lineage hub
+#: a run/persona/prompt/context snapshot all hang off (stamped by ``RunAppService._persist`` /
+#: ``create_thread`` under ``THREAD_WORKSPACE_KEY``). The thread's own ``metadata`` rides into
+#: its projected record's ``payload['metadata']`` via ``model_dump``, so the owning tenant of a
+#: traced subgraph is read off any ``chat_thread`` node here.
+_THREAD_KIND = "chat_thread"
 
 # ---- bounds ---------------------------------------------------------------
 
@@ -204,11 +224,24 @@ async def _graph_for_run(
     Tries the entity-projected ``/v1`` run service first, then the local
     Studio run store (whose runs carry a ``thread_id`` but are only present in
     the registry when the runtime projected the thread).
+
+    Tenant scoping (red-team scope-r5): the run is resolved tenant-scoped — the
+    principal's :func:`resolve_workspace` is threaded into
+    :meth:`RunAppService.get_run_lineage` (a run owned by another tenant resolves to
+    ``None`` → 404, exactly as the ``/v1`` ``/runs/{id}/lineage`` reader), and the
+    Studio run-store fallback's resolved subgraph is run through the SAME entity tenant
+    gate. For an unrestricted principal ``resolve_workspace`` returns ``None`` ⇒ the
+    legacy cross-workspace resolution, byte-unchanged.
     """
+    workspace_id = resolve_workspace(request, None)
     container = getattr(request.app.state, "container", None)
     run_app = getattr(container, "run_app", None)
     if run_app is not None:
-        graph = await _maybe_await(run_app.get_run_lineage(run_id, max_depth=depth))
+        graph = await _maybe_await(
+            run_app.get_run_lineage(
+                run_id, workspace_id=workspace_id, max_depth=depth
+            )
+        )
         if graph is not None:
             return graph  # type: ignore[no-any-return]
 
@@ -230,7 +263,9 @@ async def _graph_for_run(
             detail="this run was not projected into the entity registry — "
             "see its cognition-trace provenance instead",
         )
-    return await _trace(registry, root.record_id, depth)
+    # The Studio run-store fallback resolves the thread WITHOUT a tenant axis, so gate the
+    # traced subgraph the same way the entity path does (404 cross-tenant / unanchored).
+    return await _authorize_entity_subgraph(request, registry, root.record_id, depth)
 
 
 async def _trace(registry: Any, record_id: str, depth: int) -> LineageGraph:
@@ -238,6 +273,71 @@ async def _trace(registry: Any, record_id: str, depth: int) -> LineageGraph:
     return await _maybe_await(  # type: ignore[no-any-return]
         registry.trace(record_id, max_depth=depth)
     )
+
+
+# ---- tenant scoping (red-team scope-r5) -----------------------------------
+
+
+def _record_workspace(record: EntityRecord) -> str | None:
+    """The owning ``workspace_id`` stamped on a record, or ``None`` when unstamped.
+
+    Checks the record's own ``metadata['workspace_id']`` first, then — for a
+    ``chat_thread`` hub, whose own ``metadata`` rides into its projected
+    ``payload['metadata']`` — the payload stamp. Returns ``None`` for any record carrying
+    no tenant stamp (the caller fails closed for a tenant-bound principal on ``None``).
+    """
+    stamped = record.metadata.get("workspace_id")
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    payload_meta = record.payload.get("metadata")
+    if isinstance(payload_meta, dict):
+        ws = payload_meta.get("workspace_id")
+        if isinstance(ws, str) and ws:
+            return ws
+    return None
+
+
+def _graph_owning_workspace(graph: LineageGraph) -> str | None:
+    """The owning ``workspace_id`` of a traced subgraph, or ``None`` when undeterminable.
+
+    Reads the stamp off the subgraph's ``chat_thread`` hub (the reliably workspace-stamped
+    node) — and, as a fallback, off any node carrying a direct ``metadata['workspace_id']``
+    — so the tenant gate has a tenant to compare against. ``None`` means the subgraph has no
+    workspace anchor, which a tenant-bound caller treats as not-found (fail closed).
+    """
+    for rec in graph.nodes.values():
+        if rec.kind == _THREAD_KIND:
+            ws = _record_workspace(rec)
+            if ws is not None:
+                return ws
+    for rec in graph.nodes.values():
+        ws = _record_workspace(rec)
+        if ws is not None:
+            return ws
+    return None
+
+
+async def _authorize_entity_subgraph(
+    request: Request, registry: Any, record_id: str, depth: int
+) -> LineageGraph:
+    """Trace an entity AND tenant-gate the result (the centralized entity-path scope).
+
+    The single choke point both ``/graph?entity_id=`` and the detail walk route through, so
+    a tenant-bound caller can never read a subgraph (and its payloads) outside its tenant
+    allow-list. For an unrestricted (``all_tenants`` / offline) principal
+    :func:`studio_tenant_filter` is ``None`` ⇒ a strict NO-OP (byte-unchanged). For a
+    tenant-bound principal the subgraph's owning workspace (its ``chat_thread`` hub stamp)
+    must be in the allow-list, else **404** — failing closed when the subgraph carries no
+    workspace anchor, so an unstamped record cannot leak across tenants.
+    """
+    graph = await _trace(registry, record_id, depth)
+    tenants = studio_tenant_filter(request)
+    if tenants is None:
+        return graph
+    owner = _graph_owning_workspace(graph)
+    if owner is None or owner not in tenants:
+        raise HTTPException(status_code=404, detail="no entity found for that id")
+    return graph
 
 
 def _shape_graph(graph: LineageGraph) -> GraphResponse:
@@ -294,7 +394,9 @@ async def _link_summaries(
 # ---- endpoints --------------------------------------------------------------
 
 
-@router.get("/graph", response_model=GraphResponse)
+@router.get(
+    "/graph", response_model=GraphResponse, dependencies=[Depends(scoped_read)]
+)
 async def lineage_graph(
     request: Request,
     entity_id: str | None = Query(None, min_length=1, max_length=_MAX_ID_LEN),
@@ -324,7 +426,11 @@ async def lineage_graph(
                 status_code=404,
                 detail=f"no entity found for id {entity_id!r}",
             )
-        graph = await _trace(registry, root.record_id, depth)
+        # Tenant-gate the traced subgraph (404 cross-tenant / unanchored for a
+        # tenant-bound caller; NO-OP for an unrestricted principal).
+        graph = await _authorize_entity_subgraph(
+            request, registry, root.record_id, depth
+        )
     if not graph.nodes:
         raise HTTPException(
             status_code=404, detail="the traced entity has no lineage records"
@@ -332,18 +438,33 @@ async def lineage_graph(
     return _shape_graph(graph)
 
 
-@router.get("/entity/{record_id}", response_model=EntityDetail)
+@router.get(
+    "/entity/{record_id}",
+    response_model=EntityDetail,
+    dependencies=[Depends(scoped_read)],
+)
 async def lineage_entity(
     request: Request,
     record_id: str = Path(min_length=1, max_length=_MAX_ID_LEN),
 ) -> EntityDetail:
-    """The full record behind a graph node (payload, metadata, incident links)."""
+    """The full record behind a graph node (payload, metadata, incident links).
+
+    Tenant scoping (red-team scope-r5): a tenant-bound caller may only read a record whose
+    OWNING workspace (its ``chat_thread`` hub) is in its allow-list — the record is traced
+    and run through :func:`_authorize_entity_subgraph`, so a foreign-tenant (or
+    workspace-unanchored) record is a clean 404, never a payload leak. An unrestricted
+    principal takes the legacy path byte-unchanged.
+    """
     registry = _registry(request)
     record = await _resolve_entity(registry, record_id)
     if record is None:
         raise HTTPException(
             status_code=404, detail=f"no entity found for id {record_id!r}"
         )
+    # Gate the resolved record by its owning workspace (NO-OP for an unrestricted principal).
+    await _authorize_entity_subgraph(
+        request, registry, record.record_id, MAX_GRAPH_DEPTH
+    )
     links_in = await _maybe_await(registry.links_to(record.record_id))
     links_out = await _maybe_await(registry.links_from(record.record_id))
     return EntityDetail(

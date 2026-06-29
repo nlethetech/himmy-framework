@@ -297,6 +297,30 @@ def authorize_studio_object(request: Request, workspace_id: str | None) -> bool:
     return get_principal(request).may_access(workspace_id)
 
 
+def reveal_host_posture(request: Request) -> bool:
+    """Whether this request may see OPERATOR DEPLOYMENT POSTURE on a ``/v1`` infra read.
+
+    The ``/v1`` analogue of Studio's :func:`~himmy.api.routers.studio._caller_holds_console_write`
+    posture gate, but keyed on the tenant axis rather than the ``studio.console:write`` grant —
+    because the ``/v1`` infra reads (``GET /v1/diagnostics`` / ``GET /v1/models``) carry no
+    Studio role dimension, only a principal's tenant binding. "Host posture" is the
+    reconnaissance class red-team r6/r9 withheld from tenant browse roles on the Studio twins:
+    which LLM binaries are installed + their absolute filesystem paths, the provider-key
+    PRESENCE inventory, the live local Ollama model inventory, the storage backend DSN host, and
+    the canonical ``.himmy`` SQLite file paths.
+
+    Returns the principal's :attr:`~himmy.api.auth.principal.Principal.all_tenants` flag, so:
+
+    * an unrestricted principal — the offline default / :data:`ANONYMOUS` (``all_tenants=True``)
+      / a trusted shared key — gets the FULL posture, so the zero-config / single-box path is
+      **byte-unchanged** (the report the CLI ``himmy doctor`` / ``himmy models`` prints); and
+    * a tenant-bound principal (``all_tenants=False``) gets a POSTURE-FREE view — it may no
+      longer learn the operator's installed binaries, key inventory, DB host, or live local
+      model list, mirroring exactly what the hardened Studio ``/doctor`` / ``/models`` withhold.
+    """
+    return get_principal(request).all_tenants
+
+
 def require_workspace(request: Request, requested: str) -> str:
     """Like :func:`resolve_workspace` for write paths that always carry a workspace.
 
@@ -322,4 +346,5 @@ __all__ = [
     "studio_tenant_filter",
     "studio_subject_filter",
     "authorize_studio_object",
+    "reveal_host_posture",
 ]
