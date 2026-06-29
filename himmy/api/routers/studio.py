@@ -1594,8 +1594,21 @@ class EvalRunRequest(BaseModel):
     model: str | None = None
 
 
-@router.get("/evals")
+@router.get(
+    "/evals", dependencies=[Depends(studio_permission(_RES_EVALS, "read"))]
+)
 async def eval_suites() -> list[Any]:
+    # red-team reattack-r8: this is the un-hardened twin of GET /api/studio/eval/suites
+    # (studio_eval.list_suites). Both call ``studio_eval.discover_suites()`` — which
+    # enumerates the operator's local-filesystem eval-suite names/paths/case-counts — but
+    # this route previously carried no route-level guard, so it inherited only the
+    # router-level ``studio.console:read`` baseline that every tenant browse role holds,
+    # bypassing the r7 lockdown that withheld ``studio.eval`` from those roles. We now gate
+    # it on ``studio.evals:read`` AND move ``studio.evals`` into
+    # :data:`~himmy.api.auth.rbac._STUDIO_GLOBAL_STORE_RESOURCES` (admin-only) so this
+    # operator-local FS reconnaissance surface is withheld from tenant-facing browse roles,
+    # exactly like its r7-locked twin. The OFFLINE path is unaffected (``studio_permission``
+    # /``require_permission`` no-op without an authenticator).
     from himmy.api import studio_eval
 
     return studio_eval.discover_suites()
@@ -1641,8 +1654,23 @@ class WorkflowRunRequest(BaseModel):
     initial_state: dict[str, Any] = {}
 
 
-@router.get("/workflows")
+@router.get(
+    "/workflows",
+    dependencies=[Depends(studio_permission(_RES_WORKFLOWS, "read"))],
+)
 async def workflows() -> list[Any]:
+    # red-team reattack-r8: ``discover_workflows()`` enumerates the operator's local
+    # workflow specs (project-relative path + name + step/tool graph) — operator
+    # orchestration topology a tenant must not see. This read previously carried no
+    # route-level dependency, so it was gated only by the router-level ``studio.console:read``
+    # baseline every tenant browse role holds (the same forgotten-read-guard pattern as the
+    # ``/evals`` twin above). We gate it on ``studio.workflows:read`` AND move
+    # ``studio.workflows`` into
+    # :data:`~himmy.api.auth.rbac._STUDIO_GLOBAL_STORE_RESOURCES` (admin-only) — the
+    # discovery globs ``project_root()`` with no tenant axis to intersect on, so the fix is
+    # to withhold the resource (mirroring r7's eval/routines lockdown) rather than retrofit a
+    # filter. Write/manage stay ``studio.workflows:write`` = admin. The OFFLINE path is
+    # unaffected (``studio_permission`` no-ops without an authenticator).
     from himmy.api import studio_workflows
 
     return studio_workflows.discover_workflows()

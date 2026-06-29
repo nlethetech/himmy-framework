@@ -504,6 +504,46 @@ def test_studio_eval_suites_withheld_from_browse_roles() -> None:
     assert offline.get("/api/studio/eval/suites").status_code == 200
 
 
+def test_studio_evals_discovery_withheld_from_browse_roles() -> None:
+    """reattack-r8: GET /api/studio/evals is the un-hardened twin of /eval/suites.
+
+    Both call ``studio_eval.discover_suites()`` (operator-local eval-suite NAMES/PATHS/
+    case-counts), but ``GET /api/studio/evals`` previously carried no route-level guard, so
+    it inherited only the router-level ``studio.console:read`` baseline every tenant browse
+    role holds — bypassing the r7 lockdown. ``studio.evals`` is now in
+    ``_STUDIO_GLOBAL_STORE_RESOURCES`` (admin-only) and the route is gated on
+    ``studio.evals:read``, so a viewer/operator/auditor is 403; admin still reads it.
+    """
+    for role in ("viewer", "operator", "auditor"):
+        c = _client_with_key(_app_with_key(role))
+        assert c.get("/api/studio/evals").status_code == 403, role
+    ca = _client_with_key(_app_with_key("admin"))
+    assert ca.get("/api/studio/evals").status_code == 200
+    # OFFLINE (no authenticator) reads it byte-unchanged.
+    offline = TestClient(create_app(ApiContainer.build_default()))
+    assert offline.get("/api/studio/evals").status_code == 200
+
+
+def test_studio_workflows_discovery_withheld_from_browse_roles() -> None:
+    """reattack-r8: GET /api/studio/workflows leaked operator workflow topology.
+
+    ``discover_workflows()`` enumerates the operator's workflow specs (project-relative path
+    + name + step/tool graph). The read previously carried no route-level dependency, so it
+    was gated only by the router-level ``studio.console:read`` baseline every tenant browse
+    role holds. ``studio.workflows`` is now in ``_STUDIO_GLOBAL_STORE_RESOURCES`` (admin-only)
+    and the route is gated on ``studio.workflows:read``, so a viewer/operator/auditor is 403;
+    admin still reads it.
+    """
+    for role in ("viewer", "operator", "auditor"):
+        c = _client_with_key(_app_with_key(role))
+        assert c.get("/api/studio/workflows").status_code == 403, role
+    ca = _client_with_key(_app_with_key("admin"))
+    assert ca.get("/api/studio/workflows").status_code == 200
+    # OFFLINE (no authenticator) reads it byte-unchanged.
+    offline = TestClient(create_app(ApiContainer.build_default()))
+    assert offline.get("/api/studio/workflows").status_code == 200
+
+
 def test_studio_benchmarks_withheld_from_browse_roles() -> None:
     """reattack-r7: GET /api/studio/benchmarks raised to ``studio.console:write`` (admin).
 

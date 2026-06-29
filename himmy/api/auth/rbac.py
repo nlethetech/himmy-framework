@@ -255,6 +255,26 @@ _STUDIO_GLOBAL_STORE_RESOURCES: frozenset[str] = frozenset(
         # no-ops without an authenticator.
         "studio.routines",
         "studio.eval",
+        # red-team reattack-r8: two operator-local DISCOVERY surfaces of the SAME class the
+        # r7 sweep closed for ``studio.eval`` — a ``project_root()``-globbing read with NO
+        # per-tenant axis to intersect on, so granting their ``:read`` to a tenant-facing
+        # browse role (viewer/operator/auditor) leaked operator-local filesystem inventory:
+        #   * ``studio.evals`` — GET /api/studio/evals (studio.eval_suites) is the
+        #     un-hardened twin of the r7-locked GET /api/studio/eval/suites; both call
+        #     ``studio_eval.discover_suites()``, enumerating the operator's local eval-suite
+        #     NAMES/PATHS/case-counts. (Run/write stay ``studio.evals:write`` = admin.)
+        #   * ``studio.workflows`` — GET /api/studio/workflows (studio.workflows ->
+        #     ``discover_workflows()``) enumerates the operator's workflow specs:
+        #     project-relative path + name + the step/tool graph (orchestration topology).
+        #     (Run/write stay ``studio.workflows:write`` = admin.)
+        # Both globs are hard-scoped to the operator project root with no tenant partition, so
+        # the fix is to WITHHOLD the resource (admin-only) rather than retrofit a filter,
+        # mirroring the r7 treatment of ``studio.eval``/``studio.routines``. A deployment that
+        # deliberately exposes one to a tenant role can still grant ``studio.evals:read`` /
+        # ``studio.workflows:read`` explicitly via ``HIMMY_RBAC_FILE``. The OFFLINE path is
+        # unaffected — ``require_permission`` no-ops without an authenticator.
+        "studio.evals",
+        "studio.workflows",
     }
 )
 
