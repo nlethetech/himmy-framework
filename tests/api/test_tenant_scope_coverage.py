@@ -113,6 +113,44 @@ def _get_read_routes() -> list[tuple[str, Any]]:
     return out
 
 
+#: POST/PUT/PATCH leaves that PERFORM A READ rather than (or as well as) a mutation —
+#: the structural blind spot the GET-only gate above could not see. A read-shaped POST
+#: (semantic recall, retrieval search) takes a query + a target selector (``subject_id`` /
+#: ``kb_id``) in its BODY and returns rows; if that selector is honored over the verified
+#: principal it is a cross-subject/cross-tenant BOLA the by-construction gate must catch.
+#: Because there is no generic, body-shape-independent way to tell a read-POST from a pure
+#: mutation by AST, these are enumerated by review: each MUST carry the ``scoped_read``
+#: marker (its target derived from the principal) or sit on a documented allow-list. A new
+#: read-shaped non-GET route should be ADDED here so the gate guards it too.
+_NON_GET_READS: frozenset[str] = frozenset(
+    {
+        "/api/studio/memory/recall",  # POST recall: subject_id from body must not be honored
+        "/api/studio/knowledge/{kb_id}/search",  # POST KB search (project-local, not tenant)
+    }
+)
+
+
+def _non_get_read_routes() -> list[tuple[str, Any]]:
+    """The reviewed read-shaped POST/PUT/PATCH leaves (:data:`_NON_GET_READS`).
+
+    The GET-only :func:`_get_read_routes` is structurally blind to a read performed over
+    a POST (e.g. ``POST /api/studio/memory/recall``), so a future cross-subject recall
+    route could ship unguarded. This enumerates the reviewed read-shaped non-GET leaves
+    on the built app so the coverage gate can require each to be scoped-or-documented too.
+    """
+    app = create_app()
+    out: list[tuple[str, Any]] = []
+    for path, route in _iter_api_routes(app.routes):
+        if getattr(route, "dependant", None) is None:
+            continue
+        methods = getattr(route, "methods", None) or set()
+        if "GET" in methods:
+            continue
+        if path in _NON_GET_READS:
+            out.append((path, route))
+    return out
+
+
 # ----------------------------------------------------------------------- allow-lists
 
 #: Infra/static routes that serve NO tenant data: liveness/readiness probes, the
@@ -195,6 +233,7 @@ _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
         "/api/studio/eval/baseline",
         "/api/studio/eval/history",
         "/api/studio/knowledge",
+        "/api/studio/knowledge/{kb_id}/search",
         "/api/studio/kb/{kb_id}/documents",
         "/api/studio/files",
         "/api/studio/files/download",
@@ -206,7 +245,7 @@ _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
 #: genuinely carry NO tenant/subject column today — the process-local missions/notify
 #: registries (no ``workspace_id`` on the Mission dataclass / notification record), the
 #: cross-tenant entity-spine governance/lineage reads (``registry.list_by_kind`` has no
-#: tenant dimension), the subject-memory enumerator, and the cwd-keyed singleton SQLite
+#: tenant dimension), and the cwd-keyed singleton SQLite
 #: stores (tasks/chats/notes/calendar/cookbook/projects). The data-scoping MAP's
 #: by-construction fix for each is a DATA-MODEL change (stamp the registry/record, give the
 #: spine a tenant-aware query path, add a workspace column + migration). Until that lands,
@@ -224,9 +263,6 @@ _STUDIO_TENANT_PENDING: frozenset[str] = frozenset(
         "/api/studio/privacy/consents",
         "/api/studio/lineage/graph",
         "/api/studio/lineage/entity/{record_id}",
-        # subject memory enumerator (OrchestrationStore.list_memory has no workspace_id)
-        "/api/studio/memory",
-        "/api/studio/memory/subjects",
         # cwd-keyed singleton SQLite stores (no tenant/subject column)
         "/api/studio/tasks",
         "/api/studio/chats",
@@ -288,6 +324,58 @@ def test_every_get_read_route_is_scoped_or_documented() -> None:
     )
 
 
+def test_every_non_get_read_route_is_scoped_or_documented() -> None:
+    """The GET-only blind spot is closed: read-shaped POSTs are gated too.
+
+    ``POST /api/studio/memory/recall`` is a READ (semantic recall over a body-supplied
+    ``subject_id``) that the GET-only gate above cannot see — a tenant/subject-bound
+    principal could otherwise recall ANOTHER data subject's memories. Every reviewed
+    read-shaped non-GET leaf (:data:`_NON_GET_READS`) must EITHER carry the ``scoped_read``
+    marker (its target derived from the verified principal, never the body) OR sit on a
+    documented allow-list — exactly the by-construction property the GET gate enforces.
+    """
+    routes = _non_get_read_routes()
+    seen = {path for path, _route in routes}
+    # The gate genuinely reaches the read-shaped POSTs (not vacuously empty).
+    assert "/api/studio/memory/recall" in seen, (
+        "expected the read-shaped POST /api/studio/memory/recall to be enumerated; a "
+        "FastAPI nesting change must not make this gate silently empty"
+    )
+    # Every enumerated entry corresponds to a real route on the built app.
+    assert seen == set(_NON_GET_READS), (
+        "_NON_GET_READS has an entry that is no longer a real non-GET route (or vice "
+        f"versa); reconcile: built={sorted(seen)} declared={sorted(_NON_GET_READS)}"
+    )
+
+    offenders: list[str] = []
+    for path, route in routes:
+        if _route_is_scoped(route):
+            continue
+        if path in _ALL_ALLOWED:
+            continue
+        methods = sorted(getattr(route, "methods", None) or [])
+        offenders.append(f"{methods} {path}")
+    assert not offenders, (
+        "these read-shaped non-GET routes neither carry the scoped_read marker nor sit on "
+        f"a documented tenant-scope allow-list: {offenders}"
+    )
+
+
+def test_memory_recall_post_read_is_detected_as_scoped() -> None:
+    """Regression: the cross-subject recall fix carries the scoped_read marker.
+
+    ``POST /api/studio/memory/recall`` derives its subject from the verified principal
+    (``narrow_subject``), so it must be detected as a scoped reader — proving the
+    by-construction gate now guards this read-shaped POST.
+    """
+    routes = {path: route for path, route in _non_get_read_routes()}
+    assert "/api/studio/memory/recall" in routes
+    assert _route_is_scoped(routes["/api/studio/memory/recall"]), (
+        "/api/studio/memory/recall is subject-scoped (narrow_subject) and must carry the "
+        "scoped_read marker so the non-GET gate enforces it"
+    )
+
+
 def test_allow_lists_are_disjoint_and_have_no_stale_entries() -> None:
     """The allow-lists do not overlap and every entry maps to a real GET route.
 
@@ -309,8 +397,10 @@ def test_allow_lists_are_disjoint_and_have_no_stale_entries() -> None:
             assert not overlap, f"{name_a} and {name_b} overlap: {sorted(overlap)}"
 
     # No stale entries: every allow-listed path (except the docs paths, suppressed when
-    # auth is configured, and which the default app does expose) is a real GET route.
+    # auth is configured, and which the default app does expose) is a real read route —
+    # GET or one of the reviewed read-shaped non-GET leaves (e.g. POST .../search).
     seen = {path for path, _route in _get_read_routes()}
+    seen |= {path for path, _route in _non_get_read_routes()}
     docs = {"/docs", "/redoc", "/openapi.json"}
     for name, paths in lists.items():
         stale = {p for p in paths if p not in seen and p not in docs}

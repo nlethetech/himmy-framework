@@ -49,7 +49,9 @@ from himmy.api import (
 from himmy.api.auth import (
     authorize_object,
     authorize_studio_object,
+    enforce_subject_write,
     get_principal,
+    narrow_subject,
     scoped_read,
     studio_subject_filter,
     studio_tenant_filter,
@@ -1535,28 +1537,74 @@ class MemoryRecallRequest(BaseModel):
     similarity_threshold: float | None = Field(None, ge=0.0, le=1.0)
 
 
+def _scoped_memory_subject(request: Request, requested: str | None) -> str | None:
+    """The data subject a memory read may target, derived from the verified PRINCIPAL.
+
+    The centralized subject-axis (BOLA) gate for the subject-keyed memory surface — the
+    by-construction fix for the cross-subject recall/list leak (a tenant-bound principal
+    holding ``studio.memory:read`` recalling ANOTHER data subject's semantic memories from
+    the shared process store). For a ``subject_scoped`` principal WITHOUT ``tenant_admin``
+    the effective subject is FORCED to its own (a client-supplied ``subject_id`` for another
+    subject is ignored, never honored — mirroring :func:`narrow_subject` on the runs reader).
+    Every other principal — ``all_tenants`` / offline / the historical multi-user-workspace
+    default / a ``tenant_admin`` — keeps ``requested`` as-is, so the zero-config path is
+    byte-unchanged.
+    """
+    return narrow_subject(request, requested)
+
+
 @router.get(
     "/memory/subjects",
     response_model=list[str],
-    dependencies=[Depends(studio_permission(_RES_MEMORY, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "read")),
+        Depends(scoped_read),
+    ],
 )
-async def memory_subjects() -> list[str]:
+async def memory_subjects(request: Request) -> list[str]:
+    """Distinct subject ids with memories, NARROWED to the principal's own subject.
+
+    A ``subject_scoped`` principal sees ONLY its own subject in the enumeration (the
+    cross-subject enumeration oracle is closed); every other principal sees all. The
+    tenant axis (the process-global store carries no ``workspace_id`` column) remains the
+    documented data-model gap drained separately. NO-OP offline / ``all_tenants``.
+    """
     from himmy.api import studio_memory
 
-    return studio_memory.list_subjects()
+    pinned = _scoped_memory_subject(request, None)
+    return studio_memory.list_subjects(only_subject=pinned)
 
 
-@router.get("/memory", dependencies=[Depends(studio_permission(_RES_MEMORY, "read"))])
-async def memory_list(subject: str = "default") -> list[Any]:
+@router.get(
+    "/memory",
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def memory_list(request: Request, subject: str = "default") -> list[Any]:
+    """A subject's memories — the ``subject`` query param is never honored over the principal.
+
+    For a ``subject_scoped`` caller the effective subject is pinned to its own (a request
+    for another subject is silently narrowed, so it can only ever read its own memories).
+    NO-OP offline / ``all_tenants`` — the caller-supplied ``subject`` is used verbatim.
+    """
     from himmy.api import studio_memory
 
-    return studio_memory.list_memories(subject)
+    return studio_memory.list_memories(_scoped_memory_subject(request, subject))
 
 
 @router.post("/memory", dependencies=[Depends(studio_permission(_RES_MEMORY, "write"))])
-async def memory_add(body: MemoryAddRequest) -> Any:
+async def memory_add(body: MemoryAddRequest, request: Request) -> Any:
+    """Persist a memory — STAMPED under the principal's own subject when subject-scoped.
+
+    The write-path BOLA companion: a ``subject_scoped`` principal may only write under its
+    own subject (``enforce_subject_write`` → 403 on a foreign ``subject_id`` in the body),
+    so it cannot poison another data subject's memory store. NO-OP offline / ``all_tenants``.
+    """
     from himmy.api import studio_memory
 
+    enforce_subject_write(request, body.subject_id)
     return studio_memory.add_memory(
         body.text, subject_id=body.subject_id, kind=body.kind
     )
@@ -1566,22 +1614,43 @@ async def memory_add(body: MemoryAddRequest) -> Any:
     "/memory/{memory_id}",
     dependencies=[Depends(studio_permission(_RES_MEMORY, "write"))],
 )
-async def memory_forget(memory_id: str) -> dict[str, bool]:
+async def memory_forget(memory_id: str, request: Request) -> dict[str, bool]:
+    """Forget one memory — a ``subject_scoped`` caller may only forget its OWN subject's.
+
+    The record's owning ``subject_id`` is checked against the principal: a cross-subject
+    delete folds to a uniform 404 (existence never leaked), mirroring the runs by-id
+    reader. NO-OP offline / ``all_tenants``.
+    """
     from himmy.api import studio_memory
 
+    rec = studio_memory.get_memory(memory_id)
+    if rec is not None and not authorize_object(request, rec.subject_id):
+        raise HTTPException(status_code=404, detail=f"unknown memory {memory_id!r}")
     return {"ok": studio_memory.forget(memory_id)}
 
 
 @router.post(
     "/memory/recall",
-    dependencies=[Depends(studio_permission(_RES_MEMORY, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "read")),
+        Depends(scoped_read),
+    ],
 )
-async def memory_recall(body: MemoryRecallRequest) -> list[Any]:
+async def memory_recall(body: MemoryRecallRequest, request: Request) -> list[Any]:
+    """Semantic recall — ``subject_id`` from the body is NEVER honored over the principal.
+
+    This POST performs a READ: a tenant-bound / ``subject_scoped`` principal could
+    otherwise recall another data subject's semantic memories from the shared process
+    store by passing their ``subject_id`` in the body (a cross-subject BOLA the GET-only
+    coverage gate could not see). The subject is now derived from the verified principal
+    via :func:`_scoped_memory_subject` — a ``subject_scoped`` caller is pinned to its own
+    subject, the body value ignored. NO-OP offline / ``all_tenants``.
+    """
     from himmy.api import studio_memory
 
     return await studio_memory.recall(
         body.query,
-        subject_id=body.subject_id,
+        subject_id=_scoped_memory_subject(request, body.subject_id),
         top_k=body.top_k,
         similarity_threshold=body.similarity_threshold,
     )

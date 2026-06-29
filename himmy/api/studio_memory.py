@@ -148,13 +148,35 @@ def current_memory_store() -> MemoryStore | None:
     return _STORE
 
 
-def list_subjects() -> list[str]:
-    """Distinct subject ids that have memories (newest-active first)."""
+def list_subjects(*, only_subject: str | None = None) -> list[str]:
+    """Distinct subject ids that have memories (newest-active first).
+
+    When ``only_subject`` is given (a ``subject_scoped`` principal's own subject, derived
+    by the router from the verified principal — never client input), the enumeration is
+    NARROWED to just that subject, closing the cross-subject enumeration oracle. ``None``
+    (the offline / ``all_tenants`` default) returns every subject — byte-unchanged.
+    """
     seen: list[str] = []
     for r in _store().list():
+        if only_subject is not None and r.subject_id != only_subject:
+            continue
         if r.subject_id not in seen:
             seen.append(r.subject_id)
     return sorted(seen) or ["default"]
+
+
+def get_memory(memory_id: str) -> MemoryItem | None:
+    """One memory by id (for the router's by-id subject/BOLA check), or ``None``."""
+    rec = _store().get(memory_id)
+    if rec is None:
+        return None
+    return MemoryItem(
+        memory_id=rec.memory_id,
+        subject_id=rec.subject_id,
+        kind=rec.kind,
+        text=rec.text,
+        created_at=rec.created_at,
+    )
 
 
 def list_memories(subject_id: str) -> list[MemoryItem]:
@@ -265,6 +287,7 @@ __all__ = [
     "reset_memory_service",
     "list_subjects",
     "list_memories",
+    "get_memory",
     "add_memory",
     "forget",
     "recall",
