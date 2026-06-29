@@ -25,7 +25,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -377,6 +377,25 @@ def _jsonable_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _workflow_stream(
+    wf: Any, spec: Any, body: WorkflowStreamRequest, tool_authorizer: Any = None
+) -> AsyncIterator[str]:
+    """Bind the request principal's gate ambiently, then drive the workflow stream.
+
+    centralize-tool-gate: ``tool_authorizer`` is the request principal's tool-capability
+    gate, bound AMBIENTLY for the whole drive so every workflow step's tool dispatch is
+    enforced even though this surface builds the runtime without threading the authorizer
+    explicitly. ``None`` offline (no authenticator) → inert, byte-unchanged. The actual
+    drive lives in :func:`_workflow_stream_body`; this wrapper just scopes the ambient
+    binding around the entire async iteration.
+    """
+    from himmy.services.tools.ambient import use_tool_authorizer
+
+    with use_tool_authorizer(tool_authorizer):
+        async for frame in _workflow_stream_body(wf, spec, body):
+            yield frame
+
+
+async def _workflow_stream_body(
     wf: Any, spec: Any, body: WorkflowStreamRequest
 ) -> AsyncIterator[str]:
     """Drive one workflow run, yielding SSE frames per node transition.
@@ -509,7 +528,9 @@ async def _workflow_stream(
 
 
 @_workflows.post("/run-stream", dependencies=[_workflows_write])
-async def run_workflow_stream(body: WorkflowStreamRequest) -> StreamingResponse:
+async def run_workflow_stream(
+    body: WorkflowStreamRequest, request: Request
+) -> StreamingResponse:
     """Run a workflow with the chosen agent, streaming node-level events (SSE).
 
     Node frames carry ``state``: ``running`` → ``completed`` | ``failed``; the
@@ -532,8 +553,13 @@ async def run_workflow_stream(body: WorkflowStreamRequest) -> StreamingResponse:
     if not wf.steps:
         raise HTTPException(status_code=400, detail="workflow has no steps")
 
+    # centralize-tool-gate: thread the request principal's tool-capability gate so workflow
+    # step tools are enforced (inert offline). Bound ambiently inside ``_workflow_stream``.
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
     return StreamingResponse(
-        _workflow_stream(wf, spec, body),
+        _workflow_stream(wf, spec, body, tool_authorizer),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

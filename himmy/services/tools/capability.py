@@ -142,6 +142,35 @@ class ToolCapabilityAuthorizer:
             scopes=frozenset(str(s) for s in scopes),
         )
 
+    @classmethod
+    def from_request(cls, request: Any) -> ToolCapabilityAuthorizer | None:
+        """Build the gate for an in-flight HTTP request from its verified principal.
+
+        The request-boundary seam (centralize-tool-gate): the Studio chat / team /
+        workflow streaming surfaces and the routine ``agent_path`` seam build their runtime
+        WITHOUT threading a ``tool_authorizer`` explicitly — they instead bind THIS gate
+        ambiently (:func:`himmy.services.tools.ambient.use_tool_authorizer`) around the run
+        drive, so the tool chokepoint enforces the request principal's tool reach without
+        every router having to plumb the authorizer through ``build_runtime_for_spec``.
+
+        Returns ``None`` when no authenticator is configured (``app.state.authenticator``
+        is ``None`` — the offline / loopback Studio default) so the ambient binding is inert
+        and tool dispatch is byte-unchanged. Otherwise it is the verified principal's
+        :meth:`from_principal` authorizer over the app's :class:`AccessPolicy` — a
+        non-enforcing pass-through for an unrestricted principal, an enforcing
+        deny-by-default gate for a tenant-bound one. Mirrors the connector-inbound and
+        ``require_permission`` posture exactly: enforcement engages when auth does.
+        """
+        app = getattr(request, "app", None)
+        state = getattr(app, "state", None)
+        authenticator = getattr(state, "authenticator", None)
+        policy = getattr(state, "access_policy", None)
+        if authenticator is None or policy is None:
+            return None
+        from himmy.api.auth.context import get_principal
+
+        return cls.from_principal(get_principal(request), policy)
+
     def attenuate(self) -> ToolCapabilityAuthorizer:
         """Return the authorizer a spawned sub-agent inherits (never wider than ``self``).
 

@@ -673,6 +673,15 @@ def create_app(
         logger.warning("wiring routine container failed", exc_info=True)
 
     app.state.authenticator = authenticator
+    # centralize-tool-gate: record the deployment's auth posture process-wide so the tool
+    # chokepoint fails CLOSED when a path reaches it with NO authorizer in scope under a
+    # configured authenticator (a future path that forgot BOTH the explicit arg AND the
+    # ambient contextvar denies, instead of silently running un-gated). With no
+    # authenticator (offline default) this stays False and the chokepoint is a pure pass —
+    # byte-unchanged. Mirrors ``require_permission``: enforcement engages when auth does.
+    from himmy.services.tools.ambient import mark_auth_configured
+
+    mark_auth_configured(authenticator is not None)
     # Authorization: role → permission policy (data-driven via HIMMY_RBAC_FILE).
     # Enforced per-route via require_permission; bypassed when auth is off.
     app.state.access_policy = build_access_policy()

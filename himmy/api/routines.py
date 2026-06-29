@@ -1111,6 +1111,22 @@ def resolve_routine_container() -> Any | None:
         return None
 
 
+def _routine_access_policy() -> Any | None:
+    """The active RBAC :class:`AccessPolicy`, or ``None`` when auth is not configured.
+
+    centralize-tool-gate: the ``agent_path`` routine seam runs off any HTTP request, so it
+    cannot read ``app.state.access_policy``; it reads it from the wired run service instead
+    (the SAME policy the ``/v1`` paths use, set in ``create_app`` ONLY when an authenticator
+    is configured). ``None`` offline (no server / no authenticator) so the routine's ambient
+    gate is inert — byte-unchanged.
+    """
+    container = resolve_routine_container()
+    if container is None:
+        return None
+    run_app = getattr(container, "run_app", None)
+    return getattr(run_app, "_access_policy", None)
+
+
 # ---- headless execution ------------------------------------------------------
 
 
@@ -1176,27 +1192,56 @@ async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
         "routine_id": routine.id,
     }
 
+    # centralize-tool-gate: the scheduler runs on a background loop with NO HTTP request,
+    # so it must bind the tool-capability gate ambiently itself (the request-boundary seam
+    # cannot reach here). Under a CONFIGURED authenticator the gate is the routine's
+    # least-privilege SERVICE principal (the SAME identity the ``agent_id`` seam stamps as
+    # its run actor), so the routine's tools are deny-by-default to that service role rather
+    # than running with the agent's full authority. Offline (no server / no authenticator)
+    # ``_routine_access_policy`` is ``None`` → the ambient gate is ``None`` and inert,
+    # byte-unchanged. Were this binding ever forgotten under configured auth, the
+    # chokepoint's process-level fail-closed default would deny every tool anyway.
+    from himmy.services.tools.ambient import _active_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    _routine_policy = _routine_access_policy()
+    if _routine_policy is not None:
+        from himmy.api.auth.service_principal import routine_service_principal
+
+        routine_authorizer = ToolCapabilityAuthorizer.from_principal(
+            routine_service_principal(workspace_id=routine.workspace_id or "__local__"),
+            _routine_policy,
+        )
+    else:
+        routine_authorizer = None
+
     async def _drain() -> None:
         nonlocal output, status, error
-        async for event in studio_service.stream_agent_run(
-            spec,
-            routine.prompt,
-            provider=routine.provider,
-            model=routine.model,
-            agent_path=agent_path,
-            canonical_storage=canonical,
-            extra_metadata=routine_metadata,
-        ):
-            kind = event.get("type")
-            if kind == "message":
-                output = str(event.get("text") or output)
-            elif kind == "done":
-                output = str(event.get("output_text") or output)
-            elif kind == "paused":
-                status = "awaiting_approval"
-            elif kind == "error":
-                status = "error"
-                error = str(event.get("message") or "run failed")
+        # Bind the routine gate ambiently for the whole drain via set/reset; reset in
+        # ``finally`` so the binding is strictly scoped to this drain.
+        _routine_authz_token = _active_authorizer.set(routine_authorizer)
+        try:
+            async for event in studio_service.stream_agent_run(
+                spec,
+                routine.prompt,
+                provider=routine.provider,
+                model=routine.model,
+                agent_path=agent_path,
+                canonical_storage=canonical,
+                extra_metadata=routine_metadata,
+            ):
+                kind = event.get("type")
+                if kind == "message":
+                    output = str(event.get("text") or output)
+                elif kind == "done":
+                    output = str(event.get("output_text") or output)
+                elif kind == "paused":
+                    status = "awaiting_approval"
+                elif kind == "error":
+                    status = "error"
+                    error = str(event.get("message") or "run failed")
+        finally:
+            _active_authorizer.reset(_routine_authz_token)
 
     try:
         await asyncio.wait_for(_drain(), timeout=run_timeout_s())

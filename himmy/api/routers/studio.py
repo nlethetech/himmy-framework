@@ -274,19 +274,28 @@ async def run(body: RunRequest, request: Request) -> StreamingResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     canonical = _canonical_storage(request)
+    # centralize-tool-gate: bind the request principal's tool-capability gate ambiently for
+    # the whole stream so the Studio chat run's tools are enforced (this surface builds its
+    # runtime without an explicit authorizer). ``None`` offline (no authenticator) → inert,
+    # byte-unchanged loopback default.
+    from himmy.services.tools.ambient import use_tool_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
-            async for event in studio_service.stream_agent_run(
-                spec,
-                body.prompt,
-                history=[t.model_dump() for t in body.history],
-                provider=body.provider,
-                model=body.model,
-                agent_path=body.agent_path,
-                canonical_storage=canonical,
-            ):
-                yield _sse(event)
+            with use_tool_authorizer(tool_authorizer):
+                async for event in studio_service.stream_agent_run(
+                    spec,
+                    body.prompt,
+                    history=[t.model_dump() for t in body.history],
+                    provider=body.provider,
+                    model=body.model,
+                    agent_path=body.agent_path,
+                    canonical_storage=canonical,
+                ):
+                    yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - surface as a terminal error frame
             yield _sse({"type": "error", "message": str(exc)})
 
@@ -325,17 +334,25 @@ async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
     teams = {t.path: t for t in studio_service.list_teams()}
     team_name = teams[body.team_path].name if body.team_path in teams else "team"
     canonical = _canonical_storage(request)
+    # centralize-tool-gate: bind the request principal's gate ambiently for the team
+    # stream (inert offline). Members dispatch tools through runtimes this surface builds
+    # without an explicit authorizer; the ambient binding makes the chokepoint enforce.
+    from himmy.services.tools.ambient import use_tool_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
-            async for event in studio_service.stream_team_run(
-                spec,
-                body.prompt,
-                team_name=team_name,
-                team_path=body.team_path,
-                canonical_storage=canonical,
-            ):
-                yield _sse(event)
+            with use_tool_authorizer(tool_authorizer):
+                async for event in studio_service.stream_team_run(
+                    spec,
+                    body.prompt,
+                    team_name=team_name,
+                    team_path=body.team_path,
+                    canonical_storage=canonical,
+                ):
+                    yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
             yield _sse({"type": "error", "message": str(exc)})
 
@@ -395,18 +412,24 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
         model=body.model or "default",
     )
     canonical = _canonical_storage(request)
+    # centralize-tool-gate: bind the request principal's gate ambiently (inert offline).
+    from himmy.services.tools.ambient import use_tool_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
-            async for event in studio_service.stream_agent_run(
-                spec,
-                body.query,
-                provider=body.provider,
-                model=body.model,
-                agent_path="(deep-research)",
-                canonical_storage=canonical,
-            ):
-                yield _sse(event)
+            with use_tool_authorizer(tool_authorizer):
+                async for event in studio_service.stream_agent_run(
+                    spec,
+                    body.query,
+                    provider=body.provider,
+                    model=body.model,
+                    agent_path="(deep-research)",
+                    canonical_storage=canonical,
+                ):
+                    yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
             yield _sse({"type": "error", "message": str(exc)})
 
@@ -939,13 +962,21 @@ def _approval_actor(request: Request) -> str:
 
 
 def _resolve_stream(
-    checkpoint_id: str, approved: bool, actor: str
+    checkpoint_id: str, approved: bool, actor: str, tool_authorizer: Any = None
 ) -> StreamingResponse:
+    # centralize-tool-gate: bind the request principal's gate ambiently for the resumed
+    # run so the re-executed (approved) tool — and any further tools in the resumed loop —
+    # are enforced. Inert offline (``tool_authorizer`` None). The resume rebuilds the
+    # runtime via build_runtime_for_spec without an explicit authorizer, so the ambient
+    # binding is what reaches the chokepoint.
+    from himmy.services.tools.ambient import use_tool_authorizer
+
     async def _gen() -> AsyncIterator[str]:
-        async for event in studio_approvals.resolve(
-            checkpoint_id, approved=approved, actor=actor
-        ):
-            yield _sse(event)
+        with use_tool_authorizer(tool_authorizer):
+            async for event in studio_approvals.resolve(
+                checkpoint_id, approved=approved, actor=actor
+            ):
+                yield _sse(event)
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
@@ -956,7 +987,14 @@ def _resolve_stream(
 )
 async def approve(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Approve the pending tool call and stream the resumed run."""
-    return _resolve_stream(checkpoint_id, True, _approval_actor(request))
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    return _resolve_stream(
+        checkpoint_id,
+        True,
+        _approval_actor(request),
+        ToolCapabilityAuthorizer.from_request(request),
+    )
 
 
 @router.post(
@@ -965,7 +1003,14 @@ async def approve(checkpoint_id: str, request: Request) -> StreamingResponse:
 )
 async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Reject the pending tool call and stream the resumed run."""
-    return _resolve_stream(checkpoint_id, False, _approval_actor(request))
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    return _resolve_stream(
+        checkpoint_id,
+        False,
+        _approval_actor(request),
+        ToolCapabilityAuthorizer.from_request(request),
+    )
 
 
 # ---- Models (available providers + models) ------------------------------
@@ -1471,11 +1516,15 @@ async def eval_suites() -> list[Any]:
 @router.post(
     "/evals/run", dependencies=[Depends(studio_permission(_RES_EVALS, "write"))]
 )
-async def eval_run(body: EvalRunRequest) -> Any:
+async def eval_run(body: EvalRunRequest, request: Request) -> Any:
     import asyncio
 
     from himmy.api import studio_eval
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
+    # centralize-tool-gate: thread the request principal's gate so eval-run tools are
+    # enforced (inert offline). Bound ambiently inside ``run_eval``.
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
     try:
         return await asyncio.wait_for(
             studio_eval.run_eval(
@@ -1483,6 +1532,7 @@ async def eval_run(body: EvalRunRequest) -> Any:
                 body.agent_path,
                 provider=body.provider,
                 model=body.model,
+                tool_authorizer=tool_authorizer,
             ),
             timeout=900,
         )
@@ -1514,11 +1564,15 @@ async def workflows() -> list[Any]:
     "/workflows/run",
     dependencies=[Depends(studio_permission(_RES_WORKFLOWS, "write"))],
 )
-async def workflow_run(body: WorkflowRunRequest) -> Any:
+async def workflow_run(body: WorkflowRunRequest, request: Request) -> Any:
     import asyncio
 
     from himmy.api import studio_workflows
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
+    # centralize-tool-gate: thread the request principal's gate so workflow step tools are
+    # enforced (inert offline). Bound ambiently inside ``run_workflow``.
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
     try:
         return await asyncio.wait_for(
             studio_workflows.run_workflow(
@@ -1527,6 +1581,7 @@ async def workflow_run(body: WorkflowRunRequest) -> Any:
                 provider=body.provider,
                 model=body.model,
                 initial_state=body.initial_state,
+                tool_authorizer=tool_authorizer,
             ),
             timeout=900,
         )

@@ -1720,6 +1720,52 @@ class RunAppService:
         :class:`ChatThread` the loop continues so the model sees earlier turns; ``None``
         starts a fresh thread (every pre-T2g call site).
         """
+        # centralize-tool-gate: bind this run's tool-capability gate AMBIENTLY for the whole
+        # drive (set BEFORE _resolve_runtime so it propagates into the off-loop
+        # build_runtime_for_spec and the background run-task — contextvars copy into
+        # asyncio.to_thread/create_task). Even a runtime built by a sub-path that forgot to
+        # thread the authorizer then consults the gate at the tool chokepoint. The explicit
+        # threading into build_runtime_for_spec stays (authoritative for cross-process
+        # recovery + sub-agent attenuation); this is the belt-and-braces ambient layer. A
+        # None authorizer (no RBAC policy wired / offline) binds an inert "no ambient gate"
+        # scope, byte-unchanged.
+        from himmy.services.tools.ambient import use_tool_authorizer
+
+        ambient_authorizer = self._build_tool_authorizer(
+            (run.metadata or {}).get("actor")
+        )
+        with use_tool_authorizer(ambient_authorizer):
+            await self._execute_on_runtime_inner(
+                run,
+                persona=persona,
+                task=task,
+                llm_config=llm_config,
+                agent_spec=agent_spec,
+                agent_def=agent_def,
+                hitl=hitl,
+                plan=plan,
+                thread=thread,
+            )
+
+    async def _execute_on_runtime_inner(
+        self,
+        run: RunRecord,
+        *,
+        persona: Persona,
+        task: Task,
+        llm_config: LLMConfig | None,
+        agent_spec: AgentSpec | None,
+        agent_def: AgentDefRecord | None = None,
+        hitl: bool = False,
+        plan: bool = False,
+        thread: ChatThread | None = None,
+    ) -> None:
+        """The run-drive body, executed inside the ambient-authorizer scope.
+
+        Split out of :meth:`_execute_on_runtime` so the ambient tool-capability binding
+        wraps the ENTIRE drive (runtime build + loop) with a single ``with`` block; all
+        the original logic is unchanged below.
+        """
         # HITL/plan runs pause into /v1's OWN checkpoint store; the plain single-turn path
         # passes None so the per-run runtime stays exactly as the T0.2 build wired it.
         agentic = hitl or plan
@@ -2684,6 +2730,16 @@ class RunAppService:
                     return
                 members.append(rec)
 
+            # centralize-tool-gate: bind the launcher's gate ambiently across the resume
+            # drive too (belt-and-braces; the explicit arg below stays authoritative). Use
+            # the contextvar set/reset directly (not a ``with``) so the large call block
+            # below keeps its indentation; reset in ``finally`` so the binding is scoped.
+            from himmy.services.tools.ambient import _active_authorizer
+
+            resume_authorizer = self._build_tool_authorizer(
+                (run.metadata or {}).get("actor")
+            )
+            _resume_authz_token = _active_authorizer.set(resume_authorizer)
             try:
                 outcome = await asyncio.wait_for(
                     run_orchestration(
@@ -2704,9 +2760,7 @@ class RunAppService:
                         # P0 confused-deputy fix: re-thread the launching principal's
                         # tool-capability gate from the run's persisted actor on resume too,
                         # so a HITL resume cannot regain tool reach the launcher lacked.
-                        tool_authorizer=self._build_tool_authorizer(
-                            (run.metadata or {}).get("actor")
-                        ),
+                        tool_authorizer=resume_authorizer,
                     ),
                     timeout=self._run_timeout_seconds,
                 )
@@ -2740,6 +2794,8 @@ class RunAppService:
                 run.updated_at = _now()
                 await self._storage.save_run(run)
                 return
+            finally:
+                _active_authorizer.reset(_resume_authz_token)
 
             await self._apply_orchestration_outcome(run, outcome)
 
@@ -3110,6 +3166,20 @@ class RunAppService:
                 run.status = RunStatus.RUNNING
                 run.updated_at = _now()
                 await self._storage.save_run(run)
+                # centralize-tool-gate: also bind the launching principal's gate AMBIENTLY
+                # for the whole orchestration drive, so every member runtime — including any
+                # built by an orchestrator sub-path that forgot to thread the authorizer —
+                # consults the chokepoint. The explicit ``tool_authorizer=`` below stays
+                # authoritative (it attenuates per member); this is the belt-and-braces
+                # ambient layer. Inert (None) offline / when no RBAC policy is wired. Use the
+                # contextvar set/reset directly (not ``with``) so the large call block keeps
+                # its indentation; reset in ``finally`` so the binding is scoped.
+                from himmy.services.tools.ambient import _active_authorizer
+
+                team_authorizer = self._build_tool_authorizer(
+                    (run.metadata or {}).get("actor")
+                )
+                _team_authz_token = _active_authorizer.set(team_authorizer)
                 try:
                     outcome = await asyncio.wait_for(
                         run_orchestration(
@@ -3134,9 +3204,7 @@ class RunAppService:
                             # invoke tools the launcher's own role was granted (no-op
                             # offline / when no RBAC policy is wired). Mirrors the
                             # single-agent path's _resolve_runtime/_build_tool_authorizer.
-                            tool_authorizer=self._build_tool_authorizer(
-                                (run.metadata or {}).get("actor")
-                            ),
+                            tool_authorizer=team_authorizer,
                         ),
                         timeout=self._run_timeout_seconds,
                     )
@@ -3163,6 +3231,8 @@ class RunAppService:
                     run.updated_at = _now()
                     await self._storage.save_run(run)
                     return
+                finally:
+                    _active_authorizer.reset(_team_authz_token)
 
                 run.thread_id = outcome.thread_id
                 run.output_text = outcome.output_text or None

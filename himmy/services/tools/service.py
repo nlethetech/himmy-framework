@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 from himmy.config.secrets import get_secret
 from himmy.core.events import EventType, RunEvent
+from himmy.services.tools.ambient import resolve_effective_authorizer
 from himmy.services.tools.models import (
     HttpAuthMode,
     HttpPaginationMode,
@@ -547,7 +548,17 @@ class ToolService:
         # ``None`` authorizer both pass unconditionally, so this is a pure no-op until an
         # authenticator is configured. A denied tool is refused BEFORE any arg validation
         # or handler dispatch, so an unauthorized call never reaches the world.
-        if self._tool_authorizer is not None and not self._tool_authorizer.authorize_definition(
+        #
+        # centralize-tool-gate: the EFFECTIVE authorizer combines this service's explicit
+        # ``_tool_authorizer`` with the AMBIENT one set on the run/request contextvar
+        # (:mod:`himmy.services.tools.ambient`), so a ``ToolService`` built by a path that
+        # FORGOT to thread the arg still consults the gate — no execution path can run a
+        # tool un-gated when an authorizer is in scope. When auth is configured but NEITHER
+        # is present, the resolver returns the ``DENY_ALL`` fail-closed sentinel; offline
+        # (no authenticator, no ambient, no arg) it returns ``None`` and this branch is a
+        # pure pass exactly as before.
+        effective_authorizer = resolve_effective_authorizer(self._tool_authorizer)
+        if effective_authorizer is not None and not effective_authorizer.authorize_definition(
             definition
         ):
             # red-team r6: emit the DISTINCT ``CAPABILITY_DENIED`` (not ``POLICY_BLOCKED``).
