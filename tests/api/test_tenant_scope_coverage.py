@@ -218,9 +218,6 @@ _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
 _STUDIO_TENANT_PENDING: frozenset[str] = frozenset(
     {
         # process-local registries (no tenant stamp on the in-memory record)
-        "/api/studio/missions",
-        "/api/studio/missions/{mission_id}",
-        "/api/studio/missions/{mission_id}/stream",
         "/api/studio/notify",
         # entity-spine governance + lineage (registry.list_by_kind/get has no tenant axis)
         "/api/studio/privacy/subjects",

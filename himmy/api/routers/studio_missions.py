@@ -25,8 +25,16 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from himmy.api.auth import scoped_read
+from himmy.api.auth.context import (
+    authorize_object,
+    authorize_studio_object,
+    get_principal,
+    resolve_workspace,
+)
 from himmy.api.missions import (
     STEER_TEXT_MAX,
+    Mission,
     MissionLimitError,
     MissionNotFoundError,
     MissionNotRunningError,
@@ -36,6 +44,11 @@ from himmy.api.missions import (
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("missions", tag="studio-missions")
+#: This surface derives its read scope from the verified principal (the tenant/subject the
+#: mission was stamped with at start time) and refuses out-of-scope missions — so it carries
+#: the tenant-scope coverage gate's ``scoped_read`` marker and is no longer on that gate's
+#: time-boxed ``_STUDIO_TENANT_PENDING`` allow-list. A pure no-op offline / ``all_tenants``.
+router.dependencies.append(Depends(scoped_read))
 
 #: Launching/steering/interrupting an autonomous mission is a privileged mutation gated
 #: by ``studio.missions:write`` (admin-only by default), additively on top of the
@@ -113,13 +126,54 @@ def _view(mission: Any) -> MissionView:
     return MissionView(**mission.summary())
 
 
+def _may_read(request: Request, mission: Mission) -> bool:
+    """Whether this request's principal may see ``mission`` (tenant AND subject axes).
+
+    The centralized data-scoping gate for the process-local mission registry: a mission is
+    visible iff its OWNING ``workspace_id`` passes :func:`authorize_studio_object` (the
+    tenant/IDOR axis) AND its ``subject_id`` passes :func:`authorize_object` (the subject/
+    BOLA axis). Both are strict NO-OPs for an unrestricted (offline / ``all_tenants``)
+    principal — and an unowned mission (``None`` workspace/subject, the single-box default)
+    is allowed by both — so the zero-config path is byte-unchanged. A tenant-bound or
+    ``subject_scoped`` caller never sees another tenant's / subject's mission.
+    """
+    return authorize_studio_object(
+        request, mission.workspace_id
+    ) and authorize_object(request, mission.subject_id)
+
+
+def _owned_or_404(request: Request, mission_id: str) -> Mission:
+    """Fetch a mission, folding a cross-tenant/cross-subject one to a uniform 404.
+
+    Returning 404 (not 403) means a tenant-bound / subject-scoped principal cannot even
+    probe the existence of another tenant's / subject's mission by id — mirroring the
+    not-found-on-cross-scope convention of the ``/v1`` and Studio run readers.
+    """
+    try:
+        mission = _registry(request).get(mission_id)
+    except MissionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not _may_read(request, mission):
+        raise HTTPException(status_code=404, detail=f"unknown mission {mission_id!r}")
+    return mission
+
+
 # ---- endpoints -------------------------------------------------------------
 
 
 @router.post("", response_model=dict[str, str], dependencies=[_missions_write])
 async def start_mission(body: MissionStartRequest, request: Request) -> dict[str, str]:
-    """Start a background agent run; returns immediately with the mission id."""
+    """Start a background agent run; returns immediately with the mission id.
+
+    The mission is STAMPED with the owning tenant + data subject derived from the verified
+    principal (``resolve_workspace`` / ``get_principal``), never from the request body, so a
+    later read can be scoped to it. Both are ``None`` for an unrestricted offline /
+    ``all_tenants`` caller, leaving the mission unowned and visible to all — byte-unchanged.
+    """
     registry = _registry(request)
+    principal = get_principal(request)
+    owner_workspace = None if principal.all_tenants else resolve_workspace(request, None)
+    owner_subject = None if principal.all_tenants else principal.subject
     try:
         mission = registry.start_mission(
             agent_path=body.agent_path,
@@ -128,6 +182,8 @@ async def start_mission(body: MissionStartRequest, request: Request) -> dict[str
             model=body.model,
             history=[t.model_dump() for t in body.history],
             plan_mode=body.plan_mode,
+            workspace_id=owner_workspace,
+            subject_id=owner_subject,
         )
     except MissionLimitError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -146,19 +202,17 @@ async def list_missions(request: Request) -> MissionListResponse:
     RUNNING ones do not survive a server restart.
     """
     registry = _registry(request)
+    visible = [m for m in registry.list() if _may_read(request, m)]
     return MissionListResponse(
-        items=[_view(m) for m in registry.list()],
-        running=registry.running_count(),
+        items=[_view(m) for m in visible],
+        running=sum(1 for m in visible if m.status == "running"),
         limit=registry.max_running,
     )
 
 
 @router.get("/{mission_id}", response_model=MissionView)
 async def get_mission(mission_id: str, request: Request) -> MissionView:
-    try:
-        return _view(_registry(request).get(mission_id))
-    except MissionNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _view(_owned_or_404(request, mission_id))
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -173,10 +227,8 @@ async def stream_mission(mission_id: str, request: Request) -> StreamingResponse
     client that dropped mid-run simply reattaches and catches up.
     """
     registry = _registry(request)
-    try:
-        registry.get(mission_id)  # 404 before the stream starts, not inside it
-    except MissionNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # 404 before the stream starts (cross-tenant/subject folds to a uniform not-found).
+    _owned_or_404(request, mission_id)
 
     async def _gen() -> AsyncIterator[str]:
         try:
@@ -200,6 +252,7 @@ async def steer_mission(
     mission_id: str, body: SteerRequest, request: Request
 ) -> MissionView:
     """Queue guidance the loop injects as a USER message before its next turn."""
+    _owned_or_404(request, mission_id)  # cross-scope mission is an opaque 404
     try:
         mission = await _registry(request).steer(mission_id, body.text)
     except MissionNotFoundError as exc:
@@ -217,6 +270,7 @@ async def steer_mission(
 async def interrupt_mission(mission_id: str, request: Request) -> InterruptResponse:
     """Stop a mission — honestly reporting checkpoint-pause vs cooperative cancel."""
     registry = _registry(request)
+    _owned_or_404(request, mission_id)  # cross-scope mission is an opaque 404
     try:
         outcome = await registry.interrupt(mission_id)
     except MissionNotFoundError as exc:

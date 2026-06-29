@@ -70,7 +70,17 @@ def _cap(text: str, n: int) -> str:
 
 @dataclass
 class Mission:
-    """One background agent run: identity, live status, and its frame buffer."""
+    """One background agent run: identity, live status, and its frame buffer.
+
+    ``workspace_id`` / ``subject_id`` are the OWNING tenant + data subject, stamped at
+    :meth:`MissionRegistry.start_mission` time from the verified principal (never from
+    client input — the router resolves them via ``resolve_workspace`` / ``get_principal``).
+    They carry the tenant/subject axes the process-local registry previously lacked, so a
+    Studio read can refuse a mission belonging to another tenant/subject (BOLA/IDOR) — the
+    by-construction drain of this surface from the tenant-scope coverage gate's pending
+    allow-list. ``None`` means "no owning tenant/subject" (the offline / ``all_tenants``
+    single-box default), in which case every reader sees it — byte-unchanged.
+    """
 
     id: str
     agent: str
@@ -80,6 +90,8 @@ class Mission:
     model: str | None
     plan_mode: bool
     created_at: str
+    workspace_id: str | None = None
+    subject_id: str | None = None
     status: str = _RUNNING
     finished_at: str | None = None
     result_preview: str = ""
@@ -166,12 +178,20 @@ class MissionRegistry:
         model: str | None = None,
         history: builtins.list[dict[str, Any]] | None = None,
         plan_mode: bool = False,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
     ) -> Mission:
         """Spawn the existing stream-run generator inside a server-side task.
 
         Raises :class:`MissionLimitError` past the concurrency cap, and lets the
         spec loader's ``FileNotFoundError`` / ``ValueError`` propagate so the
         router can map them to clean 404/400s BEFORE anything is registered.
+
+        ``workspace_id`` / ``subject_id`` are the resolved-from-principal owning tenant +
+        subject (the router derives them from the verified caller, never from the request
+        body), stamped on the :class:`Mission` so a Studio read can refuse it to a
+        different tenant/subject. ``None`` (the offline / ``all_tenants`` default) leaves
+        the mission unowned and visible to every reader — byte-unchanged.
         """
         from himmy.api import studio_service
 
@@ -192,6 +212,8 @@ class MissionRegistry:
             model=model,
             plan_mode=plan_mode,
             created_at=utc_now_iso(),
+            workspace_id=workspace_id,
+            subject_id=subject_id,
             history=list(history or []),
         )
         self._missions[mission.id] = mission
