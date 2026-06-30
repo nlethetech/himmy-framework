@@ -1721,7 +1721,9 @@ async def memory_list(request: Request, subject: str = "default") -> list[Any]:
     """
     from himmy.api import studio_memory
 
-    return studio_memory.list_memories(_scoped_memory_subject(request, subject))
+    return studio_memory.list_memories(
+        _scoped_memory_subject(request, subject) or "default"
+    )
 
 
 @router.post(
@@ -1789,7 +1791,7 @@ async def memory_recall(body: MemoryRecallRequest, request: Request) -> list[Any
 
     return await studio_memory.recall(
         body.query,
-        subject_id=_scoped_memory_subject(request, body.subject_id),
+        subject_id=_scoped_memory_subject(request, body.subject_id) or "default",
         top_k=body.top_k,
         similarity_threshold=body.similarity_threshold,
     )

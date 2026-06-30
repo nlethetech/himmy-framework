@@ -481,6 +481,8 @@ async def get_studio_run_unified(
 
 
 __all__ = [
+    "LOCAL_SUBJECT",
+    "LOCAL_WORKSPACE",
     "get_studio_run_unified",
     "list_studio_runs_unified",
     "record_to_studio_run",

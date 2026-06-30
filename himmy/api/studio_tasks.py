@@ -77,7 +77,7 @@ class TasksStore:
             created_at=r["created_at"],
         )
 
-    def list(self, *, workspace_id: str | None = None) -> list[Task]:
+    def list(self, *, workspace_id: str | frozenset[str] | None = None) -> list[Task]:
         """Tasks, optionally scoped to ``workspace_id`` (``None`` = ALL, byte-unchanged).
 
         A tenant-bound caller passes its authorized workspace and sees only its own rows
@@ -112,7 +112,11 @@ class TasksStore:
         return t
 
     def set_done(
-        self, task_id: str, done: bool, *, workspace_id: str | None = None
+        self,
+        task_id: str,
+        done: bool,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> bool:
         """Mark a task done/undone; a ``workspace_id``-scoped caller cannot touch a foreign row."""
         from himmy.api.studio_tenant_scope import scope_clause
@@ -133,7 +137,7 @@ class TasksStore:
         due: str | None = None,
         priority: int | None = None,
         done: bool | None = None,
-        workspace_id: str | None = None,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> Task | None:
         """Edit a task's due / priority / done in place; returns the updated row or None.
 
@@ -171,7 +175,7 @@ class TasksStore:
         return self._row(row) if row is not None else None
 
     def complete_by_title(
-        self, title: str, *, workspace_id: str | None = None
+        self, title: str, *, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
         from himmy.api.studio_tenant_scope import scope_clause
 
@@ -184,7 +188,9 @@ class TasksStore:
         self._conn.commit()
         return cur.rowcount > 0
 
-    def delete(self, task_id: str, *, workspace_id: str | None = None) -> bool:
+    def delete(
+        self, task_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
         """Delete a task; a ``workspace_id``-scoped caller cannot delete a foreign row."""
         from himmy.api.studio_tenant_scope import scope_clause
 

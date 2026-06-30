@@ -5420,7 +5420,7 @@
     },
     "/v1/diagnostics": {
       "get": {
-        "description": "Global infra/health snapshot (secrets redacted, read-only, not per-tenant).",
+        "description": "Global infra/health snapshot (secrets redacted, read-only, not per-tenant).\n\nHost-posture fields (installed-binary paths, key-presence inventory, DSN host, DB-file\npaths) are disclosed only to an unrestricted (``all_tenants`` / offline) principal; a\ntenant-bound caller gets the posture-free view \u2014 see the module docstring.",
         "operationId": "diagnostics_v1_diagnostics_get",
         "responses": {
           "200": {
@@ -5947,7 +5947,7 @@
     },
     "/v1/models": {
       "get": {
-        "description": "The available local providers + models (with cached bench stats). Secrets-free.",
+        "description": "The available local providers + models (with cached bench stats). Secrets-free.\n\nred-team scope-r5: the catalog's host-derived ``available`` booleans (which LLM binaries\nare installed/running) and the live LOCAL Ollama model inventory are OPERATOR DEPLOYMENT\nPOSTURE \u2014 the SAME reconnaissance class the hardened Studio twin ``GET /api/studio/models``\nwithholds from tenant browse roles. ``model:read`` is held by every tenant browse role, so\na tenant-bound caller now gets the POSTURE-FREE picker (providers advertised as SUPPORTED,\nno live inventory) via ``reveal_host_posture=False``; the offline / ``all_tenants`` / CLI\npath keeps the full host-probed catalog byte-unchanged via\n:func:`~himmy.api.auth.context.reveal_host_posture`.",
         "operationId": "list_models_v1_models_get",
         "responses": {
           "200": {
