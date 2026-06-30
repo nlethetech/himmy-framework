@@ -116,7 +116,12 @@ def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
         min_similarity=config.memory_min_similarity,
         registry=spine,
     )
-    subject = config.memory_subject
+    # P1 tenancy: on a SHARED process store keyed only by subject, every tenant would
+    # otherwise read/write the one static ``memory_subject`` — a cross-tenant confused
+    # deputy (t1's ``remember`` recalled by t2's ``recall``). ``scoped_memory_subject``
+    # namespaces the subject by the run's ``tenant_scope`` when the server threads it in;
+    # ``None`` (offline / one-shot CLI) returns it verbatim — byte-for-byte unchanged.
+    subject = config.scoped_memory_subject()
 
     def remember(args: dict[str, Any]) -> dict[str, Any]:
         record = memory.remember(
@@ -124,7 +129,9 @@ def register_memory_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
             subject_id=subject,
             kind=str(args.get("kind", "semantic")),
         )
-        return {"memory_id": record.memory_id, "subject": subject}
+        # Report the logical (un-namespaced) subject to the agent; the tenant prefix is
+        # an internal isolation detail, not part of the agent-facing contract.
+        return {"memory_id": record.memory_id, "subject": config.memory_subject}
 
     async def recall(args: dict[str, Any]) -> dict[str, Any]:
         threshold = args.get("similarity_threshold")

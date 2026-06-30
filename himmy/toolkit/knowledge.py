@@ -46,9 +46,16 @@ _SEARCH_SCHEMA = {
 
 
 async def _build_durable_kb(
-    dsn: str, embedder: Any, vector_dim: int
+    dsn: str, embedder: Any, vector_dim: int, scope: tuple[str, str]
 ) -> tuple[KnowledgeBase, str]:
-    """Build a Postgres+pgvector-backed KB, persisting across processes by name."""
+    """Build a Postgres+pgvector-backed KB, persisting across processes by name.
+
+    ``scope`` is the ``(workspace_id, client_id)`` the KB is resolved/created under. On a
+    SHARED durable backend a fixed ``("local", "local")`` scope would hand EVERY tenant the
+    same KB (t1's chunks returned by t2's ``kb_search``); the caller passes the run's
+    tenant-namespaced scope so each tenant gets its own isolated KB. ``("local", "local")``
+    (the offline default) preserves the historical single shared KB byte-for-byte.
+    """
     try:
         from himmy.services.storage.postgres import PostgresStorageService
     except Exception as exc:  # pragma: no cover - optional extra missing
@@ -57,6 +64,7 @@ async def _build_durable_kb(
             "pip install 'himmy[postgres]'"
         ) from exc
 
+    workspace_id, client_id = scope
     storage = await PostgresStorageService.connect(dsn)
     await storage.create_knowledge_schema(vector_dim=vector_dim)
     kb = KnowledgeBase(
@@ -65,13 +73,13 @@ async def _build_durable_kb(
         backend=storage.knowledge_backend(),
     )
     existing = await kb.resolve_kb(
-        workspace_id="local", client_id="local", name=_DEFAULT_KB_ID
+        workspace_id=workspace_id, client_id=client_id, name=_DEFAULT_KB_ID
     )
     if existing is not None:
         return kb, existing.kb_id
     record = await kb.create_kb(
-        workspace_id="local",
-        client_id="local",
+        workspace_id=workspace_id,
+        client_id=client_id,
         name=_DEFAULT_KB_ID,
         vector_dim=vector_dim,
     )
@@ -87,17 +95,24 @@ def register_knowledge_pack(registry: ToolRegistry, config: ToolkitConfig) -> No
     """
     state: dict[str, Any] = {}
     embedder, vector_dim = config.build_embedder_and_dim()
+    # P1 tenancy: the KB scope keys are namespaced by the run's ``tenant_scope`` when the
+    # server threads it in, so a SHARED durable (pgvector) backend never hands one tenant's
+    # ingested chunks to another's ``kb_search``. ``None`` → ("local", "local"), the
+    # historical single shared KB — the offline/in-process default is byte-for-byte unchanged.
+    kb_workspace_id, kb_client_id = config.scoped_kb_keys()
 
     async def _ensure_kb() -> tuple[KnowledgeBase, str]:
         """Build the KB (in-process or durable pgvector) on first use; cache it."""
         if "kb" not in state:
             if config.kb_dsn:
-                kb, kb_id = await _build_durable_kb(config.kb_dsn, embedder, vector_dim)
+                kb, kb_id = await _build_durable_kb(
+                    config.kb_dsn, embedder, vector_dim, (kb_workspace_id, kb_client_id)
+                )
             else:
                 kb = KnowledgeBase(storage=StorageService(), embedder=embedder)
                 record = await kb.create_kb(
-                    workspace_id="local",
-                    client_id="local",
+                    workspace_id=kb_workspace_id,
+                    client_id=kb_client_id,
                     name=_DEFAULT_KB_ID,
                     vector_dim=vector_dim,
                 )

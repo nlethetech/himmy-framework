@@ -106,6 +106,19 @@ class ToolkitConfig(BaseModel):
             egress_proxy_url=self.sandbox_egress_proxy_url,
         )
 
+    #: The run's owning ``workspace_id`` (P1 tenancy), threaded in by the server run
+    #: factory (``build_runtime_for_spec(subject=...)`` → ``from_spec``). On a SHARED
+    #: process store — the durable memory ``.himmy/memory.db`` keyed only by subject, and
+    #: the durable pgvector KB pinned to a fixed ``(local, local, default)`` scope — every
+    #: tenant's runs would otherwise collide on one static subject/KB, a cross-tenant
+    #: confused-deputy read (tenant t1's ``remember``/``kb_ingest`` recalled by t2's
+    #: ``recall``/``kb_search``). When set, the memory subject and the KB scope keys are
+    #: NAMESPACED by this value so a tenant can only ever read its OWN rows. ``None`` — the
+    #: one-shot CLI / offline path (one process per tenant, no authenticator) and every
+    #: pre-existing caller — leaves both packs on their historical static scope, so the
+    #: zero-config path is byte-for-byte unchanged.
+    tenant_scope: str | None = None
+
     # memory pack -----------------------------------------------------------
     memory_path: str | None = None  # sqlite file → durable; None → in-process
     memory_subject: str = "default"
@@ -120,6 +133,33 @@ class ToolkitConfig(BaseModel):
     # fact is reconciled (ADD/UPDATE/DELETE/NOOP) against existing ones instead of
     # blindly appended. Off by default so a default agent incurs no extra cost.
     memory_consolidate: bool = False
+
+    def scoped_memory_subject(self) -> str:
+        """The memory subject to actually use, NAMESPACED by the run's tenant when set.
+
+        The by-construction fix for the cross-tenant memory leak: on a shared process
+        store keyed only by subject, every tenant would otherwise read/write the one
+        static ``memory_subject`` (``"default"``). When ``tenant_scope`` is set (the
+        server multi-tenant path) the effective subject is prefixed with the tenant so
+        t1 and t2 never collide; ``None`` (offline / one-shot CLI / every pre-existing
+        caller) returns ``memory_subject`` verbatim — byte-for-byte unchanged.
+        """
+        if self.tenant_scope:
+            return f"t:{self.tenant_scope}:{self.memory_subject}"
+        return self.memory_subject
+
+    def scoped_kb_keys(self) -> tuple[str, str]:
+        """The durable-KB ``(workspace_id, client_id)`` scope, tenant-namespaced when set.
+
+        The knowledge pack pins its KB to a fixed ``(local, local, default)`` scope, so a
+        shared durable (``HIMMY_KB_DSN`` / pgvector) backend hands EVERY tenant the same KB
+        — t1's ``kb_ingest`` chunks come back from t2's ``kb_search``. When ``tenant_scope``
+        is set the scope keys become the tenant's own; ``None`` keeps the historical
+        ``("local", "local")`` so the offline/in-process default is byte-for-byte unchanged.
+        """
+        if self.tenant_scope:
+            return (f"t:{self.tenant_scope}", f"t:{self.tenant_scope}")
+        return ("local", "local")
 
     def build_embedder_and_dim(self) -> tuple[Any, int]:
         """Build the configured embedder and its effective embedding dimension.

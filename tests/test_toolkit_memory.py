@@ -94,6 +94,47 @@ def test_memory_path_colon_memory_opts_out(tmp_path: Path, monkeypatch) -> None:
     assert not (tmp_path / ".himmy").exists()
 
 
+def test_memory_is_isolated_across_tenants_on_shared_store(tmp_path: Path) -> None:
+    """Round-8 regression: a shared durable store does NOT leak memories across tenants.
+
+    The memory pack used to key every run off the static ``memory_subject`` (``"default"``),
+    so on one shared ``.himmy/memory.db`` tenant t1's ``remember`` was recallable by tenant
+    t2's ``recall`` — a cross-tenant confused-deputy read. ``tenant_scope`` namespaces the
+    subject per tenant: t2 must NOT see t1's secret. FAILS before the fix, passes after.
+    """
+    db = str(tmp_path / "shared.db")
+    t1 = _registry(ToolkitConfig(memory_path=db, tenant_scope="tenant-1"))
+    t1.handler_for("remember")({"text": "the launch code is hunter2 for tenant one"})
+
+    t2 = _registry(ToolkitConfig(memory_path=db, tenant_scope="tenant-2"))
+    found = run_async(
+        t2.handler_for("recall")({"query": "launch code hunter2", "top_k": 5})
+    )
+    leaked = [r for r in found["results"] if "hunter2" in r["text"]]
+    assert not leaked, "tenant-2 recalled tenant-1's memory from the shared store"
+
+    # And the owning tenant still recalls its OWN memory (scoping is not over-broad).
+    own = run_async(
+        t1.handler_for("recall")({"query": "launch code hunter2", "top_k": 5})
+    )
+    assert any("hunter2" in r["text"] for r in own["results"])
+
+
+def test_memory_no_tenant_scope_shares_store_byte_unchanged(tmp_path: Path) -> None:
+    """Offline invariant: with NO ``tenant_scope`` (the default) the store is shared as before.
+
+    The zero-config / one-shot-CLI path passes ``tenant_scope=None``; behaviour must be
+    byte-for-byte the historical single-subject store — a fact written by one pack is
+    recallable by another pointed at the same path (matches the pre-fix contract).
+    """
+    db = str(tmp_path / "shared.db")
+    a = _registry(ToolkitConfig(memory_path=db))  # tenant_scope defaults to None
+    a.handler_for("remember")({"text": "the shared note about ducks and the pond"})
+    b = _registry(ToolkitConfig(memory_path=db))
+    found = run_async(b.handler_for("recall")({"query": "ducks pond", "top_k": 3}))
+    assert any("ducks" in r["text"] for r in found["results"])
+
+
 def test_remember_survives_a_fresh_pack_by_default(tmp_path: Path, monkeypatch) -> None:
     """End-to-end durability: a fact remembered with DEFAULT config is recallable
     from a brand-new registry (a 'fresh process')."""

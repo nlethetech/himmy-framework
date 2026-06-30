@@ -359,6 +359,10 @@ def build_runtime_for_spec(
         from himmy.toolkit.memory import effective_memory_path
 
         tk = ToolkitConfig.from_sources(load_project().get("toolkit"))
+        # P1 tenancy: the prompt-injection memory READ must scope to THIS run's tenant too
+        # — on the shared durable ``.himmy/memory.db`` a static subject would surface another
+        # tenant's memories in this run's context. ``None`` (offline) is unchanged.
+        tk.tenant_scope = subject
         memory_db = effective_memory_path(tk, server=server)
         store = SqliteMemoryStore(memory_db) if memory_db else InMemoryMemoryStore()
         memory = MemoryService(
@@ -372,7 +376,7 @@ def build_runtime_for_spec(
             MemoryContextAdapter(
                 memory,
                 top_k=spec.memory_top_k,
-                subject_id=tk.memory_subject,
+                subject_id=tk.scoped_memory_subject(),
                 similarity_threshold=tk.memory_min_similarity,
             )
         )
@@ -468,6 +472,12 @@ def build_runtime_for_spec(
 
             tk_config = ToolkitConfig.from_sources(load_project().get("toolkit"))
             tk_config.server_context = server
+            # P1 tenancy: scope the memory/knowledge packs to THIS run's tenant. On a
+            # shared server process both packs otherwise key off a static subject/KB scope
+            # (cross-tenant confused-deputy read). ``subject`` is the run's workspace_id;
+            # ``None`` (offline / one-shot CLI) leaves both packs on their historical
+            # static scope — byte-for-byte unchanged.
+            tk_config.tenant_scope = subject
             register_packs(registry, spec.tool_packs, tk_config)
         if spec.connectors:
             _register_outbound_connectors(
@@ -481,6 +491,9 @@ def build_runtime_for_spec(
             if "knowledge" not in spec.tool_packs:
                 _kb_config = ToolkitConfig.from_sources(load_project().get("toolkit"))
                 _kb_config.server_context = server
+                # P1 tenancy: tenant-scope the auto-provisioned KB too (same as the
+                # explicit ``knowledge`` pack above); ``None`` offline is unchanged.
+                _kb_config.tenant_scope = subject
                 register_packs(registry, ["knowledge"], _kb_config)
             n = asyncio.run(ingest_knowledge_sources(registry, spec.knowledge))
             if on_log is not None:

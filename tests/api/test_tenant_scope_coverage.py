@@ -345,6 +345,26 @@ _STUDIO_TENANT_PENDING: frozenset[str] = frozenset(
     }
 )
 
+#: Studio memory reads that DO enforce the SUBJECT axis (``narrow_subject`` →
+#: ``scoped_read``, the round-7 cross-subject-recall fix) but whose store
+#: (``himmy/api/studio_memory.py`` → the process-wide memory DB) carries NO
+#: ``workspace_id`` column, so the TENANT axis is structurally unenforceable on this
+#: surface today. The ``scoped_read`` marker advertises tenant(+subject) scope; for these
+#: three routes only the subject half is real, so without this list the tenant gap would be
+#: INVISIBLE — fully hidden behind the marker and never drained like its siblings on
+#: :data:`_STUDIO_TENANT_PENDING`. Enumerating them here makes the residual tenant gap a
+#: VISIBLE, regression-protected decision: the same KNOWN cross-tenant disclosure the
+#: process-global memory store already accepts (mirroring the tasks/chats/notes stores),
+#: now tracked so a future workspace-column migration drains it. DRAIN by stamping the
+#: memory store with a tenant column + intersecting every read, not by growing this list.
+_STUDIO_MEMORY_TENANT_PENDING: frozenset[str] = frozenset(
+    {
+        "/api/studio/memory",
+        "/api/studio/memory/subjects",
+        "/api/studio/memory/recall",
+    }
+)
+
 _ALL_ALLOWED = (
     _PUBLIC
     | _AUTHZ_ONLY
@@ -440,6 +460,36 @@ def test_memory_recall_post_read_is_detected_as_scoped() -> None:
         "/api/studio/memory/recall is subject-scoped (narrow_subject) and must carry the "
         "scoped_read marker so the non-GET gate enforces it"
     )
+
+
+def test_studio_memory_reads_are_subject_scoped_and_tenant_pending() -> None:
+    """The Studio memory reads enforce the SUBJECT axis but track the TENANT gap honestly.
+
+    Round-8 finding: the three memory read routes carry ``scoped_read`` (the round-7
+    cross-subject fix via ``narrow_subject``), which advertises tenant(+subject) scope —
+    but the process-global memory store has NO ``workspace_id`` column, so the TENANT axis
+    is structurally unenforceable here. Without explicit tracking the tenant gap would be
+    INVISIBLE behind the marker (unlike the tasks/chats/notes stores on
+    :data:`_STUDIO_TENANT_PENDING`) and never drained. This asserts the residual gap is
+    VISIBLE and regression-protected: every route is (a) detected as subject-scoped AND
+    (b) enumerated on :data:`_STUDIO_MEMORY_TENANT_PENDING` so a future store migration
+    drains it. A new memory read that escapes this tracking fails here.
+    """
+    get_routes = {path: route for path, route in _get_read_routes()}
+    nonget_routes = {path: route for path, route in _non_get_read_routes()}
+    for path in _STUDIO_MEMORY_TENANT_PENDING:
+        route = get_routes.get(path) or nonget_routes.get(path)
+        assert route is not None, (
+            f"{path} is no longer a real memory read route; reconcile "
+            "_STUDIO_MEMORY_TENANT_PENDING with the built app"
+        )
+        # The subject axis IS enforced (round-7 fix) — the marker is genuinely present.
+        assert _route_is_scoped(route), (
+            f"{path} must keep its scoped_read marker (subject axis via narrow_subject)"
+        )
+    # The three known memory reads are exactly the tracked set — a new one must be added
+    # here (and ultimately drained by a tenant column), not silently hidden by the marker.
+    assert "/api/studio/memory/recall" in _STUDIO_MEMORY_TENANT_PENDING
 
 
 def test_every_subject_keyed_write_route_is_subject_scoped() -> None:
