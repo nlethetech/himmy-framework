@@ -92,3 +92,8 @@ REDTEAM_FINAL_2026-06-25.md
 REDTEAM_REPORT_2026-06-25.md
 REDTEAM_STAGE2_REATTACK_2026-06-25.md
 chat-himalaya.command
+
+# internal red-team / hardening working reports (keep private)
+RBAC_HARDENING_*.md
+RBAC_REDTEAM_*.md
+REDTEAM_*.md
