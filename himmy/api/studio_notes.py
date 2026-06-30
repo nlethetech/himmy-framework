@@ -105,12 +105,14 @@ class NotesStore:
     def upsert(self, note: Note, *, workspace_id: str | None = None) -> Note:
         """Upsert a note, stamping ``workspace_id`` (``None`` for the single local tenant).
 
-        Re-stamp guard: when a bound tenant (``workspace_id`` not None) upserts onto an id
-        that already exists but is NOT owned by that tenant (a legacy NULL row or a foreign
-        tenant's row), the row's owner is PRESERVED instead of being captured/clobbered — the
-        ``INSERT OR REPLACE`` keyed only on id would otherwise let a bound tenant steal a
-        shared/legacy note by re-stamping it. ``workspace_id is None`` (offline / shared key)
-        is unchanged: every upsert stamps NULL exactly as before.
+        Re-stamp / content-tamper guard: when a bound tenant (``workspace_id`` not None)
+        upserts onto an id that already exists but is NOT writable by that tenant (a legacy
+        NULL row or a foreign tenant's row), the upsert is ABORTED — the existing row is
+        returned UNCHANGED. ``INSERT OR REPLACE`` keyed only on id would otherwise let a bound
+        tenant not only re-stamp/steal but also clobber the *content* (title/body) of a
+        shared/legacy note it must not be able to mutate (read-visible but IMMUTABLE).
+        ``workspace_id is None`` (offline / shared key) is unchanged: every upsert stamps NULL
+        and writes content exactly as before.
         """
         note.updated_at = utc_now_iso()
         stamp = workspace_id
@@ -118,13 +120,14 @@ class NotesStore:
             from himmy.api.studio_tenant_scope import row_writable_in_scope
 
             existing = self._conn.execute(
-                "SELECT workspace_id FROM notes WHERE id = ?", (note.id,)
+                "SELECT * FROM notes WHERE id = ?", (note.id,)
             ).fetchone()
             if existing is not None and not row_writable_in_scope(
                 existing["workspace_id"], workspace_id
             ):
-                # A bound tenant may not capture a legacy/foreign-owned row: keep its owner.
-                stamp = existing["workspace_id"]
+                # A bound tenant may not mutate a legacy/foreign-owned row at all: abort the
+                # content write and return the row as it stands (immutable to this caller).
+                return self._row(existing)
         self._conn.execute(
             "INSERT OR REPLACE INTO notes (id, title, body, updated_at, workspace_id) "
             "VALUES (?,?,?,?,?)",

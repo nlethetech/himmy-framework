@@ -55,21 +55,24 @@ class CalendarStore:
     def add(self, ev: CalendarEvent, *, workspace_id: str | None = None) -> CalendarEvent:
         """Add an event, stamped with ``workspace_id`` (``None`` for the single local tenant).
 
-        Re-stamp guard: a bound tenant upserting (``INSERT OR REPLACE``) onto an id owned by
-        another tenant or a legacy NULL row PRESERVES the existing owner rather than capturing
-        it. ``workspace_id is None`` (offline) is unchanged.
+        Re-stamp / content-tamper guard: a bound tenant upserting (``INSERT OR REPLACE``) onto
+        an id it is NOT entitled to mutate (another tenant's row or a legacy NULL row) ABORTS
+        the upsert and returns the existing event UNCHANGED — preserving only the owner would
+        still let the ``INSERT OR REPLACE`` clobber the event's content (a row that must be
+        read-visible but IMMUTABLE). ``workspace_id is None`` (offline) is unchanged.
         """
         stamp = workspace_id
         if workspace_id is not None:
             from himmy.api.studio_tenant_scope import row_writable_in_scope
 
             existing = self._conn.execute(
-                "SELECT workspace_id FROM calendar_events WHERE id = ?", (ev.id,)
+                "SELECT * FROM calendar_events WHERE id = ?", (ev.id,)
             ).fetchone()
             if existing is not None and not row_writable_in_scope(
                 existing["workspace_id"], workspace_id
             ):
-                stamp = existing["workspace_id"]
+                # A bound tenant may not mutate a legacy/foreign-owned event at all: abort.
+                return self._row(existing)
         self._conn.execute(
             "INSERT OR REPLACE INTO calendar_events "
             "(id, date, time, title, notes, created_at, workspace_id) "

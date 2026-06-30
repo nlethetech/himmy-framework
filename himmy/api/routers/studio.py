@@ -1144,7 +1144,10 @@ async def approvals(request: Request) -> list[ApprovalSummary]:
     A tenant-bound principal sees only checkpoints owned by its own workspaces (the owning
     tenant is re-read from the paused run's checkpoint ``ctx``); NO-OP offline / ``all_tenants``.
     """
-    return studio_approvals.list_pending(workspace_filter=studio_tenant_filter(request))
+    return studio_approvals.list_pending(
+        workspace_filter=studio_tenant_filter(request),
+        subject_filter=studio_subject_filter(request),
+    )
 
 
 @router.get(
@@ -1158,7 +1161,9 @@ async def approvals(request: Request) -> list[ApprovalSummary]:
 async def approval(request: Request, checkpoint_id: str) -> ApprovalDetail:
     """A pending approval's detail; a foreign-tenant checkpoint is a uniform 404."""
     detail = studio_approvals.get_detail(
-        checkpoint_id, workspace_filter=studio_tenant_filter(request)
+        checkpoint_id,
+        workspace_filter=studio_tenant_filter(request),
+        subject_filter=studio_subject_filter(request),
     )
     if detail is None:
         raise HTTPException(status_code=404, detail="approval not found")
@@ -1197,17 +1202,28 @@ def _resolve_stream(
 
 
 def _guard_approval_scope(request: Request, checkpoint_id: str) -> None:
-    """404 a resolve on a checkpoint owned by another tenant (a cross-tenant HITL write).
+    """404 a resolve on a checkpoint owned by another tenant OR another within-tenant USER.
 
     The write companion to the scoped approvals reads: a tenant-bound principal must not
-    approve/reject (and thereby resume) a run paused under a workspace it cannot access.
-    Reuses :func:`studio_approvals.get_detail`'s scope verdict so the existence of a foreign
-    checkpoint never leaks. NO-OP offline / ``all_tenants`` (filter is ``None``).
+    approve/reject (and thereby resume + execute) a run paused under a workspace it cannot
+    access, and — for the subject axis — a ``subject_scoped`` principal must not resolve a
+    checkpoint owned by ANOTHER user of the same tenant (the within-tenant cross-user HITL
+    confused-deputy BOLA). Reuses :func:`studio_approvals.get_detail`'s two-axis scope verdict
+    so the existence of a foreign checkpoint never leaks. NO-OP offline / ``all_tenants`` /
+    ``tenant_admin`` (both filters are ``None``).
     """
-    scope = studio_tenant_filter(request)
-    if scope is None:
+    tenant_filter = studio_tenant_filter(request)
+    subject_filter = studio_subject_filter(request)
+    if tenant_filter is None and subject_filter is None:
         return
-    if studio_approvals.get_detail(checkpoint_id, workspace_filter=scope) is None:
+    if (
+        studio_approvals.get_detail(
+            checkpoint_id,
+            workspace_filter=tenant_filter,
+            subject_filter=subject_filter,
+        )
+        is None
+    ):
         raise HTTPException(status_code=404, detail="approval not found")
 
 

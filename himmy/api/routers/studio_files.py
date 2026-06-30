@@ -29,13 +29,41 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from fastapi import HTTPException, Query
+from fastapi import Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from himmy.api.routers.studio_common import build_studio_router
 
 router = build_studio_router("files", tag="studio-files")
+
+
+def _require_unscoped_sandbox_reader(request: Request) -> None:
+    """Refuse the shared agent file-sandbox to a tenant-/subject-scoped principal (BOLA).
+
+    The agent file sandbox (``ToolkitConfig.fs_root``) is a SINGLE process-global directory
+    with NO tenant dimension — unlike the memory/KB/tasks/notes stores, it was never
+    per-tenant namespaced. On a multi-tenant shared-process deployment that makes
+    ``GET /api/studio/files`` and ``/download`` a cross-tenant BOLA: tenant A's agent
+    ``write_file`` outputs land in the same root that tenant B (any ``files:read`` holder)
+    could enumerate and download.
+
+    Since a shared sandbox is the intended single-box design, this is closed by restricting
+    the two file routes to an UNSCOPED operator/offline principal — exactly the
+    ``reveal_host_posture`` cross-workspace pattern. ``all_tenants`` (offline default /
+    ANONYMOUS / trusted shared key) is a NO-OP, so the zero-config single-box path is
+    byte-unchanged; a tenant-bound or ``subject_scoped`` principal gets a uniform 404 (the
+    sandbox is operator-cross-workspace, not tenant-keyed data it may browse).
+    """
+    from himmy.api.auth.context import get_principal
+
+    principal = get_principal(request)
+    # ``all_tenants`` is the unrestricted offline/ANONYMOUS/trusted-shared-key boundary
+    # (mirrors ``studio_tenant_filter`` returning None) — a NO-OP, byte-unchanged. Any other
+    # principal is tenant-/subject-bound and may not browse the shared, un-namespaced sandbox.
+    if principal.all_tenants:
+        return
+    raise HTTPException(status_code=404, detail="not found")
 
 #: Directories never listed (mirrors the agent-spec scanner's skip set).
 _SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".himmy"}
@@ -156,7 +184,11 @@ def _open_nofollow_segments(root_resolved: Path, rel: str) -> int:
         os.close(dir_fd)
 
 
-@router.get("", response_model=FileListResponse)
+@router.get(
+    "",
+    response_model=FileListResponse,
+    dependencies=[Depends(_require_unscoped_sandbox_reader)],
+)
 async def list_files(
     limit: int = Query(200, ge=1, le=1000),
 ) -> FileListResponse:
@@ -231,7 +263,7 @@ async def list_files(
     )
 
 
-@router.get("/download")
+@router.get("/download", dependencies=[Depends(_require_unscoped_sandbox_reader)])
 async def download_file(
     path: str = Query(..., min_length=1, max_length=1024),
 ) -> StreamingResponse:

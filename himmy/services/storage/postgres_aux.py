@@ -549,6 +549,28 @@ class _AsyncConversationStore:
                     self._tenant,
                     conversation_id,
                 )
+                if existing is not None and workspace_id is not None:
+                    from himmy.api.studio_tenant_scope import row_writable_in_scope
+
+                    if not row_writable_in_scope(
+                        existing["workspace_id"], workspace_id
+                    ):
+                        # Legacy/foreign-owned conversation: read-visible but IMMUTABLE to a
+                        # bound tenant — abort the content write, return the row unchanged.
+                        # Build the summary on the SAME (transaction) connection to avoid a
+                        # nested pool acquire / single-connection deadlock.
+                        row = await conn.fetchrow(
+                            "SELECT *, ("
+                            "  SELECT COUNT(*) FROM aux_conversation_messages m "
+                            "  WHERE m.tenant = c.tenant "
+                            "  AND m.conversation_id = c.conversation_id) AS n "
+                            "FROM aux_conversations c "
+                            "WHERE c.tenant = $1 AND c.conversation_id = $2",
+                            self._tenant,
+                            conversation_id,
+                        )
+                        if row is not None:
+                            return _row_to_summary(row, int(row["n"]))
                 created = existing["created_at"] if existing else now
                 # Re-stamp guard (tenant axis): NEW row stamps caller's workspace; an EXISTING
                 # row PRESERVES its owner so a bound tenant cannot capture a legacy/foreign row.
@@ -1948,6 +1970,25 @@ class _AsyncCalendarStore:
 
     async def add(self, ev: Any, workspace_id: str | None = None) -> Any:
         async with self._pool.acquire() as conn:
+            if await _existing_unwritable(
+                conn, "aux_calendar_events", self._tenant, ev.id, workspace_id
+            ):
+                # Legacy/foreign-owned event: immutable to a bound tenant — abort content write.
+                from himmy.api.studio_calendar import CalendarEvent
+
+                row = await conn.fetchrow(
+                    "SELECT * FROM aux_calendar_events WHERE tenant = $1 AND id = $2",
+                    self._tenant,
+                    ev.id,
+                )
+                return CalendarEvent(
+                    id=row["id"],
+                    date=row["date"],
+                    time=row["time"],
+                    title=row["title"],
+                    notes=row["notes"],
+                    created_at=row["created_at"],
+                )
             stamp = await _preserve_owner(
                 conn, "aux_calendar_events", self._tenant, ev.id, workspace_id
             )
@@ -2094,6 +2135,16 @@ class _AsyncCookbookStore:
 
     async def upsert(self, r: Any, workspace_id: str | None = None) -> Any:
         async with self._pool.acquire() as conn:
+            if await _existing_unwritable(
+                conn, "aux_recipes", self._tenant, r.id, workspace_id
+            ):
+                # Legacy/foreign-owned recipe: immutable to a bound tenant — abort content write.
+                row = await conn.fetchrow(
+                    "SELECT * FROM aux_recipes WHERE tenant = $1 AND id = $2",
+                    self._tenant,
+                    r.id,
+                )
+                return self._to_recipe(row)
             stamp = await _preserve_owner(conn, "aux_recipes", self._tenant, r.id, workspace_id)
             await conn.execute(
                 "INSERT INTO aux_recipes "
@@ -2223,6 +2274,16 @@ class _AsyncNotesStore:
     async def upsert(self, note: Any, workspace_id: str | None = None) -> Any:
         note.updated_at = utc_now_iso()
         async with self._pool.acquire() as conn:
+            if await _existing_unwritable(
+                conn, "aux_notes", self._tenant, note.id, workspace_id
+            ):
+                # Legacy/foreign-owned note: immutable to a bound tenant — abort content write.
+                row = await conn.fetchrow(
+                    "SELECT * FROM aux_notes WHERE tenant = $1 AND id = $2",
+                    self._tenant,
+                    note.id,
+                )
+                return self._to_note(row)
             stamp = await _preserve_owner(
                 conn, "aux_notes", self._tenant, note.id, workspace_id
             )
@@ -2969,6 +3030,37 @@ async def _preserve_owner(
         if not row_writable_in_scope(owner, workspace_id):
             return owner
     return workspace_id
+
+
+async def _existing_unwritable(
+    conn: Any,
+    table: str,
+    tenant: str,
+    row_id: str,
+    workspace_id: str | None,
+) -> bool:
+    """Whether a by-id upsert must ABORT because the target row is not writable by the caller.
+
+    Companion to :func:`_preserve_owner`. ``True`` means an existing row with this id is owned
+    by a legacy ``NULL`` tenant or a foreign tenant, so a bound writer (``workspace_id`` not
+    None) must not clobber its content (re-stamp guard only preserves the owner column; the
+    content would still be overwritten). The caller returns the existing row unchanged on
+    ``True``. ``workspace_id is None`` (offline / unrestricted) never aborts — byte-unchanged.
+    ``table`` is always a static in-module literal (never user input).
+    """
+    if workspace_id is None:
+        return False
+    from himmy.api.studio_tenant_scope import row_writable_in_scope
+
+    existing = await conn.fetchrow(
+        f"SELECT workspace_id FROM {table} "  # noqa: S608 - table is a static literal
+        f"WHERE tenant = $1 AND id = $2",
+        tenant,
+        row_id,
+    )
+    if existing is None:
+        return False
+    return not row_writable_in_scope(existing["workspace_id"], workspace_id)
 
 
 def _rowcount(result: Any) -> int:

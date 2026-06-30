@@ -324,8 +324,12 @@ class ConversationStore:
 
         ``workspace_id`` (tenant axis) stamps the owning workspace for a tenant-bound Studio
         write; it follows the leave-alone-on-``None`` contract so the CLI session path (which
-        passes nothing) keeps writing ``NULL``-tenant rows — byte-unchanged. A re-stamp guard
-        preserves an existing row's owner so a bound tenant cannot capture a legacy/foreign row.
+        passes nothing) keeps writing ``NULL``-tenant rows — byte-unchanged. A re-stamp /
+        content-tamper guard ABORTS the upsert (returning the existing summary unchanged) when
+        a bound tenant targets an existing row it is NOT entitled to mutate (a legacy NULL /
+        CLI row or a foreign tenant's row) — otherwise the ON CONFLICT would preserve the
+        owner but still clobber the thread/title/content of a row that must be read-visible but
+        IMMUTABLE.
         """
         now = utc_now_iso()
         existing = self._conn.execute(
@@ -334,6 +338,15 @@ class ConversationStore:
             "FROM conversations WHERE conversation_id = ?",
             (conversation_id,),
         ).fetchone()
+        if existing is not None and workspace_id is not None:
+            from himmy.api.studio_tenant_scope import row_writable_in_scope
+
+            if not row_writable_in_scope(existing["workspace_id"], workspace_id):
+                # A bound tenant may not mutate a legacy/foreign-owned conversation at all:
+                # abort the content write and surface the row as it stands.
+                summary = self.get_summary(conversation_id)
+                if summary is not None:
+                    return summary
         created = existing["created_at"] if existing else now
         resolved_title = (title or "").strip() or _derive_title(thread)
         resolved_agent = (

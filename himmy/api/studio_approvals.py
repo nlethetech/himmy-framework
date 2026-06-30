@@ -131,10 +131,28 @@ def _summary(cp: Any) -> ApprovalSummary:
     )
 
 
+def _subject_visible(cp: Any, subject_filter: str | None) -> bool:
+    """Whether a ``subject_scoped`` reader (``subject_filter``) may see/act on ``cp``.
+
+    The within-tenant USER axis companion to :func:`_checkpoint_owner_workspace`. ``None``
+    (offline / ``all_tenants`` / tenant_admin / non-subject-scoped) is byte-unchanged — every
+    checkpoint visible. A subject-scoped reader sees ONLY checkpoints whose paused run is
+    owned by its OWN ``subject_scope`` (re-read from the checkpoint ``ctx``), plus any legacy
+    run that carries NO subject_scope (an offline/unscoped run predates subject binding) — so
+    one user of a shared tenant can never approve/resume another user's gated tool call.
+    """
+    if subject_filter is None:
+        return True
+    owner = _checkpoint_owner_subject_scope(cp)
+    return owner is None or owner == subject_filter
+
+
 def list_pending(
-    *, workspace_filter: frozenset[str] | None = None
+    *,
+    workspace_filter: frozenset[str] | None = None,
+    subject_filter: str | None = None,
 ) -> list[ApprovalSummary]:
-    """All checkpoints a human can still act on (newest first), tenant-scoped.
+    """All checkpoints a human can still act on (newest first), tenant- + subject-scoped.
 
     Includes fresh ``awaiting_approval`` checkpoints AND any ``resolving`` row left
     stranded by a resume that crashed mid-flight — those are still re-claimable by
@@ -147,6 +165,10 @@ def list_pending(
     checkpoints whose paused run is owned by one of its workspaces (the owning tenant is
     re-read from the checkpoint ``ctx`` via :func:`_checkpoint_owner_workspace`), plus any
     legacy ``NULL``-tenant checkpoint (an offline/unscoped run predates tenant binding).
+
+    ``subject_filter`` is the within-tenant USER axis (the principal's
+    ``studio_subject_filter``): a ``subject_scoped`` reader additionally sees only checkpoints
+    owned by its own ``subject_scope`` (plus subject-less legacy runs). ``None`` is a no-op.
     """
     store = get_checkpoint_store()
     pending = [cp for status in _RESUMABLE for cp in store.list_by_status(status)]
@@ -159,16 +181,24 @@ def list_pending(
                 (ws := _checkpoint_owner_workspace(cp)) is None or ws in workspace_filter
             )
         ]
+    if subject_filter is not None:
+        pending = [cp for cp in pending if _subject_visible(cp, subject_filter)]
     return [_summary(cp) for cp in pending]
 
 
 def get_detail(
-    checkpoint_id: str, *, workspace_filter: frozenset[str] | None = None
+    checkpoint_id: str,
+    *,
+    workspace_filter: frozenset[str] | None = None,
+    subject_filter: str | None = None,
 ) -> ApprovalDetail | None:
-    """A pending checkpoint's detail; a foreign-tenant checkpoint reads as ``None`` (→404).
+    """A pending checkpoint's detail; a foreign-tenant/-subject checkpoint reads as ``None``.
 
     ``workspace_filter`` (the reader's ``studio_tenant_filter``) hides a checkpoint owned by
-    another tenant — its existence never leaks. ``None`` is byte-unchanged (offline).
+    another tenant — its existence never leaks. ``subject_filter`` (the reader's
+    ``studio_subject_filter``) additionally hides a checkpoint owned by another USER within
+    the same tenant (the within-tenant cross-user HITL BOLA). ``None`` on either axis is
+    byte-unchanged (offline / ``all_tenants`` / tenant_admin).
     """
     cp = get_checkpoint_store().load(checkpoint_id)
     if cp is None:
@@ -177,6 +207,8 @@ def get_detail(
         ws = _checkpoint_owner_workspace(cp)
         if ws is not None and ws not in workspace_filter:
             return None
+    if not _subject_visible(cp, subject_filter):
+        return None
     base = _summary(cp)
     messages = (cp.thread or {}).get("messages") or []
     preview = [

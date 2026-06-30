@@ -252,18 +252,26 @@ _AUTHZ_ONLY: frozenset[str] = frozenset(
 )
 
 #: Admin-only reads that DELIBERATELY span all workspaces (gated by an elevated
-#: permission, not data-scoped) — the security-event + privacy-report trail export.
+#: permission, not data-scoped) — the security-event + privacy-report trail export, plus the
+#: agent file sandbox (a single process-global ``fs_root`` with NO tenant dimension that
+#: agent ``write_file`` outputs land in). The sandbox served tenant-PRODUCED data with no
+#: per-tenant partition, so it was a cross-tenant BOLA when classified as "no tenant
+#: dimension" below; it is now restricted to an UNSCOPED operator/offline (``all_tenants``)
+#: principal (``_require_unscoped_sandbox_reader``), making the cross-workspace exposure an
+#: EXPLICIT reviewed decision (mirroring ``reveal_host_posture``) rather than a hidden one.
 _ADMIN_CROSS_WORKSPACE: frozenset[str] = frozenset(
     {
         "/v1/audit/bundle",  # admin-only cross-workspace export (audit:read)
         "/v1/audit/events",  # admin-only security-event trail (audit:read)
+        "/api/studio/files",  # shared agent sandbox; all_tenants-only (operator)
+        "/api/studio/files/download",  # shared agent sandbox; all_tenants-only (operator)
     }
 )
 
 #: Process-global / project-local OPERATOR resources with NO tenant dimension: the same
 #: for every workspace (model/provider catalog, infra health, connector catalog, the MCP
-#: server registry, the project-local agent/team/skill/tool specs read off disk, the file
-#: sandbox, benchmarks, the eval-history operator store). RBAC-gated, never tenant-keyed,
+#: server registry, the project-local agent/team/skill/tool specs read off disk,
+#: benchmarks, the eval-history operator store). RBAC-gated, never tenant-keyed,
 #: never echoes secret material. Each is the models/connectors class. (The seclog console is
 #: NOT here: its events carry a ``workspace_id`` and it now tenant-scopes via ``scoped_read``.)
 _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
@@ -307,8 +315,6 @@ _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
         "/api/studio/knowledge",
         "/api/studio/knowledge/{kb_id}/search",
         "/api/studio/kb/{kb_id}/documents",
-        "/api/studio/files",
-        "/api/studio/files/download",
     }
 )
 

@@ -517,36 +517,44 @@ def test_k5_offline_delete_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
 # ------------------------------------ rbac-harden(mopup-r1): K5 upsert preserve-owner
 
 
-def test_k5_notes_upsert_preserves_foreign_owner(
+def test_k5_notes_upsert_legacy_null_row_immutable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A by-id upsert onto a legacy NULL-owned row must NOT capture it onto the writer.
+    """A by-id upsert onto a legacy NULL-owned row must ABORT — no content write, no re-stamp.
 
-    Regression for the unconditional ON CONFLICT re-stamp: when the existing row is not
-    writable by this tenant (legacy NULL or foreign), the upsert preserves the existing
-    owner instead of stamping the caller's workspace (parity with the SQLite store's
-    row_writable_in_scope guard).
+    Regression (mopup-r4 content-tamper): the earlier fix preserved the owner column but the
+    ON CONFLICT still REWROTE the row's content (title/body). The store now fails CLOSED for
+    any row the caller cannot mutate — it issues NO ``INSERT INTO aux_notes`` and returns the
+    existing row unchanged (parity with the SQLite store's abort, and the stated
+    read-visible-but-IMMUTABLE invariant for legacy NULL rows).
     """
     from himmy.api.studio_notes import Note
     from himmy.services.storage.postgres_aux import PostgresNotesStore
 
-    # Existing row is NULL-owned (legacy/shared) -> not writable by tenant 'A'. The
-    # preserve-owner SELECT returns an existing row whose workspace_id IS NULL.
-    pool = _FakePool({"fetchrow": {"workspace_id": None}, "execute": "INSERT 1"})
+    # Existing row is NULL-owned (legacy/shared) -> not writable by tenant 'A'. Both the
+    # _existing_unwritable probe and the abort-path SELECT * read this canned full row.
+    pool = _FakePool(
+        {
+            "fetchrow": {
+                "id": "shared-note",
+                "title": "orig-title",
+                "body": "orig-body",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "workspace_id": None,
+            },
+            "execute": "INSERT 1",
+        }
+    )
     _install_pool(monkeypatch, pool)
     store = PostgresNotesStore(tenant="local")
-    note = Note(id="shared-note", title="t", body="b")
-    store.upsert(note, workspace_id="A")
+    returned = store.upsert(Note(id="shared-note", title="t", body="b"), workspace_id="A")
 
-    inserts = [
-        args for sql, args in pool.conn.calls if "INSERT INTO aux_notes" in sql
-    ]
-    assert inserts, "no upsert issued"
-    # The stamped workspace_id is the LAST positional arg; it must be the preserved
-    # existing owner (None), NOT the capturing writer 'A'.
-    assert inserts[0][-1] is None, (
-        "K5 notes upsert captured a legacy NULL-owned row onto the writer's tenant"
+    inserts = [args for sql, args in pool.conn.calls if "INSERT INTO aux_notes" in sql]
+    assert not inserts, (
+        "K5 notes upsert clobbered a legacy NULL-owned row's content (should abort)"
     )
+    # The caller gets the EXISTING row back, unchanged (not its attacker-supplied body).
+    assert returned.body == "orig-body" and returned.title == "orig-title"
 
 
 def test_k5_notes_upsert_stamps_own_new_row(
