@@ -735,6 +735,34 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ADD PRIMARY KEY (workspace_id, subject_id, key)",
         ],
     ),
+    # v11 (rbac-harden studio-store-drain): give the K5 Studio aux mirrors the SAME nullable
+    # ``workspace_id`` tenant column the SQLite singleton stores grew, so the drained REST
+    # routes (tasks/notes/calendar/cookbook) that now thread ``workspace_id=...`` are scoped
+    # — not crashed — on a Postgres backend. The column is ADDITIVE + nullable: the mirrors
+    # are pinned to the ``tenant='local'`` partition today, so every pre-existing row keeps
+    # ``workspace_id IS NULL`` ("single local tenant / predates tenant binding") and an
+    # unscoped (``None``) reader sees it byte-unchanged; a bound principal's filter matches
+    # its own workspace OR a legacy ``NULL`` row, mirroring the SQLite ``scope_clause``. The
+    # tenant PRIMARY KEY is untouched (workspace_id is a within-partition scope, not the
+    # partition), so the migration rewrites no keys and stays idempotent on re-run.
+    (
+        11,
+        "aux_store_workspace_id",
+        [
+            "ALTER TABLE aux_tasks ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS aux_tasks_ws_idx "
+            "ON aux_tasks (tenant, workspace_id)",
+            "ALTER TABLE aux_notes ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS aux_notes_ws_idx "
+            "ON aux_notes (tenant, workspace_id)",
+            "ALTER TABLE aux_calendar_events ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS aux_calendar_events_ws_idx "
+            "ON aux_calendar_events (tenant, workspace_id)",
+            "ALTER TABLE aux_recipes ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS aux_recipes_ws_idx "
+            "ON aux_recipes (tenant, workspace_id)",
+        ],
+    ),
 ]
 
 

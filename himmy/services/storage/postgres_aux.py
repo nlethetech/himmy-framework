@@ -1700,15 +1700,15 @@ class _AsyncCalendarStore:
         self._pool = pool
         self._tenant = tenant
 
-    async def add(self, ev: Any) -> Any:
+    async def add(self, ev: Any, workspace_id: str | None = None) -> Any:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO aux_calendar_events "
-                "(tenant, id, date, time, title, notes, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                "(tenant, id, date, time, title, notes, created_at, workspace_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
                 "ON CONFLICT (tenant, id) DO UPDATE SET "
                 "date = EXCLUDED.date, time = EXCLUDED.time, title = EXCLUDED.title, "
-                "notes = EXCLUDED.notes",
+                "notes = EXCLUDED.notes, workspace_id = EXCLUDED.workspace_id",
                 self._tenant,
                 ev.id,
                 ev.date,
@@ -1716,28 +1716,29 @@ class _AsyncCalendarStore:
                 ev.title,
                 ev.notes,
                 ev.created_at,
+                workspace_id,
             )
         return ev
 
-    async def list(self, month: str | None) -> list[Any]:
+    async def list(
+        self, month: str | None, workspace_id: str | frozenset[str] | None = None
+    ) -> list[Any]:
         from himmy.api.studio_calendar import CalendarEvent
 
         # Mirror the SQLite ``ORDER BY date, time IS NULL, time`` (all-day events last
         # within a day): a NULL time sorts AFTER a present one.
         order = "ORDER BY date, (time IS NULL), time"
+        params: list[Any] = [self._tenant]
+        sql = "SELECT * FROM aux_calendar_events WHERE tenant = $1"
+        if month:
+            params.append(f"{month}-%")
+            sql += f" AND date LIKE ${len(params)}"
+        scope, sparams = _pg_scope(workspace_id, start=len(params) + 1)
+        if scope:
+            sql += f" AND {scope}"
+            params.extend(sparams)
         async with self._pool.acquire() as conn:
-            if month:
-                rows = await conn.fetch(
-                    f"SELECT * FROM aux_calendar_events "  # noqa: S608
-                    f"WHERE tenant = $1 AND date LIKE $2 {order}",
-                    self._tenant,
-                    f"{month}-%",
-                )
-            else:
-                rows = await conn.fetch(
-                    f"SELECT * FROM aux_calendar_events WHERE tenant = $1 {order}",  # noqa: S608
-                    self._tenant,
-                )
+            rows = await conn.fetch(f"{sql} {order}", *params)  # noqa: S608
         return [
             CalendarEvent(
                 id=r["id"],
@@ -1750,12 +1751,18 @@ class _AsyncCalendarStore:
             for r in rows
         ]
 
-    async def delete(self, event_id: str) -> bool:
+    async def delete(
+        self, event_id: str, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        scope, sparams = _pg_scope(workspace_id, start=3)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM aux_calendar_events WHERE tenant = $1 AND id = $2",
+                f"DELETE FROM aux_calendar_events "  # noqa: S608
+                f"WHERE tenant = $1 AND id = $2{where}",
                 self._tenant,
                 event_id,
+                *sparams,
             )
         return _rowcount(result) > 0
 
@@ -1768,14 +1775,21 @@ class PostgresCalendarStore:
         self._pool = _new_aux_pool(dsn)
         self._async = _AsyncCalendarStore(self._pool, tenant)
 
-    def add(self, ev: Any) -> Any:
-        return self._pool.run(self._async.add(ev))
+    def add(self, ev: Any, *, workspace_id: str | None = None) -> Any:
+        return self._pool.run(self._async.add(ev, workspace_id))
 
-    def list(self, *, month: str | None = None) -> list[Any]:
-        return self._pool.run(self._async.list(month))  # type: ignore[no-any-return]
+    def list(
+        self,
+        *,
+        month: str | None = None,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> list[Any]:
+        return self._pool.run(self._async.list(month, workspace_id))  # type: ignore[no-any-return]
 
-    def delete(self, event_id: str) -> bool:
-        return bool(self._pool.run(self._async.delete(event_id)))
+    def delete(
+        self, event_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return bool(self._pool.run(self._async.delete(event_id, workspace_id)))
 
     def close(self) -> None:
         self._pool.close()
@@ -1788,35 +1802,57 @@ class _AsyncCookbookStore:
         self._pool = pool
         self._tenant = tenant
 
-    async def list(self) -> list[Any]:
+    def _to_recipe(self, r: Any) -> Any:
         from himmy.api.studio_cookbook import Recipe
 
+        return Recipe(
+            id=r["id"],
+            name=r["name"],
+            agent_path=r["agent_path"],
+            prompt=r["prompt"],
+            notes=r["notes"],
+            created_at=_norm_ts(r["created_at"]),
+        )
+
+    async def list(
+        self, workspace_id: str | frozenset[str] | None = None
+    ) -> list[Any]:
+        scope, sparams = _pg_scope(workspace_id, start=2)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM aux_recipes WHERE tenant = $1 ORDER BY created_at DESC",
+                f"SELECT * FROM aux_recipes WHERE tenant = $1{where} "  # noqa: S608
+                "ORDER BY created_at DESC",
                 self._tenant,
+                *sparams,
             )
-        return [
-            Recipe(
-                id=r["id"],
-                name=r["name"],
-                agent_path=r["agent_path"],
-                prompt=r["prompt"],
-                notes=r["notes"],
-                created_at=_norm_ts(r["created_at"]),
-            )
-            for r in rows
-        ]
+        return [self._to_recipe(r) for r in rows]
 
-    async def upsert(self, r: Any) -> Any:
+    async def get(
+        self, recipe_id: str, workspace_id: str | frozenset[str] | None = None
+    ) -> Any | None:
+        scope, sparams = _pg_scope(workspace_id, start=3)
+        where = f" AND {scope}" if scope else ""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT * FROM aux_recipes "  # noqa: S608
+                f"WHERE tenant = $1 AND id = $2{where}",
+                self._tenant,
+                recipe_id,
+                *sparams,
+            )
+        return self._to_recipe(row) if row else None
+
+    async def upsert(self, r: Any, workspace_id: str | None = None) -> Any:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO aux_recipes "
-                "(tenant, id, name, agent_path, prompt, notes, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                "(tenant, id, name, agent_path, prompt, notes, created_at, workspace_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
                 "ON CONFLICT (tenant, id) DO UPDATE SET "
                 "name = EXCLUDED.name, agent_path = EXCLUDED.agent_path, "
-                "prompt = EXCLUDED.prompt, notes = EXCLUDED.notes",
+                "prompt = EXCLUDED.prompt, notes = EXCLUDED.notes, "
+                "workspace_id = EXCLUDED.workspace_id",
                 self._tenant,
                 r.id,
                 r.name,
@@ -1824,15 +1860,22 @@ class _AsyncCookbookStore:
                 r.prompt,
                 r.notes,
                 r.created_at,
+                workspace_id,
             )
         return r
 
-    async def delete(self, recipe_id: str) -> bool:
+    async def delete(
+        self, recipe_id: str, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        scope, sparams = _pg_scope(workspace_id, start=3)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM aux_recipes WHERE tenant = $1 AND id = $2",
+                f"DELETE FROM aux_recipes "  # noqa: S608
+                f"WHERE tenant = $1 AND id = $2{where}",
                 self._tenant,
                 recipe_id,
+                *sparams,
             )
         return _rowcount(result) > 0
 
@@ -1845,14 +1888,21 @@ class PostgresCookbookStore:
         self._pool = _new_aux_pool(dsn)
         self._async = _AsyncCookbookStore(self._pool, tenant)
 
-    def list(self) -> list[Any]:
-        return self._pool.run(self._async.list())  # type: ignore[no-any-return]
+    def list(self, *, workspace_id: str | frozenset[str] | None = None) -> list[Any]:
+        return self._pool.run(self._async.list(workspace_id))  # type: ignore[no-any-return]
 
-    def upsert(self, r: Any) -> Any:
-        return self._pool.run(self._async.upsert(r))
+    def get(
+        self, recipe_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> Any | None:
+        return self._pool.run(self._async.get(recipe_id, workspace_id))
 
-    def delete(self, recipe_id: str) -> bool:
-        return bool(self._pool.run(self._async.delete(recipe_id)))
+    def upsert(self, r: Any, *, workspace_id: str | None = None) -> Any:
+        return self._pool.run(self._async.upsert(r, workspace_id))
+
+    def delete(
+        self, recipe_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return bool(self._pool.run(self._async.delete(recipe_id, workspace_id)))
 
     def close(self) -> None:
         self._pool.close()
@@ -1875,56 +1925,83 @@ class _AsyncNotesStore:
             updated_at=_norm_ts(row["updated_at"]),
         )
 
-    async def list(self) -> list[Any]:
+    async def list(
+        self, workspace_id: str | frozenset[str] | None = None
+    ) -> list[Any]:
+        scope, sparams = _pg_scope(workspace_id, start=2)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM aux_notes WHERE tenant = $1 ORDER BY updated_at DESC",
+                f"SELECT * FROM aux_notes WHERE tenant = $1{where} "  # noqa: S608
+                "ORDER BY updated_at DESC",
                 self._tenant,
+                *sparams,
             )
         return [self._to_note(r) for r in rows]
 
-    async def get(self, note_id: str) -> Any | None:
+    async def get(
+        self, note_id: str, workspace_id: str | frozenset[str] | None = None
+    ) -> Any | None:
+        scope, sparams = _pg_scope(workspace_id, start=3)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM aux_notes WHERE tenant = $1 AND id = $2",
+                f"SELECT * FROM aux_notes "  # noqa: S608
+                f"WHERE tenant = $1 AND id = $2{where}",
                 self._tenant,
                 note_id,
+                *sparams,
             )
         return self._to_note(row) if row else None
 
-    async def find_by_title(self, title: str) -> Any | None:
+    async def find_by_title(
+        self, title: str, workspace_id: str | frozenset[str] | None = None
+    ) -> Any | None:
+        scope, sparams = _pg_scope(workspace_id, start=3)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM aux_notes WHERE tenant = $1 AND title = $2 "
+                f"SELECT * FROM aux_notes "  # noqa: S608
+                f"WHERE tenant = $1 AND title = $2{where} "
                 "ORDER BY updated_at DESC LIMIT 1",
                 self._tenant,
                 title,
+                *sparams,
             )
         return self._to_note(row) if row else None
 
-    async def upsert(self, note: Any) -> Any:
+    async def upsert(self, note: Any, workspace_id: str | None = None) -> Any:
         note.updated_at = utc_now_iso()
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO aux_notes (tenant, id, title, body, updated_at) "
-                "VALUES ($1, $2, $3, $4, $5) "
+                "INSERT INTO aux_notes "
+                "(tenant, id, title, body, updated_at, workspace_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6) "
                 "ON CONFLICT (tenant, id) DO UPDATE SET "
                 "title = EXCLUDED.title, body = EXCLUDED.body, "
-                "updated_at = EXCLUDED.updated_at",
+                "updated_at = EXCLUDED.updated_at, "
+                "workspace_id = EXCLUDED.workspace_id",
                 self._tenant,
                 note.id,
                 note.title,
                 note.body,
                 note.updated_at,
+                workspace_id,
             )
         return note
 
-    async def delete(self, note_id: str) -> bool:
+    async def delete(
+        self, note_id: str, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        scope, sparams = _pg_scope(workspace_id, start=3)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM aux_notes WHERE tenant = $1 AND id = $2",
+                f"DELETE FROM aux_notes "  # noqa: S608
+                f"WHERE tenant = $1 AND id = $2{where}",
                 self._tenant,
                 note_id,
+                *sparams,
             )
         return _rowcount(result) > 0
 
@@ -1937,20 +2014,26 @@ class PostgresNotesStore:
         self._pool = _new_aux_pool(dsn)
         self._async = _AsyncNotesStore(self._pool, tenant)
 
-    def list(self) -> list[Any]:
-        return self._pool.run(self._async.list())  # type: ignore[no-any-return]
+    def list(self, *, workspace_id: str | frozenset[str] | None = None) -> list[Any]:
+        return self._pool.run(self._async.list(workspace_id))  # type: ignore[no-any-return]
 
-    def get(self, note_id: str) -> Any | None:
-        return self._pool.run(self._async.get(note_id))
+    def get(
+        self, note_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> Any | None:
+        return self._pool.run(self._async.get(note_id, workspace_id))
 
-    def find_by_title(self, title: str) -> Any | None:
-        return self._pool.run(self._async.find_by_title(title))
+    def find_by_title(
+        self, title: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> Any | None:
+        return self._pool.run(self._async.find_by_title(title, workspace_id))
 
-    def upsert(self, note: Any) -> Any:
-        return self._pool.run(self._async.upsert(note))
+    def upsert(self, note: Any, *, workspace_id: str | None = None) -> Any:
+        return self._pool.run(self._async.upsert(note, workspace_id))
 
-    def delete(self, note_id: str) -> bool:
-        return bool(self._pool.run(self._async.delete(note_id)))
+    def delete(
+        self, note_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return bool(self._pool.run(self._async.delete(note_id, workspace_id)))
 
     def close(self) -> None:
         self._pool.close()
@@ -1963,14 +2046,19 @@ class _AsyncTasksStore:
         self._pool = pool
         self._tenant = tenant
 
-    async def list(self) -> list[Any]:
+    async def list(
+        self, workspace_id: str | frozenset[str] | None = None
+    ) -> list[Any]:
         from himmy.api.studio_tasks import Task
 
+        scope, sparams = _pg_scope(workspace_id, start=2)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM aux_tasks WHERE tenant = $1 "
+                f"SELECT * FROM aux_tasks WHERE tenant = $1{where} "  # noqa: S608
                 "ORDER BY done, created_at DESC",
                 self._tenant,
+                *sparams,
             )
         return [
             Task(
@@ -1983,7 +2071,13 @@ class _AsyncTasksStore:
             for r in rows
         ]
 
-    async def add(self, title: str, due: str | None, priority: int = 0) -> Any:
+    async def add(
+        self,
+        title: str,
+        due: str | None,
+        priority: int = 0,
+        workspace_id: str | None = None,
+    ) -> Any:
         from himmy.api.studio_tasks import Task
 
         # ``priority`` rides along on the in-memory Task so callers see it back; the PG
@@ -1992,24 +2086,32 @@ class _AsyncTasksStore:
         t = Task(title=title, due=due, priority=priority)
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO aux_tasks (tenant, id, title, done, due, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO aux_tasks "
+                "(tenant, id, title, done, due, created_at, workspace_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 self._tenant,
                 t.id,
                 t.title,
                 t.done,
                 t.due,
                 t.created_at,
+                workspace_id,
             )
         return t
 
-    async def set_done(self, task_id: str, done: bool) -> bool:
+    async def set_done(
+        self, task_id: str, done: bool, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        scope, sparams = _pg_scope(workspace_id, start=4)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
-                "UPDATE aux_tasks SET done = $1 WHERE tenant = $2 AND id = $3",
+                f"UPDATE aux_tasks SET done = $1 "  # noqa: S608
+                f"WHERE tenant = $2 AND id = $3{where}",
                 done,
                 self._tenant,
                 task_id,
+                *sparams,
             )
         return _rowcount(result) > 0
 
@@ -2019,6 +2121,7 @@ class _AsyncTasksStore:
         due: str | None = None,
         priority: int | None = None,
         done: bool | None = None,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> Any:
         from himmy.api.studio_tasks import Task
 
@@ -2036,19 +2139,26 @@ class _AsyncTasksStore:
             vals.append(done)
             idx += 1
         if sets:
+            scope, sparams = _pg_scope(workspace_id, start=idx + 2)
+            where = f" AND {scope}" if scope else ""
             async with self._pool.acquire() as conn:
                 await conn.execute(
-                    f"UPDATE aux_tasks SET {', '.join(sets)} "
-                    f"WHERE tenant = ${idx} AND id = ${idx + 1}",
+                    f"UPDATE aux_tasks SET {', '.join(sets)} "  # noqa: S608
+                    f"WHERE tenant = ${idx} AND id = ${idx + 1}{where}",
                     *vals,
                     self._tenant,
                     task_id,
+                    *sparams,
                 )
+        rscope, rsparams = _pg_scope(workspace_id, start=3)
+        rwhere = f" AND {rscope}" if rscope else ""
         async with self._pool.acquire() as conn:
             r = await conn.fetchrow(
-                "SELECT * FROM aux_tasks WHERE tenant = $1 AND id = $2",
+                f"SELECT * FROM aux_tasks "  # noqa: S608
+                f"WHERE tenant = $1 AND id = $2{rwhere}",
                 self._tenant,
                 task_id,
+                *rsparams,
             )
         if r is None:
             return None
@@ -2062,22 +2172,33 @@ class _AsyncTasksStore:
         )
         return t
 
-    async def complete_by_title(self, title: str) -> bool:
+    async def complete_by_title(
+        self, title: str, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        scope, sparams = _pg_scope(workspace_id, start=3)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
-                "UPDATE aux_tasks SET done = TRUE "
-                "WHERE tenant = $1 AND title = $2 AND done = FALSE",
+                f"UPDATE aux_tasks SET done = TRUE "  # noqa: S608
+                f"WHERE tenant = $1 AND title = $2 AND done = FALSE{where}",
                 self._tenant,
                 title,
+                *sparams,
             )
         return _rowcount(result) > 0
 
-    async def delete(self, task_id: str) -> bool:
+    async def delete(
+        self, task_id: str, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        scope, sparams = _pg_scope(workspace_id, start=3)
+        where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM aux_tasks WHERE tenant = $1 AND id = $2",
+                f"DELETE FROM aux_tasks "  # noqa: S608
+                f"WHERE tenant = $1 AND id = $2{where}",
                 self._tenant,
                 task_id,
+                *sparams,
             )
         return _rowcount(result) > 0
 
@@ -2090,14 +2211,23 @@ class PostgresTasksStore:
         self._pool = _new_aux_pool(dsn)
         self._async = _AsyncTasksStore(self._pool, tenant)
 
-    def list(self) -> list[Any]:
-        return self._pool.run(self._async.list())  # type: ignore[no-any-return]
+    def list(self, *, workspace_id: str | frozenset[str] | None = None) -> list[Any]:
+        return self._pool.run(self._async.list(workspace_id))  # type: ignore[no-any-return]
 
-    def add(self, title: str, *, due: str | None = None, priority: int = 0) -> Any:
-        return self._pool.run(self._async.add(title, due, priority))
+    def add(
+        self,
+        title: str,
+        *,
+        due: str | None = None,
+        priority: int = 0,
+        workspace_id: str | None = None,
+    ) -> Any:
+        return self._pool.run(self._async.add(title, due, priority, workspace_id))
 
-    def set_done(self, task_id: str, done: bool) -> bool:
-        return bool(self._pool.run(self._async.set_done(task_id, done)))
+    def set_done(
+        self, task_id: str, done: bool, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return bool(self._pool.run(self._async.set_done(task_id, done, workspace_id)))
 
     def update(
         self,
@@ -2106,14 +2236,21 @@ class PostgresTasksStore:
         due: str | None = None,
         priority: int | None = None,
         done: bool | None = None,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> Any:
-        return self._pool.run(self._async.update(task_id, due, priority, done))
+        return self._pool.run(
+            self._async.update(task_id, due, priority, done, workspace_id)
+        )
 
-    def complete_by_title(self, title: str) -> bool:
-        return bool(self._pool.run(self._async.complete_by_title(title)))
+    def complete_by_title(
+        self, title: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return bool(self._pool.run(self._async.complete_by_title(title, workspace_id)))
 
-    def delete(self, task_id: str) -> bool:
-        return bool(self._pool.run(self._async.delete(task_id)))
+    def delete(
+        self, task_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return bool(self._pool.run(self._async.delete(task_id, workspace_id)))
 
     def close(self) -> None:
         self._pool.close()
@@ -2491,6 +2628,41 @@ def _memory_row_to_link(row: Any) -> Any:
 
 
 # --------------------------------------------------------------------------- helpers
+
+
+def _pg_scope(
+    workspace_id: str | frozenset[str] | None,
+    *,
+    start: int,
+    column: str = "workspace_id",
+) -> tuple[str, list[str]]:
+    """asyncpg ``$N`` analogue of :func:`himmy.api.studio_tenant_scope.scope_clause`.
+
+    The K5 Postgres aux mirrors carry the SAME nullable ``workspace_id`` column as the
+    SQLite stores (migration v11), so a tenant-bound Studio principal threaded through the
+    drained REST routes is filtered identically on either backend instead of crashing on a
+    rejected keyword. The contract matches the SQLite helper byte-for-byte:
+
+    * ``workspace_id is None`` (offline / ``all_tenants`` / the pinned ``tenant='local'``
+      single-box mirror) yields an EMPTY fragment + no params — "no filtering", so the
+      Postgres read is byte-unchanged from before this column existed;
+    * a concrete workspace yields ``(column = $N OR column IS NULL)`` so the caller sees its
+      OWN rows AND any legacy ``NULL`` row written before tenant binding;
+    * a ``frozenset`` yields ``(column IN ($N, ...) OR column IS NULL)``; an EMPTY set is
+      "nothing but legacy NULL rows", never "ALL".
+
+    ``start`` is the next free ``$N`` index (the callers' fixed params — ``tenant``, ids —
+    already consume the low numbers), so the fragment composes after the static predicate.
+    """
+    if workspace_id is None:
+        return "", []
+    if isinstance(workspace_id, str):
+        return f"({column} = ${start} OR {column} IS NULL)", [workspace_id]
+    ids = sorted(workspace_id)
+    if not ids:
+        return f"{column} IS NULL", []
+    placeholders = ", ".join(f"${start + i}" for i in range(len(ids)))
+    return f"({column} IN ({placeholders}) OR {column} IS NULL)", list(ids)
 
 
 def _rowcount(result: Any) -> int:

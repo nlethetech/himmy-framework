@@ -281,6 +281,83 @@ def test_memory_save_and_list_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
         assert args[0] == "local"
 
 
+def test_aux_stores_accept_workspace_id_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION (studio-store-drain): the drained REST routes pass ``workspace_id=...`` to
+    these singleton stores; under a Postgres DSN that landed on the PG mirror whose methods
+    had NO ``workspace_id`` parameter, so every drained read AND write raised ``TypeError`` ->
+    HTTP 500 on ANY Postgres deploy. This asserts each PG mirror method now tolerates the
+    keyword (the column the routers thread) AND emits the tenant-scoped fragment.
+    """
+    from himmy.api.studio_calendar import CalendarEvent
+    from himmy.api.studio_cookbook import Recipe
+    from himmy.api.studio_notes import Note
+    from himmy.services.storage.postgres_aux import (
+        PostgresCalendarStore,
+        PostgresCookbookStore,
+        PostgresNotesStore,
+        PostgresTasksStore,
+    )
+
+    pool = _FakePool({"fetch": [], "fetchrow": None, "execute": "UPDATE 1"})
+    _install_pool(monkeypatch, pool)
+
+    # tasks: every drained method must accept workspace_id and not crash.
+    tasks = PostgresTasksStore(tenant="local")
+    tasks.list(workspace_id="w1")
+    tasks.add("buy milk", workspace_id="w1")
+    tasks.set_done("id", True, workspace_id="w1")
+    tasks.update("id", done=True, workspace_id="w1")
+    tasks.complete_by_title("buy milk", workspace_id="w1")
+    tasks.delete("id", workspace_id="w1")
+
+    # notes
+    notes = PostgresNotesStore(tenant="local")
+    notes.list(workspace_id="w1")
+    notes.get("id", workspace_id="w1")
+    notes.find_by_title("t", workspace_id="w1")
+    notes.upsert(Note(title="t", body="b"), workspace_id="w1")
+    notes.delete("id", workspace_id="w1")
+
+    # calendar
+    cal = PostgresCalendarStore(tenant="local")
+    cal.list(month="2026-06", workspace_id="w1")
+    cal.add(CalendarEvent(date="2026-06-13", title="x"), workspace_id="w1")
+    cal.delete("id", workspace_id="w1")
+
+    # cookbook (incl. the get() the upsert route calls for the cross-tenant 404 check)
+    cook = PostgresCookbookStore(tenant="local")
+    cook.list(workspace_id="w1")
+    cook.get("id", workspace_id="w1")
+    cook.upsert(Recipe(name="r"), workspace_id="w1")
+    cook.delete("id", workspace_id="w1")
+
+    # A scoped read/mutation emitted the workspace predicate (NULL legacy rows stay visible).
+    scoped = [sql for sql, _ in pool.conn.calls if "workspace_id" in sql]
+    assert scoped, "no workspace_id-scoped SQL was emitted by the PG mirrors"
+    assert any("workspace_id IS NULL" in sql for sql in scoped)
+    # The bound workspace value rides as a bind param on at least one scoped call.
+    assert any("w1" in args for _, args in pool.conn.calls)
+
+
+def test_aux_stores_none_workspace_is_unscoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The offline / ``all_tenants`` path passes ``workspace_id=None`` -> NO filter clause, so
+    the PG read is byte-unchanged from before the column existed (no ``workspace_id`` predicate
+    and no extra bind param beyond tenant)."""
+    from himmy.services.storage.postgres_aux import PostgresTasksStore
+
+    pool = _FakePool({"fetch": []})
+    _install_pool(monkeypatch, pool)
+
+    PostgresTasksStore(tenant="local").list()  # workspace_id defaults to None
+    sql, args = pool.conn.calls[0]
+    assert "workspace_id" not in sql
+    assert args == ("local",)
+
+
 def test_memory_satisfies_store_protocol() -> None:
     """The PG mirror duck-types the MemoryStore protocol (drops into MemoryService)."""
     from himmy.services.memory.store import MemoryStore

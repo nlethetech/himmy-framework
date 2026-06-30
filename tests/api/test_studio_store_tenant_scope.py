@@ -287,3 +287,92 @@ def test_multi_tenant_write_is_rejected(studio_root: Path) -> None:
     app.state.access_policy = AccessPolicy.from_mapping({"reader": list(_READER_GRANTS)})
     c = _client(app)
     assert c.post("/api/studio/tasks", json={"title": "ambiguous"}).status_code == 400
+
+
+# --------------------------------------------------------------- agent tool-pack scoping
+#
+# The REST routes above are scoped, but the tasks/notes TOOL packs reach the SAME singleton
+# stores directly. A tenant-bound run threads its workspace in via ``ToolkitConfig.tenant_scope``
+# (the same lever that namespaces the memory/KB packs); these prove the agent's list/add/
+# complete/read/write are filtered + stamped exactly like the REST caller, and that ``None``
+# (offline) leaves the tool path unscoped (byte-unchanged).
+
+
+def _seed_two_tenant_tasks() -> None:
+    from himmy.api.studio_tasks import get_tasks_store
+
+    s = get_tasks_store()
+    s.add("w1 task", workspace_id="w1")
+    s.add("w2 task", workspace_id="w2")
+    s.add("legacy task")  # NULL workspace (predates tenant binding)
+
+
+def _register_pack(pack: str, tenant_scope: str | None):
+    from himmy.services.tools.registry import ToolRegistry
+    from himmy.toolkit.config import ToolkitConfig
+    from himmy.toolkit.pack import register_packs
+
+    reg = ToolRegistry()
+    cfg = ToolkitConfig(tenant_scope=tenant_scope)
+    register_packs(reg, [pack], cfg)
+    return reg
+
+
+def test_tasks_tool_pack_is_tenant_scoped(studio_root: Path) -> None:
+    """A tenant-bound run's ``list_tasks`` sees ONLY its workspace's tasks (plus legacy NULL)."""
+    _seed_two_tenant_tasks()
+    reg = _register_pack("tasks", tenant_scope="w1")
+
+    listed = reg.handler_for("list_tasks")({})
+    titles = {t["title"] for t in listed["tasks"]}
+    assert titles == {"w1 task", "legacy task"}
+    assert "w2 task" not in titles
+
+    # add_task stamps the run's workspace; the new row is visible to w1, never to w2.
+    reg.handler_for("add_task")({"title": "agent-added"})
+    from himmy.api.studio_tasks import get_tasks_store
+
+    assert {t.title for t in get_tasks_store().list(workspace_id="w1")} >= {"agent-added"}
+    assert "agent-added" not in {
+        t.title for t in get_tasks_store().list(workspace_id="w2")
+    }
+
+    # complete_task cannot complete a FOREIGN tenant's task by title.
+    assert reg.handler_for("complete_task")({"title": "w2 task"})["completed"] is False
+    assert reg.handler_for("complete_task")({"title": "w1 task"})["completed"] is True
+
+
+def test_tasks_tool_pack_offline_unscoped(studio_root: Path) -> None:
+    """No ``tenant_scope`` (offline) -> the tool pack lists EVERY task (byte-unchanged)."""
+    _seed_two_tenant_tasks()
+    reg = _register_pack("tasks", tenant_scope=None)
+    titles = {t["title"] for t in reg.handler_for("list_tasks")({})["tasks"]}
+    assert titles == {"w1 task", "w2 task", "legacy task"}
+
+
+def test_notes_tool_pack_is_tenant_scoped(studio_root: Path) -> None:
+    """A tenant-bound run's notes tools read + write ONLY its workspace (plus legacy NULL)."""
+    from himmy.api.studio_notes import Note, get_notes_store
+
+    s = get_notes_store()
+    s.upsert(Note(title="shared-key", body="w1 body"), workspace_id="w1")
+    s.upsert(Note(title="shared-key", body="w2 body"), workspace_id="w2")
+
+    reg = _register_pack("notes", tenant_scope="w1")
+    # read_note resolves to the w1 copy, never w2's.
+    read = reg.handler_for("read_note")({"title": "shared-key"})
+    assert read["found"] is True and read["body"] == "w1 body"
+
+    # write_note stamps w1 and upserts the w1 row (w2's copy is untouched).
+    reg.handler_for("write_note")({"title": "shared-key", "body": "w1 updated"})
+    assert (
+        get_notes_store().find_by_title("shared-key", workspace_id="w1").body
+        == "w1 updated"
+    )
+    assert (
+        get_notes_store().find_by_title("shared-key", workspace_id="w2").body
+        == "w2 body"
+    )
+
+    listed = {n["title"] for n in reg.handler_for("list_notes")({})["notes"]}
+    assert listed == {"shared-key"}  # one per tenant; w2's is filtered out
