@@ -140,6 +140,8 @@ def _build_team_runtime(
     shared_inference: Any,
     checkpoint_store: Any = None,
     tool_authorizer: Any = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> Any:
     """Build ``(team, registry, runtime)`` sharing the run service's storage.
 
@@ -167,11 +169,29 @@ def _build_team_runtime(
     from himmy.runtime.builder import build_runtime
     from himmy.runtime.from_spec import resolve_tools_module
 
+    # P1 tenancy (orchestration path): scope the members' memory/KB (and tasks/notes) packs to
+    # THIS run's tenant + (within-tenant) subject so two tenants' — or two users of one tenant's
+    # — team/group-chat/graph/workflow runs never share the durable memory/KB namespace. Without
+    # this, build_team falls back to ToolkitConfig.from_env() (static scope) and every member run
+    # pools onto ONE shared memory subject / KB scope — a cross-tenant confused-deputy read/write.
+    # Mirrors the Studio team path (himmy/api/studio_service.py). ``None``/``None`` leaves the
+    # historical static scope — byte-unchanged offline / all_tenants.
+    team_cfg = None
+    if owner_workspace_id is not None or owner_subject_scope is not None:
+        from himmy.toolkit import ToolkitConfig
+
+        team_cfg = ToolkitConfig.from_env()
+        team_cfg.tenant_scope = owner_workspace_id
+        team_cfg.subject_scope = owner_subject_scope
     # An operator member may declare a ``tools_module`` (privileged; tenant specs had it
     # stripped at sanitize). Wire the SAME dotted-path resolver the CLI/from_spec use so
     # the member's declared tools resolve in the team registry — including an
     # approval-gated tool a graph member can pause on.
-    team, registry = build_team(team_spec, resolve_tools_module=resolve_tools_module)
+    team, registry = build_team(
+        team_spec,
+        toolkit_config=team_cfg,
+        resolve_tools_module=resolve_tools_module,
+    )
     member_pins_provider = any(m.provider for m in team_spec.members)
     inference = (
         build_team_inference(team_spec)
@@ -201,6 +221,8 @@ async def _run_multi_agent(
     storage: Any,
     shared_inference: Any,
     tool_authorizer: Any = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> OrchestrationOutcome:
     """Drive the handoff/delegation orchestrator over the member team.
 
@@ -220,6 +242,8 @@ async def _run_multi_agent(
         storage=storage,
         shared_inference=shared_inference,
         tool_authorizer=tool_authorizer,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
     )
     orch = MultiAgentOrchestrator(
         runtime, team, registry, max_turns=_MULTI_AGENT_MAX_TURNS
@@ -245,6 +269,8 @@ async def _run_group_chat(
     storage: Any,
     shared_inference: Any,
     tool_authorizer: Any = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> OrchestrationOutcome:
     """Drive the selector-driven group chat over the member team.
 
@@ -262,6 +288,8 @@ async def _run_group_chat(
         storage=storage,
         shared_inference=shared_inference,
         tool_authorizer=tool_authorizer,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
     )
     orch = GroupChatOrchestrator(
         runtime, team, registry, max_rounds=_GROUP_CHAT_MAX_ROUNDS
@@ -335,6 +363,8 @@ async def _run_graph(
     approve_member: bool | None = None,
     actor: str = "human",
     tool_authorizer: Any = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> OrchestrationOutcome:
     """Drive a durable linear state-graph: one node per member, output threaded forward.
 
@@ -364,6 +394,8 @@ async def _run_graph(
         shared_inference=shared_inference,
         checkpoint_store=checkpoint_store,
         tool_authorizer=tool_authorizer,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
     )
 
     def _make_node(node_name: str, spec: AgentSpec) -> Any:
@@ -574,6 +606,8 @@ async def run_orchestration(
     approve_member: bool | None = None,
     actor: str = "human",
     tool_authorizer: Any = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> OrchestrationOutcome:
     """Resolve the member specs and drive the orchestrator for ``kind`` (T3b entry point).
 
@@ -593,6 +627,14 @@ async def run_orchestration(
     side-effecting tool the launching principal's own role was not granted — closing the
     same confused-deputy hole the single-agent path closes. ``None`` (offline / zero-config
     / no RBAC policy wired) leaves member tool dispatch byte-unchanged.
+
+    ``owner_workspace_id`` / ``owner_subject_scope`` (P1 tenancy) are the LAUNCHING run's tenant
+    and (within-tenant) subject. They are threaded into every member runtime's toolkit config so
+    the members' memory/KB (and tasks/notes) packs are namespaced to this run's owner — closing
+    the cross-tenant (and cross-user) confused-deputy DATA leak where two tenants' team/group-
+    chat/graph/workflow runs would otherwise share ONE durable memory subject / KB scope. Mirrors
+    the single-agent and Studio team paths. ``None``/``None`` (offline / all_tenants / no tenant
+    binding) leaves the historical static scope — byte-unchanged.
     """
     named = _member_specs(members, operator_provisioned=operator_provisioned)
 
@@ -608,6 +650,8 @@ async def run_orchestration(
             approve_member=approve_member,
             actor=actor,
             tool_authorizer=tool_authorizer,
+            owner_workspace_id=owner_workspace_id,
+            owner_subject_scope=owner_subject_scope,
         )
     if kind == "group_chat":
         return await _run_group_chat(
@@ -616,6 +660,8 @@ async def run_orchestration(
             storage=storage,
             shared_inference=shared_inference,
             tool_authorizer=tool_authorizer,
+            owner_workspace_id=owner_workspace_id,
+            owner_subject_scope=owner_subject_scope,
         )
     return await _run_multi_agent(
         named,
@@ -623,6 +669,8 @@ async def run_orchestration(
         storage=storage,
         shared_inference=shared_inference,
         tool_authorizer=tool_authorizer,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
     )
 
 

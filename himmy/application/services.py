@@ -2130,6 +2130,20 @@ class RunAppService:
 
         return ToolCapabilityAuthorizer.from_actor(actor, self._access_policy)
 
+    @staticmethod
+    def _subject_scope_from_actor(actor: dict[str, Any] | None) -> str | None:
+        """The within-tenant subject axis for a run's tool stores, from its persisted actor.
+
+        Mirrors the single-agent path: under a ``subject_scoped`` per-user actor the run's
+        memory/KB/tasks/notes packs are namespaced by the user so two users of ONE tenant never
+        read each other's facts/docs. The flag is persisted by ``Principal.actor_metadata`` (set
+        only when actually ``subject_scoped`` + not a ``tenant_admin``), so a non-subject-scoped /
+        offline run returns ``None`` — byte-for-byte unchanged.
+        """
+        if actor and actor.get("subject_scoped"):
+            return actor.get("subject")
+        return None
+
     async def _resolve_runtime(
         self,
         agent_spec: AgentSpec | None,
@@ -2794,6 +2808,14 @@ class RunAppService:
                         # tool-capability gate from the run's persisted actor on resume too,
                         # so a HITL resume cannot regain tool reach the launcher lacked.
                         tool_authorizer=resume_authorizer,
+                        # P1 tenancy: re-thread the run's tenant + (within-tenant) subject so the
+                        # resumed members' memory/KB packs stay namespaced to the owner — a HITL
+                        # resume cannot collapse onto the shared static namespace. None/None
+                        # offline / all_tenants is byte-unchanged.
+                        owner_workspace_id=run.workspace_id,
+                        owner_subject_scope=self._subject_scope_from_actor(
+                            (run.metadata or {}).get("actor")
+                        ),
                     ),
                     timeout=self._run_timeout_seconds,
                 )
@@ -3238,6 +3260,16 @@ class RunAppService:
                             # offline / when no RBAC policy is wired). Mirrors the
                             # single-agent path's _resolve_runtime/_build_tool_authorizer.
                             tool_authorizer=team_authorizer,
+                            # P1 tenancy: namespace the members' memory/KB (and tasks/notes)
+                            # packs to THIS run's tenant + (within-tenant) subject so two
+                            # tenants' — or two users of one tenant's — orchestration runs never
+                            # share the durable memory/KB namespace (cross-tenant confused-deputy
+                            # DATA leak). Mirrors the single-agent + Studio team paths; None/None
+                            # offline / all_tenants is byte-unchanged.
+                            owner_workspace_id=run.workspace_id,
+                            owner_subject_scope=self._subject_scope_from_actor(
+                                (run.metadata or {}).get("actor")
+                            ),
                         ),
                         timeout=self._run_timeout_seconds,
                     )

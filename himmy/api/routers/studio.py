@@ -54,9 +54,10 @@ from himmy.api.auth import (
     narrow_subject,
     resolve_workspace,
     scoped_read,
+    singleton_read_filter,
+    singleton_write_workspace,
     studio_subject_filter,
     studio_tenant_filter,
-    studio_write_workspace,
     subject_write,
 )
 from himmy.api.routers.studio_common import studio_permission
@@ -347,6 +348,13 @@ def _run_subject_scope(request: Request) -> str | None:
     if TENANT_ADMIN_ROLE in principal.roles:
         return None
     return principal.subject
+
+
+#: The subject-axis-aware singleton-store scope helpers (centralized in
+#: :mod:`himmy.api.auth.context`) so the tasks/notes/calendar/cookbook/chats routes here and the
+#: projects routes in :mod:`studio_projects` derive ONE owner token from the verified principal.
+_singleton_write_workspace = singleton_write_workspace
+_singleton_read_filter = singleton_read_filter
 
 
 async def _authorize_run(request: Request, run_id: str) -> bool:
@@ -1402,7 +1410,7 @@ async def tasks_list(request: Request) -> list[Any]:
     """
     from himmy.api.studio_tasks import get_tasks_store
 
-    return get_tasks_store().list(workspace_id=studio_tenant_filter(request))
+    return get_tasks_store().list(workspace_id=_singleton_read_filter(request))
 
 
 @router.post("/tasks", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))])
@@ -1410,7 +1418,7 @@ async def tasks_add(request: Request, body: TaskAddRequest) -> Any:
     from himmy.api.studio_tasks import get_tasks_store
 
     return get_tasks_store().add(
-        body.title, due=body.due, workspace_id=studio_write_workspace(request)
+        body.title, due=body.due, workspace_id=_singleton_write_workspace(request)
     )
 
 
@@ -1424,7 +1432,7 @@ async def tasks_done(
 
     return {
         "ok": get_tasks_store().set_done(
-            task_id, body.done, workspace_id=studio_tenant_filter(request)
+            task_id, body.done, workspace_id=_singleton_read_filter(request)
         )
     }
 
@@ -1437,7 +1445,7 @@ async def tasks_delete(request: Request, task_id: str) -> dict[str, bool]:
 
     return {
         "ok": get_tasks_store().delete(
-            task_id, workspace_id=studio_tenant_filter(request)
+            task_id, workspace_id=_singleton_read_filter(request)
         )
     }
 
@@ -1470,7 +1478,7 @@ class ChatRenameRequest(BaseModel):
 async def chats_list(request: Request) -> Any:
     from himmy.api.studio_chats import get_chats_store
 
-    return get_chats_store().list(workspace_id=studio_tenant_filter(request))
+    return get_chats_store().list(workspace_id=_singleton_read_filter(request))
 
 
 @router.get(
@@ -1481,7 +1489,7 @@ async def chats_get(session_id: str, request: Request) -> Any:
     from himmy.api.studio_chats import get_chats_store
 
     detail = get_chats_store().get(
-        session_id, workspace_id=studio_tenant_filter(request)
+        session_id, workspace_id=_singleton_read_filter(request)
     )
     if detail is None:
         raise HTTPException(status_code=404, detail="unknown chat session")
@@ -1496,11 +1504,12 @@ async def chats_save(body: ChatSaveRequest, request: Request) -> Any:
     from himmy.api.studio_chats import ChatMessage, get_chats_store
 
     store = get_chats_store()
-    scope = studio_tenant_filter(request)
-    # A tenant-bound caller re-using a foreign session's id must not clobber/overwrite its
-    # thread+title+messages (the ON CONFLICT upsert in save_thread only PRESERVES the owner
-    # column, not the content) — fold a cross-tenant id collision to 404 BEFORE the save,
-    # mirroring the notes/cookbook upsert guards. NO-OP offline / ``all_tenants`` (scope None).
+    scope = _singleton_read_filter(request)
+    # A tenant-bound (or per-user subject-scoped) caller re-using a foreign session's id must
+    # not clobber/overwrite its thread+title+messages (the ON CONFLICT upsert in save_thread
+    # only PRESERVES the owner column, not the content) — fold a cross-owner id collision to 404
+    # BEFORE the save, mirroring the notes/cookbook upsert guards. NO-OP offline / ``all_tenants``
+    # (scope None).
     if body.id and scope is not None and store.get(body.id) is not None:
         if store.get(body.id, workspace_id=scope) is None:
             raise HTTPException(status_code=404, detail="unknown chat session")
@@ -1511,7 +1520,7 @@ async def chats_save(body: ChatSaveRequest, request: Request) -> Any:
         provider=body.provider,
         project_id=body.project_id,
         messages=[ChatMessage(role=m.role, text=m.text) for m in body.messages],
-        workspace_id=studio_write_workspace(request),
+        workspace_id=_singleton_write_workspace(request),
     )
 
 
@@ -1526,7 +1535,7 @@ async def chats_rename(
 
     return {
         "ok": get_chats_store().rename(
-            session_id, body.title, workspace_id=studio_tenant_filter(request)
+            session_id, body.title, workspace_id=_singleton_read_filter(request)
         )
     }
 
@@ -1540,7 +1549,7 @@ async def chats_delete(session_id: str, request: Request) -> dict[str, bool]:
 
     return {
         "ok": get_chats_store().delete(
-            session_id, workspace_id=studio_tenant_filter(request)
+            session_id, workspace_id=_singleton_read_filter(request)
         )
     }
 
@@ -1567,7 +1576,7 @@ async def cookbook_list(request: Request) -> list[Any]:
     """Saved recipes, tenant-scoped (NO-OP offline / ``all_tenants``)."""
     from himmy.api.studio_cookbook import get_cookbook_store
 
-    return get_cookbook_store().list(workspace_id=studio_tenant_filter(request))
+    return get_cookbook_store().list(workspace_id=_singleton_read_filter(request))
 
 
 @router.put(
@@ -1577,9 +1586,10 @@ async def cookbook_upsert(request: Request, body: RecipeUpsertRequest) -> Any:
     from himmy.api.studio_cookbook import Recipe, get_cookbook_store
 
     store = get_cookbook_store()
-    scope = studio_tenant_filter(request)
-    # A tenant-bound caller must not clobber/re-stamp another tenant's recipe by re-using
-    # its id (INSERT OR REPLACE) — fold a cross-tenant id collision to 404.
+    scope = _singleton_read_filter(request)
+    # A tenant-bound (or per-user subject-scoped) caller must not clobber/re-stamp another
+    # owner's recipe by re-using its id (INSERT OR REPLACE) — fold a cross-owner id collision
+    # to 404.
     if body.id and scope is not None and store.get(body.id) is not None:
         if store.get(body.id, workspace_id=scope) is None:
             raise HTTPException(status_code=404, detail="recipe not found")
@@ -1591,7 +1601,7 @@ async def cookbook_upsert(request: Request, body: RecipeUpsertRequest) -> Any:
     )
     if body.id:
         r.id = body.id
-    return store.upsert(r, workspace_id=studio_write_workspace(request))
+    return store.upsert(r, workspace_id=_singleton_write_workspace(request))
 
 
 @router.delete(
@@ -1603,7 +1613,7 @@ async def cookbook_delete(request: Request, recipe_id: str) -> dict[str, bool]:
 
     return {
         "ok": get_cookbook_store().delete(
-            recipe_id, workspace_id=studio_tenant_filter(request)
+            recipe_id, workspace_id=_singleton_read_filter(request)
         )
     }
 
@@ -1628,7 +1638,7 @@ async def notes_list(request: Request) -> list[Any]:
     """Notes, tenant-scoped to the principal's workspace (NO-OP offline / ``all_tenants``)."""
     from himmy.api.studio_notes import get_notes_store
 
-    return get_notes_store().list(workspace_id=studio_tenant_filter(request))
+    return get_notes_store().list(workspace_id=_singleton_read_filter(request))
 
 
 @router.get(
@@ -1642,7 +1652,7 @@ async def notes_get(request: Request, note_id: str) -> Any:
     """A note by id; a foreign-tenant note is a uniform 404 (existence never leaks)."""
     from himmy.api.studio_notes import get_notes_store
 
-    note = get_notes_store().get(note_id, workspace_id=studio_tenant_filter(request))
+    note = get_notes_store().get(note_id, workspace_id=_singleton_read_filter(request))
     if note is None:
         raise HTTPException(status_code=404, detail="note not found")
     return note
@@ -1653,16 +1663,17 @@ async def notes_upsert(request: Request, body: NoteUpsertRequest) -> Any:
     from himmy.api.studio_notes import Note, get_notes_store
 
     store = get_notes_store()
-    scope = studio_tenant_filter(request)
-    # A tenant-bound caller re-using a foreign note's id must not clobber/re-stamp it
-    # (INSERT OR REPLACE) — fold a cross-tenant id collision to 404 (existence not leaked).
+    scope = _singleton_read_filter(request)
+    # A tenant-bound (or per-user subject-scoped) caller re-using a foreign note's id must not
+    # clobber/re-stamp it (INSERT OR REPLACE) — fold a cross-owner id collision to 404
+    # (existence not leaked).
     if body.id and scope is not None and store.get(body.id) is not None:
         if store.get(body.id, workspace_id=scope) is None:
             raise HTTPException(status_code=404, detail="note not found")
     note = Note(title=body.title, body=body.body)
     if body.id:
         note.id = body.id
-    return store.upsert(note, workspace_id=studio_write_workspace(request))
+    return store.upsert(note, workspace_id=_singleton_write_workspace(request))
 
 
 @router.delete(
@@ -1673,7 +1684,7 @@ async def notes_delete(request: Request, note_id: str) -> dict[str, bool]:
 
     return {
         "ok": get_notes_store().delete(
-            note_id, workspace_id=studio_tenant_filter(request)
+            note_id, workspace_id=_singleton_read_filter(request)
         )
     }
 
@@ -1700,7 +1711,7 @@ async def calendar_list(request: Request, month: str | None = None) -> list[Any]
     from himmy.api.studio_calendar import get_calendar_store
 
     return get_calendar_store().list(
-        month=month, workspace_id=studio_tenant_filter(request)
+        month=month, workspace_id=_singleton_read_filter(request)
     )
 
 
@@ -1713,7 +1724,7 @@ async def calendar_add(request: Request, body: CalendarAddRequest) -> Any:
     ev = CalendarEvent(
         date=body.date, title=body.title, time=body.time or None, notes=body.notes
     )
-    return get_calendar_store().add(ev, workspace_id=studio_write_workspace(request))
+    return get_calendar_store().add(ev, workspace_id=_singleton_write_workspace(request))
 
 
 @router.delete(
@@ -1725,7 +1736,7 @@ async def calendar_delete(request: Request, event_id: str) -> dict[str, bool]:
 
     return {
         "ok": get_calendar_store().delete(
-            event_id, workspace_id=studio_tenant_filter(request)
+            event_id, workspace_id=_singleton_read_filter(request)
         )
     }
 

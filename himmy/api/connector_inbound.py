@@ -24,6 +24,7 @@ tools, so an inbound delivery is genuinely agentic — not a tool-less single sh
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -111,18 +112,36 @@ def _build_inbound_handler(agent_path: str, *, app: FastAPI | None = None) -> An
     from himmy.api.auth.service_principal import connector_service_principal
 
     connector_workspace = connector_service_principal().default_tenant()
-    runtime, registry = build_runtime_for_spec(
-        spec,
-        durable_defaults=True,
-        subject=connector_workspace,
-        tool_authorizer=tool_authorizer,
-    )
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
-    has_tools = registry is not None
     threads: dict[str, Any] = {}
+    #: One runtime PER SENDER, keyed by ``sender_id``. The connector's per-sender
+    #: :class:`ChatThread` isolates conversational context, but the memory/KB tool packs would
+    #: otherwise pool EVERY external sender onto the connector's ONE ``t:<workspace>:default``
+    #: memory subject / ``t:<workspace>`` KB scope — so sender A's ``remember`` would surface in
+    #: sender B's ``recall`` (a within-connector cross-end-user data bleed). Threading
+    #: ``subject_scope=sender_id`` namespaces each sender's memory/KB to ``t:<workspace>:s:<sender>``
+    #: (the same combined-token scheme the per-user run path uses), so the per-sender memory/KB
+    #: isolation matches the per-sender thread. An agent with NO memory/KB packs builds an
+    #: identical runtime regardless of the scope, so the no-memory connector path is unchanged.
+    runtimes: dict[str, tuple[Any, Any]] = {}
+
+    def _runtime_for(sender_id: str) -> tuple[Any, Any]:
+        built = runtimes.get(sender_id)
+        if built is None:
+            built = build_runtime_for_spec(
+                spec,
+                durable_defaults=True,
+                subject=connector_workspace,
+                subject_scope=sender_id,
+                tool_authorizer=tool_authorizer,
+            )
+            runtimes[sender_id] = built
+        return built
 
     async def handle(sender_id: str, text: str) -> str:
+        runtime, registry = await asyncio.to_thread(_runtime_for, sender_id)
+        has_tools = registry is not None
         thread = threads.get(sender_id)
         if thread is None:
             thread = ChatThread(agent_id=persona.agent_id)

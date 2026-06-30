@@ -207,7 +207,9 @@ class ChatsStore:
         row = self._store.get_project_row(project_id, workspace_id=workspace_id)
         if row is None:
             return None
-        return self._to_project(row, self._store.project_chat_count(project_id))
+        return self._to_project(
+            row, self._store.project_chat_count(project_id, workspace_id=workspace_id)
+        )
 
     def create_project(
         self,

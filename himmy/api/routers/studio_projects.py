@@ -24,8 +24,8 @@ from pydantic import BaseModel, Field
 
 from himmy.api.auth import (
     scoped_read,
-    studio_tenant_filter,
-    studio_write_workspace,
+    singleton_read_filter,
+    singleton_write_workspace,
 )
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.api.studio_chats import ChatSession, ChatsStore, Project, get_chats_store
@@ -140,7 +140,7 @@ def _notify(
 @router.get("", response_model=list[Project], dependencies=[Depends(scoped_read)])
 async def projects_list(request: Request) -> list[Project]:
     """Every project the caller's tenant owns (plus legacy NULL), most recently touched first."""
-    return get_chats_store().list_projects(workspace_id=studio_tenant_filter(request))
+    return get_chats_store().list_projects(workspace_id=singleton_read_filter(request))
 
 
 @router.post("", response_model=Project, dependencies=[_projects_write])
@@ -151,12 +151,12 @@ async def projects_create(body: ProjectCreateRequest, request: Request) -> Proje
         description=body.description.strip(),
         kb_id=body.kb_id,
         agent_path=body.agent_path,
-        workspace_id=studio_write_workspace(request),
+        workspace_id=singleton_write_workspace(request),
     )
     _notify(
         f"Project “{project.name}” created",
         project,
-        workspace_id=studio_write_workspace(request),
+        workspace_id=singleton_write_workspace(request),
     )
     return project
 
@@ -168,7 +168,7 @@ async def projects_create(body: ProjectCreateRequest, request: Request) -> Proje
 )
 async def projects_get(project_id: str, request: Request) -> ProjectDetail:
     store = get_chats_store()
-    scope = studio_tenant_filter(request)
+    scope = singleton_read_filter(request)
     project = store.get_project(project_id, workspace_id=scope)
     if project is None:
         raise HTTPException(status_code=404, detail="unknown project")
@@ -182,7 +182,7 @@ async def projects_update(
     project_id: str, body: ProjectUpdateRequest, request: Request
 ) -> Project:
     store = get_chats_store()
-    scope = studio_tenant_filter(request)
+    scope = singleton_read_filter(request)
     if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
     changes: dict[str, str | None] = {}
@@ -198,7 +198,7 @@ async def projects_update(
 @router.delete("/{project_id}", dependencies=[_projects_write])
 async def projects_delete(project_id: str, request: Request) -> dict[str, bool]:
     store = get_chats_store()
-    scope = studio_tenant_filter(request)
+    scope = singleton_read_filter(request)
     project = store.get_project(project_id, workspace_id=scope)
     if project is None:
         return {"ok": False}
@@ -208,7 +208,7 @@ async def projects_delete(project_id: str, request: Request) -> dict[str, bool]:
             f"Project “{project.name}” deleted",
             project,
             body="Its chats were kept, just ungrouped.",
-            workspace_id=studio_write_workspace(request),
+            workspace_id=singleton_write_workspace(request),
         )
     return {"ok": ok}
 
@@ -218,7 +218,7 @@ async def projects_assign(
     project_id: str, body: ChatAssignRequest, request: Request
 ) -> dict[str, bool]:
     store = get_chats_store()
-    scope = studio_tenant_filter(request)
+    scope = singleton_read_filter(request)
     if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
     if not store.assign_chat(project_id, body.chat_id, workspace_id=scope):
@@ -231,7 +231,7 @@ async def projects_unassign(
     project_id: str, body: ChatAssignRequest, request: Request
 ) -> dict[str, bool]:
     store = get_chats_store()
-    scope = studio_tenant_filter(request)
+    scope = singleton_read_filter(request)
     if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
     return {"ok": store.unassign_chat(body.chat_id, workspace_id=scope)}

@@ -308,6 +308,67 @@ def studio_write_workspace(request: Request) -> str | None:
     )
 
 
+def singleton_owner_token(request: Request) -> str | None:
+    """The combined ``t:<tenant>:s:<subject>`` owner a subject-scoped singleton-store write stamps.
+
+    The cwd-keyed singleton Studio stores (tasks/notes/calendar/cookbook/chats/projects) key a
+    row by ONE opaque ``workspace_id`` owner string. The agent tool packs scope those same stores
+    by :meth:`~himmy.toolkit.config.ToolkitConfig.scoped_pack_workspace` → ``t:<tenant>:s:<subject>``
+    for a per-user ``subject_scoped`` run, but the HTTP routes historically stamped/filtered only
+    the BARE tenant (:func:`studio_write_workspace` / :func:`studio_tenant_filter`) — so (a) a
+    subject-scoped user's HTTP-created rows collapsed onto the shared bare-tenant owner readable by
+    every co-tenant user (a within-tenant cross-USER BOLA), and (b) the agent-created rows
+    (``t:<tenant>:s:<subject>``) were invisible to that same user's own GUI (a split-brain).
+
+    This returns the SAME combined owner token the packs use, so the HTTP write/read land in the
+    user's own ``t:<tenant>:s:<subject>`` partition. Returns ``None`` for every non-subject-scoped
+    principal (offline / ``all_tenants`` / tenant-only / ``tenant_admin``) so those paths fall back
+    to the bare-tenant helpers and stay byte-for-byte unchanged.
+    """
+    subject = studio_subject_filter(request)
+    if subject is None:
+        return None
+    workspace = resolve_workspace(request, None)
+    if not workspace:
+        return None
+    from himmy.toolkit.config import ToolkitConfig
+
+    return ToolkitConfig(
+        tenant_scope=workspace, subject_scope=subject
+    ).scoped_pack_workspace()
+
+
+def singleton_write_workspace(request: Request) -> str | None:
+    """The ``workspace_id`` a singleton-store WRITE is stamped with — tenant(+subject) aware.
+
+    The subject-axis-folding companion to :func:`studio_write_workspace` for the tasks/notes/
+    calendar/cookbook/chats/projects stores. For a per-user ``subject_scoped`` principal it returns
+    the combined ``t:<tenant>:s:<subject>`` token (so a co-tenant peer cannot read or mutate the
+    row); for every other principal it delegates to :func:`studio_write_workspace` (bare tenant /
+    ``None``) — byte-for-byte unchanged on the offline / tenant-only path.
+    """
+    token = singleton_owner_token(request)
+    if token is not None:
+        return token
+    return studio_write_workspace(request)
+
+
+def singleton_read_filter(request: Request) -> frozenset[str] | None:
+    """The ``workspace_id`` allow-list a singleton-store READ/MUTATE intersects — subject aware.
+
+    The subject-axis-folding companion to :func:`studio_tenant_filter` for the tasks/notes/
+    calendar/cookbook/chats/projects stores. For a per-user ``subject_scoped`` principal it pins the
+    read/mutate to the SAME combined ``{t:<tenant>:s:<subject>}`` owner the write stamps (and the
+    agent pack uses), so a co-tenant peer's bare-tenant rows are not visible and the user's own
+    agent-created rows ARE. For every other principal it delegates to :func:`studio_tenant_filter`
+    — byte-for-byte unchanged on the offline / tenant-only path.
+    """
+    token = singleton_owner_token(request)
+    if token is not None:
+        return frozenset({token})
+    return studio_tenant_filter(request)
+
+
 def authorize_studio_object(request: Request, workspace_id: str | None) -> bool:
     """By-id (BOLA-style) gate for a Studio object: may this caller read ``workspace_id``?
 

@@ -766,10 +766,25 @@ class ConversationStore:
         ).fetchone()
         return row
 
-    def project_chat_count(self, project_id: str) -> int:
+    def project_chat_count(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> int:
+        """Count conversations attached to ``project_id``, scoped to ``workspace_id`` (or ALL).
+
+        The count is constrained to the caller's own workspace (plus legacy NULL rows) exactly
+        like the scoped LEFT JOIN in :meth:`list_project_rows` and the scoped read in
+        :meth:`project_conversation_summaries`. Without this, a foreign tenant that attached its
+        own conversation to this project (via an unvalidated ``project_id`` on save) would inflate
+        the count a scoped reader sees — a cross-tenant count side channel. ``None`` (CLI /
+        offline / ``all_tenants``) is unscoped, so the single-box count is byte-unchanged.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id, column="workspace_id")
+        extra = f" AND {clause}" if clause else ""
         row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM conversations WHERE project_id = ?",
-            (project_id,),
+            f"SELECT COUNT(*) AS n FROM conversations WHERE project_id = ?{extra}",  # noqa: S608
+            (project_id, *params),
         ).fetchone()
         return int(row["n"]) if row else 0
 
