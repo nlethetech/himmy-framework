@@ -397,13 +397,30 @@ class _Cognition:
     the live SSE stream and for the run-detail cognition view.
     """
 
-    def __init__(self, read_only: dict[str, bool | None], initial_agent: str) -> None:
+    def __init__(
+        self,
+        read_only: dict[str, bool | None],
+        initial_agent: str,
+        *,
+        owner_workspace_id: str | None = None,
+        owner_subject_scope: str | None = None,
+    ) -> None:
         from himmy.core.events import EventType
 
         self._E = EventType
         self._read_only = read_only
         self.active = initial_agent
         self.active_model: str | None = None
+        # The OWNING workspace of this run, so the approval bell is only visible to the
+        # tenant that launched the run (``None``/offline = NULL-owned = shared, unchanged).
+        self._owner_workspace_id = owner_workspace_id
+        # The within-tenant USER axis (rbac-harden mopup-r6): for a per-user subject_scoped
+        # run the approval bell carries run detail, so it must be stamped with the SAME
+        # subject-aware ``t:<tenant>:s:<subject>`` owner token the singleton-store reader
+        # (``singleton_read_filter``) pins to — else a co-tenant PEER reads it (the same
+        # within-tenant cross-USER BOLA closed on the mission finish bell). ``None`` (offline
+        # / non-subject-scoped tenant) collapses to the bare workspace, byte-unchanged.
+        self._owner_subject_scope = owner_subject_scope
         self.tools_used: list[str] = []
         self.delegate_answers: list[tuple[str, str]] = []
         self.steps: list[dict[str, Any]] = []
@@ -414,6 +431,24 @@ class _Cognition:
         self.inferences = 0
         self._latencies: list[float] = []
         self._by_model: dict[str, dict[str, Any]] = {}
+
+    def _notify_owner_workspace(self) -> str | None:
+        """The owner token this run's notification (bell) is stamped with.
+
+        Mirrors :func:`himmy.api.auth.singleton_read_filter`'s owner: for a per-user
+        subject_scoped run (``owner_subject_scope`` set) this is the combined
+        ``t:<tenant>:s:<subject>`` token so a co-tenant PEER cannot read the bell; a
+        tenant-only / offline run collapses to the bare ``owner_workspace_id`` / ``None`` —
+        byte-unchanged.
+        """
+        if self._owner_subject_scope:
+            from himmy.toolkit.config import ToolkitConfig
+
+            return ToolkitConfig(
+                tenant_scope=self._owner_workspace_id,
+                subject_scope=self._owner_subject_scope,
+            ).scoped_pack_workspace()
+        return self._owner_workspace_id
 
     def _record(self, **kw: Any) -> None:
         kw["seq"] = len(self.steps) + 1
@@ -606,6 +641,7 @@ class _Cognition:
                 "Approval required: " + (", ".join(tools) if tools else "a gated tool"),
                 body=f"{self.active} paused and is waiting for your decision",
                 link="/approvals",
+                workspace_id=self._notify_owner_workspace(),
             )
             return out
 
@@ -730,6 +766,9 @@ async def stream_agent_run(
     plan_mode: bool = False,
     canonical_storage: Any | None = None,
     extra_metadata: dict[str, Any] | None = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run an agent for one user turn, yielding GUI events.
 
@@ -762,6 +801,14 @@ async def stream_agent_run(
     studio.db`` is then just a presentation cache. The canonical write happens on
     THIS (main) event loop after the worker-thread studio.db write returns; we never
     nest a loop inside ``to_thread`` (an asyncpg pool is bound to its creating loop).
+
+    ``owner_workspace_id`` / ``owner_subject_id`` (scope-r4) stamp the canonical
+    :class:`RunRecord` with the LAUNCHING tenant + data subject. They are threaded by the
+    callers that resolve a real owner from a verified principal (e.g. a background Mission
+    started by a tenant-bound caller) so the run lands in that tenant/subject's partition —
+    not the global ``__local__`` bucket :func:`studio_run_to_record` defaults to. ``None``
+    (the offline / interactive single-box default) keeps the byte-unchanged ``__local__``
+    stamping, so the zero-config path is untouched.
     """
     history = history or []
     collected_events: list[Any] = []
@@ -787,6 +834,23 @@ async def stream_agent_run(
             capture_io=True,  # power the cognition stream + trace inspector
             checkpoint_store=get_checkpoint_store(),  # pause on approval-gated tools
             durable_defaults=True,
+            # P1 tenancy (rbac-harden): thread the VERIFIED launching tenant into the
+            # per-run runtime so its memory + knowledge tool packs key off this tenant's
+            # workspace on the shared durable ``.himmy/memory.db`` / KB scope — not the
+            # static ``default`` subject / ``(local, local)`` KB scope every run shares.
+            # ``owner_workspace_id`` is resolved from the authenticated principal by every
+            # multi-tenant caller (Missions stamps ``mission.workspace_id``; Studio routers
+            # resolve ``_run_owner(request)``) and is NEVER client input. Symmetric to the
+            # ``/v1`` run service (services.py: ``subject=workspace_id``). ``None`` (the
+            # offline / interactive single-box default, and the ANONYMOUS all_tenants
+            # principal) leaves both packs on their historical static scope — byte-for-byte
+            # unchanged, so the zero-config path is untouched.
+            subject=owner_workspace_id,
+            # P1 tenancy (subject axis): under a subject_scoped per-user principal this
+            # additionally namespaces the memory/KB/tasks/notes tool stores by the user so two
+            # users of ONE tenant never read each other's facts/docs/tasks. ``None`` (the
+            # common non-subject-scoped / offline case) keeps the scope tenant-only.
+            subject_scope=owner_subject_scope,
         )
     )
     has_tools = registry is not None
@@ -796,7 +860,12 @@ async def stream_agent_run(
         # so the tool is bound and classified like any other.
         register_update_plan_tool(registry)
     thread = _rebuild_thread(spec, history)
-    cog = _Cognition(_read_only_map(registry), spec.name)
+    cog = _Cognition(
+        _read_only_map(registry),
+        spec.name,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
+    )
 
     # Attach any MCP servers for the lifetime of this run.
     mcp_clients: list[Any] = []
@@ -820,6 +889,22 @@ async def stream_agent_run(
     yield {"type": "start", "agent": spec.name, "streaming": not has_tools}
     try:
         task = spec.make_task(prompt)
+        # rbac-harden (resume tenancy): stamp the run's OWNING tenant + within-tenant USER
+        # axis onto the task's ``context_metadata`` so they ride durably into the checkpoint
+        # ctx (serialized verbatim). On a HITL resume in a fresh process the approvals path
+        # re-derives both via ``_checkpoint_owner_workspace`` / ``_checkpoint_owner_subject_scope``
+        # and re-scopes the resumed memory/KB packs to the same partition — otherwise the
+        # resume reverts to the shared tenant-only (or static) store. ``None``/``None``
+        # (offline / non-subject-scoped) writes nothing → byte-for-byte unchanged.
+        if owner_workspace_id is not None or owner_subject_scope is not None:
+            meta = task.context.get("context_metadata")
+            if not isinstance(meta, dict):
+                meta = {}
+                task.context["context_metadata"] = meta
+            if owner_workspace_id is not None:
+                meta.setdefault("workspace_id", owner_workspace_id)
+            if owner_subject_scope is not None:
+                meta.setdefault("subject_scope", owner_subject_scope)
         if plan_mode and has_tools:
             # Plan-first: nudge the agent (system prefix renders into the system
             # prompt on the first turn) and make sure update_plan stays bound
@@ -960,7 +1045,13 @@ async def stream_agent_run(
         )
     except Exception:  # noqa: BLE001 - persistence must never break the stream
         pass
-    await _record_canonical(canonical_storage, built, extra_metadata=extra_metadata)
+    await _record_canonical(
+        canonical_storage,
+        built,
+        extra_metadata=extra_metadata,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_id=owner_subject_id,
+    )
 
     if interrupted:
         # An interrupted (cancelled) consumer must observe the cancellation, not
@@ -1062,6 +1153,8 @@ async def _record_canonical(
     built: Any | None,
     *,
     extra_metadata: dict[str, Any] | None = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_id: str | None = None,
 ) -> None:
     """Mirror a Studio run into the ONE canonical RunRecord store (T2.2, main loop).
 
@@ -1077,13 +1170,28 @@ async def _record_canonical(
     "routine_id": ...}, "source": "routine"}`` here so a scheduled/run-now run is
     attributable to its routine in ``GET /v1/runs`` + ``himmy runs`` + Studio, with the
     same RUN_* lineage every canonical run carries.
+
+    ``owner_workspace_id`` / ``owner_subject_id`` (scope-r4), when supplied, stamp the
+    canonical record's tenant + subject so a run launched by a tenant-bound caller (a
+    background Mission) lands in THAT partition rather than the global ``__local__`` bucket —
+    closing the mis-scoped-write / cross-subject-pooling gap. ``None`` keeps the
+    byte-unchanged ``__local__`` default for the offline / interactive single-box path.
     """
     if canonical_storage is None or built is None:
         return
     try:
-        from himmy.api.studio_canonical import save_canonical_run, studio_run_to_record
+        from himmy.api.studio_canonical import (
+            LOCAL_SUBJECT,
+            LOCAL_WORKSPACE,
+            save_canonical_run,
+            studio_run_to_record,
+        )
 
-        record = studio_run_to_record(built)
+        record = studio_run_to_record(
+            built,
+            workspace_id=owner_workspace_id or LOCAL_WORKSPACE,
+            subject_id=owner_subject_id or LOCAL_SUBJECT,
+        )
         if extra_metadata:
             merged = dict(record.metadata or {})
             merged.update(extra_metadata)
@@ -1210,6 +1318,8 @@ async def stream_team_run(
     team_name: str = "team",
     team_path: str | None = None,
     canonical_storage: Any | None = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run a multi-agent team for one request, streaming the live routing trail.
 
@@ -1217,6 +1327,15 @@ async def stream_team_run(
     Ollama workers). Emits ``start`` → ``tool``/``delegate``/``handoff`` frames as they
     happen → ``message`` (the final synthesized answer) → ``done``. The whole run is
     persisted for the Runs browser.
+
+    ``owner_workspace_id`` / ``owner_subject_scope`` thread the LAUNCHING tenant + within-
+    tenant user axis into the members' tool packs (exactly like the single-agent
+    :func:`stream_agent_run` path): without them ``build_team`` falls back to
+    ``ToolkitConfig.from_env()`` with no tenant/subject scope, so every tenant's team-run
+    ``remember``/``recall`` and ``kb_ingest``/``kb_search`` collapse onto the static shared
+    ``default`` subject / ``("local","local")`` KB scope on a shared durable store — a
+    cross-tenant confused-deputy. Both ``None`` (offline / ``all_tenants``) → unscoped,
+    byte-for-byte unchanged.
     """
     from himmy import build_runtime
     from himmy.config.team_spec import build_team, build_team_inference
@@ -1231,8 +1350,21 @@ async def stream_team_run(
 
     # Build off the event loop (tool-module import + pack registration are sync).
     def _build() -> tuple[Any, Any, Any]:
+        # P1 tenancy: scope the members' memory/KB packs to THIS run's tenant + (within-
+        # tenant) subject so two tenants' team runs never share the durable memory/KB
+        # namespace. ``None``/``None`` leaves ToolkitConfig.from_env() on its historical
+        # static scope — byte-unchanged offline / all_tenants.
+        team_cfg = None
+        if owner_workspace_id is not None or owner_subject_scope is not None:
+            from himmy.toolkit import ToolkitConfig
+
+            team_cfg = ToolkitConfig.from_env()
+            team_cfg.tenant_scope = owner_workspace_id
+            team_cfg.subject_scope = owner_subject_scope
         team, registry = build_team(
-            spec, resolve_tools_module=from_spec.resolve_tools_module
+            spec,
+            toolkit_config=team_cfg,
+            resolve_tools_module=from_spec.resolve_tools_module,
         )
         inference = build_team_inference(spec)
         runtime, _i, _t = build_runtime(
@@ -1259,7 +1391,12 @@ async def stream_team_run(
     status = "ok"
     error_msg: str | None = None
     entry = getattr(spec, "entry", None) or team_name
-    cog = _Cognition(_read_only_map(registry), entry)
+    cog = _Cognition(
+        _read_only_map(registry),
+        entry,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
+    )
 
     yield {"type": "start", "agent": team_name, "streaming": False, "team": True}
 

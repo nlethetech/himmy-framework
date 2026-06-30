@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 from himmy.config.secrets import get_secret
 from himmy.core.events import EventType, RunEvent
+from himmy.services.tools.ambient import resolve_effective_authorizer
 from himmy.services.tools.models import (
     HttpAuthMode,
     HttpPaginationMode,
@@ -58,6 +59,7 @@ _SAFE_HTTP_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from himmy.core.events import EventSink
     from himmy.services.inference.models import BoundTool, ToolExecutor
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
 PreExecutionHook = Callable[
     [ToolInvocation, ToolDefinition], Awaitable[ToolPolicyDecision]
@@ -338,12 +340,21 @@ class ToolService:
         lenient_args: bool = True,
         reputation_provider: ToolReputationLike | None = None,
         event_workspace_id: str | None = None,
+        tool_authorizer: ToolCapabilityAuthorizer | None = None,
     ) -> None:
         self._registry = registry
         self._pre_hook = pre_execution_hook
         self._post_hook = post_execution_hook
         self.event_sink = event_sink
         self._default_timeout_seconds = default_timeout_seconds
+        # P0 tool authz (confused-deputy fix): the run principal's capability gate,
+        # consulted deny-by-default just before dispatch so a caller can only invoke
+        # tools their roles grant. ``None`` (the default, every offline/CLI path) and a
+        # NON-enforcing authorizer (ANONYMOUS / all_tenants principal) are both exact
+        # no-ops — every tool is allowed, byte-identical to before. Enforcement engages
+        # ONLY for a tenant-bound principal under a configured authenticator, mirroring
+        # the ``require_permission`` route-dependency bypass.
+        self._tool_authorizer = tool_authorizer
         # P1 tenancy: the owning workspace stamped onto every tool event this service
         # emits, so the self-learning reputation miner can scope its read to ONE tenant
         # on a shared event store (``list_events(workspace_id=...)``). ``None`` (the
@@ -527,6 +538,44 @@ class ToolService:
                 start,
                 ToolErrorCode.POLICY_BLOCKED,
                 f"tool {definition.name!r} requires approval (no approval granted)",
+                outcome="denied",
+            )
+
+        # --- capability authz (deny-by-default; offline no-op) -------------
+        # P0 confused-deputy fix: the run principal must hold the tool's capability
+        # (``tool:<name>:invoke``, plus ``tool:<name>:write`` for a side-effecting tool).
+        # A NON-enforcing authorizer (ANONYMOUS / all_tenants — the offline default) and a
+        # ``None`` authorizer both pass unconditionally, so this is a pure no-op until an
+        # authenticator is configured. A denied tool is refused BEFORE any arg validation
+        # or handler dispatch, so an unauthorized call never reaches the world.
+        #
+        # centralize-tool-gate: the EFFECTIVE authorizer combines this service's explicit
+        # ``_tool_authorizer`` with the AMBIENT one set on the run/request contextvar
+        # (:mod:`himmy.services.tools.ambient`), so a ``ToolService`` built by a path that
+        # FORGOT to thread the arg still consults the gate — no execution path can run a
+        # tool un-gated when an authorizer is in scope. When auth is configured but NEITHER
+        # is present, the resolver returns the ``DENY_ALL`` fail-closed sentinel; offline
+        # (no authenticator, no ambient, no arg) it returns ``None`` and this branch is a
+        # pure pass exactly as before.
+        effective_authorizer = resolve_effective_authorizer(self._tool_authorizer)
+        if effective_authorizer is not None and not effective_authorizer.authorize_definition(
+            definition
+        ):
+            # red-team r6: emit the DISTINCT ``CAPABILITY_DENIED`` (not ``POLICY_BLOCKED``).
+            # Both the approval gate above and this capability gate used to ``_fail`` with the
+            # SAME ``(outcome="denied", POLICY_BLOCKED)`` tuple, so the runtime's pending-
+            # approval selector (which keys on exactly that tuple) misread a capability denial
+            # as a pending HUMAN-APPROVAL checkpoint. Approving it re-ran the tool, which this
+            # gate re-denied (the persisted actor's roles are unchanged), re-pausing — wedging
+            # the run until ``max_turns`` and misleading the operator. A capability denial is a
+            # HARD failure the model sees and must route around; only the ``requires_approval``
+            # gate (POLICY_BLOCKED) is a resumable checkpoint.
+            return await self._fail(
+                invocation,
+                start,
+                ToolErrorCode.CAPABILITY_DENIED,
+                f"tool {definition.name!r} is not permitted for this caller "
+                "(missing tool capability)",
                 outcome="denied",
             )
 

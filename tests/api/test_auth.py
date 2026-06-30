@@ -40,6 +40,38 @@ def test_anonymous_is_all_tenants() -> None:
     assert ANONYMOUS.may_access("anything") is True
 
 
+# -------------------------------------------------- may_access_subject (BOLA)
+def test_may_access_subject_noop_for_default_and_anonymous() -> None:
+    """The INVARIANT: no subject narrowing for offline / non-subject-scoped principals."""
+    # ANONYMOUS / all_tenants → always True (offline byte-unchanged).
+    assert ANONYMOUS.may_access_subject("anyone") is True
+    assert ANONYMOUS.may_access_subject(None) is True
+    # A tenant-bound but NOT subject-scoped operator (the default multi-user workspace)
+    # reads every subject — subject narrowing is opt-in.
+    op = Principal.build("u", tenant_ids=["t"], roles=["operator"])
+    assert op.may_access_subject("someone-else") is True
+
+
+def test_may_access_subject_narrows_only_when_subject_scoped() -> None:
+    p = Principal.build(
+        "subj-a", tenant_ids=["t"], roles=["operator"], subject_scoped=True
+    )
+    assert p.may_access_subject("subj-a") is True  # its own
+    assert p.may_access_subject("subj-b") is False  # another subject → denied
+    assert p.may_access_subject(None) is True  # legacy subject-less resource
+
+
+def test_may_access_subject_tenant_admin_crosses_subjects() -> None:
+    admin = Principal.build(
+        "admin",
+        tenant_ids=["t"],
+        roles=["operator", "tenant_admin"],
+        subject_scoped=True,
+    )
+    assert admin.may_access_subject("subj-a") is True
+    assert admin.may_access_subject("subj-b") is True
+
+
 # -------------------------------------------------------- ApiKeyAuthenticator
 def test_shared_key_yields_all_tenants_admin() -> None:
     auth = ApiKeyAuthenticator(shared_keys={"sek"})

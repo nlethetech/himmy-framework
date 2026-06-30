@@ -26,11 +26,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import HTTPException, Query, Request
+from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from himmy.api.auth import resolve_workspace
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.auth import resolve_workspace, scoped_read
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.services.learning.overrides import (
     OverrideKind,
     OverrideSet,
@@ -39,6 +39,18 @@ from himmy.services.learning.overrides import (
 from himmy.services.learning.report import LearningReport, build_learning_report
 
 router = build_studio_router("learning", tag="studio-learning")
+# The learning report read is tenant-scoped: ``_panel_workspace`` resolves the effective
+# ``workspace_id`` from the verified principal (a tenant-bound principal is pinned to its
+# own workspace) and threads it into ``build_learning_report`` so a tenant only ever reads
+# its own learned reputation + overrides. Stamp the router as a scoped reader for the
+# whole-app tenant-scope coverage gate. A no-op marker; the real scoping is the handler.
+router.dependencies.append(Depends(scoped_read))
+
+#: Writing learning overrides and trust feedback steers how the agent picks tools — a
+#: privileged mutation gated by ``studio.learning:write`` (admin-only by default),
+#: additively on top of the router's ``studio.learning:read`` baseline so a read-only
+#: role can inspect the learning report but never edit overrides.
+_learning_write = Depends(studio_permission("studio.learning", "write"))
 
 
 def _panel_workspace(request: Request) -> str | None:
@@ -194,7 +206,9 @@ async def learning(
     return await _build_response(request, outcome_weight=outcome_weight)
 
 
-@router.post("/overrides", response_model=LearningResponse)
+@router.post(
+    "/overrides", response_model=LearningResponse, dependencies=[_learning_write]
+)
 async def set_override(
     request: Request,
     body: OverrideRequest,
@@ -232,7 +246,9 @@ async def set_override(
     return await _build_response(request)
 
 
-@router.post("/trust-feedback", response_model=LearningResponse)
+@router.post(
+    "/trust-feedback", response_model=LearningResponse, dependencies=[_learning_write]
+)
 async def set_trust_feedback(
     request: Request,
     body: TrustFeedbackRequest,

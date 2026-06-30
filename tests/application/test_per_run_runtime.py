@@ -172,12 +172,15 @@ def test_inline_persona_path_stays_tool_less_and_unchanged() -> None:
             {"http_tools": [HttpToolSpec(name="x", base_url="http://10.0.0.1", path="/")]},
         ),
         ("mcp_servers", {"mcp_servers": [MCPServerConfig(command="echo")]}),
+        # red-team r2: sub-agent orchestration amplifiers a tenant must not self-provision.
+        ("allow_spawn", {"allow_spawn": True}),
+        ("allow_skill_dispatch", {"allow_skill_dispatch": True}),
     ],
 )
 def test_tenant_spec_with_privileged_field_is_rejected(
     field: str, spec_kwargs: dict[str, object]
 ) -> None:
-    """Each of the three RCE/SSRF surface fields is rejected for a tenant spec (T0.3)."""
+    """Each operator-only surface field is rejected for a tenant spec (T0.3 + r2)."""
     spec = AgentSpec(name="evil", **spec_kwargs)  # type: ignore[arg-type]
     assert field in flagged_fields(spec)
     with pytest.raises(SpecSanitizationError) as exc:
@@ -216,6 +219,33 @@ def test_operator_provisioned_spec_keeps_privileged_fields(
     assert result.spec.tools_module == _TOOLS_MODULE
     assert result.operator_provisioned is True
     assert not result.stripped
+
+
+def test_operator_provisioned_keeps_amplifiers_without_optin() -> None:
+    """INVARIANT (r2): an operator-provisioned spec KEEPS allow_spawn/allow_skill_dispatch
+    WITHOUT the RCE opt-in flag — so the offline / single-box path (all_tenants ⇒
+    operator-provisioned) is byte-unchanged. The amplifiers are gate-protected; only a
+    real tenant is blocked from self-provisioning them.
+    """
+    spec = AgentSpec(name="trusted", allow_spawn=True, allow_skill_dispatch=True)
+    result = sanitize_tenant_spec(spec, operator_provisioned=True)
+    assert result.spec is spec  # byte-identical, nothing stripped
+    assert result.stripped is False
+    assert result.spec.allow_spawn is True
+    assert result.spec.allow_skill_dispatch is True
+
+
+def test_operator_provisioned_rce_still_rejected_even_with_amplifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator spec carrying an RCE field (no opt-in) is still rejected, amplifier or not."""
+    spec = AgentSpec(
+        name="trusted", tools_module=_TOOLS_MODULE, allow_spawn=True
+    )
+    with pytest.raises(SpecSanitizationError) as exc:
+        sanitize_tenant_spec(spec, operator_provisioned=True)
+    # The reject names the RCE field (the high-blast-radius one needing the opt-in).
+    assert "tools_module" in exc.value.fields
 
 
 def test_operator_spec_still_sanitized_without_optin() -> None:

@@ -22,6 +22,12 @@ Studio store.
 Offline-first: with no runs recorded the firings list is simply empty (the screen
 renders its clean empty state); the catalog is always non-empty (the built-ins are
 declared in code), so this endpoint never 500s.
+
+TENANT BOUNDARY (red-team r3): the studio.db cache is process-wide and carries NO
+per-run tenant stamp, so its firings cannot be safely attributed to a workspace. A
+tenant-bound principal therefore gets the catalog only (empty firings) — mirroring the
+``/runs/analytics`` reader — while the offline / ``all_tenants`` path is byte-unchanged
+and returns the full firings list. See :func:`guardrails`.
 """
 
 from __future__ import annotations
@@ -150,10 +156,32 @@ async def guardrails(
     recent ``scan`` runs in ``.himmy/studio.db`` for ``safety`` cognition steps and
     returns up to ``limit`` of them, newest first, each linked to its ``run_id``.
     """
+    from himmy.api.auth.context import studio_tenant_filter
     from himmy.api.studio_runs import get_run_store
     from himmy.cli.guardrails_view import builtin_rows
 
     builtins = [GuardrailInfo(**row) for row in builtin_rows()]
+
+    # Cross-tenant boundary (red-team r3): the firings list is read from the
+    # process-wide ``.himmy/studio.db`` presentation cache, into which EVERY tenant's
+    # Studio/v1/CLI-mirrored runs are written — and that cache carries NO per-run tenant
+    # stamp (only the canonical store does). Surfacing it raw would leak every tenant's
+    # run_id / agent_name / guardrail flags + reasons (derived from other tenants'
+    # prompts/outputs) to a tenant-bound principal that merely holds
+    # ``studio.guardrails:read``. This mirrors the run analytics reader EXACTLY: for an
+    # unrestricted principal (offline / ``all_tenants`` / ANONYMOUS / trusted shared key)
+    # ``studio_tenant_filter`` is ``None`` and the full firings list is returned —
+    # byte-unchanged single-box behavior — while a tenant-bound principal gets the
+    # catalog only (EMPTY firings) rather than a cross-tenant disclosure, since the cache
+    # cannot be safely attributed to a workspace. Per-tenant firings is a follow-up that
+    # requires a tenant-stamped firing source over the canonical store.
+    if studio_tenant_filter(request) is not None:
+        return GuardrailsResponse(
+            builtins=builtins,
+            firings=[],
+            firing_count=0,
+            runs_scanned=0,
+        )
 
     store = get_run_store()
     summaries = store.list(limit=scan, offset=0)

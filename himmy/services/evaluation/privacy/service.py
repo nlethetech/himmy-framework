@@ -432,15 +432,33 @@ class PrivacyAuditService:
         return report.to_record().stable_id
 
     # --------------------------------------------------------------- trend
-    def trend(self, *, limit: int = 20) -> list[PrivacyAuditReport]:
+    def trend(
+        self, *, limit: int = 20, workspace_id: str | None = None
+    ) -> list[PrivacyAuditReport]:
         """Return the most recent registered audit reports, newest first.
 
         Reads every ``privacy_audit_report`` record from the registry and projects each
         back into a (read-only) :class:`PrivacyAuditReport`, ordered by ``created_at``
         descending and capped at ``limit``. This is the CLI/HTTP trend surface — a
         posture-over-time view of the deployment's audits.
+
+        When ``workspace_id`` is provided (a tenant-bound HTTP caller resolved to a single
+        authorized workspace) the trend is tenant-scoped at the ROOT and FAILS CLOSED: ONLY
+        reports whose stamped ``metadata['workspace_id']`` EQUALS the caller's workspace are
+        admitted. A ``None``-stamped report is NOT admitted to a tenant-bound caller — such a
+        report is produced by an all-tenants/admin UNSCOPED run, whose ``subject_refs`` span
+        EVERY tenant's scanned subjects, so admitting it would disclose other tenants' subject
+        identifiers (the cross-tenant IDOR this closes). ``None`` (an all-tenants / offline
+        caller) keeps the full posture trend unchanged — byte-for-byte the legacy behaviour —
+        and is the only caller that sees the global/ops (``None``-stamped) reports.
         """
         records = self._registry.list_by_kind(PRIVACY_AUDIT_REPORT_KIND)
+        if workspace_id is not None:
+            records = [
+                r
+                for r in records
+                if r.metadata.get("workspace_id") == workspace_id
+            ]
         records.sort(
             key=lambda r: str(r.metadata.get("created_at") or ""), reverse=True
         )

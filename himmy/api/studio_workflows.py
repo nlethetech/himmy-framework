@@ -69,24 +69,54 @@ async def run_workflow(
     provider: str | None = None,
     model: str | None = None,
     initial_state: dict[str, Any] | None = None,
+    tool_authorizer: Any = None,
+    subject: str | None = None,
+    subject_scope: str | None = None,
 ) -> Any:
-    """Run the workflow with the chosen agent's persona; return the WorkflowResult."""
+    """Run the workflow with the chosen agent's persona; return the WorkflowResult.
+
+    ``tool_authorizer`` (centralize-tool-gate) is the request principal's tool-capability
+    gate, bound AMBIENTLY for the runtime build + orchestrator drive so every workflow
+    step's tool dispatch is enforced even though this surface builds the runtime without
+    threading the authorizer explicitly. ``None`` offline → inert, byte-unchanged.
+
+    ``subject`` (rbac-harden tenancy) is the LAUNCHING tenant's ``workspace_id`` resolved
+    from the verified principal by the router (``_run_owner(request)[0]``). It scopes the
+    workflow agent's memory + knowledge tool packs to this tenant on a shared durable store
+    instead of the static ``default`` subject / ``(local, local)`` KB scope — symmetric to
+    the ``/v1`` and Studio run paths. ``None`` (offline / single-box / ``all_tenants``)
+    leaves both packs on their historical static scope — byte-for-byte unchanged.
+
+    ``subject_scope`` (rbac-harden tenancy, subject axis) is the within-tenant USER axis
+    for a ``subject_scoped`` principal. It is threaded into the runtime build so two users
+    of one tenant never pool their memory/KB/tasks/notes onto one namespace. ``None`` (the
+    common non-subject-scoped / offline case) leaves the scope tenant-only — unchanged.
+    """
     import asyncio
 
     from himmy.api.studio_service import load_studio_spec, resolve_spec_path
     from himmy.config.workflow_spec import load_workflow_spec
     from himmy.orchestrators.workflow import WorkflowOrchestrator
     from himmy.runtime import from_spec
+    from himmy.services.tools.ambient import use_tool_authorizer
 
-    wf = load_workflow_spec(str(resolve_spec_path(workflow_path)))
-    spec = load_studio_spec(agent_path, provider=provider, model=model)
-    runtime, _registry = await asyncio.to_thread(
-        lambda: from_spec.build_runtime_for_spec(
-            spec, provider=provider, model=model, durable_defaults=True
+    with use_tool_authorizer(tool_authorizer):
+        wf = load_workflow_spec(str(resolve_spec_path(workflow_path)))
+        spec = load_studio_spec(agent_path, provider=provider, model=model)
+        runtime, _registry = await asyncio.to_thread(
+            lambda: from_spec.build_runtime_for_spec(
+                spec,
+                provider=provider,
+                model=model,
+                durable_defaults=True,
+                subject=subject,
+                subject_scope=subject_scope,
+            )
         )
-    )
-    orch = WorkflowOrchestrator(runtime)
-    return await orch.run(wf, spec.to_persona(), initial_state=initial_state or {})
+        orch = WorkflowOrchestrator(runtime)
+        return await orch.run(
+            wf, spec.to_persona(), initial_state=initial_state or {}
+        )
 
 
 __all__ = [

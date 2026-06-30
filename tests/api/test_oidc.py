@@ -230,3 +230,54 @@ def test_oidc_from_env_requires_issuer_and_audience(monkeypatch: Any) -> None:
     monkeypatch.delenv("HIMMY_OIDC_AUDIENCE", raising=False)
     with pytest.raises(AuthError):
         build_authenticator()
+
+
+# ----------------------------------------------- red-team r2: OIDC subject-scoping opt-in
+def test_oidc_principal_is_not_subject_scoped_by_default() -> None:
+    """INVARIANT: a default OIDC principal is NOT subject_scoped (byte-unchanged model).
+
+    Without the opt-in knob a tenant-bound OIDC caller stays workspace-scoped (the
+    documented model), so ``may_access_subject`` is True for any subject (no narrowing).
+    """
+    p = _authn(_auth(), _token(extra={"tenant": "t1", "roles": ["operator"]}))
+    assert p.subject_scoped is False
+    # No BOLA narrowing → may read another subject's object within the tenant.
+    assert p.may_access_subject("someone-else") is True
+
+
+def test_oidc_subject_scoped_opt_in_narrows_to_own_subject() -> None:
+    """With ``subject_scoped=True`` a tenant-bound OIDC caller is narrowed to its own sub."""
+    auth = _auth(subject_scoped=True)
+    p = _authn(auth, _token(sub="alice", extra={"tenant": "t1", "roles": ["operator"]}))
+    assert p.subject_scoped is True
+    # BOLA gate now engages: only its OWN subject is readable.
+    assert p.may_access_subject("alice") is True
+    assert p.may_access_subject("bob") is False
+    # A subject-less legacy object is still allowed.
+    assert p.may_access_subject(None) is True
+
+
+def test_oidc_subject_scoped_admin_role_crosses_subjects() -> None:
+    """An ``all_tenants`` (admin-role) OIDC principal is never narrowed even when opted in."""
+    auth = _auth(subject_scoped=True, all_tenants_roles=["platform-admin"])
+    p = _authn(auth, _token(sub="alice", extra={"roles": ["platform-admin"]}))
+    assert p.all_tenants is True
+    # all_tenants short-circuits the BOLA gate → reads any subject.
+    assert p.may_access_subject("bob") is True
+
+
+def test_oidc_from_env_reads_subject_scoped_flag(monkeypatch: Any) -> None:
+    """``HIMMY_OIDC_SUBJECT_SCOPED`` opts the env-built OIDC authenticator into BOLA."""
+    monkeypatch.setenv("HIMMY_AUTH_MODE", "oidc")
+    monkeypatch.setenv("HIMMY_OIDC_ISSUER", _ISS)
+    monkeypatch.setenv("HIMMY_OIDC_AUDIENCE", _AUD)
+    monkeypatch.setenv("HIMMY_OIDC_JWKS_URL", "https://issuer.example/jwks.json")
+    monkeypatch.setenv("HIMMY_OIDC_SUBJECT_SCOPED", "1")
+    auth = build_authenticator()
+    assert isinstance(auth, OidcAuthenticator)
+    assert auth._subject_scoped is True
+    # Default (flag absent) stays off.
+    monkeypatch.delenv("HIMMY_OIDC_SUBJECT_SCOPED", raising=False)
+    auth2 = build_authenticator()
+    assert isinstance(auth2, OidcAuthenticator)
+    assert auth2._subject_scoped is False

@@ -449,3 +449,47 @@ def test_run_bench_gate_unknown_gate_task_400(project: Path) -> None:
     resp = _client().post("/api/studio/eval/run", json={"suite": "bench:gate"})
     assert resp.status_code == 400
     assert "unknown task" in resp.json()["detail"]
+
+
+# ---- rbac-harden(mopup-r1): run_eval threads the within-tenant subject_scope axis
+
+
+class _ScopeCaptured(Exception):
+    """Sentinel raised by the build spy after recording the scope (short-circuit)."""
+
+
+def test_run_eval_threads_subject_scope_into_runtime_build(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run_eval`` must forward the within-tenant USER axis into the runtime build.
+
+    Regression for the dropped subject_scope: eval_run discarded the principal's subject and
+    run_eval did not accept/forward subject_scope, so two subject_scoped users of one tenant
+    pooled their eval agent's memory/KB onto one namespace. Assert subject_scope reaches
+    ``build_runtime_for_spec``.
+    """
+    from himmy.runtime import from_spec
+    from tests.conftest import run_async
+
+    _write_suite(project)
+    (project / "agent.yaml").write_text("name: a\nprovider: stub\n")
+
+    captured: dict[str, Any] = {}
+
+    def _spy(spec: Any, **kw: Any) -> Any:
+        captured["subject"] = kw.get("subject")
+        captured["subject_scope"] = kw.get("subject_scope")
+        raise _ScopeCaptured()
+
+    monkeypatch.setattr(from_spec, "build_runtime_for_spec", _spy)
+
+    with pytest.raises(_ScopeCaptured):
+        run_async(
+            se.run_eval(
+                "demo.eval.yaml",
+                "agent.yaml",
+                subject="tenant-A",
+                subject_scope="userA",
+            )
+        )
+    assert captured == {"subject": "tenant-A", "subject_scope": "userA"}

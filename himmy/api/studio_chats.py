@@ -116,11 +116,21 @@ class ChatsStore:
 
     # ---- chats ------------------------------------------------------------
 
-    def list(self) -> builtins.list[ChatSession]:
-        return [self._to_session(s) for s in self._store.list_summaries()]
+    def list(
+        self, *, workspace_id: str | frozenset[str] | None = None
+    ) -> builtins.list[ChatSession]:
+        return [
+            self._to_session(s)
+            for s in self._store.list_summaries(workspace_id=workspace_id)
+        ]
 
-    def get(self, session_id: str) -> ChatSessionDetail | None:
-        summary = self._store.get_summary(session_id)
+    def get(
+        self,
+        session_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> ChatSessionDetail | None:
+        summary = self._store.get_summary(session_id, workspace_id=workspace_id)
         if summary is None:
             return None
         msgs = self._store.flat_messages(session_id)
@@ -145,12 +155,14 @@ class ChatsStore:
         provider: str | None,
         messages: Sequence[ChatMessage],
         project_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> ChatSession:
         """Create or replace a session and its messages (upsert by id).
 
         ``project_id=None`` means "leave the assignment alone" (the unified store honours
         the same contract). The flat ``messages`` are lifted to the authoritative ChatThread
-        by the store.
+        by the store. ``workspace_id`` (tenant axis) stamps a tenant-bound Studio write;
+        ``None`` (CLI / offline) writes an unscoped row — byte-unchanged.
         """
         resolved_title = (title or "").strip() or _derive_title(messages)
         summary = self._store.save_flat(
@@ -161,25 +173,43 @@ class ChatsStore:
             flat_messages=[(m.role, m.text) for m in messages],
             project_id=project_id,
             origin=ORIGIN_STUDIO,
+            workspace_id=workspace_id,
         )
         return self._to_session(summary)
 
-    def rename(self, session_id: str, title: str) -> bool:
-        return self._store.rename(session_id, title)
+    def rename(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        return self._store.rename(session_id, title, workspace_id=workspace_id)
 
-    def delete(self, session_id: str) -> bool:
-        return self._store.delete(session_id)
+    def delete(
+        self, session_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return self._store.delete(session_id, workspace_id=workspace_id)
 
     # ---- projects ---------------------------------------------------------
 
-    def list_projects(self) -> builtins.list[Project]:
-        return [self._to_project(r, n) for r, n in self._store.list_project_rows()]
+    def list_projects(
+        self, *, workspace_id: str | frozenset[str] | None = None
+    ) -> builtins.list[Project]:
+        return [
+            self._to_project(r, n)
+            for r, n in self._store.list_project_rows(workspace_id=workspace_id)
+        ]
 
-    def get_project(self, project_id: str) -> Project | None:
-        row = self._store.get_project_row(project_id)
+    def get_project(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> Project | None:
+        row = self._store.get_project_row(project_id, workspace_id=workspace_id)
         if row is None:
             return None
-        return self._to_project(row, self._store.project_chat_count(project_id))
+        return self._to_project(
+            row, self._store.project_chat_count(project_id, workspace_id=workspace_id)
+        )
 
     def create_project(
         self,
@@ -188,42 +218,68 @@ class ChatsStore:
         description: str = "",
         kb_id: str | None = None,
         agent_path: str | None = None,
+        workspace_id: str | None = None,
     ) -> Project:
         data = self._store.create_project(
-            name=name, description=description, kb_id=kb_id, agent_path=agent_path
+            name=name,
+            description=description,
+            kb_id=kb_id,
+            agent_path=agent_path,
+            workspace_id=workspace_id,
         )
         return Project(**data)  # type: ignore[arg-type]
 
     def update_project(
-        self, project_id: str, changes: Mapping[str, str | None]
+        self,
+        project_id: str,
+        changes: Mapping[str, str | None],
+        *,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> Project | None:
         """Apply a partial update; unknown keys are ignored, ``None`` clears.
 
         Only the columns in ``_PROJECT_FIELDS`` are writable (the assignment dict is built
-        from that allowlist, never from caller-supplied names).
+        from that allowlist, never from caller-supplied names). ``workspace_id`` scopes the
+        update to the caller's own project (a cross-tenant / legacy project folds to None).
         """
         sets = {k: changes[k] for k in _PROJECT_FIELDS if k in changes}
         if "name" in sets and not (sets["name"] or "").strip():
             del sets["name"]  # a project always keeps a non-empty name
-        if self._store.get_project_row(project_id) is None:
+        if self._store.get_project_row(project_id, workspace_id=workspace_id) is None:
             return None
-        self._store.update_project(project_id, dict(sets))
-        return self.get_project(project_id)
+        self._store.update_project(project_id, dict(sets), workspace_id=workspace_id)
+        return self.get_project(project_id, workspace_id=workspace_id)
 
-    def delete_project(self, project_id: str) -> bool:
-        return self._store.delete_project(project_id)
+    def delete_project(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return self._store.delete_project(project_id, workspace_id=workspace_id)
 
-    def project_chats(self, project_id: str) -> builtins.list[ChatSession]:
+    def project_chats(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> builtins.list[ChatSession]:
         return [
             self._to_session(s)
-            for s in self._store.project_conversation_summaries(project_id)
+            for s in self._store.project_conversation_summaries(
+                project_id, workspace_id=workspace_id
+            )
         ]
 
-    def assign_chat(self, project_id: str, chat_id: str) -> bool:
-        return self._store.assign_conversation(project_id, chat_id)
+    def assign_chat(
+        self,
+        project_id: str,
+        chat_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        return self._store.assign_conversation(
+            project_id, chat_id, workspace_id=workspace_id
+        )
 
-    def unassign_chat(self, chat_id: str) -> bool:
-        return self._store.unassign_conversation(chat_id)
+    def unassign_chat(
+        self, chat_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return self._store.unassign_conversation(chat_id, workspace_id=workspace_id)
 
     # ---- mapping ----------------------------------------------------------
 

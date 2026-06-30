@@ -25,6 +25,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         "HIMMY_INTERNAL_API_KEY",
         "HIMMY_DATABASE_URL",
         "HIMMY_DURABLE_STORAGE",
+        "HIMMY_METRICS_TOKEN",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.chdir(tmp_path)
@@ -92,3 +93,41 @@ def test_metrics_uses_route_template_not_raw_path_param() -> None:
         for line in body.splitlines()
         if line.startswith("http_requests_total{")
     )
+
+
+# ------------------------------------------- red-team r2: opt-in /metrics scrape token
+def test_metrics_unauthenticated_by_default_byte_unchanged() -> None:
+    """INVARIANT: with no HIMMY_METRICS_TOKEN, /metrics is open exactly as before."""
+    app = create_app()
+    client = TestClient(app)
+    assert client.get("/metrics").status_code == 200
+
+
+def test_metrics_token_required_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With HIMMY_METRICS_TOKEN set, an unauthenticated scrape is 401."""
+    monkeypatch.setenv("HIMMY_METRICS_TOKEN", "scrape-secret")
+    app = create_app()
+    client = TestClient(app)
+    assert client.get("/metrics").status_code == 401
+    # A wrong token is also 401.
+    assert (
+        client.get("/metrics", headers={"x-metrics-token": "nope"}).status_code == 401
+    )
+
+
+def test_metrics_token_accepts_matching_header_and_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The configured token is accepted via X-Metrics-Token OR Authorization: Bearer."""
+    monkeypatch.setenv("HIMMY_METRICS_TOKEN", "scrape-secret")
+    app = create_app()
+    client = TestClient(app)
+    via_header = client.get("/metrics", headers={"x-metrics-token": "scrape-secret"})
+    assert via_header.status_code == 200
+    assert "# HELP http_requests_total" in via_header.text
+    via_bearer = client.get(
+        "/metrics", headers={"authorization": "Bearer scrape-secret"}
+    )
+    assert via_bearer.status_code == 200

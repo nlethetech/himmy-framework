@@ -12,19 +12,37 @@ from __future__ import annotations
 
 from himmy.api.auth.base import Authenticator, AuthError
 from himmy.api.auth.context import (
+    authorize_object,
+    authorize_studio_object,
     build_authenticator,
+    enforce_subject_write,
     get_principal,
     is_multi_tenant,
+    narrow_subject,
     principal_dependency,
     require_workspace,
     resolve_workspace,
+    reveal_host_posture,
+    singleton_owner_token,
+    singleton_read_filter,
+    singleton_write_workspace,
+    studio_subject_filter,
+    studio_tenant_filter,
+    studio_write_workspace,
 )
-from himmy.api.auth.principal import ANONYMOUS, Principal
+from himmy.api.auth.principal import ANONYMOUS, TENANT_ADMIN_ROLE, Principal
 from himmy.api.auth.rbac import (
     DEFAULT_POLICY,
     AccessPolicy,
     build_access_policy,
+    policy_fingerprint,
+    policy_source,
     require_permission,
+)
+from himmy.api.auth.scope_marker import scoped_read, subject_write
+from himmy.api.auth.service_principal import (
+    connector_service_principal,
+    routine_service_principal,
 )
 
 __all__ = [
@@ -32,14 +50,32 @@ __all__ = [
     "AuthError",
     "Principal",
     "ANONYMOUS",
+    "TENANT_ADMIN_ROLE",
     "build_authenticator",
     "is_multi_tenant",
     "principal_dependency",
     "get_principal",
     "resolve_workspace",
     "require_workspace",
+    "authorize_object",
+    "narrow_subject",
+    "enforce_subject_write",
+    "studio_tenant_filter",
+    "studio_subject_filter",
+    "studio_write_workspace",
+    "singleton_owner_token",
+    "singleton_read_filter",
+    "singleton_write_workspace",
+    "authorize_studio_object",
+    "reveal_host_posture",
+    "scoped_read",
+    "subject_write",
     "AccessPolicy",
     "DEFAULT_POLICY",
     "build_access_policy",
+    "policy_fingerprint",
+    "policy_source",
     "require_permission",
+    "connector_service_principal",
+    "routine_service_principal",
 ]

@@ -4,14 +4,22 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from himmy.api.auth import require_permission, require_workspace
+from himmy.api.auth import (
+    authorize_object,
+    get_principal,
+    require_permission,
+    require_workspace,
+    scoped_read,
+)
 from himmy.api.models import DashboardSummary
 
 _READ = [Depends(require_permission("dashboard", "read"))]
 
-router = APIRouter(prefix="/v1/dashboard", tags=["dashboard"])
+router = APIRouter(
+    prefix="/v1/dashboard", tags=["dashboard"], dependencies=[Depends(scoped_read)]
+)
 
 
 def _container(request: Request) -> Any:
@@ -23,10 +31,25 @@ def _container(request: Request) -> Any:
 async def dashboard_summary(
     subject_id: str, workspace_id: str, request: Request
 ) -> DashboardSummary:
-    """Return the operator overview: context + run/recommendation/eval counts."""
+    """Return the operator overview: context + run/recommendation/eval counts.
+
+    Object-level (BOLA, WS-bola): the summary aggregates a single data subject's
+    context/run/recommendation counts, so a ``subject_scoped`` principal requesting ANOTHER
+    data subject's aggregate within its own tenant gets a clean 404 (never an
+    existence-confirming response) — :func:`authorize_object` is a no-op for offline /
+    ``all_tenants`` / ``tenant_admin`` callers, so the zero-config path is byte-unchanged.
+    """
     workspace_id = require_workspace(request, workspace_id)
+    if not authorize_object(request, subject_id):
+        raise HTTPException(status_code=404, detail="subject not found")
+    # An ``all_tenants`` principal (offline / admin) keeps the lenient eval-tile filter so
+    # an unstamped run it explicitly asks for stays visible — byte-unchanged zero-config.
+    # A tenant-bound principal gets the STRICT eval filter (scope-r3): a None-stamped
+    # admin/offline run never leaks into its tile.
     summary = await _container(request).dashboard.summary(
-        subject_id=subject_id, workspace_id=workspace_id
+        subject_id=subject_id,
+        workspace_id=workspace_id,
+        all_tenants=get_principal(request).all_tenants,
     )
     return DashboardSummary.model_validate(summary)
 

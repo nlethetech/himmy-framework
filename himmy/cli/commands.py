@@ -1454,13 +1454,16 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
     import logging
     import signal
 
+    from himmy.api.auth import build_authenticator
     from himmy.api.routines import get_routines_store, get_scheduler
     from himmy.api.runtime_bootstrap import (
         build_durable_container,
         start_run_substrate,
         stop_run_substrate,
+        wire_tool_authz,
     )
     from himmy.api.scheduler_leader import acquire_scheduler_leadership
+    from himmy.config.flags import env_falsy, env_truthy
     from himmy.services.storage.factory import (
         reset_server_context,
         set_server_context,
@@ -1468,9 +1471,11 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
 
     log = logging.getLogger("himmy.worker")
 
-    scheduler_enabled = os.environ.get(
-        "HIMMY_ROUTINES_SCHEDULER", "on"
-    ).lower() not in ("off", "0", "false", "no")
+    # Default-ON kill-switch: stay enabled unless the operator wrote a recognised OFF token.
+    # Routed through the canonical reader so the worker (the primary surface routines fire on)
+    # honors the SAME HIMMY_ROUTINES_SCHEDULER vocabulary as studio_routines.py — e.g.
+    # ``=n`` disables in both, never enabled here while disabled there.
+    scheduler_enabled = not env_falsy("HIMMY_ROUTINES_SCHEDULER")
 
     # 1) server context FIRST so the container's spine + any in-process agent resolve the
     #    durable backend (the bootstrap relies on this being set before it builds).
@@ -1480,11 +1485,28 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
     leadership = None
     watchdog: _asyncio.Task[None] | None = None
     try:
+        # 1b) multi-tenant fail-closed posture (G2), BEFORE anything executes: a worker
+        #     draining a tenant queue / ticking tenant routines must refuse to start on an
+        #     authenticator that mints every caller an all-tenants admin, EXACTLY like the
+        #     FastAPI server (app._enforce_multi_tenant_posture). Without this a multi-tenant
+        #     worker that cannot bind tenants would silently run every claimed run as admin.
+        from himmy.api.app import _enforce_multi_tenant_posture
+
+        _enforce_multi_tenant_posture(build_authenticator())
+
         # 2) build the durable container (Postgres / file-backed SQLite) + bring up the run
         #    substrate (publish store, enable dispatch BEFORE the sweep, sweep + reconcile,
         #    start dispatcher AFTER recovery, start dedup GC, install both providers).
         container, built_durable = await build_durable_container()
         substrate = await start_run_substrate(container, install_providers=True)
+
+        # 2b) P0 tool-capability gate across the process boundary: wire the SAME two lines
+        #     create_app's body wires (mark_auth_configured + run_app._access_policy). The
+        #     worker dispatches claimed runs / fires routines through this run_app; without
+        #     this the chokepoint sentinel stays OFF and a least-privilege tenant's work runs
+        #     with the agent's FULL toolset (a cross-process confused-deputy escalation). A
+        #     strict NO-OP with no authenticator configured (offline byte-unchanged).
+        wire_tool_authz(getattr(substrate.active, "run_app", None))
 
         backend = substrate.backend
         if run_dispatcher and not substrate.dispatch_on:
@@ -1508,9 +1530,9 @@ async def _run_worker(*, run_scheduler: bool, run_dispatcher: bool) -> None:
         #    the topology guard (same-host single-scheduler flock + cross-host warning).
         n_routines = 0
         if run_scheduler and scheduler_enabled:
-            require_ack = os.environ.get(
-                "HIMMY_SCHEDULER_REQUIRE_ACK", ""
-            ).strip().lower() in ("1", "true", "yes", "on")
+            # Canonical truthy reader so ``=y`` requires-ack here exactly as it does via
+            # env_truthy in studio_routines.py (the divergence the WP exists to kill).
+            require_ack = env_truthy("HIMMY_SCHEDULER_REQUIRE_ACK")
             leadership = await acquire_scheduler_leadership(
                 substrate.active, require_single_scheduler_ack=require_ack
             )

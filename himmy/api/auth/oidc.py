@@ -180,9 +180,21 @@ class OidcAuthenticator:
         roles_claim: str = "roles",
         scopes_claim: str = "scope",
         all_tenants_roles: Iterable[str] = (),
+        subject_scoped: bool = False,
         leeway: float = 0.0,
     ) -> None:
-        """Configure issuer/audience/JWKS + how claims map to the principal."""
+        """Configure issuer/audience/JWKS + how claims map to the principal.
+
+        ``subject_scoped`` opts EVERY OIDC principal this authenticator mints into
+        per-subject (BOLA / object-level) narrowing — it may read/write only resources
+        whose data subject matches its own ``sub`` (unless it holds the ``tenant_admin``
+        role, which crosses subjects within its tenant). Default ``False`` keeps the
+        documented OIDC model (a workspace IS the trust boundary; subject-scoping is
+        OPT-IN), so the historical OIDC path is byte-unchanged. Without this knob the
+        per-subject gates (``authorize_object`` / ``narrow_subject`` /
+        ``enforce_subject_write``) were unreachable for OIDC — a deployment expecting
+        per-user isolation within a tenant under OIDC silently did not get it.
+        """
         self._issuer = issuer
         self._audience = audience
         self._provider: JwksProvider = (
@@ -194,12 +206,15 @@ class OidcAuthenticator:
         self._roles_claim = roles_claim
         self._scopes_claim = scopes_claim
         self._all_tenants_roles = set(all_tenants_roles)
+        self._subject_scoped = subject_scoped
         self._leeway = leeway
 
     @classmethod
     def from_env(cls) -> OidcAuthenticator:
         """Build from ``HIMMY_OIDC_*`` env vars (JWKS fetched + cached from the IdP)."""
         import os
+
+        from himmy.config.flags import env_truthy
 
         issuer = os.environ.get("HIMMY_OIDC_ISSUER")
         audience = os.environ.get("HIMMY_OIDC_AUDIENCE")
@@ -233,6 +248,9 @@ class OidcAuthenticator:
             roles_claim=os.environ.get("HIMMY_OIDC_ROLES_CLAIM", "roles"),
             scopes_claim=os.environ.get("HIMMY_OIDC_SCOPES_CLAIM", "scope"),
             all_tenants_roles=admin_roles,
+            # Opt-in per-subject (BOLA) isolation under OIDC — default OFF (workspace is
+            # the trust boundary, mirroring the documented model + the mapped-key path).
+            subject_scoped=env_truthy("HIMMY_OIDC_SUBJECT_SCOPED"),
         )
 
     def openapi_security_scheme(self) -> dict[str, dict[str, object]]:
@@ -326,6 +344,11 @@ class OidcAuthenticator:
             auth_method="oidc",
             source_ip=client_ip(request),
             claims=claims,
+            # Opt-in per-subject (BOLA) narrowing for OIDC callers (default off). An
+            # ``all_tenants`` (admin-role) OIDC principal is never narrowed —
+            # ``may_access_subject`` short-circuits on ``all_tenants`` — so this only
+            # bites a tenant-bound OIDC caller, mirroring the mapped-key subject_scoped path.
+            subject_scoped=self._subject_scoped,
         )
 
 

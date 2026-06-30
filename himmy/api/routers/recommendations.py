@@ -12,7 +12,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from himmy.api.auth import require_permission, resolve_workspace
+from himmy.api.auth import (
+    authorize_object,
+    narrow_subject,
+    require_permission,
+    resolve_workspace,
+    scoped_read,
+)
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
     RecommendationListResponse,
@@ -21,7 +27,11 @@ from himmy.application.services import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import RecommendationItem, RecommendationStatus
 
-router = APIRouter(prefix="/v1/recommendations", tags=["recommendations"])
+router = APIRouter(
+    prefix="/v1/recommendations",
+    tags=["recommendations"],
+    dependencies=[Depends(scoped_read)],
+)
 
 _READ = [Depends(require_permission("recommendation", "read"))]
 _WRITE = [Depends(require_permission("recommendation", "write"))]
@@ -50,8 +60,16 @@ async def list_recommendations(
     limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(0, ge=0),
 ) -> RecommendationListResponse:
-    """List recommendations (created_at desc), paginated into an envelope (AAEO-8)."""
+    """List recommendations (created_at desc), paginated into an envelope (AAEO-8).
+
+    Object-level (BOLA, WS-bola): a ``subject_scoped`` principal's list is pinned to its
+    OWN subject via :func:`narrow_subject` (a ``tenant_admin`` and every non-subject-scoped
+    / offline / ``all_tenants`` caller keep the caller-supplied filter), so a subject-scoped
+    tenant can never enumerate another data subject's subject-attributed recommendations
+    within a shared workspace — mirroring the runs router. No-op for the zero-config path.
+    """
     workspace_id = resolve_workspace(request, workspace_id)
+    subject_id = narrow_subject(request, subject_id)
     rec_app = _container(request).recommendation_app
     items = await rec_app.list(
         workspace_id=workspace_id,
@@ -90,9 +108,20 @@ async def update_recommendation(
     request: Request,
     workspace_id: str | None = None,
 ) -> RecommendationItem:
-    """Transition a recommendation's status (404 when unknown/out-of-workspace)."""
+    """Transition a recommendation's status (404 when unknown/out-of-workspace).
+
+    Object-level (BOLA, WS-bola): a ``subject_scoped`` principal that targets a
+    recommendation attributed to ANOTHER data subject within its own tenant gets a clean
+    404 (never a mutation, never an existence-confirming 403) — the workspace scope is
+    checked first, then the recommendation's ``subject_id`` is gated via
+    :func:`authorize_object`. No-op for offline / ``all_tenants`` / ``tenant_admin``.
+    """
     workspace_id = resolve_workspace(request, workspace_id)
-    item = await _container(request).recommendation_app.update_status(
+    rec_app = _container(request).recommendation_app
+    existing = await rec_app.get(recommendation_id, workspace_id=workspace_id)
+    if existing is None or not authorize_object(request, existing.subject_id):
+        raise HTTPException(status_code=404, detail="recommendation not found")
+    item = await rec_app.update_status(
         recommendation_id,
         status=body.status,
         notes=body.notes,
@@ -123,10 +152,22 @@ async def get_recommendation_provenance(
 
     Returns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.
     404 when the recommendation is unknown / out-of-workspace or was never graphed.
+
+    Object-level (BOLA, WS-bola): a ``subject_scoped`` principal that requests the
+    provenance subgraph (persona/prompt/cited-evidence) of a recommendation attributed to
+    ANOTHER data subject within its own tenant gets a clean 404 — the recommendation's
+    ``subject_id`` is resolved and gated via :func:`authorize_object` before any lineage is
+    traced. No-op for offline / ``all_tenants`` / ``tenant_admin`` callers.
     """
     rel = [r.strip() for r in relations.split(",") if r.strip()] if relations else None
     workspace_id = resolve_workspace(request, workspace_id)
-    graph = await _container(request).recommendation_app.get_recommendation_lineage(
+    rec_app = _container(request).recommendation_app
+    existing = await rec_app.get(recommendation_id, workspace_id=workspace_id)
+    if existing is None or not authorize_object(request, existing.subject_id):
+        raise HTTPException(
+            status_code=404, detail="recommendation provenance not found"
+        )
+    graph = await rec_app.get_recommendation_lineage(
         recommendation_id, workspace_id=workspace_id, max_depth=max_depth, relations=rel
     )
     if graph is None:

@@ -28,11 +28,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from himmy.api.auth import require_permission, resolve_workspace
+from himmy.api.auth import require_permission, resolve_workspace, scoped_read
 from himmy.entities.integrity import AuditBundle
 from himmy.services.evaluation.privacy import PrivacyAuditReport
 
-router = APIRouter(prefix="/v1/audit/privacy", tags=["audit"])
+router = APIRouter(
+    prefix="/v1/audit/privacy", tags=["audit"], dependencies=[Depends(scoped_read)]
+)
 
 _AUDIT_READ = [Depends(require_permission("audit", "read"))]
 _AUDIT_RUN = [Depends(require_permission("audit", "run"))]
@@ -105,12 +107,15 @@ async def list_privacy_audits(
 ) -> list[PrivacyAuditReport]:
     """Return the posture trend: registered audit reports newest-first (auditor/admin).
 
-    ``workspace_id`` is resolved against the principal (tenant scoping) so a multi-tenant
-    principal must name an authorized workspace, like the rest of the BFF; reports are not
-    themselves tenant-keyed, so this enforces access, not filtering.
+    ``workspace_id`` is resolved against the principal (tenant scoping) and the resolved
+    workspace is pushed into ``trend()`` so a tenant-bound caller sees ONLY its own
+    workspace's reports (plus global/ops reports with no ``workspace_id``) — never another
+    tenant's report, its stamped workspace or the affected ``subject_refs`` (closes the
+    cross-tenant IDOR). An all-tenants / offline principal resolves to ``None`` and keeps
+    the full posture trend, byte-for-byte unchanged.
     """
-    resolve_workspace(request, workspace_id)
-    return list(_service(request).trend(limit=limit))
+    workspace_id = resolve_workspace(request, workspace_id)
+    return list(_service(request).trend(limit=limit, workspace_id=workspace_id))
 
 
 @router.get("/{report_id}", response_model=PrivacyAuditReport, dependencies=_AUDIT_READ)
@@ -119,9 +124,17 @@ async def get_privacy_audit(
     report_id: str,
     workspace_id: str | None = None,
 ) -> PrivacyAuditReport:
-    """Return one registered audit report by id, or 404 (auditor/admin)."""
-    resolve_workspace(request, workspace_id)
-    reports: list[PrivacyAuditReport] = list(_service(request).trend(limit=10_000))
+    """Return one registered audit report by id, or 404 (auditor/admin).
+
+    The lookup is tenant-scoped: ``trend()`` is filtered to the caller's resolved
+    workspace, so a foreign ``report_id`` (another tenant's report) is a clean **404** with
+    no existence leak — never the foreign report's workspace or ``subject_refs``. An
+    all-tenants / offline principal resolves to ``None`` and may read any report by id.
+    """
+    workspace_id = resolve_workspace(request, workspace_id)
+    reports: list[PrivacyAuditReport] = list(
+        _service(request).trend(limit=10_000, workspace_id=workspace_id)
+    )
     for report in reports:
         if report.report_id == report_id:
             return report

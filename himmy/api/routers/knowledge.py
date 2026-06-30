@@ -42,12 +42,15 @@ from himmy.api.auth import (
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import NOT_FOUND_RESPONSE
 from himmy.api.security_audit import audit_event
 from himmy.core.errors import HimmyError
 
-router = APIRouter(prefix="/v1/knowledge", tags=["knowledge"])
+router = APIRouter(
+    prefix="/v1/knowledge", tags=["knowledge"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("knowledge", "read"))]
 _WRITE = [Depends(require_permission("knowledge", "write"))]

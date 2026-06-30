@@ -45,12 +45,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException, Query
+from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.auth import scoped_read, singleton_read_filter
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("notify", tag="studio-notify")
+
+#: Marking notifications read and updating notification settings are mutations gated by
+#: ``studio.notify:write`` (admin-only by default), additively on top of the router's
+#: ``studio.notify:read`` baseline so a read-only role can view but not mutate state.
+_notify_write = Depends(studio_permission("studio.notify", "write"))
 
 
 # ---- in-process notification sink ------------------------------------------
@@ -84,13 +90,14 @@ _PG_FAILED = False
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notifications (
-    id         INTEGER PRIMARY KEY,
-    kind       TEXT NOT NULL,
-    title      TEXT NOT NULL,
-    body       TEXT NOT NULL DEFAULT '',
-    link       TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    read       INTEGER NOT NULL DEFAULT 0
+    id           INTEGER PRIMARY KEY,
+    kind         TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    body         TEXT NOT NULL DEFAULT '',
+    link         TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    read         INTEGER NOT NULL DEFAULT 0,
+    workspace_id TEXT
 );
 CREATE TABLE IF NOT EXISTS notify_settings (
     key   TEXT PRIMARY KEY,
@@ -113,6 +120,7 @@ def notify_db_path() -> str:
 
 
 def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
+    keys = row.keys()
     return {
         "id": int(row["id"]),
         "kind": row["kind"],
@@ -121,6 +129,9 @@ def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
         "link": row["link"],
         "created_at": row["created_at"],
         "read": bool(row["read"]),
+        # workspace_id is the additive tenant-isolation column; a pre-migration row (no
+        # such column) reads back as None = "single local tenant / predates tenant binding".
+        "workspace_id": row["workspace_id"] if "workspace_id" in keys else None,
     }
 
 
@@ -205,6 +216,11 @@ def _ensure_db_locked(*, create: bool) -> sqlite3.Connection | None:
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
         conn.commit()
+        # Additive + nullable tenant-isolation column so an old single-box notify.db (whose
+        # CREATE predates the column) opens + reads unchanged; legacy rows carry NULL.
+        from himmy.api.studio_tenant_scope import ensure_workspace_column
+
+        ensure_workspace_column(conn, "notifications")
         # Ids must keep climbing past anything already persisted at this path.
         cur = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM notifications")
         _NEXT_ID = max(_NEXT_ID, int(cur.fetchone()["m"]))
@@ -251,8 +267,8 @@ def _persist_item_locked(item: dict[str, Any]) -> None:
     try:
         conn.execute(
             "INSERT OR REPLACE INTO notifications "
-            "(id, kind, title, body, link, created_at, read) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "(id, kind, title, body, link, created_at, read, workspace_id) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (
                 item["id"],
                 item["kind"],
@@ -261,6 +277,7 @@ def _persist_item_locked(item: dict[str, Any]) -> None:
                 item["link"],
                 item["created_at"],
                 int(item["read"]),
+                item.get("workspace_id"),
             ),
         )
         # Keep the mirror ring-bounded too (ids are monotonic).
@@ -372,13 +389,27 @@ def _forward_to_telegram(item: dict[str, Any]) -> None:
 # ---- the write contract -------------------------------------------------------
 
 
-def record_notification(kind: str, title: str, body: str = "", link: str = "") -> None:
+def record_notification(
+    kind: str,
+    title: str,
+    body: str = "",
+    link: str = "",
+    *,
+    workspace_id: str | None = None,
+) -> None:
     """Record one notification. Thread-safe, bounded, and never raises.
 
     ``kind`` is a short machine tag (``"mission"``, ``"routine"``, …), ``title``
     the human one-liner, ``body`` optional detail, ``link`` an optional in-app
     route (``"/missions"``). Failures are swallowed by design: notifying must
     never take down the work being notified about.
+
+    ``workspace_id`` (keyword-only, defaulting to ``None``) is the tenant the notification
+    belongs to. The default keeps EVERY existing importer call-site
+    (missions/routines/MCP/projects/…) compiling and stamping ``NULL`` =
+    "single local tenant" — so the offline / single-box bell is **byte-unchanged**. A
+    tenant-aware caller threads its resolved workspace so the list endpoint can hide it from
+    other tenants once an authenticator is configured.
     """
     global _NEXT_ID
     try:
@@ -390,6 +421,7 @@ def record_notification(kind: str, title: str, body: str = "", link: str = "") -
             "link": str(link),
             "created_at": datetime.now(UTC).isoformat(),
             "read": False,
+            "workspace_id": workspace_id,
         }
         with _LOCK:
             # Hydrate-before-mutate: the first touch seeds the ring + the id
@@ -415,20 +447,44 @@ class NotifySettings(BaseModel):
     forward_telegram: bool = False
 
 
-@router.get("")
+def _item_in_scope(item: dict[str, Any], scope: frozenset[str] | None) -> bool:
+    """Whether a notification is visible to a ``scope``-restricted reader.
+
+    ``scope is None`` (unrestricted / offline / ``all_tenants``) → always True
+    (byte-unchanged); a tenant-bound reader sees its own workspaces' notifications AND any
+    legacy ``NULL``-tenant one (predates tenant binding, belongs to no tenant).
+    """
+    if scope is None:
+        return True
+    ws = item.get("workspace_id")
+    return ws is None or ws in scope
+
+
+@router.get("", dependencies=[Depends(scoped_read)])
 async def list_notifications(
+    request: Request,
     after: int = Query(0, ge=0, le=2**53),
 ) -> dict[str, Any]:
-    """Recorded notifications, newest first (bounded at 500).
+    """Recorded notifications, newest first (bounded at 500), tenant-scoped.
 
     ``after=<id>`` polls incrementally — only items newer than that id are
     returned, while ``unread`` / ``latest_id`` always describe the whole ring.
+    A tenant-bound principal sees only its own workspaces' notifications (plus legacy
+    NULL-tenant ones); the offline / ``all_tenants`` path is byte-unchanged.
     """
+    scope = singleton_read_filter(request)
     with _LOCK:
         _ensure_db_locked(create=False)  # restore the ring after a restart
-        items = [dict(i) for i in _NOTIFICATIONS if int(i["id"]) > after]
-        unread = sum(1 for i in _NOTIFICATIONS if not i["read"])
-        latest = _NEXT_ID
+        visible = [i for i in _NOTIFICATIONS if _item_in_scope(i, scope)]
+        # workspace_id is an internal isolation column, NOT part of the public notification
+        # contract — strip it so the API response stays byte-identical to pre-migration.
+        items = [
+            {k: v for k, v in i.items() if k != "workspace_id"}
+            for i in visible
+            if int(i["id"]) > after
+        ]
+        unread = sum(1 for i in visible if not i["read"])
+        latest = max((int(i["id"]) for i in visible), default=0)
         forward = _FORWARD_TELEGRAM
     items.reverse()
     return {
@@ -439,36 +495,62 @@ async def list_notifications(
     }
 
 
-@router.post("/read-all")
-async def mark_all_read() -> dict[str, Any]:
-    """Mark every notification read (idempotent)."""
+@router.post("/read-all", dependencies=[_notify_write])
+async def mark_all_read(request: Request) -> dict[str, Any]:
+    """Mark every (in-scope) notification read (idempotent).
+
+    A tenant-bound caller marks only its OWN workspaces' notifications read — it cannot
+    flip another tenant's read state. NO-OP-scoped offline / ``all_tenants``.
+    """
+    scope = singleton_read_filter(request)
     with _LOCK:
         _ensure_db_locked(create=False)
-        changed = 0
+        changed_ids: list[int] = []
         for item in _NOTIFICATIONS:
-            if not item["read"]:
+            if not item["read"] and _item_in_scope(item, scope):
                 item["read"] = True
-                changed += 1
-        _persist_read_locked(None)
-    return {"ok": True, "marked": changed}
+                changed_ids.append(int(item["id"]))
+        # Scoped read-mark: when unrestricted, mark all (None); else only the in-scope ids.
+        _persist_read_locked(None if scope is None else changed_ids)
+    return {"ok": True, "marked": len(changed_ids)}
 
 
-@router.post("/{notification_id}/read")
-async def mark_read(notification_id: int) -> dict[str, Any]:
-    """Mark one notification read; 404 when the id is unknown (or rolled off)."""
+@router.post("/{notification_id}/read", dependencies=[_notify_write])
+async def mark_read(request: Request, notification_id: int) -> dict[str, Any]:
+    """Mark one notification read; 404 when the id is unknown (or out of the caller's tenant).
+
+    A tenant-bound caller cannot mark (or even probe the existence of) a foreign tenant's
+    notification — an out-of-scope id is a uniform 404, mirroring the by-id run reader.
+    """
+    scope = singleton_read_filter(request)
     with _LOCK:
         _ensure_db_locked(create=False)
         for item in _NOTIFICATIONS:
-            if int(item["id"]) == notification_id:
+            if int(item["id"]) == notification_id and _item_in_scope(item, scope):
                 item["read"] = True
                 _persist_read_locked([notification_id])
                 return {"ok": True}
     raise HTTPException(status_code=404, detail="unknown notification")
 
 
-@router.post("/settings")
-async def set_settings(settings: NotifySettings) -> dict[str, Any]:
-    """Persist the notify settings (currently just Telegram forwarding)."""
+@router.post("/settings", dependencies=[_notify_write])
+async def set_settings(settings: NotifySettings, request: Request) -> dict[str, Any]:
+    """Persist the notify settings (currently just Telegram forwarding).
+
+    The forward-Telegram flag is a single process-global (one shared ``notify_settings``
+    row, no ``workspace_id`` key), so a tenant-bound principal flipping it would toggle
+    notification forwarding for EVERY co-tenant. Restrict the write to an operator /
+    ``all_tenants`` principal (the same posture gate as :func:`reveal_host_posture`): the
+    offline / single-box default is ``all_tenants`` so it stays byte-unchanged, while a
+    tenant-bound principal can no longer mutate this deployment-global toggle.
+    """
+    from himmy.api.auth import reveal_host_posture
+
+    if not reveal_host_posture(request):
+        raise HTTPException(
+            status_code=403,
+            detail="notify forwarding is a deployment-global setting (operator-only)",
+        )
     global _FORWARD_TELEGRAM
     with _LOCK:
         conn = _ensure_db_locked(create=True)  # hydrate first, then overwrite

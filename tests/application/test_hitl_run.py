@@ -21,6 +21,7 @@ import asyncio
 import pytest
 
 from himmy.agents.personas.persona import Persona
+from himmy.api.auth.rbac import AccessPolicy
 from himmy.application.services import (
     AgentDefAppService,
     HitlNotSupportedError,
@@ -43,13 +44,19 @@ from tests.conftest import run_async
 _TOOLS_MODULE = "tests.application._per_run_tools"
 
 
-def _hitl_app(storage: object | None = None) -> tuple[object, RunAppService, AgentDefAppService]:
+def _hitl_app(
+    storage: object | None = None, *, access_policy: object | None = None
+) -> tuple[object, RunAppService, AgentDefAppService]:
     """A RunAppService wired with a HITL checkpoint store + a stored-agent resolver.
 
     ``storage`` defaults to the in-memory :class:`StorageService`; pass a durable backend
     (e.g. :class:`SqliteStorageService`) to exercise the atomic run-level resume claim on a
     backend whose ``get_run`` returns independent snapshots (so the non-atomic check alone
     cannot mask a concurrent double-approve — only the CAS does).
+
+    ``access_policy`` wires an RBAC :class:`AccessPolicy` so the per-run tool-capability
+    gate is built (the condition under which a configured authenticator runs); leaving it
+    ``None`` keeps the offline byte-unchanged path (no authorizer at all).
     """
     storage = storage or StorageService()
     registry = EntityRegistry()
@@ -67,6 +74,7 @@ def _hitl_app(storage: object | None = None) -> tuple[object, RunAppService, Age
         entity_registry=registry,
         checkpoint_store=InMemoryCheckpointStore(),
         agent_resolver=agent_app.get_agent_def,
+        access_policy=access_policy,
     )
     return storage, app, agent_app
 
@@ -82,8 +90,14 @@ async def _store_gated_agent(
     return rec
 
 
-async def _create_hitl_run(app: RunAppService, agent_rec, *, workspace_id="w1"):
-    """Create a hitl run by the stored agent and wait for it to pause/terminate."""
+async def _create_hitl_run(
+    app: RunAppService, agent_rec, *, workspace_id="w1", actor=None
+):
+    """Create a hitl run by the stored agent and wait for it to pause/terminate.
+
+    ``actor`` (a serialized principal descriptor) is persisted into ``run.metadata`` so the
+    drive AND resume paths rebuild the run's tool-capability gate from it.
+    """
     spec = agent_rec.agent_spec()
     run = await app.create_run(
         workspace_id=workspace_id,
@@ -94,6 +108,7 @@ async def _create_hitl_run(app: RunAppService, agent_rec, *, workspace_id="w1"):
         agent_def=agent_rec,
         operator_provisioned=True,
         hitl=True,
+        actor=actor,
     )
     return await _await_status(
         app,
@@ -347,6 +362,92 @@ def test_concurrent_approves_fire_the_tool_once(
         # never leaving the run stranded in RUNNING).
         done = await app.get_run(paused.run_id)
         assert done is not None and done.status == RunStatus.SUCCEEDED
+
+    run_async(_scenario())
+
+
+# -------------------------------------------------- tool-authz survives resume
+
+
+def test_resume_honors_tool_capability_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tool-capability gate must SURVIVE the HITL resume (P0 confused-deputy fix).
+
+    A run is launched by an ENFORCING actor (``tool_authz_enforce=True``) whose role holds
+    ``tool:wire_money:invoke`` but NOT ``tool:wire_money:write`` — so the side-effecting
+    money transfer is denied to it. The human approves the pause; on resume the rebuilt
+    runtime MUST carry the persisted launch actor so the gate stays enforcing and the
+    now-approved write is DENIED. The bug this pins: the resume path dropped ``actor=``,
+    rebuilt a NON-enforcing gate, and let the approved write execute with the gate off.
+    """
+    monkeypatch.setenv("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "1")
+    # A role that may INVOKE the gated tool (so the run can reach the approval pause) but
+    # lacks the WRITE sub-grant the side-effecting transfer additionally requires.
+    policy = AccessPolicy.from_mapping(
+        {"limited": ["run:read", "run:write", "tool:wire_money:invoke"]}
+    )
+    _storage, app, agent_app = _hitl_app(access_policy=policy)
+    actor = {
+        "subject": "u-limited",
+        "roles": ["limited"],
+        "tool_authz_enforce": True,
+    }
+
+    async def _scenario() -> None:
+        rec = await _store_gated_agent(agent_app)
+        paused = await _create_hitl_run(app, rec, actor=actor)
+        assert paused.status == RunStatus.AWAITING_APPROVAL
+        # The gated tool has NOT executed yet (awaiting approval).
+        assert not _per_run_tools.WIRE_CALLS
+
+        # Human approves — but the resumed run rebuilds the SAME enforcing gate, which
+        # denies the write the actor lacks ``tool:wire_money:write`` for.
+        await app.resume_run(paused.run_id, approved=True, workspace_id="w1")
+        await _await_status(
+            app, paused.run_id, {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        )
+        # The approved-but-unauthorized write NEVER executed — the gate survived resume.
+        assert not _per_run_tools.WIRE_CALLS
+
+    run_async(_scenario())
+
+
+def test_resume_authorized_actor_still_fires_the_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control: an actor WITH the write grant still fires the approved tool on resume.
+
+    Proves the gate denial above is the capability check (not an accidental break of the
+    resume path): an enforcing actor holding both ``:invoke`` and ``:write`` resumes and
+    the gated tool fires exactly once.
+    """
+    monkeypatch.setenv("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "1")
+    policy = AccessPolicy.from_mapping(
+        {
+            "full": [
+                "run:read",
+                "run:write",
+                "tool:wire_money:invoke",
+                "tool:wire_money:write",
+            ]
+        }
+    )
+    _storage, app, agent_app = _hitl_app(access_policy=policy)
+    actor = {"subject": "u-full", "roles": ["full"], "tool_authz_enforce": True}
+
+    async def _scenario() -> None:
+        rec = await _store_gated_agent(agent_app)
+        paused = await _create_hitl_run(app, rec, actor=actor)
+        assert paused.status == RunStatus.AWAITING_APPROVAL
+
+        await app.resume_run(paused.run_id, approved=True, workspace_id="w1")
+        done = await _await_status(
+            app, paused.run_id, {RunStatus.SUCCEEDED, RunStatus.FAILED}
+        )
+        assert done is not None and done.status == RunStatus.SUCCEEDED
+        # The authorized, approved write fired exactly once.
+        assert len(_per_run_tools.WIRE_CALLS) == 1
 
     run_async(_scenario())
 

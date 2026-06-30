@@ -341,6 +341,24 @@ class MetricsRegistry:
             "Total guardrail applications, by stage and action (blocked/redacted).",
             ("stage", "action"),
         )
+        # Authorization decisions (RBAC). DENY is always counted; GRANT is counted
+        # only for the small, fixed set of PRIVILEGED resources (see
+        # ``_PRIVILEGED_AUTHZ_RESOURCES``) so a normal high-volume read does not turn
+        # the grant counter into a request firehose, while a successful touch of an
+        # admin/audit surface still leaves a metric trail. ``resource`` is the RBAC
+        # resource (a closed, policy-defined vocabulary — never a run id or free-form
+        # string), so the series space stays bounded.
+        self.authz_denied_total = Counter(
+            "himmy_authz_denied_total",
+            "Total RBAC authorization denials, by resource and action.",
+            ("resource", "action"),
+        )
+        self.authz_granted_total = Counter(
+            "himmy_authz_granted_total",
+            "RBAC authorization grants for PRIVILEGED resources only, by resource "
+            "and action (a high-volume read is intentionally not counted here).",
+            ("resource", "action"),
+        )
         # Run outcomes (status is clamped to a closed lifecycle set).
         self.agent_runs_total = Counter(
             "himmy_agent_runs_total",
@@ -387,6 +405,8 @@ class MetricsRegistry:
             self.inference_tokens,
             self.tool_calls_total,
             self.guardrail_blocks_total,
+            self.authz_denied_total,
+            self.authz_granted_total,
             self.agent_runs_total,
             self.agent_run_outcomes_total,
             self.dispatcher_in_flight,
@@ -456,7 +476,16 @@ def install_metrics(app: FastAPI) -> None:
     """
     import time
 
+    from starlette.requests import Request
     from starlette.responses import PlainTextResponse
+
+    # Make ``Request`` resolvable at RUNTIME for the ``/metrics`` route's annotation:
+    # the module-level import lives under ``TYPE_CHECKING`` (so the core/offline install
+    # need not have starlette), but ``from __future__ import annotations`` makes FastAPI
+    # evaluate the string annotation against this module's globals when it builds the
+    # route — without this it would mis-read ``request`` as a query param (422). The
+    # ``_install_metrics`` path only ever runs with the [api] extra present.
+    globals().setdefault("Request", Request)
 
     registry = _REGISTRY
 
@@ -485,8 +514,26 @@ def install_metrics(app: FastAPI) -> None:
             )
 
     @app.get("/metrics", include_in_schema=False)
-    async def metrics() -> Response:
-        """Prometheus scrape endpoint (text exposition; no secrets, low cardinality)."""
+    async def metrics(request: Request) -> Response:
+        """Prometheus scrape endpoint (text exposition; no secrets, low cardinality).
+
+        OPT-IN scrape-token guard (r2): the exposition carries only aggregate, bounded
+        ``(resource, action)`` authz-deny counts + ``(method, template)`` latency series —
+        no tenant/user/run id or policy secret — so it is unauthenticated by default (the
+        standard Prometheus tradeoff) and BYTE-UNCHANGED for the offline / zero-config path.
+        When the operator sets ``HIMMY_METRICS_TOKEN`` (recommended under a multi-tenant
+        posture, so an aggregate authz-deny / latency map is not handed to any keyed
+        caller), the scrape must present the SAME token via ``Authorization: Bearer <tok>``
+        or the ``X-Metrics-Token`` header; a missing/mismatched token is **401**. The
+        compare is constant-time. With the var unset the guard is a pure no-op.
+        """
+        expected = _metrics_token()
+        if expected is not None and not _metrics_token_ok(request, expected):
+            return PlainTextResponse(
+                "metrics scrape token required",
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return PlainTextResponse(
             registry.render(), media_type=CONTENT_TYPE_LATEST
         )
@@ -496,6 +543,64 @@ def reset_registry() -> None:
     """Replace the process-wide registry with a fresh one (test helper)."""
     global _REGISTRY
     _REGISTRY = MetricsRegistry()
+
+
+def _metrics_token() -> str | None:
+    """The configured ``/metrics`` scrape token, or ``None`` when the guard is off.
+
+    ``None`` (the default — env var unset/blank) means the endpoint is unauthenticated,
+    byte-unchanged from before the r2 hardening (the offline / zero-config path).
+    """
+    import os
+
+    token = os.environ.get("HIMMY_METRICS_TOKEN", "").strip()
+    return token or None
+
+
+def _metrics_token_ok(request: Request, expected: str) -> bool:
+    """Constant-time check that the scrape presented the expected token.
+
+    Accepts either ``Authorization: Bearer <token>`` or an ``X-Metrics-Token`` header so
+    both a Prometheus bearer_token config and a simple header scrape work.
+    """
+    import hmac
+
+    presented = request.headers.get("x-metrics-token", "")
+    if not presented:
+        auth = request.headers.get("authorization", "")
+        scheme, _, value = auth.partition(" ")
+        if scheme.lower() == "bearer":
+            presented = value.strip()
+    return bool(presented) and hmac.compare_digest(presented, expected)
+
+
+# The closed set of RBAC resources whose GRANT is worth a metric: the admin/audit
+# control surfaces and the consent governance plane. A grant on one of these is rare
+# and security-relevant, so sampling it leaves an audit-friendly trail without the
+# grant counter following every ordinary read. DENY is recorded for EVERY resource.
+_PRIVILEGED_AUTHZ_RESOURCES = frozenset({"audit", "consent", "diagnostics", "*"})
+
+
+def record_authz_decision(resource: str, action: str, *, granted: bool) -> None:
+    """Record one RBAC verdict into the process-wide metrics (bounded cardinality).
+
+    A DENY always increments :attr:`MetricsRegistry.authz_denied_total`; a GRANT is
+    sampled — counted into :attr:`MetricsRegistry.authz_granted_total` ONLY when
+    ``resource`` is one of the small, fixed :data:`_PRIVILEGED_AUTHZ_RESOURCES`, so an
+    ordinary high-volume read does not turn the grant counter into a per-request
+    firehose. ``resource``/``action`` come from the route's static
+    ``require_permission`` declaration (a closed, policy-defined vocabulary), so the
+    label space is bounded and carries no run id / user id / free-form string. Never
+    raises: observability must never break a request.
+    """
+    try:
+        reg = get_registry()
+        if not granted:
+            reg.authz_denied_total.inc((resource, action))
+        elif resource in _PRIVILEGED_AUTHZ_RESOURCES:
+            reg.authz_granted_total.inc((resource, action))
+    except Exception:  # noqa: BLE001 - metrics must never break a request
+        logger.warning("failed to record authz decision metric", exc_info=True)
 
 
 def _clamp_run_status(status: object) -> str:
@@ -610,6 +715,7 @@ __all__ = [
     "get_metrics_sink",
     "get_registry",
     "install_metrics",
+    "record_authz_decision",
     "reset_registry",
     "route_template",
 ]

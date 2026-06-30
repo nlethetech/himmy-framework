@@ -109,6 +109,40 @@ class DiagnosticsReport:
         """JSON-friendly dict (nested dataclasses flattened)."""
         return asdict(self)
 
+    def to_public_dict(self) -> dict[str, Any]:
+        """A POSTURE-FREE snapshot for a tenant-bound ``/v1/diagnostics`` caller (r5).
+
+        red-team scope-r5: ``GET /v1/diagnostics`` is read-gated on ``diagnostics:read``,
+        which every tenant browse role (viewer/operator/auditor) holds — so a paying tenant
+        could read the operator's deployment RECONNAISSANCE: the absolute filesystem paths of
+        installed provider binaries (``providers[].path``), the provider-key PRESENCE inventory
+        (``keys``), the storage backend DSN host (``storage.dsn``), and the absolute
+        ``.himmy/*.db`` store paths (``db_files[].path``). The Studio twins (``/doctor`` /
+        ``/health``) already withhold this class from tenant browse roles (admin-only);
+        this is the ``/v1`` parity move.
+
+        This strips exactly those host-posture fields, leaving the BENIGN, tenant-relevant
+        shape intact: provider/embedder availability booleans, extras, the storage backend
+        NAME (not its DSN), DB-file presence/size (not the absolute path), and the scheduler
+        flag. It is reached ONLY for a tenant-bound principal — the offline / ``all_tenants``
+        / CLI path keeps :meth:`to_dict` byte-unchanged via
+        :func:`~himmy.api.auth.context.reveal_host_posture`.
+        """
+        data = self.to_dict()
+        doctor = data.get("doctor")
+        if isinstance(doctor, dict):
+            doctor.pop("keys", None)  # provider-key presence inventory (recon)
+            for provider in doctor.get("providers") or []:
+                if isinstance(provider, dict):
+                    provider.pop("path", None)  # absolute binary path (recon)
+        storage = data.get("storage")
+        if isinstance(storage, dict):
+            storage.pop("dsn", None)  # DB host/port/db (recon) — backend NAME stays
+        for db_file in data.get("db_files") or []:
+            if isinstance(db_file, dict):
+                db_file.pop("path", None)  # absolute .himmy/*.db path (recon)
+        return data
+
 
 @dataclass
 class DoctorReport:

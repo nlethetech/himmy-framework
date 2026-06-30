@@ -17,13 +17,25 @@ Offline-first notes:
 
 from __future__ import annotations
 
-from fastapi import HTTPException
+from typing import Any
+
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.auth import (
+    scoped_read,
+    singleton_read_filter,
+    singleton_write_workspace,
+)
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.api.studio_chats import ChatSession, ChatsStore, Project, get_chats_store
 
 router = build_studio_router("projects", tag="studio-projects")
+
+#: Creating/renaming/deleting a project and (un)assigning chats are mutations gated by
+#: ``studio.projects:write`` (admin-only by default), additively on top of the router's
+#: ``studio.projects:read`` baseline so a read-only role can browse but not mutate.
+_projects_write = Depends(studio_permission("studio.projects", "write"))
 
 
 # ---- request / response models ----------------------------------------------
@@ -94,8 +106,8 @@ def _resolve_agent_name(agent_path: str | None) -> str | None:
     return None
 
 
-def _detail(store: ChatsStore, project: Project) -> ProjectDetail:
-    chats = store.project_chats(project.id)
+def _detail(store: ChatsStore, project: Project, *, workspace: Any = None) -> ProjectDetail:
+    chats = store.project_chats(project.id, workspace_id=workspace)
     return ProjectDetail(
         **project.model_dump(exclude={"chat_count"}),
         chat_count=len(chats),
@@ -105,94 +117,124 @@ def _detail(store: ChatsStore, project: Project) -> ProjectDetail:
     )
 
 
-def _notify(kind_title: str, project: Project, body: str = "") -> None:
+def _notify(
+    kind_title: str, project: Project, body: str = "", *, workspace_id: str | None = None
+) -> None:
     from himmy.api.routers.studio_notify import record_notification
 
+    # Stamp the notification with the OWNING workspace so a tenant-bound reader only sees
+    # the bell (and the project NAME) for its own projects. ``None`` (offline / unrestricted)
+    # leaves it NULL-owned = visible to all, byte-unchanged.
     record_notification(
-        "project", kind_title, body=body, link=f"/projects/{project.id}"
+        "project",
+        kind_title,
+        body=body,
+        link=f"/projects/{project.id}",
+        workspace_id=workspace_id,
     )
 
 
 # ---- routes -------------------------------------------------------------------
 
 
-@router.get("", response_model=list[Project])
-async def projects_list() -> list[Project]:
-    """Every project, most recently touched first."""
-    return get_chats_store().list_projects()
+@router.get("", response_model=list[Project], dependencies=[Depends(scoped_read)])
+async def projects_list(request: Request) -> list[Project]:
+    """Every project the caller's tenant owns (plus legacy NULL), most recently touched first."""
+    return get_chats_store().list_projects(workspace_id=singleton_read_filter(request))
 
 
-@router.post("", response_model=Project)
-async def projects_create(body: ProjectCreateRequest) -> Project:
+@router.post("", response_model=Project, dependencies=[_projects_write])
+async def projects_create(body: ProjectCreateRequest, request: Request) -> Project:
     store = get_chats_store()
     project = store.create_project(
         name=body.name.strip(),
         description=body.description.strip(),
         kb_id=body.kb_id,
         agent_path=body.agent_path,
+        workspace_id=singleton_write_workspace(request),
     )
-    _notify(f"Project “{project.name}” created", project)
+    _notify(
+        f"Project “{project.name}” created",
+        project,
+        workspace_id=singleton_write_workspace(request),
+    )
     return project
 
 
-@router.get("/{project_id}", response_model=ProjectDetail)
-async def projects_get(project_id: str) -> ProjectDetail:
+@router.get(
+    "/{project_id}",
+    response_model=ProjectDetail,
+    dependencies=[Depends(scoped_read)],
+)
+async def projects_get(project_id: str, request: Request) -> ProjectDetail:
     store = get_chats_store()
-    project = store.get_project(project_id)
+    scope = singleton_read_filter(request)
+    project = store.get_project(project_id, workspace_id=scope)
     if project is None:
         raise HTTPException(status_code=404, detail="unknown project")
-    return _detail(store, project)
+    return _detail(store, project, workspace=scope)
 
 
-@router.patch("/{project_id}", response_model=Project)
-async def projects_update(project_id: str, body: ProjectUpdateRequest) -> Project:
+@router.patch(
+    "/{project_id}", response_model=Project, dependencies=[_projects_write]
+)
+async def projects_update(
+    project_id: str, body: ProjectUpdateRequest, request: Request
+) -> Project:
     store = get_chats_store()
-    if store.get_project(project_id) is None:
+    scope = singleton_read_filter(request)
+    if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
     changes: dict[str, str | None] = {}
     for field in body.model_fields_set:
         value = getattr(body, field)
         changes[field] = value.strip() if isinstance(value, str) else value
-    updated = store.update_project(project_id, changes)
+    updated = store.update_project(project_id, changes, workspace_id=scope)
     if updated is None:  # deleted between the check and the write
         raise HTTPException(status_code=404, detail="unknown project")
     return updated
 
 
-@router.delete("/{project_id}")
-async def projects_delete(project_id: str) -> dict[str, bool]:
+@router.delete("/{project_id}", dependencies=[_projects_write])
+async def projects_delete(project_id: str, request: Request) -> dict[str, bool]:
     store = get_chats_store()
-    project = store.get_project(project_id)
+    scope = singleton_read_filter(request)
+    project = store.get_project(project_id, workspace_id=scope)
     if project is None:
         return {"ok": False}
-    ok = store.delete_project(project_id)
+    ok = store.delete_project(project_id, workspace_id=scope)
     if ok:
         _notify(
             f"Project “{project.name}” deleted",
             project,
             body="Its chats were kept, just ungrouped.",
+            workspace_id=singleton_write_workspace(request),
         )
     return {"ok": ok}
 
 
-@router.post("/{project_id}/assign")
-async def projects_assign(project_id: str, body: ChatAssignRequest) -> dict[str, bool]:
+@router.post("/{project_id}/assign", dependencies=[_projects_write])
+async def projects_assign(
+    project_id: str, body: ChatAssignRequest, request: Request
+) -> dict[str, bool]:
     store = get_chats_store()
-    if store.get_project(project_id) is None:
+    scope = singleton_read_filter(request)
+    if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
-    if not store.assign_chat(project_id, body.chat_id):
+    if not store.assign_chat(project_id, body.chat_id, workspace_id=scope):
         raise HTTPException(status_code=404, detail="unknown chat session")
     return {"ok": True}
 
 
-@router.post("/{project_id}/unassign")
+@router.post("/{project_id}/unassign", dependencies=[_projects_write])
 async def projects_unassign(
-    project_id: str, body: ChatAssignRequest
+    project_id: str, body: ChatAssignRequest, request: Request
 ) -> dict[str, bool]:
     store = get_chats_store()
-    if store.get_project(project_id) is None:
+    scope = singleton_read_filter(request)
+    if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
-    return {"ok": store.unassign_chat(body.chat_id)}
+    return {"ok": store.unassign_chat(body.chat_id, workspace_id=scope)}
 
 
 __all__ = ["router"]

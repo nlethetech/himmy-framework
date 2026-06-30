@@ -1111,6 +1111,29 @@ def resolve_routine_container() -> Any | None:
         return None
 
 
+def active_access_policy() -> Any | None:
+    """The active RBAC :class:`AccessPolicy`, or ``None`` when auth is not configured.
+
+    centralize-tool-gate: the off-request background seams (the ``agent_path`` routine fire,
+    a background Mission, a Telegram-triggered run) run off any HTTP request, so they cannot
+    read ``app.state.access_policy``; they read it from the wired run service instead (the
+    SAME policy the ``/v1`` paths use, set in ``create_app`` ONLY when an authenticator is
+    configured). ``None`` offline (no server / no authenticator) so the caller's ambient
+    gate is inert — byte-unchanged. Shared by routines / missions / studio_telegram via the
+    :func:`himmy.api.auth.service_principal.bind_service_authorizer` seam.
+    """
+    container = resolve_routine_container()
+    if container is None:
+        return None
+    run_app = getattr(container, "run_app", None)
+    return getattr(run_app, "_access_policy", None)
+
+
+def _routine_access_policy() -> Any | None:
+    """Back-compat alias for :func:`active_access_policy` (the routine drain's gate policy)."""
+    return active_access_policy()
+
+
 # ---- headless execution ------------------------------------------------------
 
 
@@ -1176,27 +1199,56 @@ async def _run_headless(routine: Routine) -> tuple[str, str, str | None]:
         "routine_id": routine.id,
     }
 
+    # centralize-tool-gate: the scheduler runs on a background loop with NO HTTP request,
+    # so it must bind the tool-capability gate ambiently itself (the request-boundary seam
+    # cannot reach here). Under a CONFIGURED authenticator the gate is the routine's
+    # least-privilege SERVICE principal (the SAME identity the ``agent_id`` seam stamps as
+    # its run actor), so the routine's tools are deny-by-default to that service role rather
+    # than running with the agent's full authority. Offline (no server / no authenticator)
+    # ``_routine_access_policy`` is ``None`` → the ambient gate is ``None`` and inert,
+    # byte-unchanged. Were this binding ever forgotten under configured auth, the
+    # chokepoint's process-level fail-closed default would deny every tool anyway.
+    from himmy.services.tools.ambient import _active_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    _routine_policy = _routine_access_policy()
+    if _routine_policy is not None:
+        from himmy.api.auth.service_principal import routine_service_principal
+
+        routine_authorizer = ToolCapabilityAuthorizer.from_principal(
+            routine_service_principal(workspace_id=routine.workspace_id or "__local__"),
+            _routine_policy,
+        )
+    else:
+        routine_authorizer = None
+
     async def _drain() -> None:
         nonlocal output, status, error
-        async for event in studio_service.stream_agent_run(
-            spec,
-            routine.prompt,
-            provider=routine.provider,
-            model=routine.model,
-            agent_path=agent_path,
-            canonical_storage=canonical,
-            extra_metadata=routine_metadata,
-        ):
-            kind = event.get("type")
-            if kind == "message":
-                output = str(event.get("text") or output)
-            elif kind == "done":
-                output = str(event.get("output_text") or output)
-            elif kind == "paused":
-                status = "awaiting_approval"
-            elif kind == "error":
-                status = "error"
-                error = str(event.get("message") or "run failed")
+        # Bind the routine gate ambiently for the whole drain via set/reset; reset in
+        # ``finally`` so the binding is strictly scoped to this drain.
+        _routine_authz_token = _active_authorizer.set(routine_authorizer)
+        try:
+            async for event in studio_service.stream_agent_run(
+                spec,
+                routine.prompt,
+                provider=routine.provider,
+                model=routine.model,
+                agent_path=agent_path,
+                canonical_storage=canonical,
+                extra_metadata=routine_metadata,
+            ):
+                kind = event.get("type")
+                if kind == "message":
+                    output = str(event.get("text") or output)
+                elif kind == "done":
+                    output = str(event.get("output_text") or output)
+                elif kind == "paused":
+                    status = "awaiting_approval"
+                elif kind == "error":
+                    status = "error"
+                    error = str(event.get("message") or "run failed")
+        finally:
+            _active_authorizer.reset(_routine_authz_token)
 
     try:
         await asyncio.wait_for(_drain(), timeout=run_timeout_s())
@@ -1269,7 +1321,20 @@ async def _run_headless_agent_id(routine: Routine) -> tuple[str, str, str | None
     # create_run (HitlRequiresAgentError). Run it plainly in that case — it cannot reach a
     # gated tool anyway, so the unattended-safety contract is preserved.
     hitl = bool(agent_spec.builds_tool_registry())
-    actor = {"source": "routine", "routine_id": routine.id}
+    # P0 #2: stamp a least-privilege SERVICE principal as the run's audit actor + identity.
+    # ``actor_metadata`` carries the routine's roles + (for a tenant-bound principal under a
+    # configured authenticator) the ``tool_authz_enforce`` flag, so the routine's tools are
+    # gated deny-by-default to its allow-list roles instead of running with the agent's full
+    # authority. Offline (no authenticator) the flag is inert — byte-unchanged. The routine
+    # source/id is preserved alongside for routine<->run lineage.
+    from himmy.api.auth.service_principal import routine_service_principal
+
+    principal = routine_service_principal(workspace_id=workspace_id)
+    actor = {
+        **principal.actor_metadata(),
+        "source": "routine",
+        "routine_id": routine.id,
+    }
     try:
         run = await run_app.create_run(
             workspace_id=workspace_id,
@@ -1354,8 +1419,17 @@ async def _deliver(routine: Routine, output: str) -> str | None:
 
 
 def _notify(routine: Routine, status: str, preview: str, error: str | None) -> None:
-    """Record the lifecycle notification (never raises, per the contract)."""
+    """Record the lifecycle notification (never raises, per the contract).
+
+    The notification is stamped with the routine's OWNING workspace so a tenant-bound
+    Studio reader only sees the bell (and the routine NAME / live LLM output preview) for
+    its OWN routines. The reserved ``__local__`` single-tenant workspace maps to ``None``
+    so the offline/single-box path stays byte-unchanged (NULL-owned = visible to all, the
+    intended shared behaviour). Mirrors the missions lane (missions.py:_run).
+    """
     from himmy.api.routers.studio_notify import record_notification
+
+    ws = None if routine.workspace_id == LOCAL_WORKSPACE else routine.workspace_id
 
     if status == "ok":
         record_notification(
@@ -1363,6 +1437,7 @@ def _notify(routine: Routine, status: str, preview: str, error: str | None) -> N
             f"Routine ran: {routine.name}",
             body=preview,
             link="/routines",
+            workspace_id=ws,
         )
     elif status == "awaiting_approval":
         record_notification(
@@ -1370,6 +1445,7 @@ def _notify(routine: Routine, status: str, preview: str, error: str | None) -> N
             f"Routine needs approval: {routine.name}",
             body="An approval-gated tool paused the run — review it in Approvals.",
             link="/approvals",
+            workspace_id=ws,
         )
     else:  # error | timeout
         record_notification(
@@ -1377,6 +1453,7 @@ def _notify(routine: Routine, status: str, preview: str, error: str | None) -> N
             f"Routine failed: {routine.name}",
             body=error or status,
             link="/routines",
+            workspace_id=ws,
         )
 
 

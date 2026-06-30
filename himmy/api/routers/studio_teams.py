@@ -25,17 +25,24 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from himmy.api import studio_service
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.core.events import EventType
 
 router = APIRouter()
 _teams = build_studio_router("teams", tag="studio-teams")
 _workflows = build_studio_router("workflows", tag="studio-workflows")
+
+#: Saving a team spec writes a ``.team.yaml`` to disk; running a workflow executes
+#: agents. Both are privileged mutations gated by the respective surface's ``:write``
+#: permission (admin-only by default), additively on top of each router's ``:read``
+#: baseline so a read-only role can browse/validate but never persist or execute.
+_teams_write = Depends(studio_permission("studio.teams", "write"))
+_workflows_write = Depends(studio_permission("studio.workflows", "write"))
 
 
 # ---- Team builder: request/response shapes -------------------------------
@@ -212,7 +219,9 @@ async def validate_team(form: TeamForm) -> TeamValidationResult:
     return TeamValidationResult(ok=not errors, errors=errors)
 
 
-@_teams.post("", response_model=studio_service.TeamSummary)
+@_teams.post(
+    "", response_model=studio_service.TeamSummary, dependencies=[_teams_write]
+)
 async def save_team(body: SaveTeamRequest) -> studio_service.TeamSummary:
     """Create or update a ``<name>.team.yaml`` (validated via the team loader).
 
@@ -368,7 +377,42 @@ def _jsonable_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _workflow_stream(
-    wf: Any, spec: Any, body: WorkflowStreamRequest
+    wf: Any,
+    spec: Any,
+    body: WorkflowStreamRequest,
+    tool_authorizer: Any = None,
+    owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
+) -> AsyncIterator[str]:
+    """Bind the request principal's gate ambiently, then drive the workflow stream.
+
+    centralize-tool-gate: ``tool_authorizer`` is the request principal's tool-capability
+    gate, bound AMBIENTLY for the whole drive so every workflow step's tool dispatch is
+    enforced even though this surface builds the runtime without threading the authorizer
+    explicitly. ``None`` offline (no authenticator) → inert, byte-unchanged. The actual
+    drive lives in :func:`_workflow_stream_body`; this wrapper just scopes the ambient
+    binding around the entire async iteration.
+
+    ``owner_workspace_id`` (rbac-harden tenancy) is the LAUNCHING tenant resolved from the
+    verified principal; it scopes the workflow agent's memory + knowledge tool packs to
+    this tenant on a shared durable store. ``None`` (offline / all_tenants) → unscoped,
+    byte-unchanged.
+    """
+    from himmy.services.tools.ambient import use_tool_authorizer
+
+    with use_tool_authorizer(tool_authorizer):
+        async for frame in _workflow_stream_body(
+            wf, spec, body, owner_workspace_id, owner_subject_scope
+        ):
+            yield frame
+
+
+async def _workflow_stream_body(
+    wf: Any,
+    spec: Any,
+    body: WorkflowStreamRequest,
+    owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> AsyncIterator[str]:
     """Drive one workflow run, yielding SSE frames per node transition.
 
@@ -393,6 +437,12 @@ async def _workflow_stream(
                 provider=body.provider,
                 model=body.model,
                 durable_defaults=True,
+                # rbac-harden tenancy: scope the workflow agent's memory/knowledge packs
+                # to the launching tenant (``None`` offline / all_tenants → unscoped).
+                subject=owner_workspace_id,
+                # rbac-harden: within-tenant USER axis so two subject_scoped users of one
+                # tenant never share the workflow agent's memory/KB namespace.
+                subject_scope=owner_subject_scope,
             )
         )
     except Exception as exc:  # noqa: BLE001 - a missing provider is a clean frame
@@ -499,8 +549,10 @@ async def _workflow_stream(
         yield _sse({"type": "error", "message": str(exc)})
 
 
-@_workflows.post("/run-stream")
-async def run_workflow_stream(body: WorkflowStreamRequest) -> StreamingResponse:
+@_workflows.post("/run-stream", dependencies=[_workflows_write])
+async def run_workflow_stream(
+    body: WorkflowStreamRequest, request: Request
+) -> StreamingResponse:
     """Run a workflow with the chosen agent, streaming node-level events (SSE).
 
     Node frames carry ``state``: ``running`` → ``completed`` | ``failed``; the
@@ -523,8 +575,33 @@ async def run_workflow_stream(body: WorkflowStreamRequest) -> StreamingResponse:
     if not wf.steps:
         raise HTTPException(status_code=400, detail="workflow has no steps")
 
+    # centralize-tool-gate: thread the request principal's tool-capability gate so workflow
+    # step tools are enforced (inert offline). Bound ambiently inside ``_workflow_stream``.
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    # rbac-harden tenancy: resolve the launching tenant from the verified principal so the
+    # workflow agent's memory/knowledge packs scope to it on a shared durable store. An
+    # unrestricted offline / all_tenants caller resolves to ``None`` → unscoped (byte-
+    # unchanged single-box path), mirroring ``_run_owner`` in the studio router.
+    from himmy.api.auth.context import (
+        get_principal,
+        resolve_workspace,
+        studio_subject_filter,
+    )
+
+    _principal = get_principal(request)
+    owner_workspace = (
+        None if _principal.all_tenants else resolve_workspace(request, None)
+    )
+    # rbac-harden: within-tenant USER axis (subject_scoped principals only; ``None``
+    # otherwise → tenant-only, byte-unchanged), so two users of one tenant never share the
+    # workflow agent's memory/KB namespace. Symmetric to the eval/workflow run paths.
+    owner_subject_scope = studio_subject_filter(request)
     return StreamingResponse(
-        _workflow_stream(wf, spec, body),
+        _workflow_stream(
+            wf, spec, body, tool_authorizer, owner_workspace, owner_subject_scope
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

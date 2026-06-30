@@ -315,3 +315,131 @@ async def test_resolving_run_projects_without_keyerror() -> None:
 
     detail = await get_studio_run_unified(storage, "resolving-1")
     assert detail is not None and detail.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_cache_only_run_not_served_to_tenant_bound_reader(tmp_path: Path) -> None:
+    """Red-team r3: a cache-only Studio run is NOT served to a tenant-bound reader.
+
+    The studio.db presentation cache carries no tenant stamp. When a canonical record is
+    absent (a cache row written before / outliving its canonical mirror) the by-id reader
+    must NOT fall back to the cache for a tenant-bound principal — that would bypass the
+    workspace allow-list and leak an unattributable run cross-tenant. An unscoped
+    (single-box) reader still gets the cache row.
+    """
+    import os
+
+    from himmy.api.studio_canonical import get_studio_run_unified
+    from himmy.api.studio_runs import StudioRun, get_run_store, reset_run_store
+
+    prev_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    reset_run_store()
+    try:
+        # Seed a cache-only row (no canonical record exists for it).
+        get_run_store().save(
+            StudioRun(id="cache-only-1", created_at="2026-01-01T00:00:00Z", output="X")
+        )
+        storage = StorageService()  # canonical store has NO record for cache-only-1
+
+        # Tenant-bound reader (a non-None allow-list) must read it as not-found.
+        scoped = await get_studio_run_unified(
+            storage, "cache-only-1", accessible_workspaces=frozenset({"acme"})
+        )
+        assert scoped is None
+
+        # The unscoped (single-box) reader still gets the cache row (byte-unchanged).
+        unscoped = await get_studio_run_unified(
+            storage, "cache-only-1", accessible_workspaces=None
+        )
+        assert unscoped is not None and unscoped.id == "cache-only-1"
+    finally:
+        reset_run_store()
+        os.chdir(prev_cwd)
+
+
+# --------------------------------------------- subject axis (BOLA, scope-r1#3)
+
+
+@pytest.mark.asyncio
+async def test_studio_run_readers_enforce_subject_axis() -> None:
+    """The Studio run list + by-id readers narrow on the SUBJECT axis (not just tenant).
+
+    Vuln scope-r1#3: the Studio ``/api/studio/runs`` family scoped ONLY by tenant
+    (``accessible_workspaces``) and never by subject, so a ``subject_scoped`` principal
+    blocked from another subject's runs on ``/v1/runs`` and missions could read the SAME runs
+    via Studio. The unified readers now also accept ``accessible_subject`` (from
+    ``studio_subject_filter``): pinned to a subject, they surface only that subject's runs
+    (plus the reserved ``__local__`` single-user runs) and fold a cross-subject by-id fetch to
+    not-found. ``None`` (offline / all_tenants / tenant_admin) is byte-unchanged.
+    """
+    from himmy.api.studio_canonical import (
+        get_studio_run_unified,
+        list_studio_runs_unified,
+    )
+
+    storage = StorageService()
+    # Two subjects in the SAME tenant 't', plus one __local__ single-user run.
+    await storage.save_run(
+        RunRecord(
+            run_id="alice-run",
+            workspace_id="t",
+            subject_id="alice",
+            status=RunStatus.SUCCEEDED,
+        )
+    )
+    await storage.save_run(
+        RunRecord(
+            run_id="bob-run",
+            workspace_id="t",
+            subject_id="bob",
+            status=RunStatus.SUCCEEDED,
+        )
+    )
+    await storage.save_run(
+        RunRecord(
+            run_id="local-run",
+            workspace_id=LOCAL_WORKSPACE,
+            subject_id="__local__",
+            status=RunStatus.SUCCEEDED,
+        )
+    )
+
+    # alice (subject_scoped) tenant 't' → sees ONLY its own + the __local__ run, never bob's.
+    summaries, total = await list_studio_runs_unified(
+        storage,
+        limit=50,
+        offset=0,
+        accessible_workspaces=frozenset({"t", LOCAL_WORKSPACE}),
+        accessible_subject="alice",
+    )
+    ids = {s.id for s in summaries}
+    assert ids == {"alice-run", "local-run"}
+    assert total == 2  # bob's run never enters the visible slice/count
+
+    # By-id: alice's own + __local__ are visible; bob's folds to not-found.
+    assert (
+        await get_studio_run_unified(
+            storage, "alice-run", accessible_subject="alice"
+        )
+    ) is not None
+    assert (
+        await get_studio_run_unified(
+            storage, "local-run", accessible_subject="alice"
+        )
+    ) is not None
+    assert (
+        await get_studio_run_unified(
+            storage, "bob-run", accessible_subject="alice"
+        )
+    ) is None
+
+    # INVARIANT: no subject filter (offline / all_tenants / tenant_admin) → everything.
+    all_summaries, all_total = await list_studio_runs_unified(
+        storage, limit=50, offset=0, accessible_subject=None
+    )
+    assert {s.id for s in all_summaries} == {"alice-run", "bob-run", "local-run"}
+    assert all_total == 3
+    assert (
+        await get_studio_run_unified(storage, "bob-run", accessible_subject=None)
+    ) is not None

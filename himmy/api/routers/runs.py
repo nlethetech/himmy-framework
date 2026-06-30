@@ -14,10 +14,14 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from himmy.api.auth import (
+    authorize_object,
+    enforce_subject_write,
     get_principal,
+    narrow_subject,
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import (
     NOT_FOUND_RESPONSE,
@@ -34,7 +38,9 @@ from himmy.application.services import (
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import RunRecord, RunStatus
 
-router = APIRouter(prefix="/v1/runs", tags=["runs"])
+router = APIRouter(
+    prefix="/v1/runs", tags=["runs"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("run", "read"))]
 _WRITE = [Depends(require_permission("run", "write"))]
@@ -97,9 +103,63 @@ class CreateRunRequest(BaseModel):
     plan: bool = False
 
 
+#: Context keys a CLIENT must never get to choose on a server-launched run — they govern
+#: the TENANT axis of the per-run context-snapshot field resolution. ``workspace_id`` on
+#: ``context_metadata`` drives :meth:`ContextService._stored_field` eligibility; left
+#: client-controlled it is a cross-tenant IDOR (a tenant-bound caller could point the build
+#: at another tenant's cached context fields under a shared ``subject_id``).
+_RESERVED_CONTEXT_META_KEYS = ("workspace_id",)
+
+
+def _scope_run_context(
+    request: Request, context: dict[str, Any], workspace_id: str
+) -> dict[str, Any]:
+    """Force the per-run context-build TENANT axis to the SERVER-authorized workspace.
+
+    The ``/v1/runs`` body carries a free-form ``task.context``; the runtime's context-snapshot
+    build reads ``context_metadata.workspace_id`` from it to tenant-scope STORAGE-sourced field
+    resolution (single_agent.py ``_context_workspace_id``). On a server-launched run that value
+    MUST be the run's authorized workspace, not a client choice — otherwise a tenant-bound caller
+    submits ``context_metadata.workspace_id`` = some OTHER tenant and reads that tenant's cached
+    context fields into its own prompt (a cross-tenant IDOR).
+
+    For a tenant-bound principal this HARD-OVERRIDES (not setdefault) ``context_metadata``'s
+    reserved tenant keys to the authorized ``workspace_id``. For an unrestricted principal
+    (offline / ``all_tenants`` — a single-box deployment where there is no other tenant to cross)
+    the context dict is returned UNTOUCHED, so the offline / CLI path is byte-for-byte unchanged.
+    """
+    if get_principal(request).all_tenants:
+        return context
+    scoped = dict(context)
+    meta_raw = scoped.get("context_metadata")
+    meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
+    for key in _RESERVED_CONTEXT_META_KEYS:
+        meta[key] = workspace_id
+    scoped["context_metadata"] = meta
+    return scoped
+
+
 def _container(request: Request) -> Any:
     """Pull the wired :class:`ApiContainer` off the app state."""
     return request.app.state.container
+
+
+async def _bola_blocked(request: Request, run_id: str, workspace_id: str | None) -> bool:
+    """Whether object-level (BOLA, WS-bola) narrowing hides this run from the caller.
+
+    Returns True ONLY for an opt-in ``subject_scoped`` principal reading a run that belongs
+    to ANOTHER data subject (so the caller-facing route renders a clean 404). For every
+    other caller — offline / ``all_tenants`` / the historical multi-user-workspace default
+    / a ``tenant_admin`` — :meth:`~himmy.api.auth.principal.Principal.subject_scoped` is
+    falsy, so this short-circuits WITHOUT touching the run-resolution path and the legacy
+    behavior (e.g. ``/events`` returning ``[]`` for a foreign workspace) is byte-unchanged.
+    """
+    if not get_principal(request).subject_scoped:
+        return False
+    run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
+    if run is None:
+        return False  # unknown/out-of-workspace is handled by the route's own lookup
+    return not authorize_object(request, run.subject_id)
 
 
 @router.post("", response_model=RunRecord, dependencies=_WRITE)
@@ -131,10 +191,14 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
         )
 
     workspace_id = require_workspace(request, body.workspace_id)
+    # BOLA write gate (WS-bola): a subject_scoped principal may only create a run under its
+    # OWN subject — else it could stamp a run (and its lineage / erasure linkage) under a
+    # foreign data subject. A no-op for offline / all_tenants / tenant_admin callers.
+    enforce_subject_write(request, body.subject_id)
     task = Task(
         title=body.task.title,
         prompt=body.task.prompt,
-        context=body.task.context,
+        context=_scope_run_context(request, body.task.context, workspace_id),
     )
 
     persona: Persona
@@ -217,8 +281,20 @@ async def _resume_run(
     no-op, never a second firing of the gated tool). Stamps the approver actor and audits
     the decision. The actual gated-tool execution + continuation happen on a fresh tracked
     background task; the response is the RUNNING record (fire-and-forget, like create).
+
+    Object-level (BOLA, WS-bola): these are the WRITE siblings of the gated read surfaces
+    (``get_run`` / ``/events`` / ``/thread`` / ``/pending-approvals``), and resuming another
+    data subject's HITL-paused run is a strictly worse hole than a read leak — it would FIRE
+    (approve) or permanently BLOCK (reject) that subject's gated tool. So a ``subject_scoped``
+    principal targeting a run that belongs to ANOTHER subject is collapsed into the SAME clean
+    404 as an unknown/out-of-workspace run (never a 409 that would confirm the foreign run
+    exists or leak its lifecycle state). The check runs BEFORE ``resume_run`` so the gated
+    tool is never touched. Non-subject-scoped / ``all_tenants`` / offline callers are
+    unaffected (:func:`_bola_blocked` short-circuits to ``False``).
     """
     workspace_id = resolve_workspace(request, body.workspace_id)
+    if await _bola_blocked(request, run_id, workspace_id):
+        raise HTTPException(status_code=404, detail="run not found")
     principal = get_principal(request)
     try:
         run = cast(
@@ -305,7 +381,7 @@ async def get_pending_approvals(
     """
     workspace_id = resolve_workspace(request, workspace_id)
     run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
-    if run is None:
+    if run is None or not authorize_object(request, run.subject_id):
         raise HTTPException(status_code=404, detail="run not found")
     pending = await _container(request).run_app.pending_approvals(
         run_id, workspace_id=workspace_id
@@ -329,8 +405,15 @@ async def list_runs(
     limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(0, ge=0),
 ) -> RunListResponse:
-    """List runs (created_at desc), paginated. Returns a paged envelope (AAEO-8)."""
+    """List runs (created_at desc), paginated. Returns a paged envelope (AAEO-8).
+
+    Object-level (BOLA, WS-bola): a ``subject_scoped`` principal's list is pinned to its
+    OWN subject via :func:`narrow_subject` (a ``tenant_admin`` and every non-subject-scoped
+    / offline caller keep the caller-supplied filter), so a subject-scoped tenant can never
+    enumerate another data subject's runs within a shared workspace.
+    """
     workspace_id = resolve_workspace(request, workspace_id)
+    subject_id = narrow_subject(request, subject_id)
     run_app = _container(request).run_app
     items = await run_app.list_runs(
         workspace_id=workspace_id,
@@ -362,10 +445,18 @@ async def get_run(
     request: Request,
     workspace_id: str | None = None,
 ) -> RunRecord:
-    """Read one run record by id (404 when unknown/out-of-workspace, AAEO-4)."""
+    """Read one run record by id (404 when unknown/out-of-workspace, AAEO-4).
+
+    Object-level (BOLA, WS-bola) narrowing rides on top of the workspace scope: a
+    ``subject_scoped`` principal that resolves a run belonging to ANOTHER data subject
+    within its own tenant gets a clean 404 (not-found, never a 403 that would confirm the
+    run exists). Non-subject-scoped / ``all_tenants`` / offline callers are unaffected —
+    :func:`authorize_object` is a no-op for them, so a shared multi-user workspace and the
+    zero-config path keep reading every run byte-for-byte.
+    """
     workspace_id = resolve_workspace(request, workspace_id)
     run = await _container(request).run_app.get_run(run_id, workspace_id=workspace_id)
-    if run is None:
+    if run is None or not authorize_object(request, run.subject_id):
         raise HTTPException(status_code=404, detail="run not found")
     return cast(RunRecord, run)
 
@@ -376,8 +467,15 @@ async def get_run_events(
     request: Request,
     workspace_id: str | None = None,
 ) -> list[Any]:
-    """Replay the canonical event stream for one run (tenant-scoped, AAEO-4)."""
+    """Replay the canonical event stream for one run (tenant-scoped, AAEO-4).
+
+    BOLA (WS-bola): a ``subject_scoped`` principal reading another data subject's run gets
+    a clean 404 (:func:`_bola_blocked`). For every other caller that guard short-circuits
+    without touching the legacy path — a foreign workspace still returns ``[]`` (AAEO-4).
+    """
     workspace_id = resolve_workspace(request, workspace_id)
+    if await _bola_blocked(request, run_id, workspace_id):
+        raise HTTPException(status_code=404, detail="run not found")
     return cast(
         list[Any],
         await _container(request).run_app.get_run_events(
@@ -392,8 +490,14 @@ async def get_run_thread(
     request: Request,
     workspace_id: str | None = None,
 ) -> Any:
-    """Replay the full conversation thread for one run (404 when absent, AAEO-4)."""
+    """Replay the full conversation thread for one run (404 when absent, AAEO-4).
+
+    BOLA (WS-bola): a ``subject_scoped`` principal cannot replay another data subject's
+    thread (clean 404 via :func:`_bola_blocked`); other callers take the legacy path.
+    """
     workspace_id = resolve_workspace(request, workspace_id)
+    if await _bola_blocked(request, run_id, workspace_id):
+        raise HTTPException(status_code=404, detail="thread not found")
     thread = await _container(request).run_app.get_run_thread(
         run_id, workspace_id=workspace_id
     )
@@ -418,9 +522,17 @@ async def get_run_lineage(
 
     Returns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.
     404 when the run is unknown / out-of-workspace or has no projected lineage.
+
+    BOLA (WS-bola): lineage exposes a run's persona, prompt text, and context/evidence
+    snapshot, so it is a read sibling of ``/events`` and ``/thread`` and is gated the same
+    way — a ``subject_scoped`` principal cannot read another data subject's run lineage
+    within a shared tenant (clean 404 via :func:`_bola_blocked`). Other callers take the
+    legacy path byte-unchanged.
     """
     rel = [r.strip() for r in relations.split(",") if r.strip()] if relations else None
     workspace_id = resolve_workspace(request, workspace_id)
+    if await _bola_blocked(request, run_id, workspace_id):
+        raise HTTPException(status_code=404, detail="run lineage not found")
     graph = await _container(request).run_app.get_run_lineage(
         run_id, workspace_id=workspace_id, max_depth=max_depth, relations=rel
     )

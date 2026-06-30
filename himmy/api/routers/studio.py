@@ -5,11 +5,23 @@ Studio is the no-code front door to himmy: chat with an agent, build/edit an
 router is intentionally GUI-shaped (not the tenant-scoped ``/v1`` surface): it is
 meant to be served on loopback by ``himmy studio`` for a single local user.
 
-When an authenticator IS configured (API keys / OIDC), every Studio route
-additionally requires the ``studio:use`` permission — Studio holds credentials
-(SMTP/Telegram), approvals, and run triggers, so a tenant-scoped key without that
-grant must not reach it once the app is proxied beyond loopback. The zero-config
-(no-auth) loopback default is unchanged.
+When an authenticator IS configured (API keys / OIDC), every Studio route requires a
+PER-SURFACE permission (the coarse ``studio:use`` is gone): the main router carries a
+``studio.console:read`` baseline ("may open Studio"), and each read route on this main
+router ADDITIONALLY declares its own per-surface ``studio.<surface>:read`` (a higher-value
+read — connections/google/approvals/models — therefore needs both the console baseline AND
+that surface's read grant, NOT just the baseline), while each mutating route declares its
+``studio.<surface>:write`` / ``studio.mcp:manage`` grant — so a least-privilege role that
+holds only the console baseline cannot read a surface it was not granted, and only ``admin``
+mutates. (red-team r6: before, these reads collapsed to the coarse console baseline, so any
+console-read role reached connections/google/approvals/models — fixed by the per-route read
+guards above + withholding the operator connections/google surfaces from default browse
+roles in :data:`himmy.api.auth.rbac._STUDIO_GLOBAL_STORE_RESOURCES`.)
+Studio holds credentials (SMTP/Telegram), approvals, and run triggers, so a
+tenant-scoped key without those grants must not reach the write surface once the app
+is proxied beyond loopback. The zero-config (no-auth) loopback default is unchanged.
+A tenant-bound principal additionally sees only its own workspace's runs (the global
+run readers are tenant-filtered via :func:`himmy.api.auth.context.studio_tenant_filter`).
 
 Endpoints:
   * ``GET  /api/studio/doctor``  — environment diagnostics as JSON.
@@ -34,7 +46,21 @@ from himmy.api import (
     studio_feedback,
     studio_service,
 )
-from himmy.api.auth import get_principal, require_permission
+from himmy.api.auth import (
+    authorize_object,
+    authorize_studio_object,
+    enforce_subject_write,
+    get_principal,
+    narrow_subject,
+    resolve_workspace,
+    scoped_read,
+    singleton_read_filter,
+    singleton_write_workspace,
+    studio_subject_filter,
+    studio_tenant_filter,
+    subject_write,
+)
+from himmy.api.routers.studio_common import studio_permission
 from himmy.api.studio_approvals import ApprovalDetail, ApprovalSummary
 from himmy.api.studio_connections import (
     ConnectionStatus,
@@ -50,72 +76,149 @@ from himmy.api.studio_runs import (
     get_run_store,
 )
 
-
-async def _studio_permission(request: Request) -> None:
-    """Require ``studio:use`` on every Studio route once auth is configured.
-
-    No authenticator configured ⇒ no-op (the zero-config loopback default is
-    unchanged). With auth on, the principal must hold a role granting
-    ``studio:use`` (``admin`` — including the shared ``HIMMY_INTERNAL_API_KEY``
-    boundary — qualifies via its ``*:*`` wildcard; grant it to other roles via
-    ``HIMMY_RBAC_FILE``). Escape hatch: ``HIMMY_STUDIO_AUTH=off`` skips this
-    check — DANGEROUS, as it re-opens connections/approvals/run triggers to any
-    authenticated principal; only for a trusted single-user deployment.
-    """
-    import os
-
-    if os.environ.get("HIMMY_STUDIO_AUTH", "on").lower() in ("off", "0", "false", "no"):
-        return
-    await require_permission("studio", "use")(request)
+# Granular Studio RBAC resources (mirroring the ``/v1`` per-surface pattern). The main
+# router carries a low-privilege ``studio.console:read`` BASELINE — "may open Studio at
+# all" — so a read-only role can browse the console; each MUTATING route below declares
+# its stronger ``:write`` / ``:manage`` permission additively (FastAPI runs router- and
+# route-level dependencies together, so a mutator requires the baseline read AND the
+# write/manage grant, both of which ``admin`` holds via ``*:*``). The granular surfaces:
+_RES_CONSOLE = "studio.console"  # baseline: open Studio + read diagnostics/health
+_RES_RUNS = "studio.runs"  # run history, analytics, feedback, lineage
+_RES_CONNECTIONS = "studio.connections"  # email/telegram/web connection secrets
+_RES_GOOGLE = "studio.google"  # Gmail/Calendar OAuth credentials + send
+_RES_APPROVALS = "studio.approvals"  # HITL checkpoint approve/reject
+_RES_MODELS = "studio.models"  # provider API keys, Ollama pulls, model compare
+# red-team reattack-r6: the BENIGN model catalog (the tenant-facing picker) is split off
+# ``studio.models`` so it stays tenant-grantable while ``studio.models`` (the operator
+# provider-credential posture surface) is withheld to admin-only.
+_RES_MODEL_CATALOG = "studio.modelcatalog"  # read-only model picker (no key posture)
+_RES_AGENTS = "studio.agents"  # agent.yaml edit/validate + project-root spec discovery
+_RES_TEAMS = "studio.teams"  # team.yaml project-root spec discovery
+_RES_TASKS = "studio.tasks"  # task board CRUD
+_RES_CHATS = "studio.chats"  # chat session CRUD
+_RES_COOKBOOK = "studio.cookbook"  # saved recipes CRUD
+_RES_NOTES = "studio.notes"  # notes CRUD
+_RES_CALENDAR = "studio.calendar"  # local calendar CRUD
+_RES_MEMORY = "studio.memory"  # subject memory CRUD/recall
+_RES_KNOWLEDGE = "studio.knowledge"  # KB create/ingest/search/delete
+_RES_EVALS = "studio.evals"  # eval suite runs
+_RES_WORKFLOWS = "studio.workflows"  # workflow runs
 
 
 router = APIRouter(
     prefix="/api/studio",
     tags=["studio"],
-    dependencies=[Depends(_studio_permission)],
+    dependencies=[Depends(studio_permission(_RES_CONSOLE, "read"))],
 )
 
 
 @router.get("/health")
-async def health() -> dict[str, Any]:
-    """Fast readiness probe: version, writable secrets, and provider availability."""
+async def health(request: Request) -> dict[str, Any]:
+    """Fast readiness probe: status + version, plus operator deployment posture for admins.
+
+    red-team reattack-r6: the ``secrets_writable`` flag and the ``providers`` presence map
+    (which LLM binaries — claude/ollama — are installed) are OPERATOR deployment posture,
+    the same reconnaissance class withheld from tenant browse roles for ``/doctor`` and the
+    provider credential-status surface. The bare readiness fields (``status``/``version``)
+    stay readable by every browse role (and load balancers) under the ``studio.console:read``
+    baseline; the posture fields are included ONLY when the caller also passes
+    ``studio.console:write`` (admin-only), so a tenant browse role gets a clean probe without
+    the operator topology. OFFLINE is unaffected — :func:`_caller_holds_console_write`
+    returns True when no authenticator is configured, so the single-box console sees the full
+    payload byte-unchanged.
+    """
     import shutil
 
     from himmy import __version__
-    from himmy.config.secrets import get_writable_provider
 
-    return {
-        "status": "ok",
-        "version": __version__,
-        "secrets_writable": get_writable_provider() is not None,
-        "providers": {
+    payload: dict[str, Any] = {"status": "ok", "version": __version__}
+    if _caller_holds_console_write(request):
+        from himmy.config.secrets import get_writable_provider
+
+        payload["secrets_writable"] = get_writable_provider() is not None
+        payload["providers"] = {
             "claude_cli": shutil.which("claude") is not None,
             "ollama": shutil.which("ollama") is not None,
-        },
-    }
+        }
+    return payload
 
 
-@router.get("/doctor")
+def _caller_holds_console_write(request: Request) -> bool:
+    """Whether the request may see operator deployment posture (``studio.console:write``).
+
+    Mirrors the offline bypass + escape-hatch of :func:`studio_permission`/
+    :func:`require_permission` so the posture-field gate can never diverge from the route
+    guards: returns True when no authenticator is configured (offline-first — the zero-config
+    console is byte-unchanged), when the ``HIMMY_STUDIO_AUTH`` kill-switch is off, and
+    otherwise iff the principal's roles grant ``studio.console:write`` (admin holds it via
+    ``*:*``). Best-effort: any error fails CLOSED (posture withheld).
+    """
+    from himmy.api.routers.studio_common import _studio_auth_off
+
+    if _studio_auth_off():
+        return True
+    if getattr(request.app.state, "authenticator", None) is None:
+        return True  # offline-first → no RBAC → full posture (byte-unchanged)
+    try:
+        from himmy.api.auth.rbac import DEFAULT_POLICY
+
+        policy = getattr(request.app.state, "access_policy", None) or DEFAULT_POLICY
+        return policy.authorize(get_principal(request), "studio.console", "write")
+    except Exception:  # noqa: BLE001 - posture is non-essential; fail closed
+        return False
+
+
+@router.get(
+    "/doctor",
+    dependencies=[Depends(studio_permission(_RES_CONSOLE, "write"))],
+)
 async def doctor() -> dict[str, Any]:
     """Environment diagnostics: extras, providers, keys, and the next step.
 
     The JSON twin of ``himmy doctor`` — same
     :func:`himmy.runtime.diagnostics.collect_doctor_report` snapshot the CLI prints.
+
+    red-team r6: this leaks DEPLOYMENT TOPOLOGY (installed extras, which provider keys are
+    configured, the storage backend + a password-masked DSN host) — an OPERATOR concern,
+    not a tenant one. Inheriting only the ``studio.console:read`` baseline made it reachable
+    by every tenant-facing browse role; it now additionally requires ``studio.console:write``
+    (admin-only, like the ``benchmarks/probe`` operator action), so a tenant browse role is
+    403'd. OFFLINE is unaffected (``studio_permission`` no-ops without an authenticator).
     """
     from himmy.runtime.diagnostics import collect_doctor_report
 
     return collect_doctor_report().to_dict()
 
 
-@router.get("/benchmarks")
+@router.get(
+    "/benchmarks",
+    dependencies=[Depends(studio_permission(_RES_CONSOLE, "write"))],
+)
 async def benchmarks() -> dict[str, Any]:
-    """Cached per-model reliability scorecards (from `himmy bench` / the probe)."""
+    """Cached per-model reliability scorecards (from `himmy bench` / the probe).
+
+    red-team reattack-r7: this returns the raw cached scorecards
+    (``studio_bench.list_cached()``) — finer-grained operator-topology reliability detail
+    (``model_id``, ``suite``, run timestamp, accuracy CIs, tool-call accuracy, p50/p95
+    latency, error rate, trial counts) about the deployment's LOCAL models. Its
+    operator-topology siblings on this router (``GET /doctor`` and ``POST
+    /benchmarks/probe``) were raised to ``studio.console:write`` (admin-only) in r6 to keep
+    deployment reconnaissance away from tenant browse roles, but this read was left at the
+    ``studio.console:read`` baseline. Raised to ``studio.console:write`` for consistency so
+    a tenant browse role is 403'd here too. (The BENIGN per-model accuracy/latency summary
+    a tenant model picker needs stays tenant-readable via ``GET /api/studio/models`` ->
+    ``build_model_catalog``, gated by the separate ``studio.modelcatalog:read``.) OFFLINE is
+    unaffected (``studio_permission`` no-ops without an authenticator).
+    """
     from himmy.api import studio_bench
 
     return {"entries": studio_bench.list_cached()}
 
 
-@router.post("/benchmarks/probe")
+@router.post(
+    "/benchmarks/probe",
+    dependencies=[Depends(studio_permission(_RES_CONSOLE, "write"))],
+)
 async def benchmarks_probe() -> dict[str, Any]:
     """Run a quick tool-focused reliability check against detected local models.
 
@@ -127,15 +230,46 @@ async def benchmarks_probe() -> dict[str, Any]:
     return await studio_bench.run_probe()
 
 
-@router.get("/agents", response_model=list[studio_service.AgentSummary])
+@router.get(
+    "/agents",
+    response_model=list[studio_service.AgentSummary],
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "read"))],
+)
 async def list_agents() -> list[studio_service.AgentSummary]:
-    """Discover single-agent specs under the project root."""
+    """Discover single-agent specs under the project root.
+
+    red-team reattack-r10: this list globs the single operator ``project_root()`` and
+    returns each spec's project-relative server filesystem ``path`` (infrastructure recon),
+    ``name``, ``provider``/``model`` and tool/skill presence — operator-local filesystem
+    inventory with NO per-tenant axis to intersect on, the SAME class withheld for
+    ``studio.eval``/``studio.evals``/``studio.workflows``/``studio.routines`` in r7/r8.
+    Previously it carried only the coarse ``studio.console:read`` baseline (held by every
+    browse role), so a tenant-facing viewer/operator/auditor could read the operator's
+    agent inventory. It now requires the per-surface ``studio.agents:read``, which is
+    withheld from the default browse roles (see :data:`himmy.api.auth.rbac._STUDIO_GLOBAL_STORE_RESOURCES`)
+    and remains admin-only. OFFLINE is unaffected (``studio_permission`` no-ops without an
+    authenticator).
+    """
     return studio_service.list_agents()
 
 
-@router.get("/teams", response_model=list[studio_service.TeamSummary])
+@router.get(
+    "/teams",
+    response_model=list[studio_service.TeamSummary],
+    dependencies=[Depends(studio_permission(_RES_TEAMS, "read"))],
+)
 async def list_teams() -> list[studio_service.TeamSummary]:
-    """Discover multi-agent team specs (manager + workers) under the project root."""
+    """Discover multi-agent team specs (manager + workers) under the project root.
+
+    red-team reattack-r10: like :func:`list_agents`, this globs the single operator
+    ``project_root()`` and returns each team's project-relative filesystem ``path``,
+    ``name``, ``entry`` and the member graph (providers/models/delegates/handoffs =
+    orchestration topology) — operator-local inventory with NO tenant axis, the same class
+    closed for the sibling discovery surfaces in r7/r8. It now requires the per-surface
+    ``studio.teams:read`` (withheld from browse roles, admin-only) instead of collapsing to
+    ``studio.console:read``. OFFLINE is unaffected (``studio_permission`` no-ops without an
+    authenticator).
+    """
     return studio_service.list_teams()
 
 
@@ -174,7 +308,106 @@ def _canonical_storage(request: Request) -> Any | None:
     return getattr(container, "storage", None) if container is not None else None
 
 
-@router.post("/run")
+def _run_owner(request: Request) -> tuple[str | None, str | None]:
+    """The (workspace_id, subject_id) a Studio run should be STAMPED with (scope-r6).
+
+    Mirrors :func:`himmy.api.routers.studio_missions.start_mission`: an interactive Studio
+    chat / deep-research run is attributed to the LAUNCHING tenant + data subject derived
+    from the verified principal — never the global ``__local__`` bucket
+    :func:`studio_run_to_record` would otherwise default to. Without this, a real
+    subject-scoped user's interactive run was stamped ``subject='__local__'`` and pooled
+    into the cross-subject ``__local__`` slice every other subject-scoped reader of the
+    tenant can see (an alternate-surface BOLA the ``/v1`` narrow-subject path forbids).
+
+    Both are ``None`` for an unrestricted offline / ``all_tenants`` caller — leaving the run
+    unowned (``__local__``), so the zero-config single-box path is byte-unchanged.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return None, None
+    return resolve_workspace(request, None), principal.subject
+
+
+def _run_subject_scope(request: Request) -> str | None:
+    """The data subject the run's TOOL STORES (memory/KB/tasks/notes) must namespace by.
+
+    The within-tenant USER axis for the tool-layer stores (P1 tenancy, subject axis). It is
+    the principal's subject ONLY for an opt-in ``subject_scoped`` principal that is NOT a
+    ``tenant_admin`` — i.e. a genuine per-user identity inside a shared tenant, where the
+    memory/KB/tasks/notes packs would otherwise pool every user of the tenant onto one
+    namespace (a cross-USER confused-deputy). For every other principal (offline /
+    ``all_tenants`` / the historical multi-user-workspace tenant / a ``tenant_admin``) it
+    returns ``None`` so the tool-store scope stays tenant-only — byte-for-byte unchanged.
+    Mirrors :func:`himmy.api.auth.context.studio_subject_filter` (the read-axis companion).
+    """
+    principal = get_principal(request)
+    if principal.all_tenants or not principal.subject_scoped:
+        return None
+    from himmy.api.auth.principal import TENANT_ADMIN_ROLE
+
+    if TENANT_ADMIN_ROLE in principal.roles:
+        return None
+    return principal.subject
+
+
+#: The subject-axis-aware singleton-store scope helpers (centralized in
+#: :mod:`himmy.api.auth.context`) so the tasks/notes/calendar/cookbook/chats routes here and the
+#: projects routes in :mod:`studio_projects` derive ONE owner token from the verified principal.
+_singleton_write_workspace = singleton_write_workspace
+_singleton_read_filter = singleton_read_filter
+
+
+async def _authorize_run(request: Request, run_id: str) -> bool:
+    """May this request's principal read run ``run_id`` (BOLA gate for by-id readers)?
+
+    The by-id companion the sibling run readers (``analytics``/``feedback``/``lineage``)
+    were missing: ``get_studio_run_unified`` already 404s a cross-tenant fetch, but the
+    feedback and lineage readers hit the studio.db presentation cache directly with no
+    tenant check, so a tenant-bound principal could pull another tenant's run
+    feedback/lineage by id whenever a cache row existed. This resolves the run's
+    **canonical** ``workspace_id`` (the authoritative tenant stamp — the presentation
+    cache carries none) and applies :func:`authorize_studio_object`.
+
+    Returns True — i.e. allow — for an unrestricted principal (offline / ``all_tenants``,
+    where the tenant stamp is irrelevant) and when no canonical storage is attached (the
+    bare/single-box test app). So the zero-config path is a NO-OP and byte-unchanged.
+
+    For a TENANT-BOUND or ``subject_scoped`` principal, enforcement engages on BOTH axes: a
+    run whose canonical record is absent (cache-only — erased/crypto-shredded or aged out
+    while the process-wide studio.db presentation cache row lingers) is REFUSED (returns False
+    → 404), because the cache carries no ``workspace_id``/``subject_id`` to attribute it and
+    serving it would leak another tenant's/subject's feedback/lineage by id (an IDOR/BOLA).
+    This mirrors the sibling ``get_studio_run_unified``, which also folds a cache-only row to
+    not-found for a scoped reader. A canonically-known run is allowed only when its
+    ``workspace_id`` passes :func:`authorize_studio_object` (tenant axis) AND its
+    ``subject_id`` passes :func:`authorize_object` (subject/BOLA axis) — closing the
+    alternate-surface BOLA where a subject-scoped caller could read/poison another subject's
+    run feedback through Studio. Callers fold a False verdict into a **404** so existence is
+    never leaked.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return True
+    storage = _canonical_storage(request)
+    if storage is None:
+        return True
+    rec = await storage.get_run(run_id)
+    if rec is None:
+        # Cache-only run (the canonical RunRecord is absent — erased/crypto-shredded or
+        # aged out — while the process-wide studio.db presentation cache row lingers).
+        # A scoped reader cannot be served it: the cache carries NO workspace_id/subject_id
+        # to attribute it, so allowing it would leak another tenant's/subject's
+        # feedback/lineage by id (an IDOR/BOLA). A purely tenant-bound but NOT subject-scoped
+        # principal still refuses (the workspace stamp is missing); a subject-scoped one
+        # refuses on the same grounds. The ``all_tenants`` short-circuit above keeps the
+        # offline/admin path a no-op, so the zero-config surface is byte-unchanged.
+        return False
+    return authorize_studio_object(
+        request, getattr(rec, "workspace_id", None)
+    ) and authorize_object(request, getattr(rec, "subject_id", None))
+
+
+@router.post("/run", dependencies=[Depends(studio_permission(_RES_RUNS, "write"))])
 async def run(body: RunRequest, request: Request) -> StreamingResponse:
     """Run an agent for one user turn, streaming GUI events over SSE.
 
@@ -195,19 +428,33 @@ async def run(body: RunRequest, request: Request) -> StreamingResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     canonical = _canonical_storage(request)
+    # centralize-tool-gate: bind the request principal's tool-capability gate ambiently for
+    # the whole stream so the Studio chat run's tools are enforced (this surface builds its
+    # runtime without an explicit authorizer). ``None`` offline (no authenticator) → inert,
+    # byte-unchanged loopback default.
+    from himmy.services.tools.ambient import use_tool_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    owner_workspace, owner_subject = _run_owner(request)
+    owner_subject_scope = _run_subject_scope(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
-            async for event in studio_service.stream_agent_run(
-                spec,
-                body.prompt,
-                history=[t.model_dump() for t in body.history],
-                provider=body.provider,
-                model=body.model,
-                agent_path=body.agent_path,
-                canonical_storage=canonical,
-            ):
-                yield _sse(event)
+            with use_tool_authorizer(tool_authorizer):
+                async for event in studio_service.stream_agent_run(
+                    spec,
+                    body.prompt,
+                    history=[t.model_dump() for t in body.history],
+                    provider=body.provider,
+                    model=body.model,
+                    agent_path=body.agent_path,
+                    canonical_storage=canonical,
+                    owner_workspace_id=owner_workspace,
+                    owner_subject_id=owner_subject,
+                    owner_subject_scope=owner_subject_scope,
+                ):
+                    yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - surface as a terminal error frame
             yield _sse({"type": "error", "message": str(exc)})
 
@@ -225,7 +472,9 @@ class RunTeamRequest(BaseModel):
     prompt: str = Field(..., max_length=100_000)
 
 
-@router.post("/run-team")
+@router.post(
+    "/run-team", dependencies=[Depends(studio_permission(_RES_RUNS, "write"))]
+)
 async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
     """Run a multi-agent team, streaming the live routing/delegate/tool trail (SSE).
 
@@ -244,17 +493,35 @@ async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
     teams = {t.path: t for t in studio_service.list_teams()}
     team_name = teams[body.team_path].name if body.team_path in teams else "team"
     canonical = _canonical_storage(request)
+    # centralize-tool-gate: bind the request principal's gate ambiently for the team
+    # stream (inert offline). Members dispatch tools through runtimes this surface builds
+    # without an explicit authorizer; the ambient binding makes the chokepoint enforce.
+    from himmy.services.tools.ambient import use_tool_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    # Stamp the team run-record with the request principal's owning workspace so a
+    # tenant-bound reader's Runs browser is scoped (None offline / all_tenants, byte-
+    # unchanged). Mirrors the chat/eval/workflow run paths.
+    owner_workspace, _owner_subject = _run_owner(request)
+    # rbac-harden tenancy: thread the within-tenant USER axis so the members' memory/KB
+    # tool packs namespace by (tenant, subject) exactly like the single-agent path — without
+    # this the team path reverts to the static shared memory/KB store (cross-tenant leak).
+    owner_subject_scope = _run_subject_scope(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
-            async for event in studio_service.stream_team_run(
-                spec,
-                body.prompt,
-                team_name=team_name,
-                team_path=body.team_path,
-                canonical_storage=canonical,
-            ):
-                yield _sse(event)
+            with use_tool_authorizer(tool_authorizer):
+                async for event in studio_service.stream_team_run(
+                    spec,
+                    body.prompt,
+                    team_name=team_name,
+                    team_path=body.team_path,
+                    canonical_storage=canonical,
+                    owner_workspace_id=owner_workspace,
+                    owner_subject_scope=owner_subject_scope,
+                ):
+                    yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
             yield _sse({"type": "error", "message": str(exc)})
 
@@ -289,7 +556,9 @@ class ResearchRequest(BaseModel):
     deep: bool = True  # deep → also allow fetching pages, not just search
 
 
-@router.post("/research")
+@router.post(
+    "/research", dependencies=[Depends(studio_permission(_RES_RUNS, "write"))]
+)
 async def research(body: ResearchRequest, request: Request) -> StreamingResponse:
     """Run a deep-research agent (web search + fetch) for one question over SSE.
 
@@ -312,18 +581,29 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
         model=body.model or "default",
     )
     canonical = _canonical_storage(request)
+    # centralize-tool-gate: bind the request principal's gate ambiently (inert offline).
+    from himmy.services.tools.ambient import use_tool_authorizer
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    owner_workspace, owner_subject = _run_owner(request)
+    owner_subject_scope = _run_subject_scope(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
-            async for event in studio_service.stream_agent_run(
-                spec,
-                body.query,
-                provider=body.provider,
-                model=body.model,
-                agent_path="(deep-research)",
-                canonical_storage=canonical,
-            ):
-                yield _sse(event)
+            with use_tool_authorizer(tool_authorizer):
+                async for event in studio_service.stream_agent_run(
+                    spec,
+                    body.query,
+                    provider=body.provider,
+                    model=body.model,
+                    agent_path="(deep-research)",
+                    canonical_storage=canonical,
+                    owner_workspace_id=owner_workspace,
+                    owner_subject_id=owner_subject,
+                    owner_subject_scope=owner_subject_scope,
+                ):
+                    yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
             yield _sse({"type": "error", "message": str(exc)})
 
@@ -334,7 +614,14 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
     )
 
 
-@router.get("/runs", response_model=StudioRunListResponse)
+@router.get(
+    "/runs",
+    response_model=StudioRunListResponse,
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
+)
 async def list_runs(
     request: Request, limit: int = 50, offset: int = 0
 ) -> StudioRunListResponse:
@@ -344,13 +631,24 @@ async def list_runs(
     the CLI ``--persist`` path appear here too (Studio is the single-user-local browse
     over the unified store). studio.db is a presentation cache that enriches matching
     rows + supplies human feedback.
+
+    red-team r6: requires the per-surface ``studio.runs:read`` rather than collapsing to
+    the coarse ``studio.console:read`` baseline, so a role holding only the console
+    baseline (but not the runs grant) cannot browse run history. The rows are still
+    tenant-filtered (``studio_tenant_filter``) so a tenant-bound principal sees only its
+    own workspace's runs — this guard is the additional surface gate, NOT the tenant
+    boundary. OFFLINE is unaffected (``studio_permission`` no-ops without an authenticator).
     """
     from himmy.api.studio_canonical import list_studio_runs_unified
 
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     items, total = await list_studio_runs_unified(
-        _canonical_storage(request), limit=limit, offset=offset
+        _canonical_storage(request),
+        limit=limit,
+        offset=offset,
+        accessible_workspaces=studio_tenant_filter(request),
+        accessible_subject=studio_subject_filter(request),
     )
     return StudioRunListResponse(
         items=items,
@@ -361,13 +659,39 @@ async def list_runs(
     )
 
 
-@router.get("/runs/analytics", response_model=RunAnalytics)
-async def runs_analytics() -> RunAnalytics:
-    """Aggregate cost/token/latency stats across runs (the analytics dashboard)."""
+@router.get(
+    "/runs/analytics",
+    response_model=RunAnalytics,
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def runs_analytics(request: Request) -> RunAnalytics:
+    """Aggregate cost/token/latency stats across runs (the analytics dashboard).
+
+    The studio.db presentation cache these aggregates are computed over carries NO
+    per-run tenant stamp (only the canonical store does), so a global aggregate would
+    sum another tenant's cost/tokens into a tenant-bound principal's dashboard. For an
+    unrestricted principal (offline / ``all_tenants``) the full aggregate is returned —
+    byte-unchanged single-box behavior — while a tenant-bound principal gets EMPTY
+    analytics rather than a cross-tenant total (the cache cannot be safely attributed to
+    a workspace; per-tenant analytics is a follow-up that requires a tenant-stamped
+    aggregate over the canonical store).
+    """
+    if studio_tenant_filter(request) is not None:
+        return RunAnalytics()
     return get_run_store().analytics()
 
 
-@router.get("/runs/{run_id}", response_model=StudioRun)
+@router.get(
+    "/runs/{run_id}",
+    response_model=StudioRun,
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
+)
 async def get_run(run_id: str, request: Request) -> StudioRun:
     """Fetch one run in full from the canonical store: transcript, tools, timeline.
 
@@ -377,7 +701,12 @@ async def get_run(run_id: str, request: Request) -> StudioRun:
     """
     from himmy.api.studio_canonical import get_studio_run_unified
 
-    run = await get_studio_run_unified(_canonical_storage(request), run_id)
+    run = await get_studio_run_unified(
+        _canonical_storage(request),
+        run_id,
+        accessible_workspaces=studio_tenant_filter(request),
+        accessible_subject=studio_subject_filter(request),
+    )
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run
@@ -390,14 +719,22 @@ class RunFeedbackRequest(BaseModel):
     note: str | None = Field(default=None, max_length=4000)
 
 
-@router.post("/runs/{run_id}/feedback", response_model=RunFeedback)
-async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback:
+@router.post(
+    "/runs/{run_id}/feedback",
+    response_model=RunFeedback,
+    dependencies=[Depends(studio_permission(_RES_RUNS, "write"))],
+)
+async def set_run_feedback(
+    run_id: str, body: RunFeedbackRequest, request: Request
+) -> RunFeedback:
     """Record human feedback on a run (the cheapest, least-noisy learning signal).
 
     Writes the verdict to the run row and appends an immutable, versioned
     ``run_feedback`` record to the entity spine. Re-rating is allowed and produces
     a new spine version (a full audit of every verdict change).
     """
+    if not await _authorize_run(request, run_id):
+        raise HTTPException(status_code=404, detail="run not found")
     try:
         fb = studio_feedback.record_feedback(
             run_id, verdict=body.verdict, note=body.note
@@ -418,10 +755,19 @@ async def set_run_feedback(run_id: str, body: RunFeedbackRequest) -> RunFeedback
     return fb
 
 
-@router.get("/runs/{run_id}/feedback", response_model=RunFeedback | None)
-async def get_run_feedback(run_id: str) -> RunFeedback | None:
+@router.get(
+    "/runs/{run_id}/feedback",
+    response_model=RunFeedback | None,
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def get_run_feedback(run_id: str, request: Request) -> RunFeedback | None:
     """Current feedback on a run (latest verdict), or ``null`` if none yet."""
-    if get_run_store().get(run_id) is None:
+    if get_run_store().get(run_id) is None or not await _authorize_run(
+        request, run_id
+    ):
         raise HTTPException(status_code=404, detail="run not found")
     return studio_feedback.get_feedback(run_id)
 
@@ -433,13 +779,26 @@ class ConnectionSetRequest(BaseModel):
     fields: dict[str, Any]
 
 
-@router.get("/connections", response_model=list[ConnectionStatus])
+@router.get(
+    "/connections",
+    response_model=list[ConnectionStatus],
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "read"))],
+)
 async def connections() -> list[ConnectionStatus]:
-    """List connectable account types + their configured/writable status."""
+    """List connectable account types + their configured/writable status.
+
+    red-team r6: requires the per-surface ``studio.connections:read`` (not just the coarse
+    ``studio.console:read`` baseline), so a tenant browse role that does NOT hold the
+    connections grant cannot read the operator's connection status + masked field hints.
+    """
     return studio_connections.list_connections()
 
 
-@router.get("/connections/{ctype}", response_model=ConnectionStatus)
+@router.get(
+    "/connections/{ctype}",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "read"))],
+)
 async def connection(ctype: str) -> ConnectionStatus:
     status = studio_connections.get_connection(ctype)
     if status is None:
@@ -447,7 +806,11 @@ async def connection(ctype: str) -> ConnectionStatus:
     return status
 
 
-@router.put("/connections/{ctype}", response_model=ConnectionStatus)
+@router.put(
+    "/connections/{ctype}",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def set_connection(ctype: str, body: ConnectionSetRequest) -> ConnectionStatus:
     """Store a connection's fields (secrets → the writable backend; never echoed)."""
     try:
@@ -458,7 +821,11 @@ async def set_connection(ctype: str, body: ConnectionSetRequest) -> ConnectionSt
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.delete("/connections/{ctype}", response_model=ConnectionStatus)
+@router.delete(
+    "/connections/{ctype}",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def delete_connection(ctype: str) -> ConnectionStatus:
     try:
         return studio_connections.delete_connection(ctype)
@@ -468,7 +835,11 @@ async def delete_connection(ctype: str) -> ConnectionStatus:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.put("/connections/{ctype}/enable", response_model=ConnectionStatus)
+@router.put(
+    "/connections/{ctype}/enable",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def enable_connection(ctype: str) -> ConnectionStatus:
     """Enable a connector-managed connection for its surface (outbound tool / inbound mount).
 
@@ -486,7 +857,11 @@ async def enable_connection(ctype: str) -> ConnectionStatus:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.put("/connections/{ctype}/disable", response_model=ConnectionStatus)
+@router.put(
+    "/connections/{ctype}/disable",
+    response_model=ConnectionStatus,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def disable_connection(ctype: str) -> ConnectionStatus:
     """Disable a connector-managed connection (its tool/mount stops being wired)."""
     try:
@@ -499,7 +874,11 @@ async def disable_connection(ctype: str) -> ConnectionStatus:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("/connections/{ctype}/test", response_model=ConnectionTestResult)
+@router.post(
+    "/connections/{ctype}/test",
+    response_model=ConnectionTestResult,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def test_connection(ctype: str) -> ConnectionTestResult:
     """Live-validate a connection (SMTP login / Telegram getMe / search ping)."""
     try:
@@ -512,7 +891,11 @@ class SendRequest(BaseModel):
     payload: dict[str, Any]
 
 
-@router.post("/connections/{ctype}/send", response_model=SendResult)
+@router.post(
+    "/connections/{ctype}/send",
+    response_model=SendResult,
+    dependencies=[Depends(studio_permission(_RES_CONNECTIONS, "write"))],
+)
 async def send_via_connection(ctype: str, body: SendRequest) -> SendResult:
     """Send a user-composed message directly (a Home quick action)."""
     try:
@@ -548,14 +931,26 @@ def _google_redirect_uri(request: Any) -> str:
     return f"{base}/api/studio/google/callback"
 
 
-@router.get("/google")
+@router.get(
+    "/google",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "read"))],
+)
 async def google_status() -> Any:
+    """The operator's Google OAuth connection state (connected account, client status).
+
+    red-team r6: requires the per-surface ``studio.google:read`` rather than collapsing to
+    the ``studio.console:read`` baseline, so a tenant browse role without the Google grant
+    cannot read the operator's connected-account state.
+    """
     from himmy.api import studio_google
 
     return studio_google.status()
 
 
-@router.put("/google/client")
+@router.put(
+    "/google/client",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_set_client(body: GoogleClientRequest) -> Any:
     from himmy.api import studio_google
 
@@ -565,8 +960,18 @@ async def google_set_client(body: GoogleClientRequest) -> Any:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/google/auth-url")
+@router.get(
+    "/google/auth-url",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_auth_url(request: Request) -> dict[str, str]:
+    """Mint a Google OAuth authorization URL (and a pending CSRF ``state``).
+
+    red-team r6: this is a STATE-CHANGING step of the OAuth connect lifecycle (it registers
+    a pending ``state``), so it is gated identically to its PUT/DELETE mutator siblings with
+    ``studio.google:write`` (admin-only) — NOT the read baseline. A read-only browse role can
+    no longer initiate the operator deployment's Google connect flow.
+    """
     from himmy.api import studio_google
 
     try:
@@ -576,13 +981,23 @@ async def google_auth_url(request: Request) -> dict[str, str]:
     return {"url": url}
 
 
-@router.get("/google/callback")
+@router.get(
+    "/google/callback",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_callback(
     request: Request,
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
 ) -> HTMLResponse:
+    """Complete the Google OAuth exchange and PERSIST the operator's tokens.
+
+    red-team r6: exchanging the ``code`` writes ACCESS/REFRESH tokens into the deployment's
+    writable secrets backend — a connection-state mutation. Gated with ``studio.google:write``
+    (admin-only) like the rest of the OAuth lifecycle, so a read-only browse role cannot
+    complete a token exchange via this GET.
+    """
     from himmy.api import studio_google
 
     if error or not code:
@@ -621,7 +1036,9 @@ def _oauth_page(title: str, detail: str) -> str:
     )
 
 
-@router.delete("/google")
+@router.delete(
+    "/google", dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))]
+)
 async def google_disconnect() -> Any:
     from himmy.api import studio_google
 
@@ -631,7 +1048,10 @@ async def google_disconnect() -> Any:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.delete("/google/client")
+@router.delete(
+    "/google/client",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_forget_client() -> Any:
     from himmy.api import studio_google
 
@@ -641,8 +1061,17 @@ async def google_forget_client() -> Any:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/google/gmail")
+@router.get(
+    "/google/gmail",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "read"))],
+)
 async def google_gmail_list(max_results: int = 20) -> Any:
+    """Read the operator's connected Gmail inbox.
+
+    red-team r6: requires the per-surface ``studio.google:read`` rather than the coarse
+    console baseline, so a tenant browse role without the Google grant cannot read the
+    operator's inbox.
+    """
     from himmy.api import studio_google
 
     try:
@@ -653,7 +1082,10 @@ async def google_gmail_list(max_results: int = 20) -> Any:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@router.post("/google/gmail/send")
+@router.post(
+    "/google/gmail/send",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_gmail_send(body: GmailSendRequest) -> Any:
     from himmy.api import studio_google
 
@@ -663,8 +1095,16 @@ async def google_gmail_send(body: GmailSendRequest) -> Any:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/google/calendar")
+@router.get(
+    "/google/calendar",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "read"))],
+)
 async def google_calendar_list(max_results: int = 20) -> Any:
+    """Read the operator's connected Google Calendar.
+
+    red-team r6: requires ``studio.google:read`` rather than the coarse console baseline,
+    so a tenant browse role without the Google grant cannot read the operator's calendar.
+    """
     from himmy.api import studio_google
 
     try:
@@ -675,7 +1115,10 @@ async def google_calendar_list(max_results: int = 20) -> Any:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@router.post("/google/calendar")
+@router.post(
+    "/google/calendar",
+    dependencies=[Depends(studio_permission(_RES_GOOGLE, "write"))],
+)
 async def google_calendar_create(body: CalendarCreateRequest) -> Any:
     from himmy.api import studio_google
 
@@ -692,15 +1135,44 @@ async def google_calendar_create(body: CalendarCreateRequest) -> Any:
 # ---- Approvals (human-in-the-loop inbox) --------------------------------
 
 
-@router.get("/approvals", response_model=list[ApprovalSummary])
-async def approvals() -> list[ApprovalSummary]:
-    """List runs paused awaiting a human decision."""
-    return studio_approvals.list_pending()
+@router.get(
+    "/approvals",
+    response_model=list[ApprovalSummary],
+    dependencies=[
+        Depends(studio_permission(_RES_APPROVALS, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def approvals(request: Request) -> list[ApprovalSummary]:
+    """List runs paused awaiting a human decision, tenant-scoped.
+
+    red-team r6: requires the per-surface ``studio.approvals:read`` rather than collapsing
+    to the coarse ``studio.console:read`` baseline, so the HITL inbox honors its own grant.
+
+    A tenant-bound principal sees only checkpoints owned by its own workspaces (the owning
+    tenant is re-read from the paused run's checkpoint ``ctx``); NO-OP offline / ``all_tenants``.
+    """
+    return studio_approvals.list_pending(
+        workspace_filter=studio_tenant_filter(request),
+        subject_filter=studio_subject_filter(request),
+    )
 
 
-@router.get("/approvals/{checkpoint_id}", response_model=ApprovalDetail)
-async def approval(checkpoint_id: str) -> ApprovalDetail:
-    detail = studio_approvals.get_detail(checkpoint_id)
+@router.get(
+    "/approvals/{checkpoint_id}",
+    response_model=ApprovalDetail,
+    dependencies=[
+        Depends(studio_permission(_RES_APPROVALS, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def approval(request: Request, checkpoint_id: str) -> ApprovalDetail:
+    """A pending approval's detail; a foreign-tenant checkpoint is a uniform 404."""
+    detail = studio_approvals.get_detail(
+        checkpoint_id,
+        workspace_filter=studio_tenant_filter(request),
+        subject_filter=studio_subject_filter(request),
+    )
     if detail is None:
         raise HTTPException(status_code=404, detail="approval not found")
     return detail
@@ -718,35 +1190,113 @@ def _approval_actor(request: Request) -> str:
 
 
 def _resolve_stream(
-    checkpoint_id: str, approved: bool, actor: str
+    checkpoint_id: str, approved: bool, actor: str, tool_authorizer: Any = None
 ) -> StreamingResponse:
+    # centralize-tool-gate: bind the request principal's gate ambiently for the resumed
+    # run so the re-executed (approved) tool — and any further tools in the resumed loop —
+    # are enforced. Inert offline (``tool_authorizer`` None). The resume rebuilds the
+    # runtime via build_runtime_for_spec without an explicit authorizer, so the ambient
+    # binding is what reaches the chokepoint.
+    from himmy.services.tools.ambient import use_tool_authorizer
+
     async def _gen() -> AsyncIterator[str]:
-        async for event in studio_approvals.resolve(
-            checkpoint_id, approved=approved, actor=actor
-        ):
-            yield _sse(event)
+        with use_tool_authorizer(tool_authorizer):
+            async for event in studio_approvals.resolve(
+                checkpoint_id, approved=approved, actor=actor
+            ):
+                yield _sse(event)
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
-@router.post("/approvals/{checkpoint_id}/approve")
+def _guard_approval_scope(request: Request, checkpoint_id: str) -> None:
+    """404 a resolve on a checkpoint owned by another tenant OR another within-tenant USER.
+
+    The write companion to the scoped approvals reads: a tenant-bound principal must not
+    approve/reject (and thereby resume + execute) a run paused under a workspace it cannot
+    access, and — for the subject axis — a ``subject_scoped`` principal must not resolve a
+    checkpoint owned by ANOTHER user of the same tenant (the within-tenant cross-user HITL
+    confused-deputy BOLA). Reuses :func:`studio_approvals.get_detail`'s two-axis scope verdict
+    so the existence of a foreign checkpoint never leaks. NO-OP offline / ``all_tenants`` /
+    ``tenant_admin`` (both filters are ``None``).
+    """
+    tenant_filter = studio_tenant_filter(request)
+    subject_filter = studio_subject_filter(request)
+    if tenant_filter is None and subject_filter is None:
+        return
+    if (
+        studio_approvals.get_detail(
+            checkpoint_id,
+            workspace_filter=tenant_filter,
+            subject_filter=subject_filter,
+        )
+        is None
+    ):
+        raise HTTPException(status_code=404, detail="approval not found")
+
+
+@router.post(
+    "/approvals/{checkpoint_id}/approve",
+    dependencies=[Depends(studio_permission(_RES_APPROVALS, "write"))],
+)
 async def approve(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Approve the pending tool call and stream the resumed run."""
-    return _resolve_stream(checkpoint_id, True, _approval_actor(request))
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    _guard_approval_scope(request, checkpoint_id)
+    return _resolve_stream(
+        checkpoint_id,
+        True,
+        _approval_actor(request),
+        ToolCapabilityAuthorizer.from_request(request),
+    )
 
 
-@router.post("/approvals/{checkpoint_id}/reject")
+@router.post(
+    "/approvals/{checkpoint_id}/reject",
+    dependencies=[Depends(studio_permission(_RES_APPROVALS, "write"))],
+)
 async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Reject the pending tool call and stream the resumed run."""
-    return _resolve_stream(checkpoint_id, False, _approval_actor(request))
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    _guard_approval_scope(request, checkpoint_id)
+    return _resolve_stream(
+        checkpoint_id,
+        False,
+        _approval_actor(request),
+        ToolCapabilityAuthorizer.from_request(request),
+    )
 
 
 # ---- Models (available providers + models) ------------------------------
 
 
-@router.get("/models")
-async def models() -> list[dict[str, Any]]:
+@router.get(
+    "/models",
+    dependencies=[Depends(studio_permission(_RES_MODEL_CATALOG, "read"))],
+)
+async def models(request: Request) -> list[dict[str, Any]]:
     """Available providers + their models, with any cached benchmark stats.
+
+    red-team r6: requires the per-surface ``studio.modelcatalog:read`` rather than
+    collapsing to the coarse ``studio.console:read`` baseline, so the catalog honors its
+    own grant.
+
+    red-team reattack-r6: this BENIGN model picker is gated by ``studio.modelcatalog:read``
+    (a tenant-grantable browse read), split off ``studio.models`` — which now guards ONLY
+    the operator provider-credential posture surface (GET /api/studio/models/providers) and
+    is admin-only. The catalog carries NO provider-key configured/detected_via posture, so a
+    tenant browse role keeps the picker while losing the credential reconnaissance.
+
+    red-team reattack-r9: the catalog's host-derived ``available`` booleans (which LLM
+    binaries are installed/running) and live LOCAL Ollama model inventory are the SAME
+    operator deployment posture r6 withheld from tenant browse roles on ``GET /health``.
+    They are now disclosed ONLY to a caller that also holds ``studio.console:write``
+    (admin) — :func:`_caller_holds_console_write`, the same gate ``/health`` uses. A tenant
+    browse role gets a POSTURE-FREE picker (providers advertised as SUPPORTED, no live
+    inventory); OFFLINE is byte-unchanged (``_caller_holds_console_write`` returns True with
+    no authenticator) so the single-box console keeps the full catalog.
 
     Delegates to the shared :func:`himmy.services.inference.compare.build_model_catalog`
     seam (T3d) — the SAME catalog ``GET /v1/models`` and ``himmy models`` render, so the
@@ -754,7 +1304,11 @@ async def models() -> list[dict[str, Any]]:
     """
     from himmy.services.inference.compare import build_model_catalog
 
-    return cast(list[dict[str, Any]], await build_model_catalog())
+    posture = _caller_holds_console_write(request)
+    return cast(
+        list[dict[str, Any]],
+        await build_model_catalog(reveal_host_posture=posture),
+    )
 
 
 # ---- Compare (one prompt, N models, side-by-side) -----------------------
@@ -790,7 +1344,11 @@ class CompareResult(BaseModel):
     latency_ms: float | None = None
 
 
-@router.post("/compare", response_model=list[CompareResult])
+@router.post(
+    "/compare",
+    response_model=list[CompareResult],
+    dependencies=[Depends(studio_permission(_RES_MODELS, "write"))],
+)
 async def compare(body: CompareRequest) -> list[CompareResult]:
     """Run one prompt across several models concurrently; return outputs + usage.
 
@@ -837,32 +1395,59 @@ class TaskDoneRequest(BaseModel):
     done: bool = True
 
 
-@router.get("/tasks")
-async def tasks_list() -> list[Any]:
+@router.get(
+    "/tasks",
+    dependencies=[
+        Depends(studio_permission(_RES_TASKS, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def tasks_list(request: Request) -> list[Any]:
+    """The task board, tenant-scoped: a bound principal sees only its workspace's tasks.
+
+    NO-OP offline / ``all_tenants`` — ``studio_tenant_filter`` returns ``None`` and the
+    store lists every row exactly as before (the shared ``tasks`` tool pack is unchanged).
+    """
     from himmy.api.studio_tasks import get_tasks_store
 
-    return get_tasks_store().list()
+    return get_tasks_store().list(workspace_id=_singleton_read_filter(request))
 
 
-@router.post("/tasks")
-async def tasks_add(body: TaskAddRequest) -> Any:
+@router.post("/tasks", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))])
+async def tasks_add(request: Request, body: TaskAddRequest) -> Any:
     from himmy.api.studio_tasks import get_tasks_store
 
-    return get_tasks_store().add(body.title, due=body.due)
+    return get_tasks_store().add(
+        body.title, due=body.due, workspace_id=_singleton_write_workspace(request)
+    )
 
 
-@router.patch("/tasks/{task_id}")
-async def tasks_done(task_id: str, body: TaskDoneRequest) -> dict[str, bool]:
+@router.patch(
+    "/tasks/{task_id}", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))]
+)
+async def tasks_done(
+    request: Request, task_id: str, body: TaskDoneRequest
+) -> dict[str, bool]:
     from himmy.api.studio_tasks import get_tasks_store
 
-    return {"ok": get_tasks_store().set_done(task_id, body.done)}
+    return {
+        "ok": get_tasks_store().set_done(
+            task_id, body.done, workspace_id=_singleton_read_filter(request)
+        )
+    }
 
 
-@router.delete("/tasks/{task_id}")
-async def tasks_delete(task_id: str) -> dict[str, bool]:
+@router.delete(
+    "/tasks/{task_id}", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))]
+)
+async def tasks_delete(request: Request, task_id: str) -> dict[str, bool]:
     from himmy.api.studio_tasks import get_tasks_store
 
-    return {"ok": get_tasks_store().delete(task_id)}
+    return {
+        "ok": get_tasks_store().delete(
+            task_id, workspace_id=_singleton_read_filter(request)
+        )
+    }
 
 
 # ---- Chats (saved, resumable conversations) -----------------------------
@@ -886,49 +1471,87 @@ class ChatRenameRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
 
 
-@router.get("/chats")
-async def chats_list() -> Any:
+@router.get(
+    "/chats",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "read")), Depends(scoped_read)],
+)
+async def chats_list(request: Request) -> Any:
     from himmy.api.studio_chats import get_chats_store
 
-    return get_chats_store().list()
+    return get_chats_store().list(workspace_id=_singleton_read_filter(request))
 
 
-@router.get("/chats/{session_id}")
-async def chats_get(session_id: str) -> Any:
+@router.get(
+    "/chats/{session_id}",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "read")), Depends(scoped_read)],
+)
+async def chats_get(session_id: str, request: Request) -> Any:
     from himmy.api.studio_chats import get_chats_store
 
-    detail = get_chats_store().get(session_id)
+    detail = get_chats_store().get(
+        session_id, workspace_id=_singleton_read_filter(request)
+    )
     if detail is None:
         raise HTTPException(status_code=404, detail="unknown chat session")
     return detail
 
 
-@router.post("/chats")
-async def chats_save(body: ChatSaveRequest) -> Any:
+@router.post(
+    "/chats",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
+)
+async def chats_save(body: ChatSaveRequest, request: Request) -> Any:
     from himmy.api.studio_chats import ChatMessage, get_chats_store
 
-    return get_chats_store().save(
+    store = get_chats_store()
+    scope = _singleton_read_filter(request)
+    # A tenant-bound (or per-user subject-scoped) caller re-using a foreign session's id must
+    # not clobber/overwrite its thread+title+messages (the ON CONFLICT upsert in save_thread
+    # only PRESERVES the owner column, not the content) — fold a cross-owner id collision to 404
+    # BEFORE the save, mirroring the notes/cookbook upsert guards. NO-OP offline / ``all_tenants``
+    # (scope None).
+    if body.id and scope is not None and store.get(body.id) is not None:
+        if store.get(body.id, workspace_id=scope) is None:
+            raise HTTPException(status_code=404, detail="unknown chat session")
+    return store.save(
         session_id=body.id,
         title=body.title,
         agent_path=body.agent_path,
         provider=body.provider,
         project_id=body.project_id,
         messages=[ChatMessage(role=m.role, text=m.text) for m in body.messages],
+        workspace_id=_singleton_write_workspace(request),
     )
 
 
-@router.patch("/chats/{session_id}")
-async def chats_rename(session_id: str, body: ChatRenameRequest) -> dict[str, bool]:
+@router.patch(
+    "/chats/{session_id}",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
+)
+async def chats_rename(
+    session_id: str, body: ChatRenameRequest, request: Request
+) -> dict[str, bool]:
     from himmy.api.studio_chats import get_chats_store
 
-    return {"ok": get_chats_store().rename(session_id, body.title)}
+    return {
+        "ok": get_chats_store().rename(
+            session_id, body.title, workspace_id=_singleton_read_filter(request)
+        )
+    }
 
 
-@router.delete("/chats/{session_id}")
-async def chats_delete(session_id: str) -> dict[str, bool]:
+@router.delete(
+    "/chats/{session_id}",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
+)
+async def chats_delete(session_id: str, request: Request) -> dict[str, bool]:
     from himmy.api.studio_chats import get_chats_store
 
-    return {"ok": get_chats_store().delete(session_id)}
+    return {
+        "ok": get_chats_store().delete(
+            session_id, workspace_id=_singleton_read_filter(request)
+        )
+    }
 
 
 # ---- Cookbook (saved agent + prompt recipes) ----------------------------
@@ -942,17 +1565,34 @@ class RecipeUpsertRequest(BaseModel):
     notes: str = Field("", max_length=4000)
 
 
-@router.get("/cookbook")
-async def cookbook_list() -> list[Any]:
+@router.get(
+    "/cookbook",
+    dependencies=[
+        Depends(studio_permission(_RES_COOKBOOK, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def cookbook_list(request: Request) -> list[Any]:
+    """Saved recipes, tenant-scoped (NO-OP offline / ``all_tenants``)."""
     from himmy.api.studio_cookbook import get_cookbook_store
 
-    return get_cookbook_store().list()
+    return get_cookbook_store().list(workspace_id=_singleton_read_filter(request))
 
 
-@router.put("/cookbook")
-async def cookbook_upsert(body: RecipeUpsertRequest) -> Any:
+@router.put(
+    "/cookbook", dependencies=[Depends(studio_permission(_RES_COOKBOOK, "write"))]
+)
+async def cookbook_upsert(request: Request, body: RecipeUpsertRequest) -> Any:
     from himmy.api.studio_cookbook import Recipe, get_cookbook_store
 
+    store = get_cookbook_store()
+    scope = _singleton_read_filter(request)
+    # A tenant-bound (or per-user subject-scoped) caller must not clobber/re-stamp another
+    # owner's recipe by re-using its id (INSERT OR REPLACE) — fold a cross-owner id collision
+    # to 404.
+    if body.id and scope is not None and store.get(body.id) is not None:
+        if store.get(body.id, workspace_id=scope) is None:
+            raise HTTPException(status_code=404, detail="recipe not found")
     r = Recipe(
         name=body.name,
         agent_path=body.agent_path,
@@ -961,14 +1601,21 @@ async def cookbook_upsert(body: RecipeUpsertRequest) -> Any:
     )
     if body.id:
         r.id = body.id
-    return get_cookbook_store().upsert(r)
+    return store.upsert(r, workspace_id=_singleton_write_workspace(request))
 
 
-@router.delete("/cookbook/{recipe_id}")
-async def cookbook_delete(recipe_id: str) -> dict[str, bool]:
+@router.delete(
+    "/cookbook/{recipe_id}",
+    dependencies=[Depends(studio_permission(_RES_COOKBOOK, "write"))],
+)
+async def cookbook_delete(request: Request, recipe_id: str) -> dict[str, bool]:
     from himmy.api.studio_cookbook import get_cookbook_store
 
-    return {"ok": get_cookbook_store().delete(recipe_id)}
+    return {
+        "ok": get_cookbook_store().delete(
+            recipe_id, workspace_id=_singleton_read_filter(request)
+        )
+    }
 
 
 # ---- Notes --------------------------------------------------------------
@@ -980,38 +1627,66 @@ class NoteUpsertRequest(BaseModel):
     body: str = Field("", max_length=200_000)
 
 
-@router.get("/notes")
-async def notes_list() -> list[Any]:
+@router.get(
+    "/notes",
+    dependencies=[
+        Depends(studio_permission(_RES_NOTES, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def notes_list(request: Request) -> list[Any]:
+    """Notes, tenant-scoped to the principal's workspace (NO-OP offline / ``all_tenants``)."""
     from himmy.api.studio_notes import get_notes_store
 
-    return get_notes_store().list()
+    return get_notes_store().list(workspace_id=_singleton_read_filter(request))
 
 
-@router.get("/notes/{note_id}")
-async def notes_get(note_id: str) -> Any:
+@router.get(
+    "/notes/{note_id}",
+    dependencies=[
+        Depends(studio_permission(_RES_NOTES, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def notes_get(request: Request, note_id: str) -> Any:
+    """A note by id; a foreign-tenant note is a uniform 404 (existence never leaks)."""
     from himmy.api.studio_notes import get_notes_store
 
-    note = get_notes_store().get(note_id)
+    note = get_notes_store().get(note_id, workspace_id=_singleton_read_filter(request))
     if note is None:
         raise HTTPException(status_code=404, detail="note not found")
     return note
 
 
-@router.put("/notes")
-async def notes_upsert(body: NoteUpsertRequest) -> Any:
+@router.put("/notes", dependencies=[Depends(studio_permission(_RES_NOTES, "write"))])
+async def notes_upsert(request: Request, body: NoteUpsertRequest) -> Any:
     from himmy.api.studio_notes import Note, get_notes_store
 
+    store = get_notes_store()
+    scope = _singleton_read_filter(request)
+    # A tenant-bound (or per-user subject-scoped) caller re-using a foreign note's id must not
+    # clobber/re-stamp it (INSERT OR REPLACE) — fold a cross-owner id collision to 404
+    # (existence not leaked).
+    if body.id and scope is not None and store.get(body.id) is not None:
+        if store.get(body.id, workspace_id=scope) is None:
+            raise HTTPException(status_code=404, detail="note not found")
     note = Note(title=body.title, body=body.body)
     if body.id:
         note.id = body.id
-    return get_notes_store().upsert(note)
+    return store.upsert(note, workspace_id=_singleton_write_workspace(request))
 
 
-@router.delete("/notes/{note_id}")
-async def notes_delete(note_id: str) -> dict[str, bool]:
+@router.delete(
+    "/notes/{note_id}", dependencies=[Depends(studio_permission(_RES_NOTES, "write"))]
+)
+async def notes_delete(request: Request, note_id: str) -> dict[str, bool]:
     from himmy.api.studio_notes import get_notes_store
 
-    return {"ok": get_notes_store().delete(note_id)}
+    return {
+        "ok": get_notes_store().delete(
+            note_id, workspace_id=_singleton_read_filter(request)
+        )
+    }
 
 
 # ---- Calendar -----------------------------------------------------------
@@ -1024,28 +1699,46 @@ class CalendarAddRequest(BaseModel):
     notes: str = Field("", max_length=4000)
 
 
-@router.get("/calendar")
-async def calendar_list(month: str | None = None) -> list[Any]:
+@router.get(
+    "/calendar",
+    dependencies=[
+        Depends(studio_permission(_RES_CALENDAR, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def calendar_list(request: Request, month: str | None = None) -> list[Any]:
+    """Calendar events, tenant-scoped (NO-OP offline / ``all_tenants``)."""
     from himmy.api.studio_calendar import get_calendar_store
 
-    return get_calendar_store().list(month=month)
+    return get_calendar_store().list(
+        month=month, workspace_id=_singleton_read_filter(request)
+    )
 
 
-@router.post("/calendar")
-async def calendar_add(body: CalendarAddRequest) -> Any:
+@router.post(
+    "/calendar", dependencies=[Depends(studio_permission(_RES_CALENDAR, "write"))]
+)
+async def calendar_add(request: Request, body: CalendarAddRequest) -> Any:
     from himmy.api.studio_calendar import CalendarEvent, get_calendar_store
 
     ev = CalendarEvent(
         date=body.date, title=body.title, time=body.time or None, notes=body.notes
     )
-    return get_calendar_store().add(ev)
+    return get_calendar_store().add(ev, workspace_id=_singleton_write_workspace(request))
 
 
-@router.delete("/calendar/{event_id}")
-async def calendar_delete(event_id: str) -> dict[str, bool]:
+@router.delete(
+    "/calendar/{event_id}",
+    dependencies=[Depends(studio_permission(_RES_CALENDAR, "write"))],
+)
+async def calendar_delete(request: Request, event_id: str) -> dict[str, bool]:
     from himmy.api.studio_calendar import get_calendar_store
 
-    return {"ok": get_calendar_store().delete(event_id)}
+    return {
+        "ok": get_calendar_store().delete(
+            event_id, workspace_id=_singleton_read_filter(request)
+        )
+    }
 
 
 # ---- Memory (long-term recall browser) ----------------------------------
@@ -1065,43 +1758,250 @@ class MemoryRecallRequest(BaseModel):
     similarity_threshold: float | None = Field(None, ge=0.0, le=1.0)
 
 
-@router.get("/memory/subjects", response_model=list[str])
-async def memory_subjects() -> list[str]:
+def _memory_tenant_prefix(request: Request) -> str:
+    """The ``t:<scope_token>:`` namespace prefix the Studio memory surface stamps onto subjects.
+
+    The TENANT(+within-tenant USER) axis fix for the process-wide memory store, which has NO
+    ``workspace_id`` column: two tenants — and, under a ``subject_scoped`` principal, two users
+    of ONE tenant — sharing one process/cwd-keyed ``.himmy/memory.db`` were isolated only if
+    their subject ids happened to differ. Rather than migrate the store, the Studio memory
+    routes namespace the SUBJECT they read/write/recall by the principal's scope token — the
+    SAME token the tool-layer memory pack uses (:meth:`ToolkitConfig.scoped_memory_subject` →
+    ``t:<tenant>[:s:<subject>]:<memory_subject>``), so a tenant-bound (or per-user) Studio
+    console and that same identity's agents share ONE namespace and NO other tenant's/user's.
+
+    rbac-harden(mopup-r3-1): the prefix now folds in the within-tenant SUBJECT axis (``:s:<subject>``)
+    for a ``subject_scoped`` principal, identical to :meth:`ToolkitConfig._scope_token`, so the
+    Studio console and the agent memory pack share one namespace per (tenant, user) — closing the
+    functional-isolation skew where the console wrote ``t:T:A`` while the agent wrote
+    ``t:T:s:A:default``. Returns:
+
+    * ``""`` (empty) for an unrestricted principal (offline / ``all_tenants``) so the subject
+      is used verbatim — the zero-config single-box path is byte-for-byte unchanged;
+    * ``t:<tenant>:`` for a tenant-only (non-subject-scoped) principal — byte-unchanged; and
+    * ``t:<tenant>:s:<subject>:`` for a ``subject_scoped`` principal, so the console and that
+      user's agent runs share one namespace and a cross-user recall is structurally impossible.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return ""
+    workspace = resolve_workspace(request, None)
+    if not workspace:
+        return ""
+    # Reuse the tool-pack's scope-token construction (tenant + optional ``:s:<subject>``) so the
+    # Studio console and the agent memory pack land in ONE namespace per (tenant, user). The
+    # ``tenant_namespace_segment`` escaping inside ``_scope_token`` prevents a ``:``-bearing
+    # id (e.g. ``acme`` vs ``acme:eu``) from string-prefixing another tenant's/user's namespace
+    # — a cross-scope BOLA on the column-less shared store. Pure alphanumeric ids are
+    # byte-unchanged, so the offline / single-tenant path is untouched.
+    from himmy.toolkit.config import ToolkitConfig
+
+    token = ToolkitConfig(
+        tenant_scope=workspace, subject_scope=_run_subject_scope(request)
+    )._scope_token()
+    if not token:
+        return ""
+    return f"t:{token}:"
+
+
+def _scoped_memory_subject(request: Request, requested: str | None) -> str | None:
+    """The data subject a memory read may target, derived from the verified PRINCIPAL.
+
+    The centralized subject-axis (BOLA) gate for the subject-keyed memory surface — the
+    by-construction fix for the cross-subject recall/list leak (a tenant-bound principal
+    holding ``studio.memory:read`` recalling ANOTHER data subject's semantic memories from
+    the shared process store). For a ``subject_scoped`` principal WITHOUT ``tenant_admin``
+    the effective subject is FORCED to its own (a client-supplied ``subject_id`` for another
+    subject is ignored, never honored — mirroring :func:`narrow_subject` on the runs reader).
+    Every other principal — ``all_tenants`` / offline / the historical multi-user-workspace
+    default / a ``tenant_admin`` — keeps ``requested`` as-is, so the zero-config path is
+    byte-unchanged.
+
+    TENANT(+SUBJECT) axis: the value is additionally prefixed by :func:`_memory_tenant_prefix`
+    so a tenant-bound principal's effective subject lives in its OWN
+    ``t:<tenant>[:s:<subject>]:`` namespace on the shared process store — closing the structural
+    tenant (and within-tenant user) gap the ``scoped_read`` marker advertised. ``all_tenants`` /
+    offline returns the narrowed value unprefixed (byte-unchanged).
+
+    rbac-harden(mopup-r3-1): when the prefix already carries the within-tenant SUBJECT axis
+    (``:s:<subject>:``, the per-user ``subject_scoped`` case), the BOLA isolation comes from the
+    prefix itself, so the appended value is the requested MEMORY_SUBJECT verbatim (default
+    ``"default"``) — exactly mirroring the agent pack's ``t:<tenant>:s:<subject>:<memory_subject>``
+    so the Studio console and that user's agent runs share one namespace. For the tenant-only
+    (non-subject-scoped) prefix, ``narrow_subject`` is a no-op and the historical
+    ``t:<tenant>:<subject>`` shape is byte-unchanged.
+    """
+    prefix = _memory_tenant_prefix(request)
+    # When the prefix already encodes the within-tenant user (``:s:<subject>:``), the requested
+    # memory-subject flows through verbatim (the prefix is the isolation); otherwise narrow the
+    # subject to the principal's own (tenant-only / legacy BOLA gate — a no-op off the subject-
+    # scoped path).
+    if _run_subject_scope(request) is not None:
+        narrowed = requested
+    else:
+        narrowed = narrow_subject(request, requested)
+    if not prefix:
+        return narrowed
+    return f"{prefix}{narrowed if narrowed is not None else 'default'}"
+
+
+@router.get(
+    "/memory/subjects",
+    response_model=list[str],
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def memory_subjects(request: Request) -> list[str]:
+    """Distinct subject ids with memories, NARROWED to the principal's own subject.
+
+    A ``subject_scoped`` principal sees ONLY its own subject in the enumeration (the
+    cross-subject enumeration oracle is closed); every other principal sees all. The
+    tenant axis (the process-global store carries no ``workspace_id`` column) remains the
+    documented data-model gap drained separately. NO-OP offline / ``all_tenants``.
+    """
     from himmy.api import studio_memory
 
-    return studio_memory.list_subjects()
-
-
-@router.get("/memory")
-async def memory_list(subject: str = "default") -> list[Any]:
-    from himmy.api import studio_memory
-
-    return studio_memory.list_memories(subject)
-
-
-@router.post("/memory")
-async def memory_add(body: MemoryAddRequest) -> Any:
-    from himmy.api import studio_memory
-
-    return studio_memory.add_memory(
-        body.text, subject_id=body.subject_id, kind=body.kind
+    # TENANT(+SUBJECT) axis: the enumeration is restricted to this principal's
+    # ``t:<tenant>[:s:<subject>]:`` namespace and the prefix stripped, so a tenant-bound (or
+    # per-user) principal never sees another tenant's/user's subject ids. When the prefix
+    # already carries the within-tenant user (``:s:<subject>:``), the prefix IS the isolation
+    # and the stripped remainder is the free-form MEMORY_SUBJECT, so no further ``only_subject``
+    # narrowing applies; otherwise a subject_scoped caller is pinned to its own subject.
+    pinned = None if _run_subject_scope(request) is not None else narrow_subject(request, None)
+    return studio_memory.list_subjects(
+        only_subject=pinned, tenant_prefix=_memory_tenant_prefix(request)
     )
 
 
-@router.delete("/memory/{memory_id}")
-async def memory_forget(memory_id: str) -> dict[str, bool]:
+@router.get(
+    "/memory",
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def memory_list(request: Request, subject: str = "default") -> list[Any]:
+    """A subject's memories — the ``subject`` query param is never honored over the principal.
+
+    For a ``subject_scoped`` caller the effective subject is pinned to its own (a request
+    for another subject is silently narrowed, so it can only ever read its own memories).
+    NO-OP offline / ``all_tenants`` — the caller-supplied ``subject`` is used verbatim.
+    """
     from himmy.api import studio_memory
 
+    items = studio_memory.list_memories(
+        _scoped_memory_subject(request, subject) or "default"
+    )
+    # Present the caller's own subject id back (strip the internal tenant namespace).
+    prefix = _memory_tenant_prefix(request)
+    if prefix:
+        for it in items:
+            if it.subject_id.startswith(prefix):
+                it.subject_id = it.subject_id[len(prefix) :]
+    return items
+
+
+@router.post(
+    "/memory",
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "write")),
+        Depends(subject_write),
+    ],
+)
+async def memory_add(body: MemoryAddRequest, request: Request) -> Any:
+    """Persist a memory — STAMPED under the principal's own subject when subject-scoped.
+
+    The write-path BOLA companion: a ``subject_scoped`` principal may only write under its
+    own subject (``enforce_subject_write`` → 403 on a foreign ``subject_id`` in the body),
+    so it cannot poison another data subject's memory store. NO-OP offline / ``all_tenants``.
+    """
+    from himmy.api import studio_memory
+
+    # TENANT(+SUBJECT) axis: stamp the memory under the principal's OWN
+    # ``t:<tenant>[:s:<subject>]:`` namespace on the shared process store so it is recallable
+    # only within this tenant (and, for a subject_scoped principal, this user) — mirroring the
+    # tool-pack ``scoped_memory_subject`` so the console and the agent share one namespace.
+    # ``all_tenants`` / offline writes the raw subject. When the prefix already carries the
+    # within-tenant user axis (``:s:<subject>:``) the BOLA isolation is structural, so the
+    # body ``subject_id`` is the free-form MEMORY_SUBJECT; otherwise the legacy by-id write
+    # gate pins it to the principal's own subject (a no-op off the subject-scoped path).
+    if _run_subject_scope(request) is None:
+        enforce_subject_write(request, body.subject_id)
+    prefix = _memory_tenant_prefix(request)
+    stored = studio_memory.add_memory(
+        body.text, subject_id=f"{prefix}{body.subject_id}", kind=body.kind
+    )
+    # Present the caller's own subject id back (strip the internal tenant namespace).
+    if prefix and stored.subject_id.startswith(prefix):
+        stored.subject_id = stored.subject_id[len(prefix) :]
+    return stored
+
+
+@router.delete(
+    "/memory/{memory_id}",
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "write")),
+        Depends(subject_write),
+    ],
+)
+async def memory_forget(memory_id: str, request: Request) -> dict[str, bool]:
+    """Forget one memory — a ``subject_scoped`` caller may only forget its OWN subject's.
+
+    The record's owning ``subject_id`` is checked against the principal: a cross-subject
+    delete folds to a uniform 404 (existence never leaked), mirroring the runs by-id
+    reader. NO-OP offline / ``all_tenants``.
+    """
+    from himmy.api import studio_memory
+
+    rec = studio_memory.get_memory(memory_id)
+    if rec is not None:
+        # TENANT axis: a tenant-bound caller may only forget a memory in its OWN
+        # ``t:<workspace>:`` namespace on the shared process store; a record stamped under
+        # another tenant's namespace folds to a uniform 404 (existence never leaked).
+        prefix = _memory_tenant_prefix(request)
+        if prefix and not rec.subject_id.startswith(prefix):
+            raise HTTPException(status_code=404, detail=f"unknown memory {memory_id!r}")
+        # SUBJECT axis: when the prefix already carries the within-tenant user (``:s:<subject>:``)
+        # the prefix-match above IS the BOLA gate, and the stripped remainder is the free-form
+        # MEMORY_SUBJECT (not a data subject), so the by-id subject check is skipped. For the
+        # tenant-only / legacy path, strip the tenant namespace and apply the BOLA subject check.
+        if _run_subject_scope(request) is None:
+            bare_subject = (
+                rec.subject_id[len(prefix) :]
+                if prefix and rec.subject_id.startswith(prefix)
+                else rec.subject_id
+            )
+            if not authorize_object(request, bare_subject):
+                raise HTTPException(
+                    status_code=404, detail=f"unknown memory {memory_id!r}"
+                )
     return {"ok": studio_memory.forget(memory_id)}
 
 
-@router.post("/memory/recall")
-async def memory_recall(body: MemoryRecallRequest) -> list[Any]:
+@router.post(
+    "/memory/recall",
+    dependencies=[
+        Depends(studio_permission(_RES_MEMORY, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def memory_recall(body: MemoryRecallRequest, request: Request) -> list[Any]:
+    """Semantic recall — ``subject_id`` from the body is NEVER honored over the principal.
+
+    This POST performs a READ: a tenant-bound / ``subject_scoped`` principal could
+    otherwise recall another data subject's semantic memories from the shared process
+    store by passing their ``subject_id`` in the body (a cross-subject BOLA the GET-only
+    coverage gate could not see). The subject is now derived from the verified principal
+    via :func:`_scoped_memory_subject` — a ``subject_scoped`` caller is pinned to its own
+    subject, the body value ignored. NO-OP offline / ``all_tenants``.
+    """
     from himmy.api import studio_memory
 
     return await studio_memory.recall(
         body.query,
-        subject_id=body.subject_id,
+        subject_id=_scoped_memory_subject(request, body.subject_id) or "default",
         top_k=body.top_k,
         similarity_threshold=body.similarity_threshold,
     )
@@ -1124,39 +2024,86 @@ class KbSearchRequest(BaseModel):
     top_k: int = Field(5, ge=1, le=50)
 
 
-@router.get("/knowledge")
-async def kb_list() -> list[Any]:
+@router.get(
+    "/knowledge", dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "read"))]
+)
+async def kb_list(request: Request) -> list[Any]:
     from himmy.api import studio_knowledge
 
-    return studio_knowledge.list_kbs()
+    # TENANCY: list only the KBs in the caller's own scope (offline / all_tenants →
+    # the historical ("studio","local") scope, byte-unchanged).
+    workspace_id, _client_id = studio_knowledge.scope_keys(request)
+    return studio_knowledge.list_kbs(workspace_id=workspace_id)
 
 
-@router.post("/knowledge")
-async def kb_create(body: KbCreateRequest) -> Any:
+@router.post(
+    "/knowledge", dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))]
+)
+async def kb_create(body: KbCreateRequest, request: Request) -> Any:
     from himmy.api import studio_knowledge
 
-    return await studio_knowledge.create_kb(body.name)
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
+    return await studio_knowledge.create_kb(
+        body.name, workspace_id=workspace_id, client_id=client_id
+    )
 
 
-@router.post("/knowledge/{kb_id}/ingest")
-async def kb_ingest(kb_id: str, body: KbIngestRequest) -> Any:
+@router.post(
+    "/knowledge/{kb_id}/ingest",
+    dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))],
+)
+async def kb_ingest(kb_id: str, body: KbIngestRequest, request: Request) -> Any:
+    from himmy.api import studio_knowledge
+    from himmy.core.errors import HimmyError
+
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
+    try:
+        return await studio_knowledge.ingest_text(
+            kb_id,
+            body.text,
+            title=body.title,
+            workspace_id=workspace_id,
+            client_id=client_id,
+        )
+    except HimmyError as exc:
+        # A cross-tenant / unknown kb_id folds to 404 (existence never leaks).
+        raise HTTPException(status_code=404, detail="knowledge base not found") from exc
+
+
+@router.post(
+    "/knowledge/{kb_id}/search",
+    dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "read"))],
+)
+async def kb_search(kb_id: str, body: KbSearchRequest, request: Request) -> list[Any]:
+    from himmy.api import studio_knowledge
+    from himmy.core.errors import HimmyError
+
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
+    try:
+        return await studio_knowledge.search(
+            kb_id,
+            body.query,
+            top_k=body.top_k,
+            workspace_id=workspace_id,
+            client_id=client_id,
+        )
+    except HimmyError as exc:
+        raise HTTPException(status_code=404, detail="knowledge base not found") from exc
+
+
+@router.delete(
+    "/knowledge/{kb_id}",
+    dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))],
+)
+async def kb_delete(kb_id: str, request: Request) -> dict[str, bool]:
     from himmy.api import studio_knowledge
 
-    return await studio_knowledge.ingest_text(kb_id, body.text, title=body.title)
-
-
-@router.post("/knowledge/{kb_id}/search")
-async def kb_search(kb_id: str, body: KbSearchRequest) -> list[Any]:
-    from himmy.api import studio_knowledge
-
-    return await studio_knowledge.search(kb_id, body.query, top_k=body.top_k)
-
-
-@router.delete("/knowledge/{kb_id}")
-async def kb_delete(kb_id: str) -> dict[str, bool]:
-    from himmy.api import studio_knowledge
-
-    return {"ok": await studio_knowledge.delete_kb(kb_id)}
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
+    return {
+        "ok": await studio_knowledge.delete_kb(
+            kb_id, workspace_id=workspace_id, client_id=client_id
+        )
+    }
 
 
 # ---- Evaluation (suites → run → scorecard) ------------------------------
@@ -1169,19 +2116,41 @@ class EvalRunRequest(BaseModel):
     model: str | None = None
 
 
-@router.get("/evals")
+@router.get(
+    "/evals", dependencies=[Depends(studio_permission(_RES_EVALS, "read"))]
+)
 async def eval_suites() -> list[Any]:
+    # red-team reattack-r8: this is the un-hardened twin of GET /api/studio/eval/suites
+    # (studio_eval.list_suites). Both call ``studio_eval.discover_suites()`` — which
+    # enumerates the operator's local-filesystem eval-suite names/paths/case-counts — but
+    # this route previously carried no route-level guard, so it inherited only the
+    # router-level ``studio.console:read`` baseline that every tenant browse role holds,
+    # bypassing the r7 lockdown that withheld ``studio.eval`` from those roles. We now gate
+    # it on ``studio.evals:read`` AND move ``studio.evals`` into
+    # :data:`~himmy.api.auth.rbac._STUDIO_GLOBAL_STORE_RESOURCES` (admin-only) so this
+    # operator-local FS reconnaissance surface is withheld from tenant-facing browse roles,
+    # exactly like its r7-locked twin. The OFFLINE path is unaffected (``studio_permission``
+    # /``require_permission`` no-op without an authenticator).
     from himmy.api import studio_eval
 
     return studio_eval.discover_suites()
 
 
-@router.post("/evals/run")
-async def eval_run(body: EvalRunRequest) -> Any:
+@router.post(
+    "/evals/run", dependencies=[Depends(studio_permission(_RES_EVALS, "write"))]
+)
+async def eval_run(body: EvalRunRequest, request: Request) -> Any:
     import asyncio
 
     from himmy.api import studio_eval
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
+    # centralize-tool-gate: thread the request principal's gate so eval-run tools are
+    # enforced (inert offline). Bound ambiently inside ``run_eval``.
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    # rbac-harden tenancy: scope the eval agent's memory/knowledge packs to the launching
+    # tenant (``None`` for offline / all_tenants → unscoped, byte-unchanged).
+    owner_workspace, _owner_subject = _run_owner(request)
     try:
         return await asyncio.wait_for(
             studio_eval.run_eval(
@@ -1189,6 +2158,11 @@ async def eval_run(body: EvalRunRequest) -> Any:
                 body.agent_path,
                 provider=body.provider,
                 model=body.model,
+                tool_authorizer=tool_authorizer,
+                subject=owner_workspace,
+                # rbac-harden: thread the within-tenant USER axis so two subject_scoped
+                # users of one tenant never share the eval agent's memory/KB namespace.
+                subject_scope=_run_subject_scope(request),
             ),
             timeout=900,
         )
@@ -1209,19 +2183,44 @@ class WorkflowRunRequest(BaseModel):
     initial_state: dict[str, Any] = {}
 
 
-@router.get("/workflows")
+@router.get(
+    "/workflows",
+    dependencies=[Depends(studio_permission(_RES_WORKFLOWS, "read"))],
+)
 async def workflows() -> list[Any]:
+    # red-team reattack-r8: ``discover_workflows()`` enumerates the operator's local
+    # workflow specs (project-relative path + name + step/tool graph) — operator
+    # orchestration topology a tenant must not see. This read previously carried no
+    # route-level dependency, so it was gated only by the router-level ``studio.console:read``
+    # baseline every tenant browse role holds (the same forgotten-read-guard pattern as the
+    # ``/evals`` twin above). We gate it on ``studio.workflows:read`` AND move
+    # ``studio.workflows`` into
+    # :data:`~himmy.api.auth.rbac._STUDIO_GLOBAL_STORE_RESOURCES` (admin-only) — the
+    # discovery globs ``project_root()`` with no tenant axis to intersect on, so the fix is
+    # to withhold the resource (mirroring r7's eval/routines lockdown) rather than retrofit a
+    # filter. Write/manage stay ``studio.workflows:write`` = admin. The OFFLINE path is
+    # unaffected (``studio_permission`` no-ops without an authenticator).
     from himmy.api import studio_workflows
 
     return studio_workflows.discover_workflows()
 
 
-@router.post("/workflows/run")
-async def workflow_run(body: WorkflowRunRequest) -> Any:
+@router.post(
+    "/workflows/run",
+    dependencies=[Depends(studio_permission(_RES_WORKFLOWS, "write"))],
+)
+async def workflow_run(body: WorkflowRunRequest, request: Request) -> Any:
     import asyncio
 
     from himmy.api import studio_workflows
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
+    # centralize-tool-gate: thread the request principal's gate so workflow step tools are
+    # enforced (inert offline). Bound ambiently inside ``run_workflow``.
+    tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    # rbac-harden tenancy: scope the workflow agent's memory/knowledge packs to the
+    # launching tenant (``None`` for offline / all_tenants → unscoped, byte-unchanged).
+    owner_workspace, _owner_subject = _run_owner(request)
     try:
         return await asyncio.wait_for(
             studio_workflows.run_workflow(
@@ -1230,6 +2229,11 @@ async def workflow_run(body: WorkflowRunRequest) -> Any:
                 provider=body.provider,
                 model=body.model,
                 initial_state=body.initial_state,
+                tool_authorizer=tool_authorizer,
+                subject=owner_workspace,
+                # rbac-harden: thread the within-tenant USER axis so two subject_scoped
+                # users of one tenant never share the workflow agent's memory/KB namespace.
+                subject_scope=_run_subject_scope(request),
             ),
             timeout=900,
         )
@@ -1242,12 +2246,18 @@ async def workflow_run(body: WorkflowRunRequest) -> Any:
 # ---- Lineage (provenance of a run's answer) -----------------------------
 
 
-@router.get("/runs/{run_id}/lineage")
-async def run_lineage(run_id: str) -> Any:
+@router.get(
+    "/runs/{run_id}/lineage",
+    dependencies=[
+        Depends(studio_permission(_RES_RUNS, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def run_lineage(run_id: str, request: Request) -> Any:
     from himmy.api import studio_lineage
 
     view = studio_lineage.run_lineage(run_id)
-    if view is None:
+    if view is None or not await _authorize_run(request, run_id):
         raise HTTPException(status_code=404, detail="run not found")
     return view
 
@@ -1255,21 +2265,52 @@ async def run_lineage(run_id: str) -> Any:
 # ---- Agent authoring (the no-code builder) ------------------------------
 
 
-@router.get("/tools", response_model=list[studio_agents.PackInfo])
+@router.get(
+    "/tools",
+    response_model=list[studio_agents.PackInfo],
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "read"))],
+)
 async def tool_packs() -> list[studio_agents.PackInfo]:
-    """The built-in tool packs an agent can switch on."""
+    """The built-in tool packs an agent can switch on.
+
+    Part of the agent-authoring surface, so gated with ``studio.agents:read``
+    (admin-only by default) rather than the open ``studio.console:read``
+    baseline — the same r10 bar that locked the agent/team inventory. NO-OP
+    offline / ``all_tenants``.
+    """
     return studio_agents.list_tool_packs()
 
 
-@router.get("/skills", response_model=list[studio_agents.SkillInfo])
+@router.get(
+    "/skills",
+    response_model=list[studio_agents.SkillInfo],
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "read"))],
+)
 async def skills() -> list[studio_agents.SkillInfo]:
-    """Available skills (built-in + project-local)."""
+    """Available skills (built-in + project-local).
+
+    Authoring-surface inventory, gated with ``studio.agents:read`` (admin-only
+    by default) like the tool packs and the agent/team lists. NO-OP offline /
+    ``all_tenants``.
+    """
     return studio_agents.list_skill_infos()
 
 
-@router.get("/agent", response_model=studio_agents.AgentDetail)
+@router.get(
+    "/agent",
+    response_model=studio_agents.AgentDetail,
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "read"))],
+)
 async def get_agent(path: str) -> studio_agents.AgentDetail:
-    """Load one agent's full editable spec (by project-relative path)."""
+    """Load one agent's full editable spec (by project-relative path).
+
+    The detail view discloses strictly more than the (admin-locked) ``/agents``
+    list — the full system-prompt body, provider/model, tool packs, skills and
+    the project-relative spec path — so it carries the same ``studio.agents:read``
+    bar (admin-only by default) the r10 round applied to the inventory list,
+    rather than the open ``studio.console:read`` baseline a tenant browse role
+    holds. NO-OP offline / ``all_tenants``.
+    """
     try:
         return studio_agents.load_agent_detail(path)
     except FileNotFoundError as exc:
@@ -1285,7 +2326,11 @@ async def validate_agent(spec: dict[str, Any]) -> studio_agents.ValidationResult
     return studio_agents.ValidationResult(ok=not errors, errors=errors)
 
 
-@router.put("/agents", response_model=studio_service.AgentSummary)
+@router.put(
+    "/agents",
+    response_model=studio_service.AgentSummary,
+    dependencies=[Depends(studio_permission(_RES_AGENTS, "write"))],
+)
 async def save_agent(
     body: studio_agents.SaveAgentRequest,
 ) -> studio_service.AgentSummary:

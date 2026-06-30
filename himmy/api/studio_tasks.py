@@ -38,6 +38,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "priority" not in have:
         conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
     conn.commit()
+    # workspace_id: the tenant-isolation column (additive + nullable). A NULL value means
+    # "single local tenant / predates tenant binding"; see himmy.api.studio_tenant_scope.
+    from himmy.api.studio_tenant_scope import ensure_workspace_column
+
+    ensure_workspace_column(conn, "tasks")
 
 
 class Task(BaseModel):
@@ -72,25 +77,59 @@ class TasksStore:
             created_at=r["created_at"],
         )
 
-    def list(self) -> list[Task]:
+    def list(self, *, workspace_id: str | frozenset[str] | None = None) -> list[Task]:
+        """Tasks, optionally scoped to ``workspace_id`` (``None`` = ALL, byte-unchanged).
+
+        A tenant-bound caller passes its authorized workspace and sees only its own rows
+        (plus legacy ``NULL`` rows); the offline / ``all_tenants`` path passes ``None`` and
+        the WHERE clause collapses to nothing — identical to the pre-migration query.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id)
+        where = f"WHERE {clause} " if clause else ""
         rows = self._conn.execute(
-            "SELECT * FROM tasks ORDER BY done, created_at DESC"
+            f"SELECT * FROM tasks {where}ORDER BY done, created_at DESC", params
         ).fetchall()
         return [self._row(r) for r in rows]
 
-    def add(self, title: str, *, due: str | None = None, priority: int = 0) -> Task:
+    def add(
+        self,
+        title: str,
+        *,
+        due: str | None = None,
+        priority: int = 0,
+        workspace_id: str | None = None,
+    ) -> Task:
+        """Add a task, stamped with ``workspace_id`` (``None`` for the single local tenant)."""
         t = Task(title=title, due=due, priority=priority)
         self._conn.execute(
-            "INSERT INTO tasks (id, title, done, due, priority, created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (t.id, t.title, int(t.done), t.due, t.priority, t.created_at),
+            "INSERT INTO tasks (id, title, done, due, priority, created_at, workspace_id) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (t.id, t.title, int(t.done), t.due, t.priority, t.created_at, workspace_id),
         )
         self._conn.commit()
         return t
 
-    def set_done(self, task_id: str, done: bool) -> bool:
+    def set_done(
+        self,
+        task_id: str,
+        done: bool,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        """Mark a task done/undone; a ``workspace_id``-scoped caller cannot touch a foreign row.
+
+        Uses the strict WRITE clause (no ``OR IS NULL``) so a bound tenant can mutate only its
+        OWN rows — a legacy NULL-owned row is read-visible but immutable to a bound tenant.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id)
+        extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
-            "UPDATE tasks SET done = ? WHERE id = ?", (int(done), task_id)
+            f"UPDATE tasks SET done = ? WHERE id = ?{extra}",
+            [int(done), task_id, *params],
         )
         self._conn.commit()
         return cur.rowcount > 0
@@ -102,6 +141,7 @@ class TasksStore:
         due: str | None = None,
         priority: int | None = None,
         done: bool | None = None,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> Task | None:
         """Edit a task's due / priority / done in place; returns the updated row or None.
 
@@ -109,6 +149,15 @@ class TasksStore:
         field without clobbering the others. ``due`` cannot be cleared through this method
         (None means "leave as is") — that's deliberate parity with the add() signature.
         """
+        from himmy.api.studio_tenant_scope import scope_clause, scope_clause_write
+
+        # WRITE uses the strict clause (no OR IS NULL): a bound tenant may edit only its OWN
+        # rows, so a legacy NULL row is never clobbered/re-stamped through this path.
+        write_clause, write_params = scope_clause_write(workspace_id)
+        write_extra = f" AND {write_clause}" if write_clause else ""
+        # READ-back uses the visibility clause so the (already-written) row is returned.
+        read_clause, read_params = scope_clause(workspace_id)
+        read_extra = f" AND {read_clause}" if read_clause else ""
         sets: list[str] = []
         vals: list[object] = []
         if due is not None:
@@ -122,26 +171,47 @@ class TasksStore:
             vals.append(int(done))
         if sets:
             vals.append(task_id)
+            vals.extend(write_params)
             cur = self._conn.execute(
-                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?{write_extra}", vals
             )
             self._conn.commit()
             if cur.rowcount == 0:
                 return None
         row = self._conn.execute(
-            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            f"SELECT * FROM tasks WHERE id = ?{read_extra}", [task_id, *read_params]
         ).fetchone()
         return self._row(row) if row is not None else None
 
-    def complete_by_title(self, title: str) -> bool:
+    def complete_by_title(
+        self, title: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id)
+        extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
-            "UPDATE tasks SET done = 1 WHERE title = ? AND done = 0", (title,)
+            f"UPDATE tasks SET done = 1 WHERE title = ? AND done = 0{extra}",
+            [title, *params],
         )
         self._conn.commit()
         return cur.rowcount > 0
 
-    def delete(self, task_id: str) -> bool:
-        cur = self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    def delete(
+        self, task_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        """Delete a task; a ``workspace_id``-scoped caller cannot delete a foreign row.
+
+        Strict WRITE clause (no ``OR IS NULL``): a bound tenant can delete only its OWN rows;
+        a legacy NULL-owned row is read-visible but undeletable by a bound tenant.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id)
+        extra = f" AND {clause}" if clause else ""
+        cur = self._conn.execute(
+            f"DELETE FROM tasks WHERE id = ?{extra}", [task_id, *params]
+        )
         self._conn.commit()
         return cur.rowcount > 0
 

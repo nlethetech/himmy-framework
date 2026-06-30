@@ -24,11 +24,30 @@ class SkillDispatcher:
         skill_registry: Any | None = None,
         toolkit_config: Any | None = None,
         max_turns: int = 6,
+        tool_authorizer: Any = None,
+        tenant_scope: str | None = None,
+        subject_scope: str | None = None,
     ) -> None:
         self._inference = inference
         self._skill_registry = skill_registry
         self._toolkit_config = toolkit_config
         self._max_turns = max_turns
+        #: The PARENT run's memory/KB tenancy axes (P1). The dispatched skill's sub-agent
+        #: tool packs (memory/knowledge/tasks/notes) inherit them so they key off the same
+        #: scope as the parent — not the static shared ``default``/``(local,local)`` store
+        #: (a cross-tenant confused-deputy read/write). ``None``/``None`` (offline /
+        #: non-subject-scoped) is byte-unchanged. Mirrors ``register_spawn_tool``.
+        self._tenant_scope = tenant_scope
+        self._subject_scope = subject_scope
+        #: The PARENT run's tool-capability gate (P0). The dispatched skill's sub-agent
+        #: inherits it VERBATIM (via :meth:`ToolCapabilityAuthorizer.attenuate`) so the
+        #: sub-agent can only invoke tools the parent's principal could — capability
+        #: ATTENUATES down a dispatch chain, never amplifies. ``None`` / a NON-enforcing
+        #: authorizer is a no-op (the offline default), so the sub-runtime's tool dispatch
+        #: is byte-identical to before. Without this, a deliberately-narrowed caller could
+        #: route WITHHELD write tools through a skill's tool-packs (a confused-deputy bypass
+        #: of the per-tool capability gate).
+        self._tool_authorizer = tool_authorizer
 
     def _skills(self) -> Any:
         if self._skill_registry is None:
@@ -53,12 +72,30 @@ class SkillDispatcher:
             from himmy.toolkit import ToolkitConfig, register_packs
 
             registry = ToolRegistry()
+            sub_config = self._toolkit_config or ToolkitConfig.from_env()
+            # Inherit the parent run's tenancy axes so the dispatched skill's memory/KB
+            # packs stay scoped to the parent's tenant/subject, not the static shared store.
+            # The scope only lives in-memory on the per-run config — env never carries it.
+            sub_config.tenant_scope = self._tenant_scope
+            sub_config.subject_scope = self._subject_scope
             register_packs(
                 registry,
                 list(bundle.tool_packs),
-                self._toolkit_config or ToolkitConfig.from_env(),
+                sub_config,
             )
-            overrides["tool_registry"] = registry
+            # Propagate the parent's capability gate so the dispatched sub-agent can only
+            # invoke tools the parent's principal could (attenuate-never-amplify). Build the
+            # sub tool service HERE so the authorizer reaches the sub-runtime's dispatch — a
+            # bare ``tool_registry`` override would otherwise get an un-gated default
+            # ToolService (the confused-deputy hole). Mirrors ``register_spawn_tool``.
+            if self._tool_authorizer is not None:
+                from himmy.services.tools.service import ToolService
+
+                overrides["tool_service"] = ToolService(
+                    registry, tool_authorizer=self._tool_authorizer.attenuate()
+                )
+            else:
+                overrides["tool_registry"] = registry
         runtime, _inf, _tools = build_runtime(**overrides)
 
         sections = list(bundle.instruction_blocks)
@@ -111,12 +148,29 @@ def register_skill_dispatch_tool(
     skill_registry: Any | None = None,
     toolkit_config: Any | None = None,
     requires_approval: bool = False,
+    tool_authorizer: Any = None,
+    tenant_scope: str | None = None,
+    subject_scope: str | None = None,
 ) -> None:
-    """Register ``dispatch_skill`` bound to ``inference`` and the skill catalog."""
+    """Register ``dispatch_skill`` bound to ``inference`` and the skill catalog.
+
+    ``tool_authorizer`` (P0) is the PARENT run's tool-capability gate. The dispatched
+    skill's sub-agent inherits it VERBATIM (:meth:`ToolCapabilityAuthorizer.attenuate`)
+    so the sub-agent's tool reach is always a subset of the parent's — capability can
+    only ATTENUATE down a dispatch chain, never amplify. Without it, a deliberately
+    narrowed caller (e.g. granted ``tool:dispatch_skill:write`` but DENIED
+    ``tool:write_file:write``) could invoke withheld write/side-effecting tools by
+    routing them through a skill's tool-packs, a confused-deputy bypass of the per-tool
+    capability gate. ``None`` / a NON-enforcing authorizer is a no-op (the offline
+    default), so the sub-runtime's tool dispatch is byte-identical to before.
+    """
     dispatcher = SkillDispatcher(
         inference=inference,
         skill_registry=skill_registry,
         toolkit_config=toolkit_config,
+        tool_authorizer=tool_authorizer,
+        tenant_scope=tenant_scope,
+        subject_scope=subject_scope,
     )
 
     async def dispatch_skill(args: dict[str, Any]) -> dict[str, Any]:

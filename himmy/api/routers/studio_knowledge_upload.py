@@ -27,15 +27,21 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.core.errors import HimmyError
 
 router = build_studio_router("kb", tag="studio-knowledge-upload")
+
+#: Uploading a document into a knowledge base mutates retrieval state — a privileged
+#: mutation gated by ``studio.kb:write`` (admin-only by default), additively on top of
+#: the router's ``studio.kb:read`` baseline so a read-only role can browse but not
+#: ingest documents.
+_kb_write = Depends(studio_permission("studio.kb", "write"))
 
 #: Hard cap on the uploaded file body (15 MB).
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
@@ -117,11 +123,29 @@ def _check_kb_id(kb_id: str) -> None:
         )
 
 
-async def _require_kb(svc: Any, kb_id: str) -> None:
+async def _require_kb(
+    svc: Any, kb_id: str, *, workspace_id: str, client_id: str
+) -> None:
+    """404 when ``kb_id`` is unknown OR outside the caller's tenant scope.
+
+    The ``_authorize_kb`` guard verifies the resolved KB belongs to ``(workspace_id,
+    client_id)`` so a tenant cannot reach another tenant's KB by raw id; both unknown and
+    cross-tenant fold to the same 404 (existence never leaks).
+    """
+    from himmy.core.errors import HimmyError
+
     if await svc.get_kb(kb_id) is None:
         raise HTTPException(
             status_code=404, detail=f"knowledge base {kb_id!r} not found"
         )
+    authorize = getattr(svc, "_authorize_kb", None)
+    if authorize is not None:
+        try:
+            await authorize(kb_id, workspace_id, client_id, missing_ok=True)
+        except HimmyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"knowledge base {kb_id!r} not found"
+            ) from exc
 
 
 async def _read_bounded(upload: UploadFile) -> bytes:
@@ -219,7 +243,7 @@ def _validated_file_part(form: Any) -> tuple[UploadFile, str, str]:
     return upload, filename, ext
 
 
-@router.post("/{kb_id}/upload")
+@router.post("/{kb_id}/upload", dependencies=[_kb_write])
 async def kb_upload(kb_id: str, request: Request) -> UploadResult:
     """Upload one file into a KB: validate → extract text → chunk + embed."""
     _check_kb_id(kb_id)
@@ -240,8 +264,11 @@ async def kb_upload(kb_id: str, request: Request) -> UploadResult:
             f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit",
         )
 
+    from himmy.api import studio_knowledge
+
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
     svc = _kb_service()
-    await _require_kb(svc, kb_id)
+    await _require_kb(svc, kb_id, workspace_id=workspace_id, client_id=client_id)
 
     try:
         form = await request.form(max_files=2, max_fields=4)
@@ -311,11 +338,14 @@ async def kb_upload(kb_id: str, request: Request) -> UploadResult:
 
 
 @router.get("/{kb_id}/documents")
-async def kb_documents(kb_id: str) -> list[DocumentInfo]:
+async def kb_documents(kb_id: str, request: Request) -> list[DocumentInfo]:
     """List the documents in a KB (in-memory store; backend KBs return [])."""
+    from himmy.api import studio_knowledge
+
     _check_kb_id(kb_id)
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
     svc = _kb_service()
-    await _require_kb(svc, kb_id)
+    await _require_kb(svc, kb_id, workspace_id=workspace_id, client_id=client_id)
     docs_map = getattr(svc, "_documents", {}).get(kb_id, {})
     chunks_map = getattr(svc, "_chunks", {}).get(kb_id, {})
     counts: dict[str, int] = {}

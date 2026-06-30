@@ -4527,7 +4527,7 @@
     },
     "/v1/audit/privacy": {
       "get": {
-        "description": "Return the posture trend: registered audit reports newest-first (auditor/admin).\n\n``workspace_id`` is resolved against the principal (tenant scoping) so a multi-tenant\nprincipal must name an authorized workspace, like the rest of the BFF; reports are not\nthemselves tenant-keyed, so this enforces access, not filtering.",
+        "description": "Return the posture trend: registered audit reports newest-first (auditor/admin).\n\n``workspace_id`` is resolved against the principal (tenant scoping) and the resolved\nworkspace is pushed into ``trend()`` so a tenant-bound caller sees ONLY its own\nworkspace's reports (plus global/ops reports with no ``workspace_id``) \u2014 never another\ntenant's report, its stamped workspace or the affected ``subject_refs`` (closes the\ncross-tenant IDOR). An all-tenants / offline principal resolves to ``None`` and keeps\nthe full posture trend, byte-for-byte unchanged.",
         "operationId": "list_privacy_audits_v1_audit_privacy_get",
         "parameters": [
           {
@@ -4671,7 +4671,7 @@
     },
     "/v1/audit/privacy/{report_id}": {
       "get": {
-        "description": "Return one registered audit report by id, or 404 (auditor/admin).",
+        "description": "Return one registered audit report by id, or 404 (auditor/admin).\n\nThe lookup is tenant-scoped: ``trend()`` is filtered to the caller's resolved\nworkspace, so a foreign ``report_id`` (another tenant's report) is a clean **404** with\nno existence leak \u2014 never the foreign report's workspace or ``subject_refs``. An\nall-tenants / offline principal resolves to ``None`` and may read any report by id.",
         "operationId": "get_privacy_audit_v1_audit_privacy__report_id__get",
         "parameters": [
           {
@@ -5152,7 +5152,7 @@
     },
     "/v1/context/fields": {
       "get": {
-        "description": "List the stored context fields for a subject (workspace-scoped, AAEO-4).",
+        "description": "List the stored context fields for a subject (workspace-scoped, AAEO-4).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal reading ANOTHER data\nsubject's PII fields within its own tenant gets an empty list (the same not-found-shaped\nresponse a foreign subject yields) \u2014 :func:`authorize_object` is a no-op for offline /\n``all_tenants`` / ``tenant_admin`` callers, so the zero-config read is byte-unchanged.",
         "operationId": "list_fields_v1_context_fields_get",
         "parameters": [
           {
@@ -5215,7 +5215,7 @@
     },
     "/v1/context/fields:upsert": {
       "post": {
-        "description": "Bulk-upsert context fields for a subject; returns the saved count.",
+        "description": "Bulk-upsert context fields for a subject; returns the saved count.\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal may only write under its\nOWN ``subject_id`` (a foreign subject is 403 via :func:`enforce_subject_write`), so a\nsubject-scoped tenant can never overwrite/poison another data subject's PII fields in a\nshared workspace. The gate is a no-op for the offline / ``all_tenants`` / ``tenant_admin``\npath, so the zero-config write is byte-unchanged.",
         "operationId": "upsert_fields_v1_context_fields_upsert_post",
         "requestBody": {
           "content": {
@@ -5257,7 +5257,7 @@
     },
     "/v1/context/snapshots/{snapshot_id}": {
       "get": {
-        "description": "Load one context snapshot by id (404 when unknown/out-of-workspace, AAEO-4).",
+        "description": "Load one context snapshot by id (404 when unknown/out-of-workspace, AAEO-4).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal resolving a snapshot built\nfor ANOTHER data subject within its own tenant gets a clean 404 \u2014 the workspace scope is\nchecked first, then the snapshot's ``subject_id`` is gated via :func:`authorize_object`.\nA no-op for offline / ``all_tenants`` / ``tenant_admin`` callers (byte-unchanged).",
         "operationId": "get_snapshot_v1_context_snapshots__snapshot_id__get",
         "parameters": [
           {
@@ -5326,7 +5326,7 @@
     },
     "/v1/context/snapshots:build": {
       "post": {
-        "description": "Build, persist, and return a context snapshot (stamping workspace scope).",
+        "description": "Build, persist, and return a context snapshot (stamping workspace scope).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal may only build a snapshot\nfor its OWN ``subject_id`` (403 otherwise via :func:`enforce_subject_write`) \u2014 a no-op\nfor offline / ``all_tenants`` / ``tenant_admin`` callers.\n\nTenant isolation (red-team reattack-r1): the resolved ``workspace_id`` is also threaded\ninto field RESOLUTION, so a STORAGE-sourced field stamped with a DIFFERENT workspace is\nnever surfaced in the snapshot \u2014 closing the cross-tenant IDOR where two tenants sharing\na free-form ``subject_id`` could read each other's stored ``context_fields`` (the store\nis keyed globally by ``(subject_id, key)``). ``workspace_id`` of ``None`` (offline /\nall-tenants) keeps resolution byte-for-byte unchanged.",
         "operationId": "build_snapshot_v1_context_snapshots_build_post",
         "requestBody": {
           "content": {
@@ -5368,7 +5368,7 @@
     },
     "/v1/dashboard/summary": {
       "get": {
-        "description": "Return the operator overview: context + run/recommendation/eval counts.",
+        "description": "Return the operator overview: context + run/recommendation/eval counts.\n\nObject-level (BOLA, WS-bola): the summary aggregates a single data subject's\ncontext/run/recommendation counts, so a ``subject_scoped`` principal requesting ANOTHER\ndata subject's aggregate within its own tenant gets a clean 404 (never an\nexistence-confirming response) \u2014 :func:`authorize_object` is a no-op for offline /\n``all_tenants`` / ``tenant_admin`` callers, so the zero-config path is byte-unchanged.",
         "operationId": "dashboard_summary_v1_dashboard_summary_get",
         "parameters": [
           {
@@ -5420,7 +5420,7 @@
     },
     "/v1/diagnostics": {
       "get": {
-        "description": "Global infra/health snapshot (secrets redacted, read-only, not per-tenant).",
+        "description": "Global infra/health snapshot (secrets redacted, read-only, not per-tenant).\n\nHost-posture fields (installed-binary paths, key-presence inventory, DSN host, DB-file\npaths) are disclosed only to an unrestricted (``all_tenants`` / offline) principal; a\ntenant-bound caller gets the posture-free view \u2014 see the module docstring.",
         "operationId": "diagnostics_v1_diagnostics_get",
         "responses": {
           "200": {
@@ -5947,7 +5947,7 @@
     },
     "/v1/models": {
       "get": {
-        "description": "The available local providers + models (with cached bench stats). Secrets-free.",
+        "description": "The available local providers + models (with cached bench stats). Secrets-free.\n\nred-team scope-r5: the catalog's host-derived ``available`` booleans (which LLM binaries\nare installed/running) and the live LOCAL Ollama model inventory are OPERATOR DEPLOYMENT\nPOSTURE \u2014 the SAME reconnaissance class the hardened Studio twin ``GET /api/studio/models``\nwithholds from tenant browse roles. ``model:read`` is held by every tenant browse role, so\na tenant-bound caller now gets the POSTURE-FREE picker (providers advertised as SUPPORTED,\nno live inventory) via ``reveal_host_posture=False``; the offline / ``all_tenants`` / CLI\npath keeps the full host-probed catalog byte-unchanged via\n:func:`~himmy.api.auth.context.reveal_host_posture`.",
         "operationId": "list_models_v1_models_get",
         "responses": {
           "200": {
@@ -6015,7 +6015,7 @@
     },
     "/v1/recommendations": {
       "get": {
-        "description": "List recommendations (created_at desc), paginated into an envelope (AAEO-8).",
+        "description": "List recommendations (created_at desc), paginated into an envelope (AAEO-8).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal's list is pinned to its\nOWN subject via :func:`narrow_subject` (a ``tenant_admin`` and every non-subject-scoped\n/ offline / ``all_tenants`` caller keep the caller-supplied filter), so a subject-scoped\ntenant can never enumerate another data subject's subject-attributed recommendations\nwithin a shared workspace \u2014 mirroring the runs router. No-op for the zero-config path.",
         "operationId": "list_recommendations_v1_recommendations_get",
         "parameters": [
           {
@@ -6152,7 +6152,7 @@
     },
     "/v1/recommendations/{recommendation_id}": {
       "patch": {
-        "description": "Transition a recommendation's status (404 when unknown/out-of-workspace).",
+        "description": "Transition a recommendation's status (404 when unknown/out-of-workspace).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal that targets a\nrecommendation attributed to ANOTHER data subject within its own tenant gets a clean\n404 (never a mutation, never an existence-confirming 403) \u2014 the workspace scope is\nchecked first, then the recommendation's ``subject_id`` is gated via\n:func:`authorize_object`. No-op for offline / ``all_tenants`` / ``tenant_admin``.",
         "operationId": "update_recommendation_v1_recommendations__recommendation_id__patch",
         "parameters": [
           {
@@ -6231,7 +6231,7 @@
     },
     "/v1/recommendations/{recommendation_id}/provenance": {
       "get": {
-        "description": "Trace a recommendation back to its run, persona, prompt, and cited evidence.\n\nReturns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.\n404 when the recommendation is unknown / out-of-workspace or was never graphed.",
+        "description": "Trace a recommendation back to its run, persona, prompt, and cited evidence.\n\nReturns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.\n404 when the recommendation is unknown / out-of-workspace or was never graphed.\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal that requests the\nprovenance subgraph (persona/prompt/cited-evidence) of a recommendation attributed to\nANOTHER data subject within its own tenant gets a clean 404 \u2014 the recommendation's\n``subject_id`` is resolved and gated via :func:`authorize_object` before any lineage is\ntraced. No-op for offline / ``all_tenants`` / ``tenant_admin`` callers.",
         "operationId": "get_recommendation_provenance_v1_recommendations__recommendation_id__provenance_get",
         "parameters": [
           {
@@ -6701,7 +6701,7 @@
     },
     "/v1/runs": {
       "get": {
-        "description": "List runs (created_at desc), paginated. Returns a paged envelope (AAEO-8).",
+        "description": "List runs (created_at desc), paginated. Returns a paged envelope (AAEO-8).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal's list is pinned to its\nOWN subject via :func:`narrow_subject` (a ``tenant_admin`` and every non-subject-scoped\n/ offline caller keep the caller-supplied filter), so a subject-scoped tenant can never\nenumerate another data subject's runs within a shared workspace.",
         "operationId": "list_runs_v1_runs_get",
         "parameters": [
           {
@@ -6846,7 +6846,7 @@
     },
     "/v1/runs/{run_id}": {
       "get": {
-        "description": "Read one run record by id (404 when unknown/out-of-workspace, AAEO-4).",
+        "description": "Read one run record by id (404 when unknown/out-of-workspace, AAEO-4).\n\nObject-level (BOLA, WS-bola) narrowing rides on top of the workspace scope: a\n``subject_scoped`` principal that resolves a run belonging to ANOTHER data subject\nwithin its own tenant gets a clean 404 (not-found, never a 403 that would confirm the\nrun exists). Non-subject-scoped / ``all_tenants`` / offline callers are unaffected \u2014\n:func:`authorize_object` is a no-op for them, so a shared multi-user workspace and the\nzero-config path keep reading every run byte-for-byte.",
         "operationId": "get_run_v1_runs__run_id__get",
         "parameters": [
           {
@@ -6978,7 +6978,7 @@
     },
     "/v1/runs/{run_id}/events": {
       "get": {
-        "description": "Replay the canonical event stream for one run (tenant-scoped, AAEO-4).",
+        "description": "Replay the canonical event stream for one run (tenant-scoped, AAEO-4).\n\nBOLA (WS-bola): a ``subject_scoped`` principal reading another data subject's run gets\na clean 404 (:func:`_bola_blocked`). For every other caller that guard short-circuits\nwithout touching the legacy path \u2014 a foreign workspace still returns ``[]`` (AAEO-4).",
         "operationId": "get_run_events_v1_runs__run_id__events_get",
         "parameters": [
           {
@@ -7039,7 +7039,7 @@
     },
     "/v1/runs/{run_id}/lineage": {
       "get": {
-        "description": "Trace a run's provenance subgraph: the persona, prompt, and evidence snapshot.\n\nReturns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.\n404 when the run is unknown / out-of-workspace or has no projected lineage.",
+        "description": "Trace a run's provenance subgraph: the persona, prompt, and evidence snapshot.\n\nReturns the typed lineage graph as JSON, or Graphviz DOT with ``?format=dot``.\n404 when the run is unknown / out-of-workspace or has no projected lineage.\n\nBOLA (WS-bola): lineage exposes a run's persona, prompt text, and context/evidence\nsnapshot, so it is a read sibling of ``/events`` and ``/thread`` and is gated the same\nway \u2014 a ``subject_scoped`` principal cannot read another data subject's run lineage\nwithin a shared tenant (clean 404 via :func:`_bola_blocked`). Other callers take the\nlegacy path byte-unchanged.",
         "operationId": "get_run_lineage_v1_runs__run_id__lineage_get",
         "parameters": [
           {
@@ -7281,7 +7281,7 @@
     },
     "/v1/runs/{run_id}/thread": {
       "get": {
-        "description": "Replay the full conversation thread for one run (404 when absent, AAEO-4).",
+        "description": "Replay the full conversation thread for one run (404 when absent, AAEO-4).\n\nBOLA (WS-bola): a ``subject_scoped`` principal cannot replay another data subject's\nthread (clean 404 via :func:`_bola_blocked`); other callers take the legacy path.",
         "operationId": "get_run_thread_v1_runs__run_id__thread_get",
         "parameters": [
           {
@@ -7746,7 +7746,7 @@
     },
     "/v1/threads/{thread_id}": {
       "get": {
-        "description": "Replay the flat (user/agent) projection of an owned thread (404 cross-tenant).",
+        "description": "Replay the flat (user/agent) projection of an owned thread (404 cross-tenant).\n\nObject-level (BOLA, WS-bola): a ``subject_scoped`` principal reading a thread that\nbelongs to ANOTHER data subject within its own tenant gets a clean 404 \u2014 the workspace\nownership check runs first, then the thread's stored ``subject_id`` is gated via\n:func:`authorize_object`. Non-subject-scoped / ``all_tenants`` / offline callers are\nunaffected (the gate is a no-op for them).",
         "operationId": "get_thread_v1_threads__thread_id__get",
         "parameters": [
           {

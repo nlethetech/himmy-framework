@@ -47,8 +47,27 @@ def register_spawn_tool(
     *,
     inference: Any,
     requires_approval: bool = False,
+    tool_authorizer: Any = None,
+    tenant_scope: str | None = None,
+    subject_scope: str | None = None,
 ) -> None:
-    """Register ``spawn_agent`` bound to ``inference`` (the parent's backend)."""
+    """Register ``spawn_agent`` bound to ``inference`` (the parent's backend).
+
+    ``tool_authorizer`` (P0) is the PARENT run's tool-capability gate. A spawned
+    sub-agent inherits it VERBATIM (via :meth:`ToolCapabilityAuthorizer.attenuate`,
+    which returns the same frozen authorizer) so the sub-agent's capability set is always
+    a subset of the parent's — capability can only ATTENUATE down a spawn chain, never
+    amplify. ``None`` / a NON-enforcing authorizer is a no-op (the offline default), so
+    the sub-runtime's tool dispatch is byte-identical to before.
+
+    ``tenant_scope`` / ``subject_scope`` are the PARENT run's memory/KB tenancy axes
+    (P1). The spawned sub-agent's tool packs (memory/knowledge/tasks/notes) MUST inherit
+    them, otherwise the sub-agent's ``ToolkitConfig.from_env()`` reverts to the static
+    shared ``default`` subject / ``(local, local)`` KB scope — a cross-tenant
+    confused-deputy read/write on the shared durable store. ``None``/``None`` (offline /
+    non-subject-scoped) leaves the sub-packs on their historical static scope —
+    byte-for-byte unchanged. Mirrors the top-level pack wiring in ``from_spec``.
+    """
 
     async def spawn_agent(args: dict[str, Any]) -> dict[str, Any]:
         from himmy.agents.base_agent.task import Task
@@ -66,8 +85,25 @@ def register_spawn_tool(
             from himmy.toolkit import ToolkitConfig, register_packs
 
             sub_registry = ToolRegistry()
-            register_packs(sub_registry, packs, ToolkitConfig.from_env())
-            sub_overrides["tool_registry"] = sub_registry
+            sub_config = ToolkitConfig.from_env()
+            # Inherit the parent run's tenancy axes so the sub-agent's memory/KB packs key
+            # off the SAME scope as the parent (not the static shared store). The scope only
+            # ever lives in-memory on the per-run config — env never carries it.
+            sub_config.tenant_scope = tenant_scope
+            sub_config.subject_scope = subject_scope
+            register_packs(sub_registry, packs, sub_config)
+            # Propagate the parent's capability gate so the sub-agent can only invoke tools
+            # the parent could (attenuate-never-amplify). Build the sub tool service here so
+            # the authorizer reaches the sub-runtime's dispatch (a bare ``tool_registry``
+            # override would otherwise get an un-gated default ToolService).
+            if tool_authorizer is not None:
+                from himmy.services.tools.service import ToolService
+
+                sub_overrides["tool_service"] = ToolService(
+                    sub_registry, tool_authorizer=tool_authorizer.attenuate()
+                )
+            else:
+                sub_overrides["tool_registry"] = sub_registry
 
         sub_runtime, _inf, _tools = build_runtime(**sub_overrides)
         persona = Persona(

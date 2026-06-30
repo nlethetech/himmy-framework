@@ -38,14 +38,20 @@ from pydantic import BaseModel, Field
 
 from himmy.api import routines as svc
 from himmy.api.auth import (
+    DEFAULT_POLICY,
+    get_principal,
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
+from himmy.api.auth.service_principal import DEFAULT_SERVICE_ROLES
 from himmy.api.models import NOT_FOUND_RESPONSE
 from himmy.api.security_audit import audit_event
 
-router = APIRouter(prefix="/v1/routines", tags=["routines"])
+router = APIRouter(
+    prefix="/v1/routines", tags=["routines"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("routine", "read"))]
 _WRITE = [Depends(require_permission("routine", "write"))]
@@ -165,6 +171,61 @@ async def _require_stored_agent(
         )
 
 
+def _require_no_capability_amplification(request: Request) -> None:
+    """Reject a routine whose FIRE-TIME authority would EXCEED its creator's (confused deputy).
+
+    A scheduled routine fires under :func:`routine_service_principal` whose roles are the
+    FIXED :data:`DEFAULT_SERVICE_ROLES` (``operator`` ⇒ ``tool:*``), regardless of the
+    CREATOR's roles. Under the shipped :data:`DEFAULT_RBAC` the only ``routine:write``
+    holders (operator/admin) already hold ``tool:*``, so the service identity never exceeds
+    its creator. But a CUSTOM ``HIMMY_RBAC_FILE`` can decouple ``routine:write`` from
+    ``tool:*`` (e.g. a least-privilege role granting ``routine:write`` + a single narrow
+    ``tool:<name>:invoke``) — then the routine would run with EVERY tool the creator was
+    never granted (capability AMPLIFICATION, not attenuation).
+
+    Since the routine's tool authority is not yet creator-derived (no creator-roles are
+    persisted on the routine), we close the gap at EVERY arm-and-fire surface — create,
+    update (re-prompt / re-point), and run-now: a principal that does not ALREADY hold the
+    broad tool reach the service identity will run with may not arm or fire a routine (403).
+    The check is computed against the SERVICE identity's actual roles, so it stays correct
+    if ``DEFAULT_SERVICE_ROLES`` is ever retuned.
+
+    Strict NO-OP on the offline path: with no authenticator the principal is the
+    unrestricted operator (``all_tenants``), so the gate short-circuits and the zero-config
+    routine create is byte-unchanged.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return  # offline / unrestricted: RBAC inert, byte-unchanged
+    policy = getattr(request.app.state, "access_policy", None) or DEFAULT_POLICY
+    # Does the creator already hold every (resource, action) grant the FIRE-TIME service
+    # identity holds? If the service identity could invoke a tool the creator cannot, the
+    # routine would amplify the creator's authority — refuse it.
+    service_perms: set[tuple[str, str]] = set()
+    for role in DEFAULT_SERVICE_ROLES:
+        service_perms |= set(policy.role_permissions.get(role, frozenset()))
+    for resource, action in sorted(service_perms):
+        if not policy.authorize(principal, resource, action):
+            audit_event(
+                request,
+                event_type="authz_denied",
+                outcome="deny",
+                resource="routine",
+                action="arm",
+                detail=(
+                    "routine arm/fire denied: caller lacks the "
+                    f"{resource}:{action} authority the routine would run with"
+                ),
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "routine denied: the routine would run with broader "
+                    "authority than you hold (capability amplification)"
+                ),
+            )
+
+
 # ---- CRUD ---------------------------------------------------------------------
 
 
@@ -178,6 +239,7 @@ async def create_routine(
     A re-POST of an existing ``idempotency_key`` returns the prior routine unchanged.
     """
     workspace_id = require_workspace(request, body.workspace_id)
+    _require_no_capability_amplification(request)
     await _require_stored_agent(request, body.agent_id, workspace_id)
     store = svc.get_routines_store()
     if body.idempotency_key is not None:
@@ -267,6 +329,11 @@ async def update_routine(
     given, is re-validated as a whole. ``agent_path`` cannot be set (no field).
     """
     workspace_id = require_workspace(request, body.workspace_id or "")
+    # Same confused-deputy gate as create: a re-prompt / re-point of an EXISTING routine
+    # re-arms what fires under the FIXED operator service identity (tool:*). Without this
+    # check a low-priv ``routine:write`` holder could mutate-and-fire a routine to invoke
+    # every tool it was never granted (capability AMPLIFICATION). Strict no-op offline.
+    _require_no_capability_amplification(request)
     store = svc.get_routines_store()
     routine = store.get(routine_id, workspace_id=workspace_id)
     if routine is None:
@@ -337,6 +404,11 @@ async def run_now(
     run twice. The response carries the refreshed routine once the run settles/pauses.
     """
     workspace_id = resolve_workspace(request, workspace_id)
+    # Same confused-deputy gate as create/update: firing a routine executes it under the
+    # FIXED operator service identity (tool:*), never the caller's. A low-priv
+    # ``routine:write`` holder must not be able to launder a run-now through that broad
+    # authority and invoke tools it was never granted. Strict no-op on the offline path.
+    _require_no_capability_amplification(request)
     store = svc.get_routines_store()
     if store.get(routine_id, workspace_id=workspace_id) is None:
         raise HTTPException(status_code=404, detail="routine not found")

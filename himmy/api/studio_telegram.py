@@ -296,6 +296,12 @@ class TelegramListenerManager:
         """
         from himmy.agents.base_agent.thread import Message, MessageRole
         from himmy.api import studio_service
+        from himmy.api.auth.service_principal import (
+            bind_service_authorizer,
+            connector_service_principal,
+        )
+        from himmy.api.routines import active_access_policy
+        from himmy.services.storage.models import LOCAL_WORKSPACE
 
         conv_id = f"{_CONV_PREFIX}{chat_id}"
         store = self._store()
@@ -309,27 +315,39 @@ class TelegramListenerManager:
         except (FileNotFoundError, ValueError) as exc:
             return f"(agent unavailable: {exc})"
 
+        # centralize-tool-gate: a Telegram-triggered run drives the agent off any HTTP
+        # request, so it binds the tool-capability gate AMBIENTLY itself. Under a CONFIGURED
+        # authenticator the gate is a least-privilege SERVICE principal (deny-by-default to a
+        # named service role), so the run's tools are gated rather than running with the
+        # agent's full authority — AND rather than being denied wholesale by the chokepoint's
+        # fail-closed default. Offline ``active_access_policy()`` is ``None`` → inert,
+        # byte-unchanged. A Telegram bot is single-box / ``__local__``, like the routine
+        # ``agent_path`` seam, so it reuses the connector service principal shape.
         reply = ""
         paused = False
         errored: str | None = None
-        async for event in studio_service.stream_agent_run(
-            spec,
-            text,
-            history=history,
-            provider=provider,
-            model=model,
-            agent_path=agent_path,
-            canonical_storage=resolve_canonical_storage(),
+        with bind_service_authorizer(
+            connector_service_principal(workspace_id=LOCAL_WORKSPACE),
+            active_access_policy(),
         ):
-            kind = event.get("type")
-            if kind == "message":
-                reply = str(event.get("text") or reply)
-            elif kind == "done":
-                reply = str(event.get("output_text") or reply)
-            elif kind == "paused":
-                paused = True
-            elif kind == "error":
-                errored = str(event.get("message") or "the run failed")
+            async for event in studio_service.stream_agent_run(
+                spec,
+                text,
+                history=history,
+                provider=provider,
+                model=model,
+                agent_path=agent_path,
+                canonical_storage=resolve_canonical_storage(),
+            ):
+                kind = event.get("type")
+                if kind == "message":
+                    reply = str(event.get("text") or reply)
+                elif kind == "done":
+                    reply = str(event.get("output_text") or reply)
+                elif kind == "paused":
+                    paused = True
+                elif kind == "error":
+                    errored = str(event.get("message") or "the run failed")
 
         if errored is not None:
             return f"(sorry — {errored})"

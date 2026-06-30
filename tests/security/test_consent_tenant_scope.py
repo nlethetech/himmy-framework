@@ -313,3 +313,124 @@ def test_cross_tenant_withdraw_does_not_shred_over_http(
     # A per-tenant erasure of a shared global key would destroy other tenants' data; per-tenant
     # keys (an owner design decision) are the proper long-term fix.
     assert not container.entity_registry.list_by_kind("erasure_tombstone")
+
+
+# ----------------------------------------- subject_scoped BOLA over HTTP (scope-r1)
+def _subject_scoped_operator_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """A governed client: a ``subject_scoped`` operator 'alice' bound to ONE tenant 't'.
+
+    This is the multi-user-per-tenant SaaS posture the ``subject_scoped`` BOLA axis exists
+    to protect: alice holds ``consent:read``+``consent:write`` (the operator role) but, being
+    subject_scoped and NOT ``tenant_admin``, may only touch its OWN subject ('alice') within
+    tenant 't' — never another data subject ('bob') in the same tenant.
+    """
+    monkeypatch.setenv("HIMMY_CONSENT", "on")
+    monkeypatch.delenv("HIMMY_CONSENT_FILE", raising=False)
+    monkeypatch.setenv("HIMMY_STUDIO_GUARD", "0")
+    app = create_app(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "k": Principal.build(
+                "alice",
+                tenant_ids=["t"],
+                roles=["operator"],
+                auth_method="apikey",
+                subject_scoped=True,
+            )
+        }
+    )
+    client = TestClient(app)
+    client.headers.update({"x-himmy-internal-key": "k"})
+    return client
+
+
+def test_subject_scoped_cannot_read_other_subject_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subject_scoped operator cannot read ANOTHER subject's consent in its own tenant.
+
+    Vuln scope-r1#1: the consent reads only called ``_enforce_self_scope`` (a data_subject
+    ROLE check) and never the subject_scoped/BOLA gate every sibling reader uses, so an
+    operator+subject_scoped principal could read bob's full consent chain. The reads now also
+    apply ``_authorize_subject_read`` (``authorize_object`` → 404), pinning alice to its own
+    subject. The tenant axis is unaffected (alice IS in tenant 't').
+    """
+    c = _subject_scoped_operator_client(monkeypatch)
+    container = c.app.state.container  # type: ignore[attr-defined]
+    # Seed bob's consent directly in alice's own tenant 't' (same workspace).
+    container.consent_ledger.grant(
+        "bob", Purpose.INFER, workspace_id="t", basis="bob-private-basis"
+    )
+
+    # alice (subject_scoped) reading bob in the SAME tenant → folded to 404, never bob's data.
+    latest = c.get(
+        "/v1/consent/latest",
+        params={"subject_id": "bob", "purpose": "infer", "workspace_id": "t"},
+    )
+    assert latest.status_code == 404, latest.text
+    decision = c.get(
+        "/v1/consent/decision",
+        params={"subject_id": "bob", "purpose": "infer", "workspace_id": "t"},
+    )
+    assert decision.status_code == 404
+    history = c.get(
+        "/v1/consent/history",
+        params={"subject_id": "bob", "purpose": "infer", "workspace_id": "t"},
+    )
+    assert history.status_code == 404
+
+    # alice CAN read its OWN subject's consent (the axis is a narrowing, not a deny-all).
+    container.consent_ledger.grant("alice", Purpose.INFER, workspace_id="t")
+    own = c.get(
+        "/v1/consent/latest",
+        params={"subject_id": "alice", "purpose": "infer", "workspace_id": "t"},
+    )
+    assert own.status_code == 200, own.text
+    assert own.json()["subject_id"] == "alice"
+
+
+def test_subject_scoped_cannot_write_or_erase_other_subject_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subject_scoped operator cannot grant/deny/withdraw under ANOTHER subject (BOLA).
+
+    Vuln scope-r1#2: ``/withdraw`` (crypto-shred + erasure tombstone) and grant/deny never
+    called ``enforce_subject_write``, so a subject_scoped operator could erase bob within its
+    tenant (CSRF-gated only). The write paths now apply ``enforce_subject_write`` (403),
+    independent of any Origin/CSRF control. alice may still write under its OWN subject.
+    """
+    c = _subject_scoped_operator_client(monkeypatch)
+    container = c.app.state.container  # type: ignore[attr-defined]
+    container.consent_ledger.grant("bob", Purpose.INFER, workspace_id="t")
+
+    # Destructive withdraw of bob by subject_scoped alice → 403 (subject access denied),
+    # NOT a 200 erase, NOT merely a CSRF/Origin block.
+    wd = c.post(
+        "/v1/consent/withdraw",
+        json={"subject_id": "bob", "purpose": "infer", "workspace_id": "t"},
+    )
+    assert wd.status_code == 403, wd.text
+    # bob's consent + key survive: no erasure tombstone written.
+    assert not container.entity_registry.list_by_kind("erasure_tombstone")
+    # grant/deny under bob are equally refused.
+    assert (
+        c.post(
+            "/v1/consent/grant",
+            json={"subject_id": "bob", "purpose": "infer", "workspace_id": "t"},
+        ).status_code
+        == 403
+    )
+    assert (
+        c.post(
+            "/v1/consent/deny",
+            json={"subject_id": "bob", "purpose": "infer", "workspace_id": "t"},
+        ).status_code
+        == 403
+    )
+
+    # alice writing under its OWN subject still works (the axis narrows, not denies).
+    own = c.post(
+        "/v1/consent/grant",
+        json={"subject_id": "alice", "purpose": "infer", "workspace_id": "t"},
+    )
+    assert own.status_code == 200, own.text

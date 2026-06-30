@@ -16,13 +16,25 @@ from __future__ import annotations
 
 import os
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from himmy.api import routines as svc
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.auth import authorize_studio_object, scoped_read
+from himmy.api.auth.service_principal import require_no_capability_amplification
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("routines", tag="studio-routines")
+# Every routine read is tenant-scoped (LIST pinned to ``__local__``; by-id gated by
+# ``authorize_studio_object``), so stamp the router as a scoped reader for the whole-app
+# tenant-scope coverage gate. A no-op marker; the real scoping is the handlers above.
+router.dependencies.append(Depends(scoped_read))
+
+#: Creating/editing/deleting/firing a routine schedules an autonomous agent run — a
+#: privileged mutation gated by ``studio.routines:write`` (admin-only by default),
+#: additively on top of the router's ``studio.routines:read`` baseline so a read-only
+#: role can browse routines but never mutate one.
+_routines_write = Depends(studio_permission("studio.routines", "write"))
 
 
 def _wake_scheduler() -> None:
@@ -114,6 +126,29 @@ def _view(routine: svc.Routine) -> RoutineView:
     )
 
 
+def _load_owned_routine(request: Request, routine_id: str) -> svc.Routine:
+    """Resolve a routine by id and gate it on the caller's tenant entitlement (BOLA).
+
+    The single by-id choke point for every Studio routine reader/mutator. The Studio LIST
+    is scoped to the ``__local__`` workspace, but the by-id paths share ``.himmy/routines.db``
+    with the ``/v1`` surface, where tenants create rows stamped with their OWN ``workspace_id``
+    (POST /v1/routines). Without this gate a tenant-bound principal could read/mutate another
+    tenant's routine row by id — a cross-tenant BOLA over routine definitions (prompt, agent
+    binding, provider/model, last run preview/error). This intersects the routine's owning
+    ``workspace_id`` against the caller's tenants via :func:`authorize_studio_object`, folding
+    a foreign / unknown row into a uniform **404** (existence is never leaked), mirroring the
+    ``/v1`` ``store.get(routine_id, workspace_id=...)`` sibling.
+
+    A NO-OP for an unrestricted principal (offline / ``all_tenants`` / ANONYMOUS): every row
+    is allowed and the zero-config single-box Studio path is byte-unchanged. A ``None``
+    routine ``workspace_id`` (a legacy/uncategorized row predating tenant binding) is allowed.
+    """
+    routine: svc.Routine | None = svc.get_routines_store().get(routine_id)
+    if routine is None or not authorize_studio_object(request, routine.workspace_id):
+        raise HTTPException(status_code=404, detail="routine not found")
+    return routine
+
+
 def _validate_agent_path(rel_path: str) -> None:
     """Reject a routine pointing at a missing/escaping agent spec up front."""
     from himmy.api.studio_service import resolve_spec_path
@@ -141,9 +176,20 @@ async def list_routines() -> list[RoutineView]:
     return [_view(r) for r in rows]
 
 
-@router.post("", response_model=RoutineView)
-async def create_routine(body: RoutineCreate) -> RoutineView:
-    """Create a routine. The agent path must resolve inside the project root."""
+@router.post("", response_model=RoutineView, dependencies=[_routines_write])
+async def create_routine(body: RoutineCreate, request: Request) -> RoutineView:
+    """Create a routine. The agent path must resolve inside the project root.
+
+    Capability-amplification gate (scope-r6): a routine fires under the FIXED operator
+    SERVICE identity (``tool:*``) regardless of the creator's roles, so a caller granted
+    ``studio.routines:write`` but NOT the broad tool reach the routine would exercise is
+    refused (403) — mirroring the ``/v1`` routines twin and the Studio missions router. A
+    strict NO-OP for the offline / ``all_tenants`` principal, so the single-box arm path is
+    byte-unchanged.
+    """
+    require_no_capability_amplification(
+        request, resource="routine", action="create"
+    )
     _validate_agent_path(body.agent_path)
     routine = svc.Routine(
         name=body.name,
@@ -161,20 +207,32 @@ async def create_routine(body: RoutineCreate) -> RoutineView:
 
 
 @router.get("/{routine_id}", response_model=RoutineView)
-async def get_routine(routine_id: str) -> RoutineView:
-    routine = svc.get_routines_store().get(routine_id)
-    if routine is None:
-        raise HTTPException(status_code=404, detail="routine not found")
+async def get_routine(routine_id: str, request: Request) -> RoutineView:
+    """Read one routine by id (404 when unknown / out-of-tenant, BOLA-gated)."""
+    routine = _load_owned_routine(request, routine_id)
     return _view(routine)
 
 
-@router.patch("/{routine_id}", response_model=RoutineView)
-async def update_routine(routine_id: str, body: RoutineUpdate) -> RoutineView:
-    """Partial update; the schedule (when given) is re-validated as a whole."""
+@router.patch(
+    "/{routine_id}", response_model=RoutineView, dependencies=[_routines_write]
+)
+async def update_routine(
+    routine_id: str, body: RoutineUpdate, request: Request
+) -> RoutineView:
+    """Partial update; the schedule (when given) is re-validated as a whole.
+
+    BOLA-gated: a tenant-bound principal may only mutate a routine in a workspace it is
+    entitled to (:func:`_load_owned_routine`); a foreign row is a 404, never mutated.
+
+    Capability-amplification gated (scope-r6): re-pointing/re-prompting a routine re-arms an
+    autonomous run under the operator SERVICE identity (``tool:*``), so a caller lacking that
+    broad tool reach is refused (403), mirroring the ``/v1`` twin. NO-OP offline.
+    """
+    require_no_capability_amplification(
+        request, resource="routine", action="update"
+    )
     store = svc.get_routines_store()
-    routine = store.get(routine_id)
-    if routine is None:
-        raise HTTPException(status_code=404, detail="routine not found")
+    routine = _load_owned_routine(request, routine_id)
     patch = body.model_dump(exclude_unset=True)
     # Non-nullable fields: an explicit null means "leave unchanged", never None.
     for key in ("name", "agent_path", "prompt", "schedule", "deliver", "enabled"):
@@ -190,8 +248,10 @@ async def update_routine(routine_id: str, body: RoutineUpdate) -> RoutineView:
     return _view(stored)
 
 
-@router.delete("/{routine_id}")
-async def delete_routine(routine_id: str) -> dict[str, bool]:
+@router.delete("/{routine_id}", dependencies=[_routines_write])
+async def delete_routine(routine_id: str, request: Request) -> dict[str, bool]:
+    """Delete a routine (404 when unknown / out-of-tenant, BOLA-gated)."""
+    _load_owned_routine(request, routine_id)
     if not svc.get_routines_store().delete(routine_id):
         raise HTTPException(status_code=404, detail="routine not found")
     _wake_scheduler()
@@ -201,16 +261,28 @@ async def delete_routine(routine_id: str) -> dict[str, bool]:
 # ---- manual trigger -------------------------------------------------------------
 
 
-@router.post("/{routine_id}/run-now", response_model=RoutineView)
-async def run_now(routine_id: str) -> RoutineView:
+@router.post(
+    "/{routine_id}/run-now", response_model=RoutineView, dependencies=[_routines_write]
+)
+async def run_now(routine_id: str, request: Request) -> RoutineView:
     """Run a routine immediately through the same unattended rails.
 
     Same pipeline, same timeout, same approval pause — the response carries the
     refreshed routine once the run finishes (or pauses/fails). A routine that is
     already executing is refused with a 409, never run twice concurrently.
+
+    BOLA-gated: a tenant-bound principal may only fire a routine in a workspace it is
+    entitled to (:func:`_load_owned_routine`); a foreign row is a 404, never executed.
+
+    Capability-amplification gated (scope-r6): the fire executes the agent's tools under the
+    operator SERVICE identity (``tool:*``), so a caller lacking that broad tool reach is
+    refused (403) — closing the confused-deputy the ``/v1`` ``run-now`` twin already refuses.
+    NO-OP for the offline / ``all_tenants`` principal, byte-unchanged.
     """
-    if svc.get_routines_store().get(routine_id) is None:
-        raise HTTPException(status_code=404, detail="routine not found")
+    require_no_capability_amplification(
+        request, resource="routine", action="run_now"
+    )
+    _load_owned_routine(request, routine_id)
     try:
         routine = await svc.get_scheduler().run_now(routine_id)
     except svc.RoutineBusyError as exc:
@@ -228,8 +300,12 @@ async def run_now(routine_id: str) -> RoutineView:
 
 
 def _scheduler_enabled() -> bool:
-    raw = os.environ.get("HIMMY_ROUTINES_SCHEDULER", "on").lower()
-    return raw not in ("off", "0", "false", "no")
+    from himmy.config.flags import env_falsy
+
+    # Default-ON off-switch: enabled unless an explicit falsy token disables it. Shares
+    # the canonical falsy vocabulary (env_falsy) with HIMMY_STUDIO_AUTH so a typo can
+    # never silently disable it.
+    return not env_falsy("HIMMY_ROUTINES_SCHEDULER")
 
 
 #: Module-scoped leadership lease + failover watchdog for the FastAPI-hosted scheduler.
@@ -259,10 +335,9 @@ async def _start_scheduler() -> None:
         import asyncio
 
         from himmy.api.scheduler_leader import acquire_scheduler_leadership
+        from himmy.config.flags import env_truthy
 
-        require_ack = os.environ.get(
-            "HIMMY_SCHEDULER_REQUIRE_ACK", ""
-        ).strip().lower() in ("1", "true", "yes", "on")
+        require_ack = env_truthy("HIMMY_SCHEDULER_REQUIRE_ACK")
         leadership = await acquire_scheduler_leadership(
             container, require_single_scheduler_ack=require_ack
         )

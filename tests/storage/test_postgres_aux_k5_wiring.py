@@ -76,6 +76,10 @@ class _FakeConn:
         self.calls.append((sql, args))
         return self._script.get("fetch", [])
 
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        self.calls.append((sql, args))
+        return self._script.get("fetchval")
+
 
 class _FakePool:
     def __init__(self, script: dict[str, Any] | None = None) -> None:
@@ -281,6 +285,83 @@ def test_memory_save_and_list_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
         assert args[0] == "local"
 
 
+def test_aux_stores_accept_workspace_id_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION (studio-store-drain): the drained REST routes pass ``workspace_id=...`` to
+    these singleton stores; under a Postgres DSN that landed on the PG mirror whose methods
+    had NO ``workspace_id`` parameter, so every drained read AND write raised ``TypeError`` ->
+    HTTP 500 on ANY Postgres deploy. This asserts each PG mirror method now tolerates the
+    keyword (the column the routers thread) AND emits the tenant-scoped fragment.
+    """
+    from himmy.api.studio_calendar import CalendarEvent
+    from himmy.api.studio_cookbook import Recipe
+    from himmy.api.studio_notes import Note
+    from himmy.services.storage.postgres_aux import (
+        PostgresCalendarStore,
+        PostgresCookbookStore,
+        PostgresNotesStore,
+        PostgresTasksStore,
+    )
+
+    pool = _FakePool({"fetch": [], "fetchrow": None, "execute": "UPDATE 1"})
+    _install_pool(monkeypatch, pool)
+
+    # tasks: every drained method must accept workspace_id and not crash.
+    tasks = PostgresTasksStore(tenant="local")
+    tasks.list(workspace_id="w1")
+    tasks.add("buy milk", workspace_id="w1")
+    tasks.set_done("id", True, workspace_id="w1")
+    tasks.update("id", done=True, workspace_id="w1")
+    tasks.complete_by_title("buy milk", workspace_id="w1")
+    tasks.delete("id", workspace_id="w1")
+
+    # notes
+    notes = PostgresNotesStore(tenant="local")
+    notes.list(workspace_id="w1")
+    notes.get("id", workspace_id="w1")
+    notes.find_by_title("t", workspace_id="w1")
+    notes.upsert(Note(title="t", body="b"), workspace_id="w1")
+    notes.delete("id", workspace_id="w1")
+
+    # calendar
+    cal = PostgresCalendarStore(tenant="local")
+    cal.list(month="2026-06", workspace_id="w1")
+    cal.add(CalendarEvent(date="2026-06-13", title="x"), workspace_id="w1")
+    cal.delete("id", workspace_id="w1")
+
+    # cookbook (incl. the get() the upsert route calls for the cross-tenant 404 check)
+    cook = PostgresCookbookStore(tenant="local")
+    cook.list(workspace_id="w1")
+    cook.get("id", workspace_id="w1")
+    cook.upsert(Recipe(name="r"), workspace_id="w1")
+    cook.delete("id", workspace_id="w1")
+
+    # A scoped read/mutation emitted the workspace predicate (NULL legacy rows stay visible).
+    scoped = [sql for sql, _ in pool.conn.calls if "workspace_id" in sql]
+    assert scoped, "no workspace_id-scoped SQL was emitted by the PG mirrors"
+    assert any("workspace_id IS NULL" in sql for sql in scoped)
+    # The bound workspace value rides as a bind param on at least one scoped call.
+    assert any("w1" in args for _, args in pool.conn.calls)
+
+
+def test_aux_stores_none_workspace_is_unscoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The offline / ``all_tenants`` path passes ``workspace_id=None`` -> NO filter clause, so
+    the PG read is byte-unchanged from before the column existed (no ``workspace_id`` predicate
+    and no extra bind param beyond tenant)."""
+    from himmy.services.storage.postgres_aux import PostgresTasksStore
+
+    pool = _FakePool({"fetch": []})
+    _install_pool(monkeypatch, pool)
+
+    PostgresTasksStore(tenant="local").list()  # workspace_id defaults to None
+    sql, args = pool.conn.calls[0]
+    assert "workspace_id" not in sql
+    assert args == ("local",)
+
+
 def test_memory_satisfies_store_protocol() -> None:
     """The PG mirror duck-types the MemoryStore protocol (drops into MemoryService)."""
     from himmy.services.memory.store import MemoryStore
@@ -344,3 +425,174 @@ def test_notify_offline_still_uses_sqlite(
         assert (Path(tmp_path) / ".himmy" / "notify.db").exists()
     finally:
         studio_notify.reset_notify_state()
+
+
+# ----------------------------------------- rbac-harden(mopup-r1): K5 write scope clause
+
+
+def _write_clauses(pool: _FakePool, table: str) -> list[str]:
+    """The mutating SQL fragments (UPDATE/DELETE) issued against ``table``."""
+    return [
+        sql
+        for sql, _args in pool.conn.calls
+        if table in sql and ("UPDATE" in sql or "DELETE" in sql)
+    ]
+
+
+def test_k5_tasks_mutations_use_strict_write_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound-tenant task mutation must NOT match legacy NULL rows.
+
+    Regression for the read-clause-on-write bug: set_done / update / complete_by_title /
+    delete must emit the WRITE clause (no ``OR workspace_id IS NULL``) so a tenant-bound
+    principal can mutate ONLY its own stamped rows — a legacy/shared NULL row stays
+    READ-visible but IMMUTABLE (parity with the SQLite store's scope_clause_write).
+    """
+    from himmy.services.storage.postgres_aux import PostgresTasksStore
+
+    pool = _FakePool({"execute": "UPDATE 1", "fetchrow": None})
+    _install_pool(monkeypatch, pool)
+    store = PostgresTasksStore(tenant="local")
+    scope = frozenset({"A"})
+
+    store.set_done("t1", True, workspace_id=scope)
+    store.complete_by_title("Shared", workspace_id=scope)
+    store.delete("t1", workspace_id=scope)
+    store.update("t1", done=True, workspace_id=scope)
+
+    clauses = _write_clauses(pool, "aux_tasks")
+    assert clauses, "no task mutations were issued"
+    for sql in clauses:
+        assert "workspace_id IN" in sql, sql
+        assert "IS NULL" not in sql, (
+            "K5 task WRITE leaked the read clause (mutates legacy NULL-owned rows): " + sql
+        )
+
+
+def test_k5_calendar_notes_cookbook_delete_use_strict_write_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """calendar/notes/cookbook DELETE must use the write clause (no NULL match)."""
+    from himmy.api.studio_calendar import CalendarEvent
+    from himmy.api.studio_cookbook import Recipe
+    from himmy.api.studio_notes import Note
+    from himmy.services.storage.postgres_aux import (
+        PostgresCalendarStore,
+        PostgresCookbookStore,
+        PostgresNotesStore,
+    )
+
+    scope = frozenset({"A"})
+
+    for store_cls, table, make_id in (
+        (PostgresCalendarStore, "aux_calendar_events", CalendarEvent(date="2026-06-13", title="x").id),
+        (PostgresNotesStore, "aux_notes", Note(title="t", body="b").id),
+        (PostgresCookbookStore, "aux_recipes", Recipe(name="r").id),
+    ):
+        pool = _FakePool({"execute": "DELETE 1"})
+        _install_pool(monkeypatch, pool)
+        store = store_cls(tenant="local")
+        store.delete(make_id, workspace_id=scope)
+        clauses = _write_clauses(pool, table)
+        assert clauses, f"no delete issued for {table}"
+        for sql in clauses:
+            assert "IS NULL" not in sql, (
+                f"K5 {table} DELETE leaked the read clause: {sql}"
+            )
+
+
+def test_k5_offline_delete_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """workspace_id=None (offline / all_tenants) issues NO scope fragment — byte-unchanged."""
+    from himmy.services.storage.postgres_aux import PostgresTasksStore
+
+    pool = _FakePool({"execute": "DELETE 1"})
+    _install_pool(monkeypatch, pool)
+    store = PostgresTasksStore(tenant="local")
+    store.delete("t1", workspace_id=None)
+    for sql in _write_clauses(pool, "aux_tasks"):
+        assert "workspace_id" not in sql.split("WHERE", 1)[1], sql
+
+
+# ------------------------------------ rbac-harden(mopup-r1): K5 upsert preserve-owner
+
+
+def test_k5_notes_upsert_legacy_null_row_immutable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A by-id upsert onto a legacy NULL-owned row must ABORT — no content write, no re-stamp.
+
+    Regression (mopup-r4 content-tamper): the earlier fix preserved the owner column but the
+    ON CONFLICT still REWROTE the row's content (title/body). The store now fails CLOSED for
+    any row the caller cannot mutate — it issues NO ``INSERT INTO aux_notes`` and returns the
+    existing row unchanged (parity with the SQLite store's abort, and the stated
+    read-visible-but-IMMUTABLE invariant for legacy NULL rows).
+    """
+    from himmy.api.studio_notes import Note
+    from himmy.services.storage.postgres_aux import PostgresNotesStore
+
+    # Existing row is NULL-owned (legacy/shared) -> not writable by tenant 'A'. Both the
+    # _existing_unwritable probe and the abort-path SELECT * read this canned full row.
+    pool = _FakePool(
+        {
+            "fetchrow": {
+                "id": "shared-note",
+                "title": "orig-title",
+                "body": "orig-body",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "workspace_id": None,
+            },
+            "execute": "INSERT 1",
+        }
+    )
+    _install_pool(monkeypatch, pool)
+    store = PostgresNotesStore(tenant="local")
+    returned = store.upsert(Note(id="shared-note", title="t", body="b"), workspace_id="A")
+
+    inserts = [args for sql, args in pool.conn.calls if "INSERT INTO aux_notes" in sql]
+    assert not inserts, (
+        "K5 notes upsert clobbered a legacy NULL-owned row's content (should abort)"
+    )
+    # The caller gets the EXISTING row back, unchanged (not its attacker-supplied body).
+    assert returned.body == "orig-body" and returned.title == "orig-title"
+
+
+def test_k5_notes_upsert_stamps_own_new_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer DOES stamp its own workspace on a new / own row (no false preservation)."""
+    from himmy.api.studio_notes import Note
+    from himmy.services.storage.postgres_aux import PostgresNotesStore
+
+    # Fresh row (no existing row -> SELECT returns None): the writer stamps its own 'A'.
+    pool = _FakePool({"fetchrow": None, "execute": "INSERT 1"})
+    _install_pool(monkeypatch, pool)
+    store = PostgresNotesStore(tenant="local")
+    store.upsert(Note(id="fresh-note", title="t", body="b"), workspace_id="A")
+    inserts = [args for sql, args in pool.conn.calls if "INSERT INTO aux_notes" in sql]
+    assert inserts and inserts[0][-1] == "A", "writer lost its stamp on a fresh row"
+
+    # Own row (existing row already owned by 'A'): writer keeps its stamp.
+    pool2 = _FakePool({"fetchrow": {"workspace_id": "A"}, "execute": "INSERT 1"})
+    _install_pool(monkeypatch, pool2)
+    store2 = PostgresNotesStore(tenant="local")
+    store2.upsert(Note(id="own-note", title="t", body="b"), workspace_id="A")
+    inserts2 = [
+        args for sql, args in pool2.conn.calls if "INSERT INTO aux_notes" in sql
+    ]
+    assert inserts2 and inserts2[0][-1] == "A", (
+        "writer lost its own stamp on a row it owns"
+    )
+
+
+def test_k5_notes_upsert_offline_no_select(monkeypatch: pytest.MonkeyPatch) -> None:
+    """workspace_id=None (offline) issues NO preserve-owner SELECT — byte-unchanged."""
+    from himmy.api.studio_notes import Note
+    from himmy.services.storage.postgres_aux import PostgresNotesStore
+
+    pool = _FakePool({"execute": "INSERT 1"})
+    _install_pool(monkeypatch, pool)
+    store = PostgresNotesStore(tenant="local")
+    store.upsert(Note(id="n", title="t", body="b"), workspace_id=None)
+    selects = [sql for sql, _ in pool.conn.calls if "SELECT workspace_id" in sql]
+    assert not selects, "offline upsert issued a preserve-owner SELECT (should not)"

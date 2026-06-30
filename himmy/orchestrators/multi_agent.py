@@ -72,8 +72,10 @@ def _gated_tool_denied(result: RunResult) -> str | None:
 
     Mirrors the single-agent runtime's pending-approvals detection EXACTLY (a ``denied``
     outcome with ``error_code == 'POLICY_BLOCKED'``) so an ordinary policy denial is not
-    misclassified — only a ``requires_approval`` gate is. Returns the first such tool
-    name (for the fail-closed error), else ``None``.
+    misclassified — only a ``requires_approval`` gate is. A CAPABILITY/RBAC denial now
+    carries the distinct ``CAPABILITY_DENIED`` code (red-team r6), so it is naturally
+    excluded here and surfaces as an ordinary tool failure, not a fail-closed HITL gate.
+    Returns the first such tool name (for the fail-closed error), else ``None``.
     """
     denied_ids = {
         r.tool_call_id

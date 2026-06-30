@@ -710,3 +710,65 @@ def test_run_now_live_ollama_mechanics(client: TestClient) -> None:
         runs = client.get("/api/studio/runs").json()
         assert runs["total"] >= 1
         assert runs["items"][0]["status"] == "ok"
+
+
+# ---- rbac-harden(mopup-r1): routine lifecycle notifications carry the OWNING workspace
+
+
+def test_notify_stamps_routine_owner_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_notify`` must stamp each notification with the routine's owning workspace.
+
+    Regression for the cross-tenant notify leak: the routines notifier called
+    ``record_notification`` with NO ``workspace_id``, so a NULL-stamped item (title = victim's
+    routine NAME, body = victim's live LLM output/error) was visible to EVERY tenant. Assert
+    the owning workspace is now threaded for ok / awaiting_approval / error.
+    """
+    captured: list[dict[str, Any]] = []
+
+    import himmy.api.routers.studio_notify as sn
+
+    def _spy(kind: str, title: str, **kw: Any) -> None:
+        captured.append({"kind": kind, "title": title, **kw})
+
+    monkeypatch.setattr(sn, "record_notification", _spy)
+
+    r = svc.Routine(
+        name="Pull Q3 revenue figures",
+        workspace_id="tenant-A",
+        agent_path="agent.yaml",
+        prompt="...",
+        schedule=svc.Schedule(kind="daily", at="07:00"),
+    )
+    svc._notify(r, "ok", "A's private agent output", None)
+    svc._notify(r, "awaiting_approval", "", None)
+    svc._notify(r, "error", "", "A's private error trace")
+
+    assert captured, "no notifications recorded"
+    for item in captured:
+        assert item.get("workspace_id") == "tenant-A", (
+            f"routine notification leaked NULL-tenant (visible to all): {item}"
+        )
+
+
+def test_notify_offline_local_workspace_is_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single-box ``__local__`` workspace maps to None (NULL = shared, byte-unchanged)."""
+    captured: list[dict[str, Any]] = []
+
+    import himmy.api.routers.studio_notify as sn
+
+    monkeypatch.setattr(
+        sn,
+        "record_notification",
+        lambda kind, title, **kw: captured.append(kw),
+    )
+
+    r = svc.Routine(
+        name="local routine",
+        agent_path="agent.yaml",
+        prompt="...",
+        schedule=svc.Schedule(kind="daily", at="07:00"),
+    )  # workspace_id defaults to LOCAL_WORKSPACE
+    svc._notify(r, "ok", "ordinary output", None)
+    assert captured and captured[0].get("workspace_id") is None

@@ -23,11 +23,11 @@ import json
 import time
 from typing import TYPE_CHECKING, Any
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from himmy.api.routers.studio_common import build_studio_router
+from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import AsyncIterator
@@ -37,6 +37,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.services.evaluation.models import EvaluationCase, EvaluationSuite
 
 router = build_studio_router("eval", tag="studio-eval")
+
+#: Launching an evaluation/benchmark run spends model budget and writes results — a
+#: privileged mutation gated by ``studio.eval:write`` (admin-only by default),
+#: additively on top of the router's ``studio.eval:read`` baseline so a read-only role
+#: can browse past results but never kick off a run.
+_eval_write = Depends(studio_permission("studio.eval", "write"))
 
 # ---- bounds ---------------------------------------------------------------
 
@@ -697,7 +703,7 @@ async def _bench_events(
     }
 
 
-@router.post("/run")
+@router.post("/run", dependencies=[_eval_write])
 async def run_suite(body: RunEvalRequest) -> StreamingResponse:
     """Run a suite, streaming ``start`` → ``case``… → ``summary`` frames (SSE).
 

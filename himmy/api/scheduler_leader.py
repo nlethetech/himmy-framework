@@ -232,10 +232,9 @@ async def _acquire_postgres(storage: Any, backend: str) -> SchedulerLeadership:
 
 def _single_node_acked() -> bool:
     """True when the operator acknowledged single-node SQLite intent via env."""
-    import os
+    from himmy.config.flags import env_truthy
 
-    raw = os.environ.get("HIMMY_SCHEDULER_SINGLE_NODE_ACK", "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    return env_truthy("HIMMY_SCHEDULER_SINGLE_NODE_ACK")
 
 
 def _acquire_sqlite(

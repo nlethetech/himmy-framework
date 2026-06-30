@@ -320,13 +320,21 @@ class ContextAppService:
         task_id: str | None = None,
         build_spec: Any,
         metadata: dict[str, Any] | None = None,
+        workspace_id: str | None = None,
     ) -> Any:
-        """Build and persist an evidenced context snapshot."""
+        """Build and persist an evidenced context snapshot.
+
+        ``workspace_id`` (AAEO-4) tenant-scopes the field-RESOLUTION path so a snapshot
+        built in one workspace cannot surface another workspace's stored ``context_fields``
+        value under a shared ``subject_id`` (the store is keyed globally by
+        ``(subject_id, key)``). ``None`` keeps resolution unscoped (offline/all-tenants).
+        """
         return await self._context.build_snapshot(
             subject_id=subject_id,
             task_id=task_id,
             build_spec=build_spec,
             metadata=metadata,
+            workspace_id=workspace_id,
         )
 
     async def get_snapshot(
@@ -350,11 +358,21 @@ class ContextAppService:
 
 
 def _snapshot_in_workspace(snapshot: Any, workspace_id: str) -> bool:
-    """Whether a snapshot belongs to ``workspace_id`` (lenient when unstamped).
+    """Whether a snapshot belongs to ``workspace_id`` (FAILS CLOSED on unstamped).
 
-    A snapshot stamped with a different workspace is rejected; an unstamped
-    snapshot (legacy/no workspace metadata) is allowed so existing callers don't
-    break. New snapshots built via the app layer carry the workspace.
+    The only tenant boundary for a snapshot read: ``load_snapshot`` is keyed by
+    ``snapshot_id`` alone (the ``context_snapshots`` table has no ``workspace_id`` column),
+    so a lenient verdict here is the sole gate. This is reached ONLY when a concrete
+    ``workspace_id`` was supplied — i.e. a tenant-bound caller (an unrestricted /
+    ``all_tenants`` caller resolves to ``workspace_id is None`` and never calls this; see
+    :meth:`ContextAppService.get_snapshot`). For such a tenant-bound caller it FAILS CLOSED:
+    the snapshot must carry a workspace stamp (its own ``metadata['workspace_id']`` or a
+    field-level stamp) that EQUALS the caller's workspace. An UNSTAMPED snapshot — built by
+    the offline/CLI/``all_tenants``/routine path that does not stamp a workspace — is treated
+    as NOT in any tenant's workspace and is refused, closing the cross-tenant IDOR where any
+    tenant-bound principal could read an unstamped snapshot by guessing its id. The offline /
+    ``all_tenants`` path is byte-unchanged because it never supplies a workspace and so never
+    reaches this gate.
     """
     meta = getattr(snapshot, "metadata", {}) or {}
     stamped = meta.get("workspace_id")
@@ -366,7 +384,9 @@ def _snapshot_in_workspace(snapshot: Any, workspace_id: str) -> bool:
             if ws is not None:
                 stamped = ws
                 break
-    return stamped is None or stamped == workspace_id
+    # Fail CLOSED: a tenant-bound caller (workspace_id is non-None to even reach here) may
+    # read a snapshot ONLY if it carries a matching workspace stamp. Unstamped → refused.
+    return stamped == workspace_id
 
 
 class RecommendationAppService:
@@ -674,6 +694,7 @@ class RunAppService:
         agent_resolver: Callable[..., Any] | None = None,
         conversation_sink: Callable[..., Any] | None = None,
         graph_checkpoint_store_provider: Callable[[], Any] | None = None,
+        access_policy: Any = None,
     ) -> None:
         """Wire the runtime, store, optional registry, and recommendation service.
 
@@ -724,6 +745,14 @@ class RunAppService:
         self._checkpoint_store = checkpoint_store
         self._agent_resolver = agent_resolver
         self._conversation_sink = conversation_sink
+        # P0 tool authz: the RBAC policy used to rebuild a run's tool-capability gate from
+        # the persisted ``actor`` metadata at runtime-build time. ``None`` (the offline /
+        # zero-config default, and every programmatic caller that doesn't wire RBAC) means
+        # NO per-run tool authorizer is built — tool dispatch is byte-identical to before.
+        # The server container passes the active :class:`AccessPolicy` so a tenant-bound
+        # run's tools are gated deny-by-default; an ANONYMOUS / all_tenants actor still
+        # yields a NON-enforcing authorizer (pass-through), preserving offline behavior.
+        self._access_policy = access_policy
         # HITL orchestration resume needs the SAME durable graph checkpoint store the
         # team/workflow run paused into. The surface provides it lazily (a getter, so a
         # path/env change is honoured); ``None`` means orchestration HITL resume falls
@@ -1711,6 +1740,52 @@ class RunAppService:
         :class:`ChatThread` the loop continues so the model sees earlier turns; ``None``
         starts a fresh thread (every pre-T2g call site).
         """
+        # centralize-tool-gate: bind this run's tool-capability gate AMBIENTLY for the whole
+        # drive (set BEFORE _resolve_runtime so it propagates into the off-loop
+        # build_runtime_for_spec and the background run-task — contextvars copy into
+        # asyncio.to_thread/create_task). Even a runtime built by a sub-path that forgot to
+        # thread the authorizer then consults the gate at the tool chokepoint. The explicit
+        # threading into build_runtime_for_spec stays (authoritative for cross-process
+        # recovery + sub-agent attenuation); this is the belt-and-braces ambient layer. A
+        # None authorizer (no RBAC policy wired / offline) binds an inert "no ambient gate"
+        # scope, byte-unchanged.
+        from himmy.services.tools.ambient import use_tool_authorizer
+
+        ambient_authorizer = self._build_tool_authorizer(
+            (run.metadata or {}).get("actor")
+        )
+        with use_tool_authorizer(ambient_authorizer):
+            await self._execute_on_runtime_inner(
+                run,
+                persona=persona,
+                task=task,
+                llm_config=llm_config,
+                agent_spec=agent_spec,
+                agent_def=agent_def,
+                hitl=hitl,
+                plan=plan,
+                thread=thread,
+            )
+
+    async def _execute_on_runtime_inner(
+        self,
+        run: RunRecord,
+        *,
+        persona: Persona,
+        task: Task,
+        llm_config: LLMConfig | None,
+        agent_spec: AgentSpec | None,
+        agent_def: AgentDefRecord | None = None,
+        hitl: bool = False,
+        plan: bool = False,
+        thread: ChatThread | None = None,
+    ) -> None:
+        """The run-drive body, executed inside the ambient-authorizer scope.
+
+        Split out of :meth:`_execute_on_runtime` so the ambient tool-capability binding
+        wraps the ENTIRE drive (runtime build + loop) with a single ``with`` block; all
+        the original logic is unchanged below.
+        """
         # HITL/plan runs pause into /v1's OWN checkpoint store; the plain single-turn path
         # passes None so the per-run runtime stays exactly as the T0.2 build wired it.
         agentic = hitl or plan
@@ -1732,6 +1807,7 @@ class RunAppService:
                 checkpoint_store=checkpoint_store,
                 plan_mode=plan,
                 workspace_id=run.workspace_id,
+                actor=(run.metadata or {}).get("actor"),
             )
         except Exception as exc:  # noqa: BLE001 - spec wiring failure is terminal
             run.status = RunStatus.FAILED
@@ -2035,6 +2111,39 @@ class RunAppService:
                 return normalize_plan_steps((pending.args or {}).get("steps"))
         return []
 
+    def _build_tool_authorizer(self, actor: dict[str, Any] | None) -> Any:
+        """Rebuild this run's tool-capability gate from its persisted actor (P0).
+
+        Returns ``None`` when no RBAC policy is wired (the offline / zero-config default
+        and every programmatic caller) so ``build_runtime_for_spec`` builds a per-run
+        runtime with NO authorizer — tool dispatch byte-identical to before. When a policy
+        IS wired the gate is rebuilt from the actor descriptor: an actor carrying
+        ``tool_authz_enforce`` yields an ENFORCING authorizer over its recorded roles; the
+        ANONYMOUS / all_tenants offline actor (no flag) yields a NON-enforcing pass-through.
+        Building from the persisted actor (not a live Principal) is what lets the gate
+        survive the leased-dispatch recovery path, where a fresh process re-executes the
+        run with no in-memory principal.
+        """
+        if self._access_policy is None:
+            return None
+        from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+        return ToolCapabilityAuthorizer.from_actor(actor, self._access_policy)
+
+    @staticmethod
+    def _subject_scope_from_actor(actor: dict[str, Any] | None) -> str | None:
+        """The within-tenant subject axis for a run's tool stores, from its persisted actor.
+
+        Mirrors the single-agent path: under a ``subject_scoped`` per-user actor the run's
+        memory/KB/tasks/notes packs are namespaced by the user so two users of ONE tenant never
+        read each other's facts/docs. The flag is persisted by ``Principal.actor_metadata`` (set
+        only when actually ``subject_scoped`` + not a ``tenant_admin``), so a non-subject-scoped /
+        offline run returns ``None`` — byte-for-byte unchanged.
+        """
+        if actor and actor.get("subject_scoped"):
+            return actor.get("subject")
+        return None
+
     async def _resolve_runtime(
         self,
         agent_spec: AgentSpec | None,
@@ -2042,6 +2151,7 @@ class RunAppService:
         checkpoint_store: Any = None,
         plan_mode: bool = False,
         workspace_id: str | None = None,
+        actor: dict[str, Any] | None = None,
     ) -> SingleAgentRuntime:
         """Pick the runtime for a run: shared tool-less, or a per-run tool-bearing one.
 
@@ -2085,6 +2195,22 @@ class RunAppService:
         )
         from himmy.runtime.from_spec import build_runtime_for_spec
 
+        # P0: rebuild the run principal's tool-capability gate from the persisted actor and
+        # thread it into the per-run runtime (no-op offline / when no RBAC policy is wired).
+        tool_authorizer = self._build_tool_authorizer(actor)
+
+        # P1 tenancy (subject axis): under a subject_scoped per-user actor, namespace this
+        # run's memory/KB/tasks/notes tool stores by the user so two users of ONE tenant never
+        # read each other's facts/docs/tasks. The flag is persisted in ``actor`` by
+        # ``Principal.actor_metadata`` (stamped only when actually subject_scoped + not a
+        # tenant_admin), so a non-subject-scoped / offline run leaves the scope tenant-only
+        # (``None``) — byte-for-byte unchanged.
+        subject_scope = (
+            actor.get("subject")
+            if actor and actor.get("subject_scoped")
+            else None
+        )
+
         runtime, registry = await asyncio.to_thread(
             build_runtime_for_spec,
             agent_spec,
@@ -2092,6 +2218,8 @@ class RunAppService:
             storage=self._storage,
             checkpoint_store=checkpoint_store,
             subject=workspace_id,
+            subject_scope=subject_scope,
+            tool_authorizer=tool_authorizer,
         )
         runtime = cast("SingleAgentRuntime", runtime)
         if plan_mode:
@@ -2481,6 +2609,13 @@ class RunAppService:
                     checkpoint_store=self._checkpoint_store,
                     plan_mode=plan_mode,
                     workspace_id=run.workspace_id,
+                    # Carry the PERSISTED launch actor (stamped at create into
+                    # run.metadata['actor']) into the rebuilt runtime, mirroring the drive
+                    # path above. Without it the tool-capability gate would rebuild
+                    # NON-enforcing and the now-approved, side-effecting tool would execute
+                    # with the gate DISABLED — re-opening the confused-deputy hole on the
+                    # highest-value path (the approved write).
+                    actor=(run.metadata or {}).get("actor"),
                 )
             except Exception as exc:  # noqa: BLE001 - spec rebuild failure is terminal
                 run.status = RunStatus.FAILED
@@ -2642,6 +2777,16 @@ class RunAppService:
                     return
                 members.append(rec)
 
+            # centralize-tool-gate: bind the launcher's gate ambiently across the resume
+            # drive too (belt-and-braces; the explicit arg below stays authoritative). Use
+            # the contextvar set/reset directly (not a ``with``) so the large call block
+            # below keeps its indentation; reset in ``finally`` so the binding is scoped.
+            from himmy.services.tools.ambient import _active_authorizer
+
+            resume_authorizer = self._build_tool_authorizer(
+                (run.metadata or {}).get("actor")
+            )
+            _resume_authz_token = _active_authorizer.set(resume_authorizer)
             try:
                 outcome = await asyncio.wait_for(
                     run_orchestration(
@@ -2659,6 +2804,18 @@ class RunAppService:
                         checkpoint_store=self._checkpoint_store,
                         approve_member=approved,
                         actor=actor,
+                        # P0 confused-deputy fix: re-thread the launching principal's
+                        # tool-capability gate from the run's persisted actor on resume too,
+                        # so a HITL resume cannot regain tool reach the launcher lacked.
+                        tool_authorizer=resume_authorizer,
+                        # P1 tenancy: re-thread the run's tenant + (within-tenant) subject so the
+                        # resumed members' memory/KB packs stay namespaced to the owner — a HITL
+                        # resume cannot collapse onto the shared static namespace. None/None
+                        # offline / all_tenants is byte-unchanged.
+                        owner_workspace_id=run.workspace_id,
+                        owner_subject_scope=self._subject_scope_from_actor(
+                            (run.metadata or {}).get("actor")
+                        ),
                     ),
                     timeout=self._run_timeout_seconds,
                 )
@@ -2692,6 +2849,8 @@ class RunAppService:
                 run.updated_at = _now()
                 await self._storage.save_run(run)
                 return
+            finally:
+                _active_authorizer.reset(_resume_authz_token)
 
             await self._apply_orchestration_outcome(run, outcome)
 
@@ -3062,6 +3221,20 @@ class RunAppService:
                 run.status = RunStatus.RUNNING
                 run.updated_at = _now()
                 await self._storage.save_run(run)
+                # centralize-tool-gate: also bind the launching principal's gate AMBIENTLY
+                # for the whole orchestration drive, so every member runtime — including any
+                # built by an orchestrator sub-path that forgot to thread the authorizer —
+                # consults the chokepoint. The explicit ``tool_authorizer=`` below stays
+                # authoritative (it attenuates per member); this is the belt-and-braces
+                # ambient layer. Inert (None) offline / when no RBAC policy is wired. Use the
+                # contextvar set/reset directly (not ``with``) so the large call block keeps
+                # its indentation; reset in ``finally`` so the binding is scoped.
+                from himmy.services.tools.ambient import _active_authorizer
+
+                team_authorizer = self._build_tool_authorizer(
+                    (run.metadata or {}).get("actor")
+                )
+                _team_authz_token = _active_authorizer.set(team_authorizer)
                 try:
                     outcome = await asyncio.wait_for(
                         run_orchestration(
@@ -3080,6 +3253,23 @@ class RunAppService:
                             # graph/workflow member calling an approval-gated tool pauses
                             # to a durable member checkpoint (None disables nested HITL).
                             checkpoint_store=self._checkpoint_store,
+                            # P0 confused-deputy fix: rebuild the LAUNCHING principal's
+                            # tool-capability gate from the run's persisted actor and thread
+                            # it into every member runtime, so a team/workflow can only
+                            # invoke tools the launcher's own role was granted (no-op
+                            # offline / when no RBAC policy is wired). Mirrors the
+                            # single-agent path's _resolve_runtime/_build_tool_authorizer.
+                            tool_authorizer=team_authorizer,
+                            # P1 tenancy: namespace the members' memory/KB (and tasks/notes)
+                            # packs to THIS run's tenant + (within-tenant) subject so two
+                            # tenants' — or two users of one tenant's — orchestration runs never
+                            # share the durable memory/KB namespace (cross-tenant confused-deputy
+                            # DATA leak). Mirrors the single-agent + Studio team paths; None/None
+                            # offline / all_tenants is byte-unchanged.
+                            owner_workspace_id=run.workspace_id,
+                            owner_subject_scope=self._subject_scope_from_actor(
+                                (run.metadata or {}).get("actor")
+                            ),
                         ),
                         timeout=self._run_timeout_seconds,
                     )
@@ -3106,6 +3296,8 @@ class RunAppService:
                     run.updated_at = _now()
                     await self._storage.save_run(run)
                     return
+                finally:
+                    _active_authorizer.reset(_team_authz_token)
 
                 run.thread_id = outcome.thread_id
                 run.output_text = outcome.output_text or None
@@ -3491,6 +3683,25 @@ class ThreadAppService:
         self.load_owned_thread(conversation_id, workspace_id=workspace_id)
         return cast("list[Any]", self._store.flat_messages(conversation_id))
 
+    def owned_subject_id(
+        self, conversation_id: str, *, workspace_id: str
+    ) -> str | None:
+        """The data subject linked to an OWNED thread, for object-level (BOLA) gating.
+
+        Resolves the thread under its workspace owner FIRST (so a cross-tenant id is a
+        clean 404 before any subject is revealed), then returns the conversation's stored
+        ``subject_id`` (the S3 erasure-linkage column) via the store's ``subject_of`` —
+        or ``None`` when the store does not expose it or the thread is un-attributed. The
+        router folds this into :func:`~himmy.api.auth.authorize_object`; ``None`` means
+        "no subject to narrow on", so an un-attributed thread (and the offline path) is
+        unaffected.
+        """
+        self.load_owned_thread(conversation_id, workspace_id=workspace_id)
+        subject_of = getattr(self._store, "subject_of", None)
+        if subject_of is None:
+            return None
+        return cast("str | None", subject_of(conversation_id))
+
     # -- continue -----------------------------------------------------------
 
     async def append_message(
@@ -3634,23 +3845,50 @@ class DashboardQueryService:
         """Wire the backing store."""
         self._storage = storage
 
-    async def summary(self, *, subject_id: str, workspace_id: str) -> dict[str, Any]:
+    async def summary(
+        self,
+        *,
+        subject_id: str,
+        workspace_id: str,
+        all_tenants: bool = False,
+    ) -> dict[str, Any]:
         """Return one summary object: context stats + run/recommendation/eval counts.
 
         Context fields are scoped to ``workspace_id`` (AAEO-4) and the latest
         evaluation aggregate is folded in (AAEO-15) so the documented "scorecards
         on a dashboard" story is real.
+
+        ``all_tenants`` is the caller principal's cross-tenant flag (True for the
+        offline / admin all-tenants path). It is threaded into BOTH the context-tile and
+        eval-tile scoping so a None-stamped (unstamped) field/run an ``all_tenants`` caller
+        explicitly asks for stays visible — byte-unchanged zero-config — while a tenant-bound
+        caller gets strict ``== workspace_id`` and never folds another tenant's / an admin
+        run (scope-r3) or a None-stamped context field for a shared subject (scope-r4).
         """
         all_fields = await self._storage.list_context_fields(subject_id)
-        fields = [
-            f
-            for f in all_fields
-            if (getattr(f, "metadata", {}) or {}).get("workspace_id")
-            in (
-                None,
-                workspace_id,
-            )
-        ]
+        # Scope the context tile exactly like the dedicated reader
+        # ContextAppService.list_fields() and the eval tile (scope-r3): a
+        # TENANT-BOUND caller gets STRICT ``== workspace_id`` so a None-stamped
+        # (unstamped) context field written for this subject by an offline / admin /
+        # other-tenant unstamped path never inflates its aggregate count. Only the
+        # ``all_tenants`` (offline / admin) principal keeps the lenient
+        # ``in (None, workspace_id)`` branch — byte-unchanged zero-config (scope-r4).
+        if all_tenants:
+            fields = [
+                f
+                for f in all_fields
+                if (getattr(f, "metadata", {}) or {}).get("workspace_id")
+                in (
+                    None,
+                    workspace_id,
+                )
+            ]
+        else:
+            fields = [
+                f
+                for f in all_fields
+                if (getattr(f, "metadata", {}) or {}).get("workspace_id") == workspace_id
+            ]
         confidences = [getattr(f, "confidence", 0.0) for f in fields]
         freshness = [
             getattr(f, "freshness_seconds", None)
@@ -3677,7 +3915,9 @@ class DashboardQueryService:
         for rec in recs:
             rec_counts[rec.status.value] = rec_counts.get(rec.status.value, 0) + 1
 
-        evaluation = await self._evaluation_summary(workspace_id=workspace_id)
+        evaluation = await self._evaluation_summary(
+            workspace_id=workspace_id, all_tenants=all_tenants
+        )
 
         return {
             "subject_id": subject_id,
@@ -3699,15 +3939,23 @@ class DashboardQueryService:
         }
 
     async def _evaluation_summary(
-        self, *, workspace_id: str | None = None
+        self, *, workspace_id: str | None = None, all_tenants: bool = False
     ) -> dict[str, Any]:
         """Fold the latest evaluation run's aggregate into the dashboard (AAEO-15).
 
         Scoped to ``workspace_id`` (AAEO-4) so the tile never leaks ANOTHER tenant's
-        evaluation runs. The same inclusive rule the context-field tile uses applies:
-        a run stamped with a *different* workspace is excluded, but a legacy/offline
-        run with no stamped workspace stays visible (it belongs to no tenant). The
-        strict-equality filter lives on the GET-by-id IDOR path, not this overview.
+        evaluation runs. A TENANT-BOUND caller sees ONLY runs stamped with its own
+        workspace — STRICT ``== workspace_id`` (matching the GET-by-id IDOR path): a
+        None-stamped run (produced by an offline / admin all-tenants run) was previously
+        folded into a tenant tile via the lenient ``in (None, workspace_id)`` filter,
+        surfacing another tenant's / an admin run's aggregate_score, suite_name and
+        run_id — a cross-tenant metadata leak (scope-r3). It is now EXCLUDED for a
+        tenant-bound caller.
+
+        For the ``all_tenants`` principal (offline / admin) the filter is SKIPPED entirely
+        when ``workspace_id`` is None, and otherwise stays LENIENT (a None-stamped run the
+        caller explicitly scoped to a workspace stays visible) — so the zero-config /
+        admin path is byte-unchanged.
         """
         lister = getattr(self._storage, "list_evaluation_runs", None)
         if lister is None:
@@ -3717,11 +3965,19 @@ class DashboardQueryService:
         except Exception:  # pragma: no cover - eval persistence optional
             return {"total": 0, "latest_aggregate": None}
         if workspace_id is not None:
-            runs = [
-                r
-                for r in runs
-                if getattr(r, "workspace_id", None) in (None, workspace_id)
-            ]
+            if all_tenants:
+                # Byte-unchanged offline/admin behaviour: an unstamped run scoped to a
+                # workspace stays visible alongside that workspace's own runs.
+                runs = [
+                    r
+                    for r in runs
+                    if getattr(r, "workspace_id", None) in (None, workspace_id)
+                ]
+            else:
+                # Tenant-bound: strict — a None-stamped admin/offline run never leaks.
+                runs = [
+                    r for r in runs if getattr(r, "workspace_id", None) == workspace_id
+                ]
         if not runs:
             return {"total": 0, "latest_aggregate": None}
         latest = max(runs, key=lambda r: getattr(r, "created_at", "") or "")

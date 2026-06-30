@@ -131,23 +131,83 @@ def _summary(cp: Any) -> ApprovalSummary:
     )
 
 
-def list_pending() -> list[ApprovalSummary]:
-    """All checkpoints a human can still act on (newest first).
+def _subject_visible(cp: Any, subject_filter: str | None) -> bool:
+    """Whether a ``subject_scoped`` reader (``subject_filter``) may see/act on ``cp``.
+
+    The within-tenant USER axis companion to :func:`_checkpoint_owner_workspace`. ``None``
+    (offline / ``all_tenants`` / tenant_admin / non-subject-scoped) is byte-unchanged — every
+    checkpoint visible. A subject-scoped reader sees ONLY checkpoints whose paused run is
+    owned by its OWN ``subject_scope`` (re-read from the checkpoint ``ctx``), plus any legacy
+    run that carries NO subject_scope (an offline/unscoped run predates subject binding) — so
+    one user of a shared tenant can never approve/resume another user's gated tool call.
+    """
+    if subject_filter is None:
+        return True
+    owner = _checkpoint_owner_subject_scope(cp)
+    return owner is None or owner == subject_filter
+
+
+def list_pending(
+    *,
+    workspace_filter: frozenset[str] | None = None,
+    subject_filter: str | None = None,
+) -> list[ApprovalSummary]:
+    """All checkpoints a human can still act on (newest first), tenant- + subject-scoped.
 
     Includes fresh ``awaiting_approval`` checkpoints AND any ``resolving`` row left
     stranded by a resume that crashed mid-flight — those are still re-claimable by
     ``resume_agent_loop`` (so retryable via :func:`resolve`), and hiding them would
     strand the run with no human surface to recover it.
+
+    ``workspace_filter`` is the set of workspaces a tenant-bound reader may surface (the
+    principal's ``studio_tenant_filter``). ``None`` (offline / ``all_tenants``) means "no
+    filtering" — every pending checkpoint, byte-unchanged. A bound reader sees only the
+    checkpoints whose paused run is owned by one of its workspaces (the owning tenant is
+    re-read from the checkpoint ``ctx`` via :func:`_checkpoint_owner_workspace`), plus any
+    legacy ``NULL``-tenant checkpoint (an offline/unscoped run predates tenant binding).
+
+    ``subject_filter`` is the within-tenant USER axis (the principal's
+    ``studio_subject_filter``): a ``subject_scoped`` reader additionally sees only checkpoints
+    owned by its own ``subject_scope`` (plus subject-less legacy runs). ``None`` is a no-op.
     """
     store = get_checkpoint_store()
     pending = [cp for status in _RESUMABLE for cp in store.list_by_status(status)]
     pending.sort(key=lambda cp: cp.created_at, reverse=True)
+    if workspace_filter is not None:
+        pending = [
+            cp
+            for cp in pending
+            if (
+                (ws := _checkpoint_owner_workspace(cp)) is None or ws in workspace_filter
+            )
+        ]
+    if subject_filter is not None:
+        pending = [cp for cp in pending if _subject_visible(cp, subject_filter)]
     return [_summary(cp) for cp in pending]
 
 
-def get_detail(checkpoint_id: str) -> ApprovalDetail | None:
+def get_detail(
+    checkpoint_id: str,
+    *,
+    workspace_filter: frozenset[str] | None = None,
+    subject_filter: str | None = None,
+) -> ApprovalDetail | None:
+    """A pending checkpoint's detail; a foreign-tenant/-subject checkpoint reads as ``None``.
+
+    ``workspace_filter`` (the reader's ``studio_tenant_filter``) hides a checkpoint owned by
+    another tenant — its existence never leaks. ``subject_filter`` (the reader's
+    ``studio_subject_filter``) additionally hides a checkpoint owned by another USER within
+    the same tenant (the within-tenant cross-user HITL BOLA). ``None`` on either axis is
+    byte-unchanged (offline / ``all_tenants`` / tenant_admin).
+    """
     cp = get_checkpoint_store().load(checkpoint_id)
     if cp is None:
+        return None
+    if workspace_filter is not None:
+        ws = _checkpoint_owner_workspace(cp)
+        if ws is not None and ws not in workspace_filter:
+            return None
+    if not _subject_visible(cp, subject_filter):
         return None
     base = _summary(cp)
     messages = (cp.thread or {}).get("messages") or []
@@ -164,6 +224,50 @@ def get_detail(checkpoint_id: str) -> ApprovalDetail | None:
         ],
         thread_preview=preview,
     )
+
+
+def _checkpoint_owner_workspace(cp: Any) -> str | None:
+    """The OWNING ``workspace_id`` of a paused run, re-read from its checkpoint ``ctx``.
+
+    The original run stamps its tenant onto ``ctx['context_metadata']['workspace_id']``
+    (mirroring :func:`himmy.runtime.single_agent._context_workspace_id`); the checkpoint
+    serializes ``ctx`` verbatim, so this survives a resume in a fresh process. Threaded as
+    ``subject=`` into the resume's runtime so its memory + knowledge tool packs scope to
+    the SAME tenant the run paused under. Returns ``None`` for an offline / single-box /
+    unscoped run (no ``workspace_id`` carried), keeping the resume byte-for-byte unchanged.
+    """
+    ctx = getattr(cp, "ctx", None)
+    if not isinstance(ctx, dict):
+        return None
+    context_metadata = ctx.get("context_metadata")
+    if isinstance(context_metadata, dict):
+        value = context_metadata.get("workspace_id")
+        if value:
+            return str(value)
+    return None
+
+
+def _checkpoint_owner_subject_scope(cp: Any) -> str | None:
+    """The within-tenant USER axis (``subject_scope``) of a paused run, from its checkpoint.
+
+    The companion to :func:`_checkpoint_owner_workspace` for the subject axis. A
+    ``subject_scoped`` run stamps its data subject onto
+    ``ctx['context_metadata']['subject_scope']`` at run time (same place the workspace is
+    stamped), so it rides durably through the checkpoint into a fresh resume process.
+    Threaded as ``subject_scope=`` into the resume's runtime so its memory/KB/tasks/notes
+    packs namespace by the SAME user the run paused under — not the shared tenant-only
+    namespace (a within-tenant cross-USER leak). Returns ``None`` for a non-subject-scoped /
+    offline run (no ``subject_scope`` carried), keeping the resume byte-for-byte unchanged.
+    """
+    ctx = getattr(cp, "ctx", None)
+    if not isinstance(ctx, dict):
+        return None
+    context_metadata = ctx.get("context_metadata")
+    if isinstance(context_metadata, dict):
+        value = context_metadata.get("subject_scope")
+        if value:
+            return str(value)
+    return None
 
 
 async def resolve(
@@ -213,6 +317,21 @@ async def resolve(
         collected.append(event)
         await queue.put(event)
 
+    # P1 tenancy (rbac-harden): re-derive the paused run's OWNING workspace so the
+    # resume re-run scopes its memory + knowledge tool packs to the SAME tenant the
+    # original run ran under — not the shared static ``default`` subject / ``(local,
+    # local)`` KB scope. The owner was captured at pause time into the checkpoint's
+    # ``ctx['context_metadata']['workspace_id']`` (the same place ``_context_workspace_id``
+    # reads it), so it rides durably through the checkpoint into a fresh process. ``None``
+    # (offline / single-box / a run that carried no workspace) leaves both packs on their
+    # historical static scope — byte-for-byte unchanged.
+    owner_workspace_id = _checkpoint_owner_workspace(cp)
+    # P1 tenancy (subject axis): re-derive the within-tenant USER axis the run paused under
+    # so the resume re-run scopes memory/KB/tasks/notes to the SAME user — not the shared
+    # tenant-only namespace (a cross-USER leak for subject_scoped principals). Captured into
+    # the checkpoint at pause time (``context_metadata['subject_scope']``). ``None``
+    # (offline / non-subject-scoped) leaves the scope tenant-only — byte-for-byte unchanged.
+    owner_subject_scope = _checkpoint_owner_subject_scope(cp)
     spec = ss.load_studio_spec(agent_path, provider=provider, model=model)
     runtime, registry = await asyncio.to_thread(
         lambda: from_spec.build_runtime_for_spec(
@@ -223,9 +342,21 @@ async def resolve(
             capture_io=True,
             checkpoint_store=store,
             durable_defaults=True,
+            subject=owner_workspace_id,
+            subject_scope=owner_subject_scope,
         )
     )
-    cog = ss._Cognition(ss._read_only_map(registry), spec.name)
+    # rbac-harden(mopup-r6): thread the run's owner tenant + within-tenant USER axis so a
+    # re-pause approval bell on the RESUME path is stamped with the same subject-aware owner
+    # token the bell reader (``singleton_read_filter``) pins to — else a re-paused
+    # subject_scoped run's bell (which carries run detail) is NULL-owned and readable by every
+    # co-tenant peer. ``None`` (offline / non-subject-scoped) stays bare/NULL, byte-unchanged.
+    cog = ss._Cognition(
+        ss._read_only_map(registry),
+        spec.name,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
+    )
 
     run_id = new_uuid()
     started = time.monotonic()

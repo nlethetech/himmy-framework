@@ -221,6 +221,120 @@ def test_dashboard_summary_aggregates_counts() -> None:
     assert "recommendations" in summary
 
 
+def test_dashboard_eval_summary_excludes_none_stamped_run() -> None:
+    """scope-r3: a tenant's eval tile must NOT fold a None-stamped (admin/offline) run.
+
+    ``_evaluation_summary`` listed ALL eval runs and re-filtered with the LENIENT
+    ``in (None, workspace_id)`` predicate, so an offline/admin run with ``workspace_id``
+    NULL leaked into a tenant's dashboard tile (aggregate_score, suite_name, latest_run_id)
+    — a cross-tenant metadata disclosure. The filter is now STRICT ``== workspace_id``
+    (matching the context-field tile and the GET-by-id IDOR path): a tenant sees only its
+    own runs; an all_tenants (``workspace_id=None``) caller still sees everything.
+    """
+    from himmy.services.evaluation.models import EvaluationRun
+
+    storage, _registry, _rt, _run_app, _rec = _stack()
+    dashboard = DashboardQueryService(storage=storage)
+
+    async def _scenario():
+        # A None-stamped run (admin all-tenants / offline) and a tenant-w1 run.
+        await storage.save_evaluation_run(
+            EvaluationRun(
+                suite_id="admin",
+                suite_name="admin-suite",
+                workspace_id=None,
+                aggregate_score=0.99,
+                created_at="2999-01-01T00:00:00Z",  # newest, so it would win `max`
+            )
+        )
+        await storage.save_evaluation_run(
+            EvaluationRun(
+                suite_id="w1",
+                suite_name="w1-suite",
+                workspace_id="w1",
+                aggregate_score=0.10,
+                created_at="2000-01-01T00:00:00Z",
+            )
+        )
+        tenant = await dashboard.summary(subject_id="s1", workspace_id="w1")
+        admin = await dashboard.summary(subject_id="s1", workspace_id=None)
+        # Offline / all_tenants caller explicitly scoping to w1 keeps the None-stamped
+        # run visible — byte-unchanged zero-config (the lenient filter is retained).
+        offline = await dashboard.summary(
+            subject_id="s1", workspace_id="w1", all_tenants=True
+        )
+        return tenant, admin, offline
+
+    tenant, admin, offline = run_async(_scenario())
+    # Tenant w1 sees ONLY its own run — not the newer None-stamped admin run.
+    assert tenant["evaluation"]["total"] == 1
+    assert tenant["evaluation"]["latest_suite_name"] == "w1-suite"
+    assert tenant["evaluation"]["latest_aggregate"] == 0.10
+    # The all_tenants view (workspace=None) still folds every run.
+    assert admin["evaluation"]["total"] == 2
+    assert admin["evaluation"]["latest_suite_name"] == "admin-suite"
+    # Offline invariant: all_tenants + explicit w1 keeps BOTH (the None-stamped run too).
+    assert offline["evaluation"]["total"] == 2
+    assert offline["evaluation"]["latest_suite_name"] == "admin-suite"
+
+
+def test_dashboard_context_tile_excludes_none_stamped_field_for_tenant() -> None:
+    """scope-r4: a tenant's context tile must NOT fold a None-stamped (admin/offline) field.
+
+    ``DashboardQueryService.summary`` re-implemented the context-field filter INLINE with the
+    LENIENT ``in (None, workspace_id)`` predicate, UNCONDITIONALLY — so a context field
+    written for a SHARED ``subject_id`` by an offline/admin path with a blank/None
+    ``workspace_id`` was folded into a tenant-bound caller's context tile (field_count,
+    avg_confidence, avg_freshness), diverging from the strict reader
+    ``ContextAppService.list_fields`` and the eval tile. The filter now gates on
+    ``all_tenants`` exactly like the eval tile: STRICT ``== workspace_id`` for a tenant-bound
+    caller (the None-stamped field is excluded), lenient only for the all_tenants/offline
+    path (byte-unchanged).
+    """
+    from himmy.services.context.models import ContextField
+
+    storage, _registry, _rt, _run_app, _rec = _stack()
+    dashboard = DashboardQueryService(storage=storage)
+    context_service = ContextService(storage_service=storage)
+    context_app = ContextAppService(context_service=context_service, storage=storage)
+
+    async def _scenario():
+        # A field properly stamped for tenant w1.
+        await context_app.upsert_fields(
+            "w1", "shared-sub", [ContextField(key="own", value="v", confidence=0.4)]
+        )
+        # A legacy None-workspace-stamped field for the SAME subject (offline / admin / a
+        # DIFFERENT tenant's unstamped write).
+        await storage.save_context_field(
+            ContextField(
+                key="leak",
+                value="x",
+                confidence=1.0,
+                metadata={"subject_id": "shared-sub", "workspace_id": None},
+            )
+        )
+        tenant = await dashboard.summary(subject_id="shared-sub", workspace_id="w1")
+        offline = await dashboard.summary(
+            subject_id="shared-sub", workspace_id="w1", all_tenants=True
+        )
+        # The strict reader must agree with the tenant tile (one scoping implementation).
+        strict_fields = await context_app.list_fields(
+            "shared-sub", workspace_id="w1"
+        )
+        return tenant, offline, strict_fields
+
+    tenant, offline, strict_fields = run_async(_scenario())
+    # Tenant w1 sees ONLY its own field — the None-stamped one (conf 1.0) is excluded, so
+    # the avg_confidence is its own 0.4, not inflated toward 0.7.
+    assert tenant["context"]["field_count"] == 1
+    assert tenant["context"]["avg_confidence"] == 0.4
+    # It agrees with the strict dedicated reader (no divergence).
+    assert len(strict_fields) == 1
+    # Offline invariant: all_tenants keeps the lenient filter — the None-stamped field is
+    # folded back in (byte-unchanged zero-config).
+    assert offline["context"]["field_count"] == 2
+
+
 def test_get_run_events_and_thread() -> None:
     """A completed run exposes its event stream and conversation thread."""
     storage, _registry, _rt, run_app, _rec = _stack()

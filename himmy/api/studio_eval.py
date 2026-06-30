@@ -7,6 +7,7 @@ case and scores it with the evaluation harness — returning the per-metric scor
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -49,8 +50,30 @@ async def run_eval(
     *,
     provider: str | None = None,
     model: str | None = None,
+    tool_authorizer: Any = None,
+    subject: str | None = None,
+    subject_scope: str | None = None,
 ) -> object:
-    """Run the agent over every case in the suite and return the EvaluationRun."""
+    """Run the agent over every case in the suite and return the EvaluationRun.
+
+    ``tool_authorizer`` (centralize-tool-gate) is the request principal's tool-capability
+    gate, bound AMBIENTLY for the runtime build + every eval case so the agent's tool
+    dispatch is enforced (this surface builds the runtime without threading the authorizer
+    explicitly). ``None`` offline → inert, byte-unchanged.
+
+    ``subject`` (rbac-harden tenancy) is the LAUNCHING tenant's ``workspace_id`` resolved
+    from the verified principal by the router (``_run_owner(request)[0]``). It scopes the
+    eval agent's memory + knowledge tool packs to this tenant on a shared durable store
+    instead of the static ``default`` subject / ``(local, local)`` KB scope — symmetric to
+    the ``/v1`` and Studio run paths. ``None`` (offline / single-box / ``all_tenants``)
+    leaves both packs on their historical static scope — byte-for-byte unchanged.
+
+    ``subject_scope`` (rbac-harden tenancy, subject axis) is the within-tenant USER axis
+    for a ``subject_scoped`` principal (per-user identities inside one shared tenant). It
+    is threaded into the runtime build so two users of one tenant never pool their
+    memory/KB/tasks/notes onto one namespace. ``None`` (the common non-subject-scoped /
+    offline case) leaves the scope tenant-only — byte-for-byte unchanged.
+    """
     import asyncio
 
     from himmy.api.studio_service import load_studio_spec, resolve_spec_path
@@ -58,18 +81,25 @@ async def run_eval(
     from himmy.runtime import from_spec
     from himmy.services.evaluation.agent_harness import AgentEvalHarness
     from himmy.services.evaluation.service import EvaluationService
+    from himmy.services.tools.ambient import use_tool_authorizer
 
-    suite = load_eval_suite(str(resolve_spec_path(suite_path)))
-    spec = load_studio_spec(agent_path, provider=provider, model=model)
-    runtime, _registry = await asyncio.to_thread(
-        lambda: from_spec.build_runtime_for_spec(
-            spec, provider=provider, model=model, durable_defaults=True
+    with use_tool_authorizer(tool_authorizer):
+        suite = load_eval_suite(str(resolve_spec_path(suite_path)))
+        spec = load_studio_spec(agent_path, provider=provider, model=model)
+        runtime, _registry = await asyncio.to_thread(
+            lambda: from_spec.build_runtime_for_spec(
+                spec,
+                provider=provider,
+                model=model,
+                durable_defaults=True,
+                subject=subject,
+                subject_scope=subject_scope,
+            )
         )
-    )
-    harness = AgentEvalHarness(runtime, EvaluationService())
-    return await harness.evaluate_agent(
-        suite, spec.to_persona(), llm_config=spec.to_llm_config()
-    )
+        harness = AgentEvalHarness(runtime, EvaluationService())
+        return await harness.evaluate_agent(
+            suite, spec.to_persona(), llm_config=spec.to_llm_config()
+        )
 
 
 __all__ = ["EvalSuiteInfo", "discover_suites", "run_eval"]

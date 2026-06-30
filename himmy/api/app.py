@@ -74,7 +74,7 @@ from himmy.api.runtime_bootstrap import (
 )
 from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.core.errors import HimmyError
-from himmy.services.audit import SecurityAuditLog
+from himmy.services.audit import SecurityAuditLog, SecurityEvent
 from himmy.services.observability.logging import (
     bind_request_id,
     configure_logging,
@@ -148,22 +148,32 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
     than ``AttributeError``. We additionally HARD-REJECT the two unsafe escape hatches:
     ``HIMMY_ALLOW_UNAUTHENTICATED`` (would re-open the ANONYMOUS all-tenants surface)
     and a truthy ``HIMMY_ALLOW_OPERATOR_SPEC_TOOLS`` (would un-fail-close the RCE/SSRF
-    spec sanitizer for tenant-submitted specs). RBAC is on-by-construction once an
-    authenticator exists, but we also require ``build_access_policy()`` to resolve a
-    non-None policy so a broken ``HIMMY_RBAC_FILE`` can't silently disarm authz.
+    spec sanitizer for tenant-submitted specs), plus ``HIMMY_STUDIO_AUTH=off`` (the
+    Studio auth kill-switch — would re-open the network-isolated operator console to any
+    authenticated principal instead of gating it behind ``studio:use``). RBAC is
+    on-by-construction once an authenticator exists, but we also require
+    ``build_access_policy()`` to resolve a non-None policy so a broken
+    ``HIMMY_RBAC_FILE`` can't silently disarm authz.
 
     Note: ANY non-empty ``HIMMY_AUTH_MODE`` (incl. the ``apikey`` example in
     values.yaml) now engages strictness — a previously-working shared-key-ONLY deploy
     that also sets an auth mode will be refused until it configures tenant-binding auth
     (a mapped-keys file or OIDC).
+
+    The posture also engages when the authenticator BINDS TENANTS even with NO env flag
+    set: a per-tenant ``HIMMY_API_KEYS_FILE`` is multi-tenant IN FACT, so every guard
+    below (the ``HIMMY_STUDIO_AUTH=off`` / ``HIMMY_ALLOW_UNAUTHENTICATED`` /
+    ``HIMMY_ALLOW_OPERATOR_SPEC_TOOLS`` refusals) must fire for it too — otherwise a
+    keys-file-only deploy that also flips one of those kill-switches would silently skip
+    them (a fail-open the env-flag-only detector missed).
     """
-    import os
-
     from himmy.api.auth import build_access_policy, is_multi_tenant
+    from himmy.config.flags import env_falsy, env_truthy
 
-    if not is_multi_tenant():
+    binds_tenants = bool(getattr(authenticator, "binds_tenants", False))
+    if not (is_multi_tenant() or binds_tenants):
         return
-    if not getattr(authenticator, "binds_tenants", False):
+    if not binds_tenants:
         raise HimmyError(
             "refusing to start: a multi-tenant posture is configured "
             "(HIMMY_MULTI_TENANT / HIMMY_AUTH_MODE) but the authenticator does not "
@@ -171,14 +181,35 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
             "would run every caller as an all-tenants admin. Configure tenant-binding "
             "auth (HIMMY_API_KEYS_FILE with per-tenant keys, or HIMMY_AUTH_MODE=oidc)."
         )
-    truthy = ("1", "true", "yes")
-    if os.environ.get("HIMMY_ALLOW_UNAUTHENTICATED", "").lower() in truthy:
+    # Use the SAME truthy vocabulary as the consuming sanitizers / authenticator
+    # (apikey._env_truthy, spec_sanitizer._truthy) — all now route through
+    # himmy.config.flags.env_truthy — so a posture kill-switch can never be
+    # half-honored: a value like ``on`` that enables the dangerous opt-in downstream MUST
+    # also trip the startup refusal here. Diverging the detector from the consumer
+    # silently fails the guard open (it accepts ``on`` but the refusal misses it).
+    # Studio is a network-isolated OPERATOR console (lineage, privacy, governance,
+    # raw run inspection) — never a tenant-facing surface. ``HIMMY_STUDIO_AUTH=off``
+    # is its auth kill-switch (intended only for a trusted single-user box); under a
+    # multi-tenant posture it would re-open every Studio surface to any authenticated
+    # principal, regardless of role. Refuse to start: the operator console MUST stay
+    # behind ``studio:use`` when callers are mutually-untrusted tenants. The off-switch
+    # uses the canonical falsy reader (env_falsy) so this refusal and the runtime
+    # ``_studio_auth_off`` reader recognise exactly the same off tokens.
+    if env_falsy("HIMMY_STUDIO_AUTH"):
+        raise HimmyError(
+            "refusing to start: HIMMY_STUDIO_AUTH is disabled under a multi-tenant "
+            "posture — that kill-switch re-opens the Studio operator console (lineage, "
+            "privacy/governance, raw run inspection) to any authenticated principal "
+            "instead of gating it behind the studio:use permission. Remove it for a "
+            "multi-tenant deployment; Studio is a network-isolated operator surface."
+        )
+    if env_truthy("HIMMY_ALLOW_UNAUTHENTICATED"):
         raise HimmyError(
             "refusing to start: HIMMY_ALLOW_UNAUTHENTICATED is set under a "
             "multi-tenant posture — that override would re-expose the ANONYMOUS "
             "all-tenants admin surface. Remove it for a multi-tenant deployment."
         )
-    if os.environ.get("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "").lower() in truthy:
+    if env_truthy("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS"):
         raise HimmyError(
             "refusing to start: HIMMY_ALLOW_OPERATOR_SPEC_TOOLS is set under a "
             "multi-tenant posture — that override un-fail-closes the RCE/SSRF spec "
@@ -208,17 +239,16 @@ def _enforce_auth_posture(authenticator: object | None, bind_host: str) -> None:
     off-loopback shortcut below — so a shared-key-only deploy (which would otherwise
     satisfy ``authenticator is not None`` and return early) is still refused.
     """
-    import os
+    from himmy.config.flags import env_truthy
 
     _enforce_multi_tenant_posture(authenticator)
 
     if authenticator is not None or _is_loopback_host(bind_host):
         return
-    opt_in = os.environ.get("HIMMY_ALLOW_UNAUTHENTICATED", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    # Canonical truthy parse: the same vocabulary the multi-tenant refusal uses for this
+    # exact flag, so ``HIMMY_ALLOW_UNAUTHENTICATED=on`` cannot be honored in one check
+    # and ignored in the other (the prior ad-hoc tuple here omitted ``on``).
+    opt_in = env_truthy("HIMMY_ALLOW_UNAUTHENTICATED")
     if opt_in:
         logger.warning(
             "binding to non-loopback host %r with NO authenticator configured: the "
@@ -295,6 +325,48 @@ def _record_durability_truth(
     app.state.active_backend = _active_backend_name(container)
 
 
+def _record_policy_loaded(app: FastAPI) -> None:
+    """Emit a 'policy_loaded' audit event for the active RBAC policy (P1 observability).
+
+    Captures the policy SOURCE (file path or ``<built-in>``) + a non-reversible content
+    HASH + role count, so the forensic question "did the running authorization policy
+    change?" is answerable from the trail — while the verbatim grants are NEVER copied
+    into the (possibly wider-read) audit log.
+
+    A NO-OP when no authenticator is configured, mirroring ``require_permission`` /
+    ``audit_event``: the offline/zero-config path records nothing and is byte-unchanged.
+    Called from the ``create_app`` body AND after a lifespan ``_rebind_container`` (which
+    swaps the audit log onto the durable registry), so the event lands in whichever
+    registry actually serves requests. Best-effort: a logging hiccup never blocks
+    startup.
+    """
+    if getattr(app.state, "authenticator", None) is None:
+        return
+    audit = getattr(app.state, "security_audit", None)
+    policy = getattr(app.state, "access_policy", None)
+    if audit is None or policy is None:  # pragma: no cover - both wired together
+        return
+    try:
+        from himmy.api.auth import policy_fingerprint, policy_source
+
+        audit.record(
+            SecurityEvent(
+                event_type="policy_loaded",
+                outcome="allow",
+                actor={"subject": "system", "auth_method": "startup"},
+                resource="rbac_policy",
+                action="load",
+                detail=(
+                    f"source={policy_source()} "
+                    f"hash={policy_fingerprint(policy)} "
+                    f"roles={len(policy.role_permissions)}"
+                ),
+            )
+        )
+    except Exception:  # pragma: no cover - audit is best-effort, never fatal
+        logger.warning("recording policy_loaded audit event failed", exc_info=True)
+
+
 def _rebind_container(app: FastAPI, container: ApiContainer) -> None:
     """Point ``app.state`` at a (re)built container's services.
 
@@ -308,6 +380,26 @@ def _rebind_container(app: FastAPI, container: ApiContainer) -> None:
     app.state.consent_ledger = getattr(container, "consent_ledger", None)
     app.state.consent_policy = getattr(container, "consent_policy", None)
     app.state.retention_service = getattr(container, "retention_service", None)
+    # P0 tool authz (confused-deputy fix): re-wire the per-run tool-capability gate onto
+    # the NEW container's run_app, mirroring the wiring ``create_app`` did onto the
+    # throwaway in-memory container's run_app. The durable run_app rebuilt here in the
+    # lifespan (``ApiContainer.build_default_async``) is constructed WITHOUT an access
+    # policy, so without this re-wire its ``_access_policy`` stays ``None`` and
+    # ``_build_tool_authorizer`` returns ``None`` — silently disabling the entire
+    # capability authorizer for the durable auto-upgrade server path (the standard
+    # multi-tenant production shape), letting any caller authorized merely to START a run
+    # invoke EVERY tool the agent declares. We wire it ONLY when an authenticator is
+    # configured, exactly as ``create_app`` does, so the offline/zero-config path is
+    # byte-identical (no authenticator → no policy wired → no per-run authorizer).
+    if getattr(app.state, "authenticator", None) is not None:
+        policy = getattr(app.state, "access_policy", None)
+        run_app = getattr(container, "run_app", None)
+        if policy is not None and run_app is not None:
+            run_app._access_policy = policy
+    # Re-emit the policy_loaded marker into the NEW (durable) audit registry, so the
+    # forensic record of the active policy survives the in-memory→durable swap. No-op
+    # offline (no authenticator) — see :func:`_record_policy_loaded`.
+    _record_policy_loaded(app)
 
 
 def _build_lifespan(
@@ -507,10 +599,22 @@ def create_app(
         else os.environ.get("HIMMY_BIND_HOST", "127.0.0.1")
     )
     _enforce_auth_posture(authenticator, effective_host)
+    # Docs gate: once auth is configured (or a multi-tenant posture is declared) the
+    # interactive auto-docs (/docs, /redoc) and the raw schema (/openapi.json) are an
+    # unauthenticated map of every route + model for an attacker, so we suppress them by
+    # passing ``None`` URLs to FastAPI. ``/health`` and ``/readyz`` stay open (they are
+    # added as explicit routes, unaffected by these knobs). In the offline zero-config
+    # default (no authenticator, single-box) the docs stay ENABLED — byte-unchanged.
+    from himmy.api.auth import is_multi_tenant as _is_multi_tenant
+
+    _docs_locked = authenticator is not None or _is_multi_tenant()
     app = FastAPI(
         title="Himmy API",
         version=__version__,
         description="Backend-for-frontend over the Himmy application services.",
+        docs_url=None if _docs_locked else "/docs",
+        redoc_url=None if _docs_locked else "/redoc",
+        openapi_url=None if _docs_locked else "/openapi.json",
         # Authenticate first (so the limiter can key on the principal), then throttle.
         dependencies=[
             Depends(principal_dependency),
@@ -569,11 +673,34 @@ def create_app(
         logger.warning("wiring routine container failed", exc_info=True)
 
     app.state.authenticator = authenticator
+    # centralize-tool-gate: record the deployment's auth posture process-wide so the tool
+    # chokepoint fails CLOSED when a path reaches it with NO authorizer in scope under a
+    # configured authenticator (a future path that forgot BOTH the explicit arg AND the
+    # ambient contextvar denies, instead of silently running un-gated). With no
+    # authenticator (offline default) this stays False and the chokepoint is a pure pass —
+    # byte-unchanged. Mirrors ``require_permission``: enforcement engages when auth does.
+    from himmy.services.tools.ambient import mark_auth_configured
+
+    mark_auth_configured(authenticator is not None)
     # Authorization: role → permission policy (data-driven via HIMMY_RBAC_FILE).
     # Enforced per-route via require_permission; bypassed when auth is off.
     app.state.access_policy = build_access_policy()
+    # P0 tool authz (confused-deputy fix): hand the run service the RBAC policy ONLY when an
+    # authenticator is configured, so it rebuilds a per-run tool-capability gate from each
+    # run's actor metadata. With no authenticator (the offline/zero-config default) the
+    # policy is NOT wired, so no per-run authorizer is built and tool dispatch is
+    # byte-identical to before — enforcement engages exactly when auth does, mirroring
+    # ``require_permission``. Best-effort: a missing run_app never blocks startup.
+    if authenticator is not None:
+        run_app = getattr(container, "run_app", None)
+        if run_app is not None:
+            run_app._access_policy = app.state.access_policy
     # Security audit: auth/authz/access events as tamper-evident entities (WS1.4).
     app.state.security_audit = SecurityAuditLog(container.entity_registry)
+    # P1 observability: record a 'policy_loaded' audit event for the active RBAC policy
+    # (source + non-reversible content hash + role count). No-op offline. Re-emitted by
+    # _rebind_container if the lifespan later swaps in a durable audit registry.
+    _record_policy_loaded(app)
     # Rate limiting: per-principal/IP token bucket (WS3.2), off unless configured.
     app.state.rate_limiter = build_rate_limiter()
     # Consent governance (WS4.6): only present in a governed deployment (HIMMY_CONSENT on).
@@ -929,7 +1056,14 @@ def _install_studio_guard(app: FastAPI) -> None:
     """
     import os
 
-    if os.environ.get("HIMMY_STUDIO_GUARD", "1").lower() in ("0", "false", "no"):
+    from himmy.config.flags import env_falsy
+
+    # red-team reattack-r7: this default-ON DNS-rebinding/CSRF kill-switch must share the
+    # canonical falsy vocabulary so ``HIMMY_STUDIO_GUARD=off``/``=n`` is honored exactly like
+    # the sibling ``HIMMY_STUDIO_AUTH`` switch (the prior ad-hoc ``("0","false","no")`` tuple
+    # silently kept the guard ON for those tokens — a posture-vocabulary divergence the
+    # flags module exists to prevent). Unset/unrecognised keeps the guard ON (fail-closed).
+    if env_falsy("HIMMY_STUDIO_GUARD"):
         return
     # "testserver" is Starlette's TestClient default Host. Browsers cannot forge a
     # Host header via fetch (it's a forbidden header), so allowing it opens no hole

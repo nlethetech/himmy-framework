@@ -37,14 +37,30 @@ _COMPLETE_SCHEMA = {
 
 
 def register_tasks_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
-    """Register ``list_tasks`` / ``add_task`` / ``complete_task`` over the tasks store."""
+    """Register ``list_tasks`` / ``add_task`` / ``complete_task`` over the tasks store.
+
+    P1 tenancy: the shared ``.himmy/tasks.db`` (and its Postgres mirror) is one singleton
+    store across every run, so an agent launched by a tenant-bound principal would otherwise
+    list/add/complete EVERY tenant's tasks through the tool path (the REST path is already
+    scoped, but the tools reach the same store directly). The run's owning workspace is
+    threaded in via ``config.tenant_scope`` — the SAME lever that namespaces the memory/KB
+    packs (:meth:`ToolkitConfig.scoped_memory_subject` / ``scoped_kb_keys``) — and passed as
+    the store's ``workspace_id`` so the agent is filtered + stamped exactly like the REST
+    caller. ``None`` (offline / one-shot CLI / no authenticator) is "no scoping", so the
+    zero-config single-box path is byte-for-byte unchanged.
+    """
     from himmy.api.studio_tasks import get_tasks_store
+
+    # ``scoped_pack_workspace`` is the tenant id for a tenant-only run (byte-unchanged) and
+    # the combined ``t:<tenant>:s:<subject>`` token under a subject_scoped principal, so two
+    # users of one tenant never share a task partition. ``None`` offline = no scoping.
+    scope = config.scoped_pack_workspace()
 
     def list_tasks(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "tasks": [
                 {"title": t.title, "done": t.done, "due": t.due, "priority": t.priority}
-                for t in get_tasks_store().list()
+                for t in get_tasks_store().list(workspace_id=scope)
             ]
         }
 
@@ -56,12 +72,19 @@ def register_tasks_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
         except (TypeError, ValueError):
             priority = 0
         t = get_tasks_store().add(
-            str(args["title"]), due=args.get("due"), priority=priority
+            str(args["title"]),
+            due=args.get("due"),
+            priority=priority,
+            workspace_id=scope,
         )
         return {"added": True, "title": t.title, "due": t.due, "priority": t.priority}
 
     def complete_task(args: dict[str, Any]) -> dict[str, Any]:
-        return {"completed": get_tasks_store().complete_by_title(str(args["title"]))}
+        return {
+            "completed": get_tasks_store().complete_by_title(
+                str(args["title"]), workspace_id=scope
+            )
+        }
 
     register_local_tool(
         registry,

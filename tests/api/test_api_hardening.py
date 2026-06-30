@@ -90,12 +90,25 @@ def test_openapi_declares_error_and_security() -> None:
 
 
 def test_internal_key_security_scheme(monkeypatch) -> None:
-    """When the internal key is set, the API-key scheme appears + guards routes."""
+    """When the internal key is set, the API-key scheme is wired + guards routes.
+
+    Docs lockdown (P0 #4): once an authenticator is configured the public auto-docs
+    are suppressed, so ``/openapi.json`` is 404 over HTTP — an unauthenticated route
+    map is no longer exposed. The API-key security scheme is still wired into the
+    in-process document (``app.openapi()``), which we assert directly.
+    """
     monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "topsecret")
-    client = TestClient(create_app(ApiContainer.build_default()))
-    schema = client.get(
-        "/openapi.json", headers={"x-himmy-internal-key": "topsecret"}
-    ).json()
+    app = create_app(ApiContainer.build_default())
+    client = TestClient(app)
+    # Public schema endpoint is suppressed once auth is configured (404, not a map).
+    assert (
+        client.get(
+            "/openapi.json", headers={"x-himmy-internal-key": "topsecret"}
+        ).status_code
+        == 404
+    )
+    # The API-key scheme is still wired into the in-process OpenAPI document.
+    schema = app.openapi()
     schemes = schema.get("components", {}).get("securitySchemes", {})
     assert any(s.get("type") == "apiKey" for s in schemes.values())
     # Missing/invalid key is rejected with 401 + WWW-Authenticate.

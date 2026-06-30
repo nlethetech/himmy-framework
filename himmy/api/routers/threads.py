@@ -35,10 +35,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from himmy.api.auth import (
+    authorize_object,
+    enforce_subject_write,
     get_principal,
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import NOT_FOUND_RESPONSE
 from himmy.api.security_audit import audit_event
@@ -50,7 +53,9 @@ from himmy.application.services import (
 )
 from himmy.services.storage.models import RunRecord
 
-router = APIRouter(prefix="/v1/threads", tags=["threads"])
+router = APIRouter(
+    prefix="/v1/threads", tags=["threads"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("run", "read"))]
 _WRITE = [Depends(require_permission("run", "write"))]
@@ -163,11 +168,21 @@ async def create_thread(body: CreateThreadRequest, request: Request) -> ThreadVi
 async def get_thread(
     thread_id: str, request: Request, workspace_id: str | None = None
 ) -> ThreadMessagesView:
-    """Replay the flat (user/agent) projection of an owned thread (404 cross-tenant)."""
+    """Replay the flat (user/agent) projection of an owned thread (404 cross-tenant).
+
+    Object-level (BOLA, WS-bola): a ``subject_scoped`` principal reading a thread that
+    belongs to ANOTHER data subject within its own tenant gets a clean 404 — the workspace
+    ownership check runs first, then the thread's stored ``subject_id`` is gated via
+    :func:`authorize_object`. Non-subject-scoped / ``all_tenants`` / offline callers are
+    unaffected (the gate is a no-op for them).
+    """
     workspace_id = resolve_workspace(request, workspace_id)
     thread_app = _thread_app(request)
     try:
         thread = thread_app.load_owned_thread(thread_id, workspace_id=workspace_id)
+        subject_id = thread_app.owned_subject_id(thread_id, workspace_id=workspace_id)
+        if not authorize_object(request, subject_id):
+            raise HTTPException(status_code=404, detail="thread not found")
         flat = thread_app.flat_messages(thread_id, workspace_id=workspace_id)
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="thread not found") from exc
@@ -199,10 +214,40 @@ async def post_message(
     ``thread_id`` is a 404; a thread with no resolvable agent is a 422.
     """
     workspace_id = require_workspace(request, body.workspace_id or "")
+    # BOLA write gate (WS-bola): a subject_scoped principal may only post a turn under its
+    # OWN subject — else it could author conversation history / lineage under a foreign data
+    # subject. A no-op for offline / all_tenants / tenant_admin callers.
+    enforce_subject_write(request, body.subject_id)
+    # BOLA object gate (WS-bola): continuing an EXISTING thread must gate on the THREAD's
+    # STORED subject, not just the attacker-chosen body value — otherwise a subject_scoped
+    # principal could continue ANOTHER data subject's thread (loading its private history
+    # into an attacker-owned run, then reading it back via GET /v1/runs/{id}/thread) and
+    # re-stamp its erasure-linkage. We resolve the stored subject the SAME way get_thread
+    # does (owned_subject_id, which runs the workspace-ownership check first → 404
+    # cross-tenant) and fold a False verdict into a clean 404. We ALSO reject a
+    # body.subject_id that disagrees with the stored subject so a continuation can never
+    # re-attribute / poison a thread owned by a different subject. Both checks are no-ops
+    # for offline / all_tenants / tenant_admin / un-attributed threads.
+    thread_app = _thread_app(request)
+    try:
+        stored_subject = thread_app.owned_subject_id(
+            thread_id, workspace_id=workspace_id
+        )
+    except ThreadNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="thread not found") from exc
+    if not authorize_object(request, stored_subject):
+        raise HTTPException(status_code=404, detail="thread not found")
+    if (
+        stored_subject is not None
+        and body.subject_id is not None
+        and body.subject_id != stored_subject
+    ):
+        # A continuation may not change the thread's data subject (erasure-scope poisoning).
+        raise HTTPException(status_code=404, detail="thread not found")
     try:
         run = cast(
             RunRecord,
-            await _thread_app(request).append_message(
+            await thread_app.append_message(
                 conversation_id=thread_id,
                 workspace_id=workspace_id,
                 subject_id=body.subject_id,

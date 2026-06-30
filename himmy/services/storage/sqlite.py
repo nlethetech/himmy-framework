@@ -200,7 +200,7 @@ CREATE INDEX IF NOT EXISTS environment_states_env_round_idx
 #: applied). Bump this and append to :data:`_MIGRATIONS` whenever a table/column/index
 #: is added so existing ``.himmy/storage.db`` files upgrade forward in lock-step rather
 #: than silently diverging (``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing db).
-SQLITE_SCHEMA_VERSION = 7
+SQLITE_SCHEMA_VERSION = 8
 
 #: Ordered forward migrations applied after the base DDL, mirroring the Postgres
 #: :data:`himmy.services.storage.postgres.STORAGE_MIGRATIONS`. Each entry is
@@ -353,6 +353,54 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "UPDATE run_events SET workspace_id = "
             "json_extract(payload, '$.workspace_id') "
             "WHERE workspace_id IS NULL AND json_valid(payload)",
+        ),
+    ),
+    # v8 (red-team reattack-r9): tenant-PARTITION the context_fields store. The store was
+    # keyed by ``(subject_id, key)`` ONLY — workspace_id lived solely inside the payload
+    # metadata — so a tenant-bound upsert under a SHARED subject_id (e.g. the literal
+    # thread default 'default', or an identical persona.agent_id across tenants on the same
+    # agent spec) collided with another tenant's row via ``ON CONFLICT (subject_id, key)``,
+    # a cross-tenant BOLA write that destroyed the victim's value AND re-stamped it into the
+    # attacker's workspace (so the victim's own list/snapshot then reported it missing). The
+    # read-side workspace filter (reattack-r1/r6) never covered the WRITE. The fix promotes
+    # ``workspace_id`` to a first-class column in the PRIMARY KEY so the ON CONFLICT target
+    # is now ``(workspace_id, subject_id, key)`` and a write can only ever touch the writer's
+    # own tenant partition. SQLite cannot alter a PRIMARY KEY in place, so the table is
+    # rebuilt: a new table with the wider PK, data copied (backfilling ``workspace_id`` from
+    # the per-row payload metadata, blank for the offline / single-tenant partition — which
+    # keeps that path byte-unchanged since every legacy row shares the blank workspace), then
+    # the old table is swapped out. ``json_extract`` reads the stamp the application already
+    # writes into ``metadata.workspace_id`` (unencrypted databases; an encrypted payload
+    # backfills to blank and is re-stamped on next write).
+    (
+        8,
+        (
+            # Guard a partial/synthetic legacy DB that never laid down the v1 base
+            # ``context_fields`` (the source of the rebuild below). On a real database the
+            # table already exists and this IF NOT EXISTS is a no-op; this only re-creates
+            # the original (subject_id, key) shape so the rebuild always has a source.
+            "CREATE TABLE IF NOT EXISTS context_fields ("
+            "subject_id TEXT NOT NULL, "
+            "key TEXT NOT NULL, "
+            "payload TEXT NOT NULL DEFAULT '{}', "
+            "updated_at TEXT NOT NULL, "
+            "PRIMARY KEY (subject_id, key))",
+            "CREATE TABLE context_fields_v8 ("
+            "workspace_id TEXT NOT NULL DEFAULT '', "
+            "subject_id TEXT NOT NULL, "
+            "key TEXT NOT NULL, "
+            "payload TEXT NOT NULL DEFAULT '{}', "
+            "updated_at TEXT NOT NULL, "
+            "PRIMARY KEY (workspace_id, subject_id, key))",
+            "INSERT INTO context_fields_v8 "
+            "(workspace_id, subject_id, key, payload, updated_at) "
+            "SELECT "
+            "COALESCE(json_extract(payload, '$.metadata.workspace_id'), '') "
+            "  AS workspace_id, "
+            "subject_id, key, payload, updated_at "
+            "FROM context_fields",
+            "DROP TABLE context_fields",
+            "ALTER TABLE context_fields_v8 RENAME TO context_fields",
         ),
     ),
 )
@@ -813,34 +861,61 @@ class SqliteStorageService:
 
     # ------------------------------------------------------------------ context
     async def save_context_field(self, field: ContextField) -> ContextField:
-        """Upsert a context field keyed by ``(subject_id, key)``.
+        """Upsert a context field keyed by ``(workspace_id, subject_id, key)``.
 
-        ``subject_id`` is read from the field metadata when present, falling back to a
-        blank scope so storage-only fields still round-trip (mirrors the in-memory store).
+        ``subject_id`` and the owning ``workspace_id`` are read from the field metadata
+        when present, falling back to a blank scope so storage-only / single-tenant fields
+        still round-trip (mirrors the in-memory store; the blank workspace is the offline
+        partition). Including ``workspace_id`` in the ON CONFLICT target tenant-PARTITIONS
+        the store (red-team reattack-r9): two tenants sharing a ``subject_id`` upsert
+        DISTINCT rows, so a cross-tenant write can never overwrite/poison another tenant's
+        field — the WRITE-side analogue of the read filter in ``list_fields``.
         """
-        subject_id = str(getattr(field, "metadata", {}).get("subject_id", ""))
+        meta = getattr(field, "metadata", {}) or {}
+        subject_id = str(meta.get("subject_id", ""))
+        workspace_id = str(meta.get("workspace_id", "") or "")
         await asyncio.to_thread(
             self._write,
-            "INSERT INTO context_fields (subject_id, key, payload, updated_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (subject_id, key) DO UPDATE SET "
+            "INSERT INTO context_fields "
+            "(workspace_id, subject_id, key, payload, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (workspace_id, subject_id, key) DO UPDATE SET "
             "payload = excluded.payload, updated_at = excluded.updated_at",
-            (subject_id, field.key, self._dump(field), utc_now_iso()),
+            (workspace_id, subject_id, field.key, self._dump(field), utc_now_iso()),
         )
         return field
 
-    async def get_context_field(self, subject_id: str, key: str) -> ContextField | None:
-        """Return the context field for ``(subject_id, key)``, or None."""
+    async def get_context_field(
+        self, subject_id: str, key: str, *, workspace_id: str | None = None
+    ) -> ContextField | None:
+        """Return the context field for ``(subject_id, key)``, tenant-scoped on workspace.
+
+        When ``workspace_id`` is supplied, ONLY that tenant's partition row is returned
+        (so the snapshot-resolution path cannot pick up a sibling tenant's row). The
+        offline path (``None``) applies NO workspace filter — byte-identical to the
+        historical ``WHERE subject_id=? AND key=?`` lookup (single-tenant stores hold one
+        row per ``(subject_id, key)`` regardless, so this is unambiguous there).
+        """
         from himmy.services.context.models import ContextField
 
-        row = await asyncio.to_thread(
-            self._fetchone,
-            "SELECT payload FROM context_fields WHERE subject_id = ? AND key = ?",
-            (subject_id, key),
-        )
+        if workspace_id is None:
+            row = await asyncio.to_thread(
+                self._fetchone,
+                "SELECT payload FROM context_fields "
+                "WHERE subject_id = ? AND key = ?",
+                (subject_id, key),
+            )
+        else:
+            row = await asyncio.to_thread(
+                self._fetchone,
+                "SELECT payload FROM context_fields "
+                "WHERE workspace_id = ? AND subject_id = ? AND key = ?",
+                (str(workspace_id), subject_id, key),
+            )
         return ContextField.model_validate(json.loads(row["payload"])) if row else None
 
     async def list_context_fields(self, subject_id: str) -> list[ContextField]:
-        """Return all context fields for a subject."""
+        """Return all context fields for a subject (across every workspace partition)."""
         from himmy.services.context.models import ContextField
 
         rows = await asyncio.to_thread(

@@ -47,6 +47,26 @@ _DONE = "done"
 _ERROR = "error"
 
 
+def _mission_notify_workspace(mission: Mission) -> str | None:
+    """The owner token a mission's notification (bell) is stamped with.
+
+    Mirrors :func:`himmy.api.auth.singleton_read_filter`'s owner: for a per-user
+    ``subject_scoped`` mission (``subject_scope`` set) this is the combined
+    ``t:<tenant>:s:<subject>`` token the singleton Studio stores key by, so a co-tenant
+    PEER cannot read the bell (which carries the user's private prompt/result_preview) —
+    closing the within-tenant cross-USER BOLA. Tenant-only / offline collapses to the bare
+    ``workspace_id`` / ``None`` exactly as before, so the single-box path is byte-unchanged.
+    """
+    if mission.subject_scope:
+        from himmy.toolkit.config import ToolkitConfig
+
+        return ToolkitConfig(
+            tenant_scope=mission.workspace_id,
+            subject_scope=mission.subject_scope,
+        ).scoped_pack_workspace()
+    return mission.workspace_id
+
+
 class MissionError(Exception):
     """Base class for mission-registry domain errors."""
 
@@ -70,7 +90,17 @@ def _cap(text: str, n: int) -> str:
 
 @dataclass
 class Mission:
-    """One background agent run: identity, live status, and its frame buffer."""
+    """One background agent run: identity, live status, and its frame buffer.
+
+    ``workspace_id`` / ``subject_id`` are the OWNING tenant + data subject, stamped at
+    :meth:`MissionRegistry.start_mission` time from the verified principal (never from
+    client input — the router resolves them via ``resolve_workspace`` / ``get_principal``).
+    They carry the tenant/subject axes the process-local registry previously lacked, so a
+    Studio read can refuse a mission belonging to another tenant/subject (BOLA/IDOR) — the
+    by-construction drain of this surface from the tenant-scope coverage gate's pending
+    allow-list. ``None`` means "no owning tenant/subject" (the offline / ``all_tenants``
+    single-box default), in which case every reader sees it — byte-unchanged.
+    """
 
     id: str
     agent: str
@@ -80,6 +110,17 @@ class Mission:
     model: str | None
     plan_mode: bool
     created_at: str
+    workspace_id: str | None = None
+    subject_id: str | None = None
+    #: The within-tenant USER axis (P1 tenancy, subject axis) the mission's TOOL STORES
+    #: (memory/KB/tasks/notes) namespace by — set from the launching ``subject_scoped``
+    #: principal at start time (NOT from ``subject_id``, which is attribution only). ``None``
+    #: keeps the tool stores tenant-only (the offline / ``all_tenants`` / non-subject-scoped
+    #: tenant default) so the byte-unchanged shared-tenant path is preserved. This is the
+    #: missing axis the interactive Studio path threads via ``owner_subject_scope`` — without
+    #: it a subject_scoped user's background-mission memory/KB/tasks collapse to the shared
+    #: tenant namespace (a cross-USER, same-tenant BOLA).
+    subject_scope: str | None = None
     status: str = _RUNNING
     finished_at: str | None = None
     result_preview: str = ""
@@ -166,12 +207,21 @@ class MissionRegistry:
         model: str | None = None,
         history: builtins.list[dict[str, Any]] | None = None,
         plan_mode: bool = False,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        subject_scope: str | None = None,
     ) -> Mission:
         """Spawn the existing stream-run generator inside a server-side task.
 
         Raises :class:`MissionLimitError` past the concurrency cap, and lets the
         spec loader's ``FileNotFoundError`` / ``ValueError`` propagate so the
         router can map them to clean 404/400s BEFORE anything is registered.
+
+        ``workspace_id`` / ``subject_id`` are the resolved-from-principal owning tenant +
+        subject (the router derives them from the verified caller, never from the request
+        body), stamped on the :class:`Mission` so a Studio read can refuse it to a
+        different tenant/subject. ``None`` (the offline / ``all_tenants`` default) leaves
+        the mission unowned and visible to every reader — byte-unchanged.
         """
         from himmy.api import studio_service
 
@@ -192,6 +242,9 @@ class MissionRegistry:
             model=model,
             plan_mode=plan_mode,
             created_at=utc_now_iso(),
+            workspace_id=workspace_id,
+            subject_id=subject_id,
+            subject_scope=subject_scope,
             history=list(history or []),
         )
         self._missions[mission.id] = mission
@@ -233,42 +286,83 @@ class MissionRegistry:
         (interrupt) is recorded honestly as an error with an explicit message.
         """
         from himmy.api import studio_service
+        from himmy.api.auth.service_principal import (
+            bind_service_authorizer,
+            connector_service_principal,
+        )
         from himmy.api.routers.studio_notify import record_notification
+        from himmy.api.routines import active_access_policy
         from himmy.api.studio_canonical import resolve_canonical_storage
+        from himmy.services.storage.models import LOCAL_WORKSPACE
 
+        # centralize-tool-gate: a background Mission drives the agent off any HTTP request,
+        # so it binds the tool-capability gate AMBIENTLY itself (the request boundary cannot
+        # reach this task). Under a CONFIGURED authenticator the gate is a least-privilege
+        # SERVICE principal (deny-by-default to a named service role), so a mission's tools
+        # are gated rather than running with the agent's full authority — AND rather than
+        # being denied wholesale by the chokepoint's fail-closed default. Offline (no
+        # server / no authenticator) ``active_access_policy()`` is ``None`` → the binding is
+        # inert and the path is byte-unchanged. A mission is single-box / ``__local__``, like
+        # the routine ``agent_path`` seam, so it reuses the connector service principal shape.
         status = _DONE
         cancelled = False
         try:
-            async for frame in studio_service.stream_agent_run(
-                spec,
-                mission.prompt,
-                history=mission.history,
-                provider=mission.provider,
-                model=mission.model,
-                agent_path=mission.agent_path,
-                steer_queue=mission.steer_queue,
-                plan_mode=mission.plan_mode,
-                canonical_storage=resolve_canonical_storage(),
+            with bind_service_authorizer(
+                connector_service_principal(workspace_id=LOCAL_WORKSPACE),
+                active_access_policy(),
             ):
-                await self._append(mission, frame)
-                ftype = frame.get("type")
-                if ftype == "done":
-                    status = _DONE
-                    mission.run_id = str(frame.get("run_id") or "") or mission.run_id
-                    mission.result_preview = _cap(
-                        str(frame.get("output_text") or ""), RESULT_PREVIEW_MAX
-                    )
-                elif ftype == "error":
-                    status = _ERROR
-                    mission.error = str(frame.get("message") or "run failed")
-                    mission.run_id = str(frame.get("run_id") or "") or mission.run_id
-                elif ftype == "paused":
-                    status = _PAUSED
-                    mission.checkpoint_id = frame.get("checkpoint_id")
-                    mission.run_id = str(frame.get("run_id") or "") or mission.run_id
-                    mission.result_preview = (
-                        "paused at an approval gate — resume from Approvals"
-                    )
+                async for frame in studio_service.stream_agent_run(
+                    spec,
+                    mission.prompt,
+                    history=mission.history,
+                    provider=mission.provider,
+                    model=mission.model,
+                    agent_path=mission.agent_path,
+                    steer_queue=mission.steer_queue,
+                    plan_mode=mission.plan_mode,
+                    canonical_storage=resolve_canonical_storage(),
+                    # scope-r4: stamp the canonical RunRecord with the LAUNCHING tenant +
+                    # subject (resolved from the verified principal at start_mission time)
+                    # so the run lands in that partition, not the global ``__local__``
+                    # bucket. ``None`` (offline / unowned) keeps the byte-unchanged default.
+                    owner_workspace_id=mission.workspace_id,
+                    owner_subject_id=mission.subject_id,
+                    # rbac-harden(mopup-r3-2): thread the within-tenant USER axis into the
+                    # mission's TOOL STORES so a subject_scoped user's background-mission
+                    # memory/KB/tasks/notes namespace by ``t:<tenant>:s:<subject>`` — exactly
+                    # like the interactive Studio path (studio.py owner_subject_scope). Without
+                    # this the packs collapse to the shared ``t:<tenant>`` namespace and two
+                    # users of one tenant read each other's mission memory (cross-USER BOLA).
+                    # ``None`` (offline / non-subject-scoped tenant) stays tenant-only,
+                    # byte-unchanged. NOTE: owner_subject_id alone only stamps the RunRecord
+                    # (attribution); it does NOT namespace the tool stores — only this does.
+                    owner_subject_scope=mission.subject_scope,
+                ):
+                    await self._append(mission, frame)
+                    ftype = frame.get("type")
+                    if ftype == "done":
+                        status = _DONE
+                        mission.run_id = (
+                            str(frame.get("run_id") or "") or mission.run_id
+                        )
+                        mission.result_preview = _cap(
+                            str(frame.get("output_text") or ""), RESULT_PREVIEW_MAX
+                        )
+                    elif ftype == "error":
+                        status = _ERROR
+                        mission.error = str(frame.get("message") or "run failed")
+                        mission.run_id = (
+                            str(frame.get("run_id") or "") or mission.run_id
+                        )
+                    elif ftype == "paused":
+                        status = _PAUSED
+                        mission.checkpoint_id = frame.get("checkpoint_id")
+                        mission.run_id = (
+                            str(frame.get("run_id") or "") or mission.run_id
+                        )
+                        mission.result_preview = (
+                            "paused at an approval gate — resume from Approvals"
+                        )
         except asyncio.CancelledError:
             cancelled = True
             status = _ERROR
@@ -284,12 +378,22 @@ class MissionRegistry:
         finally:
             await self._finish(mission, status)
             try:
+                # Thread the mission's OWNING workspace so a tenant-bound Studio reader only
+                # sees the bell for its own missions (NULL/None offline, byte-unchanged).
+                # For a per-USER subject_scoped mission the bell carries the user's private
+                # prompt/result_preview — stamp the SAME subject-aware ``t:<tenant>:s:<subject>``
+                # owner token the singleton stores use (via subject_scope), so a co-tenant peer's
+                # ``singleton_read_filter`` (which pins to that token) cannot read another user's
+                # mission bell. Tenant-only / offline collapses to the bare tenant id / None —
+                # byte-unchanged.
+                ws = _mission_notify_workspace(mission)
                 if status == _DONE:
                     record_notification(
                         "mission",
                         f"Mission finished — {mission.agent}",
                         body=mission.result_preview or _cap(mission.prompt, 200),
                         link="/missions",
+                        workspace_id=ws,
                     )
                 elif status == _PAUSED:
                     record_notification(
@@ -297,6 +401,7 @@ class MissionRegistry:
                         f"Mission paused — {mission.agent} needs approval",
                         body=_cap(mission.prompt, 200),
                         link="/approvals",
+                        workspace_id=ws,
                     )
                 else:
                     record_notification(
@@ -304,6 +409,7 @@ class MissionRegistry:
                         f"Mission failed — {mission.agent}",
                         body=mission.error or "",
                         link="/missions",
+                        workspace_id=ws,
                     )
             except Exception:  # noqa: BLE001 - notifying must never mask the run
                 pass

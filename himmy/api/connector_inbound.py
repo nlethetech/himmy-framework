@@ -24,6 +24,7 @@ tools, so an inbound delivery is genuinely agentic — not a tool-less single sh
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -55,7 +56,31 @@ def inbound_agent_path() -> str | None:
     return value or None
 
 
-def _build_inbound_handler(agent_path: str) -> Any:
+def _connector_tool_authorizer(app: FastAPI | None) -> Any:
+    """The connector SERVICE principal's tool-capability gate (P0 #2), or None offline.
+
+    Returns ``None`` (no gate) when there is no app or no AUTHENTICATOR is configured —
+    i.e. the offline / zero-config default — so the inbound runtime's tool dispatch is
+    byte-identical to before. The check is on the authenticator (not merely the policy,
+    which ``build_access_policy`` always returns a non-None default for) so enforcement
+    engages exactly when auth does, mirroring ``require_permission``. When auth IS on the
+    gate enforces the connector's least-privilege roles deny-by-default, so an external
+    trigger can only reach tools the connector is granted, never the agent's full toolset.
+    """
+    state = getattr(app, "state", None)
+    authenticator = getattr(state, "authenticator", None)
+    policy = getattr(state, "access_policy", None)
+    if app is None or authenticator is None or policy is None:
+        return None
+    from himmy.api.auth.service_principal import connector_service_principal
+    from himmy.services.tools.capability import ToolCapabilityAuthorizer
+
+    return ToolCapabilityAuthorizer.from_principal(
+        connector_service_principal(), policy
+    )
+
+
+def _build_inbound_handler(agent_path: str, *, app: FastAPI | None = None) -> Any:
     """Build an async ``(sender_id, text) -> reply`` handler from an ``agent.yaml``.
 
     Mirrors ``himmy telegram`` (cli/commands.py:cmd_telegram): load the spec, wire the
@@ -63,18 +88,60 @@ def _build_inbound_handler(agent_path: str) -> Any:
     tools) or a single task (without). One :class:`ChatThread` per sender keeps each
     caller's context across deliveries. ``durable_defaults=True`` so an agent's
     runs/memory land in the durable server stores, matching the rest of the BFF.
+
+    P0 #2: the inbound delivery runs under a least-privilege SERVICE principal
+    (``service:connector-inbound``), tenant-bound to a FIXED workspace. Its
+    tool-capability gate is threaded into the runtime so an external trigger can only
+    invoke tools the connector's roles grant (deny-by-default) instead of acting with the
+    agent's full authority. The gate ENGAGES only when an authenticator is configured (the
+    app carries a non-None ``access_policy``); offline (no ``app`` / no authenticator) it
+    is a non-enforcing pass-through, so the connector path is byte-unchanged.
     """
     from himmy.agents.base_agent.thread import ChatThread
     from himmy.runtime.from_spec import build_runtime_for_spec, load_spec_file
 
     spec = load_spec_file(agent_path)
-    runtime, registry = build_runtime_for_spec(spec, durable_defaults=True)
+    tool_authorizer = _connector_tool_authorizer(app)
+    # P1 tenancy: thread the connector service principal's FIXED bound workspace as the
+    # tool-store ``subject`` so its memory/knowledge packs key off ``t:<workspace>`` instead
+    # of the static shared ``default`` subject / ``(local, local)`` KB scope that the offline
+    # CLI and every other unscoped caller share (the confused-deputy the rest of the pass
+    # closes by threading ``subject=owner_workspace_id`` on every other durable run path).
+    # The connector is pinned to ``LOCAL_WORKSPACE``; deriving it from the same service
+    # principal keeps a future per-tenant connector binding isolating by construction.
+    from himmy.api.auth.service_principal import connector_service_principal
+
+    connector_workspace = connector_service_principal().default_tenant()
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
-    has_tools = registry is not None
     threads: dict[str, Any] = {}
+    #: One runtime PER SENDER, keyed by ``sender_id``. The connector's per-sender
+    #: :class:`ChatThread` isolates conversational context, but the memory/KB tool packs would
+    #: otherwise pool EVERY external sender onto the connector's ONE ``t:<workspace>:default``
+    #: memory subject / ``t:<workspace>`` KB scope — so sender A's ``remember`` would surface in
+    #: sender B's ``recall`` (a within-connector cross-end-user data bleed). Threading
+    #: ``subject_scope=sender_id`` namespaces each sender's memory/KB to ``t:<workspace>:s:<sender>``
+    #: (the same combined-token scheme the per-user run path uses), so the per-sender memory/KB
+    #: isolation matches the per-sender thread. An agent with NO memory/KB packs builds an
+    #: identical runtime regardless of the scope, so the no-memory connector path is unchanged.
+    runtimes: dict[str, tuple[Any, Any]] = {}
+
+    def _runtime_for(sender_id: str) -> tuple[Any, Any]:
+        built = runtimes.get(sender_id)
+        if built is None:
+            built = build_runtime_for_spec(
+                spec,
+                durable_defaults=True,
+                subject=connector_workspace,
+                subject_scope=sender_id,
+                tool_authorizer=tool_authorizer,
+            )
+            runtimes[sender_id] = built
+        return built
 
     async def handle(sender_id: str, text: str) -> str:
+        runtime, registry = await asyncio.to_thread(_runtime_for, sender_id)
+        has_tools = registry is not None
         thread = threads.get(sender_id)
         if thread is None:
             thread = ChatThread(agent_id=persona.agent_id)
@@ -171,7 +238,9 @@ def mount_inbound_connectors(app: FastAPI) -> list[str]:
         try:
             if handler is None:
                 # Build the agent handler lazily, once, only when something will mount.
-                handler = _build_inbound_handler(agent_path)
+                # Pass the app so the handler can wire the connector SERVICE principal's
+                # tool-capability gate (P0 #2) when an authenticator is configured.
+                handler = _build_inbound_handler(agent_path, app=app)
             # Pass the durable dedup store via the **kwargs seam ONLY to connectors that
             # accept it (the webhook connector does). ``None`` leaves the built-in in-RAM
             # store, preserving the offline default byte-for-byte.

@@ -179,6 +179,44 @@ async def _dedup_sweep_loop(
             logger.warning("dedup sweep cycle failed", exc_info=True)
 
 
+def wire_tool_authz(run_app: Any | None) -> bool:
+    """Wire the per-run tool-capability gate onto a run substrate — the ONE place both
+    the FastAPI ``create_app`` body and the standalone ``himmy worker`` engage it (P0).
+
+    Reproduces app.py's two load-bearing lines (the auth-posture sentinel + the RBAC
+    policy hand-off) so they cannot drift across the process boundary:
+
+      1. :func:`mark_auth_configured` records the deployment's auth posture process-wide,
+         so the tool chokepoint fails **CLOSED** when a path reaches it with NO authorizer
+         in scope under a configured authenticator (the worker dispatch/routine seam, which
+         binds ``None`` ambiently, then denies instead of silently running un-gated); and
+      2. ``run_app._access_policy = build_access_policy()`` hands the run service the RBAC
+         policy so it rebuilds a per-run capability gate from each claimed run's persisted
+         actor metadata (``ToolCapabilityAuthorizer.from_actor``).
+
+    Both engage **only when an authenticator is configured** — exactly like
+    ``require_permission`` and the FastAPI body. With no authenticator (the offline /
+    zero-config default) the sentinel stays ``False`` and ``_access_policy`` stays unset, so
+    the chokepoint is a pure pass and tool dispatch is byte-identical to before. Returns
+    whether enforcement was engaged (an authenticator was configured).
+
+    The worker MUST call this after :func:`start_run_substrate`: before this, ``himmy
+    worker`` drained the same durable queue and ticked routines having wired NEITHER half,
+    so a least-privilege tenant's run/routine executed with the agent's FULL toolset on a
+    worker node (a cross-process confused-deputy privilege escalation). The fail-closed
+    DENY_ALL sentinel is inert until ``mark_auth_configured`` is called — it is the
+    load-bearing trigger the worker skipped.
+    """
+    from himmy.api.auth import build_access_policy, build_authenticator
+    from himmy.services.tools.ambient import mark_auth_configured
+
+    authenticator = build_authenticator()
+    mark_auth_configured(authenticator is not None)
+    if authenticator is not None and run_app is not None:
+        run_app._access_policy = build_access_policy()
+    return authenticator is not None
+
+
 @dataclass
 class RunSubstrate:
     """The resolved durable run substrate a started bootstrap owns.

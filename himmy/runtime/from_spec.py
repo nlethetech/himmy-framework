@@ -211,6 +211,8 @@ def build_runtime_for_spec(
     durable_defaults: bool | None = None,
     storage: Any = None,
     subject: str | None = None,
+    subject_scope: str | None = None,
+    tool_authorizer: Any = None,
 ) -> Any:
     """Wire a runtime for ``spec`` honoring provider/model overrides + tools.
 
@@ -242,6 +244,24 @@ def build_runtime_for_spec(
     another's learned reputation. ``None`` (the one-shot CLI / offline path, which already
     uses an isolated in-memory store per process, and every pre-existing caller) leaves
     learning unscoped — byte-identical to before. Inert unless ``spec.self_learning``.
+
+    ``subject_scope`` (P1 tenancy, subject axis) is the run's owning DATA SUBJECT under a
+    ``subject_scoped`` principal — a deployment that runs PER-USER identities inside ONE shared
+    tenant. ``subject`` (the tenant/workspace) is identical for every user there, so the
+    memory/knowledge/tasks/notes tool stores would isolate by tenant but NOT by user (user-B
+    recalls user-A's facts). When set, those tool-store scopes are additionally namespaced by
+    this subject so two users of one tenant never collide. ``None`` (offline / one-shot CLI /
+    a non-``subject_scoped`` principal — the common case) leaves the scope tenant-only,
+    byte-identical to before.
+
+    ``tool_authorizer`` (P0 confused-deputy fix) is the run principal's tool-capability
+    gate (:class:`~himmy.services.tools.capability.ToolCapabilityAuthorizer`). It is
+    threaded onto the per-run :class:`ToolService` so a tool call is authorized
+    deny-by-default against the caller's roles just before dispatch, AND propagated into
+    ``spawn_agent`` so a sub-agent's capabilities can only ATTENUATE (never exceed the
+    parent's). ``None`` (every offline/CLI caller) and a NON-enforcing authorizer (the
+    ANONYMOUS / all_tenants offline default) are exact no-ops — every tool is allowed,
+    byte-identical to before. Enforcement engages ONLY for a tenant-bound principal.
     """
     from himmy import build_runtime
     from himmy.cli.provider import build_inference_for
@@ -349,6 +369,13 @@ def build_runtime_for_spec(
         from himmy.toolkit.memory import effective_memory_path
 
         tk = ToolkitConfig.from_sources(load_project().get("toolkit"))
+        # P1 tenancy: the prompt-injection memory READ must scope to THIS run's tenant too
+        # — on the shared durable ``.himmy/memory.db`` a static subject would surface another
+        # tenant's memories in this run's context. ``subject_scope`` adds the within-tenant
+        # USER axis so a subject_scoped principal's read never crosses to another user of the
+        # same tenant. ``None`` (offline / non-subject-scoped) is unchanged.
+        tk.tenant_scope = subject
+        tk.subject_scope = subject_scope
         memory_db = effective_memory_path(tk, server=server)
         store = SqliteMemoryStore(memory_db) if memory_db else InMemoryMemoryStore()
         memory = MemoryService(
@@ -362,7 +389,7 @@ def build_runtime_for_spec(
             MemoryContextAdapter(
                 memory,
                 top_k=spec.memory_top_k,
-                subject_id=tk.memory_subject,
+                subject_id=tk.scoped_memory_subject(),
                 similarity_threshold=tk.memory_min_similarity,
             )
         )
@@ -458,6 +485,14 @@ def build_runtime_for_spec(
 
             tk_config = ToolkitConfig.from_sources(load_project().get("toolkit"))
             tk_config.server_context = server
+            # P1 tenancy: scope the memory/knowledge packs to THIS run's tenant. On a
+            # shared server process both packs otherwise key off a static subject/KB scope
+            # (cross-tenant confused-deputy read). ``subject`` is the run's workspace_id;
+            # ``None`` (offline / one-shot CLI) leaves both packs on their historical
+            # static scope — byte-for-byte unchanged. ``subject_scope`` adds the within-tenant
+            # USER axis (memory/KB/tasks/notes) so two users of one tenant never collide.
+            tk_config.tenant_scope = subject
+            tk_config.subject_scope = subject_scope
             register_packs(registry, spec.tool_packs, tk_config)
         if spec.connectors:
             _register_outbound_connectors(
@@ -471,6 +506,11 @@ def build_runtime_for_spec(
             if "knowledge" not in spec.tool_packs:
                 _kb_config = ToolkitConfig.from_sources(load_project().get("toolkit"))
                 _kb_config.server_context = server
+                # P1 tenancy: tenant-scope the auto-provisioned KB too (same as the
+                # explicit ``knowledge`` pack above), plus the within-tenant USER axis;
+                # ``None`` offline / non-subject-scoped is unchanged.
+                _kb_config.tenant_scope = subject
+                _kb_config.subject_scope = subject_scope
                 register_packs(registry, ["knowledge"], _kb_config)
             n = asyncio.run(ingest_knowledge_sources(registry, spec.knowledge))
             if on_log is not None:
@@ -486,14 +526,33 @@ def build_runtime_for_spec(
             # worker's runtime has no spawn_agent tool, capping recursion at one level.
             from himmy.toolkit.spawn import register_spawn_tool
 
-            register_spawn_tool(registry, inference=inference)
+            register_spawn_tool(
+                registry,
+                inference=inference,
+                tool_authorizer=tool_authorizer,
+                # P1: thread this run's tenancy axes so a spawned sub-agent's memory/KB
+                # packs stay scoped to the parent's tenant/subject (not the shared store).
+                tenant_scope=subject,
+                subject_scope=subject_scope,
+            )
         if spec.allow_skill_dispatch:
             # dispatch_skill runs a named capability as a tool-scoped sub-agent; the
             # sub-runtime lacks the tool, so a dispatched skill can't dispatch again.
             from himmy.skills import build_skill_registry, register_skill_dispatch_tool
 
             register_skill_dispatch_tool(
-                registry, inference=inference, skill_registry=build_skill_registry()
+                registry,
+                inference=inference,
+                skill_registry=build_skill_registry(),
+                # P0: propagate the parent run's capability gate into the dispatched
+                # skill's sub-agent (attenuate-never-amplify), exactly like the spawn
+                # path above — otherwise a narrowed caller could route WITHHELD write
+                # tools through a skill's tool-packs (a confused-deputy bypass).
+                tool_authorizer=tool_authorizer,
+                # P1: thread this run's tenancy axes so a dispatched skill's memory/KB
+                # packs stay scoped to the parent's tenant/subject (not the shared store).
+                tenant_scope=subject,
+                subject_scope=subject_scope,
             )
         if reputation_provider is not None:
             # Prime the sync reputation snapshot from history ONCE, here at build time
@@ -563,6 +622,8 @@ def build_runtime_for_spec(
                 # Stamp the run's workspace onto emitted tool events so the reputation
                 # miner reads them back tenant-scoped (P1). None when self-learning is off.
                 event_workspace_id=subject if reputation_provider is not None else None,
+                # P0: the run principal's deny-by-default tool-capability gate (no-op offline).
+                tool_authorizer=tool_authorizer,
             )
         elif reputation_provider is not None:
             # No guardrails, but self-learning is on: build the ToolService here (instead
@@ -578,6 +639,20 @@ def build_runtime_for_spec(
                 # Stamp the run's workspace onto emitted tool events so the reputation
                 # miner reads them back tenant-scoped (P1).
                 event_workspace_id=subject,
+                # P0: the run principal's deny-by-default tool-capability gate (no-op offline).
+                tool_authorizer=tool_authorizer,
+            )
+        elif tool_authorizer is not None:
+            # No guardrails and no self-learning, but a tool authorizer IS wired: build the
+            # ToolService here (rather than letting ``build_runtime`` make a bare one from the
+            # bare ``tool_registry``) so the capability gate actually reaches dispatch.
+            # ``event_sink`` mirrors ``build_runtime``'s default so tool events still flow.
+            from himmy.services.tools.service import ToolService
+
+            overrides["tool_service"] = ToolService(
+                registry,
+                event_sink=storage,
+                tool_authorizer=tool_authorizer,
             )
         else:
             overrides["tool_registry"] = registry

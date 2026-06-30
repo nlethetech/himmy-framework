@@ -176,3 +176,79 @@ def test_scan_param_bounded(client: TestClient) -> None:
     assert (
         client.get("/api/studio/guardrails", params={"scan": 99999}).status_code == 422
     )
+
+
+# ----------------------------------------------- cross-tenant boundary (red-team r3)
+
+
+def test_tenant_bound_guardrails_reader_gets_no_cross_tenant_firings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A tenant-bound principal sees the catalog but NO firings (cross-tenant IDOR fix).
+
+    The firings list is read from the process-wide ``.himmy/studio.db`` presentation
+    cache, which carries no per-run tenant stamp. Before this fix, a tenant-bound
+    principal holding ``studio.guardrails:read`` (granted to viewer/operator/auditor)
+    could enumerate EVERY tenant's run_id / agent_name / guardrail flags + reasons via
+    ``GET /api/studio/guardrails``. Now — mirroring the runs/analytics reader — such a
+    principal gets the catalog only (empty firings), while the offline / all-tenants
+    path is byte-unchanged (see :func:`test_firings_read_from_studio_db_cognition_steps`).
+    """
+    from himmy.api.auth.apikey import ApiKeyAuthenticator
+    from himmy.api.auth.principal import Principal
+
+    monkeypatch.chdir(tmp_path)
+    reset_run_store()
+    try:
+        # Seed a run written by ANOTHER tenant (the shared cache has no tenant axis).
+        get_run_store().save(
+            StudioRun(
+                id="tenant-b-run",
+                created_at="2026-06-13T10:00:00Z",
+                agent_name="tenant-b-agent",
+                provider="claude-cli",
+                model="haiku",
+                prompt="my secret a@b.com",
+                output="ok",
+                status="ok",
+                steps=[
+                    CognitionStep(
+                        seq=1,
+                        kind="safety",
+                        stage="input",
+                        redacted=True,
+                        flags=["pii:email"],
+                        reasons=["redacted email a@b.com"],
+                    )
+                ],
+            )
+        )
+
+        app = create_app(ApiContainer.build_default())
+        # viewer holds studio.guardrails:read; tenant-bound (tenant_ids set) so the
+        # multi-tenant boundary engages (studio_tenant_filter is not None).
+        app.state.authenticator = ApiKeyAuthenticator(
+            key_principals={
+                "k": Principal.build(
+                    "u", tenant_ids=["t"], roles=["viewer"], auth_method="apikey"
+                )
+            }
+        )
+        client = TestClient(app)
+        client.headers.update({"x-himmy-internal-key": "k"})
+
+        r = client.get("/api/studio/guardrails", params={"scan": 1000, "limit": 500})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Catalog is still served (it is declared in code, not per-tenant).
+        assert body["builtins"] == builtin_rows()
+        # But NO firings leak across the tenant boundary.
+        assert body["firings"] == []
+        assert body["firing_count"] == 0
+        assert body["runs_scanned"] == 0
+        # Defensive: the other tenant's identifiers never appear anywhere in the body.
+        assert "tenant-b-run" not in r.text
+        assert "tenant-b-agent" not in r.text
+        assert "a@b.com" not in r.text
+    finally:
+        reset_run_store()

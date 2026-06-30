@@ -16,6 +16,7 @@ from himmy.api.auth import (
     get_principal,
     require_permission,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import NOT_FOUND_RESPONSE
 from himmy.services.evaluation.models import EvaluationRun, EvaluationSuite
@@ -23,7 +24,9 @@ from himmy.services.evaluation.models import EvaluationRun, EvaluationSuite
 _READ = [Depends(require_permission("evaluation", "read"))]
 _WRITE = [Depends(require_permission("evaluation", "write"))]
 
-router = APIRouter(prefix="/v1/evaluation", tags=["evaluation"])
+router = APIRouter(
+    prefix="/v1/evaluation", tags=["evaluation"], dependencies=[Depends(scoped_read)]
+)
 
 
 class RunSuiteRequest(BaseModel):

@@ -34,17 +34,21 @@ from pydantic import BaseModel, Field, field_validator
 
 from himmy.api import teams_store as svc
 from himmy.api.auth import (
+    enforce_subject_write,
     get_principal,
     require_permission,
     require_workspace,
     resolve_workspace,
+    scoped_read,
 )
 from himmy.api.models import NOT_FOUND_RESPONSE
 from himmy.api.security_audit import audit_event
 from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.services.storage.models import RunRecord
 
-router = APIRouter(prefix="/v1/teams", tags=["teams"])
+router = APIRouter(
+    prefix="/v1/teams", tags=["teams"], dependencies=[Depends(scoped_read)]
+)
 
 _READ = [Depends(require_permission("run", "read"))]
 _WRITE = [Depends(require_permission("run", "write"))]
@@ -314,6 +318,12 @@ async def run_team(
     ``GET /v1/runs/{id}`` for the outcome); a quota breach is a 429.
     """
     workspace_id = require_workspace(request, body.workspace_id or "")
+    # BOLA write gate (WS-bola): the orchestration RunRecord is stamped with the body's
+    # subject_id, so a subject_scoped principal must only launch under its OWN subject —
+    # else it could attribute a run (and its lineage / erasure linkage) to a foreign data
+    # subject, exactly as runs.py:create_run guards. No-op offline / all_tenants /
+    # tenant_admin.
+    enforce_subject_write(request, body.subject_id)
     team = svc.get_teams_store().get(team_id, workspace_id=workspace_id)
     if team is None:
         raise HTTPException(status_code=404, detail="team not found")

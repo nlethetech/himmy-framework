@@ -36,6 +36,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HIMMY_API_KEYS_FILE",
         "HIMMY_ALLOW_UNAUTHENTICATED",
         "HIMMY_ALLOW_OPERATOR_SPEC_TOOLS",
+        "HIMMY_STUDIO_AUTH",
         "HIMMY_DATABASE_URL",
         "HIMMY_DURABLE_STORAGE",
         "HIMMY_BIND_HOST",
@@ -138,6 +139,82 @@ def test_is_multi_tenant_none_mode_is_false(monkeypatch: pytest.MonkeyPatch) -> 
     assert is_multi_tenant() is False
 
 
+def test_is_multi_tenant_via_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Red-team r3: HIMMY_MULTI_TENANT=on MUST engage the posture.
+
+    'on' is the natural on/off convention and is already accepted by the consuming
+    sanitizers (apikey._env_truthy / spec_sanitizer._truthy). A divergent detector that
+    missed 'on' silently left a shared key a cross-tenant super-admin and skipped the
+    startup refusal.
+    """
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "on")
+    assert is_multi_tenant() is True
+
+
+def test_multi_tenant_on_shared_key_only_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIMMY_MULTI_TENANT=on + shared-key-only is refused (posture engages for 'on')."""
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "on")
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "shared-secret")
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "bind callers to tenants" in str(exc.value)
+
+
+def test_multi_tenant_on_demotes_shared_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """HIMMY_MULTI_TENANT=on demotes a co-configured shared key (G1) just like '1'."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "on")
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "shared-secret")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    auth = build_authenticator()
+    assert isinstance(auth, ApiKeyAuthenticator)
+    assert auth._shared_key_roles == DEMOTED_SHARED_KEY_ROLES
+
+
+def test_multi_tenant_rejects_operator_spec_tools_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Red-team r3: HIMMY_ALLOW_OPERATOR_SPEC_TOOLS=on must ALSO trip the startup refusal.
+
+    The consuming sanitizer (spec_sanitizer._truthy) treats 'on' as enabled, so the
+    posture check must use the SAME truthy vocabulary or the RCE/SSRF opt-in slips past
+    the fail-closed guard.
+    """
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_ALLOW_OPERATOR_SPEC_TOOLS", "on")
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_ALLOW_OPERATOR_SPEC_TOOLS" in str(exc.value)
+
+
+def test_multi_tenant_rejects_allow_unauthenticated_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """HIMMY_ALLOW_UNAUTHENTICATED=on trips the startup refusal (truthy-parity)."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_ALLOW_UNAUTHENTICATED", "on")
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_ALLOW_UNAUTHENTICATED" in str(exc.value)
+
+
 def test_build_authenticator_demotes_shared_key_under_multi_tenant(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
@@ -234,6 +311,69 @@ def test_single_box_default_starts_byte_identically(
     assert TestClient(app).get("/health").status_code == 200
 
 
+# --------------------------------------- P0 #4: Studio auth kill-switch lockdown
+
+
+def test_multi_tenant_rejects_studio_auth_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # Even with tenant-binding auth, HIMMY_STUDIO_AUTH=off under a multi-tenant posture
+    # re-opens the operator console to any authenticated principal → refused at startup.
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_STUDIO_AUTH", "off")
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_STUDIO_AUTH" in str(exc.value)
+
+
+def test_single_box_studio_auth_off_still_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No multi-tenant posture → HIMMY_STUDIO_AUTH=off is the documented single-user
+    # escape hatch and MUST NOT block startup.
+    monkeypatch.setenv("HIMMY_STUDIO_AUTH", "off")
+    app = create_app()
+    assert app.state.authenticator is None
+    assert TestClient(app).get("/health").status_code == 200
+
+
+# ------------------------------------------- P0 #4: OpenAPI auto-docs lockdown gate
+
+
+def test_docs_open_on_offline_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Zero-config offline default: the interactive docs + schema stay ENABLED.
+    app = create_app()
+    client = TestClient(app)
+    assert client.get("/openapi.json").status_code == 200
+    assert client.get("/docs").status_code == 200
+
+
+def test_docs_locked_when_authenticator_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # With auth configured, /openapi.json + /docs are suppressed (404) but /health stays open.
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    app = create_app()
+    client = TestClient(app)
+    assert client.get("/openapi.json").status_code == 404
+    assert client.get("/docs").status_code == 404
+    # /health is still a registered route (the docs gate only drops the schema/docs
+    # routes); it answers 200 to an authenticated caller rather than 404.
+    assert client.get("/health", headers={"x-himmy-internal-key": "mapped"}).status_code == 200
+
+
 def test_auth_mode_apikey_without_tenant_keys_refuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -243,6 +383,79 @@ def test_auth_mode_apikey_without_tenant_keys_refuses(
     monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "shared-secret")
     with pytest.raises(HimmyError):
         create_app()
+
+
+# ----------------------- red-team r2: keys-file-only (no env flag) engages the posture
+# A per-tenant HIMMY_API_KEYS_FILE is multi-tenant IN FACT even with NO HIMMY_MULTI_TENANT
+# / HIMMY_AUTH_MODE set. The env-flag-only detector silently skipped the whole posture for
+# such a deploy, so (a) a co-configured shared key stayed an all-tenants admin (the G1 hole
+# re-opened) and (b) HIMMY_STUDIO_AUTH=off was NOT refused. Both must now engage off the
+# authenticator's binds_tenants capability.
+
+
+def test_keys_file_only_demotes_shared_key_without_env_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A mapped keys file alone (no HIMMY_MULTI_TENANT) still DEMOTES a shared key (G1)."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    # Deliberately NO HIMMY_MULTI_TENANT / HIMMY_AUTH_MODE — only a tenant-mapped keys file.
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "shared-secret")
+    assert is_multi_tenant() is False  # the env flag is genuinely absent
+    auth = build_authenticator()
+    assert isinstance(auth, ApiKeyAuthenticator)
+    assert auth.binds_tenants is True
+    # The shared key must be demoted (NOT an all-tenants admin) purely off binds_tenants.
+    assert auth._shared_key_roles == DEMOTED_SHARED_KEY_ROLES
+
+
+def test_keys_file_only_refuses_studio_auth_off_without_env_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A mapped keys file alone makes HIMMY_STUDIO_AUTH=off a startup refusal (BOLA fix)."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_STUDIO_AUTH", "off")
+    assert is_multi_tenant() is False
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_STUDIO_AUTH" in str(exc.value)
+
+
+def test_keys_file_only_refuses_allow_unauthenticated_without_env_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A mapped keys file alone makes HIMMY_ALLOW_UNAUTHENTICATED a startup refusal."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    monkeypatch.setenv("HIMMY_ALLOW_UNAUTHENTICATED", "1")
+    assert is_multi_tenant() is False
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "HIMMY_ALLOW_UNAUTHENTICATED" in str(exc.value)
+
+
+def test_keys_file_only_clean_deploy_still_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A mapped keys file with no kill-switches starts cleanly (the posture is not over-broad)."""
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"mapped": {"subject": "u1", "tenant_ids": ["t1"]}})
+    )
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    app = create_app()
+    assert app.state.authenticator is not None
+    assert app.state.authenticator.binds_tenants is True
 
 
 class _Req:

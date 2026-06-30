@@ -31,19 +31,33 @@ _READ_SCHEMA = {
 
 
 def register_notes_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
-    """Register ``list_notes`` / ``read_note`` / ``write_note`` over the notes store."""
+    """Register ``list_notes`` / ``read_note`` / ``write_note`` over the notes store.
+
+    P1 tenancy: like the tasks pack, the ``notes`` tools reach the SAME singleton
+    ``.himmy/notes.db`` (and its Postgres mirror) the scoped REST routes use, so a
+    tenant-bound run would otherwise read + overwrite EVERY tenant's notes through the tool
+    path. The run's owning workspace is threaded in via ``config.tenant_scope`` and passed as
+    the store's ``workspace_id`` so the agent's reads are filtered and its writes stamped
+    exactly like the REST caller. ``None`` (offline / one-shot CLI) is "no scoping", so the
+    zero-config single-box path is byte-for-byte unchanged.
+    """
     from himmy.api.studio_notes import Note, get_notes_store
+
+    # ``scoped_pack_workspace`` is the tenant id for a tenant-only run (byte-unchanged) and
+    # the combined ``t:<tenant>:s:<subject>`` token under a subject_scoped principal, so two
+    # users of one tenant never share a note partition. ``None`` offline = no scoping.
+    scope = config.scoped_pack_workspace()
 
     def list_notes(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "notes": [
                 {"title": n.title, "updated_at": n.updated_at}
-                for n in get_notes_store().list()
+                for n in get_notes_store().list(workspace_id=scope)
             ]
         }
 
     def read_note(args: dict[str, Any]) -> dict[str, Any]:
-        note = get_notes_store().find_by_title(str(args["title"]))
+        note = get_notes_store().find_by_title(str(args["title"]), workspace_id=scope)
         if note is None:
             return {"found": False}
         return {"found": True, "title": note.title, "body": note.body}
@@ -51,10 +65,12 @@ def register_notes_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     def write_note(args: dict[str, Any]) -> dict[str, Any]:
         store = get_notes_store()
         title = str(args["title"])
-        existing = store.find_by_title(title)
+        # ``for_write``: a bound tenant only matches its OWN note (not a legacy NULL note),
+        # so write_note creates a fresh tenant-owned note rather than clobbering a shared one.
+        existing = store.find_by_title(title, workspace_id=scope, for_write=True)
         note = existing or Note(title=title)
         note.body = str(args["body"])
-        store.upsert(note)
+        store.upsert(note, workspace_id=scope)
         return {"saved": True, "title": title}
 
     register_local_tool(

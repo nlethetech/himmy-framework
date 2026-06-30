@@ -297,6 +297,105 @@ def test_worker_acquires_sqlite_host_leadership_and_starts_scheduler(
     assert get_scheduler().active is False  # stopped on teardown
 
 
+def test_worker_scheduler_disabled_by_edge_falsy_token_n(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``HIMMY_ROUTINES_SCHEDULER=n`` disables the worker scheduler (canonical vocabulary).
+
+    Regression for the two-readers/two-vocabularies bypass: the ad-hoc worker parse honored
+    only ``off/0/false/no`` so ``=n`` left the scheduler ENABLED here while
+    studio_routines.py's ``not env_falsy(...)`` (which recognises ``n``) DISABLED it. Now the
+    worker routes through ``env_falsy`` too, so ``=n`` disables the scheduler in both — the
+    leadership bid is never even attempted.
+    """
+    import asyncio as _asyncio
+
+    import himmy.cli.commands as commands_mod
+    from himmy.api.routines import get_scheduler, reset_scheduler
+
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "n")
+    reset_scheduler()
+
+    started = {"n": 0}
+    real_start = type(get_scheduler()).start
+
+    def _spy_start(self: Any) -> None:
+        started["n"] += 1
+        return real_start(self)
+
+    monkeypatch.setattr(type(get_scheduler()), "start", _spy_start)
+    reset_scheduler()
+
+    acquired = {"n": 0}
+    import himmy.api.scheduler_leader as leader_mod
+
+    async def _never_acquire(*_a: Any, **_k: Any) -> Any:  # pragma: no cover - must not run
+        acquired["n"] += 1
+        raise AssertionError("leadership must not be bid when scheduler is disabled")
+
+    monkeypatch.setattr(leader_mod, "acquire_scheduler_leadership", _never_acquire)
+
+    class _InstantEvent(_asyncio.Event):
+        async def wait(self) -> bool:
+            return True
+
+    monkeypatch.setattr(_asyncio, "Event", _InstantEvent)
+
+    run_async(commands_mod._run_worker(run_scheduler=True, run_dispatcher=True))
+
+    assert started["n"] == 0, "=n must DISABLE the scheduler (canonical falsy vocabulary)"
+    assert acquired["n"] == 0, "no leadership bid when the scheduler is disabled"
+
+
+def test_worker_require_ack_honored_for_edge_truthy_token_y(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``HIMMY_SCHEDULER_REQUIRE_ACK=y`` requires single-scheduler ack in the worker.
+
+    Regression for the ad-hoc truthy vocabulary (``1/true/yes/on`` only) that silently
+    dropped ``y`` — diverging from studio_routines.py's ``env_truthy`` which recognises it.
+    We capture the ``require_single_scheduler_ack`` kwarg the worker passes to
+    ``acquire_scheduler_leadership`` and assert it is ``True`` for ``=y``.
+    """
+    import asyncio as _asyncio
+
+    import himmy.api.scheduler_leader as leader_mod
+    import himmy.cli.commands as commands_mod
+    from himmy.api.routines import reset_scheduler
+
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "on")
+    monkeypatch.setenv("HIMMY_SCHEDULER_REQUIRE_ACK", "y")
+    reset_scheduler()
+
+    captured: dict[str, Any] = {}
+
+    class _Leadership:
+        is_leader = False
+        mode = "stub"
+        reason = "stubbed for ack-vocabulary assertion"
+
+        async def release(self) -> None:
+            return None
+
+    async def _spy_acquire(active: Any, *, require_single_scheduler_ack: bool = False) -> Any:
+        captured["require_ack"] = require_single_scheduler_ack
+        return _Leadership()
+
+    monkeypatch.setattr(leader_mod, "acquire_scheduler_leadership", _spy_acquire)
+
+    class _InstantEvent(_asyncio.Event):
+        async def wait(self) -> bool:
+            return True
+
+    monkeypatch.setattr(_asyncio, "Event", _InstantEvent)
+
+    run_async(commands_mod._run_worker(run_scheduler=True, run_dispatcher=True))
+
+    assert captured.get("require_ack") is True, (
+        "=y must require single-scheduler ack (canonical truthy vocabulary)"
+    )
+
+
 def test_sqlite_second_scheduler_refused_but_first_runs(
     workspace: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -387,6 +486,126 @@ def test_run_now_records_durable_run_with_routine_actor(
     assert meta.get("source") == "routine"
     assert meta.get("routine_id") == routine.id
     assert (meta.get("actor") or {}).get("routine_id") == routine.id
+
+
+# ----------------------------------------- worker tool-capability gate (P0)
+
+
+def _drive_worker_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the worker async body once (instant block, no real signal)."""
+    import asyncio as _asyncio
+
+    import himmy.cli.commands as commands_mod
+    from himmy.api.routines import reset_scheduler
+
+    monkeypatch.setenv("HIMMY_ROUTINES_SCHEDULER", "off")
+    reset_scheduler()
+
+    class _InstantEvent(_asyncio.Event):
+        async def wait(self) -> bool:
+            return True
+
+    monkeypatch.setattr(_asyncio, "Event", _InstantEvent)
+    run_async(commands_mod._run_worker(run_scheduler=False, run_dispatcher=True))
+
+
+def test_worker_wires_tool_authz_when_authenticator_configured(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REGRESSION: the worker wires the tool-capability gate under a configured authenticator.
+
+    The `himmy worker` node drains the SAME durable queue / ticks routines as the API
+    server, but historically wired NEITHER half of the gate: ``mark_auth_configured`` was
+    never called and ``run_app._access_policy`` was never set. So a least-privilege tenant's
+    run/routine dispatched on a worker executed with the agent's FULL toolset (a cross-process
+    confused-deputy escalation). Assert both halves engage when an authenticator is configured.
+    """
+    import json
+
+    from himmy.api.runtime_bootstrap import build_durable_container, start_run_substrate
+    from himmy.services.storage.factory import reset_server_context, set_server_context
+    from himmy.services.tools.ambient import auth_is_configured, mark_auth_configured
+
+    # A tenant-mapped keys file → build_authenticator() returns a tenant-binding authenticator
+    # (passes the multi-tenant posture refusal AND engages the gate).
+    keys = workspace / "keys.json"
+    keys.write_text(
+        json.dumps(
+            {"tenant-key": {"subject": "u", "tenant_ids": ["acme"], "roles": ["operator"]}}
+        )
+    )
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys))
+    # Reset the process-wide sentinel so we observe the worker flip it (not a prior app).
+    mark_auth_configured(False)
+
+    _drive_worker_once(monkeypatch)
+
+    # The sentinel is ON → the chokepoint fails CLOSED when a path reaches it un-scoped.
+    assert auth_is_configured() is True
+
+    # And the run_app carries the RBAC policy so it rebuilds a per-run capability gate from
+    # each claimed run's actor metadata. Re-derive the substrate's run_app to inspect it.
+    async def _check_policy() -> None:
+        token = set_server_context(True)
+        try:
+            container, _ = await build_durable_container()
+            from himmy.api.runtime_bootstrap import (
+                stop_run_substrate,
+                wire_tool_authz,
+            )
+
+            substrate = await start_run_substrate(container, install_providers=True)
+            try:
+                engaged = wire_tool_authz(getattr(substrate.active, "run_app", None))
+                assert engaged is True
+                run_app = substrate.active.run_app
+                assert run_app._access_policy is not None
+            finally:
+                await stop_run_substrate(substrate, clear_providers=True)
+        finally:
+            reset_server_context(token)
+
+    run_async(_check_policy())
+    mark_auth_configured(False)  # restore the process default for later tests
+
+
+def test_worker_leaves_gate_off_when_no_authenticator(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INVARIANT: with NO authenticator the worker leaves the gate OFF (offline byte-unchanged).
+
+    The chokepoint stays a pure pass and ``run_app._access_policy`` is unset — exactly like
+    the FastAPI body, so the zero-config worker path is unchanged.
+    """
+    from himmy.services.tools.ambient import auth_is_configured, mark_auth_configured
+
+    monkeypatch.delenv("HIMMY_API_KEYS_FILE", raising=False)
+    monkeypatch.delenv("HIMMY_AUTH_MODE", raising=False)
+    monkeypatch.delenv("HIMMY_INTERNAL_API_KEY", raising=False)
+    mark_auth_configured(True)  # poison it; the worker must flip it back OFF
+
+    _drive_worker_once(monkeypatch)
+
+    assert auth_is_configured() is False
+
+
+def test_worker_refuses_multi_tenant_posture_without_tenant_binding(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REGRESSION: a multi-tenant worker that cannot bind tenants refuses to start.
+
+    Parity with the FastAPI server's ``_enforce_multi_tenant_posture``: a shared-key-only
+    (non-tenant-binding) authenticator under a declared multi-tenant posture would run every
+    claimed run as an all-tenants admin — the worker must refuse, not start.
+    """
+    from himmy.core.errors import HimmyError
+
+    monkeypatch.delenv("HIMMY_API_KEYS_FILE", raising=False)
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_INTERNAL_API_KEY", "shared-only-key")
+
+    with pytest.raises(HimmyError):
+        _drive_worker_once(monkeypatch)
 
 
 def test_run_now_agent_id_without_durable_store_is_refused(
