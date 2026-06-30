@@ -96,6 +96,12 @@ async def export_audit_bundle_route(request: Request) -> AuditBundle:
             )
             or (
                 r.kind != PRIVACY_AUDIT_REPORT_KIND
+                # rbac-allow-global: a None-stamped SECURITY_EVENT is a GLOBAL/ops
+                # security event with no tenant dimension and no cross-tenant
+                # subject_refs (see the asymmetric-scoping note above) — benign to
+                # surface to any tenant-bound auditor, matching /events. This is the
+                # documented genuinely-global opt-out from the fail-open None-stamp gate
+                # (tests/api/test_rbac_failopen_filter_coverage.py::_GLOBAL_ROW_OPT_OUTS).
                 and r.metadata.get("workspace_id") in (None, workspace_id)
             )
         ]
