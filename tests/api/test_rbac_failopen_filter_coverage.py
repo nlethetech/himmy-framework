@@ -1,4 +1,4 @@
-"""failopen-lint — the structural gate against the fail-OPEN None-stamp filter class.
+"""failopen-lint — the structural gate against the fail-OPEN ``in (None, scope)`` filter shape.
 
 The recurring tenancy root cause across this hardening effort was a *lenient* tenant
 filter that fails OPEN on an UNSTAMPED record:
@@ -13,14 +13,29 @@ BELOW the route's ``resolve_workspace`` scoping gate, so the route-coverage gate
 The fixes replaced these with STRICT ``== workspace_id`` for the tenant-bound branch,
 keeping the lenient form ONLY behind an ``all_tenants`` (offline / admin) guard.
 
-This test is the recurrence guard for that class — the spiritual sibling of the
+SCOPE OF THIS GATE — be precise: this lint covers the ``<scope-expr> in (None, ...)``
+*membership-LITERAL* shape ONLY. It is **not** full coverage of the broader "admit a
+NULL-tenant row" class. The two SIBLING shapes of that same class — a record-side
+``<scope> is None or <scope> == workspace_id`` BoolOp (e.g.
+``himmy/api/studio_approvals.py`` ``list_pending``,
+``himmy/api/studio_tenant_scope.py:row_in_scope``) and the SQL
+``... OR <column> IS NULL`` fragment (``himmy/api/studio_tenant_scope.py:scope_clause``)
+— are deliberately NOT matched here. Those are the audited, intentional legacy-NULL-visibility
+design: a ``NULL`` stamp predates tenant binding and belongs to no tenant, so a bound reader
+is allowed to see its own rows AND those legacy rows (mirroring
+:func:`himmy.api.auth.context.authorize_studio_object`). ``studio_tenant_scope.row_in_scope``
+/ ``scope_clause`` are the AUDITED HOME of the ``IS NULL`` variant; review NULL-visibility
+changes there, not here. Keeping this gate scoped to the literal shape keeps it a precise,
+low-false-positive recurrence guard rather than a blanket NULL-visibility ban.
+
+Within its shape, this test is the recurrence guard — the spiritual sibling of the
 route-coverage and tool-gate structural gates. It walks the reader/store/service SOURCE
 TREE and FAILS if a module contains a record-side ``<tenant-field> in (None, ...)``
 membership filter UNLESS that site is one of:
 
-* **``all_tenants``-gated** — the lenient filter is lexically inside an ``if`` branch whose
-  test references ``all_tenants`` (the established offline/admin carve-out, so a
-  tenant-bound caller never reaches it); or
+* **``all_tenants``-gated** — the lenient filter is lexically inside the BODY of an ``if``
+  branch whose test references ``all_tenants`` (the established offline/admin carve-out, so a
+  tenant-bound caller takes the strict ``else`` arm and never reaches it); or
 * **an annotated genuinely-global opt-out** — the site carries a ``# rbac-allow-global``
   comment AND its ``(module, anchor)`` is enumerated in :data:`_GLOBAL_ROW_OPT_OUTS` with a
   written reason (e.g. a None-stamped global ops security event that has no tenant
@@ -28,8 +43,9 @@ membership filter UNLESS that site is one of:
 
 A NEW sibling reader that re-introduces a bare ``in (None, scope)`` fail-open filter —
 without an ``all_tenants`` guard and without a reasoned, annotated opt-out — FAILS here, so
-the class cannot reappear unnoticed. The analyzer is self-tested against a synthetic
-fail-open / strict / guarded triple so it genuinely WOULD catch a real omission.
+this SHAPE cannot reappear unnoticed. The analyzer is self-tested against a synthetic
+fail-open / strict / guarded triple (and the swapped-arm ``else``-body case) so it genuinely
+WOULD catch a real omission.
 """
 
 from __future__ import annotations
@@ -159,6 +175,12 @@ class _OfflineGuardLocator(ast.NodeVisitor):
     ``else`` arm. We collect ``(start, end)`` line spans of the BODY of every such branch so
     a filter's line can be tested for containment, robust to nesting and to the filter being
     a list-comprehension spanning multiple lines.
+
+    Crucially the span covers the ``if all_tenants:`` BODY ONLY — never its ``else``/``elif``
+    arms, which are the path a TENANT-BOUND caller takes. A lenient filter swapped into the
+    ``else`` arm (the strict arm's home) must therefore be flagged as an offender, not
+    sanctioned by proximity to the guard. We still recurse into ``orelse`` via
+    :meth:`generic_visit` so a nested guarded ``if`` there is handled normally.
     """
 
     def __init__(self) -> None:
@@ -169,9 +191,13 @@ class _OfflineGuardLocator(ast.NodeVisitor):
             body_nodes = node.body
             if body_nodes:
                 start = body_nodes[0].lineno
+                # The guarded span is the ``if all_tenants:`` BODY only. Walking each body
+                # statement (NOT ``node`` itself) excludes the ``else``/``elif`` arms, where a
+                # tenant-bound caller lands — a lenient filter there is a real offender.
                 end = max(
                     getattr(n, "end_lineno", n.lineno) or n.lineno
-                    for n in ast.walk(node)
+                    for stmt in body_nodes
+                    for n in ast.walk(stmt)
                     if hasattr(n, "lineno")
                 )
                 self.guarded_spans.append((start, end))
@@ -238,14 +264,18 @@ def _iter_offenders() -> list[str]:
 # --------------------------------------------------------------------------- the gate
 
 
-def test_no_unsanctioned_failopen_none_stamp_filter() -> None:
+def test_no_unsanctioned_failopen_in_none_literal_filter() -> None:
     """No tenant-scoped reader admits unstamped rows via a bare ``in (None, scope)`` filter.
 
-    Every record-side ``<scope> in (None, ...)`` membership filter in the reader/store/
-    service tree must be either gated by ``all_tenants`` (offline/admin carve-out, so a
-    tenant-bound caller takes the strict ``== workspace_id`` arm) or an annotated, reasoned
-    genuinely-global opt-out in :data:`_GLOBAL_ROW_OPT_OUTS`. A new sibling reader that
-    re-introduces the fail-open pattern surfaces here.
+    Gates the ``<scope-expr> in (None, ...)`` membership-LITERAL shape only (see the module
+    docstring: the ``is None or ==`` BoolOp and the SQL ``OR ... IS NULL`` variants are the
+    audited, intentional legacy-NULL-visibility design homed in
+    ``himmy.api.studio_tenant_scope`` and are out of scope here). Every record-side
+    ``<scope> in (None, ...)`` filter in the reader/store/service tree must be either gated by
+    ``all_tenants`` (offline/admin carve-out, so a tenant-bound caller takes the strict
+    ``== workspace_id`` arm) or an annotated, reasoned genuinely-global opt-out in
+    :data:`_GLOBAL_ROW_OPT_OUTS`. A new sibling reader that re-introduces this fail-open
+    LITERAL pattern surfaces here.
     """
     offenders = _iter_offenders()
     assert not offenders, (
@@ -376,6 +406,59 @@ def test_analyzer_passes_an_all_tenants_guarded_filter() -> None:
     spans = _guarded_spans(guarded)
     # The single lenient (None-tuple) candidate must fall inside the all_tenants span.
     assert _line_in_spans(compares[0].lineno, spans)
+
+
+def test_analyzer_flags_lenient_filter_in_else_arm_of_all_tenants() -> None:
+    """A lenient filter in the ``else`` arm of ``if all_tenants:`` is an OFFENDER, not safe.
+
+    The ``else``/``elif`` arm of ``if all_tenants:`` is exactly the path a TENANT-BOUND caller
+    takes — a lenient ``in (None, scope)`` filter there fails OPEN for that caller. This is the
+    swapped-arm regression (lenient and strict arms transposed in ``services.py``): the guard
+    span must NOT swallow the ``else`` body, so the filter is reported.
+    """
+    swapped = ast.parse(
+        "def read(rows, workspace_id, all_tenants):\n"
+        "    if all_tenants:\n"
+        "        rows = [r for r in rows if r.workspace_id == workspace_id]\n"
+        "    else:\n"
+        "        rows = [r for r in rows if r.workspace_id in (None, workspace_id)]\n"
+        "    return rows\n"
+    )
+    compares = _failopen_compares(swapped)
+    assert compares, "the lenient else-arm branch should be detected as a candidate"
+    spans = _guarded_spans(swapped)
+    # The lenient filter is in the `else` arm (tenant-bound path) — it must NOT be inside the
+    # `if all_tenants:` guarded span, so it would be reported as an offender.
+    assert not _line_in_spans(compares[0].lineno, spans), (
+        "a lenient filter in the `else` arm of `if all_tenants:` was wrongly treated as "
+        "guarded — the swapped-arm fail-open regression would slip through"
+    )
+
+
+def test_analyzer_handles_nested_guard_in_else_arm() -> None:
+    """A genuinely guarded ``if all_tenants:`` NESTED inside an ``else`` arm is still honored.
+
+    Narrowing the span to the ``if`` body must not stop recursion: a nested ``all_tenants``
+    guard living in some outer ``else`` arm still sanctions its own body.
+    """
+    nested = ast.parse(
+        "def read(rows, workspace_id, mode, all_tenants):\n"
+        "    if mode:\n"
+        "        rows = [r for r in rows if r.workspace_id == workspace_id]\n"
+        "    else:\n"
+        "        if all_tenants:\n"
+        "            rows = [r for r in rows if r.workspace_id in (None, workspace_id)]\n"
+        "        else:\n"
+        "            rows = [r for r in rows if r.workspace_id == workspace_id]\n"
+        "    return rows\n"
+    )
+    compares = _failopen_compares(nested)
+    assert compares, "the nested lenient branch should be detected as a candidate"
+    spans = _guarded_spans(nested)
+    assert _line_in_spans(compares[0].lineno, spans), (
+        "a lenient filter inside a nested `if all_tenants:` (itself in an else arm) should "
+        "still be recognised as the sanctioned offline/admin carve-out"
+    )
 
 
 def test_analyzer_ignores_non_scope_membership() -> None:
