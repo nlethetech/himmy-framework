@@ -92,6 +92,15 @@ class Mission:
     created_at: str
     workspace_id: str | None = None
     subject_id: str | None = None
+    #: The within-tenant USER axis (P1 tenancy, subject axis) the mission's TOOL STORES
+    #: (memory/KB/tasks/notes) namespace by — set from the launching ``subject_scoped``
+    #: principal at start time (NOT from ``subject_id``, which is attribution only). ``None``
+    #: keeps the tool stores tenant-only (the offline / ``all_tenants`` / non-subject-scoped
+    #: tenant default) so the byte-unchanged shared-tenant path is preserved. This is the
+    #: missing axis the interactive Studio path threads via ``owner_subject_scope`` — without
+    #: it a subject_scoped user's background-mission memory/KB/tasks collapse to the shared
+    #: tenant namespace (a cross-USER, same-tenant BOLA).
+    subject_scope: str | None = None
     status: str = _RUNNING
     finished_at: str | None = None
     result_preview: str = ""
@@ -180,6 +189,7 @@ class MissionRegistry:
         plan_mode: bool = False,
         workspace_id: str | None = None,
         subject_id: str | None = None,
+        subject_scope: str | None = None,
     ) -> Mission:
         """Spawn the existing stream-run generator inside a server-side task.
 
@@ -214,6 +224,7 @@ class MissionRegistry:
             created_at=utc_now_iso(),
             workspace_id=workspace_id,
             subject_id=subject_id,
+            subject_scope=subject_scope,
             history=list(history or []),
         )
         self._missions[mission.id] = mission
@@ -296,6 +307,16 @@ class MissionRegistry:
                     # bucket. ``None`` (offline / unowned) keeps the byte-unchanged default.
                     owner_workspace_id=mission.workspace_id,
                     owner_subject_id=mission.subject_id,
+                    # rbac-harden(mopup-r3-2): thread the within-tenant USER axis into the
+                    # mission's TOOL STORES so a subject_scoped user's background-mission
+                    # memory/KB/tasks/notes namespace by ``t:<tenant>:s:<subject>`` — exactly
+                    # like the interactive Studio path (studio.py owner_subject_scope). Without
+                    # this the packs collapse to the shared ``t:<tenant>`` namespace and two
+                    # users of one tenant read each other's mission memory (cross-USER BOLA).
+                    # ``None`` (offline / non-subject-scoped tenant) stays tenant-only,
+                    # byte-unchanged. NOTE: owner_subject_id alone only stamps the RunRecord
+                    # (attribution); it does NOT namespace the tool stores — only this does.
+                    owner_subject_scope=mission.subject_scope,
                 ):
                     await self._append(mission, frame)
                     ftype = frame.get("type")

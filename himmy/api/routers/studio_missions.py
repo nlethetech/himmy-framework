@@ -183,6 +183,15 @@ async def start_mission(body: MissionStartRequest, request: Request) -> dict[str
     principal = get_principal(request)
     owner_workspace = None if principal.all_tenants else resolve_workspace(request, None)
     owner_subject = None if principal.all_tenants else principal.subject
+    # rbac-harden(mopup-r3-2): the within-tenant USER axis the mission's tool stores must
+    # namespace by — the principal's subject ONLY for a subject_scoped, non-tenant_admin
+    # identity (a genuine per-user key), else ``None`` so the shared-tenant default is
+    # byte-unchanged. Derived identically to the interactive Studio path's
+    # ``owner_subject_scope`` (NOT from ``principal.subject`` / ``owner_subject``, which is
+    # attribution only and would over-scope a non-subject-scoped tenant).
+    from himmy.api.routers.studio import _run_subject_scope
+
+    owner_subject_scope = _run_subject_scope(request)
     try:
         mission = registry.start_mission(
             agent_path=body.agent_path,
@@ -193,6 +202,7 @@ async def start_mission(body: MissionStartRequest, request: Request) -> dict[str
             plan_mode=body.plan_mode,
             workspace_id=owner_workspace,
             subject_id=owner_subject,
+            subject_scope=owner_subject_scope,
         )
     except MissionLimitError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

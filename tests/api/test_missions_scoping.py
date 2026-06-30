@@ -211,6 +211,159 @@ def test_started_mission_is_stamped_with_caller_scope(project: Path) -> None:
     assert mission.subject_id == "alice"
 
 
+# ------------------------------------ tool-store subject namespacing (mopup-r3 BOLA)
+
+
+def test_subject_scoped_mission_threads_subject_scope_into_tool_stores(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rbac-harden(mopup-r3): a subject_scoped mission's TOOL STORES namespace by the user axis.
+
+    Regression for the confirmed high-severity cross-USER (same-tenant) BOLA: ``start_mission``
+    dropped the within-tenant subject axis, so two subject_scoped users of one tenant ran their
+    background-mission memory/KB/tasks/notes under the SHARED ``t:<tenant>`` namespace (alice's
+    mission ``remember`` was readable by bob's mission ``recall``). The fix threads the launcher's
+    ``_run_subject_scope`` onto ``Mission.subject_scope`` and into ``stream_agent_run`` as
+    ``owner_subject_scope`` — exactly like the interactive Studio path. This asserts BOTH:
+
+    1. the mission is STAMPED with the launcher's subject_scope (alice / bob, not None); and
+    2. ``_run_mission`` THREADS ``owner_subject_scope=mission.subject_scope`` into the run, so
+       ``ToolkitConfig.scoped_memory_subject`` lands at ``t:t:s:<subject>:default`` (distinct
+       per user) rather than the shared tenant-only ``t:t:default``.
+    """
+    from himmy.api import missions as missions_mod
+    from himmy.api import studio_service
+    from himmy.toolkit.config import ToolkitConfig
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_stream(spec, prompt, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        captured.append(dict(kwargs))
+        yield {"type": "done", "output_text": "ok", "run_id": "r"}
+
+    monkeypatch.setattr(studio_service, "stream_agent_run", _fake_stream)
+
+    # (1) the ROUTER stamps the mission with the launcher's within-tenant user axis.
+    for subject in ("alice", "bob"):
+        client, registry = _tenant_app(
+            tenant_ids=["t"],
+            roles=["admin"],
+            grants={"admin": ["*:*"]},
+            subject=subject,
+            subject_scoped=True,
+        )
+        r = client.post(
+            "/api/studio/missions",
+            json={"agent_path": "agent.yaml", "prompt": "remember x", "provider": "stub"},
+        )
+        assert r.status_code == 200, r.text
+        mission = registry.get(r.json()["mission_id"])
+        assert mission.subject_scope == subject, (
+            f"mission for {subject} must carry subject_scope={subject!r}, not "
+            f"{mission.subject_scope!r}"
+        )
+
+    # (2) ``_run_mission`` THREADS ``owner_subject_scope=mission.subject_scope`` into the run.
+    # Drive it on ONE event loop (the registry task is created on the request loop and cannot
+    # be awaited from a fresh loop, so exercise the runner directly with a stamped Mission).
+    async def _drive(subject: str) -> None:
+        reg = MissionRegistry()
+        m = Mission(
+            id=f"m-{subject}",
+            agent="helper",
+            agent_path="agent.yaml",
+            prompt="remember x",
+            provider="stub",
+            model=None,
+            plan_mode=False,
+            created_at=utc_now_iso(),
+            workspace_id="t",
+            subject_id=subject,
+            subject_scope=subject,
+        )
+        await reg._run_mission(m, spec=object())
+
+    for subject in ("alice", "bob"):
+        run_async(_drive(subject))
+
+    # Each run threaded owner_subject_scope = its launcher's subject — never None, never
+    # collapsed to the shared tenant. The two users get DISTINCT namespaces.
+    scopes = {kw.get("owner_subject_scope") for kw in captured}
+    assert scopes == {"alice", "bob"}, scopes
+    # Concretely: the per-user memory namespaces the packs derive do NOT collide (no
+    # cross-USER read). They also do NOT collapse to the shared tenant-only ``t:t:default``.
+    alice_subject = ToolkitConfig(
+        tenant_scope="t", subject_scope="alice"
+    ).scoped_memory_subject()
+    bob_subject = ToolkitConfig(
+        tenant_scope="t", subject_scope="bob"
+    ).scoped_memory_subject()
+    tenant_only = ToolkitConfig(tenant_scope="t").scoped_memory_subject()
+    assert alice_subject == "t:t:s:alice:default"
+    assert bob_subject == "t:t:s:bob:default"
+    assert alice_subject != bob_subject != tenant_only != alice_subject
+    assert missions_mod is not None  # module import sanity (runner under test)
+
+
+def test_non_subject_scoped_mission_stays_tenant_only(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A NON-subject-scoped tenant mission keeps the shared-tenant default (byte-unchanged).
+
+    The fix must NOT over-scope: for a tenant-bound but not ``subject_scoped`` principal (the
+    historical shared-tenant deployment), ``_run_subject_scope`` returns ``None`` so the mission's
+    ``subject_scope`` stays ``None`` and the tool stores remain tenant-only — preserving the
+    pre-fix behaviour. (Threading ``principal.subject`` here would wrongly partition the shared
+    tenant per user.)
+    """
+    from himmy.api import studio_service
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_stream(spec, prompt, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        captured.append(dict(kwargs))
+        yield {"type": "done", "output_text": "ok", "run_id": "r"}
+
+    monkeypatch.setattr(studio_service, "stream_agent_run", _fake_stream)
+
+    client, registry = _tenant_app(
+        tenant_ids=["t"],
+        roles=["admin"],
+        grants={"admin": ["*:*"]},
+        subject="u",
+        subject_scoped=False,
+    )
+    r = client.post(
+        "/api/studio/missions",
+        json={"agent_path": "agent.yaml", "prompt": "hi", "provider": "stub"},
+    )
+    assert r.status_code == 200, r.text
+    mission = registry.get(r.json()["mission_id"])
+    # The router stamps subject_scope=None for a non-subject-scoped tenant.
+    assert mission.subject_scope is None
+
+    # And the runner threads owner_subject_scope=None (tenant-only, byte-unchanged). Drive
+    # _run_mission directly on one loop (the request-loop task can't be awaited elsewhere).
+    async def _drive() -> None:
+        m = Mission(
+            id="m-u",
+            agent="helper",
+            agent_path="agent.yaml",
+            prompt="hi",
+            provider="stub",
+            model=None,
+            plan_mode=False,
+            created_at=utc_now_iso(),
+            workspace_id="t",
+            subject_id="u",
+            subject_scope=None,
+        )
+        await MissionRegistry()._run_mission(m, spec=object())
+
+    run_async(_drive())
+    assert captured and captured[-1].get("owner_subject_scope") is None
+
+
 # ------------------------------------------------------ capability amplification (r4)
 
 

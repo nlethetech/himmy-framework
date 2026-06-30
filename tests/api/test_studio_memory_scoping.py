@@ -135,10 +135,12 @@ def test_edit_cannot_rewrite_another_subjects_memory(memory_project: Path) -> No
     """
     from himmy.api import studio_memory
 
-    # Seed in the tenant's OWN namespace (the shape the route/agent stamps for tenant "t":
-    # ``t:t:<subject>``) so the cross-SUBJECT axis is what is exercised, not the tenant axis.
-    _seed("t:t:alice", "alice loves espresso")
-    victim_id = _seed("t:t:bob", "bob secret tea blend xyz")
+    # Seed in each user's OWN per-user namespace (the shape the route/agent stamps for a
+    # subject_scoped principal of tenant "t": ``t:t:s:<subject>:<memory_subject>``) so the
+    # cross-USER axis is what is exercised — bob's record lives outside alice's
+    # ``t:t:s:alice:`` namespace and the edit must fold to a uniform 404.
+    _seed("t:t:s:alice:default", "alice loves espresso")
+    victim_id = _seed("t:t:s:bob:default", "bob secret tea blend xyz")
 
     client = _subject_scoped_client("alice")
     resp = client.patch(f"/api/studio/memory/{victim_id}", json={"text": "poisoned"})
@@ -147,22 +149,22 @@ def test_edit_cannot_rewrite_another_subjects_memory(memory_project: Path) -> No
     # The victim's record is byte-unchanged: not poisoned, still its own subject/text.
     rec = studio_memory.get_memory(victim_id)
     assert rec is not None
-    assert rec.subject_id == "t:t:bob"
+    assert rec.subject_id == "t:t:s:bob:default"
     assert rec.text == "bob secret tea blend xyz"
 
 
 def test_edit_can_rewrite_own_subjects_memory(memory_project: Path) -> None:
     """A subject-scoped caller CAN still edit its OWN subject's memory (gate is not over-broad).
 
-    The own-subject record is seeded in the tenant's ``t:t:<subject>`` namespace — the exact
-    shape the Studio ``memory_add`` route and the agent memory pack stamp for tenant "t" — so
-    the edit gate strips the prefix before the subject comparison and the legitimate owner can
-    still rewrite. (Regression for the round-2 over-deny: an unstripped check 404'd one's own
-    namespaced memory.)
+    The own-subject record is seeded in the caller's OWN per-user namespace
+    ``t:t:s:<subject>:<memory_subject>`` — the exact shape the Studio ``memory_add`` route and
+    the agent memory pack stamp for a subject_scoped principal of tenant "t" — so the edit gate
+    matches the principal's prefix and the legitimate owner can still rewrite. (Regression for
+    the round-2 over-deny: an unstripped check 404'd one's own namespaced memory.)
     """
     from himmy.api import studio_memory
 
-    own_id = _seed("t:t:alice", "alice loves espresso")
+    own_id = _seed("t:t:s:alice:default", "alice loves espresso")
 
     client = _subject_scoped_client("alice")
     resp = client.patch(f"/api/studio/memory/{own_id}", json={"text": "alice loves tea"})
@@ -216,3 +218,95 @@ def test_offline_subjects_enumeration_returns_all(memory_project: Path) -> None:
     client = TestClient(app)
     subjects = client.get("/api/studio/memory/subjects").json()
     assert {"alice", "bob"} <= set(subjects)
+
+
+# ------------- console <-> agent namespace parity for subject_scoped (mopup-r3-1)
+
+
+def test_studio_console_and_agent_pack_share_one_namespace_for_subject_scoped(
+    memory_project: Path,
+) -> None:
+    """rbac-harden(mopup-r3-1): the Studio memory console and the agent pack share ONE namespace.
+
+    Regression for the confirmed functional-isolation skew: for a subject_scoped principal
+    (tenant=T, subject=A) the Studio console wrote/read ``t:T:A`` while the agent memory pack
+    (``ToolkitConfig.scoped_memory_subject``) wrote/read ``t:T:s:A:default`` — two disjoint
+    stores, so the console did not show what the agent recalled. The fix folds the within-tenant
+    subject axis into ``_memory_tenant_prefix`` so BOTH surfaces land on
+    ``t:t:s:alice:default``.
+
+    Proof: a memory the AGENT PACK stamps (its ``scoped_memory_subject`` subject) is recalled by
+    the Studio console (and listed/edited there) by the SAME subject_scoped principal — and a
+    memory the console adds lands at the exact subject the agent pack would read.
+    """
+    from himmy.api import studio_memory
+    from himmy.toolkit.config import ToolkitConfig
+
+    # The subject the agent memory pack would namespace by for tenant "t", user "alice".
+    agent_subject = ToolkitConfig(
+        tenant_scope="t", subject_scope="alice"
+    ).scoped_memory_subject()
+    assert agent_subject == "t:t:s:alice:default"
+
+    # The agent writes a fact under its pack namespace.
+    _seed(agent_subject, "alice agent fact espresso")
+
+    client = _subject_scoped_client("alice")
+
+    # The Studio console LISTS that exact fact (one shared namespace, prefix stripped to the
+    # bare memory-subject "default").
+    listed = client.get("/api/studio/memory", params={"subject": "default"}).json()
+    assert any("espresso" in m["text"] for m in listed), listed
+
+    # The Studio console RECALLS it semantically.
+    recalled = client.post(
+        "/api/studio/memory/recall",
+        json={"query": "espresso", "subject_id": "default", "top_k": 50},
+    ).json()
+    assert any("espresso" in h["text"] for h in recalled), recalled
+
+    # And a fact the CONSOLE adds lands at the SAME namespace the agent pack would read.
+    add = client.post(
+        "/api/studio/memory",
+        json={"text": "alice console fact latte", "subject_id": "default"},
+    )
+    assert add.status_code == 200, add.text
+    stored_id = add.json()["memory_id"]
+    rec = studio_memory.get_memory(stored_id)
+    assert rec is not None
+    assert rec.subject_id == agent_subject, (
+        f"console write landed at {rec.subject_id!r}, not the agent pack's {agent_subject!r}"
+    )
+
+
+def test_subject_scoped_console_cannot_read_other_users_agent_memory(
+    memory_project: Path,
+) -> None:
+    """The parity fix does NOT open a cross-USER read: bob's agent memory is invisible to alice.
+
+    The within-tenant user axis lives in the prefix (``t:t:s:<subject>:``), so alice's console
+    can never list/recall/edit bob's agent-written memory — the prefix string can't collide.
+    """
+    from himmy.toolkit.config import ToolkitConfig
+
+    bob_subject = ToolkitConfig(
+        tenant_scope="t", subject_scope="bob"
+    ).scoped_memory_subject()
+    victim_id = _seed(bob_subject, "bob agent secret tea blend xyz")
+
+    client = _subject_scoped_client("alice")
+    # List/recall under alice's namespace never surfaces bob's fact.
+    listed = client.get("/api/studio/memory", params={"subject": "default"}).json()
+    assert all("xyz" not in m["text"] for m in listed), listed
+    recalled = client.post(
+        "/api/studio/memory/recall",
+        json={"query": "tea blend", "subject_id": "default", "top_k": 50},
+    ).json()
+    assert all("xyz" not in h["text"] for h in recalled), recalled
+    # And a by-id edit of bob's record folds to a uniform 404 (cross-user write blocked).
+    assert (
+        client.patch(
+            f"/api/studio/memory/{victim_id}", json={"text": "poisoned"}
+        ).status_code
+        == 404
+    )

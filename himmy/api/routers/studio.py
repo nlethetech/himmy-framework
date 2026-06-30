@@ -1732,21 +1732,28 @@ class MemoryRecallRequest(BaseModel):
 
 
 def _memory_tenant_prefix(request: Request) -> str:
-    """The ``t:<workspace>:`` namespace prefix the Studio memory surface stamps onto subjects.
+    """The ``t:<scope_token>:`` namespace prefix the Studio memory surface stamps onto subjects.
 
-    The TENANT-axis fix for the process-wide memory store, which has NO ``workspace_id``
-    column: two tenants sharing one process/cwd-keyed ``.himmy/memory.db`` were isolated only
-    if their subject ids happened to differ (or, for a non-subject-scoped principal, not at
-    all). Rather than migrate the store, the Studio memory routes namespace the SUBJECT they
-    read/write/recall by the principal's resolved workspace — the SAME scheme the tool-layer
-    memory pack already uses (:meth:`ToolkitConfig.scoped_memory_subject` →
-    ``t:<tenant>:<subject>``), so a tenant-bound Studio console and that tenant's agents share
-    one namespace and NO other tenant's. Returns:
+    The TENANT(+within-tenant USER) axis fix for the process-wide memory store, which has NO
+    ``workspace_id`` column: two tenants — and, under a ``subject_scoped`` principal, two users
+    of ONE tenant — sharing one process/cwd-keyed ``.himmy/memory.db`` were isolated only if
+    their subject ids happened to differ. Rather than migrate the store, the Studio memory
+    routes namespace the SUBJECT they read/write/recall by the principal's scope token — the
+    SAME token the tool-layer memory pack uses (:meth:`ToolkitConfig.scoped_memory_subject` →
+    ``t:<tenant>[:s:<subject>]:<memory_subject>``), so a tenant-bound (or per-user) Studio
+    console and that same identity's agents share ONE namespace and NO other tenant's/user's.
+
+    rbac-harden(mopup-r3-1): the prefix now folds in the within-tenant SUBJECT axis (``:s:<subject>``)
+    for a ``subject_scoped`` principal, identical to :meth:`ToolkitConfig._scope_token`, so the
+    Studio console and the agent memory pack share one namespace per (tenant, user) — closing the
+    functional-isolation skew where the console wrote ``t:T:A`` while the agent wrote
+    ``t:T:s:A:default``. Returns:
 
     * ``""`` (empty) for an unrestricted principal (offline / ``all_tenants``) so the subject
-      is used verbatim — the zero-config single-box path is byte-for-byte unchanged; and
-    * ``t:<workspace>:`` for a tenant-bound principal, so every Studio memory read/write/recall
-      lives in that tenant's own namespace and a cross-tenant recall is structurally impossible.
+      is used verbatim — the zero-config single-box path is byte-for-byte unchanged;
+    * ``t:<tenant>:`` for a tenant-only (non-subject-scoped) principal — byte-unchanged; and
+    * ``t:<tenant>:s:<subject>:`` for a ``subject_scoped`` principal, so the console and that
+      user's agent runs share one namespace and a cross-user recall is structurally impossible.
     """
     principal = get_principal(request)
     if principal.all_tenants:
@@ -1754,14 +1761,20 @@ def _memory_tenant_prefix(request: Request) -> str:
     workspace = resolve_workspace(request, None)
     if not workspace:
         return ""
-    # Escape ``:`` in the workspace so a ``:``-bearing id (e.g. ``acme`` vs ``acme:eu``)
-    # can never yield a prefix that string-prefixes another tenant's namespace — a
-    # cross-tenant BOLA on the column-less shared store. Pure alphanumeric ids are
-    # byte-unchanged, so the offline / single-tenant path is untouched. Mirrors the
-    # tool-pack ``ToolkitConfig._scope_token`` escaping so both share one namespace.
-    from himmy.toolkit.config import tenant_namespace_segment
+    # Reuse the tool-pack's scope-token construction (tenant + optional ``:s:<subject>``) so the
+    # Studio console and the agent memory pack land in ONE namespace per (tenant, user). The
+    # ``tenant_namespace_segment`` escaping inside ``_scope_token`` prevents a ``:``-bearing
+    # id (e.g. ``acme`` vs ``acme:eu``) from string-prefixing another tenant's/user's namespace
+    # — a cross-scope BOLA on the column-less shared store. Pure alphanumeric ids are
+    # byte-unchanged, so the offline / single-tenant path is untouched.
+    from himmy.toolkit.config import ToolkitConfig
 
-    return f"t:{tenant_namespace_segment(workspace)}:"
+    token = ToolkitConfig(
+        tenant_scope=workspace, subject_scope=_run_subject_scope(request)
+    )._scope_token()
+    if not token:
+        return ""
+    return f"t:{token}:"
 
 
 def _scoped_memory_subject(request: Request, requested: str | None) -> str | None:
@@ -1777,14 +1790,29 @@ def _scoped_memory_subject(request: Request, requested: str | None) -> str | Non
     default / a ``tenant_admin`` — keeps ``requested`` as-is, so the zero-config path is
     byte-unchanged.
 
-    TENANT axis: the (subject-narrowed) value is additionally prefixed by
-    :func:`_memory_tenant_prefix` so a tenant-bound principal's effective subject lives in its
-    OWN ``t:<workspace>:`` namespace on the shared process store — closing the structural
-    tenant gap the ``scoped_read`` marker advertised. ``all_tenants`` / offline returns the
-    narrowed value unprefixed (byte-unchanged).
+    TENANT(+SUBJECT) axis: the value is additionally prefixed by :func:`_memory_tenant_prefix`
+    so a tenant-bound principal's effective subject lives in its OWN
+    ``t:<tenant>[:s:<subject>]:`` namespace on the shared process store — closing the structural
+    tenant (and within-tenant user) gap the ``scoped_read`` marker advertised. ``all_tenants`` /
+    offline returns the narrowed value unprefixed (byte-unchanged).
+
+    rbac-harden(mopup-r3-1): when the prefix already carries the within-tenant SUBJECT axis
+    (``:s:<subject>:``, the per-user ``subject_scoped`` case), the BOLA isolation comes from the
+    prefix itself, so the appended value is the requested MEMORY_SUBJECT verbatim (default
+    ``"default"``) — exactly mirroring the agent pack's ``t:<tenant>:s:<subject>:<memory_subject>``
+    so the Studio console and that user's agent runs share one namespace. For the tenant-only
+    (non-subject-scoped) prefix, ``narrow_subject`` is a no-op and the historical
+    ``t:<tenant>:<subject>`` shape is byte-unchanged.
     """
-    narrowed = narrow_subject(request, requested)
     prefix = _memory_tenant_prefix(request)
+    # When the prefix already encodes the within-tenant user (``:s:<subject>:``), the requested
+    # memory-subject flows through verbatim (the prefix is the isolation); otherwise narrow the
+    # subject to the principal's own (tenant-only / legacy BOLA gate — a no-op off the subject-
+    # scoped path).
+    if _run_subject_scope(request) is not None:
+        narrowed = requested
+    else:
+        narrowed = narrow_subject(request, requested)
     if not prefix:
         return narrowed
     return f"{prefix}{narrowed if narrowed is not None else 'default'}"
@@ -1808,10 +1836,13 @@ async def memory_subjects(request: Request) -> list[str]:
     """
     from himmy.api import studio_memory
 
-    # SUBJECT axis: a subject_scoped caller sees only its own subject. TENANT axis: the
-    # enumeration is restricted to this tenant's ``t:<workspace>:`` namespace and the prefix
-    # stripped, so a tenant-bound principal never sees another tenant's subject ids.
-    pinned = narrow_subject(request, None)
+    # TENANT(+SUBJECT) axis: the enumeration is restricted to this principal's
+    # ``t:<tenant>[:s:<subject>]:`` namespace and the prefix stripped, so a tenant-bound (or
+    # per-user) principal never sees another tenant's/user's subject ids. When the prefix
+    # already carries the within-tenant user (``:s:<subject>:``), the prefix IS the isolation
+    # and the stripped remainder is the free-form MEMORY_SUBJECT, so no further ``only_subject``
+    # narrowing applies; otherwise a subject_scoped caller is pinned to its own subject.
+    pinned = None if _run_subject_scope(request) is not None else narrow_subject(request, None)
     return studio_memory.list_subjects(
         only_subject=pinned, tenant_prefix=_memory_tenant_prefix(request)
     )
@@ -1861,10 +1892,16 @@ async def memory_add(body: MemoryAddRequest, request: Request) -> Any:
     """
     from himmy.api import studio_memory
 
-    enforce_subject_write(request, body.subject_id)
-    # TENANT axis: stamp the memory under the principal's OWN ``t:<workspace>:`` namespace on
-    # the shared process store so it is recallable only within this tenant (mirrors the
-    # tool-pack ``scoped_memory_subject``). ``all_tenants`` / offline writes the raw subject.
+    # TENANT(+SUBJECT) axis: stamp the memory under the principal's OWN
+    # ``t:<tenant>[:s:<subject>]:`` namespace on the shared process store so it is recallable
+    # only within this tenant (and, for a subject_scoped principal, this user) — mirroring the
+    # tool-pack ``scoped_memory_subject`` so the console and the agent share one namespace.
+    # ``all_tenants`` / offline writes the raw subject. When the prefix already carries the
+    # within-tenant user axis (``:s:<subject>:``) the BOLA isolation is structural, so the
+    # body ``subject_id`` is the free-form MEMORY_SUBJECT; otherwise the legacy by-id write
+    # gate pins it to the principal's own subject (a no-op off the subject-scoped path).
+    if _run_subject_scope(request) is None:
+        enforce_subject_write(request, body.subject_id)
     prefix = _memory_tenant_prefix(request)
     stored = studio_memory.add_memory(
         body.text, subject_id=f"{prefix}{body.subject_id}", kind=body.kind
@@ -1899,14 +1936,20 @@ async def memory_forget(memory_id: str, request: Request) -> dict[str, bool]:
         prefix = _memory_tenant_prefix(request)
         if prefix and not rec.subject_id.startswith(prefix):
             raise HTTPException(status_code=404, detail=f"unknown memory {memory_id!r}")
-        # SUBJECT axis (strip the tenant namespace before the BOLA subject check).
-        bare_subject = (
-            rec.subject_id[len(prefix) :]
-            if prefix and rec.subject_id.startswith(prefix)
-            else rec.subject_id
-        )
-        if not authorize_object(request, bare_subject):
-            raise HTTPException(status_code=404, detail=f"unknown memory {memory_id!r}")
+        # SUBJECT axis: when the prefix already carries the within-tenant user (``:s:<subject>:``)
+        # the prefix-match above IS the BOLA gate, and the stripped remainder is the free-form
+        # MEMORY_SUBJECT (not a data subject), so the by-id subject check is skipped. For the
+        # tenant-only / legacy path, strip the tenant namespace and apply the BOLA subject check.
+        if _run_subject_scope(request) is None:
+            bare_subject = (
+                rec.subject_id[len(prefix) :]
+                if prefix and rec.subject_id.startswith(prefix)
+                else rec.subject_id
+            )
+            if not authorize_object(request, bare_subject):
+                raise HTTPException(
+                    status_code=404, detail=f"unknown memory {memory_id!r}"
+                )
     return {"ok": studio_memory.forget(memory_id)}
 
 

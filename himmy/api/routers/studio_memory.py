@@ -62,7 +62,7 @@ async def memory_edit(
     ``all_tenants`` (empty prefix → byte-unchanged single-box path).
     """
     from himmy.api import studio_memory
-    from himmy.api.routers.studio import _memory_tenant_prefix
+    from himmy.api.routers.studio import _memory_tenant_prefix, _run_subject_scope
 
     text = body.text.strip()
     if not text:
@@ -71,20 +71,25 @@ async def memory_edit(
     record = service.get(memory_id)
     if record is None:
         raise HTTPException(status_code=404, detail="memory not found")
-    # TENANT axis: a cross-tenant record (different ``t:<workspace>:`` namespace) is
-    # a uniform 404 BEFORE the subject check, so existence never leaks across tenants.
+    # TENANT(+SUBJECT) axis: a record outside this principal's ``t:<tenant>[:s:<subject>]:``
+    # namespace is a uniform 404 BEFORE any further check, so existence never leaks across
+    # tenants/users. When the prefix already carries the within-tenant user (``:s:<subject>:``),
+    # this prefix-match IS the BOLA gate and the stripped remainder is the free-form
+    # MEMORY_SUBJECT (not a data subject), so the by-id subject check below is skipped.
     prefix = _memory_tenant_prefix(request)
     if prefix and not record.subject_id.startswith(prefix):
         raise HTTPException(status_code=404, detail="memory not found")
-    # SUBJECT axis: strip the tenant namespace so the bare subject (the owner the
-    # principal can be scoped to) is what ``authorize_object`` compares against.
-    bare_subject = (
-        record.subject_id[len(prefix) :]
-        if prefix and record.subject_id.startswith(prefix)
-        else record.subject_id
-    )
-    if not authorize_object(request, bare_subject):
-        raise HTTPException(status_code=404, detail="memory not found")
+    # SUBJECT axis (tenant-only / legacy path only): strip the tenant namespace so the bare
+    # subject (the owner the principal can be scoped to) is what ``authorize_object`` compares
+    # against. Off the subject-scoped path the prefix above carries no user axis.
+    if _run_subject_scope(request) is None:
+        bare_subject = (
+            record.subject_id[len(prefix) :]
+            if prefix and record.subject_id.startswith(prefix)
+            else record.subject_id
+        )
+        if not authorize_object(request, bare_subject):
+            raise HTTPException(status_code=404, detail="memory not found")
     updated = record.model_copy(update={"text": text})
     service.store.save(updated)
     # The service caches embeddings per memory_id in-process; a stale vector
