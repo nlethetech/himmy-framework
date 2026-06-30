@@ -53,12 +53,28 @@ class CalendarStore:
         return CalendarEvent(**data)
 
     def add(self, ev: CalendarEvent, *, workspace_id: str | None = None) -> CalendarEvent:
-        """Add an event, stamped with ``workspace_id`` (``None`` for the single local tenant)."""
+        """Add an event, stamped with ``workspace_id`` (``None`` for the single local tenant).
+
+        Re-stamp guard: a bound tenant upserting (``INSERT OR REPLACE``) onto an id owned by
+        another tenant or a legacy NULL row PRESERVES the existing owner rather than capturing
+        it. ``workspace_id is None`` (offline) is unchanged.
+        """
+        stamp = workspace_id
+        if workspace_id is not None:
+            from himmy.api.studio_tenant_scope import row_writable_in_scope
+
+            existing = self._conn.execute(
+                "SELECT workspace_id FROM calendar_events WHERE id = ?", (ev.id,)
+            ).fetchone()
+            if existing is not None and not row_writable_in_scope(
+                existing["workspace_id"], workspace_id
+            ):
+                stamp = existing["workspace_id"]
         self._conn.execute(
             "INSERT OR REPLACE INTO calendar_events "
             "(id, date, time, title, notes, created_at, workspace_id) "
             "VALUES (?,?,?,?,?,?,?)",
-            (ev.id, ev.date, ev.time, ev.title, ev.notes, ev.created_at, workspace_id),
+            (ev.id, ev.date, ev.time, ev.title, ev.notes, ev.created_at, stamp),
         )
         self._conn.commit()
         return ev
@@ -95,10 +111,14 @@ class CalendarStore:
     def delete(
         self, event_id: str, *, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        """Delete an event; a ``workspace_id``-scoped caller cannot delete a foreign event."""
-        from himmy.api.studio_tenant_scope import scope_clause
+        """Delete an event; a ``workspace_id``-scoped caller cannot delete a foreign event.
 
-        clause, params = scope_clause(workspace_id)
+        Strict WRITE clause (no ``OR IS NULL``): a legacy NULL-owned event is read-visible
+        but undeletable by a bound tenant.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id)
         extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
             f"DELETE FROM calendar_events WHERE id = ?{extra}", [event_id, *params]

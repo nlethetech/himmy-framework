@@ -75,11 +75,25 @@ class NotesStore:
         return self._row(row) if row else None
 
     def find_by_title(
-        self, title: str, *, workspace_id: str | frozenset[str] | None = None
+        self,
+        title: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+        for_write: bool = False,
     ) -> Note | None:
-        from himmy.api.studio_tenant_scope import scope_clause
+        """Find the newest note with ``title`` visible to ``workspace_id``.
 
-        clause, params = scope_clause(workspace_id)
+        ``for_write=True`` switches to the STRICT write clause (no ``OR IS NULL``) so a
+        title-keyed upsert by a bound tenant only ever matches its OWN note — never a legacy
+        NULL-owned note. Without this a bound tenant's ``write_note(title=...)`` would reuse a
+        shared/legacy note's id and overwrite its body (a cross-tenant write); ``for_write``
+        makes it create a fresh tenant-owned note instead.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause, scope_clause_write
+
+        clause, params = (
+            scope_clause_write(workspace_id) if for_write else scope_clause(workspace_id)
+        )
         extra = f" AND {clause}" if clause else ""
         row = self._conn.execute(
             f"SELECT * FROM notes WHERE title = ?{extra} "
@@ -89,12 +103,32 @@ class NotesStore:
         return self._row(row) if row else None
 
     def upsert(self, note: Note, *, workspace_id: str | None = None) -> Note:
-        """Upsert a note, stamping ``workspace_id`` (``None`` for the single local tenant)."""
+        """Upsert a note, stamping ``workspace_id`` (``None`` for the single local tenant).
+
+        Re-stamp guard: when a bound tenant (``workspace_id`` not None) upserts onto an id
+        that already exists but is NOT owned by that tenant (a legacy NULL row or a foreign
+        tenant's row), the row's owner is PRESERVED instead of being captured/clobbered — the
+        ``INSERT OR REPLACE`` keyed only on id would otherwise let a bound tenant steal a
+        shared/legacy note by re-stamping it. ``workspace_id is None`` (offline / shared key)
+        is unchanged: every upsert stamps NULL exactly as before.
+        """
         note.updated_at = utc_now_iso()
+        stamp = workspace_id
+        if workspace_id is not None:
+            from himmy.api.studio_tenant_scope import row_writable_in_scope
+
+            existing = self._conn.execute(
+                "SELECT workspace_id FROM notes WHERE id = ?", (note.id,)
+            ).fetchone()
+            if existing is not None and not row_writable_in_scope(
+                existing["workspace_id"], workspace_id
+            ):
+                # A bound tenant may not capture a legacy/foreign-owned row: keep its owner.
+                stamp = existing["workspace_id"]
         self._conn.execute(
             "INSERT OR REPLACE INTO notes (id, title, body, updated_at, workspace_id) "
             "VALUES (?,?,?,?,?)",
-            (note.id, note.title, note.body, note.updated_at, workspace_id),
+            (note.id, note.title, note.body, note.updated_at, stamp),
         )
         self._conn.commit()
         return note
@@ -102,10 +136,14 @@ class NotesStore:
     def delete(
         self, note_id: str, *, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        """Delete a note; a ``workspace_id``-scoped caller cannot delete a foreign note."""
-        from himmy.api.studio_tenant_scope import scope_clause
+        """Delete a note; a ``workspace_id``-scoped caller cannot delete a foreign note.
 
-        clause, params = scope_clause(workspace_id)
+        Strict WRITE clause (no ``OR IS NULL``): a legacy NULL-owned note is read-visible but
+        undeletable by a bound tenant.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id)
         extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
             f"DELETE FROM notes WHERE id = ?{extra}", [note_id, *params]

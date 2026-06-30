@@ -51,7 +51,10 @@ def register_tasks_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     """
     from himmy.api.studio_tasks import get_tasks_store
 
-    scope = config.tenant_scope
+    # ``scoped_pack_workspace`` is the tenant id for a tenant-only run (byte-unchanged) and
+    # the combined ``t:<tenant>:s:<subject>`` token under a subject_scoped principal, so two
+    # users of one tenant never share a task partition. ``None`` offline = no scoping.
+    scope = config.scoped_pack_workspace()
 
     def list_tasks(args: dict[str, Any]) -> dict[str, Any]:
         return {

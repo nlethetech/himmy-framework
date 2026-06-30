@@ -424,6 +424,9 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "agent_path TEXT, "
             "provider TEXT, "
             "project_id TEXT, "
+            # within-tenant workspace scope (nullable = legacy/CLI, visible to all);
+            # see migration 13 for the ADD COLUMN that reaches an existing database.
+            "workspace_id TEXT, "
             "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
             "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
             "PRIMARY KEY (tenant, conversation_id))",
@@ -447,6 +450,7 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "description TEXT NOT NULL DEFAULT '', "
             "kb_id TEXT, "
             "agent_path TEXT, "
+            "workspace_id TEXT, "
             "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
             "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
             "PRIMARY KEY (tenant, id))",
@@ -555,6 +559,9 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "link TEXT NOT NULL DEFAULT '', "
             "created_at TEXT NOT NULL, "
             "read BOOLEAN NOT NULL DEFAULT FALSE, "
+            # within-tenant workspace scope (nullable = legacy/offline, visible to all);
+            # see migration 12 for the ADD COLUMN that reaches an existing database.
+            "workspace_id TEXT, "
             "PRIMARY KEY (tenant, id))",
             "CREATE TABLE IF NOT EXISTS aux_notify_settings ("
             "tenant TEXT NOT NULL, "
@@ -761,6 +768,41 @@ STORAGE_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ALTER TABLE aux_recipes ADD COLUMN IF NOT EXISTS workspace_id TEXT",
             "CREATE INDEX IF NOT EXISTS aux_recipes_ws_idx "
             "ON aux_recipes (tenant, workspace_id)",
+        ],
+    ),
+    # ---- 12: the durable notify ring's within-tenant workspace scope ----------------------
+    # The notify mirror (``aux_notifications``) shipped WITHOUT a ``workspace_id`` column, so
+    # the producer's ``record_notification(..., workspace_id=...)`` stamp was silently dropped
+    # on the Postgres path: every row hydrated back NULL after a restart and ``_item_in_scope``
+    # then surfaced one tenant's mission previews to every other tenant. This additive,
+    # nullable column makes the durable round-trip preserve the stamp exactly like SQLite — a
+    # NULL row stays visible to all (legacy/offline), a stamped row only to its workspace.
+    (
+        12,
+        "aux_notifications_workspace_id",
+        [
+            "ALTER TABLE aux_notifications ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS aux_notifications_ws_idx "
+            "ON aux_notifications (tenant, workspace_id)",
+        ],
+    ),
+    # ---- 13: the unified conversation store's within-tenant workspace scope --------------
+    # The Studio chats + projects surfaces are backed by aux_conversations / aux_projects.
+    # Mirroring the SQLite ConversationStore migration, this additive + nullable column lets a
+    # tenant-bound Studio principal's transcripts/projects be isolated WITHIN the shared K4
+    # ``tenant='local'`` partition (the CLI ``himmy chat`` writer leaves it NULL → visible to
+    # all, byte-unchanged). Without it the Postgres path would leak cross-tenant exactly like
+    # the notify ring did pre-migration-12.
+    (
+        13,
+        "aux_conversations_workspace_id",
+        [
+            "ALTER TABLE aux_conversations ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS aux_conversations_ws_idx "
+            "ON aux_conversations (tenant, workspace_id)",
+            "ALTER TABLE aux_projects ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+            "CREATE INDEX IF NOT EXISTS aux_projects_ws_idx "
+            "ON aux_projects (tenant, workspace_id)",
         ],
     ),
 ]

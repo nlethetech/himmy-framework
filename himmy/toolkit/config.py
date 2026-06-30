@@ -119,6 +119,17 @@ class ToolkitConfig(BaseModel):
     #: zero-config path is byte-for-byte unchanged.
     tenant_scope: str | None = None
 
+    #: The run's owning DATA SUBJECT (P1 tenancy, subject axis), threaded in alongside
+    #: ``tenant_scope`` by the server run factory for a ``subject_scoped`` principal. On a
+    #: deployment that runs PER-USER principals inside ONE shared tenant, ``tenant_scope`` is
+    #: identical for every user, so memory/KB/tasks/notes would isolate by tenant but NOT by
+    #: user — user-B recalls user-A's facts (a cross-USER confused-deputy within the tenant).
+    #: When set, the memory subject, KB scope, and the tasks/notes pack workspace are
+    #: additionally NAMESPACED by this subject so two users of one tenant never collide.
+    #: ``None`` (offline / one-shot CLI / a non-``subject_scoped`` principal — the common
+    #: case) leaves the scope tenant-only, so the historical behaviour is byte-unchanged.
+    subject_scope: str | None = None
+
     # memory pack -----------------------------------------------------------
     memory_path: str | None = None  # sqlite file → durable; None → in-process
     memory_subject: str = "default"
@@ -134,32 +145,75 @@ class ToolkitConfig(BaseModel):
     # blindly appended. Off by default so a default agent incurs no extra cost.
     memory_consolidate: bool = False
 
-    def scoped_memory_subject(self) -> str:
-        """The memory subject to actually use, NAMESPACED by the run's tenant when set.
+    def _scope_token(self) -> str | None:
+        """The combined tenant(+subject) namespace token, or ``None`` for "unscoped".
 
-        The by-construction fix for the cross-tenant memory leak: on a shared process
-        store keyed only by subject, every tenant would otherwise read/write the one
-        static ``memory_subject`` (``"default"``). When ``tenant_scope`` is set (the
-        server multi-tenant path) the effective subject is prefixed with the tenant so
-        t1 and t2 never collide; ``None`` (offline / one-shot CLI / every pre-existing
-        caller) returns ``memory_subject`` verbatim — byte-for-byte unchanged.
+        ``tenant_scope`` is the tenant axis; ``subject_scope`` (a per-user data subject under
+        a ``subject_scoped`` principal) is the within-tenant USER axis. When BOTH are set the
+        token is ``<tenant>:s:<subject>`` so two users of one tenant get distinct namespaces;
+        tenant-only stays ``<tenant>`` (byte-unchanged for the non-subject-scoped common
+        case). ``subject_scope`` alone (no tenant) is folded in too. ``None`` everywhere is
+        "no scoping" — the offline / one-shot CLI path is byte-for-byte unchanged.
         """
+        if self.tenant_scope and self.subject_scope:
+            return f"{self.tenant_scope}:s:{self.subject_scope}"
         if self.tenant_scope:
-            return f"t:{self.tenant_scope}:{self.memory_subject}"
+            return self.tenant_scope
+        if self.subject_scope:
+            return f"s:{self.subject_scope}"
+        return None
+
+    def scoped_memory_subject(self) -> str:
+        """The memory subject to actually use, NAMESPACED by the run's tenant+subject when set.
+
+        The by-construction fix for the cross-tenant (and cross-USER) memory leak: on a
+        shared process store keyed only by subject, every tenant/user would otherwise
+        read/write the one static ``memory_subject`` (``"default"``). When the scope token is
+        set (the server multi-tenant / per-user path) the effective subject is prefixed with
+        the tenant(+subject) so t1/t2 — and two users of one tenant — never collide; an unset
+        token (offline / one-shot CLI / every pre-existing caller) returns ``memory_subject``
+        verbatim — byte-for-byte unchanged.
+        """
+        token = self._scope_token()
+        if token:
+            return f"t:{token}:{self.memory_subject}"
         return self.memory_subject
 
     def scoped_kb_keys(self) -> tuple[str, str]:
-        """The durable-KB ``(workspace_id, client_id)`` scope, tenant-namespaced when set.
+        """The durable-KB ``(workspace_id, client_id)`` scope, tenant+subject-namespaced when set.
 
         The knowledge pack pins its KB to a fixed ``(local, local, default)`` scope, so a
         shared durable (``HIMMY_KB_DSN`` / pgvector) backend hands EVERY tenant the same KB
-        — t1's ``kb_ingest`` chunks come back from t2's ``kb_search``. When ``tenant_scope``
-        is set the scope keys become the tenant's own; ``None`` keeps the historical
-        ``("local", "local")`` so the offline/in-process default is byte-for-byte unchanged.
+        — t1's ``kb_ingest`` chunks come back from t2's ``kb_search`` (and, under a
+        ``subject_scoped`` principal, user-A's come back from user-B's). When the scope token
+        is set the scope keys become the tenant's (and user's) own; an unset token keeps the
+        historical ``("local", "local")`` so the offline/in-process default is byte-unchanged.
         """
-        if self.tenant_scope:
-            return (f"t:{self.tenant_scope}", f"t:{self.tenant_scope}")
+        token = self._scope_token()
+        if token:
+            return (f"t:{token}", f"t:{token}")
         return ("local", "local")
+
+    def scoped_pack_workspace(self) -> str | None:
+        """The ``workspace_id`` the tasks/notes packs scope by — tenant(+subject) namespaced.
+
+        The tasks/notes packs key the singleton SQLite store by a single ``workspace_id``.
+        Tenant-only that is the tenant id; under a ``subject_scoped`` principal it becomes the
+        combined ``t:<tenant>:s:<subject>`` token so two users of one tenant get distinct,
+        non-overlapping task/note partitions (the store's scope clauses treat it as an opaque
+        owner string). ``None`` (offline / non-subject-scoped tenant-only … see below) keeps
+        the historical behaviour.
+
+        NOTE: when ONLY ``tenant_scope`` is set (no subject) this returns the bare tenant id —
+        byte-identical to the previous ``config.tenant_scope`` the packs passed — so the
+        tenant-only path is unchanged; the subject namespace engages only for a per-user run.
+        """
+        token = self._scope_token()
+        if self.subject_scope and token:
+            # per-user run: opaque combined owner so users of one tenant never collide.
+            return f"t:{token}"
+        # tenant-only (or unscoped): preserve the historical bare tenant id / None.
+        return self.tenant_scope
 
     def build_embedder_and_dim(self) -> tuple[Any, int]:
         """Build the configured embedder and its effective embedding dimension.

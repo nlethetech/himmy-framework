@@ -2185,6 +2185,18 @@ class RunAppService:
         # thread it into the per-run runtime (no-op offline / when no RBAC policy is wired).
         tool_authorizer = self._build_tool_authorizer(actor)
 
+        # P1 tenancy (subject axis): under a subject_scoped per-user actor, namespace this
+        # run's memory/KB/tasks/notes tool stores by the user so two users of ONE tenant never
+        # read each other's facts/docs/tasks. The flag is persisted in ``actor`` by
+        # ``Principal.actor_metadata`` (stamped only when actually subject_scoped + not a
+        # tenant_admin), so a non-subject-scoped / offline run leaves the scope tenant-only
+        # (``None``) — byte-for-byte unchanged.
+        subject_scope = (
+            actor.get("subject")
+            if actor and actor.get("subject_scoped")
+            else None
+        )
+
         runtime, registry = await asyncio.to_thread(
             build_runtime_for_spec,
             agent_spec,
@@ -2192,6 +2204,7 @@ class RunAppService:
             storage=self._storage,
             checkpoint_store=checkpoint_store,
             subject=workspace_id,
+            subject_scope=subject_scope,
             tool_authorizer=tool_authorizer,
         )
         runtime = cast("SingleAgentRuntime", runtime)

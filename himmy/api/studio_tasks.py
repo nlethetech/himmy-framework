@@ -118,10 +118,14 @@ class TasksStore:
         *,
         workspace_id: str | frozenset[str] | None = None,
     ) -> bool:
-        """Mark a task done/undone; a ``workspace_id``-scoped caller cannot touch a foreign row."""
-        from himmy.api.studio_tenant_scope import scope_clause
+        """Mark a task done/undone; a ``workspace_id``-scoped caller cannot touch a foreign row.
 
-        clause, params = scope_clause(workspace_id)
+        Uses the strict WRITE clause (no ``OR IS NULL``) so a bound tenant can mutate only its
+        OWN rows — a legacy NULL-owned row is read-visible but immutable to a bound tenant.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id)
         extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
             f"UPDATE tasks SET done = ? WHERE id = ?{extra}",
@@ -145,10 +149,15 @@ class TasksStore:
         field without clobbering the others. ``due`` cannot be cleared through this method
         (None means "leave as is") — that's deliberate parity with the add() signature.
         """
-        from himmy.api.studio_tenant_scope import scope_clause
+        from himmy.api.studio_tenant_scope import scope_clause, scope_clause_write
 
-        clause, scope_params = scope_clause(workspace_id)
-        extra = f" AND {clause}" if clause else ""
+        # WRITE uses the strict clause (no OR IS NULL): a bound tenant may edit only its OWN
+        # rows, so a legacy NULL row is never clobbered/re-stamped through this path.
+        write_clause, write_params = scope_clause_write(workspace_id)
+        write_extra = f" AND {write_clause}" if write_clause else ""
+        # READ-back uses the visibility clause so the (already-written) row is returned.
+        read_clause, read_params = scope_clause(workspace_id)
+        read_extra = f" AND {read_clause}" if read_clause else ""
         sets: list[str] = []
         vals: list[object] = []
         if due is not None:
@@ -162,24 +171,24 @@ class TasksStore:
             vals.append(int(done))
         if sets:
             vals.append(task_id)
-            vals.extend(scope_params)
+            vals.extend(write_params)
             cur = self._conn.execute(
-                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?{extra}", vals
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?{write_extra}", vals
             )
             self._conn.commit()
             if cur.rowcount == 0:
                 return None
         row = self._conn.execute(
-            f"SELECT * FROM tasks WHERE id = ?{extra}", [task_id, *scope_params]
+            f"SELECT * FROM tasks WHERE id = ?{read_extra}", [task_id, *read_params]
         ).fetchone()
         return self._row(row) if row is not None else None
 
     def complete_by_title(
         self, title: str, *, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        from himmy.api.studio_tenant_scope import scope_clause
+        from himmy.api.studio_tenant_scope import scope_clause_write
 
-        clause, params = scope_clause(workspace_id)
+        clause, params = scope_clause_write(workspace_id)
         extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
             f"UPDATE tasks SET done = 1 WHERE title = ? AND done = 0{extra}",
@@ -191,10 +200,14 @@ class TasksStore:
     def delete(
         self, task_id: str, *, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        """Delete a task; a ``workspace_id``-scoped caller cannot delete a foreign row."""
-        from himmy.api.studio_tenant_scope import scope_clause
+        """Delete a task; a ``workspace_id``-scoped caller cannot delete a foreign row.
 
-        clause, params = scope_clause(workspace_id)
+        Strict WRITE clause (no ``OR IS NULL``): a bound tenant can delete only its OWN rows;
+        a legacy NULL-owned row is read-visible but undeletable by a bound tenant.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id)
         extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
             f"DELETE FROM tasks WHERE id = ?{extra}", [task_id, *params]

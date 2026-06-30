@@ -732,6 +732,7 @@ async def stream_agent_run(
     extra_metadata: dict[str, Any] | None = None,
     owner_workspace_id: str | None = None,
     owner_subject_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run an agent for one user turn, yielding GUI events.
 
@@ -809,6 +810,11 @@ async def stream_agent_run(
             # principal) leaves both packs on their historical static scope — byte-for-byte
             # unchanged, so the zero-config path is untouched.
             subject=owner_workspace_id,
+            # P1 tenancy (subject axis): under a subject_scoped per-user principal this
+            # additionally namespaces the memory/KB/tasks/notes tool stores by the user so two
+            # users of ONE tenant never read each other's facts/docs/tasks. ``None`` (the
+            # common non-subject-scoped / offline case) keeps the scope tenant-only.
+            subject_scope=owner_subject_scope,
         )
     )
     has_tools = registry is not None

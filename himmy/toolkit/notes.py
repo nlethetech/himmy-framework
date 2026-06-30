@@ -43,7 +43,10 @@ def register_notes_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     """
     from himmy.api.studio_notes import Note, get_notes_store
 
-    scope = config.tenant_scope
+    # ``scoped_pack_workspace`` is the tenant id for a tenant-only run (byte-unchanged) and
+    # the combined ``t:<tenant>:s:<subject>`` token under a subject_scoped principal, so two
+    # users of one tenant never share a note partition. ``None`` offline = no scoping.
+    scope = config.scoped_pack_workspace()
 
     def list_notes(args: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -62,7 +65,9 @@ def register_notes_pack(registry: ToolRegistry, config: ToolkitConfig) -> None:
     def write_note(args: dict[str, Any]) -> dict[str, Any]:
         store = get_notes_store()
         title = str(args["title"])
-        existing = store.find_by_title(title, workspace_id=scope)
+        # ``for_write``: a bound tenant only matches its OWN note (not a legacy NULL note),
+        # so write_note creates a fresh tenant-owned note rather than clobbering a shared one.
+        existing = store.find_by_title(title, workspace_id=scope, for_write=True)
         note = existing or Note(title=title)
         note.body = str(args["body"])
         store.upsert(note, workspace_id=scope)

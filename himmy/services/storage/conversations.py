@@ -271,11 +271,31 @@ class ConversationStore:
         }
         if "subject_id" not in cols:
             self._conn.execute("ALTER TABLE conversations ADD COLUMN subject_id TEXT")
+        # workspace_id (tenant axis): additive + nullable, mirroring the singleton Studio
+        # stores. A NULL value = "single local tenant / CLI-written / predates tenant binding"
+        # (read-visible to all, byte-unchanged on the offline CLI session path). The Studio
+        # chats/projects routes pass the principal's workspace; the CLI writers pass nothing.
+        if "workspace_id" not in cols:
+            self._conn.execute("ALTER TABLE conversations ADD COLUMN workspace_id TEXT")
+        proj_cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(projects)").fetchall()
+        }
+        if "workspace_id" not in proj_cols:
+            self._conn.execute("ALTER TABLE projects ADD COLUMN workspace_id TEXT")
         # The lookup index is created here (not in _SCHEMA) so it lands only AFTER the
         # column is guaranteed to exist — on both a fresh db and a migrated legacy one.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_conversations_subject "
             "ON conversations (subject_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_workspace "
+            "ON conversations (workspace_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_projects_workspace "
+            "ON projects (workspace_id)"
         )
 
     # -- authoritative writes ------------------------------------------------
@@ -291,6 +311,7 @@ class ConversationStore:
         provider: str | None = None,
         project_id: str | None = None,
         subject_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> ConversationSummary:
         """Upsert the authoritative ``thread`` and regenerate its flat projection.
 
@@ -300,10 +321,16 @@ class ConversationStore:
         assignment rather than clearing it. ``subject_id`` records the S3 data-subject
         linkage (so erasure can reach this conversation) and follows the same
         leave-alone-on-``None`` contract. ``created_at`` is preserved across re-saves.
+
+        ``workspace_id`` (tenant axis) stamps the owning workspace for a tenant-bound Studio
+        write; it follows the leave-alone-on-``None`` contract so the CLI session path (which
+        passes nothing) keeps writing ``NULL``-tenant rows — byte-unchanged. A re-stamp guard
+        preserves an existing row's owner so a bound tenant cannot capture a legacy/foreign row.
         """
         now = utc_now_iso()
         existing = self._conn.execute(
-            "SELECT created_at, project_id, agent_path, provider, origin, subject_id "
+            "SELECT created_at, project_id, agent_path, provider, origin, subject_id, "
+            "workspace_id "
             "FROM conversations WHERE conversation_id = ?",
             (conversation_id,),
         ).fetchone()
@@ -320,12 +347,20 @@ class ConversationStore:
         effective_project = project_id or (existing["project_id"] if existing else None)
         resolved_subject = subject_id or (existing["subject_id"] if existing else None)
         resolved_origin = origin or (existing["origin"] if existing else ORIGIN_CLI)
+        # Re-stamp guard (tenant axis): a NEW conversation is stamped with the caller's
+        # ``workspace_id``; an EXISTING row PRESERVES its current owner so a bound tenant can
+        # never capture a legacy/CLI (``NULL``) or foreign row by re-saving onto its id.
+        # ``workspace_id is None`` (CLI / offline) always preserves any existing stamp.
+        if existing is None:
+            resolved_workspace = workspace_id
+        else:
+            resolved_workspace = existing["workspace_id"]
         self._conn.execute(
             """
             INSERT INTO conversations
                 (conversation_id, thread, origin, title, agent_path, provider,
-                 project_id, subject_id, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+                 project_id, subject_id, workspace_id, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 thread=excluded.thread,
                 title=excluded.title,
@@ -333,6 +368,7 @@ class ConversationStore:
                 provider=excluded.provider,
                 project_id=excluded.project_id,
                 subject_id=excluded.subject_id,
+                workspace_id=excluded.workspace_id,
                 updated_at=excluded.updated_at
             """,
             (
@@ -344,6 +380,7 @@ class ConversationStore:
                 resolved_provider,
                 effective_project,
                 resolved_subject,
+                resolved_workspace,
                 created,
                 now,
             ),
@@ -373,12 +410,16 @@ class ConversationStore:
         flat_messages: Sequence[tuple[str, str]],
         project_id: str | None = None,
         origin: str = ORIGIN_STUDIO,
+        workspace_id: str | None = None,
     ) -> ConversationSummary:
         """Save a FLAT Studio transcript by first lifting it to an authoritative thread.
 
         This is the lossy ingress (reviewer must-fix): the flat rows are mapped to a
         :class:`ChatThread` via :func:`thread_from_flat`, which then becomes the source of
         truth and is re-projected. A title is derived from the first user row when not given.
+
+        ``workspace_id`` (tenant axis) stamps a tenant-bound Studio write; ``None`` (CLI /
+        offline) writes a ``NULL``-tenant row exactly as before.
         """
         cid = conversation_id or new_uuid()
         thread = thread_from_flat(
@@ -392,6 +433,7 @@ class ConversationStore:
             agent_path=agent_path,
             provider=provider,
             project_id=project_id,
+            workspace_id=workspace_id,
         )
 
     def _reproject(self, conversation_id: str, thread: ChatThread, now: str) -> None:
@@ -425,11 +467,24 @@ class ConversationStore:
         except Exception:  # noqa: BLE001 - a corrupt row must not break the caller
             return None
 
-    def get_summary(self, conversation_id: str) -> ConversationSummary | None:
-        """Return a summary (no bodies) for ``conversation_id`` (or None)."""
+    def get_summary(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> ConversationSummary | None:
+        """Return a summary (no bodies) for ``conversation_id`` (or None).
+
+        ``workspace_id`` (tenant axis) folds a cross-tenant by-id fetch to ``None`` (existence
+        never leaks); ``None`` (CLI / offline / ``all_tenants``) is unscoped — byte-unchanged.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id, column="workspace_id")
+        extra = f" AND {clause}" if clause else ""
         row = self._conn.execute(
-            "SELECT * FROM conversations WHERE conversation_id = ?",
-            (conversation_id,),
+            f"SELECT * FROM conversations WHERE conversation_id = ?{extra}",  # noqa: S608
+            (conversation_id, *params),
         ).fetchone()
         if row is None:
             return None
@@ -445,24 +500,40 @@ class ConversationStore:
         return [FlatMessage(role=r["role"], text=r["text"]) for r in rows]
 
     def list_summaries(
-        self, *, limit: int | None = None, origin: str | None = None
+        self,
+        *,
+        limit: int | None = None,
+        origin: str | None = None,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> list[ConversationSummary]:
         """Recent conversations, newest first, with each conversation's message count.
 
         ``origin`` filters to one front door's conversations; omit it to see ALL (the
         union both UIs are meant to show). A row whose thread fails to deserialize is still
         listed with ``message_count`` taken from the flat projection (never raises).
+
+        ``workspace_id`` (tenant axis) restricts the list to the caller's workspace (plus
+        legacy ``NULL``/CLI rows); ``None`` lists every conversation — byte-unchanged.
         """
+        from himmy.api.studio_tenant_scope import scope_clause
+
         sql = (
             "SELECT c.*, COUNT(m.id) AS n "
             "FROM conversations c "
             "LEFT JOIN conversation_messages m "
             "  ON m.conversation_id = c.conversation_id "
         )
+        preds: list[str] = []
         params: list[object] = []
         if origin is not None:
-            sql += "WHERE c.origin = ? "
+            preds.append("c.origin = ?")
             params.append(origin)
+        clause, scope_params = scope_clause(workspace_id, column="c.workspace_id")
+        if clause:
+            preds.append(clause)
+            params.extend(scope_params)
+        if preds:
+            sql += "WHERE " + " AND ".join(preds) + " "
         sql += "GROUP BY c.conversation_id ORDER BY c.updated_at DESC"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
@@ -478,21 +549,62 @@ class ConversationStore:
 
     # -- mutations -----------------------------------------------------------
 
-    def rename(self, conversation_id: str, title: str) -> bool:
+    def rename(
+        self,
+        conversation_id: str,
+        title: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        """Rename a conversation; a tenant-bound caller can rename only its OWN row.
+
+        Strict WRITE scope (no ``OR IS NULL``): a legacy/CLI ``NULL`` row is read-visible but
+        not renamable by a bound tenant. ``None`` (CLI / offline) is unscoped — byte-unchanged.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id, column="workspace_id")
+        extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
-            "UPDATE conversations SET title = ?, updated_at = ? WHERE conversation_id = ?",
-            (title, utc_now_iso(), conversation_id),
+            "UPDATE conversations SET title = ?, updated_at = ? "  # noqa: S608
+            f"WHERE conversation_id = ?{extra}",
+            (title, utc_now_iso(), conversation_id, *params),
         )
         self._conn.commit()
         return cur.rowcount > 0
 
-    def delete(self, conversation_id: str) -> bool:
+    def delete(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        """Delete a conversation; a tenant-bound caller can delete only its OWN row.
+
+        Strict WRITE scope (no ``OR IS NULL``): a legacy/CLI ``NULL`` row is read-visible but
+        not deletable by a bound tenant. ``None`` (CLI / offline) is unscoped — byte-unchanged.
+        The flat-message rows are removed only when the parent row is in scope.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id, column="workspace_id")
+        if clause:
+            # Gate the message purge on the parent being in write scope (avoid orphaning a
+            # foreign row's messages); a no-match leaves both tables untouched.
+            in_scope = self._conn.execute(
+                f"SELECT 1 FROM conversations WHERE conversation_id = ? AND {clause}",  # noqa: S608
+                (conversation_id, *params),
+            ).fetchone()
+            if in_scope is None:
+                return False
         self._conn.execute(
             "DELETE FROM conversation_messages WHERE conversation_id = ?",
             (conversation_id,),
         )
+        extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
-            "DELETE FROM conversations WHERE conversation_id = ?", (conversation_id,)
+            f"DELETE FROM conversations WHERE conversation_id = ?{extra}",  # noqa: S608
+            (conversation_id, *params),
         )
         self._conn.commit()
         return cur.rowcount > 0
@@ -602,16 +714,18 @@ class ConversationStore:
         description: str = "",
         kb_id: str | None = None,
         agent_path: str | None = None,
+        workspace_id: str | None = None,
     ) -> dict[str, object]:
         now = utc_now_iso()
         pid = new_uuid()
         self._conn.execute(
             """
             INSERT INTO projects
-                (id, name, description, kb_id, agent_path, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?)
+                (id, name, description, kb_id, agent_path, created_at, updated_at,
+                 workspace_id)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
-            (pid, name, description, kb_id, agent_path, now, now),
+            (pid, name, description, kb_id, agent_path, now, now, workspace_id),
         )
         self._conn.commit()
         return {
@@ -625,9 +739,17 @@ class ConversationStore:
             "chat_count": 0,
         }
 
-    def get_project_row(self, project_id: str) -> sqlite3.Row | None:
+    def get_project_row(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> sqlite3.Row | None:
+        """A project by id; a cross-tenant fetch folds to ``None`` (existence never leaks)."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id, column="workspace_id")
+        extra = f" AND {clause}" if clause else ""
         row: sqlite3.Row | None = self._conn.execute(
-            "SELECT * FROM projects WHERE id = ?", (project_id,)
+            f"SELECT * FROM projects WHERE id = ?{extra}",  # noqa: S608
+            (project_id, *params),
         ).fetchone()
         return row
 
@@ -638,64 +760,125 @@ class ConversationStore:
         ).fetchone()
         return int(row["n"]) if row else 0
 
-    def list_project_rows(self) -> list[tuple[sqlite3.Row, int]]:
+    def list_project_rows(
+        self, *, workspace_id: str | frozenset[str] | None = None
+    ) -> list[tuple[sqlite3.Row, int]]:
+        """Projects (with chat counts); scoped to ``workspace_id`` (plus legacy NULL) or ALL."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id, column="p.workspace_id")
+        where = f"WHERE {clause} " if clause else ""
         rows = self._conn.execute(
-            """
+            f"""
             SELECT p.*, COUNT(c.conversation_id) AS n
             FROM projects p
             LEFT JOIN conversations c ON c.project_id = p.id
-            GROUP BY p.id
+            {where}GROUP BY p.id
             ORDER BY p.updated_at DESC
-            """
+            """,  # noqa: S608 - clause is a parameterized fragment, values bound separately
+            tuple(params),
         ).fetchall()
         return [(r, r["n"]) for r in rows]
 
     def update_project(
-        self, project_id: str, assignments: dict[str, str | None]
+        self,
+        project_id: str,
+        assignments: dict[str, str | None],
+        *,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> bool:
-        """Apply pre-validated column=value assignments to a project (touch updated_at)."""
+        """Apply pre-validated column=value assignments to a project (touch updated_at).
+
+        Strict WRITE scope: a tenant-bound caller can update only its OWN project (a legacy
+        NULL / foreign project is not mutable). ``None`` (CLI / offline) is unscoped.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, scope_params = scope_clause_write(workspace_id, column="workspace_id")
+        extra = f" AND {clause}" if clause else ""
         if not assignments:
-            return self.get_project_row(project_id) is not None
+            return self.get_project_row(project_id, workspace_id=workspace_id) is not None
         cols = ", ".join(f"{k} = ?" for k in assignments)
         cur = self._conn.execute(
-            f"UPDATE projects SET {cols}, updated_at = ? WHERE id = ?",  # noqa: S608
-            (*assignments.values(), utc_now_iso(), project_id),
+            f"UPDATE projects SET {cols}, updated_at = ? WHERE id = ?{extra}",  # noqa: S608
+            (*assignments.values(), utc_now_iso(), project_id, *scope_params),
         )
         self._conn.commit()
         return cur.rowcount > 0
 
-    def delete_project(self, project_id: str) -> bool:
+    def delete_project(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        """Delete a project; a tenant-bound caller can delete only its OWN (strict scope)."""
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id, column="workspace_id")
+        if clause:
+            in_scope = self._conn.execute(
+                f"SELECT 1 FROM projects WHERE id = ? AND {clause}",  # noqa: S608
+                (project_id, *params),
+            ).fetchone()
+            if in_scope is None:
+                return False
         self._conn.execute(
             "UPDATE conversations SET project_id = NULL WHERE project_id = ?",
             (project_id,),
         )
-        cur = self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        extra = f" AND {clause}" if clause else ""
+        cur = self._conn.execute(
+            f"DELETE FROM projects WHERE id = ?{extra}",  # noqa: S608
+            (project_id, *params),
+        )
         self._conn.commit()
         return cur.rowcount > 0
 
     def project_conversation_summaries(
-        self, project_id: str
+        self,
+        project_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> list[ConversationSummary]:
+        """A project's conversations; scoped to the caller's workspace (plus legacy NULL)."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id, column="c.workspace_id")
+        extra = f" AND {clause}" if clause else ""
         rows = self._conn.execute(
-            """
+            f"""
             SELECT c.*, COUNT(m.id) AS n
             FROM conversations c
             LEFT JOIN conversation_messages m
                 ON m.conversation_id = c.conversation_id
-            WHERE c.project_id = ?
+            WHERE c.project_id = ?{extra}
             GROUP BY c.conversation_id
             ORDER BY c.updated_at DESC
-            """,
-            (project_id,),
+            """,  # noqa: S608 - clause is a parameterized fragment
+            (project_id, *params),
         ).fetchall()
         return [self._summary(r, r["n"]) for r in rows]
 
-    def assign_conversation(self, project_id: str, conversation_id: str) -> bool:
-        if self.get_project_row(project_id) is None:
+    def assign_conversation(
+        self,
+        project_id: str,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        """Assign a conversation to a project; both must be in the caller's write scope.
+
+        Strict WRITE scope on the conversation and a scoped project existence check, so a
+        tenant-bound caller can only re-parent its OWN conversation into its OWN project (a
+        legacy/foreign row is neither readable-as-target nor mutable). ``None`` is unscoped.
+        """
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        if self.get_project_row(project_id, workspace_id=workspace_id) is None:
             return False
+        clause, params = scope_clause_write(workspace_id, column="workspace_id")
+        extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
-            "UPDATE conversations SET project_id = ? WHERE conversation_id = ?",
-            (project_id, conversation_id),
+            f"UPDATE conversations SET project_id = ? WHERE conversation_id = ?{extra}",  # noqa: S608
+            (project_id, conversation_id, *params),
         )
         if cur.rowcount > 0:
             self._conn.execute(
@@ -705,11 +888,21 @@ class ConversationStore:
         self._conn.commit()
         return cur.rowcount > 0
 
-    def unassign_conversation(self, conversation_id: str) -> bool:
+    def unassign_conversation(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        """Clear a conversation's project; a tenant-bound caller only its OWN (strict scope)."""
+        from himmy.api.studio_tenant_scope import scope_clause_write
+
+        clause, params = scope_clause_write(workspace_id, column="workspace_id")
+        extra = f" AND {clause}" if clause else ""
         cur = self._conn.execute(
-            "UPDATE conversations SET project_id = NULL "
-            "WHERE conversation_id = ? AND project_id IS NOT NULL",
-            (conversation_id,),
+            "UPDATE conversations SET project_id = NULL "  # noqa: S608
+            f"WHERE conversation_id = ? AND project_id IS NOT NULL{extra}",
+            (conversation_id, *params),
         )
         self._conn.commit()
         return cur.rowcount > 0

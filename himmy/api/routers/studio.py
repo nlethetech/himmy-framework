@@ -327,6 +327,28 @@ def _run_owner(request: Request) -> tuple[str | None, str | None]:
     return resolve_workspace(request, None), principal.subject
 
 
+def _run_subject_scope(request: Request) -> str | None:
+    """The data subject the run's TOOL STORES (memory/KB/tasks/notes) must namespace by.
+
+    The within-tenant USER axis for the tool-layer stores (P1 tenancy, subject axis). It is
+    the principal's subject ONLY for an opt-in ``subject_scoped`` principal that is NOT a
+    ``tenant_admin`` — i.e. a genuine per-user identity inside a shared tenant, where the
+    memory/KB/tasks/notes packs would otherwise pool every user of the tenant onto one
+    namespace (a cross-USER confused-deputy). For every other principal (offline /
+    ``all_tenants`` / the historical multi-user-workspace tenant / a ``tenant_admin``) it
+    returns ``None`` so the tool-store scope stays tenant-only — byte-for-byte unchanged.
+    Mirrors :func:`himmy.api.auth.context.studio_subject_filter` (the read-axis companion).
+    """
+    principal = get_principal(request)
+    if principal.all_tenants or not principal.subject_scoped:
+        return None
+    from himmy.api.auth.principal import TENANT_ADMIN_ROLE
+
+    if TENANT_ADMIN_ROLE in principal.roles:
+        return None
+    return principal.subject
+
+
 async def _authorize_run(request: Request, run_id: str) -> bool:
     """May this request's principal read run ``run_id`` (BOLA gate for by-id readers)?
 
@@ -407,6 +429,7 @@ async def run(body: RunRequest, request: Request) -> StreamingResponse:
 
     tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
     owner_workspace, owner_subject = _run_owner(request)
+    owner_subject_scope = _run_subject_scope(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
@@ -421,6 +444,7 @@ async def run(body: RunRequest, request: Request) -> StreamingResponse:
                     canonical_storage=canonical,
                     owner_workspace_id=owner_workspace,
                     owner_subject_id=owner_subject,
+                    owner_subject_scope=owner_subject_scope,
                 ):
                     yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - surface as a terminal error frame
@@ -545,6 +569,7 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
 
     tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
     owner_workspace, owner_subject = _run_owner(request)
+    owner_subject_scope = _run_subject_scope(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
@@ -558,6 +583,7 @@ async def research(body: ResearchRequest, request: Request) -> StreamingResponse
                     canonical_storage=canonical,
                     owner_workspace_id=owner_workspace,
                     owner_subject_id=owner_subject,
+                    owner_subject_scope=owner_subject_scope,
                 ):
                     yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
@@ -1411,28 +1437,36 @@ class ChatRenameRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
 
 
-@router.get("/chats", dependencies=[Depends(studio_permission(_RES_CHATS, "read"))])
-async def chats_list() -> Any:
+@router.get(
+    "/chats",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "read")), Depends(scoped_read)],
+)
+async def chats_list(request: Request) -> Any:
     from himmy.api.studio_chats import get_chats_store
 
-    return get_chats_store().list()
+    return get_chats_store().list(workspace_id=studio_tenant_filter(request))
 
 
 @router.get(
     "/chats/{session_id}",
-    dependencies=[Depends(studio_permission(_RES_CHATS, "read"))],
+    dependencies=[Depends(studio_permission(_RES_CHATS, "read")), Depends(scoped_read)],
 )
-async def chats_get(session_id: str) -> Any:
+async def chats_get(session_id: str, request: Request) -> Any:
     from himmy.api.studio_chats import get_chats_store
 
-    detail = get_chats_store().get(session_id)
+    detail = get_chats_store().get(
+        session_id, workspace_id=studio_tenant_filter(request)
+    )
     if detail is None:
         raise HTTPException(status_code=404, detail="unknown chat session")
     return detail
 
 
-@router.post("/chats", dependencies=[Depends(studio_permission(_RES_CHATS, "write"))])
-async def chats_save(body: ChatSaveRequest) -> Any:
+@router.post(
+    "/chats",
+    dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
+)
+async def chats_save(body: ChatSaveRequest, request: Request) -> Any:
     from himmy.api.studio_chats import ChatMessage, get_chats_store
 
     return get_chats_store().save(
@@ -1442,6 +1476,7 @@ async def chats_save(body: ChatSaveRequest) -> Any:
         provider=body.provider,
         project_id=body.project_id,
         messages=[ChatMessage(role=m.role, text=m.text) for m in body.messages],
+        workspace_id=studio_write_workspace(request),
     )
 
 
@@ -1449,20 +1484,30 @@ async def chats_save(body: ChatSaveRequest) -> Any:
     "/chats/{session_id}",
     dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
 )
-async def chats_rename(session_id: str, body: ChatRenameRequest) -> dict[str, bool]:
+async def chats_rename(
+    session_id: str, body: ChatRenameRequest, request: Request
+) -> dict[str, bool]:
     from himmy.api.studio_chats import get_chats_store
 
-    return {"ok": get_chats_store().rename(session_id, body.title)}
+    return {
+        "ok": get_chats_store().rename(
+            session_id, body.title, workspace_id=studio_tenant_filter(request)
+        )
+    }
 
 
 @router.delete(
     "/chats/{session_id}",
     dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
 )
-async def chats_delete(session_id: str) -> dict[str, bool]:
+async def chats_delete(session_id: str, request: Request) -> dict[str, bool]:
     from himmy.api.studio_chats import get_chats_store
 
-    return {"ok": get_chats_store().delete(session_id)}
+    return {
+        "ok": get_chats_store().delete(
+            session_id, workspace_id=studio_tenant_filter(request)
+        )
+    }
 
 
 # ---- Cookbook (saved agent + prompt recipes) ----------------------------
@@ -1667,6 +1712,32 @@ class MemoryRecallRequest(BaseModel):
     similarity_threshold: float | None = Field(None, ge=0.0, le=1.0)
 
 
+def _memory_tenant_prefix(request: Request) -> str:
+    """The ``t:<workspace>:`` namespace prefix the Studio memory surface stamps onto subjects.
+
+    The TENANT-axis fix for the process-wide memory store, which has NO ``workspace_id``
+    column: two tenants sharing one process/cwd-keyed ``.himmy/memory.db`` were isolated only
+    if their subject ids happened to differ (or, for a non-subject-scoped principal, not at
+    all). Rather than migrate the store, the Studio memory routes namespace the SUBJECT they
+    read/write/recall by the principal's resolved workspace — the SAME scheme the tool-layer
+    memory pack already uses (:meth:`ToolkitConfig.scoped_memory_subject` →
+    ``t:<tenant>:<subject>``), so a tenant-bound Studio console and that tenant's agents share
+    one namespace and NO other tenant's. Returns:
+
+    * ``""`` (empty) for an unrestricted principal (offline / ``all_tenants``) so the subject
+      is used verbatim — the zero-config single-box path is byte-for-byte unchanged; and
+    * ``t:<workspace>:`` for a tenant-bound principal, so every Studio memory read/write/recall
+      lives in that tenant's own namespace and a cross-tenant recall is structurally impossible.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return ""
+    workspace = resolve_workspace(request, None)
+    if not workspace:
+        return ""
+    return f"t:{workspace}:"
+
+
 def _scoped_memory_subject(request: Request, requested: str | None) -> str | None:
     """The data subject a memory read may target, derived from the verified PRINCIPAL.
 
@@ -1679,8 +1750,18 @@ def _scoped_memory_subject(request: Request, requested: str | None) -> str | Non
     Every other principal — ``all_tenants`` / offline / the historical multi-user-workspace
     default / a ``tenant_admin`` — keeps ``requested`` as-is, so the zero-config path is
     byte-unchanged.
+
+    TENANT axis: the (subject-narrowed) value is additionally prefixed by
+    :func:`_memory_tenant_prefix` so a tenant-bound principal's effective subject lives in its
+    OWN ``t:<workspace>:`` namespace on the shared process store — closing the structural
+    tenant gap the ``scoped_read`` marker advertised. ``all_tenants`` / offline returns the
+    narrowed value unprefixed (byte-unchanged).
     """
-    return narrow_subject(request, requested)
+    narrowed = narrow_subject(request, requested)
+    prefix = _memory_tenant_prefix(request)
+    if not prefix:
+        return narrowed
+    return f"{prefix}{narrowed if narrowed is not None else 'default'}"
 
 
 @router.get(
@@ -1701,8 +1782,13 @@ async def memory_subjects(request: Request) -> list[str]:
     """
     from himmy.api import studio_memory
 
-    pinned = _scoped_memory_subject(request, None)
-    return studio_memory.list_subjects(only_subject=pinned)
+    # SUBJECT axis: a subject_scoped caller sees only its own subject. TENANT axis: the
+    # enumeration is restricted to this tenant's ``t:<workspace>:`` namespace and the prefix
+    # stripped, so a tenant-bound principal never sees another tenant's subject ids.
+    pinned = narrow_subject(request, None)
+    return studio_memory.list_subjects(
+        only_subject=pinned, tenant_prefix=_memory_tenant_prefix(request)
+    )
 
 
 @router.get(
@@ -1721,9 +1807,16 @@ async def memory_list(request: Request, subject: str = "default") -> list[Any]:
     """
     from himmy.api import studio_memory
 
-    return studio_memory.list_memories(
+    items = studio_memory.list_memories(
         _scoped_memory_subject(request, subject) or "default"
     )
+    # Present the caller's own subject id back (strip the internal tenant namespace).
+    prefix = _memory_tenant_prefix(request)
+    if prefix:
+        for it in items:
+            if it.subject_id.startswith(prefix):
+                it.subject_id = it.subject_id[len(prefix) :]
+    return items
 
 
 @router.post(
@@ -1743,9 +1836,17 @@ async def memory_add(body: MemoryAddRequest, request: Request) -> Any:
     from himmy.api import studio_memory
 
     enforce_subject_write(request, body.subject_id)
-    return studio_memory.add_memory(
-        body.text, subject_id=body.subject_id, kind=body.kind
+    # TENANT axis: stamp the memory under the principal's OWN ``t:<workspace>:`` namespace on
+    # the shared process store so it is recallable only within this tenant (mirrors the
+    # tool-pack ``scoped_memory_subject``). ``all_tenants`` / offline writes the raw subject.
+    prefix = _memory_tenant_prefix(request)
+    stored = studio_memory.add_memory(
+        body.text, subject_id=f"{prefix}{body.subject_id}", kind=body.kind
     )
+    # Present the caller's own subject id back (strip the internal tenant namespace).
+    if prefix and stored.subject_id.startswith(prefix):
+        stored.subject_id = stored.subject_id[len(prefix) :]
+    return stored
 
 
 @router.delete(
@@ -1765,8 +1866,21 @@ async def memory_forget(memory_id: str, request: Request) -> dict[str, bool]:
     from himmy.api import studio_memory
 
     rec = studio_memory.get_memory(memory_id)
-    if rec is not None and not authorize_object(request, rec.subject_id):
-        raise HTTPException(status_code=404, detail=f"unknown memory {memory_id!r}")
+    if rec is not None:
+        # TENANT axis: a tenant-bound caller may only forget a memory in its OWN
+        # ``t:<workspace>:`` namespace on the shared process store; a record stamped under
+        # another tenant's namespace folds to a uniform 404 (existence never leaked).
+        prefix = _memory_tenant_prefix(request)
+        if prefix and not rec.subject_id.startswith(prefix):
+            raise HTTPException(status_code=404, detail=f"unknown memory {memory_id!r}")
+        # SUBJECT axis (strip the tenant namespace before the BOLA subject check).
+        bare_subject = (
+            rec.subject_id[len(prefix) :]
+            if prefix and rec.subject_id.startswith(prefix)
+            else rec.subject_id
+        )
+        if not authorize_object(request, bare_subject):
+            raise HTTPException(status_code=404, detail=f"unknown memory {memory_id!r}")
     return {"ok": studio_memory.forget(memory_id)}
 
 

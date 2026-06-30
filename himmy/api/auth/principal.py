@@ -152,6 +152,13 @@ class Principal:
             meta["source_ip"] = self.source_ip
         if not self.all_tenants or self.scopes:
             meta["tool_authz_enforce"] = True
+        # P1 tenancy (subject axis): persist the opt-in per-user flag so a leased-dispatch
+        # recovery / ``/v1`` run can rebuild the subject-namespaced tool-store scope (memory/
+        # KB/tasks/notes) from the descriptor — a fresh process has no live Principal. Stamped
+        # ONLY when actually subject_scoped (and not a tenant_admin, which crosses subjects),
+        # so a non-subject-scoped / admin / offline actor is byte-unchanged (key absent).
+        if self.subject_scoped and TENANT_ADMIN_ROLE not in self.roles:
+            meta["subject_scoped"] = True
         return meta
 
 

@@ -483,6 +483,35 @@ class PostgresGraphCheckpointStore:
 # ============================================================ K4: conversation mirror
 
 
+def _pg_scope_pred(
+    workspace_id: str | frozenset[str] | None,
+    *,
+    column: str,
+    start: int,
+    write: bool = False,
+) -> tuple[str, list[Any]]:
+    """Build a Postgres ``$N`` workspace-scope predicate fragment + its params.
+
+    The asyncpg analogue of :func:`himmy.api.studio_tenant_scope.scope_clause` /
+    ``scope_clause_write``: ``None`` (CLI / offline / ``all_tenants``) yields an empty
+    fragment (no filtering — byte-unchanged); a concrete scope yields ``column = $N`` (READ
+    additionally matches legacy ``NULL`` via ``OR column IS NULL``; WRITE does not, so a bound
+    tenant cannot mutate a legacy/foreign row); a frozenset yields the ``IN`` form. ``start``
+    is the next free positional index. An EMPTY frozenset is fail-closed (read: NULL-only;
+    write: ``FALSE``).
+    """
+    if workspace_id is None:
+        return "", []
+    null_or = "" if write else f" OR {column} IS NULL"
+    if isinstance(workspace_id, str):
+        return f"({column} = ${start}{null_or})", [workspace_id]
+    ids = sorted(workspace_id)
+    if not ids:
+        return (f"{column} IS NULL" if not write else "FALSE"), []
+    placeholders = ", ".join(f"${start + i}" for i in range(len(ids)))
+    return f"({column} IN ({placeholders}){null_or})", list(ids)
+
+
 class _AsyncConversationStore:
     """Async body of the Postgres unified-conversation store (tenant-scoped)."""
 
@@ -501,6 +530,7 @@ class _AsyncConversationStore:
         provider: str | None,
         project_id: str | None,
         subject_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> ConversationSummary:
         from himmy.services.storage.conversations import (
             ORIGIN_CLI,
@@ -514,12 +544,17 @@ class _AsyncConversationStore:
             async with conn.transaction():
                 existing = await conn.fetchrow(
                     "SELECT created_at, project_id, agent_path, provider, origin, "
-                    "subject_id "
+                    "subject_id, workspace_id "
                     "FROM aux_conversations WHERE tenant = $1 AND conversation_id = $2",
                     self._tenant,
                     conversation_id,
                 )
                 created = existing["created_at"] if existing else now
+                # Re-stamp guard (tenant axis): NEW row stamps caller's workspace; an EXISTING
+                # row PRESERVES its owner so a bound tenant cannot capture a legacy/foreign row.
+                resolved_workspace = (
+                    workspace_id if existing is None else existing["workspace_id"]
+                )
                 resolved_title = (title or "").strip() or _derive_title(thread)
                 resolved_agent = (
                     agent_path
@@ -543,13 +578,15 @@ class _AsyncConversationStore:
                 await conn.execute(
                     "INSERT INTO aux_conversations "
                     "(tenant, conversation_id, thread, origin, title, agent_path, "
-                    "provider, project_id, subject_id, created_at, updated_at) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) "
+                    "provider, project_id, subject_id, workspace_id, created_at, "
+                    "updated_at) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) "
                     "ON CONFLICT (tenant, conversation_id) DO UPDATE SET "
                     "thread = EXCLUDED.thread, title = EXCLUDED.title, "
                     "agent_path = EXCLUDED.agent_path, provider = EXCLUDED.provider, "
                     "project_id = EXCLUDED.project_id, "
                     "subject_id = EXCLUDED.subject_id, "
+                    "workspace_id = EXCLUDED.workspace_id, "
                     "updated_at = EXCLUDED.updated_at",
                     self._tenant,
                     conversation_id,
@@ -560,6 +597,7 @@ class _AsyncConversationStore:
                     resolved_provider,
                     effective_project,
                     resolved_subject,
+                    resolved_workspace,
                     _norm_ts(created),
                     now,
                 )
@@ -619,7 +657,16 @@ class _AsyncConversationStore:
         except Exception:  # noqa: BLE001 - a corrupt row must not break the caller
             return None
 
-    async def get_summary(self, conversation_id: str) -> ConversationSummary | None:
+    async def get_summary(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> ConversationSummary | None:
+        pred, sparams = _pg_scope_pred(
+            workspace_id, column="c.workspace_id", start=3
+        )
+        extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT *, ("
@@ -627,9 +674,10 @@ class _AsyncConversationStore:
                 "  WHERE m.tenant = c.tenant "
                 "  AND m.conversation_id = c.conversation_id) AS n "
                 "FROM aux_conversations c "
-                "WHERE c.tenant = $1 AND c.conversation_id = $2",
+                f"WHERE c.tenant = $1 AND c.conversation_id = $2{extra}",
                 self._tenant,
                 conversation_id,
+                *sparams,
             )
         if row is None:
             return None
@@ -648,7 +696,11 @@ class _AsyncConversationStore:
         return [FlatMessage(role=r["role"], text=r["text"]) for r in rows]
 
     async def list_summaries(
-        self, *, limit: int | None, origin: str | None
+        self,
+        *,
+        limit: int | None,
+        origin: str | None,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> list[ConversationSummary]:
         sql = (
             "SELECT c.*, ("
@@ -661,6 +713,12 @@ class _AsyncConversationStore:
         if origin is not None:
             params.append(origin)
             sql += f" AND c.origin = ${len(params)}"
+        pred, sparams = _pg_scope_pred(
+            workspace_id, column="c.workspace_id", start=len(params) + 1
+        )
+        if pred:
+            sql += f" AND {pred}"
+            params.extend(sparams)
         sql += " ORDER BY c.updated_at DESC"
         if limit is not None:
             params.append(int(limit))
@@ -669,21 +727,52 @@ class _AsyncConversationStore:
             rows = await conn.fetch(sql, *params)
         return [_row_to_summary(r, int(r["n"])) for r in rows]
 
-    async def rename(self, conversation_id: str, title: str) -> bool:
+    async def rename(
+        self,
+        conversation_id: str,
+        title: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        pred, sparams = _pg_scope_pred(
+            workspace_id, column="workspace_id", start=5, write=True
+        )
+        extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
                 "UPDATE aux_conversations SET title = $1, updated_at = $2 "
-                "WHERE tenant = $3 AND conversation_id = $4",
+                f"WHERE tenant = $3 AND conversation_id = $4{extra}",
                 title,
                 utc_now_iso(),
                 self._tenant,
                 conversation_id,
+                *sparams,
             )
         return _rowcount(result) > 0
 
-    async def delete(self, conversation_id: str) -> bool:
+    async def delete(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        pred, sparams = _pg_scope_pred(
+            workspace_id, column="workspace_id", start=3, write=True
+        )
+        extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                if pred:
+                    # Gate the message purge on the parent being in write scope.
+                    in_scope = await conn.fetchrow(
+                        "SELECT 1 FROM aux_conversations "
+                        f"WHERE tenant = $1 AND conversation_id = $2{extra}",
+                        self._tenant,
+                        conversation_id,
+                        *sparams,
+                    )
+                    if in_scope is None:
+                        return False
                 await conn.execute(
                     "DELETE FROM aux_conversation_messages "
                     "WHERE tenant = $1 AND conversation_id = $2",
@@ -692,9 +781,10 @@ class _AsyncConversationStore:
                 )
                 result = await conn.execute(
                     "DELETE FROM aux_conversations "
-                    "WHERE tenant = $1 AND conversation_id = $2",
+                    f"WHERE tenant = $1 AND conversation_id = $2{extra}",
                     self._tenant,
                     conversation_id,
+                    *sparams,
                 )
         return _rowcount(result) > 0
 
@@ -759,14 +849,16 @@ class _AsyncConversationStore:
         description: str,
         kb_id: str | None,
         agent_path: str | None,
+        workspace_id: str | None = None,
     ) -> dict[str, object]:
         now = utc_now_iso()
         pid = new_uuid()
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO aux_projects "
-                "(tenant, id, name, description, kb_id, agent_path, created_at, updated_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                "(tenant, id, name, description, kb_id, agent_path, created_at, "
+                "updated_at, workspace_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 self._tenant,
                 pid,
                 name,
@@ -775,6 +867,7 @@ class _AsyncConversationStore:
                 agent_path,
                 now,
                 now,
+                workspace_id,
             )
         return {
             "id": pid,
@@ -787,12 +880,17 @@ class _AsyncConversationStore:
             "chat_count": 0,
         }
 
-    async def get_project_row(self, project_id: str) -> dict[str, Any] | None:
+    async def get_project_row(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> dict[str, Any] | None:
+        pred, sparams = _pg_scope_pred(workspace_id, column="workspace_id", start=3)
+        extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM aux_projects WHERE tenant = $1 AND id = $2",
+                f"SELECT * FROM aux_projects WHERE tenant = $1 AND id = $2{extra}",
                 self._tenant,
                 project_id,
+                *sparams,
             )
         return _project_dict(row) if row is not None else None
 
@@ -806,22 +904,34 @@ class _AsyncConversationStore:
             )
         return int(row["n"]) if row else 0
 
-    async def list_project_rows(self) -> list[tuple[dict[str, Any], int]]:
+    async def list_project_rows(
+        self, *, workspace_id: str | frozenset[str] | None = None
+    ) -> list[tuple[dict[str, Any], int]]:
+        pred, sparams = _pg_scope_pred(workspace_id, column="p.workspace_id", start=2)
+        extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT p.*, ("
                 "  SELECT COUNT(*) FROM aux_conversations c "
                 "  WHERE c.tenant = p.tenant AND c.project_id = p.id) AS n "
-                "FROM aux_projects p WHERE p.tenant = $1 ORDER BY p.updated_at DESC",
+                f"FROM aux_projects p WHERE p.tenant = $1{extra} "
+                "ORDER BY p.updated_at DESC",
                 self._tenant,
+                *sparams,
             )
         return [(_project_dict(r), int(r["n"])) for r in rows]
 
     async def update_project(
-        self, project_id: str, assignments: dict[str, str | None]
+        self,
+        project_id: str,
+        assignments: dict[str, str | None],
+        *,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> bool:
         if not assignments:
-            return (await self.get_project_row(project_id)) is not None
+            return (
+                await self.get_project_row(project_id, workspace_id=workspace_id)
+            ) is not None
         cols = ", ".join(f"{k} = ${i + 1}" for i, k in enumerate(assignments))
         params: list[Any] = list(assignments.values())
         params.append(utc_now_iso())
@@ -831,13 +941,34 @@ class _AsyncConversationStore:
             f"UPDATE aux_projects SET {cols}, updated_at = ${len(params) - 2} "  # noqa: S608
             f"WHERE tenant = ${len(params) - 1} AND id = ${len(params)}"
         )
+        pred, sparams = _pg_scope_pred(
+            workspace_id, column="workspace_id", start=len(params) + 1, write=True
+        )
+        if pred:
+            sql += f" AND {pred}"
+            params.extend(sparams)
         async with self._pool.acquire() as conn:
             result = await conn.execute(sql, *params)
         return _rowcount(result) > 0
 
-    async def delete_project(self, project_id: str) -> bool:
+    async def delete_project(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        pred, sparams = _pg_scope_pred(
+            workspace_id, column="workspace_id", start=3, write=True
+        )
+        extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                if pred:
+                    in_scope = await conn.fetchrow(
+                        f"SELECT 1 FROM aux_projects WHERE tenant = $1 AND id = $2{extra}",
+                        self._tenant,
+                        project_id,
+                        *sparams,
+                    )
+                    if in_scope is None:
+                        return False
                 await conn.execute(
                     "UPDATE aux_conversations SET project_id = NULL "
                     "WHERE tenant = $1 AND project_id = $2",
@@ -845,15 +976,23 @@ class _AsyncConversationStore:
                     project_id,
                 )
                 result = await conn.execute(
-                    "DELETE FROM aux_projects WHERE tenant = $1 AND id = $2",
+                    f"DELETE FROM aux_projects WHERE tenant = $1 AND id = $2{extra}",
                     self._tenant,
                     project_id,
+                    *sparams,
                 )
         return _rowcount(result) > 0
 
     async def project_conversation_summaries(
-        self, project_id: str
+        self,
+        project_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> list[ConversationSummary]:
+        pred, sparams = _pg_scope_pred(
+            workspace_id, column="c.workspace_id", start=3
+        )
+        extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT c.*, ("
@@ -861,31 +1000,46 @@ class _AsyncConversationStore:
                 "  WHERE m.tenant = c.tenant "
                 "  AND m.conversation_id = c.conversation_id) AS n "
                 "FROM aux_conversations c "
-                "WHERE c.tenant = $1 AND c.project_id = $2 "
+                f"WHERE c.tenant = $1 AND c.project_id = $2{extra} "
                 "ORDER BY c.updated_at DESC",
                 self._tenant,
                 project_id,
+                *sparams,
             )
         return [_row_to_summary(r, int(r["n"])) for r in rows]
 
     async def assign_conversation(
-        self, project_id: str, conversation_id: str
+        self,
+        project_id: str,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> bool:
+        proj_pred, proj_params = _pg_scope_pred(
+            workspace_id, column="workspace_id", start=3
+        )
+        proj_extra = f" AND {proj_pred}" if proj_pred else ""
+        conv_pred, conv_params = _pg_scope_pred(
+            workspace_id, column="workspace_id", start=4, write=True
+        )
+        conv_extra = f" AND {conv_pred}" if conv_pred else ""
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 exists = await conn.fetchrow(
-                    "SELECT 1 FROM aux_projects WHERE tenant = $1 AND id = $2",
+                    f"SELECT 1 FROM aux_projects WHERE tenant = $1 AND id = $2{proj_extra}",
                     self._tenant,
                     project_id,
+                    *proj_params,
                 )
                 if exists is None:
                     return False
                 result = await conn.execute(
                     "UPDATE aux_conversations SET project_id = $1 "
-                    "WHERE tenant = $2 AND conversation_id = $3",
+                    f"WHERE tenant = $2 AND conversation_id = $3{conv_extra}",
                     project_id,
                     self._tenant,
                     conversation_id,
+                    *conv_params,
                 )
                 if _rowcount(result) > 0:
                     await conn.execute(
@@ -897,13 +1051,24 @@ class _AsyncConversationStore:
                     )
         return _rowcount(result) > 0
 
-    async def unassign_conversation(self, conversation_id: str) -> bool:
+    async def unassign_conversation(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        pred, sparams = _pg_scope_pred(
+            workspace_id, column="workspace_id", start=3, write=True
+        )
+        extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
                 "UPDATE aux_conversations SET project_id = NULL "
-                "WHERE tenant = $1 AND conversation_id = $2 AND project_id IS NOT NULL",
+                "WHERE tenant = $1 AND conversation_id = $2 "
+                f"AND project_id IS NOT NULL{extra}",
                 self._tenant,
                 conversation_id,
+                *sparams,
             )
         return _rowcount(result) > 0
 
@@ -934,6 +1099,7 @@ class PostgresConversationStore:
         provider: str | None = None,
         project_id: str | None = None,
         subject_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> ConversationSummary:
         from himmy.services.storage.conversations import ORIGIN_CLI
 
@@ -947,6 +1113,7 @@ class PostgresConversationStore:
                 provider=provider,
                 project_id=project_id,
                 subject_id=subject_id,
+                workspace_id=workspace_id,
             )
         )
 
@@ -960,6 +1127,7 @@ class PostgresConversationStore:
         flat_messages: Sequence[tuple[str, str]],
         project_id: str | None = None,
         origin: str | None = None,
+        workspace_id: str | None = None,
     ) -> ConversationSummary:
         from himmy.services.storage.conversations import (
             ORIGIN_STUDIO,
@@ -978,29 +1146,62 @@ class PostgresConversationStore:
             agent_path=agent_path,
             provider=provider,
             project_id=project_id,
+            workspace_id=workspace_id,
         )
 
     def load_thread(self, conversation_id: str) -> ChatThread | None:
         return self._pool.run(self._async.load_thread(conversation_id))  # type: ignore[no-any-return]
 
-    def get_summary(self, conversation_id: str) -> ConversationSummary | None:
-        return self._pool.run(self._async.get_summary(conversation_id))  # type: ignore[no-any-return]
+    def get_summary(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> ConversationSummary | None:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.get_summary(conversation_id, workspace_id=workspace_id)
+        )
 
     def flat_messages(self, conversation_id: str) -> list[FlatMessage]:
         return self._pool.run(self._async.flat_messages(conversation_id))  # type: ignore[no-any-return]
 
     def list_summaries(
-        self, *, limit: int | None = None, origin: str | None = None
+        self,
+        *,
+        limit: int | None = None,
+        origin: str | None = None,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> list[ConversationSummary]:
         return self._pool.run(  # type: ignore[no-any-return]
-            self._async.list_summaries(limit=limit, origin=origin)
+            self._async.list_summaries(
+                limit=limit, origin=origin, workspace_id=workspace_id
+            )
         )
 
-    def rename(self, conversation_id: str, title: str) -> bool:
-        return bool(self._pool.run(self._async.rename(conversation_id, title)))
+    def rename(
+        self,
+        conversation_id: str,
+        title: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        return bool(
+            self._pool.run(
+                self._async.rename(conversation_id, title, workspace_id=workspace_id)
+            )
+        )
 
-    def delete(self, conversation_id: str) -> bool:
-        return bool(self._pool.run(self._async.delete(conversation_id)))
+    def delete(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        return bool(
+            self._pool.run(
+                self._async.delete(conversation_id, workspace_id=workspace_id)
+            )
+        )
 
     def subject_of(self, conversation_id: str) -> str | None:
         return self._pool.run(self._async.subject_of(conversation_id))  # type: ignore[no-any-return]
@@ -1025,6 +1226,7 @@ class PostgresConversationStore:
         description: str = "",
         kb_id: str | None = None,
         agent_path: str | None = None,
+        workspace_id: str | None = None,
     ) -> dict[str, object]:
         return self._pool.run(  # type: ignore[no-any-return]
             self._async.create_project(
@@ -1032,44 +1234,88 @@ class PostgresConversationStore:
                 description=description,
                 kb_id=kb_id,
                 agent_path=agent_path,
+                workspace_id=workspace_id,
             )
         )
 
-    def get_project_row(self, project_id: str) -> dict[str, Any] | None:
-        return self._pool.run(self._async.get_project_row(project_id))  # type: ignore[no-any-return]
+    def get_project_row(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> dict[str, Any] | None:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.get_project_row(project_id, workspace_id=workspace_id)
+        )
 
     def project_chat_count(self, project_id: str) -> int:
         return int(self._pool.run(self._async.project_chat_count(project_id)))
 
-    def list_project_rows(self) -> list[tuple[dict[str, Any], int]]:
-        return self._pool.run(self._async.list_project_rows())  # type: ignore[no-any-return]
+    def list_project_rows(
+        self, *, workspace_id: str | frozenset[str] | None = None
+    ) -> list[tuple[dict[str, Any], int]]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.list_project_rows(workspace_id=workspace_id)
+        )
 
     def update_project(
-        self, project_id: str, assignments: dict[str, str | None]
+        self,
+        project_id: str,
+        assignments: dict[str, str | None],
+        *,
+        workspace_id: str | frozenset[str] | None = None,
     ) -> bool:
         return bool(
-            self._pool.run(self._async.update_project(project_id, assignments))
-        )
-
-    def delete_project(self, project_id: str) -> bool:
-        return bool(self._pool.run(self._async.delete_project(project_id)))
-
-    def project_conversation_summaries(
-        self, project_id: str
-    ) -> list[ConversationSummary]:
-        return self._pool.run(  # type: ignore[no-any-return]
-            self._async.project_conversation_summaries(project_id)
-        )
-
-    def assign_conversation(self, project_id: str, conversation_id: str) -> bool:
-        return bool(
             self._pool.run(
-                self._async.assign_conversation(project_id, conversation_id)
+                self._async.update_project(
+                    project_id, assignments, workspace_id=workspace_id
+                )
             )
         )
 
-    def unassign_conversation(self, conversation_id: str) -> bool:
-        return bool(self._pool.run(self._async.unassign_conversation(conversation_id)))
+    def delete_project(
+        self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return bool(
+            self._pool.run(
+                self._async.delete_project(project_id, workspace_id=workspace_id)
+            )
+        )
+
+    def project_conversation_summaries(
+        self,
+        project_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> list[ConversationSummary]:
+        return self._pool.run(  # type: ignore[no-any-return]
+            self._async.project_conversation_summaries(
+                project_id, workspace_id=workspace_id
+            )
+        )
+
+    def assign_conversation(
+        self,
+        project_id: str,
+        conversation_id: str,
+        *,
+        workspace_id: str | frozenset[str] | None = None,
+    ) -> bool:
+        return bool(
+            self._pool.run(
+                self._async.assign_conversation(
+                    project_id, conversation_id, workspace_id=workspace_id
+                )
+            )
+        )
+
+    def unassign_conversation(
+        self, conversation_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        return bool(
+            self._pool.run(
+                self._async.unassign_conversation(
+                    conversation_id, workspace_id=workspace_id
+                )
+            )
+        )
 
     def close(self) -> None:
         self._pool.close()
@@ -2304,12 +2550,12 @@ class _AsyncNotifyStore:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO aux_notifications "
-                "(tenant, id, kind, title, body, link, created_at, read) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+                "(tenant, id, kind, title, body, link, created_at, read, workspace_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) "
                 "ON CONFLICT (tenant, id) DO UPDATE SET "
                 "kind = EXCLUDED.kind, title = EXCLUDED.title, body = EXCLUDED.body, "
                 "link = EXCLUDED.link, created_at = EXCLUDED.created_at, "
-                "read = EXCLUDED.read",
+                "read = EXCLUDED.read, workspace_id = EXCLUDED.workspace_id",
                 self._tenant,
                 int(item["id"]),
                 item["kind"],
@@ -2318,6 +2564,7 @@ class _AsyncNotifyStore:
                 item["link"],
                 item["created_at"],
                 bool(item["read"]),
+                item.get("workspace_id"),
             )
             await conn.execute(
                 "DELETE FROM aux_notifications WHERE tenant = $1 AND id <= $2",
@@ -2385,6 +2632,12 @@ class PostgresNotifyStore:
 
 
 def _notify_row_to_item(row: Any) -> dict[str, Any]:
+    # ``workspace_id`` rides through so the durable round-trip preserves the tenant stamp
+    # (matching the SQLite mirror) — without it ``_item_in_scope`` would see None on every
+    # rehydrated row and leak one tenant's mission previews to all. ``.get``-style access via
+    # ``in`` keeps a pre-migration row (no column) hydrating as an unscoped (None) item.
+    keys = row.keys() if hasattr(row, "keys") else row
+    workspace_id = row["workspace_id"] if "workspace_id" in keys else None
     return {
         "id": int(row["id"]),
         "kind": row["kind"],
@@ -2393,6 +2646,7 @@ def _notify_row_to_item(row: Any) -> dict[str, Any]:
         "link": row["link"],
         "created_at": _norm_ts(row["created_at"]),
         "read": bool(row["read"]),
+        "workspace_id": workspace_id,
     }
 
 

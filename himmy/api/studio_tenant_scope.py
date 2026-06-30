@@ -83,6 +83,55 @@ def scope_clause(
     return f"({column} IN ({placeholders}) OR {column} IS NULL)", list(ids)
 
 
+def scope_clause_write(
+    workspace_id: str | frozenset[str] | None, *, column: str = "workspace_id"
+) -> tuple[str, list[str]]:
+    """Like :func:`scope_clause` but for MUTATIONS — does NOT match legacy ``NULL`` rows.
+
+    The read-side :func:`scope_clause` deliberately matches ``workspace_id IS NULL`` so a
+    bound tenant can still SEE pre-migration / offline-written rows that predate tenant
+    binding. Applying that same ``OR col IS NULL`` predicate to ``UPDATE``/``DELETE``/upsert
+    paths, however, is a cross-tenant WRITE primitive: a tenant-bound principal could
+    complete/edit/delete (and, via ``INSERT OR REPLACE`` upsert, re-stamp/steal) any
+    NULL-owned legacy row it does not own. Those shared rows must be READ-visible but
+    IMMUTABLE to a bound tenant, so the write predicate is the strict subset:
+
+    * ``workspace_id is None`` (unrestricted / offline / ``all_tenants``) yields an EMPTY
+      fragment — "no filtering", so the single-box write is byte-unchanged and the shared
+      tool packs (which pass no workspace) keep writing exactly as before;
+    * a concrete ``workspace_id`` yields ``column = ?`` (NO ``OR IS NULL``) so a bound
+      tenant can mutate ONLY its OWN stamped rows — never a legacy NULL row, never a foreign
+      tenant's row;
+    * a ``frozenset`` yields ``column IN (?, ...)`` (NO ``OR IS NULL``); an EMPTY set yields
+      ``1 = 0`` (a bound principal with no tenant may mutate nothing — fail-closed).
+
+    The fragment carries no leading ``AND``/``WHERE`` — the caller composes it.
+    """
+    if workspace_id is None:
+        return "", []
+    if isinstance(workspace_id, str):
+        return f"{column} = ?", [workspace_id]
+    ids = sorted(workspace_id)
+    if not ids:
+        return "1 = 0", []
+    placeholders = ", ".join("?" for _ in ids)
+    return f"{column} IN ({placeholders})", list(ids)
+
+
+def row_writable_in_scope(row_workspace: str | None, workspace_id: str | None) -> bool:
+    """Whether a row stamped ``row_workspace`` may be MUTATED by a ``workspace_id`` writer.
+
+    The write-side companion to :func:`row_in_scope`. ``workspace_id is None`` (unrestricted
+    / offline) is always True (byte-unchanged). A bound writer may mutate ONLY rows stamped
+    with its EXACT workspace — never a legacy ``NULL`` row (read-visible but immutable) and
+    never a foreign tenant's. Used by by-id upsert guards to fold a re-stamp/steal attempt to
+    404 (or to preserve an existing row's owner instead of capturing it).
+    """
+    if workspace_id is None:
+        return True
+    return row_workspace == workspace_id
+
+
 def row_in_scope(row_workspace: str | None, workspace_id: str | None) -> bool:
     """Whether a row stamped ``row_workspace`` is visible to a ``workspace_id``-scoped reader.
 
@@ -96,4 +145,10 @@ def row_in_scope(row_workspace: str | None, workspace_id: str | None) -> bool:
     return row_workspace is None or row_workspace == workspace_id
 
 
-__all__ = ["ensure_workspace_column", "scope_clause", "row_in_scope"]
+__all__ = [
+    "ensure_workspace_column",
+    "scope_clause",
+    "scope_clause_write",
+    "row_in_scope",
+    "row_writable_in_scope",
+]

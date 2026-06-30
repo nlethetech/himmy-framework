@@ -17,9 +17,16 @@ Offline-first notes:
 
 from __future__ import annotations
 
-from fastapi import Depends, HTTPException
+from typing import Any
+
+from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from himmy.api.auth import (
+    scoped_read,
+    studio_tenant_filter,
+    studio_write_workspace,
+)
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.api.studio_chats import ChatSession, ChatsStore, Project, get_chats_store
 
@@ -99,8 +106,8 @@ def _resolve_agent_name(agent_path: str | None) -> str | None:
     return None
 
 
-def _detail(store: ChatsStore, project: Project) -> ProjectDetail:
-    chats = store.project_chats(project.id)
+def _detail(store: ChatsStore, project: Project, *, workspace: Any = None) -> ProjectDetail:
+    chats = store.project_chats(project.id, workspace_id=workspace)
     return ProjectDetail(
         **project.model_dump(exclude={"chat_count"}),
         chat_count=len(chats),
@@ -121,58 +128,68 @@ def _notify(kind_title: str, project: Project, body: str = "") -> None:
 # ---- routes -------------------------------------------------------------------
 
 
-@router.get("", response_model=list[Project])
-async def projects_list() -> list[Project]:
-    """Every project, most recently touched first."""
-    return get_chats_store().list_projects()
+@router.get("", response_model=list[Project], dependencies=[Depends(scoped_read)])
+async def projects_list(request: Request) -> list[Project]:
+    """Every project the caller's tenant owns (plus legacy NULL), most recently touched first."""
+    return get_chats_store().list_projects(workspace_id=studio_tenant_filter(request))
 
 
 @router.post("", response_model=Project, dependencies=[_projects_write])
-async def projects_create(body: ProjectCreateRequest) -> Project:
+async def projects_create(body: ProjectCreateRequest, request: Request) -> Project:
     store = get_chats_store()
     project = store.create_project(
         name=body.name.strip(),
         description=body.description.strip(),
         kb_id=body.kb_id,
         agent_path=body.agent_path,
+        workspace_id=studio_write_workspace(request),
     )
     _notify(f"Project “{project.name}” created", project)
     return project
 
 
-@router.get("/{project_id}", response_model=ProjectDetail)
-async def projects_get(project_id: str) -> ProjectDetail:
+@router.get(
+    "/{project_id}",
+    response_model=ProjectDetail,
+    dependencies=[Depends(scoped_read)],
+)
+async def projects_get(project_id: str, request: Request) -> ProjectDetail:
     store = get_chats_store()
-    project = store.get_project(project_id)
+    scope = studio_tenant_filter(request)
+    project = store.get_project(project_id, workspace_id=scope)
     if project is None:
         raise HTTPException(status_code=404, detail="unknown project")
-    return _detail(store, project)
+    return _detail(store, project, workspace=scope)
 
 
 @router.patch(
     "/{project_id}", response_model=Project, dependencies=[_projects_write]
 )
-async def projects_update(project_id: str, body: ProjectUpdateRequest) -> Project:
+async def projects_update(
+    project_id: str, body: ProjectUpdateRequest, request: Request
+) -> Project:
     store = get_chats_store()
-    if store.get_project(project_id) is None:
+    scope = studio_tenant_filter(request)
+    if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
     changes: dict[str, str | None] = {}
     for field in body.model_fields_set:
         value = getattr(body, field)
         changes[field] = value.strip() if isinstance(value, str) else value
-    updated = store.update_project(project_id, changes)
+    updated = store.update_project(project_id, changes, workspace_id=scope)
     if updated is None:  # deleted between the check and the write
         raise HTTPException(status_code=404, detail="unknown project")
     return updated
 
 
 @router.delete("/{project_id}", dependencies=[_projects_write])
-async def projects_delete(project_id: str) -> dict[str, bool]:
+async def projects_delete(project_id: str, request: Request) -> dict[str, bool]:
     store = get_chats_store()
-    project = store.get_project(project_id)
+    scope = studio_tenant_filter(request)
+    project = store.get_project(project_id, workspace_id=scope)
     if project is None:
         return {"ok": False}
-    ok = store.delete_project(project_id)
+    ok = store.delete_project(project_id, workspace_id=scope)
     if ok:
         _notify(
             f"Project “{project.name}” deleted",
@@ -183,23 +200,27 @@ async def projects_delete(project_id: str) -> dict[str, bool]:
 
 
 @router.post("/{project_id}/assign", dependencies=[_projects_write])
-async def projects_assign(project_id: str, body: ChatAssignRequest) -> dict[str, bool]:
+async def projects_assign(
+    project_id: str, body: ChatAssignRequest, request: Request
+) -> dict[str, bool]:
     store = get_chats_store()
-    if store.get_project(project_id) is None:
+    scope = studio_tenant_filter(request)
+    if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
-    if not store.assign_chat(project_id, body.chat_id):
+    if not store.assign_chat(project_id, body.chat_id, workspace_id=scope):
         raise HTTPException(status_code=404, detail="unknown chat session")
     return {"ok": True}
 
 
 @router.post("/{project_id}/unassign", dependencies=[_projects_write])
 async def projects_unassign(
-    project_id: str, body: ChatAssignRequest
+    project_id: str, body: ChatAssignRequest, request: Request
 ) -> dict[str, bool]:
     store = get_chats_store()
-    if store.get_project(project_id) is None:
+    scope = studio_tenant_filter(request)
+    if store.get_project(project_id, workspace_id=scope) is None:
         raise HTTPException(status_code=404, detail="unknown project")
-    return {"ok": store.unassign_chat(body.chat_id)}
+    return {"ok": store.unassign_chat(body.chat_id, workspace_id=scope)}
 
 
 __all__ = ["router"]

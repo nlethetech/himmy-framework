@@ -312,42 +312,16 @@ _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
     }
 )
 
-#: TIME-BOXED, REVIEWED gap (NOT a permanently-safe exemption). The Studio singleton SQLite
-#: stores (tasks/notes/calendar/cookbook), the process-local notify ring, and the HITL
-#: approvals queue have been DRAINED from this list: each now carries a ``workspace_id``
-#: stamp (an additive + nullable migration via ``himmy.api.studio_tenant_scope`` for the
-#: stores; the checkpoint ``ctx`` workspace for approvals) and scopes every read/list/mutate
-#: through the principal-derived ``studio_tenant_filter`` / ``studio_write_workspace`` — so
-#: they carry the ``scoped_read`` marker and pass the gate by construction.
-#:
-#: What REMAINS pending is the unified conversation store (chats + projects): it is SHARED
-#: with the CLI ``himmy chat`` / ``/resume`` session path, carries back-compat VIEWs +
-#: retention triggers, and has a Postgres mirror, so its tenant-column migration is a larger,
-#: higher-risk change deferred to its own pass to keep the offline CLI session path
-#: byte-unchanged. Until that lands these two surfaces are RBAC-gated only and remain a KNOWN
-#: cross-tenant disclosure for a tenant-bound principal holding the read grant ONCE AUTH IS
-#: ON. Enumerating them here makes the gap a VISIBLE, regression-protected decision — a NEW
-#: Studio read that should be scoped, but is not and is not on this list, fails the gate —
-#: rather than a silent leak. Entries here must be DRAINED by stamping the underlying store,
-#: not grown.
-_STUDIO_TENANT_PENDING: frozenset[str] = frozenset(
-    {
-        # The unified conversation store (himmy.services.storage.conversations) backs BOTH
-        # the Studio chats AND projects surfaces and is SHARED with the CLI `himmy chat` /
-        # `/resume` session path (a Studio chat id IS the CLI conversation_id), carries
-        # back-compat VIEWs + retention triggers, and has a Postgres mirror. Stamping a
-        # tenant column there + threading it through ~15 read/write methods AND the CLI
-        # writer AND the PG mirror is a larger, higher-risk data-model change than its
-        # singleton-store siblings; deferred to its own pass to keep the offline CLI session
-        # path byte-unchanged. The other Studio singleton stores (tasks/notes/calendar/
-        # cookbook), the notify ring, and the HITL approvals queue are now genuinely scoped
-        # (DRAINED below) — they carry a workspace_id stamp and scope every read.
-        "/api/studio/chats",
-        "/api/studio/chats/{session_id}",
-        "/api/studio/projects",
-        "/api/studio/projects/{project_id}",
-    }
-)
+#: FULLY DRAINED. Every Studio singleton/shared store now carries a ``workspace_id`` stamp
+#: and scopes every read/list/mutate through the principal-derived ``studio_tenant_filter`` /
+#: ``studio_write_workspace`` — the singleton SQLite stores (tasks/notes/calendar/cookbook),
+#: the notify ring, the HITL approvals queue, AND the unified conversation store (chats +
+#: projects). The conversation store's tenant-column migration (additive + nullable on both
+#: the SQLite ``ConversationStore`` and its Postgres mirror) keeps the offline CLI ``himmy
+#: chat`` / ``/resume`` session path byte-unchanged: the CLI writer passes no ``workspace_id``
+#: so its rows are ``NULL`` (visible to all, never re-stamped). This list is now EMPTY — any
+#: NEW Studio read that should be tenant-scoped but is not fails the coverage gate.
+_STUDIO_TENANT_PENDING: frozenset[str] = frozenset()
 
 #: Studio memory reads that DO enforce the SUBJECT axis (``narrow_subject`` →
 #: ``scoped_read``, the round-7 cross-subject-recall fix) but whose store
@@ -361,13 +335,14 @@ _STUDIO_TENANT_PENDING: frozenset[str] = frozenset(
 #: process-global memory store already accepts (mirroring the tasks/chats/notes stores),
 #: now tracked so a future workspace-column migration drains it. DRAIN by stamping the
 #: memory store with a tenant column + intersecting every read, not by growing this list.
-_STUDIO_MEMORY_TENANT_PENDING: frozenset[str] = frozenset(
-    {
-        "/api/studio/memory",
-        "/api/studio/memory/subjects",
-        "/api/studio/memory/recall",
-    }
-)
+#: DRAINED. The Studio memory reads now enforce BOTH axes. The SUBJECT axis is the round-7
+#: ``narrow_subject`` fix; the TENANT axis is closed WITHOUT a store-schema change by
+#: NAMESPACING the subject the routes read/write/recall with the principal's resolved
+#: workspace (``t:<workspace>:<subject>`` via ``_memory_tenant_prefix``) — the SAME scheme the
+#: tool-layer memory pack uses (:meth:`ToolkitConfig.scoped_memory_subject`). So a tenant-bound
+#: Studio console and that tenant's agents share one namespace and NO other tenant's, making a
+#: cross-tenant recall structurally impossible on the shared process store. This set is EMPTY.
+_STUDIO_MEMORY_TENANT_PENDING: frozenset[str] = frozenset()
 
 _ALL_ALLOWED = (
     _PUBLIC
@@ -466,34 +441,29 @@ def test_memory_recall_post_read_is_detected_as_scoped() -> None:
     )
 
 
-def test_studio_memory_reads_are_subject_scoped_and_tenant_pending() -> None:
-    """The Studio memory reads enforce the SUBJECT axis but track the TENANT gap honestly.
+def test_studio_memory_reads_are_subject_and_tenant_scoped() -> None:
+    """The Studio memory reads enforce BOTH the subject AND the tenant axis (gap CLOSED).
 
-    Round-8 finding: the three memory read routes carry ``scoped_read`` (the round-7
-    cross-subject fix via ``narrow_subject``), which advertises tenant(+subject) scope —
-    but the process-global memory store has NO ``workspace_id`` column, so the TENANT axis
-    is structurally unenforceable here. Without explicit tracking the tenant gap would be
-    INVISIBLE behind the marker (unlike the tasks/chats/notes stores on
-    :data:`_STUDIO_TENANT_PENDING`) and never drained. This asserts the residual gap is
-    VISIBLE and regression-protected: every route is (a) detected as subject-scoped AND
-    (b) enumerated on :data:`_STUDIO_MEMORY_TENANT_PENDING` so a future store migration
-    drains it. A new memory read that escapes this tracking fails here.
+    The three memory read routes carry ``scoped_read`` (the subject axis via
+    ``narrow_subject``) AND now namespace their effective subject by the principal's resolved
+    workspace (``_memory_tenant_prefix`` → ``t:<workspace>:<subject>``), closing the former
+    tenant gap on the process-global store WITHOUT a schema change. The pending set is now
+    empty; this asserts the routes are still detected as scoped (the marker is wired) and
+    that nothing remains pending.
     """
     get_routes = {path: route for path, route in _get_read_routes()}
     nonget_routes = {path: route for path, route in _non_get_read_routes()}
-    for path in _STUDIO_MEMORY_TENANT_PENDING:
+    for path in (
+        "/api/studio/memory",
+        "/api/studio/memory/subjects",
+        "/api/studio/memory/recall",
+    ):
         route = get_routes.get(path) or nonget_routes.get(path)
-        assert route is not None, (
-            f"{path} is no longer a real memory read route; reconcile "
-            "_STUDIO_MEMORY_TENANT_PENDING with the built app"
-        )
-        # The subject axis IS enforced (round-7 fix) — the marker is genuinely present.
+        assert route is not None, f"{path} is no longer a real memory read route"
         assert _route_is_scoped(route), (
-            f"{path} must keep its scoped_read marker (subject axis via narrow_subject)"
+            f"{path} must keep its scoped_read marker (subject + tenant axes)"
         )
-    # The three known memory reads are exactly the tracked set — a new one must be added
-    # here (and ultimately drained by a tenant column), not silently hidden by the marker.
-    assert "/api/studio/memory/recall" in _STUDIO_MEMORY_TENANT_PENDING
+    assert _STUDIO_MEMORY_TENANT_PENDING == frozenset()
 
 
 def test_every_subject_keyed_write_route_is_subject_scoped() -> None:

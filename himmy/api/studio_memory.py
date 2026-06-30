@@ -148,20 +148,32 @@ def current_memory_store() -> MemoryStore | None:
     return _STORE
 
 
-def list_subjects(*, only_subject: str | None = None) -> list[str]:
+def list_subjects(
+    *, only_subject: str | None = None, tenant_prefix: str = ""
+) -> list[str]:
     """Distinct subject ids that have memories (newest-active first).
 
     When ``only_subject`` is given (a ``subject_scoped`` principal's own subject, derived
     by the router from the verified principal — never client input), the enumeration is
     NARROWED to just that subject, closing the cross-subject enumeration oracle. ``None``
     (the offline / ``all_tenants`` default) returns every subject — byte-unchanged.
+
+    ``tenant_prefix`` (TENANT axis) restricts the enumeration to subjects in this tenant's
+    ``t:<workspace>:`` namespace on the shared process store and STRIPS the prefix from the
+    returned ids (so the console shows the caller's own subject ids, never another tenant's,
+    and never the internal namespace). ``""`` (offline / ``all_tenants``) is byte-unchanged.
     """
     seen: list[str] = []
     for r in _store().list():
-        if only_subject is not None and r.subject_id != only_subject:
+        sid = r.subject_id
+        if tenant_prefix:
+            if not sid.startswith(tenant_prefix):
+                continue  # another tenant's namespace — invisible here.
+            sid = sid[len(tenant_prefix) :]
+        if only_subject is not None and sid != only_subject:
             continue
-        if r.subject_id not in seen:
-            seen.append(r.subject_id)
+        if sid not in seen:
+            seen.append(sid)
     return sorted(seen) or ["default"]
 
 

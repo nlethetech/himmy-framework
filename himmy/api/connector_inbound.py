@@ -101,8 +101,21 @@ def _build_inbound_handler(agent_path: str, *, app: FastAPI | None = None) -> An
 
     spec = load_spec_file(agent_path)
     tool_authorizer = _connector_tool_authorizer(app)
+    # P1 tenancy: thread the connector service principal's FIXED bound workspace as the
+    # tool-store ``subject`` so its memory/knowledge packs key off ``t:<workspace>`` instead
+    # of the static shared ``default`` subject / ``(local, local)`` KB scope that the offline
+    # CLI and every other unscoped caller share (the confused-deputy the rest of the pass
+    # closes by threading ``subject=owner_workspace_id`` on every other durable run path).
+    # The connector is pinned to ``LOCAL_WORKSPACE``; deriving it from the same service
+    # principal keeps a future per-tenant connector binding isolating by construction.
+    from himmy.api.auth.service_principal import connector_service_principal
+
+    connector_workspace = connector_service_principal().default_tenant()
     runtime, registry = build_runtime_for_spec(
-        spec, durable_defaults=True, tool_authorizer=tool_authorizer
+        spec,
+        durable_defaults=True,
+        subject=connector_workspace,
+        tool_authorizer=tool_authorizer,
     )
     persona = spec.to_persona()
     llm_config = spec.to_llm_config()
