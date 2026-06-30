@@ -397,13 +397,22 @@ class _Cognition:
     the live SSE stream and for the run-detail cognition view.
     """
 
-    def __init__(self, read_only: dict[str, bool | None], initial_agent: str) -> None:
+    def __init__(
+        self,
+        read_only: dict[str, bool | None],
+        initial_agent: str,
+        *,
+        owner_workspace_id: str | None = None,
+    ) -> None:
         from himmy.core.events import EventType
 
         self._E = EventType
         self._read_only = read_only
         self.active = initial_agent
         self.active_model: str | None = None
+        # The OWNING workspace of this run, so the approval bell is only visible to the
+        # tenant that launched the run (``None``/offline = NULL-owned = shared, unchanged).
+        self._owner_workspace_id = owner_workspace_id
         self.tools_used: list[str] = []
         self.delegate_answers: list[tuple[str, str]] = []
         self.steps: list[dict[str, Any]] = []
@@ -606,6 +615,7 @@ class _Cognition:
                 "Approval required: " + (", ".join(tools) if tools else "a gated tool"),
                 body=f"{self.active} paused and is waiting for your decision",
                 link="/approvals",
+                workspace_id=self._owner_workspace_id,
             )
             return out
 
@@ -824,7 +834,9 @@ async def stream_agent_run(
         # so the tool is bound and classified like any other.
         register_update_plan_tool(registry)
     thread = _rebuild_thread(spec, history)
-    cog = _Cognition(_read_only_map(registry), spec.name)
+    cog = _Cognition(
+        _read_only_map(registry), spec.name, owner_workspace_id=owner_workspace_id
+    )
 
     # Attach any MCP servers for the lifetime of this run.
     mcp_clients: list[Any] = []
@@ -848,6 +860,22 @@ async def stream_agent_run(
     yield {"type": "start", "agent": spec.name, "streaming": not has_tools}
     try:
         task = spec.make_task(prompt)
+        # rbac-harden (resume tenancy): stamp the run's OWNING tenant + within-tenant USER
+        # axis onto the task's ``context_metadata`` so they ride durably into the checkpoint
+        # ctx (serialized verbatim). On a HITL resume in a fresh process the approvals path
+        # re-derives both via ``_checkpoint_owner_workspace`` / ``_checkpoint_owner_subject_scope``
+        # and re-scopes the resumed memory/KB packs to the same partition — otherwise the
+        # resume reverts to the shared tenant-only (or static) store. ``None``/``None``
+        # (offline / non-subject-scoped) writes nothing → byte-for-byte unchanged.
+        if owner_workspace_id is not None or owner_subject_scope is not None:
+            meta = task.context.get("context_metadata")
+            if not isinstance(meta, dict):
+                meta = {}
+                task.context["context_metadata"] = meta
+            if owner_workspace_id is not None:
+                meta.setdefault("workspace_id", owner_workspace_id)
+            if owner_subject_scope is not None:
+                meta.setdefault("subject_scope", owner_subject_scope)
         if plan_mode and has_tools:
             # Plan-first: nudge the agent (system prefix renders into the system
             # prompt on the first turn) and make sure update_plan stays bound
@@ -1261,6 +1289,7 @@ async def stream_team_run(
     team_name: str = "team",
     team_path: str | None = None,
     canonical_storage: Any | None = None,
+    owner_workspace_id: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run a multi-agent team for one request, streaming the live routing trail.
 
@@ -1310,7 +1339,9 @@ async def stream_team_run(
     status = "ok"
     error_msg: str | None = None
     entry = getattr(spec, "entry", None) or team_name
-    cog = _Cognition(_read_only_map(registry), entry)
+    cog = _Cognition(
+        _read_only_map(registry), entry, owner_workspace_id=owner_workspace_id
+    )
 
     yield {"type": "start", "agent": team_name, "streaming": False, "team": True}
 

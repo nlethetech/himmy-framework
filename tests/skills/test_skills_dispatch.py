@@ -85,3 +85,54 @@ def test_skills_suite_file_loads() -> None:
     assert suite.name == "skills"
     ids = {t.id for t in suite.tasks}
     assert {"skill_sql", "skill_file", "skill_summarize"} <= ids
+
+
+# ---- rbac-harden(mopup-r1): dispatched skill sub-agent inherits parent tenant/subject scope
+
+
+def test_dispatch_threads_tenant_subject_scope_into_skill_packs(monkeypatch) -> None:
+    """A dispatched skill's tool packs must key off the parent run's tenancy axes.
+
+    Regression for the same confused-deputy leak as spawn: ``dispatch_skill`` rebuilt the
+    skill's packs with a bare ``ToolkitConfig.from_env()`` carrying no tenant/subject scope,
+    so memory/KB reverted to the shared static store. Assert the threaded scope reaches the
+    ``register_packs`` config.
+    """
+    import himmy.toolkit as toolkit
+
+    captured: dict[str, object] = {}
+    real = toolkit.register_packs
+
+    def _spy(registry, packs, config):
+        captured["tenant_scope"] = config.tenant_scope
+        captured["subject_scope"] = config.subject_scope
+        return real(registry, packs, config)
+
+    monkeypatch.setattr(toolkit, "register_packs", _spy)
+
+    run_async(
+        SkillDispatcher(
+            inference=_inference(), tenant_scope="t1", subject_scope="userA"
+        ).run("data_analysis", "list the tables")
+    )
+    assert captured == {"tenant_scope": "t1", "subject_scope": "userA"}, (
+        "dispatched skill's packs did not inherit the parent's tenant/subject scope"
+    )
+
+
+def test_dispatch_offline_scope_none_is_unchanged(monkeypatch) -> None:
+    """Offline / non-subject-scoped (None/None) leaves the skill packs on the static scope."""
+    import himmy.toolkit as toolkit
+
+    captured: dict[str, object] = {}
+    real = toolkit.register_packs
+
+    def _spy(registry, packs, config):
+        captured["tenant_scope"] = config.tenant_scope
+        captured["subject_scope"] = config.subject_scope
+        return real(registry, packs, config)
+
+    monkeypatch.setattr(toolkit, "register_packs", _spy)
+
+    run_async(SkillDispatcher(inference=_inference()).run("data_analysis", "list tables"))
+    assert captured == {"tenant_scope": None, "subject_scope": None}

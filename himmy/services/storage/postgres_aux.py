@@ -1948,6 +1948,9 @@ class _AsyncCalendarStore:
 
     async def add(self, ev: Any, workspace_id: str | None = None) -> Any:
         async with self._pool.acquire() as conn:
+            stamp = await _preserve_owner(
+                conn, "aux_calendar_events", self._tenant, ev.id, workspace_id
+            )
             await conn.execute(
                 "INSERT INTO aux_calendar_events "
                 "(tenant, id, date, time, title, notes, created_at, workspace_id) "
@@ -1962,7 +1965,7 @@ class _AsyncCalendarStore:
                 ev.title,
                 ev.notes,
                 ev.created_at,
-                workspace_id,
+                stamp,
             )
         return ev
 
@@ -2000,7 +2003,7 @@ class _AsyncCalendarStore:
     async def delete(
         self, event_id: str, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        scope, sparams = _pg_scope(workspace_id, start=3)
+        scope, sparams = _pg_scope(workspace_id, start=3, write=True)
         where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
@@ -2091,6 +2094,7 @@ class _AsyncCookbookStore:
 
     async def upsert(self, r: Any, workspace_id: str | None = None) -> Any:
         async with self._pool.acquire() as conn:
+            stamp = await _preserve_owner(conn, "aux_recipes", self._tenant, r.id, workspace_id)
             await conn.execute(
                 "INSERT INTO aux_recipes "
                 "(tenant, id, name, agent_path, prompt, notes, created_at, workspace_id) "
@@ -2106,14 +2110,14 @@ class _AsyncCookbookStore:
                 r.prompt,
                 r.notes,
                 r.created_at,
-                workspace_id,
+                stamp,
             )
         return r
 
     async def delete(
         self, recipe_id: str, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        scope, sparams = _pg_scope(workspace_id, start=3)
+        scope, sparams = _pg_scope(workspace_id, start=3, write=True)
         where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
@@ -2219,6 +2223,9 @@ class _AsyncNotesStore:
     async def upsert(self, note: Any, workspace_id: str | None = None) -> Any:
         note.updated_at = utc_now_iso()
         async with self._pool.acquire() as conn:
+            stamp = await _preserve_owner(
+                conn, "aux_notes", self._tenant, note.id, workspace_id
+            )
             await conn.execute(
                 "INSERT INTO aux_notes "
                 "(tenant, id, title, body, updated_at, workspace_id) "
@@ -2232,14 +2239,14 @@ class _AsyncNotesStore:
                 note.title,
                 note.body,
                 note.updated_at,
-                workspace_id,
+                stamp,
             )
         return note
 
     async def delete(
         self, note_id: str, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        scope, sparams = _pg_scope(workspace_id, start=3)
+        scope, sparams = _pg_scope(workspace_id, start=3, write=True)
         where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
@@ -2348,7 +2355,7 @@ class _AsyncTasksStore:
     async def set_done(
         self, task_id: str, done: bool, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        scope, sparams = _pg_scope(workspace_id, start=4)
+        scope, sparams = _pg_scope(workspace_id, start=4, write=True)
         where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
@@ -2385,7 +2392,7 @@ class _AsyncTasksStore:
             vals.append(done)
             idx += 1
         if sets:
-            scope, sparams = _pg_scope(workspace_id, start=idx + 2)
+            scope, sparams = _pg_scope(workspace_id, start=idx + 2, write=True)
             where = f" AND {scope}" if scope else ""
             async with self._pool.acquire() as conn:
                 await conn.execute(
@@ -2421,7 +2428,7 @@ class _AsyncTasksStore:
     async def complete_by_title(
         self, title: str, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        scope, sparams = _pg_scope(workspace_id, start=3)
+        scope, sparams = _pg_scope(workspace_id, start=3, write=True)
         where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
@@ -2436,7 +2443,7 @@ class _AsyncTasksStore:
     async def delete(
         self, task_id: str, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
-        scope, sparams = _pg_scope(workspace_id, start=3)
+        scope, sparams = _pg_scope(workspace_id, start=3, write=True)
         where = f" AND {scope}" if scope else ""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
@@ -2889,6 +2896,7 @@ def _pg_scope(
     *,
     start: int,
     column: str = "workspace_id",
+    write: bool = False,
 ) -> tuple[str, list[str]]:
     """asyncpg ``$N`` analogue of :func:`himmy.api.studio_tenant_scope.scope_clause`.
 
@@ -2900,23 +2908,67 @@ def _pg_scope(
     * ``workspace_id is None`` (offline / ``all_tenants`` / the pinned ``tenant='local'``
       single-box mirror) yields an EMPTY fragment + no params — "no filtering", so the
       Postgres read is byte-unchanged from before this column existed;
-    * a concrete workspace yields ``(column = $N OR column IS NULL)`` so the caller sees its
-      OWN rows AND any legacy ``NULL`` row written before tenant binding;
+    * a concrete workspace yields ``(column = $N OR column IS NULL)`` for a READ so the
+      caller sees its OWN rows AND any legacy ``NULL`` row written before tenant binding;
     * a ``frozenset`` yields ``(column IN ($N, ...) OR column IS NULL)``; an EMPTY set is
       "nothing but legacy NULL rows", never "ALL".
+
+    ``write=True`` mirrors :func:`himmy.api.studio_tenant_scope.scope_clause_write` /
+    :func:`_pg_scope_pred`: it OMITS the ``OR column IS NULL`` branch so a bound tenant can
+    mutate ONLY its own stamped rows — a legacy/shared ``NULL``-owned row stays READ-visible
+    but IMMUTABLE (applying the read clause to UPDATE/DELETE is a cross-tenant WRITE
+    primitive). An EMPTY frozenset write fails closed to ``FALSE`` (mutate nothing).
 
     ``start`` is the next free ``$N`` index (the callers' fixed params — ``tenant``, ids —
     already consume the low numbers), so the fragment composes after the static predicate.
     """
     if workspace_id is None:
         return "", []
+    null_or = "" if write else f" OR {column} IS NULL"
     if isinstance(workspace_id, str):
-        return f"({column} = ${start} OR {column} IS NULL)", [workspace_id]
+        return f"({column} = ${start}{null_or})", [workspace_id]
     ids = sorted(workspace_id)
     if not ids:
-        return f"{column} IS NULL", []
+        return (f"{column} IS NULL" if not write else "FALSE"), []
     placeholders = ", ".join(f"${start + i}" for i in range(len(ids)))
-    return f"({column} IN ({placeholders}) OR {column} IS NULL)", list(ids)
+    return f"({column} IN ({placeholders}){null_or})", list(ids)
+
+
+async def _preserve_owner(
+    conn: Any,
+    table: str,
+    tenant: str,
+    row_id: str,
+    workspace_id: str | None,
+) -> str | None:
+    """Resolve the ``workspace_id`` to STAMP on a by-id upsert, preserving a foreign owner.
+
+    Mirrors the SQLite stores' ``row_writable_in_scope`` re-stamp guard (studio_cookbook /
+    studio_notes / studio_calendar): a by-id upsert that targets an existing row the writer
+    is NOT entitled to mutate (a legacy ``NULL``-owned or foreign-tenant row) PRESERVES the
+    existing owner instead of capturing/clobbering it onto ``workspace_id``. ``workspace_id
+    is None`` (offline / unrestricted) is byte-unchanged — the raw value is returned and no
+    SELECT is issued, so the single-box path is untouched. ``table`` is always a static
+    in-module literal (never user input).
+    """
+    if workspace_id is None:
+        return workspace_id
+    from himmy.api.studio_tenant_scope import row_writable_in_scope
+
+    # ``fetchrow`` (not ``fetchval``) so a legacy row whose ``workspace_id`` IS NULL is
+    # distinguishable from "no such row": a missing row → fresh insert (stamp the writer);
+    # an existing NULL/foreign-owned row the writer cannot mutate → preserve its owner.
+    existing = await conn.fetchrow(
+        f"SELECT workspace_id FROM {table} "  # noqa: S608 - table is a static literal
+        f"WHERE tenant = $1 AND id = $2",
+        tenant,
+        row_id,
+    )
+    if existing is not None:
+        owner = existing["workspace_id"]
+        if not row_writable_in_scope(owner, workspace_id):
+            return owner
+    return workspace_id
 
 
 def _rowcount(result: Any) -> int:

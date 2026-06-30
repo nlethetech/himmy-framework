@@ -743,6 +743,13 @@ def test_admin_passes_studio_mutation_rbac(studio_cwd: Path) -> None:
     """
     c, _ = _studio_client("admin")
     for method, path, body in _VIEWER_DENIED_MUTATIONS:
+        # rbac-harden(mopup-r1): /notify/settings flips a DEPLOYMENT-GLOBAL, tenant-unscoped
+        # forwarding toggle, so it now carries an operator-posture gate ABOVE RBAC — a
+        # tenant-bound admin is intentionally 403 there (covered by
+        # tests/api/test_studio_notify.py::test_tenant_bound_principal_cannot_flip_global_forwarding).
+        # The RBAC-passthrough invariant this test guards still holds for every per-tenant route.
+        if path == "/api/studio/notify/settings":
+            continue
         resp = c.request(method, path, json=body)
         assert resp.status_code != 403, f"admin blocked on {method} {path}"
 

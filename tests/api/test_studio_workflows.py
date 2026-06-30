@@ -38,3 +38,50 @@ def test_discover_workflows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     found = sw.discover_workflows()
     assert [w.name for w in found] == ["a"]
     assert found[0].steps[0].subtask == "do it"
+
+
+# ---- rbac-harden(mopup-r1): run_workflow threads the within-tenant subject_scope axis
+
+
+class _ScopeCaptured(Exception):
+    """Sentinel raised by the build spy after recording the scope (short-circuit)."""
+
+
+def test_run_workflow_threads_subject_scope_into_runtime_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run_workflow`` must forward the within-tenant USER axis into the runtime build.
+
+    Regression for the dropped subject_scope: workflow_run discarded the principal's subject
+    and run_workflow did not forward subject_scope, so two subject_scoped users of one tenant
+    pooled their workflow agent's memory/KB onto one namespace. Assert subject_scope reaches
+    ``build_runtime_for_spec``.
+    """
+    from himmy.runtime import from_spec
+    from tests.conftest import run_async
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "brief.workflow.yaml").write_text(
+        "name: brief\nsteps:\n  - name: s\n    subtask: do it\n"
+    )
+    (tmp_path / "agent.yaml").write_text("name: a\nprovider: stub\n")
+
+    captured: dict[str, object] = {}
+
+    def _spy(spec, **kw):
+        captured["subject"] = kw.get("subject")
+        captured["subject_scope"] = kw.get("subject_scope")
+        raise _ScopeCaptured()
+
+    monkeypatch.setattr(from_spec, "build_runtime_for_spec", _spy)
+
+    with pytest.raises(_ScopeCaptured):
+        run_async(
+            sw.run_workflow(
+                "brief.workflow.yaml",
+                "agent.yaml",
+                subject="tenant-A",
+                subject_scope="userA",
+            )
+        )
+    assert captured == {"subject": "tenant-A", "subject_scope": "userA"}

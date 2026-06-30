@@ -291,3 +291,55 @@ def test_live_approval_pause_rings_the_bell(
         sn._HYDRATED = True
         sa.reset_checkpoint_store()
         reset_run_store()
+
+
+# ---- rbac-harden(mopup-r1): notify forwarding is a deployment-global, operator-only toggle
+
+
+def _tenant_admin_client() -> TestClient:
+    """A TENANT-BOUND admin principal (all_tenants=False, holds studio.notify:write)."""
+    from himmy.api import ApiContainer
+    from himmy.api import create_app as _create
+    from himmy.api.auth.apikey import ApiKeyAuthenticator
+    from himmy.api.auth.principal import Principal
+
+    app = _create(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "k": Principal.build(
+                "u", tenant_ids=["t"], roles=["admin"], auth_method="apikey"
+            )
+        }
+    )
+    c = TestClient(app)
+    c.headers.update({"x-himmy-internal-key": "k"})
+    return c
+
+
+def test_tenant_bound_principal_cannot_flip_global_forwarding(
+    notify_env: Path,
+) -> None:
+    """A tenant-bound principal must NOT toggle the deployment-global forward setting.
+
+    Even holding studio.notify:write (admin), the forward-Telegram flag is a process-global
+    one-row setting shared across co-tenants, so the write is restricted to an operator /
+    all_tenants principal. A tenant-bound caller gets 403 instead of silently flipping
+    forwarding for every other tenant.
+    """
+    client = _tenant_admin_client()
+    resp = client.post(
+        "/api/studio/notify/settings", json={"forward_telegram": False}
+    )
+    assert resp.status_code == 403, resp.text
+    # The global flag was NOT mutated by the rejected request.
+    assert sn._FORWARD_TELEGRAM is False  # default, untouched
+
+
+def test_offline_principal_can_set_forwarding(notify_env: Path) -> None:
+    """The offline / all_tenants default (no authenticator) still sets the toggle."""
+    client = _client()  # ANONYMOUS / all_tenants -> operator posture
+    resp = client.post(
+        "/api/studio/notify/settings", json={"forward_telegram": True}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["settings"] == {"forward_telegram": True}

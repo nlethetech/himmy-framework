@@ -71,6 +71,7 @@ async def run_workflow(
     initial_state: dict[str, Any] | None = None,
     tool_authorizer: Any = None,
     subject: str | None = None,
+    subject_scope: str | None = None,
 ) -> Any:
     """Run the workflow with the chosen agent's persona; return the WorkflowResult.
 
@@ -85,6 +86,11 @@ async def run_workflow(
     instead of the static ``default`` subject / ``(local, local)`` KB scope — symmetric to
     the ``/v1`` and Studio run paths. ``None`` (offline / single-box / ``all_tenants``)
     leaves both packs on their historical static scope — byte-for-byte unchanged.
+
+    ``subject_scope`` (rbac-harden tenancy, subject axis) is the within-tenant USER axis
+    for a ``subject_scoped`` principal. It is threaded into the runtime build so two users
+    of one tenant never pool their memory/KB/tasks/notes onto one namespace. ``None`` (the
+    common non-subject-scoped / offline case) leaves the scope tenant-only — unchanged.
     """
     import asyncio
 
@@ -104,6 +110,7 @@ async def run_workflow(
                 model=model,
                 durable_defaults=True,
                 subject=subject,
+                subject_scope=subject_scope,
             )
         )
         orch = WorkflowOrchestrator(runtime)

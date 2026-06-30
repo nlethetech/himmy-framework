@@ -492,6 +492,10 @@ async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
     from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
     tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    # Stamp the team run-record with the request principal's owning workspace so a
+    # tenant-bound reader's Runs browser is scoped (None offline / all_tenants, byte-
+    # unchanged). Mirrors the chat/eval/workflow run paths.
+    owner_workspace, _owner_subject = _run_owner(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
@@ -502,6 +506,7 @@ async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
                     team_name=team_name,
                     team_path=body.team_path,
                     canonical_storage=canonical,
+                    owner_workspace_id=owner_workspace,
                 ):
                     yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
@@ -2030,6 +2035,9 @@ async def eval_run(body: EvalRunRequest, request: Request) -> Any:
                 model=body.model,
                 tool_authorizer=tool_authorizer,
                 subject=owner_workspace,
+                # rbac-harden: thread the within-tenant USER axis so two subject_scoped
+                # users of one tenant never share the eval agent's memory/KB namespace.
+                subject_scope=_run_subject_scope(request),
             ),
             timeout=900,
         )
@@ -2098,6 +2106,9 @@ async def workflow_run(body: WorkflowRunRequest, request: Request) -> Any:
                 initial_state=body.initial_state,
                 tool_authorizer=tool_authorizer,
                 subject=owner_workspace,
+                # rbac-harden: thread the within-tenant USER axis so two subject_scoped
+                # users of one tenant never share the workflow agent's memory/KB namespace.
+                subject_scope=_run_subject_scope(request),
             ),
             timeout=900,
         )

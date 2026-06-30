@@ -117,11 +117,20 @@ def _detail(store: ChatsStore, project: Project, *, workspace: Any = None) -> Pr
     )
 
 
-def _notify(kind_title: str, project: Project, body: str = "") -> None:
+def _notify(
+    kind_title: str, project: Project, body: str = "", *, workspace_id: str | None = None
+) -> None:
     from himmy.api.routers.studio_notify import record_notification
 
+    # Stamp the notification with the OWNING workspace so a tenant-bound reader only sees
+    # the bell (and the project NAME) for its own projects. ``None`` (offline / unrestricted)
+    # leaves it NULL-owned = visible to all, byte-unchanged.
     record_notification(
-        "project", kind_title, body=body, link=f"/projects/{project.id}"
+        "project",
+        kind_title,
+        body=body,
+        link=f"/projects/{project.id}",
+        workspace_id=workspace_id,
     )
 
 
@@ -144,7 +153,11 @@ async def projects_create(body: ProjectCreateRequest, request: Request) -> Proje
         agent_path=body.agent_path,
         workspace_id=studio_write_workspace(request),
     )
-    _notify(f"Project “{project.name}” created", project)
+    _notify(
+        f"Project “{project.name}” created",
+        project,
+        workspace_id=studio_write_workspace(request),
+    )
     return project
 
 
@@ -195,6 +208,7 @@ async def projects_delete(project_id: str, request: Request) -> dict[str, bool]:
             f"Project “{project.name}” deleted",
             project,
             body="Its chats were kept, just ungrouped.",
+            workspace_id=studio_write_workspace(request),
         )
     return {"ok": ok}
 

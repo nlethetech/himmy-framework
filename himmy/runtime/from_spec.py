@@ -527,7 +527,13 @@ def build_runtime_for_spec(
             from himmy.toolkit.spawn import register_spawn_tool
 
             register_spawn_tool(
-                registry, inference=inference, tool_authorizer=tool_authorizer
+                registry,
+                inference=inference,
+                tool_authorizer=tool_authorizer,
+                # P1: thread this run's tenancy axes so a spawned sub-agent's memory/KB
+                # packs stay scoped to the parent's tenant/subject (not the shared store).
+                tenant_scope=subject,
+                subject_scope=subject_scope,
             )
         if spec.allow_skill_dispatch:
             # dispatch_skill runs a named capability as a tool-scoped sub-agent; the
@@ -543,6 +549,10 @@ def build_runtime_for_spec(
                 # path above — otherwise a narrowed caller could route WITHHELD write
                 # tools through a skill's tool-packs (a confused-deputy bypass).
                 tool_authorizer=tool_authorizer,
+                # P1: thread this run's tenancy axes so a dispatched skill's memory/KB
+                # packs stay scoped to the parent's tenant/subject (not the shared store).
+                tenant_scope=subject,
+                subject_scope=subject_scope,
             )
         if reputation_provider is not None:
             # Prime the sync reputation snapshot from history ONCE, here at build time

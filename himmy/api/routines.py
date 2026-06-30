@@ -1419,8 +1419,17 @@ async def _deliver(routine: Routine, output: str) -> str | None:
 
 
 def _notify(routine: Routine, status: str, preview: str, error: str | None) -> None:
-    """Record the lifecycle notification (never raises, per the contract)."""
+    """Record the lifecycle notification (never raises, per the contract).
+
+    The notification is stamped with the routine's OWNING workspace so a tenant-bound
+    Studio reader only sees the bell (and the routine NAME / live LLM output preview) for
+    its OWN routines. The reserved ``__local__`` single-tenant workspace maps to ``None``
+    so the offline/single-box path stays byte-unchanged (NULL-owned = visible to all, the
+    intended shared behaviour). Mirrors the missions lane (missions.py:_run).
+    """
     from himmy.api.routers.studio_notify import record_notification
+
+    ws = None if routine.workspace_id == LOCAL_WORKSPACE else routine.workspace_id
 
     if status == "ok":
         record_notification(
@@ -1428,6 +1437,7 @@ def _notify(routine: Routine, status: str, preview: str, error: str | None) -> N
             f"Routine ran: {routine.name}",
             body=preview,
             link="/routines",
+            workspace_id=ws,
         )
     elif status == "awaiting_approval":
         record_notification(
@@ -1435,6 +1445,7 @@ def _notify(routine: Routine, status: str, preview: str, error: str | None) -> N
             f"Routine needs approval: {routine.name}",
             body="An approval-gated tool paused the run — review it in Approvals.",
             link="/approvals",
+            workspace_id=ws,
         )
     else:  # error | timeout
         record_notification(
@@ -1442,6 +1453,7 @@ def _notify(routine: Routine, status: str, preview: str, error: str | None) -> N
             f"Routine failed: {routine.name}",
             body=error or status,
             link="/routines",
+            workspace_id=ws,
         )
 
 

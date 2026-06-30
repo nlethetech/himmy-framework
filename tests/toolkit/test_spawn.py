@@ -94,3 +94,87 @@ def test_spawn_with_tool_packs_gives_subagent_those_tools() -> None:
     )
     assert res.outcome == "success"
     assert res.result["succeeded"] is True
+
+
+# ---- rbac-harden(mopup-r1): spawned sub-agent inherits the parent's tenant/subject scope
+
+
+def test_spawn_threads_tenant_subject_scope_into_subagent_packs(
+    monkeypatch: Any,
+) -> None:
+    """The sub-agent's memory/KB packs must key off the PARENT run's tenancy axes.
+
+    Regression for the confused-deputy leak: ``spawn_agent`` rebuilt the sub-agent's packs
+    with a bare ``ToolkitConfig.from_env()`` that carried NO tenant/subject scope, so the
+    sub-agent reverted to the shared static ``default`` subject / ``(local, local)`` KB —
+    cross-tenant on a durable shared store. Assert the threaded scope reaches the
+    ``register_packs`` config.
+    """
+    captured: dict[str, Any] = {}
+
+    import himmy.toolkit as toolkit
+
+    real_register_packs = toolkit.register_packs
+
+    def _spy(registry: Any, packs: Any, config: Any) -> Any:
+        captured["tenant_scope"] = config.tenant_scope
+        captured["subject_scope"] = config.subject_scope
+        return real_register_packs(registry, packs, config)
+
+    monkeypatch.setattr(toolkit, "register_packs", _spy)
+
+    _runtime, inference, _tools = build_runtime()
+    registry = ToolRegistry()
+    register_spawn_tool(
+        registry, inference=inference, tenant_scope="t1", subject_scope="userA"
+    )
+    service = ToolService(registry)
+    run_async(
+        service.execute(
+            ToolInvocation(
+                tool_name="spawn_agent",
+                args={
+                    "instructions": "Use memory.",
+                    "prompt": "remember nothing",
+                    "tool_packs": ["memory"],
+                },
+            )
+        )
+    )
+    assert captured == {"tenant_scope": "t1", "subject_scope": "userA"}, (
+        "spawned sub-agent's packs did not inherit the parent's tenant/subject scope"
+    )
+
+
+def test_spawn_offline_scope_none_is_unchanged(monkeypatch: Any) -> None:
+    """Offline / non-subject-scoped (None/None) leaves the sub-packs on the static scope."""
+    captured: dict[str, Any] = {}
+
+    import himmy.toolkit as toolkit
+
+    real_register_packs = toolkit.register_packs
+
+    def _spy(registry: Any, packs: Any, config: Any) -> Any:
+        captured["tenant_scope"] = config.tenant_scope
+        captured["subject_scope"] = config.subject_scope
+        return real_register_packs(registry, packs, config)
+
+    monkeypatch.setattr(toolkit, "register_packs", _spy)
+
+    _runtime, inference, _tools = build_runtime()
+    registry = ToolRegistry()
+    register_spawn_tool(registry, inference=inference)  # no scope
+    service = ToolService(registry)
+    run_async(
+        service.execute(
+            ToolInvocation(
+                tool_name="spawn_agent",
+                args={
+                    "instructions": "Use memory.",
+                    "prompt": "x",
+                    "tool_packs": ["memory"],
+                },
+            )
+        )
+    )
+    assert captured == {"tenant_scope": None, "subject_scope": None}

@@ -215,6 +215,29 @@ def _checkpoint_owner_workspace(cp: Any) -> str | None:
     return None
 
 
+def _checkpoint_owner_subject_scope(cp: Any) -> str | None:
+    """The within-tenant USER axis (``subject_scope``) of a paused run, from its checkpoint.
+
+    The companion to :func:`_checkpoint_owner_workspace` for the subject axis. A
+    ``subject_scoped`` run stamps its data subject onto
+    ``ctx['context_metadata']['subject_scope']`` at run time (same place the workspace is
+    stamped), so it rides durably through the checkpoint into a fresh resume process.
+    Threaded as ``subject_scope=`` into the resume's runtime so its memory/KB/tasks/notes
+    packs namespace by the SAME user the run paused under — not the shared tenant-only
+    namespace (a within-tenant cross-USER leak). Returns ``None`` for a non-subject-scoped /
+    offline run (no ``subject_scope`` carried), keeping the resume byte-for-byte unchanged.
+    """
+    ctx = getattr(cp, "ctx", None)
+    if not isinstance(ctx, dict):
+        return None
+    context_metadata = ctx.get("context_metadata")
+    if isinstance(context_metadata, dict):
+        value = context_metadata.get("subject_scope")
+        if value:
+            return str(value)
+    return None
+
+
 async def resolve(
     checkpoint_id: str, *, approved: bool, actor: str = "human"
 ) -> AsyncIterator[dict[str, Any]]:
@@ -271,6 +294,12 @@ async def resolve(
     # (offline / single-box / a run that carried no workspace) leaves both packs on their
     # historical static scope — byte-for-byte unchanged.
     owner_workspace_id = _checkpoint_owner_workspace(cp)
+    # P1 tenancy (subject axis): re-derive the within-tenant USER axis the run paused under
+    # so the resume re-run scopes memory/KB/tasks/notes to the SAME user — not the shared
+    # tenant-only namespace (a cross-USER leak for subject_scoped principals). Captured into
+    # the checkpoint at pause time (``context_metadata['subject_scope']``). ``None``
+    # (offline / non-subject-scoped) leaves the scope tenant-only — byte-for-byte unchanged.
+    owner_subject_scope = _checkpoint_owner_subject_scope(cp)
     spec = ss.load_studio_spec(agent_path, provider=provider, model=model)
     runtime, registry = await asyncio.to_thread(
         lambda: from_spec.build_runtime_for_spec(
@@ -282,6 +311,7 @@ async def resolve(
             checkpoint_store=store,
             durable_defaults=True,
             subject=owner_workspace_id,
+            subject_scope=owner_subject_scope,
         )
     )
     cog = ss._Cognition(ss._read_only_map(registry), spec.name)

@@ -534,8 +534,23 @@ async def mark_read(request: Request, notification_id: int) -> dict[str, Any]:
 
 
 @router.post("/settings", dependencies=[_notify_write])
-async def set_settings(settings: NotifySettings) -> dict[str, Any]:
-    """Persist the notify settings (currently just Telegram forwarding)."""
+async def set_settings(settings: NotifySettings, request: Request) -> dict[str, Any]:
+    """Persist the notify settings (currently just Telegram forwarding).
+
+    The forward-Telegram flag is a single process-global (one shared ``notify_settings``
+    row, no ``workspace_id`` key), so a tenant-bound principal flipping it would toggle
+    notification forwarding for EVERY co-tenant. Restrict the write to an operator /
+    ``all_tenants`` principal (the same posture gate as :func:`reveal_host_posture`): the
+    offline / single-box default is ``all_tenants`` so it stays byte-unchanged, while a
+    tenant-bound principal can no longer mutate this deployment-global toggle.
+    """
+    from himmy.api.auth import reveal_host_posture
+
+    if not reveal_host_posture(request):
+        raise HTTPException(
+            status_code=403,
+            detail="notify forwarding is a deployment-global setting (operator-only)",
+        )
     global _FORWARD_TELEGRAM
     with _LOCK:
         conn = _ensure_db_locked(create=True)  # hydrate first, then overwrite
