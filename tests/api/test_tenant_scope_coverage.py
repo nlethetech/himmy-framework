@@ -312,36 +312,40 @@ _GLOBAL_NOT_TENANT_KEYED: frozenset[str] = frozenset(
     }
 )
 
-#: TIME-BOXED, REVIEWED gap (NOT a permanently-safe exemption). These Studio data surfaces
-#: genuinely carry NO tenant/subject column today — the process-local missions/notify
-#: registries (no ``workspace_id`` on the Mission dataclass / notification record), the
-#: cross-tenant entity-spine governance/lineage reads (``registry.list_by_kind`` has no
-#: tenant dimension), and the cwd-keyed singleton SQLite
-#: stores (tasks/chats/notes/calendar/cookbook/projects). The data-scoping MAP's
-#: by-construction fix for each is a DATA-MODEL change (stamp the registry/record, give the
-#: spine a tenant-aware query path, add a workspace column + migration). Until that lands,
-#: each is RBAC-gated only and is a KNOWN cross-tenant disclosure for any tenant-bound
-#: principal holding the read grant ONCE AUTH IS ON. Enumerating them here makes the gap a
-#: VISIBLE, regression-protected decision — a NEW Studio read that should be scoped, but is
-#: not and is not on this list, fails the gate — rather than the silent leak each prior
-#: round shipped. Entries here must be DRAINED by stamping the underlying store, not grown.
+#: TIME-BOXED, REVIEWED gap (NOT a permanently-safe exemption). The Studio singleton SQLite
+#: stores (tasks/notes/calendar/cookbook), the process-local notify ring, and the HITL
+#: approvals queue have been DRAINED from this list: each now carries a ``workspace_id``
+#: stamp (an additive + nullable migration via ``himmy.api.studio_tenant_scope`` for the
+#: stores; the checkpoint ``ctx`` workspace for approvals) and scopes every read/list/mutate
+#: through the principal-derived ``studio_tenant_filter`` / ``studio_write_workspace`` — so
+#: they carry the ``scoped_read`` marker and pass the gate by construction.
+#:
+#: What REMAINS pending is the unified conversation store (chats + projects): it is SHARED
+#: with the CLI ``himmy chat`` / ``/resume`` session path, carries back-compat VIEWs +
+#: retention triggers, and has a Postgres mirror, so its tenant-column migration is a larger,
+#: higher-risk change deferred to its own pass to keep the offline CLI session path
+#: byte-unchanged. Until that lands these two surfaces are RBAC-gated only and remain a KNOWN
+#: cross-tenant disclosure for a tenant-bound principal holding the read grant ONCE AUTH IS
+#: ON. Enumerating them here makes the gap a VISIBLE, regression-protected decision — a NEW
+#: Studio read that should be scoped, but is not and is not on this list, fails the gate —
+#: rather than a silent leak. Entries here must be DRAINED by stamping the underlying store,
+#: not grown.
 _STUDIO_TENANT_PENDING: frozenset[str] = frozenset(
     {
-        # process-local registries (no tenant stamp on the in-memory record)
-        "/api/studio/notify",
-        # cwd-keyed singleton SQLite stores (no tenant/subject column)
-        "/api/studio/tasks",
+        # The unified conversation store (himmy.services.storage.conversations) backs BOTH
+        # the Studio chats AND projects surfaces and is SHARED with the CLI `himmy chat` /
+        # `/resume` session path (a Studio chat id IS the CLI conversation_id), carries
+        # back-compat VIEWs + retention triggers, and has a Postgres mirror. Stamping a
+        # tenant column there + threading it through ~15 read/write methods AND the CLI
+        # writer AND the PG mirror is a larger, higher-risk data-model change than its
+        # singleton-store siblings; deferred to its own pass to keep the offline CLI session
+        # path byte-unchanged. The other Studio singleton stores (tasks/notes/calendar/
+        # cookbook), the notify ring, and the HITL approvals queue are now genuinely scoped
+        # (DRAINED below) — they carry a workspace_id stamp and scope every read.
         "/api/studio/chats",
         "/api/studio/chats/{session_id}",
-        "/api/studio/notes",
-        "/api/studio/notes/{note_id}",
-        "/api/studio/calendar",
-        "/api/studio/cookbook",
         "/api/studio/projects",
         "/api/studio/projects/{project_id}",
-        # HITL approvals queue (checkpoint store, not tenant-stamped)
-        "/api/studio/approvals",
-        "/api/studio/approvals/{checkpoint_id}",
     }
 )
 

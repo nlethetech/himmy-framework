@@ -131,24 +131,52 @@ def _summary(cp: Any) -> ApprovalSummary:
     )
 
 
-def list_pending() -> list[ApprovalSummary]:
-    """All checkpoints a human can still act on (newest first).
+def list_pending(
+    *, workspace_filter: frozenset[str] | None = None
+) -> list[ApprovalSummary]:
+    """All checkpoints a human can still act on (newest first), tenant-scoped.
 
     Includes fresh ``awaiting_approval`` checkpoints AND any ``resolving`` row left
     stranded by a resume that crashed mid-flight — those are still re-claimable by
     ``resume_agent_loop`` (so retryable via :func:`resolve`), and hiding them would
     strand the run with no human surface to recover it.
+
+    ``workspace_filter`` is the set of workspaces a tenant-bound reader may surface (the
+    principal's ``studio_tenant_filter``). ``None`` (offline / ``all_tenants``) means "no
+    filtering" — every pending checkpoint, byte-unchanged. A bound reader sees only the
+    checkpoints whose paused run is owned by one of its workspaces (the owning tenant is
+    re-read from the checkpoint ``ctx`` via :func:`_checkpoint_owner_workspace`), plus any
+    legacy ``NULL``-tenant checkpoint (an offline/unscoped run predates tenant binding).
     """
     store = get_checkpoint_store()
     pending = [cp for status in _RESUMABLE for cp in store.list_by_status(status)]
     pending.sort(key=lambda cp: cp.created_at, reverse=True)
+    if workspace_filter is not None:
+        pending = [
+            cp
+            for cp in pending
+            if (
+                (ws := _checkpoint_owner_workspace(cp)) is None or ws in workspace_filter
+            )
+        ]
     return [_summary(cp) for cp in pending]
 
 
-def get_detail(checkpoint_id: str) -> ApprovalDetail | None:
+def get_detail(
+    checkpoint_id: str, *, workspace_filter: frozenset[str] | None = None
+) -> ApprovalDetail | None:
+    """A pending checkpoint's detail; a foreign-tenant checkpoint reads as ``None`` (→404).
+
+    ``workspace_filter`` (the reader's ``studio_tenant_filter``) hides a checkpoint owned by
+    another tenant — its existence never leaks. ``None`` is byte-unchanged (offline).
+    """
     cp = get_checkpoint_store().load(checkpoint_id)
     if cp is None:
         return None
+    if workspace_filter is not None:
+        ws = _checkpoint_owner_workspace(cp)
+        if ws is not None and ws not in workspace_filter:
+            return None
     base = _summary(cp)
     messages = (cp.thread or {}).get("messages") or []
     preview = [

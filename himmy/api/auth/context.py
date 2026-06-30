@@ -279,6 +279,35 @@ def studio_subject_filter(request: Request) -> str | None:
     return principal.subject
 
 
+def studio_write_workspace(request: Request) -> str | None:
+    """The single ``workspace_id`` a Studio singleton-store WRITE must be stamped with.
+
+    The write-path companion to :func:`studio_tenant_filter` (the LIST read path) for the
+    cwd-keyed singleton Studio stores (tasks/notes/calendar/cookbook/notify), which key a
+    row by a single owning workspace rather than a per-request body field. Returns:
+
+    * ``None`` for an unrestricted principal (offline default / ANONYMOUS / a trusted shared
+      key), so a write lands UNSTAMPED exactly as before — the zero-config / single-box path
+      is **byte-unchanged** and the shared tool packs (which never pass a workspace) keep
+      writing ``NULL``-tenant rows;
+    * the principal's sole tenant for a tenant-bound principal, so its writes are stamped to
+      the workspace it is entitled to and become invisible to other tenants;
+    * **400** when a tenant-bound principal binds MORE THAN ONE tenant — a Studio write
+      cannot guess which workspace to stamp (mirrors :func:`resolve_workspace`'s
+      require-a-default rule), so the ambiguity is a client error, not a silent mis-stamp.
+    """
+    principal = get_principal(request)
+    if principal.all_tenants:
+        return None
+    default = principal.default_tenant()
+    if default is not None:
+        return default
+    raise HTTPException(
+        status_code=400,
+        detail="workspace_id is required for a multi-tenant principal",
+    )
+
+
 def authorize_studio_object(request: Request, workspace_id: str | None) -> bool:
     """By-id (BOLA-style) gate for a Studio object: may this caller read ``workspace_id``?
 
@@ -345,6 +374,7 @@ __all__ = [
     "enforce_subject_write",
     "studio_tenant_filter",
     "studio_subject_filter",
+    "studio_write_workspace",
     "authorize_studio_object",
     "reveal_host_posture",
 ]

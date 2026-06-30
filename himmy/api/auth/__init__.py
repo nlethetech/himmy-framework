@@ -25,6 +25,7 @@ from himmy.api.auth.context import (
     reveal_host_posture,
     studio_subject_filter,
     studio_tenant_filter,
+    studio_write_workspace,
 )
 from himmy.api.auth.principal import ANONYMOUS, TENANT_ADMIN_ROLE, Principal
 from himmy.api.auth.rbac import (
@@ -58,6 +59,7 @@ __all__ = [
     "enforce_subject_write",
     "studio_tenant_filter",
     "studio_subject_filter",
+    "studio_write_workspace",
     "authorize_studio_object",
     "reveal_host_posture",
     "scoped_read",

@@ -56,6 +56,7 @@ from himmy.api.auth import (
     scoped_read,
     studio_subject_filter,
     studio_tenant_filter,
+    studio_write_workspace,
     subject_write,
 )
 from himmy.api.routers.studio_common import studio_permission
@@ -1093,24 +1094,36 @@ async def google_calendar_create(body: CalendarCreateRequest) -> Any:
 @router.get(
     "/approvals",
     response_model=list[ApprovalSummary],
-    dependencies=[Depends(studio_permission(_RES_APPROVALS, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_APPROVALS, "read")),
+        Depends(scoped_read),
+    ],
 )
-async def approvals() -> list[ApprovalSummary]:
-    """List runs paused awaiting a human decision.
+async def approvals(request: Request) -> list[ApprovalSummary]:
+    """List runs paused awaiting a human decision, tenant-scoped.
 
     red-team r6: requires the per-surface ``studio.approvals:read`` rather than collapsing
     to the coarse ``studio.console:read`` baseline, so the HITL inbox honors its own grant.
+
+    A tenant-bound principal sees only checkpoints owned by its own workspaces (the owning
+    tenant is re-read from the paused run's checkpoint ``ctx``); NO-OP offline / ``all_tenants``.
     """
-    return studio_approvals.list_pending()
+    return studio_approvals.list_pending(workspace_filter=studio_tenant_filter(request))
 
 
 @router.get(
     "/approvals/{checkpoint_id}",
     response_model=ApprovalDetail,
-    dependencies=[Depends(studio_permission(_RES_APPROVALS, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_APPROVALS, "read")),
+        Depends(scoped_read),
+    ],
 )
-async def approval(checkpoint_id: str) -> ApprovalDetail:
-    detail = studio_approvals.get_detail(checkpoint_id)
+async def approval(request: Request, checkpoint_id: str) -> ApprovalDetail:
+    """A pending approval's detail; a foreign-tenant checkpoint is a uniform 404."""
+    detail = studio_approvals.get_detail(
+        checkpoint_id, workspace_filter=studio_tenant_filter(request)
+    )
     if detail is None:
         raise HTTPException(status_code=404, detail="approval not found")
     return detail
@@ -1147,6 +1160,21 @@ def _resolve_stream(
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
+def _guard_approval_scope(request: Request, checkpoint_id: str) -> None:
+    """404 a resolve on a checkpoint owned by another tenant (a cross-tenant HITL write).
+
+    The write companion to the scoped approvals reads: a tenant-bound principal must not
+    approve/reject (and thereby resume) a run paused under a workspace it cannot access.
+    Reuses :func:`studio_approvals.get_detail`'s scope verdict so the existence of a foreign
+    checkpoint never leaks. NO-OP offline / ``all_tenants`` (filter is ``None``).
+    """
+    scope = studio_tenant_filter(request)
+    if scope is None:
+        return
+    if studio_approvals.get_detail(checkpoint_id, workspace_filter=scope) is None:
+        raise HTTPException(status_code=404, detail="approval not found")
+
+
 @router.post(
     "/approvals/{checkpoint_id}/approve",
     dependencies=[Depends(studio_permission(_RES_APPROVALS, "write"))],
@@ -1155,6 +1183,7 @@ async def approve(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Approve the pending tool call and stream the resumed run."""
     from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
+    _guard_approval_scope(request, checkpoint_id)
     return _resolve_stream(
         checkpoint_id,
         True,
@@ -1171,6 +1200,7 @@ async def reject(checkpoint_id: str, request: Request) -> StreamingResponse:
     """Reject the pending tool call and stream the resumed run."""
     from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
+    _guard_approval_scope(request, checkpoint_id)
     return _resolve_stream(
         checkpoint_id,
         False,
@@ -1305,36 +1335,59 @@ class TaskDoneRequest(BaseModel):
     done: bool = True
 
 
-@router.get("/tasks", dependencies=[Depends(studio_permission(_RES_TASKS, "read"))])
-async def tasks_list() -> list[Any]:
+@router.get(
+    "/tasks",
+    dependencies=[
+        Depends(studio_permission(_RES_TASKS, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def tasks_list(request: Request) -> list[Any]:
+    """The task board, tenant-scoped: a bound principal sees only its workspace's tasks.
+
+    NO-OP offline / ``all_tenants`` — ``studio_tenant_filter`` returns ``None`` and the
+    store lists every row exactly as before (the shared ``tasks`` tool pack is unchanged).
+    """
     from himmy.api.studio_tasks import get_tasks_store
 
-    return get_tasks_store().list()
+    return get_tasks_store().list(workspace_id=studio_tenant_filter(request))
 
 
 @router.post("/tasks", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))])
-async def tasks_add(body: TaskAddRequest) -> Any:
+async def tasks_add(request: Request, body: TaskAddRequest) -> Any:
     from himmy.api.studio_tasks import get_tasks_store
 
-    return get_tasks_store().add(body.title, due=body.due)
+    return get_tasks_store().add(
+        body.title, due=body.due, workspace_id=studio_write_workspace(request)
+    )
 
 
 @router.patch(
     "/tasks/{task_id}", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))]
 )
-async def tasks_done(task_id: str, body: TaskDoneRequest) -> dict[str, bool]:
+async def tasks_done(
+    request: Request, task_id: str, body: TaskDoneRequest
+) -> dict[str, bool]:
     from himmy.api.studio_tasks import get_tasks_store
 
-    return {"ok": get_tasks_store().set_done(task_id, body.done)}
+    return {
+        "ok": get_tasks_store().set_done(
+            task_id, body.done, workspace_id=studio_tenant_filter(request)
+        )
+    }
 
 
 @router.delete(
     "/tasks/{task_id}", dependencies=[Depends(studio_permission(_RES_TASKS, "write"))]
 )
-async def tasks_delete(task_id: str) -> dict[str, bool]:
+async def tasks_delete(request: Request, task_id: str) -> dict[str, bool]:
     from himmy.api.studio_tasks import get_tasks_store
 
-    return {"ok": get_tasks_store().delete(task_id)}
+    return {
+        "ok": get_tasks_store().delete(
+            task_id, workspace_id=studio_tenant_filter(request)
+        )
+    }
 
 
 # ---- Chats (saved, resumable conversations) -----------------------------
@@ -1424,20 +1477,32 @@ class RecipeUpsertRequest(BaseModel):
 
 
 @router.get(
-    "/cookbook", dependencies=[Depends(studio_permission(_RES_COOKBOOK, "read"))]
+    "/cookbook",
+    dependencies=[
+        Depends(studio_permission(_RES_COOKBOOK, "read")),
+        Depends(scoped_read),
+    ],
 )
-async def cookbook_list() -> list[Any]:
+async def cookbook_list(request: Request) -> list[Any]:
+    """Saved recipes, tenant-scoped (NO-OP offline / ``all_tenants``)."""
     from himmy.api.studio_cookbook import get_cookbook_store
 
-    return get_cookbook_store().list()
+    return get_cookbook_store().list(workspace_id=studio_tenant_filter(request))
 
 
 @router.put(
     "/cookbook", dependencies=[Depends(studio_permission(_RES_COOKBOOK, "write"))]
 )
-async def cookbook_upsert(body: RecipeUpsertRequest) -> Any:
+async def cookbook_upsert(request: Request, body: RecipeUpsertRequest) -> Any:
     from himmy.api.studio_cookbook import Recipe, get_cookbook_store
 
+    store = get_cookbook_store()
+    scope = studio_tenant_filter(request)
+    # A tenant-bound caller must not clobber/re-stamp another tenant's recipe by re-using
+    # its id (INSERT OR REPLACE) — fold a cross-tenant id collision to 404.
+    if body.id and scope is not None and store.get(body.id) is not None:
+        if store.get(body.id, workspace_id=scope) is None:
+            raise HTTPException(status_code=404, detail="recipe not found")
     r = Recipe(
         name=body.name,
         agent_path=body.agent_path,
@@ -1446,17 +1511,21 @@ async def cookbook_upsert(body: RecipeUpsertRequest) -> Any:
     )
     if body.id:
         r.id = body.id
-    return get_cookbook_store().upsert(r)
+    return store.upsert(r, workspace_id=studio_write_workspace(request))
 
 
 @router.delete(
     "/cookbook/{recipe_id}",
     dependencies=[Depends(studio_permission(_RES_COOKBOOK, "write"))],
 )
-async def cookbook_delete(recipe_id: str) -> dict[str, bool]:
+async def cookbook_delete(request: Request, recipe_id: str) -> dict[str, bool]:
     from himmy.api.studio_cookbook import get_cookbook_store
 
-    return {"ok": get_cookbook_store().delete(recipe_id)}
+    return {
+        "ok": get_cookbook_store().delete(
+            recipe_id, workspace_id=studio_tenant_filter(request)
+        )
+    }
 
 
 # ---- Notes --------------------------------------------------------------
@@ -1468,43 +1537,65 @@ class NoteUpsertRequest(BaseModel):
     body: str = Field("", max_length=200_000)
 
 
-@router.get("/notes", dependencies=[Depends(studio_permission(_RES_NOTES, "read"))])
-async def notes_list() -> list[Any]:
+@router.get(
+    "/notes",
+    dependencies=[
+        Depends(studio_permission(_RES_NOTES, "read")),
+        Depends(scoped_read),
+    ],
+)
+async def notes_list(request: Request) -> list[Any]:
+    """Notes, tenant-scoped to the principal's workspace (NO-OP offline / ``all_tenants``)."""
     from himmy.api.studio_notes import get_notes_store
 
-    return get_notes_store().list()
+    return get_notes_store().list(workspace_id=studio_tenant_filter(request))
 
 
 @router.get(
     "/notes/{note_id}",
-    dependencies=[Depends(studio_permission(_RES_NOTES, "read"))],
+    dependencies=[
+        Depends(studio_permission(_RES_NOTES, "read")),
+        Depends(scoped_read),
+    ],
 )
-async def notes_get(note_id: str) -> Any:
+async def notes_get(request: Request, note_id: str) -> Any:
+    """A note by id; a foreign-tenant note is a uniform 404 (existence never leaks)."""
     from himmy.api.studio_notes import get_notes_store
 
-    note = get_notes_store().get(note_id)
+    note = get_notes_store().get(note_id, workspace_id=studio_tenant_filter(request))
     if note is None:
         raise HTTPException(status_code=404, detail="note not found")
     return note
 
 
 @router.put("/notes", dependencies=[Depends(studio_permission(_RES_NOTES, "write"))])
-async def notes_upsert(body: NoteUpsertRequest) -> Any:
+async def notes_upsert(request: Request, body: NoteUpsertRequest) -> Any:
     from himmy.api.studio_notes import Note, get_notes_store
 
+    store = get_notes_store()
+    scope = studio_tenant_filter(request)
+    # A tenant-bound caller re-using a foreign note's id must not clobber/re-stamp it
+    # (INSERT OR REPLACE) — fold a cross-tenant id collision to 404 (existence not leaked).
+    if body.id and scope is not None and store.get(body.id) is not None:
+        if store.get(body.id, workspace_id=scope) is None:
+            raise HTTPException(status_code=404, detail="note not found")
     note = Note(title=body.title, body=body.body)
     if body.id:
         note.id = body.id
-    return get_notes_store().upsert(note)
+    return store.upsert(note, workspace_id=studio_write_workspace(request))
 
 
 @router.delete(
     "/notes/{note_id}", dependencies=[Depends(studio_permission(_RES_NOTES, "write"))]
 )
-async def notes_delete(note_id: str) -> dict[str, bool]:
+async def notes_delete(request: Request, note_id: str) -> dict[str, bool]:
     from himmy.api.studio_notes import get_notes_store
 
-    return {"ok": get_notes_store().delete(note_id)}
+    return {
+        "ok": get_notes_store().delete(
+            note_id, workspace_id=studio_tenant_filter(request)
+        )
+    }
 
 
 # ---- Calendar -----------------------------------------------------------
@@ -1518,34 +1609,45 @@ class CalendarAddRequest(BaseModel):
 
 
 @router.get(
-    "/calendar", dependencies=[Depends(studio_permission(_RES_CALENDAR, "read"))]
+    "/calendar",
+    dependencies=[
+        Depends(studio_permission(_RES_CALENDAR, "read")),
+        Depends(scoped_read),
+    ],
 )
-async def calendar_list(month: str | None = None) -> list[Any]:
+async def calendar_list(request: Request, month: str | None = None) -> list[Any]:
+    """Calendar events, tenant-scoped (NO-OP offline / ``all_tenants``)."""
     from himmy.api.studio_calendar import get_calendar_store
 
-    return get_calendar_store().list(month=month)
+    return get_calendar_store().list(
+        month=month, workspace_id=studio_tenant_filter(request)
+    )
 
 
 @router.post(
     "/calendar", dependencies=[Depends(studio_permission(_RES_CALENDAR, "write"))]
 )
-async def calendar_add(body: CalendarAddRequest) -> Any:
+async def calendar_add(request: Request, body: CalendarAddRequest) -> Any:
     from himmy.api.studio_calendar import CalendarEvent, get_calendar_store
 
     ev = CalendarEvent(
         date=body.date, title=body.title, time=body.time or None, notes=body.notes
     )
-    return get_calendar_store().add(ev)
+    return get_calendar_store().add(ev, workspace_id=studio_write_workspace(request))
 
 
 @router.delete(
     "/calendar/{event_id}",
     dependencies=[Depends(studio_permission(_RES_CALENDAR, "write"))],
 )
-async def calendar_delete(event_id: str) -> dict[str, bool]:
+async def calendar_delete(request: Request, event_id: str) -> dict[str, bool]:
     from himmy.api.studio_calendar import get_calendar_store
 
-    return {"ok": get_calendar_store().delete(event_id)}
+    return {
+        "ok": get_calendar_store().delete(
+            event_id, workspace_id=studio_tenant_filter(request)
+        )
+    }
 
 
 # ---- Memory (long-term recall browser) ----------------------------------

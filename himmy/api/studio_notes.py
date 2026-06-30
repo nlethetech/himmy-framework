@@ -34,43 +34,82 @@ class Note(BaseModel):
 
 class NotesStore:
     def __init__(self, path: str = ":memory:") -> None:
+        from himmy.api.studio_tenant_scope import ensure_workspace_column
         from himmy.core.sqlite_util import connect_hardened
 
         self._conn = connect_hardened(path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Additive + nullable tenant-isolation column; old single-box DBs open unchanged.
+        ensure_workspace_column(self._conn, "notes")
 
-    def list(self) -> list[Note]:
+    def _row(self, r: sqlite3.Row) -> Note:
+        # workspace_id is not a Note field — strip it before constructing the model so a
+        # migrated row (which carries the extra column) still validates.
+        data = {k: r[k] for k in r.keys() if k != "workspace_id"}
+        return Note(**data)
+
+    def list(self, *, workspace_id: str | frozenset[str] | None = None) -> list[Note]:
+        """Notes, optionally scoped to ``workspace_id`` (``None`` = ALL, byte-unchanged)."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id)
+        where = f"WHERE {clause} " if clause else ""
         rows = self._conn.execute(
-            "SELECT * FROM notes ORDER BY updated_at DESC"
+            f"SELECT * FROM notes {where}ORDER BY updated_at DESC", params
         ).fetchall()
-        return [Note(**dict(r)) for r in rows]
+        return [self._row(r) for r in rows]
 
-    def get(self, note_id: str) -> Note | None:
+    def get(
+        self, note_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> Note | None:
+        """A note by id; a ``workspace_id``-scoped caller cannot read a foreign note (None)."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id)
+        extra = f" AND {clause}" if clause else ""
         row = self._conn.execute(
-            "SELECT * FROM notes WHERE id = ?", (note_id,)
+            f"SELECT * FROM notes WHERE id = ?{extra}", [note_id, *params]
         ).fetchone()
-        return Note(**dict(row)) if row else None
+        return self._row(row) if row else None
 
-    def find_by_title(self, title: str) -> Note | None:
+    def find_by_title(
+        self, title: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> Note | None:
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id)
+        extra = f" AND {clause}" if clause else ""
         row = self._conn.execute(
-            "SELECT * FROM notes WHERE title = ? ORDER BY updated_at DESC LIMIT 1",
-            (title,),
+            f"SELECT * FROM notes WHERE title = ?{extra} "
+            "ORDER BY updated_at DESC LIMIT 1",
+            [title, *params],
         ).fetchone()
-        return Note(**dict(row)) if row else None
+        return self._row(row) if row else None
 
-    def upsert(self, note: Note) -> Note:
+    def upsert(self, note: Note, *, workspace_id: str | None = None) -> Note:
+        """Upsert a note, stamping ``workspace_id`` (``None`` for the single local tenant)."""
         note.updated_at = utc_now_iso()
         self._conn.execute(
-            "INSERT OR REPLACE INTO notes (id, title, body, updated_at) VALUES (?,?,?,?)",
-            (note.id, note.title, note.body, note.updated_at),
+            "INSERT OR REPLACE INTO notes (id, title, body, updated_at, workspace_id) "
+            "VALUES (?,?,?,?,?)",
+            (note.id, note.title, note.body, note.updated_at, workspace_id),
         )
         self._conn.commit()
         return note
 
-    def delete(self, note_id: str) -> bool:
-        cur = self._conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+    def delete(
+        self, note_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        """Delete a note; a ``workspace_id``-scoped caller cannot delete a foreign note."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id)
+        extra = f" AND {clause}" if clause else ""
+        cur = self._conn.execute(
+            f"DELETE FROM notes WHERE id = ?{extra}", [note_id, *params]
+        )
         self._conn.commit()
         return cur.rowcount > 0
 

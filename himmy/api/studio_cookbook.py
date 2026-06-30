@@ -37,30 +37,66 @@ class Recipe(BaseModel):
 
 class CookbookStore:
     def __init__(self, path: str = ":memory:") -> None:
+        from himmy.api.studio_tenant_scope import ensure_workspace_column
         from himmy.core.sqlite_util import connect_hardened
 
         self._conn = connect_hardened(path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Additive + nullable tenant-isolation column; old single-box DBs open unchanged.
+        ensure_workspace_column(self._conn, "recipes")
 
-    def list(self) -> list[Recipe]:
+    def _row(self, r: sqlite3.Row) -> Recipe:
+        data = {k: r[k] for k in r.keys() if k != "workspace_id"}
+        return Recipe(**data)
+
+    def list(self, *, workspace_id: str | frozenset[str] | None = None) -> list[Recipe]:
+        """Recipes, optionally scoped to ``workspace_id`` (``None`` = ALL, byte-unchanged)."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id)
+        where = f"WHERE {clause} " if clause else ""
         rows = self._conn.execute(
-            "SELECT * FROM recipes ORDER BY created_at DESC"
+            f"SELECT * FROM recipes {where}ORDER BY created_at DESC", params
         ).fetchall()
-        return [Recipe(**dict(r)) for r in rows]
+        return [self._row(r) for r in rows]
 
-    def upsert(self, r: Recipe) -> Recipe:
+    def get(
+        self, recipe_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> Recipe | None:
+        """A recipe by id; a ``workspace_id``-scoped caller cannot read a foreign one (None)."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id)
+        extra = f" AND {clause}" if clause else ""
+        row = self._conn.execute(
+            f"SELECT * FROM recipes WHERE id = ?{extra}", [recipe_id, *params]
+        ).fetchone()
+        return self._row(row) if row else None
+
+    def upsert(self, r: Recipe, *, workspace_id: str | None = None) -> Recipe:
+        """Upsert a recipe, stamping ``workspace_id`` (``None`` for the single local tenant)."""
         self._conn.execute(
             "INSERT OR REPLACE INTO recipes "
-            "(id, name, agent_path, prompt, notes, created_at) VALUES (?,?,?,?,?,?)",
-            (r.id, r.name, r.agent_path, r.prompt, r.notes, r.created_at),
+            "(id, name, agent_path, prompt, notes, created_at, workspace_id) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (r.id, r.name, r.agent_path, r.prompt, r.notes, r.created_at, workspace_id),
         )
         self._conn.commit()
         return r
 
-    def delete(self, recipe_id: str) -> bool:
-        cur = self._conn.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
+    def delete(
+        self, recipe_id: str, *, workspace_id: str | frozenset[str] | None = None
+    ) -> bool:
+        """Delete a recipe; a ``workspace_id``-scoped caller cannot delete a foreign one."""
+        from himmy.api.studio_tenant_scope import scope_clause
+
+        clause, params = scope_clause(workspace_id)
+        extra = f" AND {clause}" if clause else ""
+        cur = self._conn.execute(
+            f"DELETE FROM recipes WHERE id = ?{extra}", [recipe_id, *params]
+        )
         self._conn.commit()
         return cur.rowcount > 0
 

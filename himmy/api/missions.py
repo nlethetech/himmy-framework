@@ -337,12 +337,16 @@ class MissionRegistry:
         finally:
             await self._finish(mission, status)
             try:
+                # Thread the mission's OWNING workspace so a tenant-bound Studio reader only
+                # sees the bell for its own missions (NULL/None offline, byte-unchanged).
+                ws = mission.workspace_id
                 if status == _DONE:
                     record_notification(
                         "mission",
                         f"Mission finished — {mission.agent}",
                         body=mission.result_preview or _cap(mission.prompt, 200),
                         link="/missions",
+                        workspace_id=ws,
                     )
                 elif status == _PAUSED:
                     record_notification(
@@ -350,6 +354,7 @@ class MissionRegistry:
                         f"Mission paused — {mission.agent} needs approval",
                         body=_cap(mission.prompt, 200),
                         link="/approvals",
+                        workspace_id=ws,
                     )
                 else:
                     record_notification(
@@ -357,6 +362,7 @@ class MissionRegistry:
                         f"Mission failed — {mission.agent}",
                         body=mission.error or "",
                         link="/missions",
+                        workspace_id=ws,
                     )
             except Exception:  # noqa: BLE001 - notifying must never mask the run
                 pass

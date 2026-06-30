@@ -218,6 +218,14 @@ ignore = [
 # (?/$n) path — same posture as the storage layers above.
 "himmy/services/storage/postgres_aux.py" = ["S608"]
 "himmy/api/studio_tasks.py" = ["S608"]
+# Studio singleton-store tenant scoping: the only interpolated SQL fragment is the
+# code-built `(workspace_id = ? OR workspace_id IS NULL)` predicate from
+# himmy.api.studio_tenant_scope (constant table/column literals, no user input); every
+# value still goes through the parameterized (?) path — same posture as studio_tasks above.
+"himmy/api/studio_tenant_scope.py" = ["S608"]
+"himmy/api/studio_notes.py" = ["S608"]
+"himmy/api/studio_calendar.py" = ["S608"]
+"himmy/api/studio_cookbook.py" = ["S608"]
 # Local research/bench harnesses: drive a self-managed localhost model server over a
 # fixed subprocess + loopback HTTP (never untrusted input/URLs). Not shipped in the
 # package; kept lint-clean without weakening the active S rules in library code.
