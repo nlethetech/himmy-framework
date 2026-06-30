@@ -166,6 +166,27 @@ def get_detail(checkpoint_id: str) -> ApprovalDetail | None:
     )
 
 
+def _checkpoint_owner_workspace(cp: Any) -> str | None:
+    """The OWNING ``workspace_id`` of a paused run, re-read from its checkpoint ``ctx``.
+
+    The original run stamps its tenant onto ``ctx['context_metadata']['workspace_id']``
+    (mirroring :func:`himmy.runtime.single_agent._context_workspace_id`); the checkpoint
+    serializes ``ctx`` verbatim, so this survives a resume in a fresh process. Threaded as
+    ``subject=`` into the resume's runtime so its memory + knowledge tool packs scope to
+    the SAME tenant the run paused under. Returns ``None`` for an offline / single-box /
+    unscoped run (no ``workspace_id`` carried), keeping the resume byte-for-byte unchanged.
+    """
+    ctx = getattr(cp, "ctx", None)
+    if not isinstance(ctx, dict):
+        return None
+    context_metadata = ctx.get("context_metadata")
+    if isinstance(context_metadata, dict):
+        value = context_metadata.get("workspace_id")
+        if value:
+            return str(value)
+    return None
+
+
 async def resolve(
     checkpoint_id: str, *, approved: bool, actor: str = "human"
 ) -> AsyncIterator[dict[str, Any]]:
@@ -213,6 +234,15 @@ async def resolve(
         collected.append(event)
         await queue.put(event)
 
+    # P1 tenancy (rbac-harden): re-derive the paused run's OWNING workspace so the
+    # resume re-run scopes its memory + knowledge tool packs to the SAME tenant the
+    # original run ran under — not the shared static ``default`` subject / ``(local,
+    # local)`` KB scope. The owner was captured at pause time into the checkpoint's
+    # ``ctx['context_metadata']['workspace_id']`` (the same place ``_context_workspace_id``
+    # reads it), so it rides durably through the checkpoint into a fresh process. ``None``
+    # (offline / single-box / a run that carried no workspace) leaves both packs on their
+    # historical static scope — byte-for-byte unchanged.
+    owner_workspace_id = _checkpoint_owner_workspace(cp)
     spec = ss.load_studio_spec(agent_path, provider=provider, model=model)
     runtime, registry = await asyncio.to_thread(
         lambda: from_spec.build_runtime_for_spec(
@@ -223,6 +253,7 @@ async def resolve(
             capture_io=True,
             checkpoint_store=store,
             durable_defaults=True,
+            subject=owner_workspace_id,
         )
     )
     cog = ss._Cognition(ss._read_only_map(registry), spec.name)

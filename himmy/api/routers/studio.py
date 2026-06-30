@@ -1800,6 +1800,9 @@ async def eval_run(body: EvalRunRequest, request: Request) -> Any:
     # centralize-tool-gate: thread the request principal's gate so eval-run tools are
     # enforced (inert offline). Bound ambiently inside ``run_eval``.
     tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    # rbac-harden tenancy: scope the eval agent's memory/knowledge packs to the launching
+    # tenant (``None`` for offline / all_tenants → unscoped, byte-unchanged).
+    owner_workspace, _owner_subject = _run_owner(request)
     try:
         return await asyncio.wait_for(
             studio_eval.run_eval(
@@ -1808,6 +1811,7 @@ async def eval_run(body: EvalRunRequest, request: Request) -> Any:
                 provider=body.provider,
                 model=body.model,
                 tool_authorizer=tool_authorizer,
+                subject=owner_workspace,
             ),
             timeout=900,
         )
@@ -1863,6 +1867,9 @@ async def workflow_run(body: WorkflowRunRequest, request: Request) -> Any:
     # centralize-tool-gate: thread the request principal's gate so workflow step tools are
     # enforced (inert offline). Bound ambiently inside ``run_workflow``.
     tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    # rbac-harden tenancy: scope the workflow agent's memory/knowledge packs to the
+    # launching tenant (``None`` for offline / all_tenants → unscoped, byte-unchanged).
+    owner_workspace, _owner_subject = _run_owner(request)
     try:
         return await asyncio.wait_for(
             studio_workflows.run_workflow(
@@ -1872,6 +1879,7 @@ async def workflow_run(body: WorkflowRunRequest, request: Request) -> Any:
                 model=body.model,
                 initial_state=body.initial_state,
                 tool_authorizer=tool_authorizer,
+                subject=owner_workspace,
             ),
             timeout=900,
         )

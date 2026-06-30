@@ -51,6 +51,7 @@ async def run_eval(
     provider: str | None = None,
     model: str | None = None,
     tool_authorizer: Any = None,
+    subject: str | None = None,
 ) -> object:
     """Run the agent over every case in the suite and return the EvaluationRun.
 
@@ -58,6 +59,13 @@ async def run_eval(
     gate, bound AMBIENTLY for the runtime build + every eval case so the agent's tool
     dispatch is enforced (this surface builds the runtime without threading the authorizer
     explicitly). ``None`` offline → inert, byte-unchanged.
+
+    ``subject`` (rbac-harden tenancy) is the LAUNCHING tenant's ``workspace_id`` resolved
+    from the verified principal by the router (``_run_owner(request)[0]``). It scopes the
+    eval agent's memory + knowledge tool packs to this tenant on a shared durable store
+    instead of the static ``default`` subject / ``(local, local)`` KB scope — symmetric to
+    the ``/v1`` and Studio run paths. ``None`` (offline / single-box / ``all_tenants``)
+    leaves both packs on their historical static scope — byte-for-byte unchanged.
     """
     import asyncio
 
@@ -73,7 +81,11 @@ async def run_eval(
         spec = load_studio_spec(agent_path, provider=provider, model=model)
         runtime, _registry = await asyncio.to_thread(
             lambda: from_spec.build_runtime_for_spec(
-                spec, provider=provider, model=model, durable_defaults=True
+                spec,
+                provider=provider,
+                model=model,
+                durable_defaults=True,
+                subject=subject,
             )
         )
         harness = AgentEvalHarness(runtime, EvaluationService())

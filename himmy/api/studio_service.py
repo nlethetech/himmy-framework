@@ -797,6 +797,18 @@ async def stream_agent_run(
             capture_io=True,  # power the cognition stream + trace inspector
             checkpoint_store=get_checkpoint_store(),  # pause on approval-gated tools
             durable_defaults=True,
+            # P1 tenancy (rbac-harden): thread the VERIFIED launching tenant into the
+            # per-run runtime so its memory + knowledge tool packs key off this tenant's
+            # workspace on the shared durable ``.himmy/memory.db`` / KB scope — not the
+            # static ``default`` subject / ``(local, local)`` KB scope every run shares.
+            # ``owner_workspace_id`` is resolved from the authenticated principal by every
+            # multi-tenant caller (Missions stamps ``mission.workspace_id``; Studio routers
+            # resolve ``_run_owner(request)``) and is NEVER client input. Symmetric to the
+            # ``/v1`` run service (services.py: ``subject=workspace_id``). ``None`` (the
+            # offline / interactive single-box default, and the ANONYMOUS all_tenants
+            # principal) leaves both packs on their historical static scope — byte-for-byte
+            # unchanged, so the zero-config path is untouched.
+            subject=owner_workspace_id,
         )
     )
     has_tools = registry is not None

@@ -377,7 +377,11 @@ def _jsonable_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _workflow_stream(
-    wf: Any, spec: Any, body: WorkflowStreamRequest, tool_authorizer: Any = None
+    wf: Any,
+    spec: Any,
+    body: WorkflowStreamRequest,
+    tool_authorizer: Any = None,
+    owner_workspace_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Bind the request principal's gate ambiently, then drive the workflow stream.
 
@@ -387,16 +391,24 @@ async def _workflow_stream(
     explicitly. ``None`` offline (no authenticator) → inert, byte-unchanged. The actual
     drive lives in :func:`_workflow_stream_body`; this wrapper just scopes the ambient
     binding around the entire async iteration.
+
+    ``owner_workspace_id`` (rbac-harden tenancy) is the LAUNCHING tenant resolved from the
+    verified principal; it scopes the workflow agent's memory + knowledge tool packs to
+    this tenant on a shared durable store. ``None`` (offline / all_tenants) → unscoped,
+    byte-unchanged.
     """
     from himmy.services.tools.ambient import use_tool_authorizer
 
     with use_tool_authorizer(tool_authorizer):
-        async for frame in _workflow_stream_body(wf, spec, body):
+        async for frame in _workflow_stream_body(wf, spec, body, owner_workspace_id):
             yield frame
 
 
 async def _workflow_stream_body(
-    wf: Any, spec: Any, body: WorkflowStreamRequest
+    wf: Any,
+    spec: Any,
+    body: WorkflowStreamRequest,
+    owner_workspace_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Drive one workflow run, yielding SSE frames per node transition.
 
@@ -421,6 +433,9 @@ async def _workflow_stream_body(
                 provider=body.provider,
                 model=body.model,
                 durable_defaults=True,
+                # rbac-harden tenancy: scope the workflow agent's memory/knowledge packs
+                # to the launching tenant (``None`` offline / all_tenants → unscoped).
+                subject=owner_workspace_id,
             )
         )
     except Exception as exc:  # noqa: BLE001 - a missing provider is a clean frame
@@ -558,8 +573,18 @@ async def run_workflow_stream(
     from himmy.services.tools.capability import ToolCapabilityAuthorizer
 
     tool_authorizer = ToolCapabilityAuthorizer.from_request(request)
+    # rbac-harden tenancy: resolve the launching tenant from the verified principal so the
+    # workflow agent's memory/knowledge packs scope to it on a shared durable store. An
+    # unrestricted offline / all_tenants caller resolves to ``None`` → unscoped (byte-
+    # unchanged single-box path), mirroring ``_run_owner`` in the studio router.
+    from himmy.api.auth.context import get_principal, resolve_workspace
+
+    _principal = get_principal(request)
+    owner_workspace = (
+        None if _principal.all_tenants else resolve_workspace(request, None)
+    )
     return StreamingResponse(
-        _workflow_stream(wf, spec, body, tool_authorizer),
+        _workflow_stream(wf, spec, body, tool_authorizer, owner_workspace),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
