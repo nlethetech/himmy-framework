@@ -16,19 +16,27 @@ is 404-inert, mirroring :mod:`himmy.api.routers.consent`. Audit export/verify on
 need a signing key (``HIMMY_AUDIT_PRIVATE_KEY`` / ``HIMMY_AUDIT_SECRET``) — without
 one they answer a clear 503, never an import error.
 
-Tenant scoping (red-team scope-r6). ``studio.privacy:read`` is withheld to admin-only,
-but a TENANT-BOUND ``admin`` key (``roles:["admin"], tenant_ids:["A"], all_tenants:false``)
-holds it — so the subjects/consents readers MUST refuse cross-tenant rows, not trust the
-admin-only gate. The governance spine is a single process-wide store shared across tenants;
-its consent records carry a ``metadata['workspace_id']`` stamp (the tenant that recorded
-them). Every read here intersects each record's owning workspace against the caller's
-:func:`~himmy.api.auth.context.studio_tenant_filter` allow-list via :func:`_visible_records`
-— **failing closed** (dropping the row) for a tenant-bound caller when a record carries no
-workspace stamp, so an unstamped governance row can never leak across tenants. The
-``/subjects`` and ``/consents`` readers, the per-subject footprint counters, and the audit
-bundle's evidence set all route through this one choke point, so a new privacy read cannot
-forget the filter. Every check is a strict NO-OP for an unrestricted (``all_tenants`` /
-offline) principal (filter ``None``), so the single-box path is byte-unchanged.
+Tenant + subject scoping (red-team scope-r6/r7). ``studio.privacy:read`` /
+``studio.privacy:manage`` are withheld to admin-only, but a TENANT-BOUND ``admin`` key
+(``roles:["admin"], tenant_ids:["A"], all_tenants:false``) holds them via the ``*:*``
+wildcard — so every read AND the audit export/verify MUST refuse out-of-scope rows, not
+trust the admin-only gate. The governance spine is a single process-wide store shared
+across tenants; its consent records carry a ``metadata['workspace_id']`` stamp (the tenant
+that recorded them) and a ``subject_id``. :func:`_visible_records` is the one choke point,
+enforcing BOTH axes: it intersects each record's owning workspace against the caller's
+:func:`~himmy.api.auth.context.studio_tenant_filter` allow-list (the IDOR axis) AND pins
+each record's subject against :func:`~himmy.api.auth.context.studio_subject_filter` (the
+BOLA axis — a ``subject_scoped`` caller sees only its OWN subject's consent chains/footprint
+WITHIN its tenant), **failing closed** (dropping the row) when a record carries no workspace
+stamp / no subject. The ``/subjects`` and ``/consents`` readers, the per-subject footprint
+counters, AND the audit bundle's evidence set (:func:`_evidence_records`, scope-r7) ALL
+route through this one choke point, so a new privacy read — GET or read-shaped POST export —
+cannot forget the filter. The destructive ``/erase`` threads the verified principal's
+:func:`~himmy.api.auth.context.resolve_workspace` tenant into
+:meth:`ConsentLedger.withdraw` (scope-r7), so a tenant-bound caller's crypto-shred can never
+destroy a global/foreign-bound key across tenants (mirroring ``/v1/consent/withdraw``).
+Every check is a strict NO-OP for an unrestricted (``all_tenants`` / offline) principal
+(filters ``None``, workspace ``None``), so the single-box path is byte-unchanged.
 """
 
 from __future__ import annotations
@@ -38,7 +46,13 @@ from typing import Any
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
 
-from himmy.api.auth import get_principal, studio_tenant_filter
+from himmy.api.auth import (
+    get_principal,
+    resolve_workspace,
+    scoped_read,
+    studio_subject_filter,
+    studio_tenant_filter,
+)
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 from himmy.api.security_audit import audit_event
 from himmy.core.ids import utc_now_iso
@@ -132,23 +146,43 @@ def _record_workspace(record: Any) -> str | None:
 
 
 def _visible_records(request: Request, records: Any) -> list[Any]:
-    """Narrow ``records`` to the caller's tenant allow-list (the scope-r6 choke point).
+    """Narrow ``records`` to the caller's tenant AND subject allow-list (the scope-r7 choke point).
 
-    The single tenant-isolation gate every privacy read routes through. Intersects each
-    record's owning :func:`_record_workspace` against the caller's
-    :func:`~himmy.api.auth.context.studio_tenant_filter`:
+    The single isolation gate every privacy read (and the audit bundle's evidence set)
+    routes through. It enforces BOTH governance axes:
 
-    * an unrestricted principal (offline / ``all_tenants`` / trusted shared key) gets the
-      filter ``None`` ⇒ the list is returned UNCHANGED — so the zero-config / single-box
-      path is byte-unchanged; and
-    * a tenant-bound principal sees only records whose stamped workspace is in its
-      allow-list — **failing closed** (dropping the row) when a record carries no workspace
-      stamp, so an unstamped cross-tenant governance row can never leak.
+    * **Tenant (IDOR).** Intersects each record's owning :func:`_record_workspace` against
+      the caller's :func:`~himmy.api.auth.context.studio_tenant_filter` — an unrestricted
+      principal (offline / ``all_tenants`` / trusted shared key) gets the filter ``None`` ⇒
+      no tenant narrowing; a tenant-bound principal sees only records whose stamped
+      workspace is in its allow-list, **failing closed** (dropping the row) when a record
+      carries no workspace stamp.
+    * **Subject (BOLA, scope-r7).** Pins each record's :func:`_subject_of` against the
+      caller's :func:`~himmy.api.auth.context.studio_subject_filter` — ``None`` for every
+      principal except an opt-in ``subject_scoped`` one (so the historical
+      multi-user-workspace / ``tenant_admin`` path is unchanged), and the principal's own
+      ``subject`` for a ``subject_scoped`` caller WITHOUT ``tenant_admin``. A
+      ``subject_scoped`` caller therefore sees only records attributed to its OWN data
+      subject — closing the cross-subject enumeration of consent chains/footprint a
+      ``subject_scoped`` admin could otherwise walk WITHIN its tenant. A record with no
+      recorded subject is dropped for a subject-pinned caller (fail closed).
+
+    Both axes are a strict NO-OP for an unrestricted (``all_tenants`` / offline) principal
+    (both filters ``None``) ⇒ the list is returned UNCHANGED, so the zero-config / single-box
+    path is byte-unchanged.
     """
     allowed = studio_tenant_filter(request)
-    if allowed is None:
+    subject = studio_subject_filter(request)
+    if allowed is None and subject is None:
         return list(records)
-    return [r for r in records if _record_workspace(r) in allowed]
+    out: list[Any] = []
+    for r in records:
+        if allowed is not None and _record_workspace(r) not in allowed:
+            continue
+        if subject is not None and _subject_of(r) != subject:
+            continue
+        out.append(r)
+    return out
 
 
 def _tombstones_by_subject(request: Request, registry: Any) -> dict[str, list[Any]]:
@@ -193,7 +227,11 @@ class SubjectsResponse(BaseModel):
     subjects: list[SubjectInfo]
 
 
-@router.get("/subjects", response_model=SubjectsResponse)
+@router.get(
+    "/subjects",
+    response_model=SubjectsResponse,
+    dependencies=[Depends(scoped_read)],
+)
 async def list_subjects(request: Request) -> SubjectsResponse:
     """Every known data subject with consent/record counts and the erased flag."""
     governed = getattr(request.app.state, "consent_ledger", None) is not None
@@ -266,7 +304,11 @@ class ConsentsResponse(BaseModel):
     items: list[ConsentEntry]
 
 
-@router.get("/consents", response_model=ConsentsResponse)
+@router.get(
+    "/consents",
+    response_model=ConsentsResponse,
+    dependencies=[Depends(scoped_read)],
+)
 async def list_consents(
     request: Request,
     subject: str | None = Query(None, max_length=200),
@@ -361,8 +403,19 @@ async def erase_subject(body: EraseRequest, request: Request) -> EraseResponse:
             status_code=404, detail=f"no data recorded for subject {subject!r}"
         )
 
+    # Thread the verified principal's tenant into the destructive withdraw, exactly as the
+    # hardened ``/v1/consent/withdraw`` does (scope-r7). Without it ``workspace_id`` defaulted
+    # to ``None``, which (a) operated on the GLOBAL consent chain and (b) made
+    # ``SubjectKeyVault.destroy`` crypto-shred a global/foreign-bound key + hard-delete the
+    # subject's rows across ALL tenants — a confused-deputy cross-tenant destructive write a
+    # TENANT-BOUND admin could trigger on a colliding subject id. ``resolve_workspace`` returns
+    # the caller's tenant (403 on a foreign one, 400 on an ambiguous multi-tenant omission), and
+    # ``None`` for an unrestricted (offline / ``all_tenants``) principal — so the single-box
+    # erasure (which legitimately shreds the global key) is byte-unchanged.
+    workspace_id = resolve_workspace(request, None)
     withdrawn = ledger.withdraw(
         subject,
+        workspace_id=workspace_id,
         reason="studio erasure",
         actor=get_principal(request).subject,
         source="studio",
@@ -406,18 +459,31 @@ class AuditExportResponse(BaseModel):
     bundle: AuditBundle
 
 
-def _evidence_records(registry: Any, kinds: tuple[str, ...]) -> list[Any]:
-    """Every spine record of the evidence kinds (the set a bundle commits to)."""
+def _evidence_records(
+    request: Request, registry: Any, kinds: tuple[str, ...]
+) -> list[Any]:
+    """The evidence records a bundle commits to — TENANT/SUBJECT-scoped (scope-r7).
+
+    Routes every kind through :func:`_visible_records`, the SAME choke point the
+    ``/subjects`` and ``/consents`` readers use, so the signed audit bundle's evidence set
+    can never commit to (and thus leak the ids/counts/content-hashes of) another tenant's —
+    or, for a ``subject_scoped`` caller, another subject's — governance records. A
+    TENANT-BOUND ``admin`` (``roles:["admin"], tenant_ids:["A"], all_tenants:false``) holds
+    ``studio.privacy:manage`` via the ``*:*`` wildcard, so the export/verify paths MUST
+    refuse cross-tenant payloads rather than trust the admin-only gate — exactly as the GET
+    readers do. A strict NO-OP for an unrestricted (offline / ``all_tenants``) principal, so
+    the single-box bundle is byte-unchanged.
+    """
     records: list[Any] = []
     for kind in kinds:
-        records.extend(registry.list_by_kind(kind))
+        records.extend(_visible_records(request, registry.list_by_kind(kind)))
     return records
 
 
 @router.post(
     "/audit/export",
     response_model=AuditExportResponse,
-    dependencies=[_privacy_manage],
+    dependencies=[_privacy_manage, Depends(scoped_read)],
 )
 async def export_audit(request: Request) -> AuditExportResponse:
     """Export a signed, tamper-evident bundle over the governance evidence.
@@ -432,7 +498,7 @@ async def export_audit(request: Request) -> AuditExportResponse:
     )
 
     kinds = _bundle_kinds()
-    records = _evidence_records(_registry(request), kinds)
+    records = _evidence_records(request, _registry(request), kinds)
     private_pem = get_secret("HIMMY_AUDIT_PRIVATE_KEY")
     if private_pem:
         bundle = export_audit_bundle_ed25519(records, [], private_pem=private_pem)
@@ -550,7 +616,7 @@ def _ids_detail(ids: list[str], verb: str) -> str:
 @router.post(
     "/audit/verify",
     response_model=AuditVerifyResponse,
-    dependencies=[_privacy_manage],
+    dependencies=[_privacy_manage, Depends(scoped_read)],
 )
 async def verify_audit(
     body: AuditVerifyRequest, request: Request
@@ -570,7 +636,7 @@ async def verify_audit(
         )
         or default_kinds
     )
-    records = _evidence_records(_registry(request), kinds)
+    records = _evidence_records(request, _registry(request), kinds)
 
     if bundle.algorithm.lower().startswith("ed25519"):
         private_pem = get_secret("HIMMY_AUDIT_PRIVATE_KEY")

@@ -145,6 +145,12 @@ _NON_GET_READS: frozenset[str] = frozenset(
     {
         "/api/studio/memory/recall",  # POST recall: subject_id from body must not be honored
         "/api/studio/knowledge/{kb_id}/search",  # POST KB search (project-local, not tenant)
+        # POST audit export/verify are READS over the governance evidence set: a tenant-bound
+        # admin must NOT walk away with a signed bundle of every tenant's (or, subject_scoped,
+        # every subject's) consent/erasure/security records (scope-r7). They route the
+        # evidence set through _visible_records (tenant + subject axis) and carry scoped_read.
+        "/api/studio/privacy/audit/export",
+        "/api/studio/privacy/audit/verify",
     }
 )
 
@@ -323,9 +329,6 @@ _STUDIO_TENANT_PENDING: frozenset[str] = frozenset(
     {
         # process-local registries (no tenant stamp on the in-memory record)
         "/api/studio/notify",
-        # entity-spine governance (registry.list_by_kind/get has no tenant axis)
-        "/api/studio/privacy/subjects",
-        "/api/studio/privacy/consents",
         # cwd-keyed singleton SQLite stores (no tenant/subject column)
         "/api/studio/tasks",
         "/api/studio/chats",
