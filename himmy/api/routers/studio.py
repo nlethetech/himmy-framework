@@ -496,6 +496,10 @@ async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
     # tenant-bound reader's Runs browser is scoped (None offline / all_tenants, byte-
     # unchanged). Mirrors the chat/eval/workflow run paths.
     owner_workspace, _owner_subject = _run_owner(request)
+    # rbac-harden tenancy: thread the within-tenant USER axis so the members' memory/KB
+    # tool packs namespace by (tenant, subject) exactly like the single-agent path — without
+    # this the team path reverts to the static shared memory/KB store (cross-tenant leak).
+    owner_subject_scope = _run_subject_scope(request)
 
     async def _stream() -> AsyncIterator[str]:
         try:
@@ -507,6 +511,7 @@ async def run_team(body: RunTeamRequest, request: Request) -> StreamingResponse:
                     team_path=body.team_path,
                     canonical_storage=canonical,
                     owner_workspace_id=owner_workspace,
+                    owner_subject_scope=owner_subject_scope,
                 ):
                     yield _sse(event)
         except Exception as exc:  # noqa: BLE001 - terminal error frame
@@ -1474,7 +1479,16 @@ async def chats_get(session_id: str, request: Request) -> Any:
 async def chats_save(body: ChatSaveRequest, request: Request) -> Any:
     from himmy.api.studio_chats import ChatMessage, get_chats_store
 
-    return get_chats_store().save(
+    store = get_chats_store()
+    scope = studio_tenant_filter(request)
+    # A tenant-bound caller re-using a foreign session's id must not clobber/overwrite its
+    # thread+title+messages (the ON CONFLICT upsert in save_thread only PRESERVES the owner
+    # column, not the content) — fold a cross-tenant id collision to 404 BEFORE the save,
+    # mirroring the notes/cookbook upsert guards. NO-OP offline / ``all_tenants`` (scope None).
+    if body.id and scope is not None and store.get(body.id) is not None:
+        if store.get(body.id, workspace_id=scope) is None:
+            raise HTTPException(status_code=404, detail="unknown chat session")
+    return store.save(
         session_id=body.id,
         title=body.title,
         agent_path=body.agent_path,
@@ -1740,7 +1754,14 @@ def _memory_tenant_prefix(request: Request) -> str:
     workspace = resolve_workspace(request, None)
     if not workspace:
         return ""
-    return f"t:{workspace}:"
+    # Escape ``:`` in the workspace so a ``:``-bearing id (e.g. ``acme`` vs ``acme:eu``)
+    # can never yield a prefix that string-prefixes another tenant's namespace — a
+    # cross-tenant BOLA on the column-less shared store. Pure alphanumeric ids are
+    # byte-unchanged, so the offline / single-tenant path is untouched. Mirrors the
+    # tool-pack ``ToolkitConfig._scope_token`` escaping so both share one namespace.
+    from himmy.toolkit.config import tenant_namespace_segment
+
+    return f"t:{tenant_namespace_segment(workspace)}:"
 
 
 def _scoped_memory_subject(request: Request, requested: str | None) -> str | None:
@@ -1936,49 +1957,83 @@ class KbSearchRequest(BaseModel):
 @router.get(
     "/knowledge", dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "read"))]
 )
-async def kb_list() -> list[Any]:
+async def kb_list(request: Request) -> list[Any]:
     from himmy.api import studio_knowledge
 
-    return studio_knowledge.list_kbs()
+    # TENANCY: list only the KBs in the caller's own scope (offline / all_tenants →
+    # the historical ("studio","local") scope, byte-unchanged).
+    workspace_id, _client_id = studio_knowledge.scope_keys(request)
+    return studio_knowledge.list_kbs(workspace_id=workspace_id)
 
 
 @router.post(
     "/knowledge", dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))]
 )
-async def kb_create(body: KbCreateRequest) -> Any:
+async def kb_create(body: KbCreateRequest, request: Request) -> Any:
     from himmy.api import studio_knowledge
 
-    return await studio_knowledge.create_kb(body.name)
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
+    return await studio_knowledge.create_kb(
+        body.name, workspace_id=workspace_id, client_id=client_id
+    )
 
 
 @router.post(
     "/knowledge/{kb_id}/ingest",
     dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))],
 )
-async def kb_ingest(kb_id: str, body: KbIngestRequest) -> Any:
+async def kb_ingest(kb_id: str, body: KbIngestRequest, request: Request) -> Any:
     from himmy.api import studio_knowledge
+    from himmy.core.errors import HimmyError
 
-    return await studio_knowledge.ingest_text(kb_id, body.text, title=body.title)
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
+    try:
+        return await studio_knowledge.ingest_text(
+            kb_id,
+            body.text,
+            title=body.title,
+            workspace_id=workspace_id,
+            client_id=client_id,
+        )
+    except HimmyError as exc:
+        # A cross-tenant / unknown kb_id folds to 404 (existence never leaks).
+        raise HTTPException(status_code=404, detail="knowledge base not found") from exc
 
 
 @router.post(
     "/knowledge/{kb_id}/search",
     dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "read"))],
 )
-async def kb_search(kb_id: str, body: KbSearchRequest) -> list[Any]:
+async def kb_search(kb_id: str, body: KbSearchRequest, request: Request) -> list[Any]:
     from himmy.api import studio_knowledge
+    from himmy.core.errors import HimmyError
 
-    return await studio_knowledge.search(kb_id, body.query, top_k=body.top_k)
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
+    try:
+        return await studio_knowledge.search(
+            kb_id,
+            body.query,
+            top_k=body.top_k,
+            workspace_id=workspace_id,
+            client_id=client_id,
+        )
+    except HimmyError as exc:
+        raise HTTPException(status_code=404, detail="knowledge base not found") from exc
 
 
 @router.delete(
     "/knowledge/{kb_id}",
     dependencies=[Depends(studio_permission(_RES_KNOWLEDGE, "write"))],
 )
-async def kb_delete(kb_id: str) -> dict[str, bool]:
+async def kb_delete(kb_id: str, request: Request) -> dict[str, bool]:
     from himmy.api import studio_knowledge
 
-    return {"ok": await studio_knowledge.delete_kb(kb_id)}
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
+    return {
+        "ok": await studio_knowledge.delete_kb(
+            kb_id, workspace_id=workspace_id, client_id=client_id
+        )
+    }
 
 
 # ---- Evaluation (suites → run → scorecard) ------------------------------

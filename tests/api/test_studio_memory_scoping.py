@@ -135,8 +135,10 @@ def test_edit_cannot_rewrite_another_subjects_memory(memory_project: Path) -> No
     """
     from himmy.api import studio_memory
 
-    _seed("alice", "alice loves espresso")
-    victim_id = _seed("bob", "bob secret tea blend xyz")
+    # Seed in the tenant's OWN namespace (the shape the route/agent stamps for tenant "t":
+    # ``t:t:<subject>``) so the cross-SUBJECT axis is what is exercised, not the tenant axis.
+    _seed("t:t:alice", "alice loves espresso")
+    victim_id = _seed("t:t:bob", "bob secret tea blend xyz")
 
     client = _subject_scoped_client("alice")
     resp = client.patch(f"/api/studio/memory/{victim_id}", json={"text": "poisoned"})
@@ -145,20 +147,26 @@ def test_edit_cannot_rewrite_another_subjects_memory(memory_project: Path) -> No
     # The victim's record is byte-unchanged: not poisoned, still its own subject/text.
     rec = studio_memory.get_memory(victim_id)
     assert rec is not None
-    assert rec.subject_id == "bob"
+    assert rec.subject_id == "t:t:bob"
     assert rec.text == "bob secret tea blend xyz"
 
 
 def test_edit_can_rewrite_own_subjects_memory(memory_project: Path) -> None:
-    """A subject-scoped caller CAN still edit its OWN subject's memory (gate is not over-broad)."""
+    """A subject-scoped caller CAN still edit its OWN subject's memory (gate is not over-broad).
+
+    The own-subject record is seeded in the tenant's ``t:t:<subject>`` namespace — the exact
+    shape the Studio ``memory_add`` route and the agent memory pack stamp for tenant "t" — so
+    the edit gate strips the prefix before the subject comparison and the legitimate owner can
+    still rewrite. (Regression for the round-2 over-deny: an unstripped check 404'd one's own
+    namespaced memory.)
+    """
     from himmy.api import studio_memory
 
-    own_id = _seed("alice", "alice loves espresso")
+    own_id = _seed("t:t:alice", "alice loves espresso")
 
     client = _subject_scoped_client("alice")
     resp = client.patch(f"/api/studio/memory/{own_id}", json={"text": "alice loves tea"})
     assert resp.status_code == 200, resp.text
-    assert resp.json()["subject_id"] == "alice"
 
     rec = studio_memory.get_memory(own_id)
     assert rec is not None

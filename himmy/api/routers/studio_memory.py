@@ -46,15 +46,23 @@ async def memory_edit(
     preserved. The cached embedding for the record is dropped so the next
     recall re-embeds the new text instead of ranking against the old one.
 
-    A ``subject_scoped`` caller may only edit its OWN subject's memory: the
-    fetched record's owning ``subject_id`` is checked against the principal and
-    a cross-subject edit folds to a uniform 404 (existence never leaked),
-    mirroring the by-id ``memory_forget`` reader. Without this gate the
-    in-place edit was the one cross-subject memory WRITE left ungated while
-    ``memory_add`` (``enforce_subject_write``) and ``memory_forget``
-    (``authorize_object``) were both closed. NO-OP offline / ``all_tenants``.
+    TENANT axis: a tenant-bound caller may only edit a memory in its OWN
+    ``t:<workspace>:`` namespace on the shared (column-less) process store; a
+    record stamped under another tenant's namespace folds to a uniform 404
+    (existence never leaked), mirroring the by-id ``memory_forget`` writer.
+    Without this gate ``memory_edit`` was the one Studio memory write that
+    skipped the tenant-prefix axis its siblings enforce, so a tenant-bound
+    ``studio.memory:write`` holder could PATCH-overwrite another tenant's memory.
+
+    SUBJECT axis: the (de-namespaced) owning ``subject_id`` is then checked
+    against the principal so a ``subject_scoped`` caller may only edit its OWN
+    subject's memory; a cross-subject edit folds to the same 404. The tenant
+    prefix is STRIPPED before the subject comparison (mirroring ``memory_forget``)
+    so a legitimately-owned namespaced memory remains editable. NO-OP offline /
+    ``all_tenants`` (empty prefix → byte-unchanged single-box path).
     """
     from himmy.api import studio_memory
+    from himmy.api.routers.studio import _memory_tenant_prefix
 
     text = body.text.strip()
     if not text:
@@ -63,7 +71,19 @@ async def memory_edit(
     record = service.get(memory_id)
     if record is None:
         raise HTTPException(status_code=404, detail="memory not found")
-    if not authorize_object(request, record.subject_id):
+    # TENANT axis: a cross-tenant record (different ``t:<workspace>:`` namespace) is
+    # a uniform 404 BEFORE the subject check, so existence never leaks across tenants.
+    prefix = _memory_tenant_prefix(request)
+    if prefix and not record.subject_id.startswith(prefix):
+        raise HTTPException(status_code=404, detail="memory not found")
+    # SUBJECT axis: strip the tenant namespace so the bare subject (the owner the
+    # principal can be scoped to) is what ``authorize_object`` compares against.
+    bare_subject = (
+        record.subject_id[len(prefix) :]
+        if prefix and record.subject_id.startswith(prefix)
+        else record.subject_id
+    )
+    if not authorize_object(request, bare_subject):
         raise HTTPException(status_code=404, detail="memory not found")
     updated = record.model_copy(update={"text": text})
     service.store.save(updated)

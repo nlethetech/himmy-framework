@@ -123,11 +123,29 @@ def _check_kb_id(kb_id: str) -> None:
         )
 
 
-async def _require_kb(svc: Any, kb_id: str) -> None:
+async def _require_kb(
+    svc: Any, kb_id: str, *, workspace_id: str, client_id: str
+) -> None:
+    """404 when ``kb_id`` is unknown OR outside the caller's tenant scope.
+
+    The ``_authorize_kb`` guard verifies the resolved KB belongs to ``(workspace_id,
+    client_id)`` so a tenant cannot reach another tenant's KB by raw id; both unknown and
+    cross-tenant fold to the same 404 (existence never leaks).
+    """
+    from himmy.core.errors import HimmyError
+
     if await svc.get_kb(kb_id) is None:
         raise HTTPException(
             status_code=404, detail=f"knowledge base {kb_id!r} not found"
         )
+    authorize = getattr(svc, "_authorize_kb", None)
+    if authorize is not None:
+        try:
+            await authorize(kb_id, workspace_id, client_id, missing_ok=True)
+        except HimmyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"knowledge base {kb_id!r} not found"
+            ) from exc
 
 
 async def _read_bounded(upload: UploadFile) -> bytes:
@@ -246,8 +264,11 @@ async def kb_upload(kb_id: str, request: Request) -> UploadResult:
             f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit",
         )
 
+    from himmy.api import studio_knowledge
+
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
     svc = _kb_service()
-    await _require_kb(svc, kb_id)
+    await _require_kb(svc, kb_id, workspace_id=workspace_id, client_id=client_id)
 
     try:
         form = await request.form(max_files=2, max_fields=4)
@@ -317,11 +338,14 @@ async def kb_upload(kb_id: str, request: Request) -> UploadResult:
 
 
 @router.get("/{kb_id}/documents")
-async def kb_documents(kb_id: str) -> list[DocumentInfo]:
+async def kb_documents(kb_id: str, request: Request) -> list[DocumentInfo]:
     """List the documents in a KB (in-memory store; backend KBs return [])."""
+    from himmy.api import studio_knowledge
+
     _check_kb_id(kb_id)
+    workspace_id, client_id = studio_knowledge.scope_keys(request)
     svc = _kb_service()
-    await _require_kb(svc, kb_id)
+    await _require_kb(svc, kb_id, workspace_id=workspace_id, client_id=client_id)
     docs_map = getattr(svc, "_documents", {}).get(kb_id, {})
     chunks_map = getattr(svc, "_chunks", {}).get(kb_id, {})
     counts: dict[str, int] = {}

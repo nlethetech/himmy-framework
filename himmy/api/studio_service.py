@@ -1290,6 +1290,7 @@ async def stream_team_run(
     team_path: str | None = None,
     canonical_storage: Any | None = None,
     owner_workspace_id: str | None = None,
+    owner_subject_scope: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run a multi-agent team for one request, streaming the live routing trail.
 
@@ -1297,6 +1298,15 @@ async def stream_team_run(
     Ollama workers). Emits ``start`` → ``tool``/``delegate``/``handoff`` frames as they
     happen → ``message`` (the final synthesized answer) → ``done``. The whole run is
     persisted for the Runs browser.
+
+    ``owner_workspace_id`` / ``owner_subject_scope`` thread the LAUNCHING tenant + within-
+    tenant user axis into the members' tool packs (exactly like the single-agent
+    :func:`stream_agent_run` path): without them ``build_team`` falls back to
+    ``ToolkitConfig.from_env()`` with no tenant/subject scope, so every tenant's team-run
+    ``remember``/``recall`` and ``kb_ingest``/``kb_search`` collapse onto the static shared
+    ``default`` subject / ``("local","local")`` KB scope on a shared durable store — a
+    cross-tenant confused-deputy. Both ``None`` (offline / ``all_tenants``) → unscoped,
+    byte-for-byte unchanged.
     """
     from himmy import build_runtime
     from himmy.config.team_spec import build_team, build_team_inference
@@ -1311,8 +1321,21 @@ async def stream_team_run(
 
     # Build off the event loop (tool-module import + pack registration are sync).
     def _build() -> tuple[Any, Any, Any]:
+        # P1 tenancy: scope the members' memory/KB packs to THIS run's tenant + (within-
+        # tenant) subject so two tenants' team runs never share the durable memory/KB
+        # namespace. ``None``/``None`` leaves ToolkitConfig.from_env() on its historical
+        # static scope — byte-unchanged offline / all_tenants.
+        team_cfg = None
+        if owner_workspace_id is not None or owner_subject_scope is not None:
+            from himmy.toolkit import ToolkitConfig
+
+            team_cfg = ToolkitConfig.from_env()
+            team_cfg.tenant_scope = owner_workspace_id
+            team_cfg.subject_scope = owner_subject_scope
         team, registry = build_team(
-            spec, resolve_tools_module=from_spec.resolve_tools_module
+            spec,
+            toolkit_config=team_cfg,
+            resolve_tools_module=from_spec.resolve_tools_module,
         )
         inference = build_team_inference(spec)
         runtime, _i, _t = build_runtime(

@@ -19,6 +19,23 @@ from pydantic import BaseModel, Field
 from himmy.services.sandbox.models import SandboxLimits, SandboxPolicy
 
 
+def tenant_namespace_segment(value: str) -> str:
+    """Escape a tenant/subject value so it is SAFE as one ``:``-delimited namespace segment.
+
+    The tenant-axis isolation for the column-less Studio memory store (and the durable
+    memory/KB tool packs) rests on prefixing the subject with ``t:<workspace>:`` and, on a
+    shared store, distinguishing tenants by that prefix. A raw value containing the ``:``
+    delimiter would let one tenant's prefix straddle another's: workspace ``acme`` would be a
+    string-prefix of every row written by workspace ``acme:eu`` (stored ``t:acme:eu:...``), a
+    cross-tenant BOLA. We percent-encode the two characters that can confuse the delimiter
+    (``%`` first, then ``:``) so each segment is unambiguous and ``acme`` / ``acme:eu`` can
+    never collide. Pure alphanumeric / dash IDs (the overwhelmingly common case) contain
+    neither character and are returned BYTE-UNCHANGED, so the offline path and every existing
+    tenant id are unaffected.
+    """
+    return value.replace("%", "%25").replace(":", "%3A")
+
+
 class ToolkitConfig(BaseModel):
     """Resolved settings for the built-in tool packs."""
 
@@ -154,13 +171,24 @@ class ToolkitConfig(BaseModel):
         tenant-only stays ``<tenant>`` (byte-unchanged for the non-subject-scoped common
         case). ``subject_scope`` alone (no tenant) is folded in too. ``None`` everywhere is
         "no scoping" — the offline / one-shot CLI path is byte-for-byte unchanged.
+
+        Each axis value is run through :func:`tenant_namespace_segment` so a ``:``-bearing
+        tenant/subject id (e.g. ``acme`` vs ``acme:eu``) can never produce a prefix that
+        straddles another's namespace — a cross-tenant BOLA on the shared store. Pure
+        alphanumeric / dash ids (the common case) are unchanged.
         """
-        if self.tenant_scope and self.subject_scope:
-            return f"{self.tenant_scope}:s:{self.subject_scope}"
-        if self.tenant_scope:
-            return self.tenant_scope
-        if self.subject_scope:
-            return f"s:{self.subject_scope}"
+        tenant = (
+            tenant_namespace_segment(self.tenant_scope) if self.tenant_scope else None
+        )
+        subject = (
+            tenant_namespace_segment(self.subject_scope) if self.subject_scope else None
+        )
+        if tenant and subject:
+            return f"{tenant}:s:{subject}"
+        if tenant:
+            return tenant
+        if subject:
+            return f"s:{subject}"
         return None
 
     def scoped_memory_subject(self) -> str:
