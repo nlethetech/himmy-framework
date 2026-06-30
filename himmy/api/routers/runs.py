@@ -103,6 +103,42 @@ class CreateRunRequest(BaseModel):
     plan: bool = False
 
 
+#: Context keys a CLIENT must never get to choose on a server-launched run — they govern
+#: the TENANT axis of the per-run context-snapshot field resolution. ``workspace_id`` on
+#: ``context_metadata`` drives :meth:`ContextService._stored_field` eligibility; left
+#: client-controlled it is a cross-tenant IDOR (a tenant-bound caller could point the build
+#: at another tenant's cached context fields under a shared ``subject_id``).
+_RESERVED_CONTEXT_META_KEYS = ("workspace_id",)
+
+
+def _scope_run_context(
+    request: Request, context: dict[str, Any], workspace_id: str
+) -> dict[str, Any]:
+    """Force the per-run context-build TENANT axis to the SERVER-authorized workspace.
+
+    The ``/v1/runs`` body carries a free-form ``task.context``; the runtime's context-snapshot
+    build reads ``context_metadata.workspace_id`` from it to tenant-scope STORAGE-sourced field
+    resolution (single_agent.py ``_context_workspace_id``). On a server-launched run that value
+    MUST be the run's authorized workspace, not a client choice — otherwise a tenant-bound caller
+    submits ``context_metadata.workspace_id`` = some OTHER tenant and reads that tenant's cached
+    context fields into its own prompt (a cross-tenant IDOR).
+
+    For a tenant-bound principal this HARD-OVERRIDES (not setdefault) ``context_metadata``'s
+    reserved tenant keys to the authorized ``workspace_id``. For an unrestricted principal
+    (offline / ``all_tenants`` — a single-box deployment where there is no other tenant to cross)
+    the context dict is returned UNTOUCHED, so the offline / CLI path is byte-for-byte unchanged.
+    """
+    if get_principal(request).all_tenants:
+        return context
+    scoped = dict(context)
+    meta_raw = scoped.get("context_metadata")
+    meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
+    for key in _RESERVED_CONTEXT_META_KEYS:
+        meta[key] = workspace_id
+    scoped["context_metadata"] = meta
+    return scoped
+
+
 def _container(request: Request) -> Any:
     """Pull the wired :class:`ApiContainer` off the app state."""
     return request.app.state.container
@@ -162,7 +198,7 @@ async def create_run(body: CreateRunRequest, request: Request) -> RunRecord:
     task = Task(
         title=body.task.title,
         prompt=body.task.prompt,
-        context=body.task.context,
+        context=_scope_run_context(request, body.task.context, workspace_id),
     )
 
     persona: Persona

@@ -346,7 +346,17 @@ async def resolve(
             subject_scope=owner_subject_scope,
         )
     )
-    cog = ss._Cognition(ss._read_only_map(registry), spec.name)
+    # rbac-harden(mopup-r6): thread the run's owner tenant + within-tenant USER axis so a
+    # re-pause approval bell on the RESUME path is stamped with the same subject-aware owner
+    # token the bell reader (``singleton_read_filter``) pins to — else a re-paused
+    # subject_scoped run's bell (which carries run detail) is NULL-owned and readable by every
+    # co-tenant peer. ``None`` (offline / non-subject-scoped) stays bare/NULL, byte-unchanged.
+    cog = ss._Cognition(
+        ss._read_only_map(registry),
+        spec.name,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
+    )
 
     run_id = new_uuid()
     started = time.monotonic()

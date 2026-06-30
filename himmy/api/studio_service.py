@@ -403,6 +403,7 @@ class _Cognition:
         initial_agent: str,
         *,
         owner_workspace_id: str | None = None,
+        owner_subject_scope: str | None = None,
     ) -> None:
         from himmy.core.events import EventType
 
@@ -413,6 +414,13 @@ class _Cognition:
         # The OWNING workspace of this run, so the approval bell is only visible to the
         # tenant that launched the run (``None``/offline = NULL-owned = shared, unchanged).
         self._owner_workspace_id = owner_workspace_id
+        # The within-tenant USER axis (rbac-harden mopup-r6): for a per-user subject_scoped
+        # run the approval bell carries run detail, so it must be stamped with the SAME
+        # subject-aware ``t:<tenant>:s:<subject>`` owner token the singleton-store reader
+        # (``singleton_read_filter``) pins to — else a co-tenant PEER reads it (the same
+        # within-tenant cross-USER BOLA closed on the mission finish bell). ``None`` (offline
+        # / non-subject-scoped tenant) collapses to the bare workspace, byte-unchanged.
+        self._owner_subject_scope = owner_subject_scope
         self.tools_used: list[str] = []
         self.delegate_answers: list[tuple[str, str]] = []
         self.steps: list[dict[str, Any]] = []
@@ -423,6 +431,24 @@ class _Cognition:
         self.inferences = 0
         self._latencies: list[float] = []
         self._by_model: dict[str, dict[str, Any]] = {}
+
+    def _notify_owner_workspace(self) -> str | None:
+        """The owner token this run's notification (bell) is stamped with.
+
+        Mirrors :func:`himmy.api.auth.singleton_read_filter`'s owner: for a per-user
+        subject_scoped run (``owner_subject_scope`` set) this is the combined
+        ``t:<tenant>:s:<subject>`` token so a co-tenant PEER cannot read the bell; a
+        tenant-only / offline run collapses to the bare ``owner_workspace_id`` / ``None`` —
+        byte-unchanged.
+        """
+        if self._owner_subject_scope:
+            from himmy.toolkit.config import ToolkitConfig
+
+            return ToolkitConfig(
+                tenant_scope=self._owner_workspace_id,
+                subject_scope=self._owner_subject_scope,
+            ).scoped_pack_workspace()
+        return self._owner_workspace_id
 
     def _record(self, **kw: Any) -> None:
         kw["seq"] = len(self.steps) + 1
@@ -615,7 +641,7 @@ class _Cognition:
                 "Approval required: " + (", ".join(tools) if tools else "a gated tool"),
                 body=f"{self.active} paused and is waiting for your decision",
                 link="/approvals",
-                workspace_id=self._owner_workspace_id,
+                workspace_id=self._notify_owner_workspace(),
             )
             return out
 
@@ -835,7 +861,10 @@ async def stream_agent_run(
         register_update_plan_tool(registry)
     thread = _rebuild_thread(spec, history)
     cog = _Cognition(
-        _read_only_map(registry), spec.name, owner_workspace_id=owner_workspace_id
+        _read_only_map(registry),
+        spec.name,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
     )
 
     # Attach any MCP servers for the lifetime of this run.
@@ -1363,7 +1392,10 @@ async def stream_team_run(
     error_msg: str | None = None
     entry = getattr(spec, "entry", None) or team_name
     cog = _Cognition(
-        _read_only_map(registry), entry, owner_workspace_id=owner_workspace_id
+        _read_only_map(registry),
+        entry,
+        owner_workspace_id=owner_workspace_id,
+        owner_subject_scope=owner_subject_scope,
     )
 
     yield {"type": "start", "agent": team_name, "streaming": False, "team": True}

@@ -47,6 +47,26 @@ _DONE = "done"
 _ERROR = "error"
 
 
+def _mission_notify_workspace(mission: Mission) -> str | None:
+    """The owner token a mission's notification (bell) is stamped with.
+
+    Mirrors :func:`himmy.api.auth.singleton_read_filter`'s owner: for a per-user
+    ``subject_scoped`` mission (``subject_scope`` set) this is the combined
+    ``t:<tenant>:s:<subject>`` token the singleton Studio stores key by, so a co-tenant
+    PEER cannot read the bell (which carries the user's private prompt/result_preview) —
+    closing the within-tenant cross-USER BOLA. Tenant-only / offline collapses to the bare
+    ``workspace_id`` / ``None`` exactly as before, so the single-box path is byte-unchanged.
+    """
+    if mission.subject_scope:
+        from himmy.toolkit.config import ToolkitConfig
+
+        return ToolkitConfig(
+            tenant_scope=mission.workspace_id,
+            subject_scope=mission.subject_scope,
+        ).scoped_pack_workspace()
+    return mission.workspace_id
+
+
 class MissionError(Exception):
     """Base class for mission-registry domain errors."""
 
@@ -360,7 +380,13 @@ class MissionRegistry:
             try:
                 # Thread the mission's OWNING workspace so a tenant-bound Studio reader only
                 # sees the bell for its own missions (NULL/None offline, byte-unchanged).
-                ws = mission.workspace_id
+                # For a per-USER subject_scoped mission the bell carries the user's private
+                # prompt/result_preview — stamp the SAME subject-aware ``t:<tenant>:s:<subject>``
+                # owner token the singleton stores use (via subject_scope), so a co-tenant peer's
+                # ``singleton_read_filter`` (which pins to that token) cannot read another user's
+                # mission bell. Tenant-only / offline collapses to the bare tenant id / None —
+                # byte-unchanged.
+                ws = _mission_notify_workspace(mission)
                 if status == _DONE:
                     record_notification(
                         "mission",

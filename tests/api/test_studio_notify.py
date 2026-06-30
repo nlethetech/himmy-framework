@@ -343,3 +343,182 @@ def test_offline_principal_can_set_forwarding(notify_env: Path) -> None:
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["settings"] == {"forward_telegram": True}
+
+
+# ---- rbac-harden(mopup-r6): mission bell does not leak across co-tenant USERS (BOLA)
+
+
+def _subject_scoped_client(subject: str) -> TestClient:
+    """A subject_scoped principal sharing tenant ``t`` (distinct ``subject``)."""
+    from himmy.api import ApiContainer
+    from himmy.api import create_app as _create
+    from himmy.api.auth.apikey import ApiKeyAuthenticator
+    from himmy.api.auth.principal import Principal
+
+    app = _create(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            "k": Principal.build(
+                subject,
+                tenant_ids=["t"],
+                roles=["admin"],
+                auth_method="apikey",
+                subject_scoped=True,
+            )
+        }
+    )
+    c = TestClient(app)
+    c.headers.update({"x-himmy-internal-key": "k"})
+    return c
+
+
+def test_mission_bell_not_readable_by_cotenant_user(
+    notify_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rbac-harden(mopup-r6): a co-tenant USER cannot read another user's mission bell.
+
+    Confirmed cross-user (within-tenant) BOLA: mission notifications carry the user's private
+    prompt/result_preview but were stamped only with the BARE tenant ``workspace_id``, and the
+    notify list filtered with the bare tenant axis — so two subject_scoped users of one tenant
+    (alice/bob) saw each other's mission bells. The fix stamps the SAME subject-aware
+    ``t:<tenant>:s:<subject>`` owner token the singleton stores use (via the mission's
+    ``subject_scope``) AND filters the notify reads with ``singleton_read_filter``.
+
+    This drives the REAL end-to-end finish seam (``MissionRegistry._run_mission`` ->
+    ``record_notification`` in its ``finally``), so reverting EITHER the write stamp or the
+    read filter makes it fail.
+    """
+    from himmy.api import studio_service
+    from himmy.api.missions import Mission, MissionRegistry
+    from tests.conftest import run_async
+
+    async def _fake_stream(spec, prompt, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        yield {"type": "done", "output_text": "ok", "run_id": "r"}
+
+    monkeypatch.setattr(studio_service, "stream_agent_run", _fake_stream)
+
+    # Alice's finished mission rings the bell via the production finish path.
+    async def _drive() -> None:
+        m = Mission(
+            id="m-alice",
+            agent="helper",
+            agent_path="agent.yaml",
+            prompt="alice's SECRET prompt",
+            provider="stub",
+            model=None,
+            plan_mode=False,
+            created_at="2026-06-29T00:00:00+00:00",
+            workspace_id="t",
+            subject_id="alice",
+            subject_scope="alice",
+        )
+        await MissionRegistry()._run_mission(m, spec=object())
+
+    run_async(_drive())
+
+    # Bob (co-tenant, different subject) MUST NOT see alice's mission bell.
+    bob = _subject_scoped_client("bob")
+    bob_items = bob.get("/api/studio/notify").json()
+    assert all(
+        i["kind"] != "mission" for i in bob_items["items"]
+    ), bob_items
+    assert bob_items["unread"] == 0
+
+    # Alice DOES see her own mission bell.
+    alice = _subject_scoped_client("alice")
+    alice_data = alice.get("/api/studio/notify").json()
+    mine = [i for i in alice_data["items"] if i["kind"] == "mission"]
+    assert mine, alice_data
+    assert alice_data["unread"] == 1
+    nid = mine[0]["id"]
+    # Bob cannot mark alice's notification read (out-of-scope id -> 404).
+    assert bob.post(f"/api/studio/notify/{nid}/read").status_code == 404
+    # Bob's read-all marks nothing of alice's.
+    assert bob.post("/api/studio/notify/read-all").json()["marked"] == 0
+    # Alice still sees it unread (bob could not flip her read state).
+    assert alice.get("/api/studio/notify").json()["unread"] == 1
+
+
+def test_mission_bell_offline_byte_unchanged(notify_env: Path) -> None:
+    """Offline / non-subject-scoped: the mission bell is byte-unchanged (no subject token).
+
+    A tenant-only (non-subject-scoped) mission's owner token collapses to the bare tenant id,
+    and an offline mission (no workspace) to ``None`` — so the single-box bell is unchanged and
+    every reader sees it.
+    """
+    from himmy.api.missions import Mission, _mission_notify_workspace
+
+    def _mission(*, ws: str | None, scope: str | None) -> Mission:
+        return Mission(
+            id="m",
+            agent="helper",
+            agent_path="agent.yaml",
+            prompt="hi",
+            provider="stub",
+            model=None,
+            plan_mode=False,
+            created_at="2026-06-29T00:00:00+00:00",
+            workspace_id=ws,
+            subject_id="u",
+            subject_scope=scope,
+        )
+
+    # Tenant-only (no subject_scope) -> bare tenant id (byte-unchanged stamp).
+    assert _mission_notify_workspace(_mission(ws="t", scope=None)) == "t"
+    # Offline (no workspace) -> None (byte-unchanged).
+    assert _mission_notify_workspace(_mission(ws=None, scope=None)) is None
+
+    sn.record_notification(
+        "mission", "Offline bell", body="hi", link="/missions", workspace_id=None
+    )
+    # The offline / all_tenants reader sees everything (no filtering).
+    items = _client().get("/api/studio/notify").json()["items"]
+    assert any(i["title"] == "Offline bell" for i in items)
+
+
+def test_approval_bell_not_readable_by_cotenant_user(notify_env: Path) -> None:
+    """rbac-harden(mopup-r6): the approval bell is subject-scoped, like the mission bell.
+
+    The Studio approval translator (``_Cognition``) rings the bell on every
+    ``APPROVAL_REQUIRED`` event. For a per-user subject_scoped run it must stamp the SAME
+    subject-aware ``t:<tenant>:s:<subject>`` owner token the notify reader pins to — else a
+    co-tenant PEER reads another user's approval bell (run detail). This drives the real
+    translation seam and asserts the resulting stamp via the HTTP read filter.
+    """
+    from himmy.api import studio_service as ss
+    from himmy.core.events import EventType
+
+    class _Evt:
+        event_type = EventType.APPROVAL_REQUIRED
+        payload = {"checkpoint_id": "cp-1", "tools": ["send_telegram"]}
+        timestamp = "2026-06-29T00:00:00+00:00"
+
+    # Alice's subject_scoped run pauses for approval -> bell under her own owner token.
+    cog = ss._Cognition(
+        {}, "helper", owner_workspace_id="t", owner_subject_scope="alice"
+    )
+    assert cog._notify_owner_workspace() == "t:t:s:alice"
+    cog.frames(_Evt())
+
+    # Bob (co-tenant peer) MUST NOT see alice's approval bell.
+    bob = _subject_scoped_client("bob")
+    bob_items = bob.get("/api/studio/notify").json()
+    assert all(i["kind"] != "approval" for i in bob_items["items"]), bob_items
+
+    # Alice DOES see it.
+    alice = _subject_scoped_client("alice")
+    alice_items = alice.get("/api/studio/notify").json()
+    assert any(i["kind"] == "approval" for i in alice_items["items"]), alice_items
+
+
+def test_approval_bell_offline_byte_unchanged(notify_env: Path) -> None:
+    """Offline / non-subject-scoped: the approval bell stamp is byte-unchanged."""
+    from himmy.api import studio_service as ss
+
+    # Tenant-only (no subject scope) -> bare tenant id.
+    assert (
+        ss._Cognition({}, "helper", owner_workspace_id="t")._notify_owner_workspace()
+        == "t"
+    )
+    # Offline (no owner) -> None.
+    assert ss._Cognition({}, "helper")._notify_owner_workspace() is None

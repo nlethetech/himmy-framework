@@ -48,7 +48,7 @@ from typing import Any
 from fastapi import Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from himmy.api.auth import scoped_read, studio_tenant_filter
+from himmy.api.auth import scoped_read, singleton_read_filter
 from himmy.api.routers.studio_common import build_studio_router, studio_permission
 
 router = build_studio_router("notify", tag="studio-notify")
@@ -472,7 +472,7 @@ async def list_notifications(
     A tenant-bound principal sees only its own workspaces' notifications (plus legacy
     NULL-tenant ones); the offline / ``all_tenants`` path is byte-unchanged.
     """
-    scope = studio_tenant_filter(request)
+    scope = singleton_read_filter(request)
     with _LOCK:
         _ensure_db_locked(create=False)  # restore the ring after a restart
         visible = [i for i in _NOTIFICATIONS if _item_in_scope(i, scope)]
@@ -502,7 +502,7 @@ async def mark_all_read(request: Request) -> dict[str, Any]:
     A tenant-bound caller marks only its OWN workspaces' notifications read — it cannot
     flip another tenant's read state. NO-OP-scoped offline / ``all_tenants``.
     """
-    scope = studio_tenant_filter(request)
+    scope = singleton_read_filter(request)
     with _LOCK:
         _ensure_db_locked(create=False)
         changed_ids: list[int] = []
@@ -522,7 +522,7 @@ async def mark_read(request: Request, notification_id: int) -> dict[str, Any]:
     A tenant-bound caller cannot mark (or even probe the existence of) a foreign tenant's
     notification — an out-of-scope id is a uniform 404, mirroring the by-id run reader.
     """
-    scope = studio_tenant_filter(request)
+    scope = singleton_read_filter(request)
     with _LOCK:
         _ensure_db_locked(create=False)
         for item in _NOTIFICATIONS:
