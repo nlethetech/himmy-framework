@@ -119,7 +119,11 @@ class AgentSpec(BaseModel):
     # code). The agent gains kb_search and can answer grounded in these docs.
     knowledge: list[str] = []
     # Auto-compaction: summarize old turns once the thread crosses the token budget,
-    # so long multi-turn runs don't overflow the context window.
+    # so long multi-turn runs don't overflow the context window. Setting this True pins
+    # an explicit ``compaction_spec`` (with THESE thresholds) onto the task context.
+    # NOTE (eff-p0 #3): the runtime is now DEFAULT-ON with a conservative high budget even
+    # when this is False — this flag only overrides that default with tighter thresholds.
+    # Disable compaction entirely with the env ``HIMMY_AUTO_COMPACT=0``.
     compact_context: bool = False
     compact_after_tokens: int = 3000
     compact_keep_recent: int = 6

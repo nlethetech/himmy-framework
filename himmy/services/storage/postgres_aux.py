@@ -3026,7 +3026,7 @@ async def _preserve_owner(
         row_id,
     )
     if existing is not None:
-        owner = existing["workspace_id"]
+        owner: str | None = existing["workspace_id"]
         if not row_writable_in_scope(owner, workspace_id):
             return owner
     return workspace_id

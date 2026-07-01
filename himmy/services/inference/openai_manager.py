@@ -47,6 +47,7 @@ from himmy.services.inference.models import (
 from himmy.services.inference.prompt_cache import (
     CacheCapability,
     UsageBreakdown,
+    apply_history_cache_breakpoint,
     cache_policy_active,
     cache_savings_usd,
     compute_cached_cost,
@@ -247,6 +248,13 @@ def _openai_messages(
                 "cache_control": {"type": "ephemeral"},
             }
         ]
+        # Second breakpoint on the tail of history: the fixed system prefix above only
+        # discounts the stable head, so a tool loop re-pays full price for every prior
+        # step. OpenRouter forwards this ``cache_control`` block to the Anthropic/Gemini
+        # backend (which allows up to 4 breakpoints), caching the conversation-so-far so
+        # the next appended tool result reads it back cheaply. Plain 5m ephemeral,
+        # matching the system marker on this path.
+        apply_history_cache_breakpoint(messages, ttl="5m", ttl_supported=False)
     return messages
 
 

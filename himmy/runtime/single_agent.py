@@ -101,6 +101,139 @@ try:
 except ValueError:
     _TOOL_RESULT_EVENT_MAX = 2000
 
+# How many characters of a tool's result text are written to the MODEL-FACING thread
+# (the TOOL Message in ``_append_tool_messages``). Unlike ``_TOOL_RESULT_EVENT_MAX``
+# (which only bounds the observability event), this bounds what the model actually
+# sees — and because the whole thread is re-sent on every subsequent turn, an
+# uncapped multi-KB tool blob (a scraped page, a file dump, a wide DB result) is
+# re-billed on every later turn of the run. Capping the model copy is a pure
+# efficiency win: it shrinks the re-sent prefix while the FULL result stays intact
+# on the tool-return record + the TOOL_COMPLETED event for observers.
+#
+# Default 6000 chars (~1.5k tokens) keeps a single tool result from dominating the
+# window while still leaving room for a substantial page/table. Raise it, or set
+# ``HIMMY_TOOL_RESULT_MODEL_MAX=0`` to DISABLE the cap entirely (restores the
+# pre-C5 uncapped behaviour). A per-tool opt-out (for tools whose full output is
+# essential — the model must see every byte) is available via the tool definition
+# metadata flag ``model_result_uncapped=True`` (see ``_tool_result_uncapped``).
+_TOOL_RESULT_MODEL_MAX_DEFAULT = 6000
+try:
+    _TOOL_RESULT_MODEL_MAX = max(0, int(os.environ.get("HIMMY_TOOL_RESULT_MODEL_MAX", str(_TOOL_RESULT_MODEL_MAX_DEFAULT))))
+except ValueError:
+    _TOOL_RESULT_MODEL_MAX = _TOOL_RESULT_MODEL_MAX_DEFAULT
+
+
+# --- Default auto-compaction (eff-p0 #3) -------------------------------------------------
+# A multi-turn agent re-sends its ENTIRE history every turn, so an unbounded run pays
+# O(turns^2) cumulative tokens (the same growing prefix, re-billed each turn). The
+# compaction planner (:mod:`himmy.runtime.compaction`) has always been correct, but it
+# only ran when a caller opted in via ``ctx['compaction_spec']`` / ``AgentSpec.compact_context``
+# — which almost nobody set — so by default the full uncompressed history rode along
+# forever. This makes compaction DEFAULT-ON with a DELIBERATELY CONSERVATIVE high
+# threshold: short runs are byte-identical (they never cross the budget), while a run
+# that genuinely balloons gets its middle summarized before it overflows.
+#
+# The threshold is high on purpose: correctness (the model seeing recent history) matters
+# more than shaving tokens off a run that was never going to overflow anyway. An explicit
+# ``compaction_spec`` in the context ALWAYS wins over this default; the default only fills
+# in when no per-run spec was provided.
+#
+# Fully overridable:
+#   * ``HIMMY_AUTO_COMPACT=0``           → disable the default entirely (restores the
+#                                          pre-eff-p0 opt-in-only behaviour). Accepts
+#                                          0/false/no/off (case-insensitive).
+#   * ``HIMMY_AUTO_COMPACT_TOKENS=<int>``→ override the conservative token budget.
+#   * ``HIMMY_AUTO_COMPACT_KEEP=<int>``  → override how many recent messages ride verbatim.
+# An explicit ``ctx['compaction_spec']`` overrides all three for that run.
+_AUTO_COMPACT_TOKENS_DEFAULT = 24000
+_AUTO_COMPACT_KEEP_DEFAULT = 8
+
+
+def _auto_compact_default_spec() -> dict[str, Any] | None:
+    """The default compaction spec, or ``None`` when disabled via ``HIMMY_AUTO_COMPACT``.
+
+    Read fresh from the environment on every call (not cached) so tests — and a caller
+    that flips the flag between runs — see the current value. Returns a spec dict shaped
+    exactly like an explicit ``ctx['compaction_spec']`` so the apply path is identical.
+    """
+    if os.environ.get("HIMMY_AUTO_COMPACT", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        max_tokens = max(1, int(os.environ.get("HIMMY_AUTO_COMPACT_TOKENS", str(_AUTO_COMPACT_TOKENS_DEFAULT))))
+    except ValueError:
+        max_tokens = _AUTO_COMPACT_TOKENS_DEFAULT
+    try:
+        keep_recent = max(1, int(os.environ.get("HIMMY_AUTO_COMPACT_KEEP", str(_AUTO_COMPACT_KEEP_DEFAULT))))
+    except ValueError:
+        keep_recent = _AUTO_COMPACT_KEEP_DEFAULT
+    return {"max_tokens": max_tokens, "keep_recent": keep_recent}
+
+
+def _cap_tool_result_for_model(text: str, cap: int) -> str:
+    """Bound a tool result's model-facing text at ``cap`` characters.
+
+    Mirrors :func:`_truncate` but appends an explicit, self-describing marker so the
+    model knows the content was shortened for context economy (and by how much),
+    rather than silently seeing a mid-sentence cut. Returns ``text`` unchanged when
+    ``cap`` is ``0`` (cap disabled) or the text already fits.
+    """
+    text = text or ""
+    if cap <= 0 or len(text) <= cap:
+        return text
+    dropped = len(text) - cap
+    return text[:cap] + f"\n…[truncated {dropped} chars]"
+
+
+# --- Mandatory compaction-summary scrub (eff-p0 sec-r3 #3) ------------------------------
+# The compaction summary is distilled from UN-guarded USER + TOOL content (a scraped page,
+# a poisoned tool result), so it is untrusted. sec-r1 ran it through the configured INPUT
+# guardrail — but that guardrail is opt-in and is ``None`` in the offline / CLI / default
+# runtime, where ``_guard_input`` short-circuits to a plain passthrough. With compaction
+# now DEFAULT-ON, that left the offline default with NO laundering barrier: a planted
+# secret or standing directive would ride into a persistent USER recap message AND land
+# unredacted at rest in durable episodic memory recalled into future runs.
+#
+# This MANDATORY scrub runs REGARDLESS of whether a full input guardrail is wired. It
+# reuses the same credential rule set as the always-on ``SecretsGuardrail`` (redacts API
+# keys / JWTs / URL-embedded creds — things no legitimate summary should contain) so
+# secrets never persist unredacted, and neutralizes the common injection imperatives so a
+# distilled "ignore previous instructions"/"you are now" directive cannot re-ride as a
+# standing instruction. It is deliberately NARROW (credentials + injection markers only) so
+# it never mangles legitimate recap text; the configured input guardrail (when present)
+# still runs on top for the broader DLP/blocklist policy.
+_SUMMARY_INJECTION_MARKER = "[neutralized-directive]"
+try:  # narrow, dependency-free reuse of the builtin credential + injection rule sets.
+    from himmy.services.guardrails.builtins import (  # noqa: E402
+        _INJECTION_PATTERNS as _SUMMARY_INJECTION_PATTERNS,
+    )
+    from himmy.services.guardrails.builtins import (  # noqa: E402
+        _SECRET_RULES as _SUMMARY_SECRET_RULES,
+    )
+    from himmy.services.guardrails.builtins import (  # noqa: E402
+        _redact as _summary_redact_secrets,
+    )
+except Exception:  # pragma: no cover - guardrails always ship; defensive only
+    _SUMMARY_SECRET_RULES = None  # type: ignore[assignment]
+    _SUMMARY_INJECTION_PATTERNS = None  # type: ignore[assignment]
+
+
+def _scrub_compaction_summary(text: str) -> str:
+    """Mandatory, guardrail-independent scrub of a compaction summary (sec-r3 #3).
+
+    Redacts credentials (via the always-on secret rule set) and neutralizes common
+    prompt-injection imperatives so an untrusted, model-distilled recap can neither leak
+    a secret at rest nor smuggle a standing directive into every later turn — even when
+    NO input guardrail is configured (the offline / default deployment). Returns ``text``
+    unchanged only if the rule sets could not be imported (defensive).
+    """
+    if not text:
+        return text
+    if _SUMMARY_SECRET_RULES is not None:
+        text, _flags = _summary_redact_secrets(text, _SUMMARY_SECRET_RULES)
+    if _SUMMARY_INJECTION_PATTERNS is not None:
+        for pattern in _SUMMARY_INJECTION_PATTERNS:
+            text = pattern.sub(_SUMMARY_INJECTION_MARKER, text)
+    return text
 
 
 def _validate_max_turns(max_turns: int, entry_point: str) -> None:
@@ -268,6 +401,26 @@ def _cache_scope_metadata(ctx: dict[str, Any]) -> dict[str, Any]:
             if value:
                 meta[key] = value
     return meta
+
+
+def _prompt_cache_key_for_scope(scope_metadata: dict[str, Any]) -> str | None:
+    """Derive a stable, per-principal PROVIDER prompt-cache partition key (sec-r2).
+
+    Folds the same tenant-isolation metadata :func:`_cache_scope_metadata` stamps for the
+    internal response cache into one deterministic ``key=value|…`` string, so the
+    OpenAI-family adapter can set ``prompt_cache_key`` and never serve one principal a
+    cache-read of another's prefix on a shared provider API key. Returns ``None`` for an
+    unscoped run (offline / single-tenant / CLI — no principal metadata) so the request
+    payload stays byte-identical to the pre-sec-r2 no-cache-key contract.
+    """
+    from himmy.services.inference.cache import CACHE_SCOPE_METADATA_KEYS
+
+    parts = [
+        f"{key}={scope_metadata[key]}"
+        for key in CACHE_SCOPE_METADATA_KEYS
+        if scope_metadata.get(key) not in (None, "")
+    ]
+    return "|".join(parts) if parts else None
 
 
 def _context_workspace_id(ctx: dict[str, Any]) -> str | None:
@@ -2177,18 +2330,39 @@ class SingleAgentRuntime:
     ) -> bool:
         """Summarize old turns in-place when the thread outgrows its token budget.
 
-        Opt-in via ``ctx['compaction_spec']``. Keeps the system head + recent tail,
-        replaces the middle with one model-written summary message, and emits a
-        ``CONTEXT_COMPACTED`` event (the audit trail of what was condensed). A no-op
-        when not configured or under budget.
+        DEFAULT-ON (eff-p0 #3) with a deliberately conservative high budget: an explicit
+        ``ctx['compaction_spec']`` wins, otherwise :func:`_auto_compact_default_spec`
+        supplies a default budget so long runs don't re-send their whole (O(turns^2))
+        history uncompressed. The default is disable-able via ``HIMMY_AUTO_COMPACT=0``
+        and tunable via ``HIMMY_AUTO_COMPACT_TOKENS`` / ``HIMMY_AUTO_COMPACT_KEEP``.
+
+        Keeps the system head + recent tail, replaces the middle with one model-written
+        summary message, and emits a ``CONTEXT_COMPACTED`` event (the audit trail of what
+        was condensed). A no-op when under budget, when the default is disabled and no
+        explicit spec was given, or when the summary would not actually shrink the span
+        (the summary-only-if-smaller guard below).
 
         Returns ``True`` iff compaction actually rewrote the thread this turn. The
         caller (C5) uses that to BUST the prompt cache for the very next request:
-        compaction inserts a new ``[Summary …]`` SYSTEM message, which changes the
-        joined system prefix and would otherwise pay a write premium on a stale-cache
-        miss. Skipping the breakpoint that one turn lets the prefix re-stabilize.
+        compaction inserts a new ``[Summary …]`` message, which changes the joined
+        message prefix and would otherwise pay a write premium on a stale-cache miss.
+        Skipping the breakpoint that one turn lets the prefix re-stabilize.
+
+        SECURITY (sec-r1 + sec-r3): the summary is distilled from untrusted USER/TOOL
+        content, so it is (1) run through the configured input guardrail (injection/DLP/
+        blocklist) when one is wired AND — regardless of any guardrail — through a
+        MANDATORY credential + injection scrub (:func:`_scrub_compaction_summary`) so the
+        offline / default deployment (which wires no input guardrail) still cannot leak a
+        secret at rest or launder a directive, and (2) inserted at USER — never SYSTEM —
+        trust so a planted "instruction" can't be laundered into a standing directive.
+        Operator steer/control messages are pinned out of the summarize span upstream
+        (see :mod:`himmy.runtime.compaction`) so they always ride verbatim.
         """
+        # An explicit per-run spec always wins; otherwise fall back to the default-on
+        # policy (which may itself be disabled via HIMMY_AUTO_COMPACT=0 → None).
         spec = ctx.get("compaction_spec")
+        if not spec:
+            spec = _auto_compact_default_spec()
         if not spec:
             return False
         from himmy.agents.base_agent.thread import Message, MessageRole
@@ -2222,9 +2396,43 @@ class SingleAgentRuntime:
         if not summary_text:
             return False  # summarization failed/empty — leave history intact (safe)
 
+        # SECURITY (sec-r1 + sec-r3): the summarized span is distilled from USER and
+        # (crucially) UN-guarded TOOL result messages, so ``summary_text`` is UNTRUSTED —
+        # an attacker who planted an "instruction"/"decision" in a scraped page or poisoned
+        # tool result would otherwise have it re-emitted verbatim-in-spirit. Hardenings:
+        #   1. run it through the configured input guardrail (injection / DLP / blocklist)
+        #      when one is wired — BUT that guardrail is opt-in and absent in the offline /
+        #      default runtime, so it is NOT a guarantee on its own;
+        #   1b. (sec-r3) ALWAYS run a mandatory, guardrail-independent credential + injection
+        #      scrub so secrets are redacted and directives neutralized even with no
+        #      guardrail configured — this is the real laundering barrier;
+        #   2. insert it at USER trust (not SYSTEM). SYSTEM is reserved for operator /
+        #      persona text; laundering summarized untrusted content into a SYSTEM
+        #      directive would elevate its trust and let a one-shot indirect injection
+        #      persist as a standing higher-trust instruction on every later turn.
+        summary_text = await self._guard_input(
+            summary_text,
+            agent_id=persona.agent_id,
+            trace_id=trace_id,
+            thread_id=thread.thread_id,
+        )
+        # sec-r3 #3: the configured input guardrail above is OPT-IN and is ``None`` in the
+        # offline / default runtime (``_guard_input`` then passes through untouched). Apply
+        # a MANDATORY, guardrail-independent scrub so credentials are always redacted and
+        # injection directives are neutralized BEFORE the summary re-enters context or is
+        # persisted to durable episodic memory — regardless of whether a full guardrail is
+        # wired. This is the load-bearing laundering barrier for default-on compaction.
+        summary_text = _scrub_compaction_summary(summary_text)
+        if not summary_text.strip():
+            return False  # guardrail/scrub emptied it — nothing safe to fold in
+
         summary_msg = Message(
-            role=MessageRole.SYSTEM,
-            content=f"[Summary of earlier conversation]\n{summary_text}",
+            role=MessageRole.USER,
+            content=(
+                "[Summary of earlier conversation — untrusted recap of prior turns, "
+                "not an operator instruction]\n"
+                f"{summary_text}"
+            ),
             metadata={"compacted": True},
         )
         # Only apply if the summary is actually smaller than what it replaces — a verbose
@@ -2233,8 +2441,14 @@ class SingleAgentRuntime:
             return False
         head = list(thread.messages[: plan.head_count])
         tail = list(thread.messages[plan.tail_start :])
+        # sec-r3 #4: pinned control/safety messages inside the summarize span are lifted
+        # out (plan.carry) and re-inserted VERBATIM between the summary and the kept tail,
+        # so the refusal/steer boundary survives compaction while the non-pinned middle is
+        # still condensed. Their tool_call group rides with them (planner-guaranteed), so
+        # no tool_result is orphaned after the USER summary.
+        carry = list(plan.carry)
         compacted_count = len(plan.summarize)
-        thread.messages[:] = [*head, summary_msg, *tail]
+        thread.messages[:] = [*head, summary_msg, *carry, *tail]
         thread.version += 1
 
         await self._emit(
@@ -2257,6 +2471,11 @@ class SingleAgentRuntime:
         # middle is replaced, persist it as an episodic trace so learning loops have
         # a corpus of "what happened" from day one. Best-effort: a persistence
         # failure must never break the run (the in-context summary already applied).
+        # SECURITY (sec-r1 + sec-r3): ``summary_text`` here is the SCRUBBED text — through
+        # the configured input guardrail (if any) AND the mandatory credential + injection
+        # scrub — so secrets a tool returned verbatim are redacted BEFORE they land
+        # unredacted-at-rest in durable, subject-scoped episodic memory (recalled into
+        # FUTURE runs and readable by store-level exports) even with no guardrail wired.
         save_episodic = getattr(self.memory_store, "save_episodic_memory", None)
         if save_episodic is not None:
             from himmy.services.storage.models import EpisodicMemoryObject
@@ -2359,12 +2578,20 @@ class SingleAgentRuntime:
         assistant_text = response.output_text
         if assistant_text is None and response.output_structured is not None:
             assistant_text = json.dumps(response.output_structured, default=str)
+        # sec-r3 #2: capture the pre-guard text so a guardrail CORRECTION (rewrite /
+        # redaction / refusal substitution) can be marked ``guarded`` on the assistant
+        # turn. The compaction planner pins guarded turns verbatim (sec-r2); previously
+        # only the streaming path stamped this flag, so on the DEFAULT non-streaming
+        # tool-loop continuation a corrected refusal was left unmarked and could be
+        # summarized away, defeating the sec-r2 protection on the primary code path.
+        raw_assistant_text = assistant_text
         assistant_text = await self._guard_output(
             assistant_text,
             agent_id=persona.agent_id,
             trace_id=trace_id,
             thread_id=thread.thread_id,
         )
+        guarded_corrected = assistant_text != raw_assistant_text
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
         assistant_message = Message(
@@ -2380,6 +2607,7 @@ class SingleAgentRuntime:
                 "input_tokens": response.input_tokens,
                 "output_tokens": response.output_tokens,
                 "output_structured": response.output_structured,
+                **({"guarded": True} if guarded_corrected else {}),
             },
         )
         thread.append_message(assistant_message)
@@ -2650,12 +2878,16 @@ class SingleAgentRuntime:
         assistant_text = response.output_text
         if assistant_text is None and response.output_structured is not None:
             assistant_text = json.dumps(response.output_structured, default=str)
+        # sec-r3 #2: capture the pre-guard text so a guardrail CORRECTION marks the
+        # assistant turn ``guarded`` (compaction pins guarded turns verbatim, sec-r2).
+        raw_assistant_text = assistant_text
         assistant_text = await self._guard_output(
             assistant_text,
             agent_id=persona.agent_id,
             trace_id=trace_id,
             thread_id=thread.thread_id,
         )
+        guarded_corrected = assistant_text != raw_assistant_text
         error_message = response.error.message if response.error else None
         error_code = response.error.code.value if response.error else None
         assistant_metadata: AssistantMessageMetadata = {
@@ -2674,6 +2906,8 @@ class SingleAgentRuntime:
             "error_code": error_code,
             "output_structured": response.output_structured,
         }
+        if guarded_corrected:
+            assistant_metadata["guarded"] = True
         if response.workflow is not None:
             assistant_metadata["workflow_complete"] = response.workflow.is_complete
         assistant_message = Message(
@@ -3115,7 +3349,7 @@ class SingleAgentRuntime:
         return ctx.get("model_key") or self.default_model_key
 
     def _prompt_cache_policy(
-        self, model_key: str, *, cache_busted: bool
+        self, model_key: str, *, cache_busted: bool, scope_metadata: dict[str, Any]
     ) -> CachePolicy | None:
         """The per-turn :class:`CachePolicy` (or ``None`` to leave the request unmarked).
 
@@ -3135,13 +3369,27 @@ class SingleAgentRuntime:
         baked datetime/recalled-memory/KB snapshot — is appended once on the first turn
         and never re-rendered on continuation turns), so the only intra-run buster is
         compaction, which ``cache_busted`` handles.
+
+        sec-r2 + sec-r3 #5: when the run is tenant/principal-scoped (``scope_metadata``
+        non-empty), the policy carries a ``cache_key`` derived from that scope so BOTH
+        provider families partition the prompt cache per principal:
+
+        * OpenAI-family sets the native ``prompt_cache_key`` routing hint;
+        * Anthropic (which has NO out-of-band partition key) folds the scope key into the
+          cached prefix as a leading salt block (``anthropic_scope_salt_block``), so two
+          principals never share cacheable prefix BYTES — closing the shared-key
+          cross-tenant cache-read side-channel on a byte-identical prefix (which the new
+          history-cache breakpoint would otherwise widen to tenant/tool-result content).
+
+        An unscoped run keeps ``cache_key=None`` so the payload is byte-identical to the
+        pre-change no-cache-key contract.
         """
         if cache_busted or not self._enable_prompt_cache:
             return None
         capability = self.inference_service.cache_capability_for(model_key)
         if capability is CacheCapability.NONE:
             return None
-        return CachePolicy()
+        return CachePolicy(cache_key=_prompt_cache_key_for_scope(scope_metadata))
 
     def _build_request(
         self,
@@ -3264,8 +3512,10 @@ class SingleAgentRuntime:
             seed=seed,
             validate_structured_output=validate_structured_output,
             route_override=route_override,
-            metadata=_cache_scope_metadata(ctx),
-            cache_policy=self._prompt_cache_policy(model_key, cache_busted=cache_busted),
+            metadata=(scope_metadata := _cache_scope_metadata(ctx)),
+            cache_policy=self._prompt_cache_policy(
+                model_key, cache_busted=cache_busted, scope_metadata=scope_metadata
+            ),
             bound_tools=bound_tools,
             # The single execution seam for the bound tools (see ToolExecutor),
             # wrapped with bounded turn-level retry for transient failures.
@@ -3396,6 +3646,37 @@ class SingleAgentRuntime:
         return _execute
 
     # ------------------------------------------------------- tool messages
+    def _tool_result_uncapped(self, tool_name: str) -> bool:
+        """Whether ``tool_name`` opts OUT of the model-facing result cap.
+
+        A tool whose full output is essential (the model must see every byte — e.g. a
+        tool that returns a signed artifact, a full document the next step must quote
+        verbatim) can preserve its complete result two ways:
+
+        * declaratively — its :class:`ToolDefinition` metadata carries
+          ``model_result_uncapped=True``; or
+        * by deployment — its name appears in the comma-separated env allowlist
+          ``HIMMY_TOOL_RESULT_UNCAPPED`` (whitespace-trimmed, case-sensitive).
+
+        Returns ``False`` (cap applies) for any unknown tool or when neither opt-out
+        is set. Resolution is best-effort: a missing/odd tool service or metadata
+        never raises here — the cap simply applies.
+        """
+        raw = os.environ.get("HIMMY_TOOL_RESULT_UNCAPPED", "")
+        allowlist = {n.strip() for n in raw.split(",") if n.strip()}
+        if tool_name in allowlist:
+            return True
+        registry = getattr(self.tool_service, "registry", None)
+        if registry is None:
+            return False
+        try:
+            definition = registry.get(tool_name)
+        except Exception:  # noqa: BLE001 - opt-out lookup is best-effort, never fatal
+            return False
+        if definition is None:
+            return False
+        return bool((getattr(definition, "metadata", None) or {}).get("model_result_uncapped"))
+
     async def _append_tool_messages(
         self,
         thread: Any,
@@ -3453,21 +3734,44 @@ class SingleAgentRuntime:
                 code = meta.get("error_code", ret.outcome.upper())
                 detail = meta.get("error_message") or content_text or ""
                 content_text = f"ERROR: {code}: {detail}".strip().rstrip(":")
+            # C5: cap the MODEL-FACING copy of the result. ``content_text`` (the FULL
+            # result) is preserved untouched for the tool-return record + the
+            # TOOL_COMPLETED event below; only ``model_content_text`` — what rides on
+            # the re-sent thread every subsequent turn — is bounded. A per-tool
+            # opt-out (metadata flag / env allowlist) or ``HIMMY_TOOL_RESULT_MODEL_MAX=0``
+            # keeps the full result on the thread.
+            if _TOOL_RESULT_MODEL_MAX and not self._tool_result_uncapped(call.tool_name):
+                model_content_text = _cap_tool_result_for_model(
+                    content_text, _TOOL_RESULT_MODEL_MAX
+                )
+            else:
+                model_content_text = content_text
+            # sec-r3 #1: the message ``content`` is the capped MODEL-facing copy (what
+            # rides the re-sent thread), but the entity spine projects Message.content
+            # into the canonical kind='message'/'chat_thread' audit records. If those
+            # only ever saw the truncated copy, an auditor reconstructing "what the tool
+            # actually returned" from the spine would get a lossy, marker-suffixed answer
+            # while the full bytes lived only on a transient event/DTO. When (and only
+            # when) the model copy was actually shortened, stash the FULL untruncated
+            # result on ``metadata['full_content']`` so the audit trail stays faithful.
+            tool_metadata: dict[str, Any] = {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "tool_outcome": ret.outcome if ret is not None else "unknown",
+                "tool_args": dict(call.args),
+                "request_id": request_id,
+                "trace_id": trace_id,
+                "timestamp": message_timestamp(),
+                "tool_return_metadata": dict(ret.metadata)
+                if ret is not None
+                else {},
+            }
+            if model_content_text != content_text:
+                tool_metadata["full_content"] = content_text
             message = Message(
                 role=MessageRole.TOOL,
-                content=content_text,
-                metadata={
-                    "tool_call_id": call.tool_call_id,
-                    "tool_name": call.tool_name,
-                    "tool_outcome": ret.outcome if ret is not None else "unknown",
-                    "tool_args": dict(call.args),
-                    "request_id": request_id,
-                    "trace_id": trace_id,
-                    "timestamp": message_timestamp(),
-                    "tool_return_metadata": dict(ret.metadata)
-                    if ret is not None
-                    else {},
-                },
+                content=model_content_text,
+                metadata=tool_metadata,
             )
             thread.append_message(message)
             self._register_message(message)

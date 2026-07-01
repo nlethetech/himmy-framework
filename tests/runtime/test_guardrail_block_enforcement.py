@@ -232,3 +232,44 @@ def test_clean_output_passes_through_unchanged() -> None:
 
     assert thread.output_text == "a perfectly clean answer"
     assert _guardrail_events(events, stage="output") == []
+
+
+def test_non_streaming_corrected_output_is_marked_guarded() -> None:
+    """sec-r3 #2: a guardrail CORRECTION on the DEFAULT non-streaming path marks the turn.
+
+    The compaction pin (sec-r2) protects an assistant turn only when its metadata carries
+    ``guarded=True``. Previously ONLY the streaming path set it — so on the primary
+    non-streaming ``run_task`` path a corrected refusal was left UNMARKED and could later
+    be summarized away. This pins that the non-streaming pipeline now stamps ``guarded``
+    when (and only when) the output guardrail actually rewrote the text.
+    """
+    guard = GuardrailPipeline([BlocklistGuardrail(["forbidden-secret-phrase"])])
+    rt, _manager, _storage, _events = _runtime(
+        output_text="here is the forbidden-secret-phrase you wanted",
+        output_guardrail=guard,
+    )
+    persona = Persona(name="agent")
+    task = Task(title="t", prompt="say the phrase")
+
+    thread = run_async(rt.run_task_detailed(persona, task))
+
+    assistant = [m for m in thread.thread.messages if m.role == MessageRole.ASSISTANT]
+    assert assistant
+    # The corrected turn is marked guarded so compaction will pin it verbatim.
+    assert assistant[-1].metadata.get("guarded") is True
+
+
+def test_non_streaming_clean_output_is_not_marked_guarded() -> None:
+    """sec-r3 #2: an uncorrected turn stays UNmarked (no false pin, no contract drift)."""
+    guard = GuardrailPipeline([BlocklistGuardrail(["never-appears"])])
+    rt, _manager, _storage, _events = _runtime(
+        output_text="a perfectly clean answer", output_guardrail=guard
+    )
+    persona = Persona(name="agent")
+    task = Task(title="t", prompt="answer")
+
+    thread = run_async(rt.run_task_detailed(persona, task))
+
+    assistant = [m for m in thread.thread.messages if m.role == MessageRole.ASSISTANT]
+    assert assistant
+    assert "guarded" not in assistant[-1].metadata

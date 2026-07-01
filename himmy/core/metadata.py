@@ -40,6 +40,10 @@ class AssistantMessageMetadata(TypedDict, total=False):
     output_structured: Any
     workflow_complete: bool
     streamed: bool
+    #: Set True when an output guardrail rewrote/redacted/refused this turn's text
+    #: (sec-r2/r3). Compaction pins guarded turns verbatim so the refusal boundary
+    #: survives history summarization.
+    guarded: bool
     compacted: bool
     approved: bool
     round_trip_complete: bool
