@@ -101,6 +101,42 @@ try:
 except ValueError:
     _TOOL_RESULT_EVENT_MAX = 2000
 
+# How many characters of a tool's result text are written to the MODEL-FACING thread
+# (the TOOL Message in ``_append_tool_messages``). Unlike ``_TOOL_RESULT_EVENT_MAX``
+# (which only bounds the observability event), this bounds what the model actually
+# sees — and because the whole thread is re-sent on every subsequent turn, an
+# uncapped multi-KB tool blob (a scraped page, a file dump, a wide DB result) is
+# re-billed on every later turn of the run. Capping the model copy is a pure
+# efficiency win: it shrinks the re-sent prefix while the FULL result stays intact
+# on the tool-return record + the TOOL_COMPLETED event for observers.
+#
+# Default 6000 chars (~1.5k tokens) keeps a single tool result from dominating the
+# window while still leaving room for a substantial page/table. Raise it, or set
+# ``HIMMY_TOOL_RESULT_MODEL_MAX=0`` to DISABLE the cap entirely (restores the
+# pre-C5 uncapped behaviour). A per-tool opt-out (for tools whose full output is
+# essential — the model must see every byte) is available via the tool definition
+# metadata flag ``model_result_uncapped=True`` (see ``_tool_result_uncapped``).
+_TOOL_RESULT_MODEL_MAX_DEFAULT = 6000
+try:
+    _TOOL_RESULT_MODEL_MAX = max(0, int(os.environ.get("HIMMY_TOOL_RESULT_MODEL_MAX", str(_TOOL_RESULT_MODEL_MAX_DEFAULT))))
+except ValueError:
+    _TOOL_RESULT_MODEL_MAX = _TOOL_RESULT_MODEL_MAX_DEFAULT
+
+
+def _cap_tool_result_for_model(text: str, cap: int) -> str:
+    """Bound a tool result's model-facing text at ``cap`` characters.
+
+    Mirrors :func:`_truncate` but appends an explicit, self-describing marker so the
+    model knows the content was shortened for context economy (and by how much),
+    rather than silently seeing a mid-sentence cut. Returns ``text`` unchanged when
+    ``cap`` is ``0`` (cap disabled) or the text already fits.
+    """
+    text = text or ""
+    if cap <= 0 or len(text) <= cap:
+        return text
+    dropped = len(text) - cap
+    return text[:cap] + f"\n…[truncated {dropped} chars]"
+
 
 
 def _validate_max_turns(max_turns: int, entry_point: str) -> None:
@@ -3396,6 +3432,37 @@ class SingleAgentRuntime:
         return _execute
 
     # ------------------------------------------------------- tool messages
+    def _tool_result_uncapped(self, tool_name: str) -> bool:
+        """Whether ``tool_name`` opts OUT of the model-facing result cap.
+
+        A tool whose full output is essential (the model must see every byte — e.g. a
+        tool that returns a signed artifact, a full document the next step must quote
+        verbatim) can preserve its complete result two ways:
+
+        * declaratively — its :class:`ToolDefinition` metadata carries
+          ``model_result_uncapped=True``; or
+        * by deployment — its name appears in the comma-separated env allowlist
+          ``HIMMY_TOOL_RESULT_UNCAPPED`` (whitespace-trimmed, case-sensitive).
+
+        Returns ``False`` (cap applies) for any unknown tool or when neither opt-out
+        is set. Resolution is best-effort: a missing/odd tool service or metadata
+        never raises here — the cap simply applies.
+        """
+        raw = os.environ.get("HIMMY_TOOL_RESULT_UNCAPPED", "")
+        allowlist = {n.strip() for n in raw.split(",") if n.strip()}
+        if tool_name in allowlist:
+            return True
+        registry = getattr(self.tool_service, "registry", None)
+        if registry is None:
+            return False
+        try:
+            definition = registry.get(tool_name)
+        except Exception:  # noqa: BLE001 - opt-out lookup is best-effort, never fatal
+            return False
+        if definition is None:
+            return False
+        return bool((getattr(definition, "metadata", None) or {}).get("model_result_uncapped"))
+
     async def _append_tool_messages(
         self,
         thread: Any,
@@ -3453,9 +3520,21 @@ class SingleAgentRuntime:
                 code = meta.get("error_code", ret.outcome.upper())
                 detail = meta.get("error_message") or content_text or ""
                 content_text = f"ERROR: {code}: {detail}".strip().rstrip(":")
+            # C5: cap the MODEL-FACING copy of the result. ``content_text`` (the FULL
+            # result) is preserved untouched for the tool-return record + the
+            # TOOL_COMPLETED event below; only ``model_content_text`` — what rides on
+            # the re-sent thread every subsequent turn — is bounded. A per-tool
+            # opt-out (metadata flag / env allowlist) or ``HIMMY_TOOL_RESULT_MODEL_MAX=0``
+            # keeps the full result on the thread.
+            if _TOOL_RESULT_MODEL_MAX and not self._tool_result_uncapped(call.tool_name):
+                model_content_text = _cap_tool_result_for_model(
+                    content_text, _TOOL_RESULT_MODEL_MAX
+                )
+            else:
+                model_content_text = content_text
             message = Message(
                 role=MessageRole.TOOL,
-                content=content_text,
+                content=model_content_text,
                 metadata={
                     "tool_call_id": call.tool_call_id,
                     "tool_name": call.tool_name,
