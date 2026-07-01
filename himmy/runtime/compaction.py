@@ -34,7 +34,18 @@ span and be lossily condensed away:
 
 Dropping such a boundary from the in-context history lets a later turn — now missing the
 explicit "we already refused / this was denied" signal — be re-persuaded into the
-previously-refused action. Pinning them keeps the refusal verbatim in the kept tail.
+previously-refused action. Pinning them keeps the refusal verbatim.
+
+sec-r3 #4 changes HOW a pin is preserved. The original design snapped the tail boundary
+back to just before the EARLIEST pinned message, keeping it and everything after it
+verbatim. On a long run that hit one *early* refusal, that kept the whole rest of the run
+un-summarized forever — compaction could no longer shrink the middle, restoring the
+O(turns^2) re-send growth and risking a context-window overflow precisely on runs that
+touched a security boundary (an availability/cost regression). Instead, each pinned
+message is now LIFTED OUT of the summarize span into ``plan.carry`` and re-inserted
+verbatim immediately after the summary, while the non-pinned middle around it is still
+summarized. Tool-pairing is preserved: a pinned TOOL refusal carries its owning ASSISTANT
+tool_call group forward with it, so no tool_result is orphaned after the summary.
 """
 
 from __future__ import annotations
@@ -103,7 +114,16 @@ def _is_pinned(message: Any) -> bool:
 
 @dataclass(frozen=True)
 class CompactionPlan:
-    """The decision of what to compact. ``should_compact`` False means leave as-is."""
+    """The decision of what to compact. ``should_compact`` False means leave as-is.
+
+    ``summarize`` is the (non-pinned) span the model condenses. ``carry`` (sec-r3 #4) is
+    the list of pinned control/safety messages that fell INSIDE that span but must ride
+    verbatim — they are lifted OUT of the summarize span and re-inserted, in original
+    order, immediately after the summary message. This lets compaction still shrink the
+    non-pinned middle of a long run even when an EARLY pin exists, instead of snapping the
+    whole tail back to the earliest pin (which defeated compaction entirely on any long
+    run that touched a security boundary — an availability/cost regression).
+    """
 
     should_compact: bool
     head_count: int = 0  # leading system messages kept untouched
@@ -112,6 +132,8 @@ class CompactionPlan:
     before_tokens: int = 0
     reason: str = ""
     summarize: list[Any] = field(default_factory=list)
+    #: Pinned messages lifted out of the summarize span, carried verbatim after the summary.
+    carry: list[Any] = field(default_factory=list)
 
     @property
     def tail_start(self) -> int:
@@ -164,19 +186,39 @@ class ContextCompactor:
         while split > head_count and _role(messages[split]) == "tool":
             split -= 1
 
-        # 4. pin control/safety directives (operator steers): if any pinned message
-        #    falls inside the candidate summarize span, snap the tail boundary back to
-        #    just before the EARLIEST pinned message so it — and everything after it —
-        #    rides verbatim in the kept tail instead of being lossily summarized away.
+        # 4. carry control/safety directives out of the summarize span (sec-r3 #4).
+        #    A pinned message must ride VERBATIM, but — unlike the old design, which
+        #    snapped the whole tail back to just before the EARLIEST pin (so a single
+        #    early refusal kept the entire rest of the run un-summarized forever, an
+        #    availability/cost regression) — we instead LIFT each pinned message out of
+        #    the summarize span and carry it forward verbatim after the summary, while
+        #    still summarizing the non-pinned middle around it. This keeps every
+        #    security boundary intact AND lets compaction bound context growth on long
+        #    runs that touched a boundary.
+        #
+        #    Tool-pairing: a pinned TOOL message (a HITL/policy rejection) is meaningless
+        #    without the ASSISTANT tool_call that owns it, and a bare carried TOOL result
+        #    after the USER summary would orphan a tool_result for strict providers. So
+        #    when a pinned TOOL message is carried, the contiguous run of preceding
+        #    ASSISTANT/TOOL messages (its call group) is carried with it.
+        carry_indices: set[int] = set()
         for i in range(head_count, split):
-            if _is_pinned(messages[i]):
-                split = i
-                break
-        # A pin may have exposed a fresh tool orphan at the new boundary; re-snap.
-        while split > head_count and _role(messages[split]) == "tool":
-            split -= 1
+            if not _is_pinned(messages[i]):
+                continue
+            carry_indices.add(i)
+            if _role(messages[i]) == "tool":
+                # walk back over the contiguous assistant/tool call-group owning it.
+                j = i - 1
+                while j >= head_count and _role(messages[j]) in ("assistant", "tool"):
+                    carry_indices.add(j)
+                    if _role(messages[j]) == "assistant":
+                        break  # the owning tool_call — stop at the first assistant.
+                    j -= 1
 
-        summarize = list(messages[head_count:split])
+        carry = [messages[i] for i in sorted(carry_indices)]
+        summarize = [
+            messages[i] for i in range(head_count, split) if i not in carry_indices
+        ]
         if len(summarize) < self.min_summarize:
             return CompactionPlan(
                 False, before_tokens=before, reason="too little to summarize"
@@ -189,6 +231,7 @@ class ContextCompactor:
             before_tokens=before,
             reason=f"{before} est. tokens over {self.max_tokens} budget",
             summarize=summarize,
+            carry=carry,
         )
 
     def render_span(self, summarize: Sequence[Any]) -> str:

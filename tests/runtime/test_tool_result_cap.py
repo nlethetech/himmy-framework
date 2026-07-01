@@ -191,3 +191,37 @@ def test_small_result_is_left_untouched() -> None:
     content = _tool_message_content(thread)
     assert "truncated" not in content
     assert "ok" in content
+
+
+def _tool_message(thread: ChatThread) -> Any:
+    tool_msgs = [m for m in thread.messages if m.role == MessageRole.TOOL]
+    assert len(tool_msgs) == 1
+    return tool_msgs[0]
+
+
+def test_truncated_message_record_keeps_full_content_in_metadata() -> None:
+    # sec-r3 #1: the canonical kind='message'/'chat_thread' audit records project
+    # Message.content — the CAPPED model copy. If that were the only durable trace, an
+    # auditor reconstructing "what the tool actually returned" from the spine would get a
+    # lossy, marker-suffixed answer. The full bytes must be recoverable from the message
+    # record itself (metadata['full_content']), so the audit trail is not lossy.
+    runtime, _events = _runtime()
+    blob = "Z" * (single_agent._TOOL_RESULT_MODEL_MAX + 5000)
+    thread = _append(runtime, _response("scrape", blob))
+    msg = _tool_message(thread)
+
+    # The model-facing content is capped (efficiency win preserved) ...
+    assert len(msg.content) < len(blob)
+    assert "truncated" in msg.content
+    # ... but the FULL, untruncated result is preserved on the SAME record's metadata.
+    assert msg.metadata["full_content"] == blob
+
+
+def test_uncapped_message_record_has_no_redundant_full_content() -> None:
+    # When the result already fits (no truncation), the message content IS the full
+    # result — no redundant duplicate copy is stashed on the metadata.
+    runtime, _events = _runtime()
+    thread = _append(runtime, _response("probe", "short result"))
+    msg = _tool_message(thread)
+    assert "truncated" not in msg.content
+    assert "full_content" not in msg.metadata

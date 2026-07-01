@@ -80,25 +80,28 @@ def test_too_little_to_summarize_is_a_noop() -> None:
 
 
 def test_steer_message_is_pinned_out_of_summarize_span() -> None:
-    # sec-r1: an operator steer ("never call the payment tool") lands mid-thread. It
-    # must NOT be summarized away — the boundary snaps back so the steer (and everything
-    # after it) rides verbatim in the kept tail.
+    # sec-r1 + sec-r3 #4: an operator steer ("never call the payment tool") lands
+    # mid-thread. It must NOT be summarized away — it is lifted into ``carry`` and rides
+    # verbatim, while the non-pinned middle around it is still summarized (so an early
+    # pin no longer defeats compaction on a long run).
     steer = _m(MessageRole.USER, _big(50))
     steer.metadata = {"steer": True}
     msgs = [
         _m(MessageRole.SYSTEM, _big(50)),
         _m(MessageRole.USER, _big(300)),
         _m(MessageRole.ASSISTANT, _big(300)),
-        steer,  # operator directive — must be pinned to the tail
+        steer,  # operator directive — carried verbatim, never summarized
         _m(MessageRole.ASSISTANT, _big(300)),
         _m(MessageRole.USER, _big(10)),
     ]
     plan = ContextCompactor(max_tokens=300, keep_recent=1).plan(msgs)
     assert plan.should_compact is True
-    # The summarize span stops BEFORE the steer (index 3).
-    assert plan.summarize_end == 3
-    assert steer not in plan.summarize
+    assert steer not in plan.summarize  # never lossily condensed
+    assert steer in plan.carry  # rides verbatim
     assert all(not m.metadata.get("steer") for m in plan.summarize)
+    # The non-pinned middle (indices 1,2,4) is still summarized — an early pin no longer
+    # collapses the summarize span.
+    assert len(plan.summarize) == 3
 
 
 def test_pin_metadata_is_also_honored() -> None:
@@ -114,51 +117,55 @@ def test_pin_metadata_is_also_honored() -> None:
     ]
     plan = ContextCompactor(max_tokens=300, keep_recent=1).plan(msgs)
     assert plan.should_compact is True
-    assert plan.summarize_end == 3  # stops before the pinned message
-    assert pinned not in plan.summarize
+    assert pinned not in plan.summarize  # never summarized
+    assert pinned in plan.carry  # carried verbatim
 
 
 def test_guarded_assistant_turn_is_pinned_out_of_summarize_span() -> None:
-    # sec-r2: a guardrail-CORRECTED assistant turn (metadata['guarded']) carries a
-    # security boundary ("I can't share that…"). It must not be lossily summarized away,
-    # or a later turn — missing the refusal — could be re-persuaded into the action.
+    # sec-r2 + sec-r3 #4: a guardrail-CORRECTED assistant turn (metadata['guarded'])
+    # carries a security boundary ("I can't share that…"). It must not be lossily
+    # summarized away, or a later turn — missing the refusal — could be re-persuaded into
+    # the action; it is carried verbatim instead.
     guarded = _m(MessageRole.ASSISTANT, _big(50))
     guarded.metadata = {"guarded": True}
     msgs = [
         _m(MessageRole.SYSTEM, _big(50)),
         _m(MessageRole.USER, _big(300)),
         _m(MessageRole.ASSISTANT, _big(300)),
-        guarded,  # guardrail-corrected refusal — must be pinned to the tail
+        guarded,  # guardrail-corrected refusal — carried verbatim
         _m(MessageRole.USER, _big(300)),
         _m(MessageRole.USER, _big(10)),
     ]
     plan = ContextCompactor(max_tokens=300, keep_recent=1).plan(msgs)
     assert plan.should_compact is True
-    assert plan.summarize_end == 3  # stops before the guarded turn
     assert guarded not in plan.summarize
+    assert guarded in plan.carry
 
 
 def test_hitl_denied_tool_message_is_pinned_out_of_summarize_span() -> None:
-    # sec-r2: a HITL/policy REJECTION recorded as a TOOL message
+    # sec-r2 + sec-r3 #4: a HITL/policy REJECTION recorded as a TOOL message
     # (metadata['tool_outcome'] == 'rejected') is a "we did NOT run this" boundary; it
-    # must ride verbatim in the kept tail, not be condensed to a neutral paraphrase.
+    # must ride verbatim, not be condensed to a neutral paraphrase. It is carried
+    # forward WITH its owning ASSISTANT tool_call so the tool_result is never orphaned.
     denial = _m(MessageRole.TOOL, _big(50))
     denial.metadata = {"tool_call_id": "c1", "tool_outcome": "rejected"}
+    owner = _m(MessageRole.ASSISTANT, _big(300))  # the tool CALL owning the denial
     msgs = [
         _m(MessageRole.SYSTEM, _big(50)),
         _m(MessageRole.USER, _big(300)),  # ┐ summarizable prefix (before the pair)
         _m(MessageRole.ASSISTANT, _big(300)),  # ┘
-        _m(MessageRole.ASSISTANT, _big(300)),  # the tool CALL owning the denial
+        owner,
         denial,  # its rejected result — a refusal boundary
         _m(MessageRole.USER, _big(300)),
         _m(MessageRole.USER, _big(10)),
     ]
     plan = ContextCompactor(max_tokens=300, keep_recent=1).plan(msgs)
     assert plan.should_compact is True
-    # Boundary snaps back to just before the denial, and the re-snap off the orphaned
-    # TOOL leaves the tail on the owning ASSISTANT (index 3) — so it rides verbatim.
-    assert plan.summarize_end == 3
     assert denial not in plan.summarize
+    assert denial in plan.carry  # rides verbatim
+    assert owner in plan.carry  # its tool_call group carried with it (no orphan)
+    # The carried denial follows its owning assistant in order.
+    assert plan.carry.index(owner) < plan.carry.index(denial)
     assert all(m.metadata.get("tool_outcome") != "rejected" for m in plan.summarize)
 
 

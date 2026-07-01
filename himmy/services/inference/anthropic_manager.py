@@ -404,8 +404,17 @@ class AnthropicClientManager:
         policy = request.cache_policy
         assert policy is not None  # narrowed by should_cache_prefix
         ttl_supported = anthropic_ttl_supported()
+        # sec-r3 #5: Anthropic's prompt cache has no out-of-band partition key (unlike
+        # OpenAI's ``prompt_cache_key``), so a per-principal ``cache_key`` — which the
+        # OpenAI adapter uses to scope its cache — is otherwise a NO-OP here, leaving a
+        # shared-key multi-tenant deployment exposed to a cross-tenant cache-read
+        # side-channel on a byte-identical prefix. Fold the scope key into the cached
+        # prefix as a leading salt block so two principals never share cacheable bytes.
         payload["system"] = anthropic_system_blocks(
-            system, ttl=policy.ttl, ttl_supported=ttl_supported
+            system,
+            ttl=policy.ttl,
+            ttl_supported=ttl_supported,
+            scope_salt=policy.cache_key,
         )
         if policy.ttl == "1h" and ttl_supported:
             payload["extra_headers"] = {

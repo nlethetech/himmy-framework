@@ -166,6 +166,65 @@ def test_anthropic_scope_none_stays_plain_string() -> None:
     assert client.messages.seen["system"] == BIG_SYSTEM
 
 
+def test_anthropic_scope_salt_partitions_prefix_per_principal() -> None:
+    """sec-r3 #5: a scoped ``cache_key`` folds a salt block into the cached prefix.
+
+    Anthropic's prompt cache has no out-of-band partition key, so ``policy.cache_key`` was
+    a no-op on this path — a shared-key multi-tenant deployment leaked a cross-tenant
+    cache-read oracle on a byte-identical prefix. The scope key must now be injected as a
+    LEADING salt block (with no cache_control of its own) so two principals' cacheable
+    prefixes differ in bytes; the persona system block still carries the breakpoint.
+    """
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    run_async(
+        mgr.generate(
+            _areq(BIG_SYSTEM, cache_policy=CachePolicy(cache_key="tenant_id=acme"))
+        )
+    )
+    system = client.messages.seen["system"]
+    assert isinstance(system, list) and len(system) == 2
+    salt, persona = system
+    # The salt is the leading block, is derived from the scope key, and carries NO
+    # breakpoint (it consumes none of the four-breakpoint budget).
+    assert salt["type"] == "text"
+    assert "tenant_id=acme" in salt["text"]
+    assert "cache_control" not in salt
+    # The persona system block is unchanged and still carries the breakpoint.
+    assert persona["text"] == BIG_SYSTEM
+    assert persona["cache_control"] == {"type": "ephemeral"}
+
+
+def test_anthropic_two_tenants_get_distinct_cacheable_prefix_bytes() -> None:
+    """sec-r3 #5: distinct principals never produce a byte-identical cacheable prefix."""
+    client_a, client_b = _aclient(), _aclient()
+    mgr_a = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client_a)
+    mgr_b = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client_b)
+    run_async(
+        mgr_a.generate(
+            _areq(BIG_SYSTEM, cache_policy=CachePolicy(cache_key="tenant_id=A"))
+        )
+    )
+    run_async(
+        mgr_b.generate(
+            _areq(BIG_SYSTEM, cache_policy=CachePolicy(cache_key="tenant_id=B"))
+        )
+    )
+    salt_a = client_a.messages.seen["system"][0]["text"]
+    salt_b = client_b.messages.seen["system"][0]["text"]
+    assert salt_a != salt_b  # no shared cacheable prefix across tenants
+
+
+def test_anthropic_no_scope_key_is_single_block_byte_identical() -> None:
+    """An UNSCOPED cache policy adds no salt block — byte-identical to the prior contract."""
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    run_async(mgr.generate(_areq(BIG_SYSTEM, cache_policy=CachePolicy())))
+    system = client.messages.seen["system"]
+    assert isinstance(system, list) and len(system) == 1
+    assert system[0]["text"] == BIG_SYSTEM
+
+
 def test_anthropic_1h_ttl_is_version_gated_degrades_to_5m(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
