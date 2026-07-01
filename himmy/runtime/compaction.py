@@ -16,11 +16,25 @@ the actual summarization inference call and applies the plan. Planning is fully 
 without a model.
 
 Beyond the three structural invariants, the planner also refuses to summarize
-**control-channel** messages: any message carrying ``metadata['steer']`` (or another
-``metadata['pin']`` marker) is an operator directive that steers a running mission
-("stop touching production", "do not email anyone"). A lossy model-written summary could
-dilute or drop such a safety-relevant constraint, so these messages are pinned to the
-kept tail and always ride verbatim — they are never handed to the summarizer (sec-r1).
+**control-channel** and **security-boundary** messages. Any message carrying
+``metadata['steer']`` (or another ``metadata['pin']`` marker) is an operator directive
+that steers a running mission ("stop touching production", "do not email anyone"). A
+lossy model-written summary could dilute or drop such a safety-relevant constraint, so
+these messages are pinned to the kept tail and always ride verbatim — they are never
+handed to the summarizer (sec-r1).
+
+sec-r2 widens the pin set beyond operator steers to the run's own **security events**,
+which carry no ``steer``/``pin`` marker and would otherwise fall inside the summarize
+span and be lossily condensed away:
+
+* a **guardrail-corrected** assistant turn (``metadata['guarded']`` — its output was
+  rewritten/blocked by an output guardrail);
+* a **HITL / policy denial** recorded as a TOOL message whose ``metadata['tool_outcome']``
+  is ``rejected`` or ``denied`` (a human or policy refused a tool call).
+
+Dropping such a boundary from the in-context history lets a later turn — now missing the
+explicit "we already refused / this was denied" signal — be re-persuaded into the
+previously-refused action. Pinning them keeps the refusal verbatim in the kept tail.
 """
 
 from __future__ import annotations
@@ -50,8 +64,14 @@ def estimate_tokens(text: str) -> int:
 
 #: Metadata keys that mark a message as a pinned control/safety directive which must
 #: never be summarized away (it rides verbatim in the kept tail). ``steer`` is the
-#: operator between-turns steering seam; ``pin`` is a general-purpose escape hatch.
-_PIN_METADATA_KEYS = ("steer", "pin")
+#: operator between-turns steering seam; ``pin`` is a general-purpose escape hatch;
+#: ``guarded`` marks a guardrail-corrected assistant turn (a security boundary, sec-r2).
+_PIN_METADATA_KEYS = ("steer", "pin", "guarded")
+
+#: TOOL-message ``metadata['tool_outcome']`` values that record a refused tool call — a
+#: human-in-the-loop rejection or a policy denial. These are security boundaries whose
+#: "we did NOT run this" signal must survive compaction verbatim (sec-r2).
+_PIN_TOOL_OUTCOMES = ("rejected", "denied")
 
 
 def _role(message: Any) -> str:
@@ -61,14 +81,24 @@ def _role(message: Any) -> str:
 
 
 def _is_pinned(message: Any) -> bool:
-    """True if ``message`` is a control/safety directive that must not be summarized.
+    """True if ``message`` is a control/safety boundary that must not be summarized.
 
-    An operator steer ("do not email anyone") is a behavioral control message; a lossy
-    summary could dilute or drop it, so it is pinned to the kept tail and always ridden
-    verbatim rather than handed to the summarizer.
+    Two families ride verbatim in the kept tail instead of being handed to the lossy
+    summarizer:
+
+    * **control directives** — an operator steer ("do not email anyone") or an explicit
+      ``pin``, and a guardrail-corrected (``guarded``) assistant turn; and
+    * **refusal boundaries** — a TOOL message recording a HITL/policy *rejection* or
+      *denial* (``metadata['tool_outcome']`` in :data:`_PIN_TOOL_OUTCOMES`).
+
+    A lossy summary could dilute or drop either signal, letting a later turn be
+    re-persuaded into a previously-refused action, so both are pinned (sec-r1 + sec-r2).
     """
     metadata = getattr(message, "metadata", None) or {}
-    return any(bool(metadata.get(key)) for key in _PIN_METADATA_KEYS)
+    if any(bool(metadata.get(key)) for key in _PIN_METADATA_KEYS):
+        return True
+    outcome = metadata.get("tool_outcome")
+    return isinstance(outcome, str) and outcome.lower() in _PIN_TOOL_OUTCOMES
 
 
 @dataclass(frozen=True)

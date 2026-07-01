@@ -86,6 +86,62 @@ def test_secrets_in_summary_are_redacted_before_persist_and_context() -> None:
     assert "sk-abcDEF1234567890TOKEN" not in episodes[0].payload["summary"]
 
 
+def test_guarded_refusal_survives_compaction_verbatim() -> None:
+    """sec-r2: a guardrail-corrected refusal is pinned, not summarized into a paraphrase.
+
+    An earlier assistant turn was rewritten by an output guardrail (metadata['guarded']).
+    After the context balloons and compaction fires, that refusal must still be present
+    VERBATIM in the thread — otherwise a later turn, missing the "we already refused"
+    boundary, could be re-persuaded into the previously-refused action.
+    """
+    from himmy.agents.base_agent.thread import ChatThread, Message
+
+    refusal = "I can't share that response: it was withheld by an output guardrail."
+    thread = ChatThread()
+    thread.append_message(Message(role=MessageRole.SYSTEM, content="x" * 80))
+    thread.append_message(Message(role=MessageRole.USER, content="x" * 1200))
+    thread.append_message(Message(role=MessageRole.ASSISTANT, content="x" * 1200))
+    thread.append_message(
+        Message(
+            role=MessageRole.ASSISTANT, content=refusal, metadata={"guarded": True}
+        )
+    )
+    thread.append_message(Message(role=MessageRole.USER, content="x" * 1200))
+    thread.append_message(Message(role=MessageRole.USER, content="ok"))
+
+    rt = _rt("bland recap that drops the refusal")
+    ctx = {"compaction_spec": {"max_tokens": 100, "keep_recent": 1}}
+    applied = run_async(rt._maybe_compact(Persona(name="a"), thread, ctx, "tr", None))
+    assert applied is True
+    # The guarded refusal rode verbatim into the kept tail — it was NOT summarized away.
+    assert any(m.content == refusal for m in thread.messages)
+
+
+def test_hitl_denial_survives_compaction_verbatim() -> None:
+    """sec-r2: a HITL/policy REJECTION (TOOL, tool_outcome='rejected') is not condensed."""
+    from himmy.agents.base_agent.thread import ChatThread, Message
+
+    thread = ChatThread()
+    thread.append_message(Message(role=MessageRole.SYSTEM, content="x" * 80))
+    thread.append_message(Message(role=MessageRole.USER, content="x" * 1200))
+    thread.append_message(Message(role=MessageRole.ASSISTANT, content="x" * 1200))
+    thread.append_message(Message(role=MessageRole.ASSISTANT, content="x" * 1200))
+    denial = Message(
+        role=MessageRole.TOOL,
+        content='{"rejected": true, "reason": "rejected by human"}',
+        metadata={"tool_call_id": "c1", "tool_outcome": "rejected"},
+    )
+    thread.append_message(denial)
+    thread.append_message(Message(role=MessageRole.USER, content="x" * 1200))
+    thread.append_message(Message(role=MessageRole.USER, content="ok"))
+
+    rt = _rt("bland recap that drops the denial")
+    ctx = {"compaction_spec": {"max_tokens": 100, "keep_recent": 1}}
+    applied = run_async(rt._maybe_compact(Persona(name="a"), thread, ctx, "tr", None))
+    assert applied is True
+    assert any(m.metadata.get("tool_outcome") == "rejected" for m in thread.messages)
+
+
 def test_offline_default_no_guardrail_summary_is_verbatim_user_message() -> None:
     """No guardrail configured ⇒ passthrough: summary text is byte-identical (invariant)."""
     rt = _rt("plain distilled trace")

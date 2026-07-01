@@ -352,6 +352,26 @@ def _cache_scope_metadata(ctx: dict[str, Any]) -> dict[str, Any]:
     return meta
 
 
+def _prompt_cache_key_for_scope(scope_metadata: dict[str, Any]) -> str | None:
+    """Derive a stable, per-principal PROVIDER prompt-cache partition key (sec-r2).
+
+    Folds the same tenant-isolation metadata :func:`_cache_scope_metadata` stamps for the
+    internal response cache into one deterministic ``key=value|…`` string, so the
+    OpenAI-family adapter can set ``prompt_cache_key`` and never serve one principal a
+    cache-read of another's prefix on a shared provider API key. Returns ``None`` for an
+    unscoped run (offline / single-tenant / CLI — no principal metadata) so the request
+    payload stays byte-identical to the pre-sec-r2 no-cache-key contract.
+    """
+    from himmy.services.inference.cache import CACHE_SCOPE_METADATA_KEYS
+
+    parts = [
+        f"{key}={scope_metadata[key]}"
+        for key in CACHE_SCOPE_METADATA_KEYS
+        if scope_metadata.get(key) not in (None, "")
+    ]
+    return "|".join(parts) if parts else None
+
+
 def _context_workspace_id(ctx: dict[str, Any]) -> str | None:
     """The run's owning ``workspace_id`` (for tenant-scoping the context build), if any.
 
@@ -3243,7 +3263,7 @@ class SingleAgentRuntime:
         return ctx.get("model_key") or self.default_model_key
 
     def _prompt_cache_policy(
-        self, model_key: str, *, cache_busted: bool
+        self, model_key: str, *, cache_busted: bool, scope_metadata: dict[str, Any]
     ) -> CachePolicy | None:
         """The per-turn :class:`CachePolicy` (or ``None`` to leave the request unmarked).
 
@@ -3263,13 +3283,22 @@ class SingleAgentRuntime:
         baked datetime/recalled-memory/KB snapshot — is appended once on the first turn
         and never re-rendered on continuation turns), so the only intra-run buster is
         compaction, which ``cache_busted`` handles.
+
+        sec-r2: when the run is tenant/principal-scoped (``scope_metadata`` non-empty),
+        the policy carries a ``cache_key`` derived from that scope so the OpenAI-family
+        adapter partitions the PROVIDER prompt cache per principal (OpenAI
+        ``prompt_cache_key``). Without it, isolation on a shared provider API key would
+        rest solely on the system prefix differing per tenant — a byte-identical prefix
+        (cold/empty-memory tenants, a shared default persona) could otherwise serve one
+        tenant a cache-read of another's prefix. An unscoped run keeps ``cache_key=None``
+        so the payload is byte-identical to the pre-change no-cache-key contract.
         """
         if cache_busted or not self._enable_prompt_cache:
             return None
         capability = self.inference_service.cache_capability_for(model_key)
         if capability is CacheCapability.NONE:
             return None
-        return CachePolicy()
+        return CachePolicy(cache_key=_prompt_cache_key_for_scope(scope_metadata))
 
     def _build_request(
         self,
@@ -3392,8 +3421,10 @@ class SingleAgentRuntime:
             seed=seed,
             validate_structured_output=validate_structured_output,
             route_override=route_override,
-            metadata=_cache_scope_metadata(ctx),
-            cache_policy=self._prompt_cache_policy(model_key, cache_busted=cache_busted),
+            metadata=(scope_metadata := _cache_scope_metadata(ctx)),
+            cache_policy=self._prompt_cache_policy(
+                model_key, cache_busted=cache_busted, scope_metadata=scope_metadata
+            ),
             bound_tools=bound_tools,
             # The single execution seam for the bound tools (see ToolExecutor),
             # wrapped with bounded turn-level retry for transient failures.

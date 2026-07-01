@@ -118,6 +118,60 @@ def test_pin_metadata_is_also_honored() -> None:
     assert pinned not in plan.summarize
 
 
+def test_guarded_assistant_turn_is_pinned_out_of_summarize_span() -> None:
+    # sec-r2: a guardrail-CORRECTED assistant turn (metadata['guarded']) carries a
+    # security boundary ("I can't share that…"). It must not be lossily summarized away,
+    # or a later turn — missing the refusal — could be re-persuaded into the action.
+    guarded = _m(MessageRole.ASSISTANT, _big(50))
+    guarded.metadata = {"guarded": True}
+    msgs = [
+        _m(MessageRole.SYSTEM, _big(50)),
+        _m(MessageRole.USER, _big(300)),
+        _m(MessageRole.ASSISTANT, _big(300)),
+        guarded,  # guardrail-corrected refusal — must be pinned to the tail
+        _m(MessageRole.USER, _big(300)),
+        _m(MessageRole.USER, _big(10)),
+    ]
+    plan = ContextCompactor(max_tokens=300, keep_recent=1).plan(msgs)
+    assert plan.should_compact is True
+    assert plan.summarize_end == 3  # stops before the guarded turn
+    assert guarded not in plan.summarize
+
+
+def test_hitl_denied_tool_message_is_pinned_out_of_summarize_span() -> None:
+    # sec-r2: a HITL/policy REJECTION recorded as a TOOL message
+    # (metadata['tool_outcome'] == 'rejected') is a "we did NOT run this" boundary; it
+    # must ride verbatim in the kept tail, not be condensed to a neutral paraphrase.
+    denial = _m(MessageRole.TOOL, _big(50))
+    denial.metadata = {"tool_call_id": "c1", "tool_outcome": "rejected"}
+    msgs = [
+        _m(MessageRole.SYSTEM, _big(50)),
+        _m(MessageRole.USER, _big(300)),  # ┐ summarizable prefix (before the pair)
+        _m(MessageRole.ASSISTANT, _big(300)),  # ┘
+        _m(MessageRole.ASSISTANT, _big(300)),  # the tool CALL owning the denial
+        denial,  # its rejected result — a refusal boundary
+        _m(MessageRole.USER, _big(300)),
+        _m(MessageRole.USER, _big(10)),
+    ]
+    plan = ContextCompactor(max_tokens=300, keep_recent=1).plan(msgs)
+    assert plan.should_compact is True
+    # Boundary snaps back to just before the denial, and the re-snap off the orphaned
+    # TOOL leaves the tail on the owning ASSISTANT (index 3) — so it rides verbatim.
+    assert plan.summarize_end == 3
+    assert denial not in plan.summarize
+    assert all(m.metadata.get("tool_outcome") != "rejected" for m in plan.summarize)
+
+
+def test_ordinary_successful_tool_message_is_not_pinned() -> None:
+    # A normal successful tool result carries no security boundary and must remain
+    # summarizable — the pin is scoped to rejected/denied outcomes only.
+    ok = _m(MessageRole.TOOL, _big(50))
+    ok.metadata = {"tool_call_id": "c1", "tool_outcome": "success"}
+    from himmy.runtime.compaction import _is_pinned
+
+    assert _is_pinned(ok) is False
+
+
 def test_render_span_flattens_roles_and_content() -> None:
     span = [_m(MessageRole.USER, "how many ducks?"), _m(MessageRole.TOOL, "12")]
     text = ContextCompactor().render_span(span)
