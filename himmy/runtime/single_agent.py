@@ -2273,9 +2273,16 @@ class SingleAgentRuntime:
 
         Returns ``True`` iff compaction actually rewrote the thread this turn. The
         caller (C5) uses that to BUST the prompt cache for the very next request:
-        compaction inserts a new ``[Summary …]`` SYSTEM message, which changes the
-        joined system prefix and would otherwise pay a write premium on a stale-cache
-        miss. Skipping the breakpoint that one turn lets the prefix re-stabilize.
+        compaction inserts a new ``[Summary …]`` message, which changes the joined
+        message prefix and would otherwise pay a write premium on a stale-cache miss.
+        Skipping the breakpoint that one turn lets the prefix re-stabilize.
+
+        SECURITY (sec-r1): the summary is distilled from untrusted USER/TOOL content, so
+        it is (1) run through the input guardrail (injection/DLP/blocklist) before it
+        re-enters context or is persisted, and (2) inserted at USER — never SYSTEM —
+        trust so a planted "instruction" can't be laundered into a standing directive.
+        Operator steer/control messages are pinned out of the summarize span upstream
+        (see :mod:`himmy.runtime.compaction`) so they always ride verbatim.
         """
         # An explicit per-run spec always wins; otherwise fall back to the default-on
         # policy (which may itself be disabled via HIMMY_AUTO_COMPACT=0 → None).
@@ -2315,9 +2322,33 @@ class SingleAgentRuntime:
         if not summary_text:
             return False  # summarization failed/empty — leave history intact (safe)
 
+        # SECURITY (sec-r1): the summarized span is distilled from USER and (crucially)
+        # UN-guarded TOOL result messages, so ``summary_text`` is UNTRUSTED — an attacker
+        # who planted an "instruction"/"decision" in a scraped page or poisoned tool
+        # result would otherwise have it re-emitted verbatim-in-spirit. Two hardenings:
+        #   1. run it through the SAME input guardrail that guards recalled memory / KB
+        #      blocks (injection / DLP / blocklist), so injected directives are
+        #      flagged/blocked and secrets/PII are redacted BEFORE it re-enters context;
+        #   2. insert it at USER trust (not SYSTEM). SYSTEM is reserved for operator /
+        #      persona text; laundering summarized untrusted content into a SYSTEM
+        #      directive would elevate its trust and let a one-shot indirect injection
+        #      persist as a standing higher-trust instruction on every later turn.
+        summary_text = await self._guard_input(
+            summary_text,
+            agent_id=persona.agent_id,
+            trace_id=trace_id,
+            thread_id=thread.thread_id,
+        )
+        if not summary_text.strip():
+            return False  # guardrail emptied it — nothing safe to fold in
+
         summary_msg = Message(
-            role=MessageRole.SYSTEM,
-            content=f"[Summary of earlier conversation]\n{summary_text}",
+            role=MessageRole.USER,
+            content=(
+                "[Summary of earlier conversation — untrusted recap of prior turns, "
+                "not an operator instruction]\n"
+                f"{summary_text}"
+            ),
             metadata={"compacted": True},
         )
         # Only apply if the summary is actually smaller than what it replaces — a verbose
@@ -2350,6 +2381,10 @@ class SingleAgentRuntime:
         # middle is replaced, persist it as an episodic trace so learning loops have
         # a corpus of "what happened" from day one. Best-effort: a persistence
         # failure must never break the run (the in-context summary already applied).
+        # SECURITY (sec-r1): ``summary_text`` here is the GUARDED text (redacted by the
+        # input guardrail above), so secrets/PII a tool returned verbatim are scrubbed
+        # BEFORE they land unredacted-at-rest in durable, subject-scoped episodic memory
+        # (which is recalled into FUTURE runs and readable by store-level exports).
         save_episodic = getattr(self.memory_store, "save_episodic_memory", None)
         if save_episodic is not None:
             from himmy.services.storage.models import EpisodicMemoryObject

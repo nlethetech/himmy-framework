@@ -14,6 +14,13 @@ list valid and the recent context intact:
 This module is the pure *planner* (decide whether + what to compact); the runtime owns
 the actual summarization inference call and applies the plan. Planning is fully testable
 without a model.
+
+Beyond the three structural invariants, the planner also refuses to summarize
+**control-channel** messages: any message carrying ``metadata['steer']`` (or another
+``metadata['pin']`` marker) is an operator directive that steers a running mission
+("stop touching production", "do not email anyone"). A lossy model-written summary could
+dilute or drop such a safety-relevant constraint, so these messages are pinned to the
+kept tail and always ride verbatim — they are never handed to the summarizer (sec-r1).
 """
 
 from __future__ import annotations
@@ -41,10 +48,27 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
+#: Metadata keys that mark a message as a pinned control/safety directive which must
+#: never be summarized away (it rides verbatim in the kept tail). ``steer`` is the
+#: operator between-turns steering seam; ``pin`` is a general-purpose escape hatch.
+_PIN_METADATA_KEYS = ("steer", "pin")
+
+
 def _role(message: Any) -> str:
     """The message role as a lowercase string (handles str or an Enum)."""
     role = message.role
     return (role.value if hasattr(role, "value") else str(role)).lower()
+
+
+def _is_pinned(message: Any) -> bool:
+    """True if ``message`` is a control/safety directive that must not be summarized.
+
+    An operator steer ("do not email anyone") is a behavioral control message; a lossy
+    summary could dilute or drop it, so it is pinned to the kept tail and always ridden
+    verbatim rather than handed to the summarizer.
+    """
+    metadata = getattr(message, "metadata", None) or {}
+    return any(bool(metadata.get(key)) for key in _PIN_METADATA_KEYS)
 
 
 @dataclass(frozen=True)
@@ -110,6 +134,18 @@ class ContextCompactor:
         while split > head_count and _role(messages[split]) == "tool":
             split -= 1
 
+        # 4. pin control/safety directives (operator steers): if any pinned message
+        #    falls inside the candidate summarize span, snap the tail boundary back to
+        #    just before the EARLIEST pinned message so it — and everything after it —
+        #    rides verbatim in the kept tail instead of being lossily summarized away.
+        for i in range(head_count, split):
+            if _is_pinned(messages[i]):
+                split = i
+                break
+        # A pin may have exposed a fresh tool orphan at the new boundary; re-snap.
+        while split > head_count and _role(messages[split]) == "tool":
+            split -= 1
+
         summarize = list(messages[head_count:split])
         if len(summarize) < self.min_summarize:
             return CompactionPlan(
@@ -141,3 +177,6 @@ __all__ = [
     "estimate_tokens",
     "SUMMARY_INSTRUCTION",
 ]
+
+#: Re-exported for the runtime + tests that need to reason about pinned messages.
+__all__ += ["_is_pinned"]

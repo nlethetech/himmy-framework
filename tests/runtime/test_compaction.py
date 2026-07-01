@@ -79,6 +79,45 @@ def test_too_little_to_summarize_is_a_noop() -> None:
     assert plan.reason == "too little to summarize"
 
 
+def test_steer_message_is_pinned_out_of_summarize_span() -> None:
+    # sec-r1: an operator steer ("never call the payment tool") lands mid-thread. It
+    # must NOT be summarized away — the boundary snaps back so the steer (and everything
+    # after it) rides verbatim in the kept tail.
+    steer = _m(MessageRole.USER, _big(50))
+    steer.metadata = {"steer": True}
+    msgs = [
+        _m(MessageRole.SYSTEM, _big(50)),
+        _m(MessageRole.USER, _big(300)),
+        _m(MessageRole.ASSISTANT, _big(300)),
+        steer,  # operator directive — must be pinned to the tail
+        _m(MessageRole.ASSISTANT, _big(300)),
+        _m(MessageRole.USER, _big(10)),
+    ]
+    plan = ContextCompactor(max_tokens=300, keep_recent=1).plan(msgs)
+    assert plan.should_compact is True
+    # The summarize span stops BEFORE the steer (index 3).
+    assert plan.summarize_end == 3
+    assert steer not in plan.summarize
+    assert all(not m.metadata.get("steer") for m in plan.summarize)
+
+
+def test_pin_metadata_is_also_honored() -> None:
+    pinned = _m(MessageRole.ASSISTANT, _big(50))
+    pinned.metadata = {"pin": True}
+    msgs = [
+        _m(MessageRole.SYSTEM, _big(50)),
+        _m(MessageRole.USER, _big(300)),
+        _m(MessageRole.ASSISTANT, _big(300)),
+        pinned,
+        _m(MessageRole.USER, _big(300)),
+        _m(MessageRole.USER, _big(10)),
+    ]
+    plan = ContextCompactor(max_tokens=300, keep_recent=1).plan(msgs)
+    assert plan.should_compact is True
+    assert plan.summarize_end == 3  # stops before the pinned message
+    assert pinned not in plan.summarize
+
+
 def test_render_span_flattens_roles_and_content() -> None:
     span = [_m(MessageRole.USER, "how many ducks?"), _m(MessageRole.TOOL, "12")]
     text = ContextCompactor().render_span(span)
