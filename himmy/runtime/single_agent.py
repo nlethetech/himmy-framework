@@ -123,6 +123,52 @@ except ValueError:
     _TOOL_RESULT_MODEL_MAX = _TOOL_RESULT_MODEL_MAX_DEFAULT
 
 
+# --- Default auto-compaction (eff-p0 #3) -------------------------------------------------
+# A multi-turn agent re-sends its ENTIRE history every turn, so an unbounded run pays
+# O(turns^2) cumulative tokens (the same growing prefix, re-billed each turn). The
+# compaction planner (:mod:`himmy.runtime.compaction`) has always been correct, but it
+# only ran when a caller opted in via ``ctx['compaction_spec']`` / ``AgentSpec.compact_context``
+# — which almost nobody set — so by default the full uncompressed history rode along
+# forever. This makes compaction DEFAULT-ON with a DELIBERATELY CONSERVATIVE high
+# threshold: short runs are byte-identical (they never cross the budget), while a run
+# that genuinely balloons gets its middle summarized before it overflows.
+#
+# The threshold is high on purpose: correctness (the model seeing recent history) matters
+# more than shaving tokens off a run that was never going to overflow anyway. An explicit
+# ``compaction_spec`` in the context ALWAYS wins over this default; the default only fills
+# in when no per-run spec was provided.
+#
+# Fully overridable:
+#   * ``HIMMY_AUTO_COMPACT=0``           → disable the default entirely (restores the
+#                                          pre-eff-p0 opt-in-only behaviour). Accepts
+#                                          0/false/no/off (case-insensitive).
+#   * ``HIMMY_AUTO_COMPACT_TOKENS=<int>``→ override the conservative token budget.
+#   * ``HIMMY_AUTO_COMPACT_KEEP=<int>``  → override how many recent messages ride verbatim.
+# An explicit ``ctx['compaction_spec']`` overrides all three for that run.
+_AUTO_COMPACT_TOKENS_DEFAULT = 24000
+_AUTO_COMPACT_KEEP_DEFAULT = 8
+
+
+def _auto_compact_default_spec() -> dict[str, Any] | None:
+    """The default compaction spec, or ``None`` when disabled via ``HIMMY_AUTO_COMPACT``.
+
+    Read fresh from the environment on every call (not cached) so tests — and a caller
+    that flips the flag between runs — see the current value. Returns a spec dict shaped
+    exactly like an explicit ``ctx['compaction_spec']`` so the apply path is identical.
+    """
+    if os.environ.get("HIMMY_AUTO_COMPACT", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        max_tokens = max(1, int(os.environ.get("HIMMY_AUTO_COMPACT_TOKENS", str(_AUTO_COMPACT_TOKENS_DEFAULT))))
+    except ValueError:
+        max_tokens = _AUTO_COMPACT_TOKENS_DEFAULT
+    try:
+        keep_recent = max(1, int(os.environ.get("HIMMY_AUTO_COMPACT_KEEP", str(_AUTO_COMPACT_KEEP_DEFAULT))))
+    except ValueError:
+        keep_recent = _AUTO_COMPACT_KEEP_DEFAULT
+    return {"max_tokens": max_tokens, "keep_recent": keep_recent}
+
+
 def _cap_tool_result_for_model(text: str, cap: int) -> str:
     """Bound a tool result's model-facing text at ``cap`` characters.
 
@@ -2213,10 +2259,17 @@ class SingleAgentRuntime:
     ) -> bool:
         """Summarize old turns in-place when the thread outgrows its token budget.
 
-        Opt-in via ``ctx['compaction_spec']``. Keeps the system head + recent tail,
-        replaces the middle with one model-written summary message, and emits a
-        ``CONTEXT_COMPACTED`` event (the audit trail of what was condensed). A no-op
-        when not configured or under budget.
+        DEFAULT-ON (eff-p0 #3) with a deliberately conservative high budget: an explicit
+        ``ctx['compaction_spec']`` wins, otherwise :func:`_auto_compact_default_spec`
+        supplies a default budget so long runs don't re-send their whole (O(turns^2))
+        history uncompressed. The default is disable-able via ``HIMMY_AUTO_COMPACT=0``
+        and tunable via ``HIMMY_AUTO_COMPACT_TOKENS`` / ``HIMMY_AUTO_COMPACT_KEEP``.
+
+        Keeps the system head + recent tail, replaces the middle with one model-written
+        summary message, and emits a ``CONTEXT_COMPACTED`` event (the audit trail of what
+        was condensed). A no-op when under budget, when the default is disabled and no
+        explicit spec was given, or when the summary would not actually shrink the span
+        (the summary-only-if-smaller guard below).
 
         Returns ``True`` iff compaction actually rewrote the thread this turn. The
         caller (C5) uses that to BUST the prompt cache for the very next request:
@@ -2224,7 +2277,11 @@ class SingleAgentRuntime:
         joined system prefix and would otherwise pay a write premium on a stale-cache
         miss. Skipping the breakpoint that one turn lets the prefix re-stabilize.
         """
+        # An explicit per-run spec always wins; otherwise fall back to the default-on
+        # policy (which may itself be disabled via HIMMY_AUTO_COMPACT=0 → None).
         spec = ctx.get("compaction_spec")
+        if not spec:
+            spec = _auto_compact_default_spec()
         if not spec:
             return False
         from himmy.agents.base_agent.thread import Message, MessageRole
