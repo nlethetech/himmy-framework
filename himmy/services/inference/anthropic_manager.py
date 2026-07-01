@@ -50,6 +50,7 @@ from himmy.services.inference.prompt_cache import (
     UsageBreakdown,
     anthropic_system_blocks,
     anthropic_ttl_supported,
+    apply_history_cache_breakpoint,
     cache_savings_usd,
     compute_cached_cost,
     read_anthropic_usage,
@@ -312,6 +313,7 @@ class AnthropicClientManager:
             system = f"{system}\n\n{instruction}" if system else instruction
         if system:
             self._apply_system(request, model, payload, system)
+        self._apply_history_cache(request, model, payload)
         if params.get("temperature") is not None:
             payload["temperature"] = params["temperature"]
         if params.get("top_p") is not None:
@@ -409,6 +411,34 @@ class AnthropicClientManager:
             payload["extra_headers"] = {
                 "anthropic-beta": "extended-cache-ttl-2025-04-11"
             }
+
+    def _apply_history_cache(
+        self, request: InferenceRequest, model: str, payload: dict[str, Any]
+    ) -> None:
+        """Add a SECOND cache breakpoint on the tail of the conversation history.
+
+        The system+tools breakpoint (:meth:`_apply_system`) discounts only the FIXED
+        prefix; the growing conversation/tool-result history sits outside it, so a tool
+        loop re-pays full price for every prior step (O(N^2) uncached growth). Anthropic
+        allows up to FOUR ``cache_control`` breakpoints, so this stamps one ephemeral
+        marker on the last content block of the last message — caching the whole
+        conversation-so-far so the NEXT turn (one more tool result appended) reads it
+        back cheaply.
+
+        Gated on the SAME predicate as the system breakpoint (``should_cache_prefix``),
+        which is ``False`` on a cache-busted (compaction) turn because the runtime drops
+        the policy that turn — so a rewritten prefix is never marked. A no-op (leaving
+        the payload byte-identical) when caching is inactive.
+        """
+        if not should_cache_prefix(request, model, self.cache_capability):
+            return
+        policy = request.cache_policy
+        assert policy is not None  # narrowed by should_cache_prefix
+        apply_history_cache_breakpoint(
+            payload["messages"],
+            ttl=policy.ttl,
+            ttl_supported=anthropic_ttl_supported(),
+        )
 
     async def _map_message(
         self,
@@ -522,6 +552,7 @@ class AnthropicClientManager:
         system = _system_text(request)
         if system:
             self._apply_system(request, model, payload, system)
+        self._apply_history_cache(request, model, payload)
         if params.get("temperature") is not None:
             payload["temperature"] = params["temperature"]
         if request.bound_tools:

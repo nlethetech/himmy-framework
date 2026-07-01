@@ -518,6 +518,291 @@ def test_openrouter_openai_backend_relies_on_automatic_string_content() -> None:
     assert "prompt_cache_key" not in seen  # none set here
 
 
+# ============================================ history/tail cache breakpoint (P0 #1)
+def _count_breakpoints(payload: dict[str, Any]) -> int:
+    """Count every ``cache_control`` marker across ``system`` blocks and ``messages``.
+
+    Anthropic's per-request budget is FOUR; this mirrors how the API tallies markers so
+    a test can pin ``total <= 4`` no matter which blocks carry them.
+    """
+    total = 0
+    system = payload.get("system")
+    if isinstance(system, list):
+        total += sum(1 for b in system if isinstance(b, dict) and "cache_control" in b)
+    for msg in payload.get("messages", []):
+        content = msg.get("content")
+        if isinstance(content, list):
+            total += sum(
+                1 for b in content if isinstance(b, dict) and "cache_control" in b
+            )
+    return total
+
+
+def _multi_turn_messages() -> list[InferenceMessage]:
+    """A system head + a user/assistant/tool loop, so the tail is a tool_result turn."""
+    return [
+        InferenceMessage(role="system", content=BIG_SYSTEM),
+        InferenceMessage(role="user", content="what are the rates?"),
+        InferenceMessage(role="assistant", content="let me check"),
+        InferenceMessage(
+            role="tool",
+            content='{"rate": 5}',
+            tool_call_id="tc_1",
+            name="lookup",
+            metadata={"tool_name": "lookup", "tool_args": {"q": "rates"}},
+        ),
+    ]
+
+
+def test_anthropic_history_breakpoint_marks_tail_on_multi_turn() -> None:
+    """A multi-turn Anthropic request gets a SECOND breakpoint on the tail tool_result."""
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    req = InferenceRequest(
+        model_key="claude-3-5-sonnet-latest",
+        messages=_multi_turn_messages(),
+        response_format=ResponseFormat.AUTO_TOOLS,
+        cache_policy=CachePolicy(),
+    )
+    run_async(mgr.generate(req))
+    seen = client.messages.seen
+    # The system prefix still carries its breakpoint.
+    assert isinstance(seen["system"], list)
+    assert seen["system"][0]["cache_control"] == {"type": "ephemeral"}
+    # The LAST message (the tool_result user turn) gets the tail breakpoint on its
+    # LAST content block — caching the whole conversation-so-far.
+    tail = seen["messages"][-1]
+    assert tail["role"] == "user"
+    assert tail["content"][-1]["type"] == "tool_result"
+    assert tail["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    # System + tail = exactly two breakpoints, well within Anthropic's budget of four.
+    assert _count_breakpoints(seen) == 2
+    assert _count_breakpoints(seen) <= 4
+
+
+def test_anthropic_history_breakpoint_wraps_string_tail() -> None:
+    """A plain-string tail (user turn) is lifted to a text block carrying the marker."""
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    req = InferenceRequest(
+        model_key="claude-3-5-sonnet-latest",
+        messages=[
+            InferenceMessage(role="system", content=BIG_SYSTEM),
+            InferenceMessage(role="user", content="hello"),
+        ],
+        cache_policy=CachePolicy(),
+    )
+    run_async(mgr.generate(req))
+    tail = client.messages.seen["messages"][-1]
+    assert tail["content"] == [
+        {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+    ]
+
+
+def test_anthropic_history_breakpoint_absent_without_policy() -> None:
+    """No policy → no tail breakpoint; the message tail stays a plain string."""
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    req = InferenceRequest(
+        model_key="claude-3-5-sonnet-latest",
+        messages=_multi_turn_messages(),
+        response_format=ResponseFormat.AUTO_TOOLS,
+    )  # no cache_policy
+    run_async(mgr.generate(req))
+    assert _count_breakpoints(client.messages.seen) == 0
+
+
+def test_anthropic_history_breakpoint_skipped_on_cache_busted_turn() -> None:
+    """A compaction (cache_busted) turn drops the policy → no breakpoints at all.
+
+    The runtime sets ``cache_policy=None`` for the one turn compaction rewrote the
+    system prefix, so ``should_cache_prefix`` is False and NEITHER the system nor the
+    tail breakpoint is emitted — the prefix re-stabilizes uncached instead of paying a
+    write premium on a stale-cache miss.
+    """
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    req = InferenceRequest(
+        model_key="claude-3-5-sonnet-latest",
+        messages=_multi_turn_messages(),
+        response_format=ResponseFormat.AUTO_TOOLS,
+        cache_policy=None,  # what the runtime passes on a cache_busted/compaction turn
+    )
+    run_async(mgr.generate(req))
+    seen = client.messages.seen
+    assert seen["system"] == BIG_SYSTEM  # plain string, no system breakpoint
+    assert _count_breakpoints(seen) == 0
+
+
+def test_anthropic_history_breakpoint_below_floor_stays_unmarked() -> None:
+    """A sub-threshold prefix marks nothing (tail included) — never a wasted breakpoint."""
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    req = InferenceRequest(
+        model_key="claude-3-5-sonnet-latest",
+        messages=[
+            InferenceMessage(role="system", content=SMALL_SYSTEM),
+            InferenceMessage(role="user", content="hello"),
+        ],
+        cache_policy=CachePolicy(),
+    )
+    run_async(mgr.generate(req))
+    assert _count_breakpoints(client.messages.seen) == 0
+
+
+def test_anthropic_history_breakpoint_single_turn_still_marks_system_only() -> None:
+    """Single-turn (system + one user turn): system + tail = 2 breakpoints, both valid."""
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    req = InferenceRequest(
+        model_key="claude-3-5-sonnet-latest",
+        messages=[
+            InferenceMessage(role="system", content=BIG_SYSTEM),
+            InferenceMessage(role="user", content="hello"),
+        ],
+        cache_policy=CachePolicy(),
+    )
+    run_async(mgr.generate(req))
+    seen = client.messages.seen
+    assert seen["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert _count_breakpoints(seen) == 2
+
+
+def test_anthropic_history_breakpoint_stream_path_marks_tail() -> None:
+    """generate_stream applies the same tail breakpoint as generate."""
+
+    class _Stream:
+        def __init__(self, final: _AMessage) -> None:
+            self._final = final
+
+        async def __aenter__(self) -> _Stream:
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+        @property
+        def text_stream(self) -> Any:
+            async def _gen() -> Any:
+                yield "ok"
+
+            return _gen()
+
+        async def get_final_message(self) -> _AMessage:
+            return self._final
+
+    class _StreamMessages:
+        def __init__(self, final: _AMessage) -> None:
+            self._final = final
+            self.seen: dict[str, Any] = {}
+
+        def stream(self, **kwargs: Any) -> _Stream:
+            self.seen.update(kwargs)
+            return _Stream(self._final)
+
+    class _StreamClient:
+        def __init__(self, final: _AMessage) -> None:
+            self.messages = _StreamMessages(final)
+
+    client = _StreamClient(_AMessage([_ATextBlock("ok")], _AUsage(3, 2)))
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    req = InferenceRequest(
+        model_key="claude-3-5-sonnet-latest",
+        messages=[
+            InferenceMessage(role="system", content=BIG_SYSTEM),
+            InferenceMessage(role="user", content="hello"),
+        ],
+        cache_policy=CachePolicy(),
+    )
+
+    async def _drain() -> None:
+        async for _ in mgr.generate_stream(req):
+            pass
+
+    run_async(_drain())
+    seen = client.messages.seen
+    assert seen["system"][0]["cache_control"] == {"type": "ephemeral"}
+    tail = seen["messages"][-1]
+    assert tail["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert _count_breakpoints(seen) == 2
+
+
+def test_anthropic_history_breakpoint_1h_ttl_matches_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tail marker follows the same TTL gating as the system block.
+
+    When the SDK reports 1h support, both the system and the tail carry ``ttl=1h``;
+    the two markers must never drift apart on TTL.
+    """
+    import himmy.services.inference.anthropic_manager as am
+
+    monkeypatch.setattr(am, "anthropic_ttl_supported", lambda *a, **k: True)
+    client = _aclient()
+    mgr = AnthropicClientManager(model="claude-3-5-sonnet-latest", client=client)
+    req = InferenceRequest(
+        model_key="claude-3-5-sonnet-latest",
+        messages=[
+            InferenceMessage(role="system", content=BIG_SYSTEM),
+            InferenceMessage(role="user", content="hello"),
+        ],
+        cache_policy=CachePolicy(ttl="1h"),
+    )
+    run_async(mgr.generate(req))
+    seen = client.messages.seen
+    assert seen["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    tail = seen["messages"][-1]
+    assert tail["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+# --- OpenRouter passthrough tail breakpoint (block-form → forwarded to Anthropic) ---
+def test_openrouter_anthropic_backend_marks_history_tail() -> None:
+    """OpenRouter→anthropic passthrough marks BOTH the system and the tail message."""
+    client = _oclient()
+    mgr = OpenAIClientManager(
+        model="anthropic/claude-3.5-sonnet",
+        client=client,
+        provider_name="openrouter",
+    )
+    req = _oreq(
+        "anthropic/claude-3.5-sonnet",
+        cache_policy=CachePolicy(),
+    )
+    run_async(mgr.generate(req))
+    messages = client.chat.completions.seen["messages"]
+    # System (index 0) is block-form with a breakpoint.
+    assert messages[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    # The tail user turn is lifted to block form carrying the tail breakpoint.
+    tail = messages[-1]
+    assert tail["role"] == "user"
+    assert tail["content"] == [
+        {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+    ]
+
+
+def test_openrouter_openai_backend_history_tail_stays_string() -> None:
+    """OpenRouter→openai-backed (automatic caching) never rewrites the tail to blocks."""
+    client = _oclient()
+    mgr = OpenAIClientManager(
+        model="openai/gpt-4o-mini",
+        client=client,
+        provider_name="openrouter",
+    )
+    run_async(mgr.generate(_oreq("openai/gpt-4o-mini", cache_policy=CachePolicy())))
+    messages = client.chat.completions.seen["messages"]
+    assert messages[-1] == {"role": "user", "content": "hello"}
+
+
+def test_openai_native_history_tail_unchanged() -> None:
+    """OpenAI-native requests are untouched: string tail, no cache_control anywhere."""
+    client = _oclient()
+    mgr = OpenAIClientManager(model="gpt-4o-mini", client=client)
+    run_async(mgr.generate(_oreq("gpt-4o-mini", cache_policy=CachePolicy())))
+    messages = client.chat.completions.seen["messages"]
+    assert messages[0] == {"role": "system", "content": SMALL_SYSTEM}
+    assert messages[-1] == {"role": "user", "content": "hello"}
+
+
 def test_direct_openai_provider_never_does_block_passthrough() -> None:
     """A direct openai provider never rewrites system to block form (automatic only)."""
     client = _oclient()

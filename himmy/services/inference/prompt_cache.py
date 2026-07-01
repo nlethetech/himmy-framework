@@ -351,6 +351,67 @@ def anthropic_system_blocks(
     return [{"type": "text", "text": system, "cache_control": cache_control}]
 
 
+def anthropic_cache_control(*, ttl: str, ttl_supported: bool) -> dict[str, Any]:
+    """The single ``cache_control`` value both breakpoint sites emit.
+
+    Mirrors the marker :func:`anthropic_system_blocks` stamps on the system block: a
+    plain 5m ``ephemeral`` marker, upgraded to a ``1h`` ``ttl`` only when the SDK is
+    known to accept it (else degrade to 5m). Keeping one builder means the system and
+    the history breakpoints never drift apart on TTL semantics.
+    """
+    cache_control: dict[str, Any] = {"type": "ephemeral"}
+    if ttl == "1h" and ttl_supported:
+        cache_control["ttl"] = "1h"
+    return cache_control
+
+
+def apply_history_cache_breakpoint(
+    messages: list[dict[str, Any]], *, ttl: str, ttl_supported: bool
+) -> None:
+    """Mark the tail of the conversation as a second cacheable prefix, in place.
+
+    The system+tools breakpoint only discounts the FIXED prefix; the growing
+    conversation/tool-result history sits outside it, so every step of a tool loop
+    re-pays full price for all prior steps (O(N^2) uncached growth). Anthropic permits
+    up to FOUR ``cache_control`` breakpoints per request and a breakpoint marks the END
+    of a cacheable prefix, so stamping one ``ephemeral`` marker on the LAST content
+    block of the LAST message caches the whole conversation-so-far as a second prefix —
+    which the NEXT turn (one more tool result appended) reads back cheaply.
+
+    Behaviour:
+
+    * A no-op when ``messages`` is empty (nothing to mark).
+    * String content is lifted into a single ``text`` block carrying the marker; an
+      empty string is NOT marked (an empty tail block is not a cacheable prefix).
+    * Block-form content gets the marker on its LAST block, leaving earlier blocks
+      untouched — so a ``tool_result`` / mixed ``text``+``tool_use`` turn is marked
+      without disturbing its shape.
+    * If the last block already carries a ``cache_control`` (e.g. the system block IS
+      the last message, an unusual single-turn shape) it is left as-is — never a
+      duplicate marker, so the per-request breakpoint budget is respected.
+
+    The ``ttl`` marker matches :func:`anthropic_cache_control`. The caller is
+    responsible for the gate (``should_cache_prefix`` / ``cache_system``): on a
+    cache-busted (compaction) turn the policy is absent so this is never invoked.
+    """
+    if not messages:
+        return
+    last = messages[-1]
+    content = last.get("content")
+    marker = anthropic_cache_control(ttl=ttl, ttl_supported=ttl_supported)
+    if isinstance(content, str):
+        if not content:
+            return  # an empty tail is not a cacheable prefix — leave the shape intact.
+        last["content"] = [
+            {"type": "text", "text": content, "cache_control": marker}
+        ]
+        return
+    if isinstance(content, list) and content:
+        tail_block = content[-1]
+        if isinstance(tail_block, dict) and "cache_control" not in tail_block:
+            tail_block["cache_control"] = marker
+
+
 class UsageBreakdown(BaseModel):
     """A typed split of a provider ``usage`` object into cache-aware token buckets.
 
@@ -583,8 +644,10 @@ __all__ = [
     "DEFAULT_MIN_CACHEABLE_TOKENS",
     "MIN_CACHEABLE_TOKENS",
     "UsageBreakdown",
+    "anthropic_cache_control",
     "anthropic_system_blocks",
     "anthropic_ttl_supported",
+    "apply_history_cache_breakpoint",
     "cache_metrics_payload",
     "cache_policy_active",
     "cache_savings_usd",

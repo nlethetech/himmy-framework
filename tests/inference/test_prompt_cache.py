@@ -32,6 +32,8 @@ from himmy.services.inference.prompt_cache import (
     DEFAULT_MIN_CACHEABLE_TOKENS,
     CacheCapability,
     UsageBreakdown,
+    anthropic_cache_control,
+    apply_history_cache_breakpoint,
     cache_savings_usd,
     compute_cached_cost,
     min_cacheable_tokens,
@@ -94,6 +96,75 @@ def test_stable_prefix_estimate_counts_system_and_tools_only() -> None:
     # ~100 tokens from the 400-char system block, plus a small tools contribution;
     # the 4000-char user turn must NOT inflate it.
     assert 100 <= est < 200
+
+
+# ----------------------------------------------- history/tail breakpoint helper
+def test_anthropic_cache_control_ttl_gating() -> None:
+    """The marker builder: plain 5m ephemeral, 1h only when the SDK supports it."""
+    assert anthropic_cache_control(ttl="5m", ttl_supported=True) == {
+        "type": "ephemeral"
+    }
+    assert anthropic_cache_control(ttl="1h", ttl_supported=True) == {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
+    # 1h requested but unsupported → degrade to 5m (no ttl key).
+    assert anthropic_cache_control(ttl="1h", ttl_supported=False) == {
+        "type": "ephemeral"
+    }
+
+
+def test_apply_history_breakpoint_wraps_string_content() -> None:
+    """A string tail is lifted into a text block carrying the marker."""
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    apply_history_cache_breakpoint(messages, ttl="5m", ttl_supported=False)
+    assert messages[0] == {"role": "user", "content": "first"}  # earlier turn untouched
+    assert messages[-1]["content"] == [
+        {"type": "text", "text": "reply", "cache_control": {"type": "ephemeral"}}
+    ]
+
+
+def test_apply_history_breakpoint_marks_last_block_only() -> None:
+    """Block-form content gets the marker on its LAST block; earlier blocks untouched."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+            ],
+        }
+    ]
+    apply_history_cache_breakpoint(messages, ttl="5m", ttl_supported=False)
+    content = messages[-1]["content"]
+    assert "cache_control" not in content[0]
+    assert content[-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_apply_history_breakpoint_empty_string_not_marked() -> None:
+    """An empty-string tail is not a cacheable prefix — left intact, never wrapped."""
+    messages = [{"role": "assistant", "content": ""}]
+    apply_history_cache_breakpoint(messages, ttl="5m", ttl_supported=False)
+    assert messages[-1] == {"role": "assistant", "content": ""}
+
+
+def test_apply_history_breakpoint_no_duplicate_on_already_marked_tail() -> None:
+    """A tail block that ALREADY carries cache_control is left as-is (budget respected)."""
+    marked = {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+    messages = [{"role": "system", "content": [marked]}]
+    apply_history_cache_breakpoint(messages, ttl="1h", ttl_supported=True)
+    # Not overwritten to a 1h marker, not duplicated — still the single 5m marker.
+    assert messages[-1]["content"] == [marked]
+
+
+def test_apply_history_breakpoint_empty_messages_noop() -> None:
+    """No messages → no-op (nothing to mark, never raises)."""
+    messages: list[dict[str, Any]] = []
+    apply_history_cache_breakpoint(messages, ttl="5m", ttl_supported=False)
+    assert messages == []
 
 
 # -------------------------------------------------------- usage breakdown split
