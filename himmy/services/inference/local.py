@@ -273,41 +273,57 @@ async def _execute_tool_calls(
     :class:`StubClientManager`'s execution path; ``bound_tools`` is still used to
     validate/repair the call's tool name before invoking the executor.
 
-    Independent READ-ONLY calls in a single fan-out are executed CONCURRENTLY under a
-    bounded semaphore (``HIMMY_TOOL_PARALLELISM``, default 8) — reads have no ordering,
-    idempotency, or approval hazard, so parallelising them cuts a multi-tool turn's
-    wall-clock without changing any result. Write/side-effecting/ambiguous tools stay
-    STRICTLY SEQUENTIAL (in original order) to preserve approval/HITL gates, idempotency,
-    and ordering. Results are always returned in the calls' ORIGINAL order, and per-call
-    error handling is byte-identical to the serial path: a concurrent read that raises
-    is isolated (siblings still complete) and the earliest-in-order failure is the one
-    re-raised, exactly as a serial loop would surface it. Setting the knob to ``1``
-    restores fully serial behaviour.
+    Only MAXIMAL RUNS OF CONSECUTIVE read-only calls are executed CONCURRENTLY under a
+    bounded semaphore (``HIMMY_TOOL_PARALLELISM``, default 8). Write/side-effecting/
+    ambiguous/unknown calls act as strict ORDERING BARRIERS: iterating in original order,
+    a pending read-batch is fully awaited before the barrier call runs, and the barrier
+    runs sequentially before iteration continues. This preserves the serial
+    happens-before across every write boundary — a read positioned AFTER a write still
+    observes that write's effect (e.g. ``append_note`` then ``list_notes``) — while still
+    parallelising the common all-reads (or trailing-reads-after-a-write) case. Reads have
+    no ordering, idempotency, or approval hazard, so within one uninterrupted read-batch
+    concurrency cuts wall-clock without changing any result.
+
+    Results are always returned in the calls' ORIGINAL order, and per-call error handling
+    is byte-identical to the serial path: a concurrent read that raises is isolated
+    (siblings in its batch still complete) and the earliest-in-order failure is the one
+    re-raised, exactly as a serial loop would surface it — no call is executed twice.
+    Setting the knob to ``1`` restores fully serial behaviour.
     """
     by_name = {t.name: t for t in bound_tools}
     available = list(by_name)
     parallelism = _default_tool_parallelism()
 
-    # Partition into (index, call) so read-only calls can run concurrently while the
-    # slots for write/ambiguous calls are filled by a strictly sequential pass — then
-    # everything is reassembled in ORIGINAL order.
     returns: list[ToolReturnRecord | None] = [None] * len(tool_calls)
-    read_indices: list[int] = []
-    for i, call in enumerate(tool_calls):
+
+    def _is_parallel(call: ToolCallRecord) -> bool:
+        """Read-only + executable => eligible to join the current concurrent batch."""
+        if parallelism <= 1 or executor is None:
+            return False
         tool = by_name.get(call.tool_name)
         if tool is None:
             resolution = resolve_tool_name(call.tool_name, available)
             if resolution.name is not None:
                 tool = by_name[resolution.name]
-        parallel = (
-            parallelism > 1 and tool is not None and executor is not None
-            and _is_read_only(tool)
-        )
-        if parallel:
-            read_indices.append(i)
+        return tool is not None and _is_read_only(tool)
 
-    read_exceptions: dict[int, BaseException] = {}
-    if read_indices:
+    async def _flush(batch: list[int]) -> None:
+        """Run a batch of CONSECUTIVE read indices concurrently, preserving order.
+
+        Exceptions are isolated per call (siblings still complete); the earliest-in-order
+        failure within the batch is re-raised so the caller sees exactly what a serial
+        loop would have surfaced. Because a batch only ever contains reads that are
+        adjacent in the original ``tool_calls`` order, no read is ever hoisted across a
+        write barrier.
+        """
+        if not batch:
+            return
+        if len(batch) == 1:
+            # Single read: no benefit to spinning up a gather/semaphore.
+            returns[batch[0]] = await _run_one_tool_call(
+                tool_calls[batch[0]], by_name, available, executor
+            )
+            return
         semaphore = asyncio.Semaphore(parallelism)
 
         async def _guarded(idx: int) -> ToolReturnRecord:
@@ -316,29 +332,27 @@ async def _execute_tool_calls(
                     tool_calls[idx], by_name, available, executor
                 )
 
-        # ``return_exceptions`` isolates a failing read from its siblings (they still
-        # complete); the captured exception is re-raised in the sequential pass below at
-        # the call's ORIGINAL position, so the caller sees exactly what a serial loop
-        # would have raised — no read is executed twice.
         results = await asyncio.gather(
-            *(_guarded(i) for i in read_indices), return_exceptions=True
+            *(_guarded(i) for i in batch), return_exceptions=True
         )
-        for idx, result in zip(read_indices, results, strict=True):
+        for idx, result in zip(batch, results, strict=True):
             if isinstance(result, BaseException):
-                read_exceptions[idx] = result
-            else:
-                returns[idx] = result
+                # Re-raise the FIRST failure in original order; siblings already ran.
+                raise result
+            returns[idx] = result
 
-    # Sequential pass: fills write/ambiguous slots in order AND re-raises the earliest
-    # exception (read or write) exactly where the serial loop would have surfaced it.
-    read_set = set(read_indices)
+    # Walk calls in order, accumulating a batch of consecutive reads. Any non-parallel
+    # call is a barrier: flush the pending batch (await completion), run it sequentially,
+    # then continue — exactly the serial happens-before, minus the read-batch latency.
+    batch: list[int] = []
     for i, call in enumerate(tool_calls):
-        if i in read_set:
-            exc = read_exceptions.get(i)
-            if exc is not None:
-                raise exc
+        if _is_parallel(call):
+            batch.append(i)
             continue
+        await _flush(batch)
+        batch = []
         returns[i] = await _run_one_tool_call(call, by_name, available, executor)
+    await _flush(batch)
 
     return [r for r in returns if r is not None]
 

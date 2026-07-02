@@ -114,6 +114,114 @@ def test_write_tool_stays_sequential_and_ordered() -> None:
     assert w_end == w_start + 1  # nothing interleaved inside the write
 
 
+def test_read_after_write_runs_after_the_write() -> None:
+    """A read positioned AFTER a write must execute AFTER it (barrier ordering).
+
+    Regression for the read-after-write hoist: [read_a, write_w, read_b] must fire in
+    the serial order ['read_a', 'write_w', 'read_b'], NOT hoist read_b ahead of write_w.
+    The write is an ORDERING BARRIER, so read_b observes write_w's effect (the serial
+    happens-before contract, e.g. ``append_note`` then ``list_notes``).
+    """
+    fired: list[str] = []
+
+    async def executor(name: str, args: dict) -> ToolReturnRecord:
+        fired.append(name)
+        await asyncio.sleep(0.01)
+        return ToolReturnRecord(tool_call_id="", tool_name=name, content=name)
+
+    tools = [_read_tool("read_a"), _write_tool("write_w"), _read_tool("read_b")]
+    calls = [_call("read_a"), _call("write_w"), _call("read_b")]
+
+    returns = _run(_execute_tool_calls(tools, calls, executor))
+    assert [r.tool_name for r in returns] == ["read_a", "write_w", "read_b"]
+    # Executor FIRING order (not just return order): read_b started only after write_w.
+    assert fired == ["read_a", "write_w", "read_b"]
+
+
+def test_read_after_write_observes_write_effect() -> None:
+    """State-based proof: a read after a write sees the write's mutation, not stale state.
+
+    Models ``append_note`` then ``list_notes`` in one fan-out — ``list_notes`` must
+    include the appended note. The pre-fix algorithm ran all reads up-front, so the
+    trailing read observed stale state.
+    """
+    store: list[str] = []
+    observed: dict[str, list[str]] = {}
+
+    async def executor(name: str, args: dict) -> ToolReturnRecord:
+        if name == "append_note":
+            store.append(str(args.get("text", "")))
+            return ToolReturnRecord(tool_call_id="", tool_name=name, content="ok")
+        # list_notes (read): snapshot what it observes.
+        observed[name] = list(store)
+        return ToolReturnRecord(
+            tool_call_id="", tool_name=name, content=",".join(store)
+        )
+
+    tools = [
+        _read_tool("list_before"),
+        _write_tool("append_note"),
+        _read_tool("list_after"),
+    ]
+    calls = [
+        _call("list_before"),
+        _call("append_note", text="hello"),
+        _call("list_after"),
+    ]
+
+    returns = _run(_execute_tool_calls(tools, calls, executor))
+    assert observed["list_before"] == []  # ran before the write
+    assert observed["list_after"] == ["hello"]  # observed the write's effect
+    assert returns[2].content == "hello"
+
+
+def test_reads_split_by_write_barrier_batch_independently() -> None:
+    """Two read-runs separated by a write parallelize WITHIN each run, not across it.
+
+    [r1, r2, w, r3, r4]: r1/r2 run concurrently (max 2), the write is isolated, then
+    r3/r4 run concurrently — but no read ever overlaps the write, and r3/r4 start only
+    after the write ends.
+    """
+    events: list[str] = []
+    active = 0
+    peak_before = 0
+    peak_after = 0
+    write_ended = False
+
+    async def executor(name: str, args: dict) -> ToolReturnRecord:
+        nonlocal active, peak_before, peak_after, write_ended
+        active += 1
+        if name in {"r1", "r2"}:
+            peak_before = max(peak_before, active)
+            assert not write_ended  # first-run reads precede the write
+        if name in {"r3", "r4"}:
+            peak_after = max(peak_after, active)
+            assert write_ended  # second-run reads follow the write
+        events.append(f"start:{name}")
+        await asyncio.sleep(0.02)
+        events.append(f"end:{name}")
+        if name == "w":
+            write_ended = True
+        active -= 1
+        return ToolReturnRecord(tool_call_id="", tool_name=name, content=name)
+
+    tools = [
+        _read_tool("r1"),
+        _read_tool("r2"),
+        _write_tool("w"),
+        _read_tool("r3"),
+        _read_tool("r4"),
+    ]
+    calls = [_call("r1"), _call("r2"), _call("w"), _call("r3"), _call("r4")]
+
+    returns = _run(_execute_tool_calls(tools, calls, executor))
+    assert [r.tool_name for r in returns] == ["r1", "r2", "w", "r3", "r4"]
+    assert peak_before == 2  # first read-run parallelized
+    assert peak_after == 2  # second read-run parallelized
+    w_start = events.index("start:w")
+    assert events[w_start + 1] == "end:w"  # write ran in isolation
+
+
 def test_parallelism_one_restores_serial(monkeypatch: pytest.MonkeyPatch) -> None:
     """HIMMY_TOOL_PARALLELISM=1 => fully serial (no two calls ever overlap)."""
     monkeypatch.setenv("HIMMY_TOOL_PARALLELISM", "1")
