@@ -31,6 +31,13 @@ def connect_hardened(
     try:
         if path != ":memory:":  # WAL is meaningless (and noisy) for in-memory DBs
             conn.execute("PRAGMA journal_mode=WAL")
+            # Throughput pragmas for on-disk paths only (an in-memory DB already lives
+            # in RAM, so a page cache / mmap / spill-to-memory buys nothing there). No
+            # behavior change: a larger page cache, in-memory temp tables/indexes, and a
+            # memory-mapped read window only make the same reads/writes cheaper.
+            conn.execute("PRAGMA cache_size=-16000")  # ~16 MB page cache (negative = KiB)
+            conn.execute("PRAGMA temp_store=MEMORY")  # temp b-trees/sorts in RAM
+            conn.execute("PRAGMA mmap_size=268435456")  # ~256 MB memory-mapped read window
         conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         conn.execute(f"PRAGMA synchronous={synchronous}")
     except sqlite3.Error:  # pragma: no cover - pragmas are best-effort

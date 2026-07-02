@@ -541,8 +541,12 @@ class ConversationStore:
         """
         from himmy.api.studio_tenant_scope import scope_clause
 
+        # Select only the 8 metadata columns ``_summary`` reads — never the large
+        # ``thread`` blob a list view never touches (P2.5 storage-micro: summaries returned
+        # are byte-identical, we just stop pulling the payload over the row for every row).
         sql = (
-            "SELECT c.*, COUNT(m.id) AS n "
+            "SELECT c.conversation_id, c.origin, c.title, c.agent_path, c.provider, "
+            "c.project_id, c.created_at, c.updated_at, COUNT(m.id) AS n "
             "FROM conversations c "
             "LEFT JOIN conversation_messages m "
             "  ON m.conversation_id = c.conversation_id "
