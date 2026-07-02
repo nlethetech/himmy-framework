@@ -279,6 +279,73 @@ def test_timestamp_cannot_be_swapped_without_breaking_the_signature() -> None:
     assert seen == []
 
 
+# ------------------------------------------------ require_timestamp (deploy replay guard)
+def test_require_timestamp_rejects_a_body_only_signature() -> None:
+    """With require_timestamp on, a timestamp-less (body-only) signed request is refused.
+
+    Regression for the deploy/serve replay hole: the auto-wired front door sets
+    HIMMY_WEBHOOK_REQUIRE_TIMESTAMP, so a captured body-only signed request can no longer
+    replay forever — it is rejected because it carries no fresh, skew-checked timestamp.
+    """
+    conn, seen = _connector(require_timestamp=True)
+    body = _payload()
+    sig = _sign(_SECRET, body)  # NO timestamp bound
+    result = run_async(conn.handle_webhook(body, {DEFAULT_SIGNATURE_HEADER: sig}))
+    assert result == {"ok": False, "reason": "invalid signature"}
+    assert seen == []  # the agent never ran
+
+
+def test_require_timestamp_accepts_a_fresh_timestamped_request() -> None:
+    """A properly timestamped signed request still runs when require_timestamp is on."""
+    fixed = 2_000_000.0
+    conn, seen = _connector(require_timestamp=True, clock=lambda: fixed)
+    body = _payload()
+    ts = str(int(fixed))
+    sig = _sign(_SECRET, body, timestamp=ts)
+    result = run_async(
+        conn.handle_webhook(
+            body, {DEFAULT_SIGNATURE_HEADER: sig, DEFAULT_TIMESTAMP_HEADER: ts}
+        )
+    )
+    assert result["ok"] is True
+    assert seen == ["ci:build 1234 passed"]
+
+
+def test_require_timestamp_dedups_an_idless_replay_within_the_window() -> None:
+    """An id-less payload is deduped on its timestamp+body hash, so a replay never re-fires.
+
+    Regression for the second half of the replay finding: dedup previously engaged ONLY when
+    the payload carried an ``id``. The deploy sample body has none, so under require_timestamp
+    the connector synthesizes a stable dedup key from the timestamp+body — a byte-for-byte
+    replay (same ts + body + sig) is acknowledged as a duplicate instead of re-running the agent.
+    """
+    fixed = 3_000_000.0
+    conn, seen = _connector(require_timestamp=True, clock=lambda: fixed)
+    body = json.dumps({"source": "ci", "text": "hello"}).encode("utf-8")  # no id field
+    ts = str(int(fixed))
+    sig = _sign(_SECRET, body, timestamp=ts)
+    headers = {DEFAULT_SIGNATURE_HEADER: sig, DEFAULT_TIMESTAMP_HEADER: ts}
+    first = run_async(conn.handle_webhook(body, headers))
+    second = run_async(conn.handle_webhook(body, headers))
+    assert first["handled"] is True
+    assert second == {"ok": True, "handled": False, "deduplicated": True}
+    assert seen == ["ci:hello"]  # ran exactly once despite the byte-for-byte replay
+
+
+def test_require_timestamp_defaults_off_preserves_body_only_interop() -> None:
+    """Default (require_timestamp off): a body-only signed request is still accepted.
+
+    The GitHub-style body-only-signature interop is preserved when the flag is not set, so
+    only the auto-wired deploy front door is stricter — not every webhook everywhere.
+    """
+    conn, seen = _connector()  # require_timestamp defaults to False
+    body = _payload()
+    sig = _sign(_SECRET, body)
+    result = run_async(conn.handle_webhook(body, {DEFAULT_SIGNATURE_HEADER: sig}))
+    assert result["ok"] is True
+    assert seen == ["ci:build 1234 passed"]
+
+
 # ------------------------------------------------------------------ de-duplication
 def test_duplicate_delivery_id_is_not_run_twice() -> None:
     conn, seen = _connector()
@@ -415,6 +482,36 @@ def test_connector_service_build_inbound_injects_durable_store() -> None:
     connector = service.build_inbound("webhook", handler, idempotency=store)
     assert isinstance(connector, WebhookInboundConnector)
     assert connector._dedupe is store
+
+
+def test_build_inbound_reads_require_timestamp_env_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIMMY_WEBHOOK_REQUIRE_TIMESTAMP flips the connector into fail-closed replay mode.
+
+    This is how the deploy/serve front door turns the guard on: it sets the env flag before
+    mount, and the ConnectorService build path forwards it into the connector. Assert the
+    built connector requires a timestamp (a body-only signed request is refused).
+    """
+    from himmy.connectors.manage import ConnectorService
+
+    configure_secrets(_MemSecrets({WEBHOOK_SIGNING_SECRET: _SECRET}))
+    monkeypatch.setenv("HIMMY_WEBHOOK_REQUIRE_TIMESTAMP", "1")
+    monkeypatch.setenv("HIMMY_WEBHOOK_ALLOWED_SOURCES", "ci")
+
+    seen: list[str] = []
+
+    async def handler(sender_id: str, text: str) -> str:
+        seen.append(text)
+        return "ok"
+
+    connector = ConnectorService().build_inbound("webhook", handler)
+    assert isinstance(connector, WebhookInboundConnector)
+    body = _payload()
+    sig = _sign(_SECRET, body)  # body-only signature, no timestamp
+    result = run_async(connector.handle_webhook(body, {DEFAULT_SIGNATURE_HEADER: sig}))
+    assert result == {"ok": False, "reason": "invalid signature"}
+    assert seen == []
 
 
 # ------------------------------------------------------------------ capability + secrets

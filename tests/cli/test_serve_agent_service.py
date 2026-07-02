@@ -44,6 +44,7 @@ from himmy.connectors.webhook import (
 _TOUCHED = [
     WEBHOOK_SIGNING_SECRET,
     "HIMMY_WEBHOOK_ALLOWED_SOURCES",
+    "HIMMY_WEBHOOK_REQUIRE_TIMESTAMP",
     _enabled_flag_name("webhook", "inbound"),
     INBOUND_AGENT_PATH_ENV,
     INBOUND_PROVIDER_ENV,
@@ -145,19 +146,27 @@ def test_serve_wiring_mounts_webhook_signed_ok_unsigned_401(env: Path) -> None:
     app = create_app(bind_host="127.0.0.1")
     assert "/v1/connectors/webhook" in collect_route_paths(app)
 
-    # Sign the EXACT sample payload the summary advertises, over the raw bytes.
-    from himmy.connectors.webhook import sign_webhook_body
+    # Sign the EXACT sample payload the summary advertises, over the raw bytes. The front
+    # door requires a fresh timestamp (replay guard), so bind one into the signature and send
+    # the timestamp header — mirroring what the rendered curl now teaches.
+    import time as _time
+
+    from himmy.connectors.webhook import (
+        DEFAULT_TIMESTAMP_HEADER,
+        sign_webhook_body,
+    )
 
     body = json.dumps(
         {"source": commands._SERVICE_SAMPLE_SOURCE, "text": "hello"},
         separators=(",", ":"),
     ).encode()
-    sig = sign_webhook_body(secret=secret, body=body)
+    ts = str(int(_time.time()))
+    sig = sign_webhook_body(secret=secret, body=body, timestamp=ts)
     with TestClient(app) as client:
         ok = client.post(
             "/v1/connectors/webhook",
             content=body,
-            headers={DEFAULT_SIGNATURE_HEADER: sig},
+            headers={DEFAULT_SIGNATURE_HEADER: sig, DEFAULT_TIMESTAMP_HEADER: ts},
         )
         assert ok.status_code == 200
         data = ok.json()
@@ -166,6 +175,16 @@ def test_serve_wiring_mounts_webhook_signed_ok_unsigned_401(env: Path) -> None:
 
         unsigned = client.post("/v1/connectors/webhook", content=body)
         assert unsigned.status_code == 401
+
+        # Replay guard: a body-only signature with NO timestamp header is refused (the front
+        # door turns on HIMMY_WEBHOOK_REQUIRE_TIMESTAMP), so a captured request can't replay.
+        body_only_sig = sign_webhook_body(secret=secret, body=body)
+        replay = client.post(
+            "/v1/connectors/webhook",
+            content=body,
+            headers={DEFAULT_SIGNATURE_HEADER: body_only_sig},
+        )
+        assert replay.status_code == 401
 
 
 def test_summary_endpoint_signature_actually_verifies(env: Path) -> None:
@@ -184,11 +203,20 @@ def test_summary_endpoint_signature_actually_verifies(env: Path) -> None:
     assert "/docs" in summary and "/readyz" in summary and "/metrics" in summary
     assert ".himmy/storage.db" in summary
 
-    # Pull the signature out of the rendered curl and prove it verifies over the sample body.
+    # Pull the signature + timestamp out of the rendered curl and prove they verify over the
+    # sample body. The front door binds a live timestamp into the signature and prints the
+    # timestamp header, so the taught pattern is replay-safe (not a body-only signature).
+    from himmy.connectors.webhook import DEFAULT_TIMESTAMP_HEADER
+
     sig = next(
         line.split(f"{DEFAULT_SIGNATURE_HEADER}: ", 1)[1].split("'", 1)[0]
         for line in summary.splitlines()
         if DEFAULT_SIGNATURE_HEADER in line
+    )
+    ts = next(
+        line.split(f"{DEFAULT_TIMESTAMP_HEADER}: ", 1)[1].split("'", 1)[0]
+        for line in summary.splitlines()
+        if DEFAULT_TIMESTAMP_HEADER in line
     )
     body = json.dumps(
         {"source": commands._SERVICE_SAMPLE_SOURCE, "text": "hello"},
@@ -198,8 +226,14 @@ def test_summary_endpoint_signature_actually_verifies(env: Path) -> None:
         lambda sender, text: text,  # unused: we only exercise verify_webhook
         signing_secret=secret,
         allowed_sources=[commands._SERVICE_SAMPLE_SOURCE],
+        require_timestamp=True,
     )
-    assert connector.verify_webhook(body, {DEFAULT_SIGNATURE_HEADER: sig}) is True
+    assert (
+        connector.verify_webhook(
+            body, {DEFAULT_SIGNATURE_HEADER: sig, DEFAULT_TIMESTAMP_HEADER: ts}
+        )
+        is True
+    )
 
 
 def test_worker_summary_has_store_no_http_and_hides_secret(env: Path) -> None:

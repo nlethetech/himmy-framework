@@ -1548,23 +1548,28 @@ def _enable_inbound_webhook(agent_path: str) -> str:
     * ``HIMMY_INBOUND_AGENT_PATH`` names the agent an inbound delivery runs;
     * the webhook connector is enabled for the ``inbound`` surface;
     * a signing secret is ensured — an operator-configured one is honoured (never
-      clobbered), else a fresh random one is generated for THIS process so the public
-      trigger is signed by construction (an unsigned webhook is a forgeable agent trigger,
-      so the connector refuses to mount without a secret);
+      clobbered), else a fresh random one is generated so the public trigger is signed by
+      construction (an unsigned webhook is a forgeable agent trigger, so the connector
+      refuses to mount without a secret). A generated secret is PERSISTED through the active
+      writable secrets provider (keychain/file) when one exists, so a restart reuses the SAME
+      secret and previously-configured signed senders keep working; when the backend is
+      read-only (the default ``env`` mode) it falls back to the process env for this run;
+    * the anti-replay guard is turned ON for the auto-wired front door
+      (``HIMMY_WEBHOOK_REQUIRE_TIMESTAMP``) so an accepted delivery MUST carry a fresh,
+      skew-checked timestamp — a captured signed request goes stale instead of replaying
+      forever;
     * the sample source is allow-listed ONLY when the operator has set no allowlist (an
       empty allowlist is default-deny — the safe posture — but then the ready-to-paste curl
       would 403; adding one source keeps default-deny for everyone else).
 
-    Values are written to the PROCESS ENV (the ``EnvSecrets`` link of the secrets chain), so
-    this works offline with no writable secrets backend and never persists a generated secret
-    to disk. Idempotent: an already-configured secret/allowlist/agent is left untouched.
-    Returns the effective signing secret so the caller can render a VALID sample signature —
-    the raw secret itself is NEVER printed or logged.
+    Idempotent: an already-configured secret/allowlist/agent is left untouched. Returns the
+    effective signing secret so the caller can render a VALID sample signature — the raw
+    secret itself is NEVER printed or logged.
     """
     import secrets as _secrets
 
     from himmy.api.connector_inbound import INBOUND_AGENT_PATH_ENV
-    from himmy.config.secrets import get_secret
+    from himmy.config.secrets import get_secret, get_writable_provider
     from himmy.connectors.manage import _enabled_flag_name
     from himmy.connectors.webhook import WEBHOOK_SIGNING_SECRET
 
@@ -1572,10 +1577,25 @@ def _enable_inbound_webhook(agent_path: str) -> str:
     os.environ.setdefault(
         _enabled_flag_name(_SERVICE_INBOUND_CONNECTOR, "inbound"), "1"
     )
+    # The auto-wired public trigger must not be replayable: require a fresh timestamp per
+    # delivery. Set (not clobber) so an operator can still opt out deliberately.
+    os.environ.setdefault("HIMMY_WEBHOOK_REQUIRE_TIMESTAMP", "1")
     secret = get_secret(WEBHOOK_SIGNING_SECRET)
     if not secret:
         secret = "whsec_" + _secrets.token_hex(24)
-        os.environ[WEBHOOK_SIGNING_SECRET] = secret
+        # Persist through the writable provider FIRST so a restart reuses this exact secret
+        # (previously-configured signed senders keep verifying). A read-only backend (env
+        # mode) has none — fall back to the process env for this run.
+        provider = get_writable_provider()
+        persisted = False
+        if provider is not None:
+            try:
+                provider.set(WEBHOOK_SIGNING_SECRET, secret)
+                persisted = True
+            except Exception:  # noqa: BLE001 - persistence is best-effort; env still works
+                persisted = False
+        if not persisted:
+            os.environ[WEBHOOK_SIGNING_SECRET] = secret
     if not get_secret("HIMMY_WEBHOOK_ALLOWED_SOURCES"):
         os.environ["HIMMY_WEBHOOK_ALLOWED_SOURCES"] = _SERVICE_SAMPLE_SOURCE
     return secret
@@ -1606,14 +1626,18 @@ def render_service_summary(
     Shared by ``himmy serve``/``himmy worker`` (and reusable by ``himmy deploy``): shows the
     base URL, the mounted agent endpoint + a ready-to-paste **signed** curl, the docs/health/
     metrics routes, and the durable store path. The curl carries a signature this build's
-    verifier accepts — computed with :func:`sign_webhook_body` over the SAME sample payload —
-    so a newcomer can prove the endpoint end to end in one paste. The raw signing SECRET is
-    NEVER included (only a valid signature for the sample body is); when no agent is wired the
-    endpoint block is omitted (a bare BFF has no agent surface).
+    verifier accepts — computed with :func:`sign_webhook_body` over the SAME sample payload,
+    BOUND to a fresh timestamp (the front door requires one — see the replay guard) and
+    accompanied by the timestamp header — so a newcomer can prove the endpoint end to end in
+    one paste, and the taught pattern is replay-safe (re-sending needs a fresh timestamp). The
+    raw signing SECRET is NEVER included (only a valid signature for the sample body is); when
+    no agent is wired the endpoint block is omitted (a bare BFF has no agent surface).
 
     When ``apikey`` is given (the ``--share`` path minted one and turned auth ON), the sample
-    curl also carries the ``x-himmy-internal-key`` header — off-loopback the app requires it
-    IN ADDITION to the webhook signature, so the printed curl stays copy-paste-able there.
+    curl also carries the ``x-himmy-internal-key`` header — off-loopback the app requires it IN
+    ADDITION to the webhook signature. The live key is NOT baked into the command: the header
+    references ``$HIMMY_SHARE_KEY`` (which the operator exports) so the raw admin credential
+    never lands in shell history/scrollback from pasting the curl.
 
     ``host`` is ``None`` for a ``himmy worker`` (no HTTP surface): the URL/endpoint/routes
     blocks are dropped and only the store path (+ agent, if any) is shown, since a worker
@@ -1627,9 +1651,12 @@ def render_service_summary(
         base = f"http://{host}:{port}"
         lines.append(f"  │  {base}")
         if agent_path and signing_secret:
+            import time as _time
+
             from himmy.api.connector_inbound import _INBOUND_PATHS
             from himmy.connectors.webhook import (
                 DEFAULT_SIGNATURE_HEADER,
+                DEFAULT_TIMESTAMP_HEADER,
                 sign_webhook_body,
             )
 
@@ -1638,24 +1665,35 @@ def render_service_summary(
                 {"source": _SERVICE_SAMPLE_SOURCE, "text": "hello"},
                 separators=(",", ":"),
             )
+            # The auto-wired front door REQUIRES a fresh timestamp (replay guard), so the
+            # sample curl computes the signature the SAME way — bound to a live timestamp —
+            # and includes the timestamp header, so the taught pattern is replay-safe by
+            # construction rather than an eternally-replayable body-only signature.
+            timestamp = str(int(_time.time()))
             signature = sign_webhook_body(
-                secret=signing_secret, body=body.encode("utf-8")
+                secret=signing_secret,
+                body=body.encode("utf-8"),
+                timestamp=timestamp,
             )
             lines += [
                 "  │",
                 f"  │  agent    {endpoint}",
-                "  │  try it (signed; paste as-is):",
+                "  │  try it (signed; refresh the timestamp before re-sending):",
                 f"  │    curl -s {endpoint} \\",
             ]
             if apikey:
                 # --share off-loopback: auth is ON, so the endpoint needs the apikey header
-                # IN ADDITION to the signature — include it so the curl works as pasted. The
-                # header is x-himmy-internal-key (the ApiKeyAuthenticator's header), NOT
-                # Authorization: Bearer, which this authenticator ignores.
+                # IN ADDITION to the signature. Reference an env var rather than baking the
+                # LIVE all-tenants key into a copy-paste command (a pasted literal lands in
+                # shell history / scrollback). The header is x-himmy-internal-key (the
+                # ApiKeyAuthenticator's header), NOT Authorization: Bearer (which it ignores).
                 from himmy.api.auth.apikey import DEFAULT_HEADER as _APIKEY_HEADER
 
-                lines.append(f"  │      -H '{_APIKEY_HEADER}: {apikey}' \\")
+                lines.append(
+                    f'  │      -H "{_APIKEY_HEADER}: $HIMMY_SHARE_KEY" \\'
+                )
             lines += [
+                f"  │      -H '{DEFAULT_TIMESTAMP_HEADER}: {timestamp}' \\",
                 f"  │      -H '{DEFAULT_SIGNATURE_HEADER}: {signature}' \\",
                 f"  │      -d '{body}'",
                 "  │",
@@ -2248,10 +2286,18 @@ def _stamp_spec_provider_in_place(
 
     Called ONLY when the resolved spec would run on the offline stub AND its ``provider`` is
     unset and its ``model`` is ``default`` — i.e. the user has expressed no explicit backend.
-    Rewrites the YAML in place, setting ``provider:`` (and ``model:`` when the detected choice
-    carries one), and returns ``(provider, model)``. This is idempotent and NEVER clobbers
-    explicit config: with a provider already set, or a model other than ``default``, the caller
-    does not reach here, so a deliberate ``provider: stub`` or a pinned model always stands.
+    Sets ``provider:`` (and ``model:`` when the detected choice carries one) and returns
+    ``(provider, model)``. This is idempotent and NEVER clobbers explicit config: with a
+    provider already set, or a model other than ``default``, the caller does not reach here, so
+    a deliberate ``provider: stub`` or a pinned model always stands.
+
+    The edit is TEXTUAL and comment-preserving — it mutates only the ``model:``/``provider:``
+    lines rather than re-dumping the parsed YAML — so the user's hand-authored comments,
+    formatting, and key order survive (a ``deploy`` the user expected only to SERVE must not
+    silently reformat their spec). The write is ATOMIC (tmp file + ``os.replace``), so a
+    concurrent stamp or a crash mid-write can never leave a truncated/half-written spec — the
+    file every subsequent boot depends on. Falls back to a YAML re-dump ONLY when the textual
+    anchors are absent (a non-scaffold spec), still writing atomically.
 
     Returns ``None`` when nothing was written (unreadable/absent file) so the caller can fall
     back to a clearly-labelled stub rather than claim a real backend it did not stamp.
@@ -2260,7 +2306,8 @@ def _stamp_spec_provider_in_place(
 
     path = Path(agent_path)
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        text = path.read_text(encoding="utf-8")
+        raw = yaml.safe_load(text) or {}
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
@@ -2268,14 +2315,64 @@ def _stamp_spec_provider_in_place(
     # Idempotent + never-clobber: only stamp when the user set neither provider nor model.
     if raw.get("provider") or (raw.get("model") not in (None, "default")):
         return raw.get("provider") or None, raw.get("model") or None
-    raw["provider"] = choice.key
-    if choice.model:
-        raw["model"] = choice.model
-    try:
-        path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    except OSError:
+
+    model = choice.model or "default"
+    stamped = _textual_stamp_provider(text, provider=choice.key, model=model)
+    if stamped is None:
+        # No textual anchors (a spec that didn't come from the scaffold): fall back to a
+        # structured re-dump. Comments are lost in this branch only, but the common
+        # scaffold path above preserves them; the write is still atomic.
+        raw["provider"] = choice.key
+        if choice.model:
+            raw["model"] = choice.model
+        stamped = yaml.safe_dump(raw, sort_keys=False)
+    if not _atomic_write_text(path, stamped):
         return None
     return choice.key, choice.model
+
+
+def _textual_stamp_provider(text: str, *, provider: str, model: str) -> str | None:
+    """Set ``provider:``/``model:`` in a scaffold spec by line edit (comments preserved).
+
+    Mirrors :func:`_stamp_scaffold_provider`: uncomment the ``# provider: ...`` template line
+    and replace ``model: default``, touching nothing else. Returns the new text, or ``None``
+    when the expected anchors are absent (so the caller can fall back to a structured re-dump).
+    """
+    guard = f"\n{text}"
+    if "\nprovider:" in guard or "\nmodel: default" not in guard:
+        return None
+    stamped = text.replace("model: default", f"model: {model}", 1)
+    if "# provider: claude-cli" in stamped:
+        return stamped.replace("# provider: claude-cli", f"provider: {provider}", 1)
+    # Model anchor present but no commented provider line: append the provider setting.
+    return stamped.replace(
+        f"model: {model}", f"model: {model}\nprovider: {provider}", 1
+    )
+
+
+def _atomic_write_text(path: Path, text: str) -> bool:
+    """Write ``text`` to ``path`` atomically (tmp file + ``os.replace``). True on success.
+
+    Mirrors the api_keys writer's care: a crash or a concurrent writer can never observe a
+    truncated file — the replace is atomic, so a reader sees either the old or the new whole
+    contents. Returns ``False`` on an OS error so the caller can fall back cleanly.
+    """
+    import tempfile
+
+    try:
+        directory = path.parent
+        fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".stamp-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.replace(tmp, path)
+        finally:
+            with contextlib.suppress(OSError):
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+    except OSError:
+        return False
+    return True
 
 
 def _deploy_resolve_provider(agent_path: str) -> tuple[str | None, str | None, str | None]:
@@ -2470,6 +2567,9 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         # Fail-closed posture: off-loopback with no auth is refused — point at --share.
         # create_app raises HimmyError (subclasses Exception, NOT RuntimeError), so this
         # is the type we must catch for the friendly guidance to fire.
+        # The deploy aborted before serving — revoke the share key we minted so it does not
+        # linger as a live, never-expiring all-tenants credential on disk.
+        _revoke_share_key(share_apikey)
         _eprint(f"error: {exc}")
         _eprint("  add auth before exposing off-loopback:  himmy deploy --share")
         return 2
@@ -2499,7 +2599,9 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         _eprint("\n(stopped)")
         return 130
     except OSError as exc:
-        # The most common boot failure: the port is already in use.
+        # The server never came up (most commonly the port is already in use) — revoke the
+        # minted share key so a failed --share attempt doesn't leave an orphaned live key.
+        _revoke_share_key(share_apikey)
         if getattr(exc, "errno", None) in (48, 98) or "address already in use" in str(
             exc
         ).lower():
@@ -2518,20 +2620,41 @@ def commands_telegram_wrapper(args: argparse.Namespace) -> int:
     return cmd_telegram(args)
 
 
+#: Exit code the channel entrypoints (``cmd_telegram``/``cmd_studio``) return for a
+#: PERMANENT, deterministic misconfiguration (a missing bot token, a held process lock) —
+#: as opposed to a transient crash. The restart supervisor treats this as fatal and gives up
+#: immediately rather than thrashing forever on a config error a restart can never heal.
+_DEPLOY_FATAL_EXIT = 2
+
+#: A run that stays up at least this long is treated as "healthy" — the restart backoff is
+#: reset to its floor afterwards, so a daemon that survives for hours then blips restarts
+#: quickly rather than at the last (long) backoff of an unrelated earlier crash-loop.
+_DEPLOY_HEALTHY_RUNTIME_S = 60.0
+
+
 def _deploy_channel_with_restart(
     fn: Any, args: argparse.Namespace, label: str
 ) -> int:
     """Run a channel entrypoint with restart-on-failure (a long-running daemon should heal).
 
-    ``himmy deploy --channel telegram``/``studio`` is meant to STAY up; a transient crash
-    (network blip, provider hiccup) should not end the deployment. This restarts ``fn`` on a
+    ``himmy deploy --channel telegram``/``studio`` is meant to STAY up; a TRANSIENT crash
+    (network blip, provider hiccup) should not end the deployment, so this restarts ``fn`` on a
     non-zero return or an exception, backing off up to a cap, and stops cleanly on Ctrl-C. A
     clean exit (``0``) is honoured — the operator stopped it on purpose.
+
+    A PERMANENT misconfiguration is NOT retried: when the entrypoint returns
+    :data:`_DEPLOY_FATAL_EXIT` (2) — a missing bot token, a held Telegram lock, any
+    deterministic startup refusal — restarting can never heal it, so the supervisor gives up
+    immediately and propagates the failure (a wrapping ``systemd``/``docker`` unit then sees a
+    real non-zero exit instead of a pinned, silently-looping process). The backoff is RESET
+    after a run that stayed up past :data:`_DEPLOY_HEALTHY_RUNTIME_S`, so a long-lived daemon
+    that blips restarts fast rather than at a stale long backoff.
     """
     import time
 
     backoff = 1.0
     while True:
+        started = time.monotonic()
         try:
             code = fn(args)
         except KeyboardInterrupt:  # pragma: no cover - interactive
@@ -2542,7 +2665,20 @@ def _deploy_channel_with_restart(
         else:
             if code == 0:
                 return 0
+            if code == _DEPLOY_FATAL_EXIT:
+                # A permanent config error (missing credential / held lock): a restart can
+                # never fix it, so fail fast rather than loop forever pinning the supervisor.
+                _eprint(
+                    f"error: {label} exited ({code}) — this looks like a permanent "
+                    "configuration error, not a transient crash. Fix the config and re-run; "
+                    "not restarting."
+                )
+                return code
             _eprint(f"⚠ {label} exited ({code}) — restarting in {backoff:.0f}s")
+        # Reset the backoff after a run that stayed up long enough to be "healthy", so an
+        # unrelated later blip doesn't inherit a long backoff from an earlier crash-loop.
+        if time.monotonic() - started >= _DEPLOY_HEALTHY_RUNTIME_S:
+            backoff = 1.0
         try:
             time.sleep(backoff)
         except KeyboardInterrupt:  # pragma: no cover - interactive
@@ -2595,15 +2731,51 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
         return False, None
     os.environ["HIMMY_API_KEYS_FILE"] = str(path)
     os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    # Keep the shared "friend" key off the observability surface: /metrics authenticates any
+    # valid principal, so without its OWN token the shared key could scrape the deployment-wide
+    # authz-deny / latency / token-cost map. Provision a SEPARATE metrics token (not the shared
+    # key, not printed) so /metrics stays out of the shared credential's reach. Set (not
+    # clobber) so an operator-configured token stands.
+    os.environ.setdefault("HIMMY_METRICS_TOKEN", _secrets.token_urlsafe(32))
     from himmy.api.auth.apikey import DEFAULT_HEADER as _APIKEY_HEADER
 
     _eprint(
         "--share: minted an API key and enabled auth (required before the tunnel "
         "exposes this service).\n"
-        f"  send it as the {_APIKEY_HEADER} header. SECRET (shown once):\n"
-        f"    {secret}\n"
+        f"  send it as the {_APIKEY_HEADER} header. This is a LIVE admin credential and is\n"
+        "  shown ONCE — save it now (it will not be shown again):\n\n"
+        f"    {secret}\n\n"
+        "  the sample curl references it as $HIMMY_SHARE_KEY — export it (keeps the raw\n"
+        "  key out of your shell history):\n"
+        "    export HIMMY_SHARE_KEY=<the key above>\n"
     )
     return True, secret
+
+
+def _revoke_share_key(secret: str | None) -> None:
+    """Remove a just-minted ``--share`` key from the keys file when the deploy aborts.
+
+    ``--share`` mints a live all-tenants key + persists it BEFORE the server binds. If the
+    deploy then aborts (fail-closed refusal, port-in-use), that key would otherwise linger on
+    disk as a never-expiring admin credential that a later server reading the same keys file
+    would honour — and repeated failed attempts would accrete more. Deleting exactly the
+    minted secret on abort keeps the file clean without touching any operator-managed key.
+    Best-effort and silent on error (a stale key is a hygiene issue, never a boot blocker).
+    """
+    if not secret:
+        return
+    from himmy.cli.apikey_cmd import _load_keys, _write_json_0600
+
+    keys_file = os.environ.get("HIMMY_API_KEYS_FILE") or ".himmy/api_keys.json"
+    path = Path(keys_file)
+    try:
+        keys = _load_keys(path)
+    except (OSError, ValueError):
+        return
+    if keys.pop(secret, None) is None:
+        return
+    with contextlib.suppress(OSError):
+        _write_json_0600(path, keys)
 
 
 def render_share_tunnel(*, host: str, port: int) -> str:

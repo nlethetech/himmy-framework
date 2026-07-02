@@ -45,6 +45,7 @@ from himmy.connectors.webhook import (
 _TOUCHED = [
     WEBHOOK_SIGNING_SECRET,
     "HIMMY_WEBHOOK_ALLOWED_SOURCES",
+    "HIMMY_WEBHOOK_REQUIRE_TIMESTAMP",
     _enabled_flag_name("webhook", "inbound"),
     INBOUND_AGENT_PATH_ENV,
     INBOUND_PROVIDER_ENV,
@@ -53,6 +54,7 @@ _TOUCHED = [
     "HIMMY_TELEGRAM_BOT_TOKEN",
     "HIMMY_AUTH_MODE",
     "HIMMY_API_KEYS_FILE",
+    "HIMMY_METRICS_TOKEN",
     commands.API_KEYS_JSON_ENV,
     commands.API_KEY_ENV,
 ]
@@ -89,16 +91,21 @@ def test_deploy_wiring_mounts_signed_endpoint_unsigned_denied(env: Path) -> None
     app = create_app(bind_host="127.0.0.1")
     assert "/v1/connectors/webhook" in collect_route_paths(app)
 
+    import time as _time
+
+    from himmy.connectors.webhook import DEFAULT_TIMESTAMP_HEADER
+
     body = json.dumps(
         {"source": commands._SERVICE_SAMPLE_SOURCE, "text": "hello"},
         separators=(",", ":"),
     ).encode()
-    sig = sign_webhook_body(secret=secret, body=body)
+    ts = str(int(_time.time()))
+    sig = sign_webhook_body(secret=secret, body=body, timestamp=ts)
     with TestClient(app) as client:
         ok = client.post(
             "/v1/connectors/webhook",
             content=body,
-            headers={DEFAULT_SIGNATURE_HEADER: sig},
+            headers={DEFAULT_SIGNATURE_HEADER: sig, DEFAULT_TIMESTAMP_HEADER: ts},
         )
         assert ok.status_code == 200
         data = ok.json()
@@ -107,6 +114,15 @@ def test_deploy_wiring_mounts_signed_endpoint_unsigned_denied(env: Path) -> None
 
         unsigned = client.post("/v1/connectors/webhook", content=body)
         assert unsigned.status_code == 401
+
+        # A timestamp-less body-only signature is refused by the front door (replay guard on).
+        body_only_sig = sign_webhook_body(secret=secret, body=body)
+        replay = client.post(
+            "/v1/connectors/webhook",
+            content=body,
+            headers={DEFAULT_SIGNATURE_HEADER: body_only_sig},
+        )
+        assert replay.status_code == 401
 
 
 # ------------------------------------------------------------- provider stamping
@@ -384,29 +400,40 @@ def test_share_summary_curl_carries_apikey_and_succeeds(env: Path) -> None:
     os.environ["HIMMY_API_KEYS_FILE"] = str(keys_path)
     os.environ["HIMMY_AUTH_MODE"] = "apikey"
     try:
+        import time as _time
+
+        from himmy.connectors.webhook import DEFAULT_TIMESTAMP_HEADER
+
         app = create_app(bind_host="127.0.0.1")
         body = json.dumps(
             {"source": commands._SERVICE_SAMPLE_SOURCE, "text": "hello"},
             separators=(",", ":"),
         ).encode()
-        sig = sign_webhook_body(secret=secret, body=body)
+        ts = str(int(_time.time()))
+        sig = sign_webhook_body(secret=secret, body=body, timestamp=ts)
         with TestClient(app) as client:
             # signature alone (what the OLD curl sent) is rejected in apikey mode.
             denied = client.post(
                 "/v1/connectors/webhook",
                 content=body,
-                headers={DEFAULT_SIGNATURE_HEADER: sig},
+                headers={DEFAULT_SIGNATURE_HEADER: sig, DEFAULT_TIMESTAMP_HEADER: ts},
             )
             assert denied.status_code in (401, 403)
-            # signature + apikey (what the NEW summary prints) succeeds.
+            # signature + timestamp + apikey (what the NEW summary prints) succeeds.
             ok = client.post(
                 "/v1/connectors/webhook",
                 content=body,
-                headers={DEFAULT_SIGNATURE_HEADER: sig, APIKEY_HEADER: apikey},
+                headers={
+                    DEFAULT_SIGNATURE_HEADER: sig,
+                    DEFAULT_TIMESTAMP_HEADER: ts,
+                    APIKEY_HEADER: apikey,
+                },
             )
             assert ok.status_code == 200
 
-        # And the rendered summary actually includes the apikey header line.
+        # The rendered summary references the apikey via $HIMMY_SHARE_KEY (NOT the raw key —
+        # baking a live admin credential into a copy-paste command would leak it into shell
+        # history). The header name is present; the literal key is NOT.
         summary = commands.render_service_summary(
             host="0.0.0.0",  # noqa: S104
             port=8000,
@@ -415,7 +442,9 @@ def test_share_summary_curl_carries_apikey_and_succeeds(env: Path) -> None:
             store_path="x",
             apikey=apikey,
         )
-        assert f"{APIKEY_HEADER}: {apikey}" in summary
+        assert APIKEY_HEADER in summary
+        assert "$HIMMY_SHARE_KEY" in summary
+        assert apikey not in summary
     finally:
         os.environ.pop("HIMMY_API_KEYS_FILE", None)
         os.environ.pop("HIMMY_AUTH_MODE", None)
@@ -486,7 +515,7 @@ def test_share_provisions_auth_before_printing_any_public_command(
     assert "cloudflared tunnel --url http://127.0.0.1:8000" in err
     assert "ngrok http 8000" in err
     # And the minted key was shown once (the credential the friend needs).
-    assert "SECRET (shown once)" in err
+    assert "shown ONCE" in err
     # The tunnel block explicitly states auth is ON before offering the public command.
     assert "auth is ON" in err
 
@@ -621,12 +650,17 @@ def test_cloud_template_env_boots_authenticated_on_0000_after_seeding(env: Path)
     seeded = json.loads(keys_file.read_text())
     assert apikey in seeded and seeded[apikey]["all_tenants"] is True
 
+    import time as _time
+
+    from himmy.connectors.webhook import DEFAULT_TIMESTAMP_HEADER
+
     body = json.dumps(
         {"source": commands._SERVICE_SAMPLE_SOURCE, "text": "hi"}, separators=(",", ":")
     ).encode()
     # Wire the signed webhook so we can prove the seeded key gates a real request.
     secret = commands._enable_inbound_webhook(str(env / "agent.yaml"))
-    sig = sign_webhook_body(secret=secret, body=body)
+    ts = str(int(_time.time()))
+    sig = sign_webhook_body(secret=secret, body=body, timestamp=ts)
     from himmy.api.auth.apikey import DEFAULT_HEADER as APIKEY_HEADER
 
     # create_app now BOOTS on 0.0.0.0 (was a refusal before seeding) — proven authenticated.
@@ -635,13 +669,17 @@ def test_cloud_template_env_boots_authenticated_on_0000_after_seeding(env: Path)
         denied = client.post(
             "/v1/connectors/webhook",
             content=body,
-            headers={DEFAULT_SIGNATURE_HEADER: sig},
+            headers={DEFAULT_SIGNATURE_HEADER: sig, DEFAULT_TIMESTAMP_HEADER: ts},
         )
         assert denied.status_code in (401, 403)
         ok = client.post(
             "/v1/connectors/webhook",
             content=body,
-            headers={DEFAULT_SIGNATURE_HEADER: sig, APIKEY_HEADER: apikey},
+            headers={
+                DEFAULT_SIGNATURE_HEADER: sig,
+                DEFAULT_TIMESTAMP_HEADER: ts,
+                APIKEY_HEADER: apikey,
+            },
         )
         assert ok.status_code == 200
 
@@ -716,3 +754,173 @@ def test_seed_never_prints_raw_key_material(
     combined = out.err + out.out
     assert commands.API_KEY_ENV in combined  # names the env it seeded from
     assert raw not in combined  # but never the secret itself
+
+
+# ------------------------------------------- sec-r1 regressions (deploy-DX red-team round 1)
+
+
+def test_generated_webhook_secret_persists_across_restarts(env: Path) -> None:
+    """A generated signing secret is PERSISTED, so a restart reuses it (signed senders survive).
+
+    Regression: the secret used to be written to process env only, so every restart minted a
+    fresh secret and broke every previously-configured signed sender. With a writable secrets
+    backend (the ``env`` fixture wires a FileSecrets provider), the generated secret must be
+    stored through it so a second ``_enable_inbound_webhook`` (a fresh process reading the same
+    backend) resolves the SAME secret.
+    """
+    from himmy.config.secrets import get_secret
+
+    yaml = str(env / "agent.yaml")
+    # No operator secret set → a fresh one is generated and persisted through the provider.
+    os.environ.pop(WEBHOOK_SIGNING_SECRET, None)
+    first = commands._enable_inbound_webhook(yaml)
+    assert first
+    # It landed in the (writable) secrets backend, not merely process env.
+    assert get_secret(WEBHOOK_SIGNING_SECRET) == first
+    # Simulate a restart: clear the process env, re-run — the SAME secret is resolved.
+    os.environ.pop(WEBHOOK_SIGNING_SECRET, None)
+    second = commands._enable_inbound_webhook(yaml)
+    assert second == first  # not regenerated — the persisted secret is reused
+
+
+def test_enable_inbound_webhook_turns_on_the_replay_guard(env: Path) -> None:
+    """The front door sets HIMMY_WEBHOOK_REQUIRE_TIMESTAMP (replay guard on by default)."""
+    commands._enable_inbound_webhook(str(env / "agent.yaml"))
+    from himmy.config.flags import truthy
+
+    assert truthy(os.environ.get("HIMMY_WEBHOOK_REQUIRE_TIMESTAMP"))
+
+
+def test_provider_stamp_preserves_comments_and_writes_atomically(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stamp is a comment-preserving textual edit, not a safe_dump that drops comments.
+
+    Regression: ``himmy deploy`` used to yaml.safe_load + safe_dump the user's spec, destroying
+    every teaching comment. Now it edits only the ``model:``/``provider:`` lines textually, so
+    comments survive; and it writes atomically (no truncation window).
+    """
+    yaml = env / "agent.yaml"
+    yaml.write_text(
+        "name: bot\n"
+        "description: d\n"
+        "model: default\n"
+        "# provider: claude-cli      # keep this teaching comment\n"
+        "# tool_packs: [web]         # and this one\n"
+    )
+    from himmy.cli.wizard import ProviderChoice
+
+    fake = ProviderChoice(key="ollama", label="ollama", model="llama3.2")
+    monkeypatch.setattr("himmy.cli.wizard.detect_provider_choices", lambda: [fake])
+
+    provider, model, hint = commands._deploy_resolve_provider(str(yaml))
+    assert provider == "ollama" and model == "llama3.2" and hint is None
+    text = yaml.read_text()
+    assert "provider: ollama" in text
+    assert "model: llama3.2" in text
+    # The user's teaching comments survived the stamp (the whole point of the fix).
+    assert "# keep this teaching comment" in text
+    assert "# and this one" in text
+
+
+def test_atomic_write_leaves_no_temp_file(env: Path) -> None:
+    """The atomic writer replaces the target and leaves no stray tmp file behind."""
+    target = env / "spec.yaml"
+    target.write_text("old\n")
+    assert commands._atomic_write_text(target, "new content\n") is True
+    assert target.read_text() == "new content\n"
+    strays = [p.name for p in env.iterdir() if p.name.startswith(".stamp-")]
+    assert strays == []
+
+
+def test_restart_supervisor_fails_fast_on_permanent_config_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A permanent config error (exit 2) is NOT retried forever — the supervisor gives up.
+
+    Regression: ``himmy deploy --channel telegram`` with no token returned exit 2 on every
+    attempt and the supervisor looped forever. Now exit 2 (the fatal-config code) is
+    propagated immediately instead of thrashing.
+    """
+    calls = {"n": 0}
+
+    def _always_fatal(_args: object) -> int:
+        calls["n"] += 1
+        return commands._DEPLOY_FATAL_EXIT  # a missing-token-style permanent failure
+
+    code = commands._deploy_channel_with_restart(_always_fatal, argparse.Namespace(), "telegram")
+    assert code == commands._DEPLOY_FATAL_EXIT
+    assert calls["n"] == 1  # tried exactly once, did not loop
+    assert "permanent" in capsys.readouterr().err.lower()
+
+
+def test_restart_supervisor_still_retries_transient_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient non-zero exit (not the fatal code) is still retried, then succeeds."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    codes = iter([1, 1, 0])  # two transient failures, then a clean stop
+
+    def _flaky(_args: object) -> int:
+        return next(codes)
+
+    code = commands._deploy_channel_with_restart(_flaky, argparse.Namespace(), "studio")
+    assert code == 0
+    assert len(sleeps) == 2  # backed off between the two retries, then exited on 0
+
+
+def test_share_key_is_revoked_when_deploy_aborts(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failed ``--share`` deploy revokes the just-minted key (no orphaned live credential).
+
+    Regression: the share key was persisted BEFORE the server bound, so an abort (fail-closed
+    refusal / port-in-use) left a never-expiring all-tenants key on disk. The abort paths now
+    revoke exactly that key.
+    """
+    from himmy.cli.apikey_cmd import _load_keys
+
+    monkeypatch.chdir(env)
+
+    # Force the server bind to fail as if the port were in use.
+    async def _boom(*a: object, **k: object) -> None:
+        raise OSError(48, "address already in use")
+
+    monkeypatch.setattr(commands, "_serve_and_worker", _boom)
+
+    args = argparse.Namespace(
+        file=str(env / "agent.yaml"),
+        agent=None,
+        docker=False,
+        channel="http",
+        host="127.0.0.1",
+        port=8000,
+        share=True,
+    )
+    rc = commands.cmd_deploy(args)
+    assert rc == 1  # port-in-use failure
+
+    # The minted share key must NOT linger in the keys file.
+    keys_path = Path(os.environ["HIMMY_API_KEYS_FILE"])
+    remaining = _load_keys(keys_path) if keys_path.exists() else {}
+    # Any himmy_ all-tenants key that was minted for --share is gone (file empty or no share key).
+    assert not any(k.startswith("himmy_") for k in remaining)
+
+
+def test_share_provisions_a_metrics_token_off_the_shared_key(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--share`` sets HIMMY_METRICS_TOKEN so the shared key can't scrape /metrics.
+
+    Regression: /metrics authenticates any valid principal, so without its own token the
+    shared 'friend' key could read the deployment-wide observability map. --share now
+    provisions a SEPARATE metrics token (not the shared key, not printed).
+    """
+    monkeypatch.chdir(env)
+    os.environ.pop("HIMMY_METRICS_TOKEN", None)
+    ok, apikey = commands._deploy_configure_share_auth("127.0.0.1")
+    assert ok and apikey
+    token = os.environ.get("HIMMY_METRICS_TOKEN")
+    assert token  # a metrics token was provisioned
+    assert token != apikey  # and it is NOT the shared friend key

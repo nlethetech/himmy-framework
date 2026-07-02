@@ -684,9 +684,11 @@ class ConnectorService:
         """Instantiate the inbound connector for ``name`` wired to ``handler``."""
         if name == "webhook":
             allow = _split_env("HIMMY_WEBHOOK_ALLOWED_SOURCES")
+            require_ts = _secret_truthy("HIMMY_WEBHOOK_REQUIRE_TIMESTAMP")
             return make_webhook_connector(
                 handler,
                 allowed_sources=kwargs.pop("allowed_sources", None) or allow or None,
+                require_timestamp=kwargs.pop("require_timestamp", None) or require_ts,
                 context=self._context,
                 **kwargs,
             )
@@ -732,6 +734,14 @@ def _split_env(name: str) -> list[str]:
     """Split a comma-separated allow-list env into a clean list (resolved via secrets)."""
     raw = get_secret(name) or os.environ.get(name) or ""
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _secret_truthy(name: str) -> bool:
+    """Whether a boolean config flag (resolved via the secrets layer) is on."""
+    from himmy.config.flags import truthy
+
+    raw = get_secret(name) or os.environ.get(name) or ""
+    return truthy(raw)
 
 
 #: Built-in outbound connectors that :func:`_direct_outbound` can construct directly,

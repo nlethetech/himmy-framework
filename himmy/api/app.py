@@ -181,6 +181,24 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
             "would run every caller as an all-tenants admin. Configure tenant-binding "
             "auth (HIMMY_API_KEYS_FILE with per-tenant keys, or HIMMY_AUTH_MODE=oidc)."
         )
+    # When the operator EXPLICITLY declares mutually-untrusted tenants (HIMMY_MULTI_TENANT),
+    # ``binds_tenants`` is not enough: a keys file holding ONLY all-tenants-admin records
+    # satisfies it yet still runs every caller as an all-tenants admin — the exact posture the
+    # guard's own error text promises to refuse. Require at least one CONCRETE tenant-scoped
+    # key so the guarantee is real. A missing member (custom authenticator, or OIDC which binds
+    # per-request) is treated as concrete-binding (True) so only the apikey all-tenants-only
+    # file is caught. The single-agent apikey deploy (auth mode set, HIMMY_MULTI_TENANT unset)
+    # is the operator's intentional one-key posture and is NOT subject to this stricter check.
+    if env_truthy("HIMMY_MULTI_TENANT"):
+        concrete = getattr(authenticator, "binds_concrete_tenants", True)
+        if not concrete:
+            raise HimmyError(
+                "refusing to start: HIMMY_MULTI_TENANT is set but the configured keys bind "
+                "no concrete tenant — every key is an all-tenants admin, so every caller "
+                "would run as an all-tenants admin with no isolation. Configure per-tenant "
+                "API keys (HIMMY_API_KEYS_FILE entries with a non-empty tenant_ids), or use "
+                "HIMMY_AUTH_MODE=oidc."
+            )
     # Use the SAME truthy vocabulary as the consuming sanitizers / authenticator
     # (apikey._env_truthy, spec_sanitizer._truthy) — all now route through
     # himmy.config.flags.env_truthy — so a posture kill-switch can never be

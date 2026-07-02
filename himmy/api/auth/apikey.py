@@ -391,6 +391,23 @@ class ApiKeyAuthenticator:
         """
         return self._mapped_present
 
+    @property
+    def binds_concrete_tenants(self) -> bool:
+        """Whether ANY configured key is scoped to a concrete tenant (stricter than G1).
+
+        ``binds_tenants`` counts a mapped/record key as tenant-binding even when it is an
+        all-tenants admin — so a keys FILE holding ONLY all-tenants records satisfies it,
+        giving false assurance under a DECLARED multi-tenant posture (every caller would still
+        be an all-tenants admin, with no tenant to isolate from). This is the honest stricter
+        test the ``HIMMY_MULTI_TENANT`` guard uses: True only when at least one record carries
+        a non-empty ``tenant_ids`` (``all_tenants=False`` with concrete tenants). A file of
+        purely all-tenants records returns ``False`` here even though ``binds_tenants`` is True.
+        """
+        return any(
+            not record.principal.all_tenants and bool(record.principal.tenant_ids)
+            for record in self._records
+        )
+
     def openapi_security_scheme(self) -> dict[str, dict[str, object]]:
         """Advertise the API-key header as an OpenAPI security scheme (for docs)."""
         return {
