@@ -140,6 +140,15 @@ class ToolDefinition(BaseModel):
     #: the model-facing description infer intent from the tool's name. Surfaced to
     #: small models so a look-up never lands on a write tool (reader/writer confusion).
     read_only: bool | None = None
+    #: Whether ``read_only`` is an AUTHORITATIVE author assertion of no side effect
+    #: (safe to re-fire on a TIMEOUT), as opposed to a mere INFERENCE from the tool's
+    #: HTTP method or name. Only an authoritative ``read_only=True`` may re-fire a
+    #: timed-out call: a GET/HEAD endpoint can still have server-side side effects (an
+    #: analytics beacon, ``GET /trigger``), so method-derived read-only is a
+    #: parallelism hint ONLY — never a licence to duplicate a timed-out invocation.
+    #: Defaults False so any tool not explicitly asserted read-only is treated as
+    #: side-effecting for retry purposes (fail closed).
+    read_only_authoritative: bool = False
     timeout_seconds: float | None = None
     retry_hints: dict[str, Any] = {}
     sequential: bool = False

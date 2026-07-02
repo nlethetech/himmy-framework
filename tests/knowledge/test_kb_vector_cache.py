@@ -369,7 +369,8 @@ def test_fetch_publish_window_no_stale_publish() -> None:
     fired = {"done": False}
 
     def build_then_mutate(kb_id: str) -> Any:
-        gen, snapshot = real_build(kb_id)  # reads OLD committed rows + old generation
+        # reads OLD committed rows + old generation + old data_version
+        gen, data_version, snapshot = real_build(kb_id)
         if not fired["done"]:
             fired["done"] = True
             # Commit a NEW, query-aligned chunk in the fetch->publish window. This bumps
@@ -378,7 +379,7 @@ def test_fetch_publish_window_no_stale_publish() -> None:
                 backend, kb, doc_id="late", source_uri="late", text="late",
                 embedding=[1.0, 0.0, 0.0],
             )
-        return gen, snapshot
+        return gen, data_version, snapshot
 
     backend._build_chunk_snapshot = build_then_mutate  # type: ignore[method-assign]
     # This search built the stale snapshot, then the late chunk committed mid-flight.

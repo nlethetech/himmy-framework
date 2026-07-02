@@ -338,15 +338,15 @@ def test_resolve_auto_backend_concurrent_probes_at_most_once(
         t.join()
 
     assert results == ["ollama"] * 16  # every concurrent caller saw the same decision
-    # Exactly one converged cache entry for the default base_url (value is a
-    # ``(decision, deadline)`` tuple; only the decision is asserted here).
-    assert list(local_embedders._AUTO_BACKEND_CACHE) == [
-        local_embedders._DEFAULT_OLLAMA_URL
-    ]
-    assert (
-        local_embedders._AUTO_BACKEND_CACHE[local_embedders._DEFAULT_OLLAMA_URL][0]
-        == "ollama"
+    # Exactly one converged cache entry for the default base_url (key is now a
+    # ``(base, embed_model)`` tuple; value is a ``(decision, deadline)`` tuple —
+    # only the decision is asserted here).
+    key = (
+        local_embedders._DEFAULT_OLLAMA_URL,
+        local_embedders.default_ollama_embed_model(),
     )
+    assert list(local_embedders._AUTO_BACKEND_CACHE) == [key]
+    assert local_embedders._AUTO_BACKEND_CACHE[key][0] == "ollama"
 
 
 # ---------------------------------------- red-team r1: staleness TTL + normalisation
@@ -446,7 +446,9 @@ def test_equivalent_base_urls_share_one_cache_entry(
         assert resolve_auto_backend(ollama_base_url=url) == "ollama"
     # All four spellings collapsed to ONE normalised key and ONE probe.
     assert counter.reachable_calls == 1
-    assert list(local_embedders._AUTO_BACKEND_CACHE) == ["http://localhost:11434"]
+    assert list(local_embedders._AUTO_BACKEND_CACHE) == [
+        ("http://localhost:11434", local_embedders.default_ollama_embed_model())
+    ]
 
 
 def test_normalise_base_url_leaves_path_and_port() -> None:
@@ -456,3 +458,103 @@ def test_normalise_base_url_leaves_path_and_port() -> None:
     assert n("HTTP://LocalHost:11434") == "http://localhost:11434"
     assert n("http://host:8080/v1/") == "http://host:8080/v1"
     assert n("not-a-url/") == "not-a-url"
+
+
+# --------------------------------------- red-team r2: model-keyed memo + guard TOCTOU
+
+
+def test_auto_backend_memo_reprobes_when_embed_model_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different HIMMY_OLLAMA_EMBED_MODEL re-probes: the memo is keyed on the model too.
+
+    The Ollama leg is model-dependent (it checks the *configured* model is pulled), so a
+    decision made while ``nomic-embed-text`` is pulled must NOT be served when an un-pulled
+    ``qwen3-embedding`` is later configured against the SAME server — that would build an
+    OllamaEmbedder that 404s at first embed instead of degrading to deterministic.
+    """
+    local_embedders.reset_auto_backend_cache()
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: True)
+
+    pulled = {"nomic-embed-text"}
+    probed_models: list[str | None] = []
+
+    def _avail(model: str | None = None, base_url: str = "", **_k: object) -> bool:
+        probed_models.append(model)
+        return (model or "").split(":", 1)[0] in pulled
+
+    monkeypatch.setattr(local_embedders, "ollama_embed_model_available", _avail)
+
+    monkeypatch.setenv("HIMMY_OLLAMA_EMBED_MODEL", "nomic-embed-text")
+    assert resolve_auto_backend(ollama_base_url="http://localhost:11434") == "ollama"
+
+    # Switch to an UN-pulled model on the SAME server: must re-probe (new cache key) and
+    # degrade to deterministic rather than serving the stale ``ollama`` decision.
+    monkeypatch.setenv("HIMMY_OLLAMA_EMBED_MODEL", "qwen3-embedding")
+    assert (
+        resolve_auto_backend(ollama_base_url="http://localhost:11434")
+        == "deterministic"
+    )
+    # The second probe actually ran and asked about the NEW model.
+    assert "qwen3-embedding" in probed_models
+
+
+def test_impl_and_guard_reads_cache_flag_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runtime env flip between the two reads can never pair a SHARED session + nullcontext.
+
+    ``_impl_and_guard`` must read ``_embed_cache_enabled`` ONCE and thread it into
+    ``_model_impl`` so the guard decision (shared -> lock) and the impl decision
+    (shared -> process-wide session) are made from the SAME observation. Previously the
+    two independent reads could diverge (off at read #1 -> nullcontext; on at read #2 ->
+    shared session), returning the shared session under a no-op guard.
+    """
+    reads = {"n": 0}
+
+    def _counting_enabled() -> bool:
+        reads["n"] += 1
+        return True  # cache ON: the shared session must be paired with the LOCK, never nullcontext
+
+    monkeypatch.setattr(local_embedders, "_embed_cache_enabled", _counting_enabled)
+
+    shared_session = object()
+    monkeypatch.setattr(
+        local_embedders, "_load_text_embedding", lambda _model: shared_session
+    )
+
+    emb = FastEmbedEmbedder(model="stub")
+    impl, guard = emb._impl_and_guard()
+
+    # Exactly ONE flag read backed BOTH the guard decision and the impl decision, so a
+    # runtime env flip landing between two independent reads can no longer pair the shared
+    # session with a no-op guard.
+    assert reads["n"] == 1
+    # cache ON -> the SHARED process-wide session, serialised under the real lock.
+    assert impl is shared_session
+    assert guard is local_embedders._TEXT_EMBED_LOCK
+
+
+def test_impl_and_guard_private_session_uses_nullcontext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single flag read of OFF yields a PRIVATE session under nullcontext (no shared race)."""
+    reads = {"n": 0}
+
+    def _counting_disabled() -> bool:
+        reads["n"] += 1
+        return False
+
+    monkeypatch.setattr(local_embedders, "_embed_cache_enabled", _counting_disabled)
+
+    private = object()
+    emb = FastEmbedEmbedder(model="stub")
+    emb._impl = private  # a pre-set (private) session wins over any cache path
+    impl, guard = emb._impl_and_guard()
+
+    assert reads["n"] == 1
+    assert impl is private
+    import contextlib
+
+    assert isinstance(guard, contextlib.nullcontext)

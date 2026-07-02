@@ -740,10 +740,19 @@ class ToolService:
     ) -> bool:
         """Whether a transient ``code`` may be retried for THIS invocation.
 
-        LOCAL tools and read-only / idempotent HTTP calls are always safe to repeat. A
+        LOCAL tools and idempotent HTTP calls are always safe to repeat. A
         side-effecting HTTP method (POST/PUT/PATCH/DELETE) with NO idempotency key may
         already have landed when a TIMEOUT or PROVIDER_UNAVAILABLE fires, so those are
         not retried — only RATE_LIMITED (429, rejected before any work) is.
+
+        A method-SAFE HTTP verb (GET/HEAD/OPTIONS) is retry-safe for RATE_LIMITED and
+        PROVIDER_UNAVAILABLE (a 429/503 was rejected/declined by the server before any
+        work) but on a TIMEOUT — the one code where the request may already have LANDED
+        and committed a side effect — it is re-fired ONLY when the tool is
+        AUTHORITATIVELY read-only (an explicit author assertion), because a GET endpoint
+        may still have a server-side side effect (an analytics beacon, ``GET /trigger``)
+        and the method is only a convention the remote server may violate. The method
+        alone is a parallelism hint, never a licence to duplicate a timed-out call.
 
         The idempotency exemption is keyed off whether the key was actually supplied
         for *this* call — not merely whether ``idempotency_arg`` is configured. The
@@ -755,10 +764,21 @@ class ToolService:
         cfg = definition.http_config
         if cfg is None:
             return True
-        if cfg.method.upper() in _SAFE_HTTP_METHODS:
-            return True
         if cfg.idempotency_arg and args.get(cfg.idempotency_arg):
             return True  # the Idempotency-Key lets the upstream dedupe a resend
+        safe_method = cfg.method.upper() in _SAFE_HTTP_METHODS
+        if code is ToolErrorCode.TIMEOUT:
+            # The request may already have LANDED and committed a side effect. A safe
+            # method re-fires only when the author AUTHORITATIVELY asserted no side
+            # effect; a method-derived read-only (a bare GET) does NOT — the endpoint
+            # may be side-effecting (an analytics beacon, ``GET /trigger``).
+            return (
+                definition.read_only_authoritative and definition.read_only is True
+            )
+        # RATE_LIMITED (429) / PROVIDER_UNAVAILABLE (503): the server rejected/declined
+        # the request before doing any work, so a safe method is always safe to resend.
+        if safe_method:
+            return True
         return code is ToolErrorCode.RATE_LIMITED
 
     async def _dispatch(self, definition: ToolDefinition, args: dict[str, Any]) -> Any:

@@ -131,7 +131,7 @@ class FastEmbedReranker:
         self.model = model
         self._impl: Any = None
 
-    def _model_impl(self) -> Any:
+    def _model_impl(self, cache_enabled: bool | None = None) -> Any:
         """Return the cross-encoder, sharing one native session per model name.
 
         When the shared cache is enabled (the default; see :data:`_EMBED_CACHE_ENV`),
@@ -139,12 +139,20 @@ class FastEmbedReranker:
         every :class:`FastEmbedReranker` for the same model reuses one ONNX session; with
         the cache off, each instance lazily builds and holds its own private session.
 
+        ``cache_enabled`` lets the caller pass a SINGLE observation of
+        :func:`_rerank_cache_enabled` so this decision and the guard-selection in
+        :meth:`_impl_and_guard` are made from the same read — closing a TOCTOU where a
+        runtime env flip between two independent reads could pair the shared session with
+        a no-op lock. When ``None`` the flag is read here.
+
         An explicitly pre-set ``self._impl`` (e.g. a test-injected fake) always wins over
         the shared cache, so per-instance overrides keep working unchanged.
         """
         if self._impl is not None:
             return self._impl
-        if _rerank_cache_enabled():
+        if cache_enabled is None:
+            cache_enabled = _rerank_cache_enabled()
+        if cache_enabled:
             # Load-exactly-once under concurrent cold start (see the build-lock docstring);
             # an uncontended dict-hit once warm, released before any rerank runs.
             with _CROSS_ENCODER_BUILD_LOCK:
@@ -172,9 +180,15 @@ class FastEmbedReranker:
         injected ``self._impl`` or a ``HIMMY_EMBED_CACHE=off`` build) is unique to this
         instance and parallelises under :class:`contextlib.nullcontext`. The shared flag is
         captured *before* :meth:`_model_impl` populates ``self._impl``.
+
+        THREAD-SAFETY: :func:`_rerank_cache_enabled` reads the env LIVE. The flag is read
+        EXACTLY ONCE here and threaded into :meth:`_model_impl` so the guard decision and
+        the impl decision can never diverge across two independent reads (which would pair
+        the shared session with a no-op ``nullcontext`` and let concurrent reranks race).
         """
-        shared = self._impl is None and _rerank_cache_enabled()
-        impl = self._model_impl()
+        cache_enabled = _rerank_cache_enabled()
+        shared = self._impl is None and cache_enabled
+        impl = self._model_impl(cache_enabled)
         guard = _CROSS_ENCODER_LOCK if shared else contextlib.nullcontext()
         return impl, guard
 

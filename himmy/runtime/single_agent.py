@@ -3537,18 +3537,24 @@ class SingleAgentRuntime:
         return request, tool_names_override or tool_names
 
     def _tool_is_read_only(self, tool_name: str) -> bool:
-        """True only when ``tool_name`` is provably read-only (no side effect).
+        """True only when ``tool_name`` is provably safe to RE-FIRE after a TIMEOUT.
 
-        Used to decide whether a TIMEOUT may be retried: a read-only tool has no
-        side effect, so re-running it after a timeout is safe; anything else (a write
-        tool, or an ambiguously-named one whose intent can't be inferred) is treated
-        as side-effecting and NOT retried on timeout. Resolution: the definition's
-        explicit ``read_only`` flag wins; otherwise the name is classified with the
-        STRICT :func:`classify_parallel_safe` — NOT the first-token-wins
-        ``classify_read_only`` hint, which infers a name like ``fetch_and_delete`` /
-        ``get_or_create`` as read-only despite a write verb and would then let a
-        side-effecting call be re-fired after a timeout. A mixed/ambiguous name (and an
-        unknown tool with no definition) is conservatively treated as side-effecting.
+        A TIMEOUT does not mean the tool didn't run — the effect may have committed
+        server-side after the client gave up — so re-firing is only safe for a tool
+        with NO side effect. This is deliberately strict:
+
+        * an AUTHORITATIVE ``read_only=True`` (the author explicitly asserted no side
+          effect via the ``read_only`` argument) is trusted; but
+        * a merely-INFERRED read-only — a GET/HEAD HTTP method, or a name the strict
+          classifier reads as safe — is NOT, because a GET endpoint can still have a
+          server-side side effect (an analytics beacon, ``GET /trigger``) and a name is
+          only a guess. For those, timeout-retry falls back to the strict NAME check
+          only when there is no method signal; a method-derived read-only never
+          re-fires on its own.
+
+        Anything else (a write tool, an ambiguous name, an unknown tool with no
+        definition) is conservatively treated as side-effecting and NOT retried on
+        timeout.
         """
         if self.tool_service is None:
             return False
@@ -3558,8 +3564,17 @@ class SingleAgentRuntime:
         definition = registry.get(tool_name)
         if definition is None:
             return False
-        if definition.read_only is not None:
+        # An author's explicit read_only=True is authoritative — safe to re-fire.
+        if definition.read_only_authoritative:
             return bool(definition.read_only)
+        # A method-DERIVED read_only (HTTP GET/HEAD/OPTIONS) is a parallelism hint only;
+        # the remote server may violate the convention, so never re-fire on it.
+        if definition.http_config is not None:
+            return False
+        # An author's explicit read_only=False is honoured; an inferred/absent value on
+        # a local tool falls back to the strict name gate.
+        if definition.read_only is False:
+            return False
         from himmy.services.tools.access import classify_parallel_safe
 
         return classify_parallel_safe(tool_name)

@@ -103,6 +103,9 @@ def register_local_tool(
     whether the tool only reads (vs mutates) — surfaced to small models so a
     look-up doesn't land on a write tool; omit it to infer from the name. Returns
     the created :class:`ToolDefinition`.
+
+    An explicit ``read_only=True`` is AUTHORITATIVE (the author asserts no side
+    effect), so a timed-out call may be re-fired; a name-inferred read-only is not.
     """
     definition = ToolDefinition(
         name=name,
@@ -112,6 +115,7 @@ def register_local_tool(
         output_json_schema=output_json_schema,
         requires_approval=requires_approval,
         read_only=read_only,
+        read_only_authoritative=read_only is True,
         sequential=sequential,
         timeout_seconds=timeout_seconds,
         retry_hints=retry_hints or {},
@@ -149,7 +153,13 @@ def register_http_tool(
     are read-only, every other method (POST/PUT/PATCH/DELETE) is a writer. An explicit
     ``read_only`` argument overrides the method (e.g. a read-only POST search). This
     beats the name heuristic so a POST named ``search_orders`` is never mis-parallelised.
+
+    A method-DERIVED ``read_only`` is a parallelism hint only, NOT authoritative: a
+    GET/HEAD endpoint may still have server-side side effects (an analytics beacon,
+    ``GET /trigger``), so it must never license re-firing a timed-out call. Only an
+    EXPLICIT ``read_only=True`` argument is authoritative for timeout-retry.
     """
+    read_only_authoritative = read_only is True
     if read_only is None:
         read_only = _read_only_from_method(http_config.method)
     definition = ToolDefinition(
@@ -160,6 +170,7 @@ def register_http_tool(
         output_json_schema=output_json_schema,
         requires_approval=requires_approval,
         read_only=read_only,
+        read_only_authoritative=read_only_authoritative,
         sequential=sequential,
         timeout_seconds=timeout_seconds,
         retry_hints=retry_hints or {},

@@ -199,7 +199,7 @@ class FastEmbedEmbedder:
         self.dim = dim
         self._impl: Any = None
 
-    def _model_impl(self) -> Any:
+    def _model_impl(self, cache_enabled: bool | None = None) -> Any:
         """Return the fastembed model, sharing one native session per model name.
 
         The native ``TextEmbedding`` constructor downloads (first time) and
@@ -211,12 +211,21 @@ class FastEmbedEmbedder:
         reloading the native model per build. With the cache off, each instance builds
         and holds its own private session (the pre-cache behaviour).
 
+        ``cache_enabled`` lets the caller pass a SINGLE observation of
+        :func:`_embed_cache_enabled` so the shared-vs-private decision here and the
+        guard-selection in :meth:`_impl_and_guard` are made from the same read — closing
+        a TOCTOU where a runtime env flip between two independent reads could pair the
+        shared session with a no-op lock. When ``None`` the flag is read here (callers
+        outside the guard path are unaffected).
+
         An explicitly pre-set ``self._impl`` (e.g. a test-injected fake session) always
         wins over the shared cache, so per-instance overrides keep working unchanged.
         """
         if self._impl is not None:
             return self._impl
-        if _embed_cache_enabled():
+        if cache_enabled is None:
+            cache_enabled = _embed_cache_enabled()
+        if cache_enabled:
             # Hold the build lock across the cache lookup+build so a concurrent cold-start
             # for the same model loads the ONNX session EXACTLY ONCE (``functools.cache``
             # runs the loader outside its own lock, so two missers would otherwise each
@@ -247,9 +256,17 @@ class FastEmbedEmbedder:
         under :class:`contextlib.nullcontext` — the pre-cache behaviour. The shared flag is
         captured *before* :meth:`_model_impl` populates ``self._impl`` so the two never
         disagree.
+
+        THREAD-SAFETY: :func:`_embed_cache_enabled` reads the env LIVE, and operators/tests
+        may flip ``HIMMY_EMBED_CACHE`` at runtime. The flag is therefore read EXACTLY ONCE
+        here and threaded into :meth:`_model_impl`, so the guard decision (shared → lock)
+        and the impl decision (shared → process-wide session) can never diverge across two
+        independent reads — which would otherwise pair the shared session with a no-op
+        ``nullcontext`` and let concurrent embeds race on fastembed's mutable state.
         """
-        shared = self._impl is None and _embed_cache_enabled()
-        impl = self._model_impl()
+        cache_enabled = _embed_cache_enabled()
+        shared = self._impl is None and cache_enabled
+        impl = self._model_impl(cache_enabled)
         guard = _TEXT_EMBED_LOCK if shared else contextlib.nullcontext()
         return impl, guard
 
@@ -428,9 +445,13 @@ _TERMINAL_BACKENDS = frozenset({"fastembed"})
 #: where ``deadline`` is ``None`` for a terminal decision. The decision is stable for the
 #: process lifetime — ``fastembed`` importability does not change turn-to-turn — yet
 #: ``build_runtime_for_spec`` re-runs it 1–4× *per turn*, each doing blocking ~0.25s +
-#: ~0.5s HTTP probes. Caching keyed on the normalised base_url keeps different servers
-#: independent while de-duping trivially-different spellings of the SAME server.
-_AUTO_BACKEND_CACHE: dict[str, tuple[str, float | None]] = {}
+#: ~0.5s HTTP probes. Caching keyed on ``(normalised base_url, embed model)`` keeps
+#: different servers AND different embed models independent (the Ollama leg is
+#: model-dependent: it checks the *configured* embed model is pulled) while de-duping
+#: trivially-different spellings of the SAME server. A model-blind key would serve an
+#: ``ollama`` decision made for a pulled model when a different, un-pulled model is later
+#: configured against the same server — building an OllamaEmbedder that 404s at first embed.
+_AUTO_BACKEND_CACHE: dict[tuple[str, str], tuple[str, float | None]] = {}
 
 #: Guards :data:`_AUTO_BACKEND_CACHE` so concurrent turns racing on the first probe
 #: cannot corrupt the dict or run redundant probes; the actual probe (network I/O) runs
@@ -488,15 +509,20 @@ def reset_auto_backend_cache() -> None:
         _AUTO_BACKEND_CACHE.clear()
 
 
-def _probe_auto_backend(base: str) -> str:
+def _probe_auto_backend(base: str, embed_model: str) -> str:
     """Actually probe for the concrete auto-backend for a normalised Ollama ``base`` URL.
 
     The uncached inner decision (see :func:`resolve_auto_backend` for the caching layer):
-    ``fastembed`` → a local Ollama **with the embed model pulled** → ``deterministic``.
+    ``fastembed`` → a local Ollama **with the configured ``embed_model`` pulled** →
+    ``deterministic``. The Ollama leg is probed for the SPECIFIC ``embed_model`` that will
+    actually be embedded with, so switching to an un-pulled model degrades to deterministic
+    instead of 404-ing at embed time.
     """
     if fastembed_available():
         return "fastembed"
-    if ollama_reachable(base) and ollama_embed_model_available(base_url=base):
+    if ollama_reachable(base) and ollama_embed_model_available(
+        model=embed_model, base_url=base
+    ):
         return "ollama"
     return "deterministic"
 
@@ -513,12 +539,16 @@ def resolve_auto_backend(*, ollama_base_url: str | None = None) -> str:
     pulled an Ollama embedding model. The result is a plain backend name so callers can
     both build the embedder and look up its conventional dim coherently.
 
-    The decision is **memoised per process, keyed on the NORMALISED Ollama base URL**
-    (default ON; disable with ``HIMMY_BACKEND_PROBE_CACHE=off``). Within a turn
-    ``build_runtime_for_spec`` calls this several times; the memo collapses those to at
-    most one blocking probe per window — a pure latency win with a byte-identical result.
-    Equivalent spellings of the same server (trailing slash, host case) share one entry
-    (see :func:`_normalise_base_url`). A ``fastembed`` decision is terminal (cached
+    The decision is **memoised per process, keyed on ``(NORMALISED Ollama base URL,
+    configured embed model)``** (default ON; disable with ``HIMMY_BACKEND_PROBE_CACHE=off``).
+    Within a turn ``build_runtime_for_spec`` calls this several times; the memo collapses
+    those to at most one blocking probe per window — a pure latency win with a
+    byte-identical result. Equivalent spellings of the same server (trailing slash, host
+    case) share one entry (see :func:`_normalise_base_url`). The embed model is part of the
+    key because the Ollama leg is model-dependent: a decision made while one model is pulled
+    must NOT be served when a different (possibly un-pulled) model is later configured
+    against the same server — that would build an OllamaEmbedder that 404s at first embed
+    instead of degrading to deterministic. A ``fastembed`` decision is terminal (cached
     forever). A ``deterministic``/``ollama`` decision is re-probed after
     ``HIMMY_BACKEND_PROBE_TTL`` seconds (default 10; ``0`` ⇒ cache forever) so a
     long-lived process that started before Ollama was up (or before the embed model was
@@ -527,10 +557,12 @@ def resolve_auto_backend(*, ollama_base_url: str | None = None) -> str:
     fired by :func:`reset_embedder_cache`) clears the memo outright for tests/reconfig.
     """
     base = _normalise_base_url(ollama_base_url or _DEFAULT_OLLAMA_URL)
+    embed_model = default_ollama_embed_model()
+    key = (base, embed_model)
     if not _backend_probe_cache_enabled():
-        return _probe_auto_backend(base)
+        return _probe_auto_backend(base, embed_model)
     now = time.monotonic()
-    cached = _AUTO_BACKEND_CACHE.get(base)
+    cached = _AUTO_BACKEND_CACHE.get(key)
     if cached is not None:
         decision, deadline = cached
         if deadline is None or now < deadline:
@@ -539,11 +571,11 @@ def resolve_auto_backend(*, ollama_base_url: str | None = None) -> str:
     # race just re-probes (identical result); the last writer wins under the lock. A
     # terminal (``fastembed``) decision is pinned (deadline ``None``); a non-terminal one
     # carries a TTL deadline so liveness changes are eventually noticed.
-    resolved = _probe_auto_backend(base)
+    resolved = _probe_auto_backend(base, embed_model)
     ttl = _backend_probe_ttl()
     deadline = None if (resolved in _TERMINAL_BACKENDS or ttl <= 0) else now + ttl
     with _AUTO_BACKEND_LOCK:
-        _AUTO_BACKEND_CACHE[base] = (resolved, deadline)
+        _AUTO_BACKEND_CACHE[key] = (resolved, deadline)
         return resolved
 
 

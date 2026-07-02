@@ -845,7 +845,7 @@ class SqliteKnowledgeBackend:
         is built and returned WITHOUT caching, preserving the exact pre-cache decode path.
         """
         if self._vec_cache_max_kbs <= 0:
-            _gen, snapshot = self._build_chunk_snapshot(kb_id)
+            _gen, _ver, snapshot = self._build_chunk_snapshot(kb_id)
             return snapshot
         # Drop the whole cache if ANOTHER connection committed to the file since we last
         # looked (cross-process / raw-SQL write) — cheap ``PRAGMA data_version`` check.
@@ -858,8 +858,9 @@ class SqliteKnowledgeBackend:
                 return cached
         # Build OUTSIDE the cache lock (the SELECT + JSON decode can be slow and must not
         # serialize other KBs' cache reads); the write lock still guards the SQL fetch AND the
-        # generation read, so ``gen`` and ``snapshot`` describe the SAME committed state.
-        gen, snapshot = self._build_chunk_snapshot(kb_id)
+        # gen + data_version reads, so ``(gen, data_version)`` and ``snapshot`` describe the
+        # SAME committed state.
+        gen, data_version, snapshot = self._build_chunk_snapshot(kb_id)
         with self._vec_state.cache_lock:
             # A concurrent builder may have populated it first — prefer the published entry so
             # every reader shares one snapshot (both reflect the same committed rows).
@@ -867,12 +868,19 @@ class SqliteKnowledgeBackend:
             if existing is not None:
                 cache.move_to_end(kb_id)
                 return existing
-            # Only publish if no committed mutation intervened between the fetch and now.
-            # If the generation advanced, an invalidation already fired (a no-op pop, since
-            # we hadn't published yet) and this snapshot is stale — return it uncached so the
-            # NEXT search rebuilds from the newer rows. This closes the fetch->publish TOCTOU
-            # that would otherwise pin a stale matrix indefinitely.
-            if self._current_vec_gen() == gen:
+            # Only publish if NEITHER an own-write (``gen``) NOR an EXTERNAL write
+            # (``data_version``) intervened between the fetch and now. ``gen`` catches this
+            # connection's own committed mutations; ``data_version`` catches a second
+            # process / sidecar / raw-``sqlite3`` write that committed after our snapshot
+            # was built but before we publish — without this second signal that external
+            # DELETE/UPDATE would be invisible (it never moves ``gen``) and we would pin a
+            # stale/deleted matrix for a full search window. If either advanced this
+            # snapshot is stale — return it uncached so the NEXT search rebuilds from the
+            # newer rows. This closes the full fetch->publish TOCTOU.
+            if (
+                self._current_vec_gen() == gen
+                and self._current_data_version() == data_version
+            ):
                 cache[kb_id] = snapshot
                 cache.move_to_end(kb_id)
                 while len(cache) > self._vec_cache_max_kbs:
@@ -907,19 +915,39 @@ class SqliteKnowledgeBackend:
         with self._lock:
             return self._vec_state.gen
 
-    def _build_chunk_snapshot(self, kb_id: str) -> tuple[int, list[_CachedChunk]]:
-        """Fetch + decode a KB's chunks, returning ``(generation, snapshot)`` atomically.
+    def _current_data_version(self) -> int:
+        """Read ``PRAGMA data_version`` under the write lock (external-write detector).
 
-        The commit generation is read in the SAME ``self._lock`` critical section as the row
-        fetch, so the returned ``generation`` exactly describes the committed state these rows
-        came from. :meth:`_cached_chunks` then refuses to publish the snapshot if the
-        generation has since advanced, so an invalidation that lands between fetch and publish
-        can never leave a stale matrix cached. This is the one place the ``embedding`` /
-        ``metadata`` JSON is decoded; the cache amortises it across repeat searches. Ordering
-        is left to the callers' sort, so the row order here does not affect results.
+        SQLite bumps this whenever a DIFFERENT connection commits to the file, so comparing
+        it against the value captured when a snapshot was built detects an EXTERNAL write
+        that raced the in-flight build — the fetch->publish TOCTOU the ``gen`` counter (own
+        writes only) cannot see.
+        """
+        with self._lock:
+            row = self._conn.execute("PRAGMA data_version").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def _build_chunk_snapshot(
+        self, kb_id: str
+    ) -> tuple[int, int, list[_CachedChunk]]:
+        """Fetch + decode a KB's chunks, returning ``(gen, data_version, snapshot)``.
+
+        Both the commit generation AND ``PRAGMA data_version`` are read in the SAME
+        ``self._lock`` critical section as the row fetch, so the returned pair exactly
+        describes the committed state these rows came from. ``gen`` tracks THIS connection's
+        own committed mutations; ``data_version`` tracks EXTERNAL ones (a second process /
+        sidecar / raw ``sqlite3`` write). :meth:`_cached_chunks` then refuses to publish the
+        snapshot if EITHER has since advanced, so an invalidation OR an external write that
+        lands between fetch and publish can never leave a stale/deleted matrix cached (the
+        two-signal generation guard closes the full fetch->publish TOCTOU). This is the one
+        place the ``embedding`` / ``metadata`` JSON is decoded; the cache amortises it across
+        repeat searches. Ordering is left to the callers' sort, so row order here does not
+        affect results.
         """
         with self._lock:
             gen = self._vec_state.gen
+            ver_row = self._conn.execute("PRAGMA data_version").fetchone()
+            data_version = int(ver_row[0]) if ver_row is not None else 0
             cur = self._conn.execute(
                 "SELECT c.chunk_id, c.document_id, c.text, c.start_pos, c.end_pos, "
                 "c.embedding, c.chunk_kind, c.image_uri, c.caption, c.metadata, "
@@ -930,7 +958,7 @@ class SqliteKnowledgeBackend:
                 (kb_id,),
             )
             rows = list(cur.fetchall())
-        return gen, [
+        return gen, data_version, [
             _CachedChunk(
                 chunk_id=str(row["chunk_id"]),
                 document_id=row["document_id"],
