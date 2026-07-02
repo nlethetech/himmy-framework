@@ -283,3 +283,154 @@ def test_deploy_parser_accepts_new_flags() -> None:
 
     shared = parser.parse_args(["deploy", "--share", "--host", "0.0.0.0"])  # noqa: S104
     assert shared.share is True and shared.host == "0.0.0.0"  # noqa: S104
+
+
+# ---------------------------------------------------- off-loopback fail-closed DX
+
+
+def test_deploy_off_loopback_no_share_prints_share_hint_exit_2(
+    env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`himmy deploy --host 0.0.0.0` with no --share fails closed WITH the friendly hint.
+
+    create_app raises HimmyError (subclasses Exception, NOT RuntimeError) — the except must
+    catch HimmyError or the guidance never fires and a raw traceback leaks. Assert exit 2 and
+    the `himmy deploy --share` hint, not a traceback.
+    """
+    args = argparse.Namespace(
+        file=str(env / "agent.yaml"),
+        agent=None,
+        docker=False,
+        channel="http",
+        host="0.0.0.0",  # noqa: S104
+        port=8000,
+        share=False,
+    )
+    assert commands.cmd_deploy(args) == 2
+    err = capsys.readouterr().err
+    assert "himmy deploy --share" in err
+    assert "off-loopback" in err
+    # The server never bound and no traceback surfaced.
+    assert "Traceback" not in err
+
+
+def test_deploy_off_loopback_share_is_accepted(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--share` off-loopback mints a key + enables auth so create_app is accepted (no refusal).
+
+    We stop before actually binding (monkeypatch the supervised group) — the point is that
+    the fail-closed posture passes because --share minted an apikey record + set apikey mode.
+    """
+    ran: dict[str, object] = {}
+
+    async def _fake_group(app: object, host: str, port: int, **kwargs: object) -> None:
+        ran["host"] = host
+        ran["port"] = port
+
+    monkeypatch.setattr(commands, "_serve_and_worker", _fake_group)
+    monkeypatch.chdir(env)  # keys file + store land in the tmp dir
+
+    args = argparse.Namespace(
+        file=str(env / "agent.yaml"),
+        agent=None,
+        docker=False,
+        channel="http",
+        host="0.0.0.0",  # noqa: S104
+        port=8000,
+        share=True,
+    )
+    assert commands.cmd_deploy(args) == 0
+    assert ran == {"host": "0.0.0.0", "port": 8000}  # noqa: S104
+    out = capsys.readouterr()
+    # --share minted a key + enabled auth; the summary curl carries the apikey header.
+    assert os.environ.get("HIMMY_AUTH_MODE") == "apikey"
+    assert "x-himmy-internal-key" in (out.err + out.out)
+
+
+def test_share_summary_curl_carries_apikey_and_succeeds(env: Path) -> None:
+    """In --share (apikey) mode the printed sample curl works: signature + apikey both pass.
+
+    The finding: apikey mode 403s any request without the key, but the sample curl only
+    carried the signature. The summary must thread the apikey (x-himmy-internal-key) so a
+    paste succeeds. We build the apikey-mode app and replay the summary's headers.
+    """
+    import secrets as _secrets
+
+    from himmy.api.auth.apikey import DEFAULT_HEADER as APIKEY_HEADER
+    from himmy.cli.apikey_cmd import _fingerprint, _load_keys, _write_json_0600
+
+    yaml = str(env / "agent.yaml")
+    secret = commands._enable_inbound_webhook(yaml)
+
+    # Mint an apikey record + turn on apikey mode (what --share does).
+    keys_path = env / "api_keys.json"
+    apikey = f"himmy_{_secrets.token_urlsafe(16)}"
+    keys = _load_keys(keys_path)
+    keys[apikey] = {
+        "subject": f"apikey:{_fingerprint(apikey)}",
+        "tenant_ids": [],
+        "roles": [],
+        "all_tenants": True,
+        "disabled": False,
+    }
+    _write_json_0600(keys_path, keys)
+    os.environ["HIMMY_API_KEYS_FILE"] = str(keys_path)
+    os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    try:
+        app = create_app(bind_host="127.0.0.1")
+        body = json.dumps(
+            {"source": commands._SERVICE_SAMPLE_SOURCE, "text": "hello"},
+            separators=(",", ":"),
+        ).encode()
+        sig = sign_webhook_body(secret=secret, body=body)
+        with TestClient(app) as client:
+            # signature alone (what the OLD curl sent) is rejected in apikey mode.
+            denied = client.post(
+                "/v1/connectors/webhook",
+                content=body,
+                headers={DEFAULT_SIGNATURE_HEADER: sig},
+            )
+            assert denied.status_code in (401, 403)
+            # signature + apikey (what the NEW summary prints) succeeds.
+            ok = client.post(
+                "/v1/connectors/webhook",
+                content=body,
+                headers={DEFAULT_SIGNATURE_HEADER: sig, APIKEY_HEADER: apikey},
+            )
+            assert ok.status_code == 200
+
+        # And the rendered summary actually includes the apikey header line.
+        summary = commands.render_service_summary(
+            host="0.0.0.0",  # noqa: S104
+            port=8000,
+            agent_path=yaml,
+            signing_secret=secret,
+            store_path="x",
+            apikey=apikey,
+        )
+        assert f"{APIKEY_HEADER}: {apikey}" in summary
+    finally:
+        os.environ.pop("HIMMY_API_KEYS_FILE", None)
+        os.environ.pop("HIMMY_AUTH_MODE", None)
+
+
+def test_docker_cmd_does_not_bind_0000_unauthenticated(
+    env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The emitted Dockerfile binds 0.0.0.0 but opts into auth explicitly (boots on run 1).
+
+    A bare `--host 0.0.0.0` CMD with no auth would make the image REFUSE to boot (fail-closed).
+    The Dockerfile must set HIMMY_ALLOW_UNAUTHENTICATED (documented proxy-terminated auth) so
+    the container starts — never a silent unauthenticated admin surface.
+    """
+    args = argparse.Namespace(
+        file=str(env / "agent.yaml"), agent=None, docker=True, channel="http"
+    )
+    assert commands.cmd_deploy(args) == 0
+    out = capsys.readouterr().out
+    assert "ENV HIMMY_ALLOW_UNAUTHENTICATED=1" in out
+    # The opt-in is documented as a trusted-proxy assumption, not silent.
+    assert "trusted proxy" in out
+    # The agent endpoint stays signature-verified regardless.
+    assert "signature-verified" in out

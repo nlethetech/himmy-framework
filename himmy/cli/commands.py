@@ -21,6 +21,7 @@ from typing import Any
 
 from himmy.cli.provider import build_inference_for
 from himmy.config.agent_spec import AgentSpec, load_agent_spec
+from himmy.core.errors import HimmyError
 from himmy.runtime import from_spec
 
 
@@ -1464,6 +1465,7 @@ def render_service_summary(
     agent_path: str | None,
     signing_secret: str | None,
     store_path: str,
+    apikey: str | None = None,
 ) -> str:
     """A boxed "your agent is live" summary, printed after a service binds.
 
@@ -1474,6 +1476,10 @@ def render_service_summary(
     so a newcomer can prove the endpoint end to end in one paste. The raw signing SECRET is
     NEVER included (only a valid signature for the sample body is); when no agent is wired the
     endpoint block is omitted (a bare BFF has no agent surface).
+
+    When ``apikey`` is given (the ``--share`` path minted one and turned auth ON), the sample
+    curl also carries the ``x-himmy-internal-key`` header — off-loopback the app requires it
+    IN ADDITION to the webhook signature, so the printed curl stays copy-paste-able there.
 
     ``host`` is ``None`` for a ``himmy worker`` (no HTTP surface): the URL/endpoint/routes
     blocks are dropped and only the store path (+ agent, if any) is shown, since a worker
@@ -1506,6 +1512,16 @@ def render_service_summary(
                 f"  │  agent    {endpoint}",
                 "  │  try it (signed; paste as-is):",
                 f"  │    curl -s {endpoint} \\",
+            ]
+            if apikey:
+                # --share off-loopback: auth is ON, so the endpoint needs the apikey header
+                # IN ADDITION to the signature — include it so the curl works as pasted. The
+                # header is x-himmy-internal-key (the ApiKeyAuthenticator's header), NOT
+                # Authorization: Bearer, which this authenticator ignores.
+                from himmy.api.auth.apikey import DEFAULT_HEADER as _APIKEY_HEADER
+
+                lines.append(f"  │      -H '{_APIKEY_HEADER}: {apikey}' \\")
+            lines += [
                 f"  │      -H '{DEFAULT_SIGNATURE_HEADER}: {signature}' \\",
                 f"  │      -d '{body}'",
                 "  │",
@@ -2130,8 +2146,10 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     # 3) --share: real auth BEFORE we widen the bind off-loopback (fail-closed otherwise).
     host = getattr(args, "host", None) or "127.0.0.1"
     port = getattr(args, "port", None) or 8000
+    share_apikey: str | None = None
     if getattr(args, "share", False):
-        if not _deploy_configure_share_auth(host):
+        ok, share_apikey = _deploy_configure_share_auth(host)
+        if not ok:
             return 2
 
     # 4) wire the signed webhook (auto-secret via the secrets layer; never printed raw).
@@ -2154,8 +2172,10 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
     try:
         app = create_app(bind_host=host)
-    except RuntimeError as exc:
+    except HimmyError as exc:
         # Fail-closed posture: off-loopback with no auth is refused — point at --share.
+        # create_app raises HimmyError (subclasses Exception, NOT RuntimeError), so this
+        # is the type we must catch for the friendly guidance to fire.
         _eprint(f"error: {exc}")
         _eprint("  add auth before exposing off-loopback:  himmy deploy --share")
         return 2
@@ -2167,6 +2187,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             agent_path=agent_path,
             signing_secret=signing_secret,
             store_path=_durable_store_path(),
+            apikey=share_apikey,
         )
     )
     _eprint("  (serve + worker running together — Ctrl-C stops both)\n")
@@ -2232,20 +2253,23 @@ def _deploy_channel_with_restart(
         backoff = min(backoff * 2, 30.0)
 
 
-def _deploy_configure_share_auth(host: str) -> bool:
+def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
     """Mint an apikey and turn auth ON so an off-loopback ``--share`` bind is fail-closed-safe.
 
     Binding off-loopback with no authenticator is REFUSED by ``create_app`` (the fail-closed
     posture). ``--share`` therefore mints a real API key into the default keys file and sets
     ``HIMMY_AUTH_MODE=apikey`` + ``HIMMY_API_KEYS_FILE`` for THIS process, so the widened
     surface is authenticated by construction — never an open admin endpoint. The minted key is
-    printed ONCE (it is the credential the operator hands to callers); returns ``True`` on
-    success. A loopback bind needs no auth, so this is a no-op there.
+    printed ONCE (it is the credential the operator hands to callers).
+
+    Returns ``(ok, apikey)``: ``apikey`` is the minted secret (so the caller can thread it into
+    the sample curl — off-loopback the endpoint needs it in addition to the signature) or
+    ``None`` when none was minted (loopback needs no auth, so this is a no-op there).
     """
     from himmy.api.app import _is_loopback_host
 
     if _is_loopback_host(host):
-        return True  # loopback needs no auth — nothing to configure
+        return True, None  # loopback needs no auth — nothing to configure
     import secrets as _secrets
 
     from himmy.cli.apikey_cmd import _fingerprint, _load_keys, _write_json_0600
@@ -2256,7 +2280,7 @@ def _deploy_configure_share_auth(host: str) -> bool:
         keys = _load_keys(path)
     except (OSError, ValueError) as exc:
         _eprint(f"error: could not read keys file {path}: {exc}")
-        return False
+        return False, None
     secret = f"himmy_{_secrets.token_urlsafe(32)}"
     keys[secret] = {
         "subject": f"apikey:{_fingerprint(secret)}",
@@ -2268,13 +2292,15 @@ def _deploy_configure_share_auth(host: str) -> bool:
     _write_json_0600(path, keys)
     os.environ["HIMMY_API_KEYS_FILE"] = str(path)
     os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    from himmy.api.auth.apikey import DEFAULT_HEADER as _APIKEY_HEADER
+
     _eprint(
         "--share: minted an API key and enabled auth (required before exposing "
         "off-loopback).\n"
-        "  send it as the Authorization: Bearer header. SECRET (shown once):\n"
+        f"  send it as the {_APIKEY_HEADER} header. SECRET (shown once):\n"
         f"    {secret}\n"
     )
-    return True
+    return True, secret
 
 
 def _emit_deploy_dockerfile(args: argparse.Namespace) -> int:
@@ -2295,6 +2321,13 @@ def _emit_deploy_dockerfile(args: argparse.Namespace) -> int:
         f"COPY {name} /app/agent.yaml\n"
         "WORKDIR /app\n"
         "EXPOSE 8000\n"
+        "# The container binds 0.0.0.0 so the mapped port is reachable. himmy fails\n"
+        "# CLOSED off-loopback with no auth, so we opt in explicitly: this image assumes\n"
+        "# auth is terminated at a trusted proxy / ingress in front of it. If you expose\n"
+        "# it directly, add real auth instead (set HIMMY_API_KEYS_FILE / HIMMY_AUTH_MODE,\n"
+        "# or run `himmy deploy --share`) and drop this line.\n"
+        "ENV HIMMY_ALLOW_UNAUTHENTICATED=1\n"
+        "# The agent endpoint stays signature-verified + default-deny regardless.\n"
         'CMD ["himmy", "deploy", "-f", "agent.yaml", "--host", "0.0.0.0"]\n'
     )
     print(dockerfile, end="")
