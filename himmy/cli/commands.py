@@ -1596,6 +1596,17 @@ def _enable_inbound_webhook(agent_path: str) -> str:
                 persisted = False
         if not persisted:
             os.environ[WEBHOOK_SIGNING_SECRET] = secret
+            # env-mode secrets backend (the read-only default): the signing secret now lives in
+            # THIS process's environment, so any same-uid reader of /proc/<pid>/environ (a
+            # co-located process, a crash dump) could recover it and forge signed deliveries to
+            # the loopback endpoint. Warn once and point at the durable backends that keep the
+            # secret out of the environment — a hardening nudge for shared/multi-user hosts.
+            _eprint(
+                "note: webhook signing secret is auto-generated and held in this process's "
+                "environment (HIMMY_SECRETS=env, the read-only default). On a shared/multi-user "
+                "host prefer a writable secrets backend so it is not readable from the process "
+                "env:  export HIMMY_SECRETS=keychain  (or =file for a 0600 file store)."
+            )
     if not get_secret("HIMMY_WEBHOOK_ALLOWED_SOURCES"):
         os.environ["HIMMY_WEBHOOK_ALLOWED_SOURCES"] = _SERVICE_SAMPLE_SOURCE
     return secret
@@ -2451,11 +2462,18 @@ async def _serve_and_worker(
         for task in (server_task, worker_task):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-    # Surface a boot failure (e.g. port already in use) as an exception the caller reports.
-    if server_task in done and not server_task.cancelled():
-        exc = server_task.exception()
-        if exc is not None:
-            raise exc
+    # Surface a boot failure as an exception the caller reports — from EITHER half. A worker
+    # task that finishes first with an exception (e.g. the scheduler failing to acquire its
+    # leader lock, a durable-store startup error) lands in ``done`` while the server is still
+    # pending; without this it would be swallowed by the ``suppress(Exception)`` above and the
+    # deploy would falsely report "live" + exit 0 with NO scheduler/dispatcher running. Check
+    # both completed tasks and re-raise the first real failure so cmd_deploy's handlers fire
+    # (revoke the share key, print a real error, non-zero exit).
+    for task in (server_task, worker_task):
+        if task in done and not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                raise exc
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:
@@ -2612,6 +2630,15 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             return 1
         _eprint(f"error: failed to bind {host}:{port}: {exc}")
         return 1
+    except Exception as exc:  # noqa: BLE001 - report ANY startup failure, don't exit 0 silently
+        # A non-OSError startup failure from EITHER half (e.g. the worker's scheduler/dispatcher
+        # raising a HimmyError or RuntimeError at boot) now propagates out of _serve_and_worker
+        # instead of being swallowed — so it MUST be surfaced here rather than falling through to
+        # `return 0` with a false "live" banner. Revoke the minted share key (the deploy never
+        # actually served) and exit non-zero so a wrapping unit sees a real failure.
+        _revoke_share_key(share_apikey)
+        _eprint(f"error: the service failed to start: {exc}")
+        return 1
     return 0
 
 
@@ -2686,6 +2713,21 @@ def _deploy_channel_with_restart(
         backoff = min(backoff * 2, 30.0)
 
 
+#: Subject stamped on a ``--share`` key so it is IDENTIFIABLE (pruned on the next --share so
+#: the keys file does not accrete stale credentials; distinct from the connector service
+#: subject, which the authenticator mints internally — this is the human-shared credential).
+_SHARE_KEY_SUBJECT = "share:deploy-tunnel"
+
+#: Least-privilege role a ``--share`` key holds — the SAME role the inbound-connector service
+#: principal runs under (``operator``: read+write + ``tool:*`` so the shared webhook can drive
+#: the agent), NOT ``admin``/all-tenants. Scoped to :data:`LOCAL_WORKSPACE` alone.
+_SHARE_KEY_ROLE = "operator"
+
+#: Bounded lifetime for a ``--share`` key so a forgotten tunnel credential self-expires instead
+#: of lingering as a live key forever (``himmy apikey mint`` similarly supports ``--ttl-days``).
+_SHARE_KEY_TTL_DAYS = 7
+
+
 def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
     """Mint an apikey and turn auth ON — the mandatory pre-step before ``--share`` exposes.
 
@@ -2703,9 +2745,11 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
     in which case ``--share`` REFUSES rather than exposing an unauthenticated endpoint.
     """
     import secrets as _secrets
+    from datetime import UTC, datetime, timedelta
 
     from himmy.api.auth.apikey import _fingerprint
     from himmy.cli.apikey_cmd import _load_keys, _write_json_0600
+    from himmy.services.storage.models import LOCAL_WORKSPACE
 
     keys_file = os.environ.get("HIMMY_API_KEYS_FILE") or ".himmy/api_keys.json"
     path = Path(keys_file)
@@ -2715,13 +2759,28 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
         _eprint(f"error: could not read keys file {path}: {exc}")
         _eprint("  --share refuses to expose an unauthenticated endpoint — aborting.")
         return False, None
+    # Prune any prior --share keys before minting a fresh one: each session mints a new random
+    # secret, so without this the file would monotonically accrete never-expiring credentials.
+    # Share keys are tagged by their SUBJECT (below), so we drop exactly those and leave every
+    # operator-managed key untouched.
+    for prior, spec in list(keys.items()):
+        if isinstance(spec, dict) and spec.get("subject") == _SHARE_KEY_SUBJECT:
+            keys.pop(prior, None)
     secret = f"himmy_{_secrets.token_urlsafe(32)}"
+    # Least-privilege by construction: the share key exists ONLY to reach the agent webhook,
+    # which runs under the connector SERVICE principal (LOCAL_WORKSPACE, role ``operator``,
+    # all_tenants=False). Mirror that exactly rather than minting an all-tenants admin — so a
+    # shared key authenticates as the same tenant-bound, role-scoped identity the webhook uses,
+    # NOT a cross-workspace principal that could read every other workspace on the box. Also
+    # give it a bounded TTL so a forgotten tunnel key self-expires instead of lingering forever.
+    expires_at = (datetime.now(UTC) + timedelta(days=_SHARE_KEY_TTL_DAYS)).isoformat()
     keys[secret] = {
-        "subject": f"apikey:{_fingerprint(secret)}",
-        "tenant_ids": [],
-        "roles": [],
-        "all_tenants": True,
+        "subject": _SHARE_KEY_SUBJECT,
+        "tenant_ids": [LOCAL_WORKSPACE],
+        "roles": [_SHARE_KEY_ROLE],
+        "all_tenants": False,
         "disabled": False,
+        "expires_at": expires_at,
     }
     try:
         _write_json_0600(path, keys)
@@ -2742,12 +2801,17 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
     _eprint(
         "--share: minted an API key and enabled auth (required before the tunnel "
         "exposes this service).\n"
-        f"  send it as the {_APIKEY_HEADER} header. This is a LIVE admin credential and is\n"
-        "  shown ONCE — save it now (it will not be shown again):\n\n"
+        f"  send it as the {_APIKEY_HEADER} header. It is scoped to THIS agent's webhook "
+        "surface\n"
+        f"  (workspace '{LOCAL_WORKSPACE}', role '{_SHARE_KEY_ROLE}', not all-tenants) and "
+        f"expires in {_SHARE_KEY_TTL_DAYS} days.\n"
+        "  It is shown ONCE — save it now (it will not be shown again):\n\n"
         f"    {secret}\n\n"
         "  the sample curl references it as $HIMMY_SHARE_KEY — export it (keeps the raw\n"
         "  key out of your shell history):\n"
         "    export HIMMY_SHARE_KEY=<the key above>\n"
+        "  revoke it early with:  himmy apikey revoke "
+        f"{_fingerprint(secret)}\n"
     )
     return True, secret
 

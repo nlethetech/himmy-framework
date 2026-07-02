@@ -924,3 +924,220 @@ def test_share_provisions_a_metrics_token_off_the_shared_key(
     token = os.environ.get("HIMMY_METRICS_TOKEN")
     assert token  # a metrics token was provisioned
     assert token != apikey  # and it is NOT the shared friend key
+
+
+# ---------------------------------------------------------- security red-team r2
+
+
+def test_share_key_is_least_privilege_not_all_tenants_admin(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sec-r2: ``--share`` mints a tenant-bound, role-scoped key — NOT an all-tenants admin.
+
+    Bug: the share key was ``{tenant_ids: [], roles: [], all_tenants: True}`` — a cross-tenant,
+    cross-workspace principal that could reach every /v1 route gated only on the principal +
+    workspace access on ANY workspace, far broader than the single webhook it exposes. The fix
+    scopes it to the SAME identity the inbound connector runs under: LOCAL_WORKSPACE, role
+    ``operator``, ``all_tenants=False`` — so a shared key cannot read unrelated workspaces.
+    """
+    from himmy.cli.apikey_cmd import _load_keys
+    from himmy.services.storage.models import LOCAL_WORKSPACE
+
+    monkeypatch.chdir(env)
+    ok, apikey = commands._deploy_configure_share_auth("127.0.0.1")
+    assert ok and apikey
+
+    keys = _load_keys(Path(os.environ["HIMMY_API_KEYS_FILE"]))
+    record = keys[apikey]
+    assert record["all_tenants"] is False  # NOT a cross-tenant admin
+    assert record["tenant_ids"] == [LOCAL_WORKSPACE]  # bound to the connector workspace
+    assert record["roles"] == [commands._SHARE_KEY_ROLE]  # least-privilege (operator, not *:*)
+    assert commands._SHARE_KEY_ROLE == "operator"
+
+
+def test_share_key_has_bounded_ttl(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sec-r2: the ``--share`` key carries an ``expires_at`` so a forgotten key self-expires."""
+    from datetime import UTC, datetime
+
+    from himmy.cli.apikey_cmd import _load_keys
+
+    monkeypatch.chdir(env)
+    ok, apikey = commands._deploy_configure_share_auth("127.0.0.1")
+    assert ok and apikey
+
+    record = _load_keys(Path(os.environ["HIMMY_API_KEYS_FILE"]))[apikey]
+    assert "expires_at" in record
+    expires = datetime.fromisoformat(record["expires_at"])
+    assert expires > datetime.now(UTC)  # in the future, bounded (not never-expiring)
+
+
+def test_repeated_share_does_not_accrete_stale_keys(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sec-r2: a second ``--share`` prunes the prior share key — no monotonic accretion.
+
+    Bug: each session minted a fresh never-expiring key and GC'd none, so the keys file filled
+    with live credentials. The share subject tag lets the next mint drop exactly the old one
+    while leaving operator-managed keys untouched.
+    """
+    from himmy.cli.apikey_cmd import _load_keys, _write_json_0600
+
+    monkeypatch.chdir(env)
+    keys_path = env / ".himmy" / "api_keys.json"
+    # An operator-managed key that must SURVIVE the prune.
+    _write_json_0600(
+        keys_path,
+        {"himmy_operator_key": {"subject": "ops", "all_tenants": True, "roles": ["admin"]}},
+    )
+
+    ok1, key1 = commands._deploy_configure_share_auth("127.0.0.1")
+    ok2, key2 = commands._deploy_configure_share_auth("127.0.0.1")
+    assert ok1 and ok2 and key1 != key2
+
+    keys = _load_keys(Path(os.environ["HIMMY_API_KEYS_FILE"]))
+    assert key1 not in keys  # the prior share key was pruned
+    assert key2 in keys  # the fresh one remains
+    assert "himmy_operator_key" in keys  # operator key untouched
+    # Exactly ONE share-subject key remains (no accretion).
+    share_keys = [
+        s for s, spec in keys.items() if spec.get("subject") == commands._SHARE_KEY_SUBJECT
+    ]
+    assert len(share_keys) == 1
+
+
+def test_write_json_0600_never_world_readable_and_tightens_parent(tmp_path: Path) -> None:
+    """sec-r2: the keys writer creates the file 0600 with NO race window + a 0700 parent dir.
+
+    Bug: ``_write_json_0600`` did ``write_text`` (0644 at umask) THEN chmod, leaving a
+    world-readable window, used a predictable ``<path>.tmp`` name (symlink-redirectable), and
+    left ``.himmy/`` at 0755 (filename enumerable). The fix uses ``mkstemp`` (0600 from birth,
+    unpredictable name) and chmods the parent to 0700.
+    """
+    import stat
+
+    from himmy.cli.apikey_cmd import _write_json_0600
+
+    keys_dir = tmp_path / ".himmy"
+    path = keys_dir / "api_keys.json"
+    _write_json_0600(path, {"himmy_x": {"all_tenants": False}})
+
+    file_mode = stat.S_IMODE(path.stat().st_mode)
+    assert file_mode == 0o600  # owner-only, never world-readable
+    dir_mode = stat.S_IMODE(keys_dir.stat().st_mode)
+    assert dir_mode == 0o700  # parent tightened so the filename is not enumerable
+    # No predictable leftover temp file remains next to the target.
+    assert not (keys_dir / "api_keys.json.tmp").exists()
+
+
+def test_env_mode_signing_secret_warns_about_process_env_storage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """sec-r2: on the read-only ``env`` secrets backend the auto-secret warns it lives in env.
+
+    Bug: the auto-generated signing secret silently falls back to the process environment under
+    the default env backend, where a same-uid reader could recover it. It now prints a hardening
+    nudge toward a writable backend (keychain/file) instead of doing it silently.
+    """
+    from himmy.config.secrets import EnvSecrets, configure_secrets
+
+    for name in _TOUCHED:
+        os.environ.pop(name, None)
+    configure_secrets(EnvSecrets())  # read-only backend: no writable provider
+    try:
+        agent = tmp_path / "agent.yaml"
+        agent.write_text("name: b\ndescription: d\nprovider: stub\n")
+        commands._enable_inbound_webhook(str(agent))
+        err = capsys.readouterr().err
+        assert "process's environment" in err
+        assert "HIMMY_SECRETS=keychain" in err
+    finally:
+        configure_secrets(None)
+        for name in _TOUCHED:
+            os.environ.pop(name, None)
+
+
+def test_serve_and_worker_surfaces_worker_startup_failure() -> None:
+    """sec-r2: a worker task that fails FIRST is re-raised, not swallowed into a false 'live'.
+
+    Bug: ``asyncio.wait(FIRST_COMPLETED)`` + the ``suppress(Exception)`` join ate a worker-only
+    startup exception and the re-raise gate checked ONLY the server task, so deploy reported
+    'live' + exited 0 with no worker running. The fix re-raises the first failing completed task.
+    """
+
+    class _FakeServer:
+        should_exit = False
+
+        def install_signal_handlers(self) -> None:  # pragma: no cover - patched away
+            pass
+
+        async def serve(self) -> None:
+            # A healthy server that runs until cancelled (the worker fails first).
+            import asyncio as _a
+
+            try:
+                await _a.Event().wait()
+            except _a.CancelledError:
+                raise
+
+    async def _boom_worker(**_k: object) -> None:
+        raise RuntimeError("scheduler failed to acquire leader lock")
+
+    import himmy.cli.commands as _c
+
+    class _FakeConfig:
+        def __init__(self, *a: object, **k: object) -> None:
+            pass
+
+    import uvicorn
+
+    orig_config, orig_server = uvicorn.Config, uvicorn.Server
+    uvicorn.Config = _FakeConfig  # type: ignore[assignment,misc]
+    uvicorn.Server = lambda *a, **k: _FakeServer()  # type: ignore[assignment,misc]
+    orig_run_worker = _c._run_worker
+    _c._run_worker = _boom_worker  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError, match="leader lock"):
+            asyncio.run(
+                _c._serve_and_worker(
+                    object(), "127.0.0.1", 8000, run_scheduler=True, run_dispatcher=True
+                )
+            )
+    finally:
+        uvicorn.Config, uvicorn.Server = orig_config, orig_server  # type: ignore[misc]
+        _c._run_worker = orig_run_worker  # type: ignore[assignment]
+
+
+def test_deploy_worker_failure_revokes_share_key_and_exits_nonzero(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sec-r2: a swallowed worker failure no longer leaves a false 'live' + orphaned share key.
+
+    End-to-end: when the supervised group raises a non-OSError startup failure, cmd_deploy now
+    catches it, revokes the minted share key, and returns non-zero (not 0 with a live banner).
+    """
+    from himmy.cli.apikey_cmd import _load_keys
+
+    monkeypatch.chdir(env)
+
+    async def _boom(*a: object, **k: object) -> None:
+        raise RuntimeError("worker exploded at startup")
+
+    monkeypatch.setattr(commands, "_serve_and_worker", _boom)
+
+    args = argparse.Namespace(
+        file=str(env / "agent.yaml"),
+        agent=None,
+        docker=False,
+        channel="http",
+        host="127.0.0.1",
+        port=8000,
+        share=True,
+    )
+    rc = commands.cmd_deploy(args)
+    assert rc == 1  # non-zero, not a false 0
+
+    keys_path = Path(os.environ["HIMMY_API_KEYS_FILE"])
+    remaining = _load_keys(keys_path) if keys_path.exists() else {}
+    assert not any(k.startswith("himmy_") for k in remaining)  # share key revoked
