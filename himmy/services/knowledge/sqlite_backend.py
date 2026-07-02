@@ -347,7 +347,9 @@ class SqliteKnowledgeBackend:
         # detaches it after an explicit eviction. A SHARED connection is left to its owning
         # storage service's lifecycle (it legitimately outlives this backend), so no
         # finalizer is registered there.
-        self._cache_finalizer: weakref.finalize | None = None
+        self._cache_finalizer: (
+            weakref.finalize[[int], SqliteKnowledgeBackend] | None
+        ) = None
         if self._owns_conn:
             self._cache_finalizer = weakref.finalize(
                 self, _drop_vector_cache_state_by_id, id(self._conn)
