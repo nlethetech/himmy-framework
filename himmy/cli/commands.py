@@ -2210,8 +2210,10 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     5. prints the boxed live summary with a working signed curl.
 
     ``--channel telegram``/``studio`` wrap the existing entrypoints (restart-on-failure);
-    ``--host``/``--port`` override the bind; ``--share`` adds real apikey auth BEFORE binding
-    off-loopback; ``--docker`` emits a minimal Dockerfile and exits.
+    ``--host``/``--port`` override the bind; ``--share`` mints real apikey auth (turning it ON)
+    and prints a ``cloudflared``/``ngrok`` tunnel command so a friend can reach the service —
+    auth is provisioned BEFORE any public command is printed, never an open endpoint;
+    ``--docker`` emits a minimal Dockerfile and exits.
     """
     channel = getattr(args, "channel", None) or "http"
     if getattr(args, "docker", False):
@@ -2255,7 +2257,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     if install_hint:
         _eprint(f"note: {install_hint}\n")
 
-    # 3) --share: real auth BEFORE we widen the bind off-loopback (fail-closed otherwise).
+    # 3) --share: real auth ON BEFORE we print any public tunnel command (fail-closed).
     host = getattr(args, "host", None) or "127.0.0.1"
     port = getattr(args, "port", None) or 8000
     share_apikey: str | None = None
@@ -2302,6 +2304,9 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             apikey=share_apikey,
         )
     )
+    if getattr(args, "share", False):
+        # Auth is already minted + on (above) — only now do we print a public command.
+        _eprint(render_share_tunnel(host=host, port=port))
     _eprint("  (serve + worker running together — Ctrl-C stops both)\n")
 
     try:
@@ -2366,22 +2371,21 @@ def _deploy_channel_with_restart(
 
 
 def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
-    """Mint an apikey and turn auth ON so an off-loopback ``--share`` bind is fail-closed-safe.
+    """Mint an apikey and turn auth ON — the mandatory pre-step before ``--share`` exposes.
 
-    Binding off-loopback with no authenticator is REFUSED by ``create_app`` (the fail-closed
-    posture). ``--share`` therefore mints a real API key into the default keys file and sets
-    ``HIMMY_AUTH_MODE=apikey`` + ``HIMMY_API_KEYS_FILE`` for THIS process, so the widened
-    surface is authenticated by construction — never an open admin endpoint. The minted key is
-    printed ONCE (it is the credential the operator hands to callers).
+    ``--share`` puts the service on the public internet (a cloudflared/ngrok tunnel to the
+    local port), so it MUST be authenticated by construction — an open admin endpoint reachable
+    from anywhere is exactly the posture we refuse to ship. This ALWAYS mints a real API key
+    (even on a loopback bind, because the TUNNEL is the exposure, not the bind) into the default
+    keys file and sets ``HIMMY_AUTH_MODE=apikey`` + ``HIMMY_API_KEYS_FILE`` for THIS process, so
+    the exposed surface needs the key. The minted key is printed ONCE (it is the credential the
+    operator hands to whoever they share the tunnel URL with).
 
     Returns ``(ok, apikey)``: ``apikey`` is the minted secret (so the caller can thread it into
-    the sample curl — off-loopback the endpoint needs it in addition to the signature) or
-    ``None`` when none was minted (loopback needs no auth, so this is a no-op there).
+    the sample curl — the exposed endpoint needs it in addition to the webhook signature), or
+    ``(False, None)`` when auth could NOT be provisioned (a read/write error on the keys file),
+    in which case ``--share`` REFUSES rather than exposing an unauthenticated endpoint.
     """
-    from himmy.api.app import _is_loopback_host
-
-    if _is_loopback_host(host):
-        return True, None  # loopback needs no auth — nothing to configure
     import secrets as _secrets
 
     from himmy.cli.apikey_cmd import _fingerprint, _load_keys, _write_json_0600
@@ -2392,6 +2396,7 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
         keys = _load_keys(path)
     except (OSError, ValueError) as exc:
         _eprint(f"error: could not read keys file {path}: {exc}")
+        _eprint("  --share refuses to expose an unauthenticated endpoint — aborting.")
         return False, None
     secret = f"himmy_{_secrets.token_urlsafe(32)}"
     keys[secret] = {
@@ -2401,18 +2406,51 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
         "all_tenants": True,
         "disabled": False,
     }
-    _write_json_0600(path, keys)
+    try:
+        _write_json_0600(path, keys)
+    except OSError as exc:
+        _eprint(f"error: could not write keys file {path}: {exc}")
+        _eprint("  --share refuses to expose an unauthenticated endpoint — aborting.")
+        return False, None
     os.environ["HIMMY_API_KEYS_FILE"] = str(path)
     os.environ["HIMMY_AUTH_MODE"] = "apikey"
     from himmy.api.auth.apikey import DEFAULT_HEADER as _APIKEY_HEADER
 
     _eprint(
-        "--share: minted an API key and enabled auth (required before exposing "
-        "off-loopback).\n"
+        "--share: minted an API key and enabled auth (required before the tunnel "
+        "exposes this service).\n"
         f"  send it as the {_APIKEY_HEADER} header. SECRET (shown once):\n"
         f"    {secret}\n"
     )
     return True, secret
+
+
+def render_share_tunnel(*, host: str, port: int) -> str:
+    """A boxed 'share it with a friend' block: copy-paste tunnel commands to the local port.
+
+    Printed after ``--share`` has ALREADY minted an API key + turned auth on (so the endpoint the
+    tunnel exposes is authenticated — we never print a public command for an open endpoint). It
+    offers two keyless one-liners, cloudflared (no signup) and ngrok, each tunnelling to the
+    exact ``host:port`` the service bound. The public HTTPS URL the tool prints is what the
+    operator hands out; callers still need the API key + a valid webhook signature to reach the
+    agent, so exposure stays fail-closed end to end.
+    """
+    target = f"http://{host}:{port}"
+    return "\n".join(
+        [
+            "  ┌─ share it (public tunnel to the local port) ─────",
+            "  │  auth is ON, so the exposed endpoint needs the API key above.",
+            "  │  run ONE of these; it prints a public https URL to hand out:",
+            "  │",
+            "  │  cloudflared (no signup):",
+            f"  │    cloudflared tunnel --url {target}",
+            "  │",
+            "  │  ngrok (needs a free account):",
+            f"  │    ngrok http {port}",
+            "  └──────────────────────────────────────────────────",
+            "",
+        ]
+    )
 
 
 # The published runtime image (built + pushed by .github/workflows/deploy.yml on

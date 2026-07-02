@@ -51,6 +51,8 @@ _TOUCHED = [
     "HIMMY_STUDIO_GUARD",
     "HIMMY_SMTP_HOST",
     "HIMMY_TELEGRAM_BOT_TOKEN",
+    "HIMMY_AUTH_MODE",
+    "HIMMY_API_KEYS_FILE",
 ]
 
 
@@ -440,3 +442,147 @@ def test_docker_cmd_is_fail_closed_not_open_by_default(
     # The opt-in still exists as documented (commented) trusted-proxy guidance.
     assert "trusted proxy" in out
     assert "HIMMY_ALLOW_UNAUTHENTICATED" in out
+
+
+# --------------------------------------------------------- --share tunnel (WP #9)
+
+
+def test_share_provisions_auth_before_printing_any_public_command(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--share` (even on the DEFAULT loopback bind) mints auth BEFORE printing the tunnel.
+
+    A tunnel makes the loopback port public, so the security-critical ordering is: auth ON
+    first, THEN the copy-paste `cloudflared`/`ngrok` command. We assert both — the apikey was
+    provisioned AND the printed tunnel command references the local port — never a public
+    command for an unauthenticated endpoint.
+    """
+    ran: dict[str, object] = {}
+
+    async def _fake_group(app: object, host: str, port: int, **kwargs: object) -> None:
+        # By the time we reach the supervised group, auth MUST already be configured.
+        ran["auth_mode"] = os.environ.get("HIMMY_AUTH_MODE")
+
+    monkeypatch.setattr(commands, "_serve_and_worker", _fake_group)
+    monkeypatch.chdir(env)
+
+    args = argparse.Namespace(
+        file=str(env / "agent.yaml"),
+        agent=None,
+        docker=False,
+        channel="http",
+        host="127.0.0.1",  # the DEFAULT loopback bind — tunnel is the exposure
+        port=8000,
+        share=True,
+    )
+    assert commands.cmd_deploy(args) == 0
+    # Auth was minted + enabled BEFORE the process group booted (and stays on after).
+    assert ran["auth_mode"] == "apikey"
+    assert os.environ.get("HIMMY_AUTH_MODE") == "apikey"
+    err = capsys.readouterr().err
+    # The public tunnel command is printed, targeting the local port.
+    assert "cloudflared tunnel --url http://127.0.0.1:8000" in err
+    assert "ngrok http 8000" in err
+    # And the minted key was shown once (the credential the friend needs).
+    assert "SECRET (shown once)" in err
+    # The tunnel block explicitly states auth is ON before offering the public command.
+    assert "auth is ON" in err
+
+
+def test_share_refuses_when_auth_cannot_be_provisioned(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """If auth can't be minted, `--share` REFUSES — it never exposes an unauthenticated port.
+
+    We force the keys-file write to fail; `--share` must abort with exit 2, print a refusal,
+    and NOT boot the service or print any tunnel command.
+    """
+    booted = {"ran": False}
+
+    async def _fake_group(*a: object, **k: object) -> None:  # pragma: no cover - must not run
+        booted["ran"] = True
+
+    def _boom(*a: object, **k: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(commands, "_serve_and_worker", _fake_group)
+    monkeypatch.setattr("himmy.cli.apikey_cmd._write_json_0600", _boom)
+    monkeypatch.chdir(env)
+
+    args = argparse.Namespace(
+        file=str(env / "agent.yaml"),
+        agent=None,
+        docker=False,
+        channel="http",
+        host="127.0.0.1",
+        port=8000,
+        share=True,
+    )
+    assert commands.cmd_deploy(args) == 2
+    assert booted["ran"] is False
+    out = capsys.readouterr()
+    combined = out.err + out.out
+    assert "refuses to expose an unauthenticated endpoint" in combined
+    # No public tunnel command was printed.
+    assert "cloudflared" not in combined
+    assert "ngrok" not in combined
+
+
+def test_share_tunnel_block_only_after_auth() -> None:
+    """`render_share_tunnel` states auth is required + targets the exact host:port."""
+    block = commands.render_share_tunnel(host="127.0.0.1", port=9123)
+    assert "cloudflared tunnel --url http://127.0.0.1:9123" in block
+    assert "ngrok http 9123" in block
+    assert "needs the API key" in block
+
+
+# --------------------------------------------------------- cloud templates (WP #9)
+
+
+def test_cloud_templates_exist_and_reference_image_and_agent() -> None:
+    """The deploy/cloud/ templates are valid + wire the ghcr image + an agent path.
+
+    fly.toml, render.yaml, railway.json must each be parseable AND reference the published
+    runtime image (directly or via the thin agent Dockerfile that builds FROM it) plus the
+    agent.yaml path — proving they deploy the USER's agent, not empty Studio.
+    """
+    import tomllib
+
+    import yaml as _yaml
+
+    root = Path(commands.__file__).resolve().parents[2]
+    cloud = root / "deploy" / "cloud"
+    fly = cloud / "fly.toml"
+    render = cloud / "render.yaml"
+    railway = cloud / "railway.json"
+    assert fly.is_file() and render.is_file() and railway.is_file()
+
+    # fly.toml: valid TOML, builds the agent Dockerfile, runs api + worker on the agent.
+    fly_data = tomllib.loads(fly.read_text())
+    assert fly_data["build"]["dockerfile"] == "Dockerfile"
+    procs = fly_data["processes"]
+    assert "/app/agent.yaml" in procs["api"]
+    assert "/app/agent.yaml" in procs["worker"]
+    # Auth is enabled before the public service accepts traffic.
+    assert fly_data["env"]["HIMMY_AUTH_MODE"] == "apikey"
+
+    # render.yaml: valid YAML, api + worker services on the agent, image via Dockerfile.
+    render_data = _yaml.safe_load(render.read_text())
+    svcs = {s["name"]: s for s in render_data["services"]}
+    assert "himmy-agent-api" in svcs and "himmy-agent-worker" in svcs
+    assert "/app/agent.yaml" in svcs["himmy-agent-api"]["dockerCommand"]
+    assert svcs["himmy-agent-api"]["dockerfilePath"] == "./Dockerfile"
+    auth = {
+        e["key"]: e.get("value")
+        for e in svcs["himmy-agent-api"]["envVars"]
+    }
+    assert auth["HIMMY_AUTH_MODE"] == "apikey"
+
+    # railway.json: valid JSON, builds the Dockerfile, serves the agent.
+    railway_data = json.loads(railway.read_text())
+    assert railway_data["build"]["builder"] == "DOCKERFILE"
+    assert "/app/agent.yaml" in railway_data["deploy"]["startCommand"]
+    # The published image + agent path are referenced in the guidance comment.
+    comment = "\n".join(railway_data["_comment"])
+    assert "ghcr.io/nlethetech/himmy" in comment
+    assert "agent.yaml" in comment

@@ -588,6 +588,24 @@ bound `127.0.0.1`, signature-verified webhook). For a durable multi-process topo
 - **Kubernetes** — the [`deploy/helm/himmy-agent/`](deploy/helm/himmy-agent/) chart: api +
   worker Deployments mounting your `agent.yaml` (inline or an existing ConfigMap), sharing
   one RWO state PVC. Fail-closed by default (loopback bind; add auth before exposing).
+- **One-click cloud** — the [`deploy/cloud/`](deploy/cloud/) templates
+  ([`fly.toml`](deploy/cloud/fly.toml), [`render.yaml`](deploy/cloud/render.yaml),
+  [`railway.json`](deploy/cloud/railway.json)) stand up the SAME api + worker topology on a
+  hosted platform, running **your** agent (baked/mounted via the thin
+  `himmy deploy --docker > Dockerfile`), not empty Studio. Each sets `HIMMY_AUTH_MODE=apikey`
+  so the public endpoint is authenticated before it accepts traffic. Buttons deploy the repo
+  next to your `agent.yaml`:
+
+  [![Deploy to Fly.io](https://fly.io/static/images/brand/brandmark.svg)](https://fly.io/launch)
+  [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+  [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template)
+
+### Let a friend try it (`--share`)
+
+Want someone else to hit your agent without a full cloud deploy? `himmy deploy --share`
+**mints an API key + turns auth on FIRST**, then prints a copy-paste `cloudflared`/`ngrok`
+tunnel command to your local port — it never exposes an unauthenticated endpoint. Hand out
+the tunnel URL + the printed key; callers still need a valid webhook signature too.
 
 ### Deploy Himmy Studio (the admin GUI)
 

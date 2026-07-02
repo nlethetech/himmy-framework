@@ -1,0 +1,71 @@
+# =============================================================================
+# Deploy MY agent to Fly.io — a real, reachable service from an agent.yaml
+# =============================================================================
+#
+# This runs YOUR agent (the one in your agent.yaml), NOT Himmy Studio (the admin
+# GUI). It layers your spec onto the published runtime image so there is no
+# framework checkout: copy this file next to an agent.yaml + a 3-line Dockerfile
+# (`himmy deploy --docker > Dockerfile`) and run `fly launch --copy-config`.
+#
+# The Dockerfile COPYs your agent.yaml to /app/agent.yaml on top of
+# ghcr.io/nlethetech/himmy, so the api + worker below serve THAT spec.
+#
+# Security posture (READ before opening the port)
+# ------------------------------------------------
+# The agent webhook stays signature-verified + default-DENY. To reach it from the
+# internet you MUST provide auth first: set HIMMY_AUTH_MODE=apikey and an API key
+# (as a Fly secret, see below) — binding 0.0.0.0 with NO auth is refused by
+# create_app (himmy will not boot an open admin surface). The `[[services]]` block
+# publishes 0.0.0.0:8000, so configure auth BEFORE the first deploy:
+#   fly secrets set HIMMY_AUTH_MODE=apikey HIMMY_API_KEYS_FILE=/app/.himmy/api_keys.json
+#   fly secrets set OPENROUTER_API_KEY=...      # whatever your tool packs need
+# =============================================================================
+
+app = "my-himmy-agent"
+primary_region = "iad"
+
+# Built from the thin agent Dockerfile (FROM ghcr.io/nlethetech/himmy + COPY agent.yaml).
+[build]
+  dockerfile = "Dockerfile"
+  # Or skip the Dockerfile and pin the base image directly (agent.yaml must then be
+  # baked another way, e.g. a Fly volume mount at /app/agent.yaml):
+  # image = "ghcr.io/nlethetech/himmy:0.2.0"
+
+[env]
+  HIMMY_DURABLE_STORAGE = "1"
+  HIMMY_STORE_PATH = "/app/.himmy/storage.db"
+  # Auth is required before the public service below accepts traffic; set the mode
+  # here and the key via `fly secrets set` so it never lands in this file.
+  HIMMY_AUTH_MODE = "apikey"
+  HIMMY_API_KEYS_FILE = "/app/.himmy/api_keys.json"
+
+# The api process serves the agent webhook; bind 0.0.0.0 so Fly's proxy can reach it
+# (auth above keeps it fail-closed). The worker drains the run queue + fires routines.
+[processes]
+  api = "himmy serve -f /app/agent.yaml --host 0.0.0.0 --port 8000"
+  worker = "himmy worker -f /app/agent.yaml --store /app/.himmy/storage.db"
+
+# Durable store survives restarts + redeploys.
+[[mounts]]
+  source = "himmy_agent_state"
+  destination = "/app/.himmy"
+  processes = ["api", "worker"]
+
+[[services]]
+  processes = ["api"]
+  internal_port = 8000
+  protocol = "tcp"
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "40s"
+    method = "get"
+    path = "/health"

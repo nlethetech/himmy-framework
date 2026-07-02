@@ -505,7 +505,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_deploy.add_argument(
         "--share",
         action="store_true",
-        help="mint an API key + enable auth so the service can bind off-loopback safely",
+        help="let a friend try it: mint an API key + enable auth, then print a "
+        "cloudflared/ngrok tunnel command (never exposes an unauthenticated endpoint)",
     )
     p_deploy.add_argument(
         "--docker",
