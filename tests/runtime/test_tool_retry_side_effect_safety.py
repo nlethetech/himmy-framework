@@ -165,6 +165,30 @@ def test_read_only_tool_still_retried_on_timeout() -> None:
     assert len(_retries(events)) == 2
 
 
+def test_read_verb_prefixed_writer_not_retried_on_timeout() -> None:
+    """red-team r1: a read-verb-PREFIXED writer (``fetch_and_delete``) is NOT timeout-retried.
+
+    first-token-wins ``classify_read_only`` infers ``fetch_and_delete``/``get_or_create`` as
+    read-only despite the write suffix; retrying such a name after a TIMEOUT could
+    double-apply its side effect. The retry gate now uses the strict
+    ``classify_parallel_safe`` so these fire exactly once.
+    """
+    for name in ("fetch_and_delete", "get_or_create_session"):
+        registry = ToolRegistry()
+        handler, calls = _timeout_handler()
+        register_local_tool(
+            registry,
+            name=name,  # read-verb prefix, but a write suffix -> side-effecting
+            handler=handler,
+            args_json_schema={"type": "object", "properties": {}},
+            timeout_seconds=0.05,
+        )
+        rt, events = _runtime(registry)
+        run_async(rt.run_task_detailed(Persona(name="a"), _task(name)))
+        assert calls["count"] == 1, name  # ran once, never re-fired on timeout
+        assert _retries(events) == [], name
+
+
 def test_write_tool_still_retried_on_rate_limited() -> None:
     """A RATE_LIMITED write IS retried — the call never reached the tool, so it's safe."""
     registry = ToolRegistry()

@@ -521,7 +521,26 @@ class SqliteStorageService:
         return self._path
 
     async def close(self) -> None:
-        """Close the underlying connection (idempotent; awaited on container teardown)."""
+        """Close the underlying connection (idempotent; awaited on container teardown).
+
+        Also evicts this connection's shared vector-cache state. A knowledge backend
+        built from THIS service (:meth:`knowledge_backend`) shares ``self._conn`` and so
+        is created with ``_owns_conn=False`` — its own ``close`` is a no-op for eviction,
+        leaving the process-global ``_VECTOR_CACHE_STATES`` entry (which strong-references
+        the connection plus decoded vector matrices) pinned forever. The storage service
+        is the connection's true owner, so it drops that entry here; otherwise every
+        create/close of a storage service (per-request/per-tenant, test fixtures,
+        container recreation) would leak a closed connection and its cached matrices.
+        Import is lazy so this module stays import-safe without the knowledge package.
+        """
+        try:
+            from himmy.services.knowledge.sqlite_backend import (
+                _drop_vector_cache_state,
+            )
+
+            _drop_vector_cache_state(self._conn)
+        except Exception:  # noqa: BLE001 - cache eviction must never block close()
+            pass
         await asyncio.to_thread(self._conn.close)
 
     async def __aenter__(self) -> SqliteStorageService:

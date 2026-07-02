@@ -153,6 +153,10 @@ class BoundTool(BaseModel):
     #: read-only (True) / mutating (False) / infer-from-name (None); surfaced to the
     #: model so a look-up doesn't pick a write tool.
     read_only: bool | None = None
+    #: Author opt-out of concurrency: when True the tool is NEVER batched into a parallel
+    #: read-run (forced to run one-at-a-time as an ordering barrier), even if it is
+    #: read-only — for a non-reentrant client that must not overlap itself.
+    sequential: bool = False
 
 
 class WorkflowDefinition(BaseModel):

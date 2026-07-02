@@ -87,6 +87,10 @@ class HttpToolSpec(BaseModel):
     idempotency_arg: str | None = None
     timeout_seconds: float = 15.0
     requires_approval: bool = False
+    #: Read/write intent override. Unset ⇒ DERIVED from ``method`` (GET/HEAD/OPTIONS
+    #: read-only, POST/PUT/PATCH/DELETE writers) so the tool is never mis-parallelised by
+    #: its name. Set True only for a genuinely side-effect-free non-GET (e.g. a POST search).
+    read_only: bool | None = None
     args_schema: dict[str, Any] | None = None  # optional explicit JSON Schema override
     #: Optional JSON Schema the response is validated against (typed errors on mismatch).
     response_schema: dict[str, Any] | None = None
@@ -176,6 +180,7 @@ class HttpToolSpec(BaseModel):
             output_json_schema=self.response_schema,
             requires_approval=self.requires_approval,
             timeout_seconds=self.timeout_seconds,
+            read_only=self.read_only,
         )
 
 

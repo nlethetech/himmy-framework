@@ -18,13 +18,105 @@ imports or downloads a model.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
+import os
+import threading
+from functools import lru_cache
 from typing import Any, Protocol, runtime_checkable
 
+from himmy.config.flags import env_falsy
 from himmy.core.errors import HimmyError
 
 #: A small, fast ONNX cross-encoder that fastembed can fetch on first use.
 DEFAULT_RERANKER_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+
+#: Kill-switch for the shared cross-encoder cache (default ON). Shares the embedder's
+#: :data:`~himmy.services.knowledge.local_embedders._EMBED_CACHE_ENV` toggle so one
+#: ``HIMMY_EMBED_CACHE=off`` disables *all* shared native sessions coherently.
+_EMBED_CACHE_ENV = "HIMMY_EMBED_CACHE"
+
+
+def _rerank_cache_enabled() -> bool:
+    """Whether the shared cross-encoder cache is active (default ON, env-overridable)."""
+    return not env_falsy(_EMBED_CACHE_ENV)
+
+
+#: Guards concurrent ``rerank()`` calls that share one native cross-encoder session, for
+#: the same reason as the embedder's lock: onnxruntime inference is thread-safe but
+#: fastembed's wrapper carries mutable per-instance state, so we serialise inference over
+#: a shared session to keep scores byte-identical under concurrency.
+#:
+#: Acquired *only* when the impl is the shared cached session (see
+#: :meth:`FastEmbedReranker._impl_and_guard`): a private per-instance session — an injected
+#: ``self._impl`` or a ``HIMMY_EMBED_CACHE=off`` build — is not shared and runs under
+#: :class:`contextlib.nullcontext`, so the kill-switch restores pre-cache parallelism.
+_CROSS_ENCODER_LOCK = threading.Lock()
+
+#: Serialises the one-time CONSTRUCTION of a shared :func:`_load_cross_encoder` session so
+#: concurrent cold-start misses for the same model don't each build (and discard) a heavy
+#: ONNX session — ``functools.cache`` runs the loader outside its own lock. Held only
+#: across the cache lookup+build in :meth:`_model_impl`; uncontended once warm. Kept
+#: separate from the inference guard so a build never blocks an in-flight rerank.
+_CROSS_ENCODER_BUILD_LOCK = threading.Lock()
+
+
+def _reranker_cache_maxsize(default: int = 4) -> int:
+    """LRU bound for the cross-encoder session cache (env → positive int, else ``default``).
+
+    Mirrors the embedder's :func:`~himmy.services.knowledge.local_embedders._session_cache_maxsize`:
+    bounds how many distinct reranker model names stay resident so a process reconfigured
+    across many models evicts the least-recently-used session instead of pinning every one.
+    A misconfigured value falls back to the default. Override with
+    ``HIMMY_RERANK_SESSION_CACHE_MAX`` (read at import).
+    """
+    raw = os.environ.get("HIMMY_RERANK_SESSION_CACHE_MAX", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+#: LRU bound (distinct model names) for the shared cross-encoder session cache; read once
+#: at import so the ``lru_cache`` maxsize is fixed for the process.
+_CROSS_ENCODER_CACHE_MAX = _reranker_cache_maxsize()
+
+
+@lru_cache(maxsize=_CROSS_ENCODER_CACHE_MAX)
+def _load_cross_encoder(model_name: str) -> Any:
+    """Load (and cache process-wide) the heavy fastembed ``TextCrossEncoder`` session.
+
+    Keyed by ``model_name`` only (a reranker carries no ``dim``), so every
+    :class:`FastEmbedReranker` for the same model reuses one ONNX session instead of
+    reloading the native cross-encoder per build — hundreds of ms + tens–hundreds MB
+    saved per duplicate. Wrapped by a BOUNDED :func:`functools.lru_cache` (see
+    :data:`_CROSS_ENCODER_CACHE_MAX`) so a process reconfigured across MANY reranker models
+    evicts the least-recently-used session instead of pinning every model ever seen
+    (unbounded ``functools.cache`` grew RSS without bound). An in-flight rerank holds its own
+    reference to the session, so an LRU eviction of the cache entry cannot free a session
+    still in use. Raises a clear :class:`HimmyError` when the ``[embeddings]`` extra is
+    absent (an errored call is not memoised, so a later install can succeed).
+    """
+    try:
+        from fastembed.rerank.cross_encoder import (  # type: ignore
+            TextCrossEncoder,
+        )
+    except ImportError as exc:  # pragma: no cover - only without the extra
+        raise HimmyError(
+            "FastEmbedReranker requires the [embeddings] extra "
+            "(pip install 'himmy[embeddings]')."
+        ) from exc
+    return TextCrossEncoder(model_name=model_name)
+
+
+def reset_reranker_cache() -> None:
+    """Clear the shared cross-encoder cache (test hook / operator escape hatch).
+
+    Mirrors :func:`~himmy.services.knowledge.local_embedders.reset_embedder_cache` for
+    the rerank session so tests can assert cache identity/invalidation in isolation.
+    """
+    _load_cross_encoder.cache_clear()
 
 
 @runtime_checkable
@@ -66,8 +158,32 @@ class FastEmbedReranker:
         self.model = model
         self._impl: Any = None
 
-    def _model_impl(self) -> Any:
-        """Lazily construct the fastembed cross-encoder, raising if absent."""
+    def _model_impl(self, cache_enabled: bool | None = None) -> Any:
+        """Return the cross-encoder, sharing one native session per model name.
+
+        When the shared cache is enabled (the default; see :data:`_EMBED_CACHE_ENV`),
+        the session comes from the process-wide :func:`_load_cross_encoder` cache so
+        every :class:`FastEmbedReranker` for the same model reuses one ONNX session; with
+        the cache off, each instance lazily builds and holds its own private session.
+
+        ``cache_enabled`` lets the caller pass a SINGLE observation of
+        :func:`_rerank_cache_enabled` so this decision and the guard-selection in
+        :meth:`_impl_and_guard` are made from the same read — closing a TOCTOU where a
+        runtime env flip between two independent reads could pair the shared session with
+        a no-op lock. When ``None`` the flag is read here.
+
+        An explicitly pre-set ``self._impl`` (e.g. a test-injected fake) always wins over
+        the shared cache, so per-instance overrides keep working unchanged.
+        """
+        if self._impl is not None:
+            return self._impl
+        if cache_enabled is None:
+            cache_enabled = _rerank_cache_enabled()
+        if cache_enabled:
+            # Load-exactly-once under concurrent cold start (see the build-lock docstring);
+            # an uncontended dict-hit once warm, released before any rerank runs.
+            with _CROSS_ENCODER_BUILD_LOCK:
+                return _load_cross_encoder(self.model)
         if self._impl is None:
             try:
                 from fastembed.rerank.cross_encoder import (  # type: ignore
@@ -81,6 +197,28 @@ class FastEmbedReranker:
             self._impl = TextCrossEncoder(model_name=self.model)
         return self._impl
 
+    def _impl_and_guard(self) -> tuple[Any, Any]:
+        """Return the cross-encoder impl and the lock to serialise inference under.
+
+        The impl is *shared* only when this instance holds no private session
+        (``self._impl is None``) **and** the cache is enabled — exactly when
+        :meth:`_model_impl` returns the process-wide :func:`_load_cross_encoder` session,
+        which is then serialised under :data:`_CROSS_ENCODER_LOCK`. A private session (an
+        injected ``self._impl`` or a ``HIMMY_EMBED_CACHE=off`` build) is unique to this
+        instance and parallelises under :class:`contextlib.nullcontext`. The shared flag is
+        captured *before* :meth:`_model_impl` populates ``self._impl``.
+
+        THREAD-SAFETY: :func:`_rerank_cache_enabled` reads the env LIVE. The flag is read
+        EXACTLY ONCE here and threaded into :meth:`_model_impl` so the guard decision and
+        the impl decision can never diverge across two independent reads (which would pair
+        the shared session with a no-op ``nullcontext`` and let concurrent reranks race).
+        """
+        cache_enabled = _rerank_cache_enabled()
+        shared = self._impl is None and cache_enabled
+        impl = self._model_impl(cache_enabled)
+        guard = _CROSS_ENCODER_LOCK if shared else contextlib.nullcontext()
+        return impl, guard
+
     async def rerank(
         self, query: str, candidates: list[tuple[str, str]]
     ) -> list[tuple[str, float]]:
@@ -92,10 +230,14 @@ class FastEmbedReranker:
         def _score() -> list[float]:
             # Load the cross-encoder (first use) AND score inside the worker thread:
             # both the native model load and rerank() are GIL-releasing ONNX work, so
-            # keeping them off the event loop preserves host-loop responsiveness.
-            impl = self._model_impl()
+            # keeping them off the event loop preserves host-loop responsiveness. When
+            # the session is shared, serialise inference so concurrent rerank() calls
+            # cannot race on fastembed's mutable state — scores stay byte-identical; a
+            # private session (kill-switch off, or injected) parallelises freely.
+            impl, guard = self._impl_and_guard()
             # fastembed's rerank() yields one score per document, in input order.
-            return [float(s) for s in impl.rerank(query, texts)]
+            with guard:
+                return [float(s) for s in impl.rerank(query, texts)]
 
         scores = await asyncio.to_thread(_score)
         ranked = [
@@ -129,5 +271,6 @@ __all__ = [
     "FastEmbedReranker",
     "build_reranker",
     "fastembed_rerank_available",
+    "reset_reranker_cache",
     "DEFAULT_RERANKER_MODEL",
 ]

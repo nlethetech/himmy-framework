@@ -1867,6 +1867,17 @@
             "title": "Query",
             "type": "array"
           },
+          "read_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read Only"
+          },
           "requires_approval": {
             "default": false,
             "title": "Requires Approval",

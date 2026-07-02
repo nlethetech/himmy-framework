@@ -64,10 +64,12 @@ def test_resolve_auto_uses_ollama_only_when_embed_model_pulled(
         local_embedders, "ollama_embed_model_available", lambda *a, **k: True
     )
     assert local_embedders.resolve_auto_backend() == "ollama"
-    # Embed model absent → auto degrades to deterministic (no 404).
+    # Embed model absent → auto degrades to deterministic (no 404). The decision is memoised
+    # per process, so clear the memo to re-probe the changed environment.
     monkeypatch.setattr(
         local_embedders, "ollama_embed_model_available", lambda *a, **k: False
     )
+    local_embedders.reset_auto_backend_cache()
     assert local_embedders.resolve_auto_backend() == "deterministic"
 
 

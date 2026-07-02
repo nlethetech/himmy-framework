@@ -46,7 +46,7 @@ from himmy.services.inference.tool_protocol import (
     _iter_json_objects,
     parse_text_tool_calls,
 )
-from himmy.services.tools.access import describe_for_model
+from himmy.services.tools.access import classify_parallel_safe, describe_for_model
 from himmy.services.tools.repair import resolve_tool_name, unknown_tool_message
 from himmy.services.tools.schema_normalize import normalize_tool_schema
 
@@ -184,6 +184,92 @@ def _parse_react_tool_calls(
     return parse_text_tool_calls(text, known_names)
 
 
+def _default_tool_parallelism() -> int:
+    """Max concurrent read-only tool calls per fan-out: ``HIMMY_TOOL_PARALLELISM`` or 8.
+
+    A misconfigured env var (non-int, ``<= 0``) falls back to the default rather than
+    failing — a bad knob must never take the offline tool path down. ``1`` restores
+    fully serial execution (the pre-optimization behaviour).
+    """
+    raw = os.environ.get("HIMMY_TOOL_PARALLELISM", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 8
+    return value if value > 0 else 8
+
+
+def _is_parallel_safe(tool: BoundTool) -> bool:
+    """Whether a resolved tool may join a CONCURRENT read-batch (fail-closed).
+
+    An explicit author ``sequential=True`` ALWAYS forces the tool out of any parallel run
+    (a non-reentrant client that must not overlap itself), regardless of read-only intent.
+    Otherwise the author's explicit ``read_only`` flag wins: only ``read_only=True`` is
+    eligible; ``False`` (a writer) is a barrier.
+
+    When ``read_only`` is unset (``None``) we DO NOT trust the first-token-wins
+    :func:`classify_read_only` hint to gate concurrency — it infers a name like
+    ``fetch_and_delete``/``report_incident`` as read-only despite a write verb, which would
+    let a mutating call be hoisted into a concurrent read-batch ahead of a dependent read.
+    Instead we use the strict :func:`classify_parallel_safe`, which is read-only ONLY when
+    the name has a read verb and NO write verb anywhere. Ambiguous or mixed names stay
+    sequential — parallelism is opt-in for unambiguous readers, never assumed.
+    """
+    if tool.sequential:
+        return False
+    if tool.read_only is not None:
+        return tool.read_only
+    return classify_parallel_safe(tool.name)
+
+
+async def _run_one_tool_call(
+    call: ToolCallRecord,
+    by_name: dict[str, BoundTool],
+    available: list[str],
+    executor: ToolExecutor | None,
+) -> ToolReturnRecord:
+    """Execute a SINGLE tool call (name-repair + authz/approval via the executor).
+
+    Extracted so the fan-out can dispatch calls either serially or concurrently while
+    the per-call semantics (typo-repair, capability authz + approval gate inside the
+    executor, unknown-tool correction) stay byte-identical to the serial path.
+    """
+    tool = by_name.get(call.tool_name)
+    if tool is None:
+        # Repair a near-miss name: auto-apply a confident typo-fix, otherwise hand
+        # the model a concrete correction (did-you-mean + the available tools).
+        resolution = resolve_tool_name(call.tool_name, available)
+        if resolution.name is not None:
+            tool = by_name[resolution.name]
+    if tool is not None and executor is not None:
+        ret = await executor(tool.name, call.args)
+        ret = ret.model_copy(update={"tool_call_id": call.tool_call_id})
+        if tool.name != call.tool_name:  # record the auto-correction
+            ret = ret.model_copy(
+                update={
+                    "tool_name": tool.name,
+                    "metadata": {
+                        **(ret.metadata or {}),
+                        "repaired_from": call.tool_name,
+                    },
+                }
+            )
+        return ret
+    resolution = resolve_tool_name(call.tool_name, available)
+    message = unknown_tool_message(resolution, available)
+    return ToolReturnRecord(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        content=message,
+        outcome="failed",
+        metadata={
+            "error_code": "UNKNOWN_TOOL",
+            "error_message": message,
+            "suggestions": resolution.suggestions,
+        },
+    )
+
+
 async def _execute_tool_calls(
     bound_tools: list[BoundTool],
     tool_calls: list[ToolCallRecord],
@@ -196,47 +282,97 @@ async def _execute_tool_calls(
     onto the thread, so without this the model never sees a result and loops. Mirrors
     :class:`StubClientManager`'s execution path; ``bound_tools`` is still used to
     validate/repair the call's tool name before invoking the executor.
+
+    Only MAXIMAL RUNS OF CONSECUTIVE read-only calls are executed CONCURRENTLY under a
+    bounded semaphore (``HIMMY_TOOL_PARALLELISM``, default 8). Write/side-effecting/
+    ambiguous/unknown calls act as strict ORDERING BARRIERS: iterating in original order,
+    a pending read-batch is fully awaited before the barrier call runs, and the barrier
+    runs sequentially before iteration continues. This preserves the serial
+    happens-before across every write boundary — a read positioned AFTER a write still
+    observes that write's effect (e.g. ``append_note`` then ``list_notes``) — while still
+    parallelising the common all-reads (or trailing-reads-after-a-write) case. Reads have
+    no ordering, idempotency, or approval hazard, so within one uninterrupted read-batch
+    concurrency cuts wall-clock without changing any result.
+
+    Results are always returned in the calls' ORIGINAL order. The executor
+    (:meth:`ToolService.tool_executor`) converts ordinary tool errors into a ``failed``
+    RETURN record rather than raising, so on the normal path the batch is fully
+    order-preserving and no call runs twice. A concurrent read that does raise an
+    UNEXPECTED exception (cancellation, OOM, an executor-wrapper bug) is isolated —
+    siblings already scheduled in its batch run to completion and the earliest-in-order
+    failure is re-raised. NOTE: on that raise path a read-batch is all-or-nothing, not
+    first-failure-stop: a sibling ordered AFTER the failing read within the SAME batch
+    will already have executed, whereas a strictly serial loop would have aborted before
+    reaching it. Reads carry no ordering/idempotency/approval hazard, so the only
+    observable difference is a benign extra read side effect (e.g. a lazy cache
+    write-through); no write is ever in a batch. Setting the knob to ``1`` restores fully
+    serial (first-failure-stop) behaviour.
     """
     by_name = {t.name: t for t in bound_tools}
     available = list(by_name)
-    returns: list[ToolReturnRecord] = []
-    for call in tool_calls:
+    parallelism = _default_tool_parallelism()
+
+    returns: list[ToolReturnRecord | None] = [None] * len(tool_calls)
+
+    def _is_parallel(call: ToolCallRecord) -> bool:
+        """Read-only + executable => eligible to join the current concurrent batch."""
+        if parallelism <= 1 or executor is None:
+            return False
         tool = by_name.get(call.tool_name)
         if tool is None:
-            # Repair a near-miss name: auto-apply a confident typo-fix, otherwise hand
-            # the model a concrete correction (did-you-mean + the available tools).
             resolution = resolve_tool_name(call.tool_name, available)
             if resolution.name is not None:
                 tool = by_name[resolution.name]
-        if tool is not None and executor is not None:
-            ret = await executor(tool.name, call.args)
-            ret = ret.model_copy(update={"tool_call_id": call.tool_call_id})
-            if tool.name != call.tool_name:  # record the auto-correction
-                ret = ret.model_copy(
-                    update={
-                        "tool_name": tool.name,
-                        "metadata": {
-                            **(ret.metadata or {}),
-                            "repaired_from": call.tool_name,
-                        },
-                    }
-                )
-        else:
-            resolution = resolve_tool_name(call.tool_name, available)
-            message = unknown_tool_message(resolution, available)
-            ret = ToolReturnRecord(
-                tool_call_id=call.tool_call_id,
-                tool_name=call.tool_name,
-                content=message,
-                outcome="failed",
-                metadata={
-                    "error_code": "UNKNOWN_TOOL",
-                    "error_message": message,
-                    "suggestions": resolution.suggestions,
-                },
+        return tool is not None and _is_parallel_safe(tool)
+
+    async def _flush(batch: list[int]) -> None:
+        """Run a batch of CONSECUTIVE read indices concurrently, preserving order.
+
+        Exceptions are isolated per call (siblings still complete); the earliest-in-order
+        failure within the batch is re-raised so the caller sees exactly what a serial
+        loop would have surfaced. Because a batch only ever contains reads that are
+        adjacent in the original ``tool_calls`` order, no read is ever hoisted across a
+        write barrier.
+        """
+        if not batch:
+            return
+        if len(batch) == 1:
+            # Single read: no benefit to spinning up a gather/semaphore.
+            returns[batch[0]] = await _run_one_tool_call(
+                tool_calls[batch[0]], by_name, available, executor
             )
-        returns.append(ret)
-    return returns
+            return
+        semaphore = asyncio.Semaphore(parallelism)
+
+        async def _guarded(idx: int) -> ToolReturnRecord:
+            async with semaphore:
+                return await _run_one_tool_call(
+                    tool_calls[idx], by_name, available, executor
+                )
+
+        results = await asyncio.gather(
+            *(_guarded(i) for i in batch), return_exceptions=True
+        )
+        for idx, result in zip(batch, results, strict=True):
+            if isinstance(result, BaseException):
+                # Re-raise the FIRST failure in original order; siblings already ran.
+                raise result
+            returns[idx] = result
+
+    # Walk calls in order, accumulating a batch of consecutive reads. Any non-parallel
+    # call is a barrier: flush the pending batch (await completion), run it sequentially,
+    # then continue — exactly the serial happens-before, minus the read-batch latency.
+    batch: list[int] = []
+    for i, call in enumerate(tool_calls):
+        if _is_parallel(call):
+            batch.append(i)
+            continue
+        await _flush(batch)
+        batch = []
+        returns[i] = await _run_one_tool_call(call, by_name, available, executor)
+    await _flush(batch)
+
+    return [r for r in returns if r is not None]
 
 
 def _default_ollama_timeout() -> float:

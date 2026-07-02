@@ -103,6 +103,9 @@ def register_local_tool(
     whether the tool only reads (vs mutates) — surfaced to small models so a
     look-up doesn't land on a write tool; omit it to infer from the name. Returns
     the created :class:`ToolDefinition`.
+
+    An explicit ``read_only=True`` is AUTHORITATIVE (the author asserts no side
+    effect), so a timed-out call may be re-fired; a name-inferred read-only is not.
     """
     definition = ToolDefinition(
         name=name,
@@ -112,6 +115,7 @@ def register_local_tool(
         output_json_schema=output_json_schema,
         requires_approval=requires_approval,
         read_only=read_only,
+        read_only_authoritative=read_only is True,
         sequential=sequential,
         timeout_seconds=timeout_seconds,
         retry_hints=retry_hints or {},
@@ -134,6 +138,7 @@ def register_http_tool(
     timeout_seconds: float | None = None,
     retry_hints: dict[str, Any] | None = None,
     sensitive_arg_names: list[str] | None = None,
+    read_only: bool | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> ToolDefinition:
     """Register an ``HTTP`` connector described declaratively by ``http_config``.
@@ -142,7 +147,21 @@ def register_http_tool(
     placeholders, query/body/header args, and env-backed auth at call time.
     Definition-level ``timeout_seconds`` (overrides ``http_config.timeout_seconds``),
     ``retry_hints``, ``sequential``, and ``sensitive_arg_names`` are all reachable.
+
+    ``read_only`` intent is the HTTP METHOD's ground truth, not a name guess: when the
+    caller leaves it unset it is DERIVED from ``http_config.method`` — GET/HEAD/OPTIONS
+    are read-only, every other method (POST/PUT/PATCH/DELETE) is a writer. An explicit
+    ``read_only`` argument overrides the method (e.g. a read-only POST search). This
+    beats the name heuristic so a POST named ``search_orders`` is never mis-parallelised.
+
+    A method-DERIVED ``read_only`` is a parallelism hint only, NOT authoritative: a
+    GET/HEAD endpoint may still have server-side side effects (an analytics beacon,
+    ``GET /trigger``), so it must never license re-firing a timed-out call. Only an
+    EXPLICIT ``read_only=True`` argument is authoritative for timeout-retry.
     """
+    read_only_authoritative = read_only is True
+    if read_only is None:
+        read_only = _read_only_from_method(http_config.method)
     definition = ToolDefinition(
         name=name,
         kind=ToolBackendKind.HTTP,
@@ -150,6 +169,8 @@ def register_http_tool(
         args_json_schema=args_json_schema or {},
         output_json_schema=output_json_schema,
         requires_approval=requires_approval,
+        read_only=read_only,
+        read_only_authoritative=read_only_authoritative,
         sequential=sequential,
         timeout_seconds=timeout_seconds,
         retry_hints=retry_hints or {},
@@ -158,3 +179,15 @@ def register_http_tool(
         metadata=metadata or {},
     )
     return registry.register(definition)
+
+
+#: HTTP methods with no server-side side effect (safe to run concurrently / retry).
+_READ_ONLY_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _read_only_from_method(method: str) -> bool:
+    """Derive read/write intent from an HTTP method (the ground-truth side-effect signal).
+
+    GET/HEAD/OPTIONS are read-only; every other verb (POST/PUT/PATCH/DELETE/…) mutates.
+    """
+    return method.upper() in _READ_ONLY_HTTP_METHODS
