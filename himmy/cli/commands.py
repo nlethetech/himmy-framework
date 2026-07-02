@@ -1361,11 +1361,172 @@ def cmd_demo_video(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------- agent-as-service
+
+#: The one inbound channel `himmy serve -f` / `himmy worker -f` turn on: the generic
+#: signed-webhook trigger. The Slack/Discord connectors need provider-specific secrets,
+#: so the one-command front door wires only the channel-agnostic webhook.
+_SERVICE_INBOUND_CONNECTOR = "webhook"
+#: The sample payload source the summary's ready-to-paste curl uses (and that the
+#: front door allow-lists when the operator has set no allowlist of their own).
+_SERVICE_SAMPLE_SOURCE = "local"
+
+
+def _service_agent_path(args: argparse.Namespace) -> str | None:
+    """The agent.yaml a service should expose: ``-f``/``--agent``, or the nearest one.
+
+    ``himmy serve -f agent.yaml`` names the file explicitly; ``--agent`` is an alias so the
+    flag reads the same as ``himmy eval --agent``. With neither, an ``agent.yaml`` discovered
+    upward from cwd (git-style, :func:`_discover_spec_file`) is used — so ``himmy serve`` in a
+    scaffolded project just works. Returns ``None`` when nothing is configured (the BFF then
+    boots with NO agent endpoint mounted, byte-identical to a bare ``himmy serve``).
+    """
+    explicit = getattr(args, "file", None) or getattr(args, "agent", None)
+    if explicit:
+        return str(Path(explicit).expanduser())
+    discovered = _discover_spec_file()
+    return str(discovered) if discovered is not None else None
+
+
+def _enable_inbound_webhook(agent_path: str) -> str:
+    """Point the inbound webhook at ``agent_path`` and ensure it can mount; return its secret.
+
+    Wires the SAME machinery ``mount_inbound_connectors`` reads (never a parallel runtime):
+
+    * ``HIMMY_INBOUND_AGENT_PATH`` names the agent an inbound delivery runs;
+    * the webhook connector is enabled for the ``inbound`` surface;
+    * a signing secret is ensured — an operator-configured one is honoured (never
+      clobbered), else a fresh random one is generated for THIS process so the public
+      trigger is signed by construction (an unsigned webhook is a forgeable agent trigger,
+      so the connector refuses to mount without a secret);
+    * the sample source is allow-listed ONLY when the operator has set no allowlist (an
+      empty allowlist is default-deny — the safe posture — but then the ready-to-paste curl
+      would 403; adding one source keeps default-deny for everyone else).
+
+    Values are written to the PROCESS ENV (the ``EnvSecrets`` link of the secrets chain), so
+    this works offline with no writable secrets backend and never persists a generated secret
+    to disk. Idempotent: an already-configured secret/allowlist/agent is left untouched.
+    Returns the effective signing secret so the caller can render a VALID sample signature —
+    the raw secret itself is NEVER printed or logged.
+    """
+    import secrets as _secrets
+
+    from himmy.api.connector_inbound import INBOUND_AGENT_PATH_ENV
+    from himmy.config.secrets import get_secret
+    from himmy.connectors.manage import _enabled_flag_name
+    from himmy.connectors.webhook import WEBHOOK_SIGNING_SECRET
+
+    os.environ[INBOUND_AGENT_PATH_ENV] = agent_path
+    os.environ.setdefault(
+        _enabled_flag_name(_SERVICE_INBOUND_CONNECTOR, "inbound"), "1"
+    )
+    secret = get_secret(WEBHOOK_SIGNING_SECRET)
+    if not secret:
+        secret = "whsec_" + _secrets.token_hex(24)
+        os.environ[WEBHOOK_SIGNING_SECRET] = secret
+    if not get_secret("HIMMY_WEBHOOK_ALLOWED_SOURCES"):
+        os.environ["HIMMY_WEBHOOK_ALLOWED_SOURCES"] = _SERVICE_SAMPLE_SOURCE
+    return secret
+
+
+def _durable_store_path() -> str:
+    """The durable SQLite run-store path the summary reports (``HIMMY_STORE_PATH``)."""
+    from himmy.config.secrets import get_secret
+    from himmy.services.storage.factory import HIMMY_STORE_PATH
+
+    dsn = get_secret("HIMMY_DATABASE_URL")
+    if dsn:
+        return "postgres (HIMMY_DATABASE_URL)"
+    return get_secret("HIMMY_STORE_PATH") or HIMMY_STORE_PATH
+
+
+def render_service_summary(
+    *,
+    host: str | None,
+    port: int | None,
+    agent_path: str | None,
+    signing_secret: str | None,
+    store_path: str,
+) -> str:
+    """A boxed "your agent is live" summary, printed after a service binds.
+
+    Shared by ``himmy serve``/``himmy worker`` (and reusable by ``himmy deploy``): shows the
+    base URL, the mounted agent endpoint + a ready-to-paste **signed** curl, the docs/health/
+    metrics routes, and the durable store path. The curl carries a signature this build's
+    verifier accepts — computed with :func:`sign_webhook_body` over the SAME sample payload —
+    so a newcomer can prove the endpoint end to end in one paste. The raw signing SECRET is
+    NEVER included (only a valid signature for the sample body is); when no agent is wired the
+    endpoint block is omitted (a bare BFF has no agent surface).
+
+    ``host`` is ``None`` for a ``himmy worker`` (no HTTP surface): the URL/endpoint/routes
+    blocks are dropped and only the store path (+ agent, if any) is shown, since a worker
+    reaches its agent through the run queue / scheduler, not an HTTP endpoint.
+    """
+    top = "  ┌─ your agent is live ─────────────────────────────"
+    bottom = "  └──────────────────────────────────────────────────"
+    lines = ["", top]
+    http = host is not None and port is not None
+    if http:
+        base = f"http://{host}:{port}"
+        lines.append(f"  │  {base}")
+        if agent_path and signing_secret:
+            from himmy.api.connector_inbound import _INBOUND_PATHS
+            from himmy.connectors.webhook import (
+                DEFAULT_SIGNATURE_HEADER,
+                sign_webhook_body,
+            )
+
+            endpoint = f"{base}{_INBOUND_PATHS[_SERVICE_INBOUND_CONNECTOR]}"
+            body = json.dumps(
+                {"source": _SERVICE_SAMPLE_SOURCE, "text": "hello"},
+                separators=(",", ":"),
+            )
+            signature = sign_webhook_body(
+                secret=signing_secret, body=body.encode("utf-8")
+            )
+            lines += [
+                "  │",
+                f"  │  agent    {endpoint}",
+                "  │  try it (signed; paste as-is):",
+                f"  │    curl -s {endpoint} \\",
+                f"  │      -H '{DEFAULT_SIGNATURE_HEADER}: {signature}' \\",
+                f"  │      -d '{body}'",
+                "  │",
+                f"  │  docs     {base}/docs",
+                f"  │  ready    {base}/readyz",
+                f"  │  metrics  {base}/metrics",
+            ]
+        else:
+            lines += [
+                "  │",
+                f"  │  docs     {base}/docs",
+                f"  │  ready    {base}/readyz",
+                f"  │  metrics  {base}/metrics",
+            ]
+    else:
+        lines.append("  │  worker (no HTTP endpoint — runs the queue + scheduler)")
+        if agent_path:
+            lines.append(f"  │  agent    {agent_path}")
+    lines += [
+        f"  │  store    {store_path}",
+        bottom,
+        "",
+    ]
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------- serve
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """Boot the FastAPI BFF via uvicorn (requires the ``api`` extra)."""
+    """Boot the FastAPI BFF via uvicorn (requires the ``api`` extra).
+
+    With ``-f agent.yaml`` (or a discovered nearest one) the agent is exposed as a
+    signature-verified HTTP endpoint (POST ``/v1/connectors/webhook``) via the SAME inbound
+    machinery ``himmy deploy`` uses — reusing :mod:`himmy.api.connector_inbound`, so its
+    default-deny + HMAC verification are untouched. With no agent the BFF boots exactly as
+    before (no agent endpoint). Either way a boxed summary prints after bind.
+    """
     try:
         import uvicorn
 
@@ -1377,9 +1538,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # Expose the agent as a signed webhook endpoint when one is configured/discovered.
+    agent_path = _service_agent_path(args)
+    signing_secret: str | None = None
+    if agent_path is not None:
+        signing_secret = _enable_inbound_webhook(agent_path)
+
     # Pass the bind host so create_app can fail closed when an unauthenticated
     # build would be exposed off-loopback (see _enforce_auth_posture).
     app = create_app(bind_host=args.host)
+    _eprint(
+        render_service_summary(
+            host=args.host,
+            port=args.port,
+            agent_path=agent_path,
+            signing_secret=signing_secret,
+            store_path=_durable_store_path(),
+        )
+    )
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
@@ -1425,11 +1601,29 @@ def cmd_worker(args: argparse.Namespace) -> int:
         _eprint("error: --no-scheduler and --scheduler-only are mutually exclusive")
         return 1
 
+    # ``himmy worker -f agent.yaml`` points the inbound agent at this file so any in-process
+    # agent resolution (and a co-located `himmy serve`) uses the SAME spec. The worker has NO
+    # HTTP surface, so it exposes no webhook endpoint — the summary reflects that.
+    agent_path = _service_agent_path(args)
+    if agent_path is not None:
+        from himmy.api.connector_inbound import INBOUND_AGENT_PATH_ENV
+
+        os.environ[INBOUND_AGENT_PATH_ENV] = agent_path
+
     # Surface the worker's lifecycle log lines on stderr (the CLI default is quiet).
     logging.basicConfig(
         level=os.environ.get("HIMMY_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
+    )
+    _eprint(
+        render_service_summary(
+            host=None,
+            port=None,
+            agent_path=agent_path,
+            signing_secret=None,
+            store_path=_durable_store_path(),
+        )
     )
 
     try:

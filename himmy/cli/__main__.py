@@ -156,6 +156,28 @@ def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_service_agent_flags(parser: argparse.ArgumentParser) -> None:
+    """Agent-selection flags for the long-running SERVICE commands (serve, worker).
+
+    A thinner set than :func:`_add_agent_flags`: a service picks WHICH agent to expose, but
+    the per-run permission profile (``--yolo``/``--safe``/``--role``/``--budget``) does not
+    apply to a daemon — an inbound delivery runs under the connector's least-privilege service
+    principal, not an interactive session. ``-f``/``--agent`` name the ``agent.yaml`` (aliases,
+    so ``serve -f`` and ``eval --agent`` read alike); with neither, the nearest ``agent.yaml``
+    is discovered. ``--name``/``--provider`` are accepted for parity with the other commands.
+    """
+    parser.add_argument("-f", "--file", help="path to the agent.yaml to expose as a service")
+    parser.add_argument(
+        "--agent", dest="agent", help="alias for -f/--file (the agent.yaml to serve)"
+    )
+    parser.add_argument("--name", help="agent name (parity with run/chat; informational)")
+    parser.add_argument(
+        "--provider",
+        choices=PROVIDERS,
+        help="inference provider override for the served agent (default: the spec's)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argument parser with all subcommands."""
     parser = argparse.ArgumentParser(prog="himmy", description="Himmy agent CLI.")
@@ -428,7 +450,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_demo.set_defaults(func=commands.cmd_demo_video)
 
-    p_serve = sub.add_parser("serve", help="serve the FastAPI BFF (needs api extra)")
+    p_serve = sub.add_parser(
+        "serve",
+        help="serve the FastAPI BFF, exposing -f agent.yaml as a signed HTTP endpoint "
+        "(needs api extra)",
+    )
+    _add_service_agent_flags(p_serve)
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.set_defaults(func=commands.cmd_serve)
@@ -437,6 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
         "worker",
         help="run the routine scheduler + durable run-queue dispatcher (no API server)",
     )
+    _add_service_agent_flags(p_worker)
     p_worker.add_argument(
         "--store",
         help="path for the durable SQLite run store (sets HIMMY_STORE_PATH; "
