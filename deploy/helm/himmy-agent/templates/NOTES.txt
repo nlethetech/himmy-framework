@@ -49,7 +49,13 @@ components share one durable .himmy store:
 {{- if .Values.persistence.enabled }}
 
 NOTE: Each component is single-replica by design. The shared /app/.himmy SQLite
-stores live on an RWO PVC and are single-writer — do NOT raise replicaCount.
+stores live on an RWO PVC — single-WRITER but multi-PROCESS-safe (opened WAL +
+busy_timeout), so api + worker coordinate on one node. Do NOT raise replicaCount.
+{{- if not .Values.affinity }}
+The worker is hard-scheduled onto the api pod's node (podAffinity) so both can mount
+that RWO PVC. If you set .Values.affinity yourself, keep them co-located or move the
+run store off the PVC — cross-node placement hangs the worker (Multi-Attach error).
+{{- end }}
 {{- if .Values.persistence.retain }}
 The state PVC ({{ include "himmy-agent.pvcName" . }}) is annotated
 helm.sh/resource-policy: keep, so `helm uninstall` will NOT delete it.

@@ -61,7 +61,10 @@ services:
     # Fail-closed by default: bind 127.0.0.1 so the port is NOT reachable through a
     # published mapping until auth is configured. Override with AGENT_BIND=0.0.0.0
     # ONLY after setting HIMMY_AUTH_MODE + a key (see the header's security posture).
+    # The image has NO ENTRYPOINT (only CMD), so `command:` fully REPLACES the exec
+    # target — it must start with the `himmy` binary or Docker tries to exec "serve".
     command:
+      - "himmy"
       - "serve"
       - "-f"
       - "/app/agent.yaml"
@@ -118,7 +121,10 @@ services:
     restart: unless-stopped
     # Routine scheduler + durable run-queue dispatcher on the SAME store as api. No
     # HTTP surface (no --host/--port) — this process exposes nothing on the network.
+    # NO ENTRYPOINT in the image → `command:` must start with the `himmy` binary
+    # (else Docker execs "worker", which does not exist).
     command:
+      - "himmy"
       - "worker"
       - "-f"
       - "/app/agent.yaml"

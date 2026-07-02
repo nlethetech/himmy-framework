@@ -46,6 +46,10 @@ spec:
           # `himmy worker -f agent.yaml` runs the routine scheduler + durable
           # run-queue dispatcher on the SAME /app/.himmy store the api writes to.
           # No HTTP surface — this pod exposes nothing on the network.
+          # NO ENTRYPOINT in the image → pin `command: ["himmy"]` so `args` don't
+          # exec a nonexistent "worker" binary and CrashLoop the pod.
+          command:
+            - "himmy"
           args:
             - "worker"
             - "-f"
@@ -64,9 +68,22 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- if .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if .Values.persistence.enabled }}
+      # No user affinity + a shared RWO PVC: a RWO volume attaches to ONE node at a
+      # time, so the worker MUST land on the api pod's node or it hangs with a
+      # Multi-Attach error. Hard-require co-location with the api pod. Override by
+      # setting `.Values.affinity` (e.g. when using an RWX volume or Postgres-only).
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "himmy-agent.selectorLabels" . | nindent 18 }}
+                  app.kubernetes.io/component: api
+              topologyKey: kubernetes.io/hostname
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:

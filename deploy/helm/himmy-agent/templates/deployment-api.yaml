@@ -45,6 +45,11 @@ spec:
           # webhook. Fail-closed default bindHost 127.0.0.1: reachable only in-pod
           # until auth.mode is set and bindHost widened to 0.0.0.0 (create_app
           # refuses an unauthenticated off-loopback bind).
+          # The image has NO ENTRYPOINT (only CMD), and `args:` REPLACES CMD without
+          # prepending anything — so we pin `command: ["himmy"]` explicitly, else the
+          # kubelet execs "serve" and the pod CrashLoops.
+          command:
+            - "himmy"
           args:
             - "serve"
             - "-f"
@@ -59,21 +64,28 @@ spec:
               protocol: TCP
           env:
             {{- include "himmy-agent.commonEnv" . | nindent 12 }}
-          # Probes hit the UNGUARDED /health (liveness: process up) and /readyz
-          # (readiness: 503 while durable storage is unwired), both answered on
-          # loopback regardless of the bind host.
+          # exec probes (NOT httpGet): with the fail-closed default bindHost 127.0.0.1
+          # uvicorn listens only on the container loopback, so a kubelet httpGet to the
+          # POD IP would be refused and CrashLoop the pod. curl-in-container runs in the
+          # pod's own netns, so it reaches loopback and stays correct at ANY bindHost
+          # (mirrors the compose healthcheck; curl is installed in the image).
+          # /health = liveness (process up); /readyz = readiness (503 until storage wired).
           livenessProbe:
-            httpGet:
-              path: /health
-              port: http
+            exec:
+              command:
+                - "curl"
+                - "-fsS"
+                - "http://127.0.0.1:{{ .Values.api.port }}/health"
             initialDelaySeconds: {{ .Values.api.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.api.probes.liveness.periodSeconds }}
             timeoutSeconds: {{ .Values.api.probes.liveness.timeoutSeconds }}
             failureThreshold: {{ .Values.api.probes.liveness.failureThreshold }}
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: http
+            exec:
+              command:
+                - "curl"
+                - "-fsS"
+                - "http://127.0.0.1:{{ .Values.api.port }}/readyz"
             initialDelaySeconds: {{ .Values.api.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.api.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ .Values.api.probes.readiness.timeoutSeconds }}

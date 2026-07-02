@@ -9,10 +9,15 @@
 #              run-queue dispatcher over the SAME .himmy store.
 #
 # Single-writer reality (READ THIS before scaling):
-#   himmy keeps a cwd-relative /app/.himmy state dir of SQLite stores that are
-#   single-writer. The api and worker therefore mount the SAME RWO PVC and are each
-#   hard-pinned to a single replica with a Recreate strategy. Even with an external
-#   Postgres entity store, those sidecar SQLite stores stay single-writer.
+#   himmy keeps a cwd-relative /app/.himmy state dir of SQLite stores. The durable
+#   run store is opened WAL + busy_timeout (himmy.core.sqlite_util.connect_hardened),
+#   so TWO processes on ONE node (api enqueues, worker dispatches) coordinate instead
+#   of raising `database is locked` — this two-process-same-node topology IS the
+#   supported mode. It is single-WRITER, not single-process: api + worker mount the
+#   SAME RWO PVC and are each hard-pinned to one replica with a Recreate strategy, and
+#   the worker is auto co-located on the api's node (see `affinity` below). Even with
+#   an external Postgres entity store, those SQLite run stores stay on the shared PVC,
+#   so both pods must remain on the same node.
 #
 # Intentionally OUT OF SCOPE (wire in yourself): HPA, PDB, NetworkPolicy,
 # ServiceMonitor, a bundled Postgres subchart, and multi-replica scaling.
@@ -172,4 +177,10 @@ env: {}
 
 nodeSelector: {}
 tolerations: []
+# -- Pod affinity/anti-affinity. When LEFT EMPTY and persistence is enabled, the
+# worker pod auto-gets a HARD podAffinity co-locating it on the api pod's node —
+# required because the shared RWO state PVC can attach to only one node at a time
+# (cross-node placement → the worker hangs with a Multi-Attach error). Set this to
+# your own affinity ONLY if you use an RWX volume or a fully external run store, as
+# it REPLACES that auto co-location.
 affinity: {}

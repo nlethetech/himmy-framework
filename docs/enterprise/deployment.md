@@ -84,8 +84,15 @@ Fail-closed by default: `api.bindHost` is `127.0.0.1`, so the endpoint is reacha
 in-pod. To expose it via the Service/ingress you MUST set `auth.mode` (e.g. `apikey`) AND
 `api.bindHost=0.0.0.0` — the chart refuses to render an ingress otherwise, and himmy
 refuses to boot an unauthenticated off-loopback bind. Each component is single-replica by
-design (the shared `.himmy` SQLite stores are single-writer); a Postgres
-`HIMMY_DATABASE_URL` is what makes multi-node dispatch safe.
+design (the shared `.himmy` SQLite run store is single-WRITER but opened WAL +
+busy_timeout, so the api + worker coordinate safely as two processes on ONE node); a
+Postgres `HIMMY_DATABASE_URL` moves the entity store off SQLite, but the run store
+stays on the shared PVC. Because that PVC is `ReadWriteOnce` (one node at a time), the
+worker pod is auto-scheduled onto the api pod's node via a hard `podAffinity` — leave
+`affinity` empty to keep it, or supply your own only with an RWX volume. The api's
+health/readiness use `exec` (in-pod `curl`) probes, not `httpGet`, so they stay correct
+at the loopback `bindHost` default. Both containers pin `command: ["himmy"]` (the image
+has no ENTRYPOINT).
 
 ---
 

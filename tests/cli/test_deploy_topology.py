@@ -65,6 +65,16 @@ def test_agent_compose_has_api_and_worker_running_the_agent() -> None:
     assert "worker" in worker_cmd and "/app/agent.yaml" in worker_cmd
 
 
+def test_agent_compose_commands_invoke_the_himmy_binary() -> None:
+    """The exec target is `himmy` — the image has NO ENTRYPOINT, so `command:` must
+    start with the binary or Docker execs a nonexistent "serve"/"worker"."""
+    doc = yaml.safe_load(_compose_path().read_text(encoding="utf-8"))
+    for name in ("api", "worker"):
+        cmd = doc["services"][name].get("command", [])
+        assert isinstance(cmd, list) and cmd, f"{name} command must be a non-empty list"
+        assert cmd[0] == "himmy", f"{name} must exec the himmy binary, got {cmd[0]!r}"
+
+
 def test_agent_compose_mounts_agent_yaml_in_both_services() -> None:
     """Both api and worker bind-mount the user's agent.yaml at the stable CMD path."""
     doc = yaml.safe_load(_compose_path().read_text(encoding="utf-8"))
@@ -147,6 +157,47 @@ def test_agent_chart_has_api_and_worker_deployments() -> None:
     # api runs `himmy serve`; worker runs `himmy worker`. Both mount the agent.yaml.
     assert '"serve"' in api and "/app/agent.yaml" in api
     assert '"worker"' in worker and "/app/agent.yaml" in worker
+
+
+def test_agent_chart_deployments_pin_the_himmy_command() -> None:
+    """Both Deployments pin `command: ["himmy"]` — the image has NO ENTRYPOINT, so a
+    bare `args:` would exec a nonexistent "serve"/"worker" and CrashLoop the pod."""
+    tpl = _agent_chart_dir() / "templates"
+    for fname in ("deployment-api.yaml", "deployment-worker.yaml"):
+        text = (tpl / fname).read_text(encoding="utf-8")
+        assert "command:" in text and '- "himmy"' in text, (
+            f"{fname} must pin command: [\"himmy\"] so args don't exec a missing binary"
+        )
+
+
+def test_agent_chart_api_probes_are_exec_not_httpget() -> None:
+    """The api liveness/readiness probes are `exec` (in-pod curl), not `httpGet`.
+
+    With the fail-closed bindHost 127.0.0.1 default uvicorn listens only on the
+    container loopback, so a kubelet httpGet to the pod IP would be refused and
+    CrashLoop the pod. exec runs in the pod netns and reaches loopback at any bind.
+    """
+    api = (_agent_chart_dir() / "templates" / "deployment-api.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "httpGet:" not in api, "api probes must not use httpGet (loopback bind)"
+    assert api.count("exec:") >= 2, "api needs exec liveness + readiness probes"
+    assert "/health" in api and "/readyz" in api
+
+
+def test_agent_chart_worker_colocates_with_api() -> None:
+    """The worker template hard-co-locates with the api pod (shared RWO PVC).
+
+    A RWO PVC attaches to one node at a time; without podAffinity the worker can land
+    on a different node and hang with a Multi-Attach error.
+    """
+    worker = (_agent_chart_dir() / "templates" / "deployment-worker.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "podAffinity:" in worker
+    assert "requiredDuringSchedulingIgnoredDuringExecution" in worker
+    assert "kubernetes.io/hostname" in worker
+    assert "component: api" in worker
 
 
 def test_agent_chart_mounts_agent_yaml_from_configmap() -> None:
