@@ -1174,6 +1174,7 @@ class ToolService:
                 args_json_schema=definition.args_json_schema,
                 output_json_schema=definition.output_json_schema,
                 read_only=definition.read_only,
+                sequential=definition.sequential,
             )
             for definition in selected
         ]

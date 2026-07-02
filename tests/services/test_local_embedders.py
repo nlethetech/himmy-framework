@@ -338,7 +338,121 @@ def test_resolve_auto_backend_concurrent_probes_at_most_once(
         t.join()
 
     assert results == ["ollama"] * 16  # every concurrent caller saw the same decision
-    # Exactly one converged cache entry for the default base_url.
-    assert local_embedders._AUTO_BACKEND_CACHE == {
-        local_embedders._DEFAULT_OLLAMA_URL: "ollama"
-    }
+    # Exactly one converged cache entry for the default base_url (value is a
+    # ``(decision, deadline)`` tuple; only the decision is asserted here).
+    assert list(local_embedders._AUTO_BACKEND_CACHE) == [
+        local_embedders._DEFAULT_OLLAMA_URL
+    ]
+    assert (
+        local_embedders._AUTO_BACKEND_CACHE[local_embedders._DEFAULT_OLLAMA_URL][0]
+        == "ollama"
+    )
+
+
+# ---------------------------------------- red-team r1: staleness TTL + normalisation
+
+
+class _FlippableProbe:
+    """Ollama probes whose reachability can be flipped between resolves + call-counted."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, reachable: bool) -> None:
+        self.reachable = reachable
+        self.reachable_calls = 0
+
+        def _reachable(*_a: object, **_k: object) -> bool:
+            self.reachable_calls += 1
+            return self.reachable
+
+        monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+        monkeypatch.setattr(local_embedders, "ollama_reachable", _reachable)
+        monkeypatch.setattr(
+            local_embedders, "ollama_embed_model_available", lambda *a, **k: True
+        )
+
+
+def test_non_terminal_decision_reprobes_after_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``deterministic`` decision made before Ollama was up UPGRADES after the TTL.
+
+    Regression: the memo pinned the first probe for the process lifetime, so a server that
+    started before Ollama came up served non-semantic ``deterministic`` embeddings forever.
+    With a TTL the stale non-terminal decision is re-probed and upgrades to ``ollama``.
+    """
+    monkeypatch.setenv("HIMMY_BACKEND_PROBE_TTL", "5")
+    probe = _FlippableProbe(monkeypatch, reachable=False)
+    fake_now = [100.0]
+    monkeypatch.setattr(local_embedders.time, "monotonic", lambda: fake_now[0])
+
+    # Ollama not up yet -> deterministic, cached with a deadline at now+5.
+    assert resolve_auto_backend() == "deterministic"
+    # Within the TTL window: no re-probe, still deterministic.
+    fake_now[0] = 103.0
+    assert resolve_auto_backend() == "deterministic"
+    assert probe.reachable_calls == 1
+    # Past the deadline + Ollama now up: re-probe upgrades to ollama.
+    fake_now[0] = 200.0
+    probe.reachable = True
+    assert resolve_auto_backend() == "ollama"
+    assert probe.reachable_calls == 2
+
+
+def test_ttl_zero_caches_forever(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HIMMY_BACKEND_PROBE_TTL=0 pins the decision (prior cache-forever behaviour)."""
+    monkeypatch.setenv("HIMMY_BACKEND_PROBE_TTL", "0")
+    probe = _FlippableProbe(monkeypatch, reachable=False)
+    assert resolve_auto_backend() == "deterministic"
+    probe.reachable = True
+    # No TTL: the pinned deterministic decision is served regardless of clock/liveness.
+    for _ in range(5):
+        assert resolve_auto_backend() == "deterministic"
+    assert probe.reachable_calls == 1  # never re-probed
+
+
+def test_fastembed_decision_is_terminal_never_reprobes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``fastembed`` decision is cached forever even with a TTL (importability is stable)."""
+    monkeypatch.setenv("HIMMY_BACKEND_PROBE_TTL", "1")
+    calls = {"n": 0}
+
+    def _fastembed() -> bool:
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(local_embedders, "fastembed_available", _fastembed)
+    monkeypatch.setattr(local_embedders.time, "monotonic", lambda: 0.0)
+    assert resolve_auto_backend() == "fastembed"
+    monkeypatch.setattr(local_embedders.time, "monotonic", lambda: 10_000.0)
+    assert resolve_auto_backend() == "fastembed"
+    assert calls["n"] == 1  # terminal: no re-probe despite the elapsed TTL
+
+
+def test_equivalent_base_urls_share_one_cache_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trailing-slash / host-case spellings of the same server probe once, not per spelling.
+
+    Regression: the memo keyed on the RAW base_url, so ``.../11434`` and ``.../11434/`` each
+    paid their own blocking probe and stored a separate entry despite hitting one server.
+    """
+    counter = _ProbeCounter(monkeypatch)
+    for url in (
+        "http://localhost:11434",
+        "http://localhost:11434/",
+        "http://LOCALHOST:11434",
+        "http://localhost:11434///",
+    ):
+        assert resolve_auto_backend(ollama_base_url=url) == "ollama"
+    # All four spellings collapsed to ONE normalised key and ONE probe.
+    assert counter.reachable_calls == 1
+    assert list(local_embedders._AUTO_BACKEND_CACHE) == ["http://localhost:11434"]
+
+
+def test_normalise_base_url_leaves_path_and_port() -> None:
+    """Normalisation only touches trailing slashes + scheme/host case, not path/port."""
+    n = local_embedders._normalise_base_url
+    assert n("http://localhost:11434/") == "http://localhost:11434"
+    assert n("HTTP://LocalHost:11434") == "http://localhost:11434"
+    assert n("http://host:8080/v1/") == "http://host:8080/v1"
+    assert n("not-a-url/") == "not-a-url"

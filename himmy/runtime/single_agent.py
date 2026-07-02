@@ -3543,9 +3543,12 @@ class SingleAgentRuntime:
         side effect, so re-running it after a timeout is safe; anything else (a write
         tool, or an ambiguously-named one whose intent can't be inferred) is treated
         as side-effecting and NOT retried on timeout. Resolution: the definition's
-        explicit ``read_only`` flag wins; otherwise the name is classified
-        (``classify_read_only`` — ``None``/ambiguous ⇒ not read-only); an unknown
-        tool (no definition) is conservatively treated as side-effecting.
+        explicit ``read_only`` flag wins; otherwise the name is classified with the
+        STRICT :func:`classify_parallel_safe` — NOT the first-token-wins
+        ``classify_read_only`` hint, which infers a name like ``fetch_and_delete`` /
+        ``get_or_create`` as read-only despite a write verb and would then let a
+        side-effecting call be re-fired after a timeout. A mixed/ambiguous name (and an
+        unknown tool with no definition) is conservatively treated as side-effecting.
         """
         if self.tool_service is None:
             return False
@@ -3557,9 +3560,9 @@ class SingleAgentRuntime:
             return False
         if definition.read_only is not None:
             return bool(definition.read_only)
-        from himmy.services.tools.access import classify_read_only
+        from himmy.services.tools.access import classify_parallel_safe
 
-        return classify_read_only(tool_name) is True
+        return classify_parallel_safe(tool_name)
 
     def _wrap_executor_with_retry(
         self,

@@ -52,6 +52,13 @@ def _rerank_cache_enabled() -> bool:
 #: :class:`contextlib.nullcontext`, so the kill-switch restores pre-cache parallelism.
 _CROSS_ENCODER_LOCK = threading.Lock()
 
+#: Serialises the one-time CONSTRUCTION of a shared :func:`_load_cross_encoder` session so
+#: concurrent cold-start misses for the same model don't each build (and discard) a heavy
+#: ONNX session — ``functools.cache`` runs the loader outside its own lock. Held only
+#: across the cache lookup+build in :meth:`_model_impl`; uncontended once warm. Kept
+#: separate from the inference guard so a build never blocks an in-flight rerank.
+_CROSS_ENCODER_BUILD_LOCK = threading.Lock()
+
 
 @cache
 def _load_cross_encoder(model_name: str) -> Any:
@@ -138,7 +145,10 @@ class FastEmbedReranker:
         if self._impl is not None:
             return self._impl
         if _rerank_cache_enabled():
-            return _load_cross_encoder(self.model)
+            # Load-exactly-once under concurrent cold start (see the build-lock docstring);
+            # an uncontended dict-hit once warm, released before any rerank runs.
+            with _CROSS_ENCODER_BUILD_LOCK:
+                return _load_cross_encoder(self.model)
         if self._impl is None:
             try:
                 from fastembed.rerank.cross_encoder import (  # type: ignore

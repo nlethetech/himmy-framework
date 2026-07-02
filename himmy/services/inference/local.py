@@ -46,7 +46,7 @@ from himmy.services.inference.tool_protocol import (
     _iter_json_objects,
     parse_text_tool_calls,
 )
-from himmy.services.tools.access import classify_read_only, describe_for_model
+from himmy.services.tools.access import classify_parallel_safe, describe_for_model
 from himmy.services.tools.repair import resolve_tool_name, unknown_tool_message
 from himmy.services.tools.schema_normalize import normalize_tool_schema
 
@@ -199,17 +199,27 @@ def _default_tool_parallelism() -> int:
     return value if value > 0 else 8
 
 
-def _is_read_only(tool: BoundTool) -> bool:
-    """Whether a resolved tool is safe to run concurrently (read-only).
+def _is_parallel_safe(tool: BoundTool) -> bool:
+    """Whether a resolved tool may join a CONCURRENT read-batch (fail-closed).
 
-    The author's explicit ``read_only`` flag wins; when unset, fall back to the shared
-    name-based classifier (:func:`classify_read_only`). An ambiguous classification
-    (``None``) is treated as NOT read-only so write/side-effecting/HITL-gated tools stay
-    sequential by default — parallelism is opt-out-safe, never assumed.
+    An explicit author ``sequential=True`` ALWAYS forces the tool out of any parallel run
+    (a non-reentrant client that must not overlap itself), regardless of read-only intent.
+    Otherwise the author's explicit ``read_only`` flag wins: only ``read_only=True`` is
+    eligible; ``False`` (a writer) is a barrier.
+
+    When ``read_only`` is unset (``None``) we DO NOT trust the first-token-wins
+    :func:`classify_read_only` hint to gate concurrency — it infers a name like
+    ``fetch_and_delete``/``report_incident`` as read-only despite a write verb, which would
+    let a mutating call be hoisted into a concurrent read-batch ahead of a dependent read.
+    Instead we use the strict :func:`classify_parallel_safe`, which is read-only ONLY when
+    the name has a read verb and NO write verb anywhere. Ambiguous or mixed names stay
+    sequential — parallelism is opt-in for unambiguous readers, never assumed.
     """
+    if tool.sequential:
+        return False
     if tool.read_only is not None:
         return tool.read_only
-    return classify_read_only(tool.name) is True
+    return classify_parallel_safe(tool.name)
 
 
 async def _run_one_tool_call(
@@ -284,11 +294,19 @@ async def _execute_tool_calls(
     no ordering, idempotency, or approval hazard, so within one uninterrupted read-batch
     concurrency cuts wall-clock without changing any result.
 
-    Results are always returned in the calls' ORIGINAL order, and per-call error handling
-    is byte-identical to the serial path: a concurrent read that raises is isolated
-    (siblings in its batch still complete) and the earliest-in-order failure is the one
-    re-raised, exactly as a serial loop would surface it — no call is executed twice.
-    Setting the knob to ``1`` restores fully serial behaviour.
+    Results are always returned in the calls' ORIGINAL order. The executor
+    (:meth:`ToolService.tool_executor`) converts ordinary tool errors into a ``failed``
+    RETURN record rather than raising, so on the normal path the batch is fully
+    order-preserving and no call runs twice. A concurrent read that does raise an
+    UNEXPECTED exception (cancellation, OOM, an executor-wrapper bug) is isolated —
+    siblings already scheduled in its batch run to completion and the earliest-in-order
+    failure is re-raised. NOTE: on that raise path a read-batch is all-or-nothing, not
+    first-failure-stop: a sibling ordered AFTER the failing read within the SAME batch
+    will already have executed, whereas a strictly serial loop would have aborted before
+    reaching it. Reads carry no ordering/idempotency/approval hazard, so the only
+    observable difference is a benign extra read side effect (e.g. a lazy cache
+    write-through); no write is ever in a batch. Setting the knob to ``1`` restores fully
+    serial (first-failure-stop) behaviour.
     """
     by_name = {t.name: t for t in bound_tools}
     available = list(by_name)
@@ -305,7 +323,7 @@ async def _execute_tool_calls(
             resolution = resolve_tool_name(call.tool_name, available)
             if resolution.name is not None:
                 tool = by_name[resolution.name]
-        return tool is not None and _is_read_only(tool)
+        return tool is not None and _is_parallel_safe(tool)
 
     async def _flush(batch: list[int]) -> None:
         """Run a batch of CONSECUTIVE read indices concurrently, preserving order.

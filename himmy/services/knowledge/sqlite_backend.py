@@ -161,6 +161,62 @@ def _vector_cache_max_kbs() -> int:
         return _DEFAULT_VECTOR_CACHE_MAX_KBS
 
 
+class _VectorCacheState:
+    """Decoded-vector cache state ANCHORED to a shared SQLite connection, not an instance.
+
+    :meth:`SqliteStorageService.knowledge_backend` is a FACTORY: it hands out a NEW
+    :class:`SqliteKnowledgeBackend` per call, all fronting the SAME connection. If each
+    kept its own cache + generation counter, a mutation through backend A would invalidate
+    only A's cache, and a warm backend B over the same connection would serve deleted/old
+    vectors forever. Storing the cache dict, its lock, and the commit-generation counter on
+    a per-CONNECTION holder (looked up in :data:`_VECTOR_CACHE_STATES`) makes every backend
+    built from one connection share the SAME cache, so any instance's committed mutation
+    invalidates the snapshot every sibling would read.
+    """
+
+    __slots__ = ("cache", "cache_lock", "data_version", "gen")
+
+    def __init__(self) -> None:
+        self.cache: OrderedDict[str, list[_CachedChunk]] = OrderedDict()
+        self.cache_lock = threading.Lock()
+        #: Monotonic commit-generation, bumped under the backend's write lock at every
+        #: committed chunk mutation by ANY backend sharing this connection.
+        self.gen = 0
+        #: Last observed ``PRAGMA data_version`` for the shared connection. SQLite bumps it
+        #: whenever ANOTHER connection commits to the file (a second process, sidecar, or
+        #: raw ``sqlite3`` write); a change means the whole cache may be stale, so it is
+        #: dropped. ``None`` until the first read. Guarded by ``cache_lock``.
+        self.data_version: int | None = None
+
+
+#: Per-connection vector-cache state, so multiple :class:`SqliteKnowledgeBackend`\\ s over
+#: one shared connection coordinate one cache + generation counter (see
+#: :class:`_VectorCacheState`). ``sqlite3.Connection`` is neither weakly-referenceable nor
+#: attribute-settable, so we key by ``id(conn)`` and STRONG-reference the connection in the
+#: value tuple ``(conn, state)`` — pinning it guarantees the id cannot be reused (and thus
+#: collide) while the entry lives. :meth:`SqliteKnowledgeBackend.close` evicts the entry
+#: for a connection this backend OWNS; a shared connection's entry lives as long as its
+#: owning storage service (matching that lifetime). Guarded by the states lock on lookup.
+_VECTOR_CACHE_STATES: dict[int, tuple[sqlite3.Connection, _VectorCacheState]] = {}
+_VECTOR_CACHE_STATES_LOCK = threading.Lock()
+
+
+def _vector_cache_state_for(conn: sqlite3.Connection) -> _VectorCacheState:
+    """Return the shared cache state for ``conn``, creating it once (thread-safe)."""
+    with _VECTOR_CACHE_STATES_LOCK:
+        entry = _VECTOR_CACHE_STATES.get(id(conn))
+        if entry is None:
+            entry = (conn, _VectorCacheState())
+            _VECTOR_CACHE_STATES[id(conn)] = entry
+        return entry[1]
+
+
+def _drop_vector_cache_state(conn: sqlite3.Connection) -> None:
+    """Evict a connection's shared cache state (called when an OWNED connection closes)."""
+    with _VECTOR_CACHE_STATES_LOCK:
+        _VECTOR_CACHE_STATES.pop(id(conn), None)
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
     """Cosine similarity between two equal-length vectors (0.0 when degenerate).
 
@@ -239,18 +295,26 @@ class SqliteKnowledgeBackend:
         # the KB-wide chunk purge) invalidates that kb_id precisely so a stale matrix is never
         # served. Keyed strictly by ``kb_id`` (a global PRIMARY KEY, unique across
         # tenant/workspace even in a shared ``.db``), so KB A never serves KB B's matrix.
-        self._vec_cache: OrderedDict[str, list[_CachedChunk]] = OrderedDict()
-        self._vec_cache_lock = threading.Lock()
+        # Cache state is anchored to the CONNECTION (shared across every backend built from
+        # the same connection), NOT to this instance — see :class:`_VectorCacheState`. Two
+        # backends over one shared ``.db`` therefore coordinate one cache + generation
+        # counter, so a mutation through one invalidates the snapshot the other would read.
+        self._vec_state = _vector_cache_state_for(self._conn)
         self._vec_cache_max_kbs = _vector_cache_max_kbs()
-        # Monotonic commit-generation counter, bumped under ``self._lock`` at every committed
-        # chunk mutation (persist/delete-document/delete-kb). A snapshot captures the
-        # generation ATOMICALLY with its row fetch (same ``self._lock`` hold); publication into
-        # ``_vec_cache`` only happens if the generation has not advanced since. This closes the
-        # fetch->publish TOCTOU where an invalidation lands after the fetch but before the
-        # publish (a bare pop would be a no-op on the not-yet-published entry, then the stale
-        # snapshot would be published and served indefinitely). Guarded by ``self._lock`` on
-        # write and read-with-fetch; a plain int read under that lock is all that's needed.
-        self._vec_gen = 0
+        # Last ``PRAGMA data_version`` this backend observed per kb_id snapshot. SQLite bumps
+        # ``data_version`` whenever ANOTHER connection (a second process, a sidecar, a raw
+        # ``sqlite3`` write) commits to the file, so folding it into the snapshot-validity
+        # check makes an externally-written KB re-decode instead of serving a stale matrix.
+        self._vec_data_version = 0
+        # The commit-generation counter (``self._vec_state.gen``) is bumped under
+        # ``self._lock`` at every committed chunk mutation (persist/delete-document/
+        # delete-kb). A snapshot captures the generation ATOMICALLY with its row fetch (same
+        # ``self._lock`` hold); publication into the cache only happens if the generation
+        # has not advanced since. This closes the fetch->publish TOCTOU where an
+        # invalidation lands after the fetch but before the publish (a bare pop would be a
+        # no-op on the not-yet-published entry, then the stale snapshot would be published
+        # and served indefinitely). For a SHARED connection ``self._lock`` is the shared
+        # write lock, so sibling backends' bumps are seen coherently.
         self._apply_schema()
 
     @property
@@ -258,9 +322,22 @@ class SqliteKnowledgeBackend:
         """The filesystem path of the backing database (``:shared:`` for a reused conn)."""
         return self._path
 
+    @property
+    def _vec_cache(self) -> OrderedDict[str, list[_CachedChunk]]:
+        """The shared decoded-vector cache for this backend's connection (see the state).
+
+        A property so multiple backends over one connection observe the SAME mapping and
+        tests can introspect it, while the storage lives on the per-connection
+        :class:`_VectorCacheState` (never a per-instance dict).
+        """
+        return self._vec_state.cache
+
     async def close(self) -> None:
         """Close the connection if this backend owns it (a shared conn is left alone)."""
         if self._owns_conn:
+            # Evict the per-connection cache state BEFORE closing so its ``id`` can't be
+            # reused by a later connection while a stale entry lingers.
+            _drop_vector_cache_state(self._conn)
             await asyncio.to_thread(self._conn.close)
 
     # ------------------------------------------------------------- sync primitives
@@ -380,7 +457,7 @@ class SqliteKnowledgeBackend:
                 deleted = cur.rowcount == 1
                 # Bump under the write lock so any snapshot that captured the pre-commit
                 # generation (and thus pre-commit rows) will refuse to publish afterwards.
-                self._vec_gen += 1
+                self._vec_state.gen += 1
             except BaseException:
                 self._rollback_quietly()
                 raise
@@ -466,7 +543,7 @@ class SqliteKnowledgeBackend:
                 self._conn.commit()
                 # Bump under the write lock so an in-flight snapshot that read the old rows
                 # (with the old generation) is refused publication after this commit.
-                self._vec_gen += 1
+                self._vec_state.gen += 1
             except BaseException:
                 self._rollback_quietly()
                 raise
@@ -487,7 +564,7 @@ class SqliteKnowledgeBackend:
                 self._conn.commit()
                 # Bump under the write lock so a concurrent snapshot that captured the
                 # pre-commit generation cannot publish its now-stale rows.
-                self._vec_gen += 1
+                self._vec_state.gen += 1
             except BaseException:
                 self._rollback_quietly()
                 raise
@@ -770,38 +847,65 @@ class SqliteKnowledgeBackend:
         if self._vec_cache_max_kbs <= 0:
             _gen, snapshot = self._build_chunk_snapshot(kb_id)
             return snapshot
-        with self._vec_cache_lock:
-            cached = self._vec_cache.get(kb_id)
+        # Drop the whole cache if ANOTHER connection committed to the file since we last
+        # looked (cross-process / raw-SQL write) — cheap ``PRAGMA data_version`` check.
+        self._drop_cache_on_external_write()
+        cache = self._vec_state.cache
+        with self._vec_state.cache_lock:
+            cached = cache.get(kb_id)
             if cached is not None:
-                self._vec_cache.move_to_end(kb_id)
+                cache.move_to_end(kb_id)
                 return cached
         # Build OUTSIDE the cache lock (the SELECT + JSON decode can be slow and must not
         # serialize other KBs' cache reads); the write lock still guards the SQL fetch AND the
         # generation read, so ``gen`` and ``snapshot`` describe the SAME committed state.
         gen, snapshot = self._build_chunk_snapshot(kb_id)
-        with self._vec_cache_lock:
+        with self._vec_state.cache_lock:
             # A concurrent builder may have populated it first — prefer the published entry so
             # every reader shares one snapshot (both reflect the same committed rows).
-            existing = self._vec_cache.get(kb_id)
+            existing = cache.get(kb_id)
             if existing is not None:
-                self._vec_cache.move_to_end(kb_id)
+                cache.move_to_end(kb_id)
                 return existing
             # Only publish if no committed mutation intervened between the fetch and now.
-            # If ``_vec_gen`` advanced, an invalidation already fired (a no-op pop, since we
-            # hadn't published yet) and this snapshot is stale — return it uncached so the
+            # If the generation advanced, an invalidation already fired (a no-op pop, since
+            # we hadn't published yet) and this snapshot is stale — return it uncached so the
             # NEXT search rebuilds from the newer rows. This closes the fetch->publish TOCTOU
             # that would otherwise pin a stale matrix indefinitely.
             if self._current_vec_gen() == gen:
-                self._vec_cache[kb_id] = snapshot
-                self._vec_cache.move_to_end(kb_id)
-                while len(self._vec_cache) > self._vec_cache_max_kbs:
-                    self._vec_cache.popitem(last=False)
+                cache[kb_id] = snapshot
+                cache.move_to_end(kb_id)
+                while len(cache) > self._vec_cache_max_kbs:
+                    cache.popitem(last=False)
         return snapshot
+
+    def _drop_cache_on_external_write(self) -> None:
+        """Clear the shared cache when another CONNECTION has committed since last checked.
+
+        ``PRAGMA data_version`` is a per-connection counter SQLite increments whenever the
+        database file is modified by a DIFFERENT connection (another process, a sidecar
+        worker, or a manual ``sqlite3`` write) — it does NOT move for this connection's own
+        writes (those are tracked precisely by ``self._vec_state.gen``). Reading it is a
+        cheap pragma. On a change we conservatively drop the ENTIRE cache so a KB written
+        externally re-decodes fresh rows instead of serving a stale matrix — restoring the
+        read-your-writes-across-processes property the cache-free path had. Guarded by the
+        write lock (the pragma is a read on the shared connection) + the cache lock.
+        """
+        with self._lock:
+            row = self._conn.execute("PRAGMA data_version").fetchone()
+        current = int(row[0]) if row is not None else 0
+        with self._vec_state.cache_lock:
+            if self._vec_state.data_version is None:
+                self._vec_state.data_version = current
+                return
+            if current != self._vec_state.data_version:
+                self._vec_state.cache.clear()
+                self._vec_state.data_version = current
 
     def _current_vec_gen(self) -> int:
         """Read the commit-generation counter under the write lock (atomic w.r.t. bumps)."""
         with self._lock:
-            return self._vec_gen
+            return self._vec_state.gen
 
     def _build_chunk_snapshot(self, kb_id: str) -> tuple[int, list[_CachedChunk]]:
         """Fetch + decode a KB's chunks, returning ``(generation, snapshot)`` atomically.
@@ -815,7 +919,7 @@ class SqliteKnowledgeBackend:
         is left to the callers' sort, so the row order here does not affect results.
         """
         with self._lock:
-            gen = self._vec_gen
+            gen = self._vec_state.gen
             cur = self._conn.execute(
                 "SELECT c.chunk_id, c.document_id, c.text, c.start_pos, c.end_pos, "
                 "c.embedding, c.chunk_kind, c.image_uri, c.caption, c.metadata, "
@@ -848,14 +952,15 @@ class SqliteKnowledgeBackend:
         """Drop the cached decoded snapshot for ``kb_id`` (precise, single-KB eviction).
 
         Called from every mutation that changes a KB's chunk set (AFTER it bumped
-        ``self._vec_gen`` under the write lock) so the next search rebuilds from committed
-        rows. This pop evicts an ALREADY-published stale entry; the generation guard in
-        :meth:`_cached_chunks` covers the complementary case where a build is in flight and
-        has not yet published (a bare pop would no-op there). Cheap and idempotent (a miss is a
-        no-op); other KBs' snapshots are untouched.
+        ``self._vec_state.gen`` under the write lock) so the next search rebuilds from
+        committed rows. Because the cache is anchored to the shared connection, this evicts
+        the entry that EVERY backend over that connection would read — not just this
+        instance's — closing the cross-instance staleness. The generation guard in
+        :meth:`_cached_chunks` covers the complementary in-flight-build case (a bare pop
+        would no-op there). Cheap and idempotent; other KBs' snapshots are untouched.
         """
-        with self._vec_cache_lock:
-            self._vec_cache.pop(kb_id, None)
+        with self._vec_state.cache_lock:
+            self._vec_state.cache.pop(kb_id, None)
 
     # ---------------------------------------------------------------- helpers
     def _row_to_result(

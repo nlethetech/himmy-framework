@@ -107,6 +107,68 @@ def classify_read_only(name: str) -> bool | None:
     return None
 
 
+# DUAL-USE read verbs: they read in some names but head an ACTION in others
+# (``report_incident``/``report_bug`` file something; ``check_out`` mutates; ``search_replace``
+# writes; ``count_and_reset`` resets). They must NOT, on their own, qualify a multi-token
+# name as safe to run concurrently — only a name that is ENTIRELY read verbs does.
+_AMBIGUOUS_READ_VERBS = frozenset(
+    {
+        "report",
+        "check",
+        "status",
+        "count",
+        "view",
+        "history",
+        "search",
+        "find",
+        "fetch",
+    }
+)
+#: Read verbs whose presence as the FIRST token reliably implies no side effect.
+_UNAMBIGUOUS_READ_VERBS = _READ_VERBS - _AMBIGUOUS_READ_VERBS
+
+
+def classify_parallel_safe(name: str) -> bool:
+    """Whether a NAME is safe to run CONCURRENTLY with siblings (strict, fail-closed).
+
+    This is deliberately STRICTER than :func:`classify_read_only`. The latter is
+    first-token-wins (a model-facing *hint* only) and so infers a name like
+    ``fetch_and_delete``/``get_or_create``/``report_incident`` as read-only even though it
+    may mutate state — harmless for a description tag, but UNSAFE to gate parallelism on,
+    because such a call must never be hoisted into a concurrent read-batch ahead of a
+    dependent read.
+
+    A name is parallel-safe ONLY when BOTH hold:
+
+    * NO write verb appears anywhere in its tokens (``fetch_and_delete``, ``get_or_create``,
+      ``status_update`` carry ``delete``/``create``/``update`` → barrier); and
+    * it is unambiguously a reader — either the FIRST token is an *unambiguous* read verb
+      (``get``/``list``/``read``/``describe``/…), or EVERY token is a read verb. A DUAL-USE
+      read verb (``report``/``check``/``search``/``find``/``fetch``/``count``/``view``/
+      ``status``/``history``) heading a name with a non-read tail (``report_incident``,
+      ``check_out``, ``count_and_reset``, ``view_and_ack``, ``history_purge``,
+      ``search_replace``) is NOT parallel-safe — it may be an action.
+
+    Everything else (mixed read+write, ambiguous, dual-use+action) stays sequential.
+    Authors flag genuine look-ups explicitly with ``read_only=True`` to opt such tools back
+    into concurrency.
+    """
+    tokens = [t for t in name.lower().replace("-", "_").split("_") if t]
+    if not tokens:
+        return False
+    if any(t in _WRITE_VERBS for t in tokens):
+        return False
+    # A DUAL-USE read verb heading a name whose tail isn't itself all-read may be an
+    # ACTION (``report_incident``, ``check_out``, ``search_replace``) → not parallel-safe.
+    if tokens[0] in _AMBIGUOUS_READ_VERBS and not all(t in _READ_VERBS for t in tokens):
+        return False
+    # Otherwise: an unambiguous read verb ANYWHERE (noun-first ``egg_totals`` too), or a
+    # name that is entirely read verbs, is safe.
+    if any(t in _UNAMBIGUOUS_READ_VERBS for t in tokens):
+        return True
+    return all(t in _READ_VERBS for t in tokens)
+
+
 _READ_TAG = " — [read-only: returns data; safe to call for look-ups]"
 _WRITE_TAG = (
     " — [WRITE: changes data; only call to record/modify something, "
@@ -133,4 +195,4 @@ def describe_for_model(
     return description
 
 
-__all__ = ["classify_read_only", "describe_for_model"]
+__all__ = ["classify_parallel_safe", "classify_read_only", "describe_for_model"]
