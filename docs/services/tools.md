@@ -50,7 +50,16 @@ definition stays JSON-serializable and projectable to an `EntityRecord`
 - `name`, `kind` (`ToolBackendKind.LOCAL | HTTP`), `description`
 - `args_json_schema` / `output_json_schema` — validated before/after execution
 - `requires_approval: bool` — gated before any user pre-hook
-- `read_only: bool | None` — read vs mutate intent surfaced to the model
+- `read_only: bool | None` — read vs mutate intent surfaced to the model. Declaring
+  `read_only=True` on `register_local_tool` / `register_http_tool` is AUTHORITATIVE
+  (`read_only_authoritative=True`): a first-class STRUCTURAL assertion of no side effect that
+  lets the tool join a concurrent read-batch and be re-fired on a bare timeout. `read_only=False`
+  is a strict write barrier (never parallelised, never timeout-retried) — set it on a
+  side-effecting GET or a read-named mutator (`get_then_charge`). Leaving it unset (`None`) is
+  fail-closed: intent falls back to the strict name gate and, when the name is ambiguous, the
+  tool is treated as a sequential WRITE barrier. A method-DERIVED read-only (an HTTP `GET`) is a
+  parallelism hint only, NOT authoritative — it too routes through the fail-closed name gate, so
+  a `GET /trigger` with a server-side side effect is never auto-parallelised.
 - `timeout_seconds`, `retry_hints` (dict), `sequential`
 - `http_config: HttpToolConfig | None` — declarative REST connector
 - `sensitive_arg_names: list[str]` — arg keys redacted from emitted events
