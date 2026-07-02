@@ -242,6 +242,15 @@ class SqliteKnowledgeBackend:
         self._vec_cache: OrderedDict[str, list[_CachedChunk]] = OrderedDict()
         self._vec_cache_lock = threading.Lock()
         self._vec_cache_max_kbs = _vector_cache_max_kbs()
+        # Monotonic commit-generation counter, bumped under ``self._lock`` at every committed
+        # chunk mutation (persist/delete-document/delete-kb). A snapshot captures the
+        # generation ATOMICALLY with its row fetch (same ``self._lock`` hold); publication into
+        # ``_vec_cache`` only happens if the generation has not advanced since. This closes the
+        # fetch->publish TOCTOU where an invalidation lands after the fetch but before the
+        # publish (a bare pop would be a no-op on the not-yet-published entry, then the stale
+        # snapshot would be published and served indefinitely). Guarded by ``self._lock`` on
+        # write and read-with-fetch; a plain int read under that lock is all that's needed.
+        self._vec_gen = 0
         self._apply_schema()
 
     @property
@@ -369,6 +378,9 @@ class SqliteKnowledgeBackend:
                 )
                 self._conn.commit()
                 deleted = cur.rowcount == 1
+                # Bump under the write lock so any snapshot that captured the pre-commit
+                # generation (and thus pre-commit rows) will refuse to publish afterwards.
+                self._vec_gen += 1
             except BaseException:
                 self._rollback_quietly()
                 raise
@@ -452,6 +464,9 @@ class SqliteKnowledgeBackend:
                             (ch.chunk_id, kb_id, ch.text),
                         )
                 self._conn.commit()
+                # Bump under the write lock so an in-flight snapshot that read the old rows
+                # (with the old generation) is refused publication after this commit.
+                self._vec_gen += 1
             except BaseException:
                 self._rollback_quietly()
                 raise
@@ -470,6 +485,9 @@ class SqliteKnowledgeBackend:
             try:
                 deleted = self._delete_document_rows(kb_id, document_id)
                 self._conn.commit()
+                # Bump under the write lock so a concurrent snapshot that captured the
+                # pre-commit generation cannot publish its now-stale rows.
+                self._vec_gen += 1
             except BaseException:
                 self._rollback_quietly()
                 raise
@@ -750,15 +768,17 @@ class SqliteKnowledgeBackend:
         is built and returned WITHOUT caching, preserving the exact pre-cache decode path.
         """
         if self._vec_cache_max_kbs <= 0:
-            return self._build_chunk_snapshot(kb_id)
+            _gen, snapshot = self._build_chunk_snapshot(kb_id)
+            return snapshot
         with self._vec_cache_lock:
             cached = self._vec_cache.get(kb_id)
             if cached is not None:
                 self._vec_cache.move_to_end(kb_id)
                 return cached
         # Build OUTSIDE the cache lock (the SELECT + JSON decode can be slow and must not
-        # serialize other KBs' cache reads); the write lock still guards the SQL fetch.
-        snapshot = self._build_chunk_snapshot(kb_id)
+        # serialize other KBs' cache reads); the write lock still guards the SQL fetch AND the
+        # generation read, so ``gen`` and ``snapshot`` describe the SAME committed state.
+        gen, snapshot = self._build_chunk_snapshot(kb_id)
         with self._vec_cache_lock:
             # A concurrent builder may have populated it first — prefer the published entry so
             # every reader shares one snapshot (both reflect the same committed rows).
@@ -766,29 +786,47 @@ class SqliteKnowledgeBackend:
             if existing is not None:
                 self._vec_cache.move_to_end(kb_id)
                 return existing
-            self._vec_cache[kb_id] = snapshot
-            self._vec_cache.move_to_end(kb_id)
-            while len(self._vec_cache) > self._vec_cache_max_kbs:
-                self._vec_cache.popitem(last=False)
+            # Only publish if no committed mutation intervened between the fetch and now.
+            # If ``_vec_gen`` advanced, an invalidation already fired (a no-op pop, since we
+            # hadn't published yet) and this snapshot is stale — return it uncached so the
+            # NEXT search rebuilds from the newer rows. This closes the fetch->publish TOCTOU
+            # that would otherwise pin a stale matrix indefinitely.
+            if self._current_vec_gen() == gen:
+                self._vec_cache[kb_id] = snapshot
+                self._vec_cache.move_to_end(kb_id)
+                while len(self._vec_cache) > self._vec_cache_max_kbs:
+                    self._vec_cache.popitem(last=False)
         return snapshot
 
-    def _build_chunk_snapshot(self, kb_id: str) -> list[_CachedChunk]:
-        """Fetch + decode every chunk of a KB into :class:`_CachedChunk` records (uncached).
+    def _current_vec_gen(self) -> int:
+        """Read the commit-generation counter under the write lock (atomic w.r.t. bumps)."""
+        with self._lock:
+            return self._vec_gen
 
-        This is the one place the ``embedding`` / ``metadata`` JSON is decoded; the cache then
-        amortises it across repeat searches. Ordering is left to the callers' sort, so the row
-        order here does not affect results.
+    def _build_chunk_snapshot(self, kb_id: str) -> tuple[int, list[_CachedChunk]]:
+        """Fetch + decode a KB's chunks, returning ``(generation, snapshot)`` atomically.
+
+        The commit generation is read in the SAME ``self._lock`` critical section as the row
+        fetch, so the returned ``generation`` exactly describes the committed state these rows
+        came from. :meth:`_cached_chunks` then refuses to publish the snapshot if the
+        generation has since advanced, so an invalidation that lands between fetch and publish
+        can never leave a stale matrix cached. This is the one place the ``embedding`` /
+        ``metadata`` JSON is decoded; the cache amortises it across repeat searches. Ordering
+        is left to the callers' sort, so the row order here does not affect results.
         """
-        rows = self._fetchall(
-            "SELECT c.chunk_id, c.document_id, c.text, c.start_pos, c.end_pos, "
-            "c.embedding, c.chunk_kind, c.image_uri, c.caption, c.metadata, "
-            "d.source_uri AS doc_source_uri, d.text AS doc_text "
-            "FROM knowledge_chunks c "
-            "JOIN knowledge_documents d ON d.document_id = c.document_id "
-            "WHERE c.kb_id = ?",
-            (kb_id,),
-        )
-        return [
+        with self._lock:
+            gen = self._vec_gen
+            cur = self._conn.execute(
+                "SELECT c.chunk_id, c.document_id, c.text, c.start_pos, c.end_pos, "
+                "c.embedding, c.chunk_kind, c.image_uri, c.caption, c.metadata, "
+                "d.source_uri AS doc_source_uri, d.text AS doc_text "
+                "FROM knowledge_chunks c "
+                "JOIN knowledge_documents d ON d.document_id = c.document_id "
+                "WHERE c.kb_id = ?",
+                (kb_id,),
+            )
+            rows = list(cur.fetchall())
+        return gen, [
             _CachedChunk(
                 chunk_id=str(row["chunk_id"]),
                 document_id=row["document_id"],
@@ -809,9 +847,12 @@ class SqliteKnowledgeBackend:
     def _invalidate_vector_cache(self, kb_id: str) -> None:
         """Drop the cached decoded snapshot for ``kb_id`` (precise, single-KB eviction).
 
-        Called from every mutation that changes a KB's chunk set so the next search rebuilds
-        from committed rows — the cache never serves a stale matrix. Cheap and idempotent
-        (a miss is a no-op); other KBs' snapshots are untouched.
+        Called from every mutation that changes a KB's chunk set (AFTER it bumped
+        ``self._vec_gen`` under the write lock) so the next search rebuilds from committed
+        rows. This pop evicts an ALREADY-published stale entry; the generation guard in
+        :meth:`_cached_chunks` covers the complementary case where a build is in flight and
+        has not yet published (a bare pop would no-op there). Cheap and idempotent (a miss is a
+        no-op); other KBs' snapshots are untouched.
         """
         with self._vec_cache_lock:
             self._vec_cache.pop(kb_id, None)

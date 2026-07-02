@@ -341,3 +341,130 @@ def test_concurrent_search_and_mutate_safe() -> None:
         )
     )
     assert sorted(r.text for r in final) == [f"seed{i}" for i in range(6)]
+
+
+def test_fetch_publish_window_no_stale_publish() -> None:
+    """A commit landing in the fetch->publish gap must NOT be masked by a stale publish.
+
+    This exercises the exact TOCTOU the generation guard closes: a search fetches the OLD
+    committed rows (and old generation), then — BEFORE it publishes — a mutation commits new
+    rows and invalidates (a no-op pop, since nothing is published yet). Without the guard the
+    search would then publish its stale snapshot and serve it indefinitely. We drive the
+    interleaving deterministically by committing a query-ALIGNED chunk from inside the
+    snapshot builder (after it read the old state), and assert the next fresh search sees it.
+    """
+    backend = SqliteKnowledgeBackend(":memory:", enable_lexical=False)
+    kb = _make_kb(backend)
+    _ingest(
+        backend, kb, doc_id="seed", source_uri="seed", text="seed",
+        embedding=[1.0, 0.0, 0.0],
+    )
+    # Warm, then evict so the next search takes the build->publish path (not a warm hit).
+    run_async(
+        backend.search(kb, [1.0, 0.0, 0.0], top_k=5, similarity_threshold=None, metadata_filters=None)
+    )
+    backend._invalidate_vector_cache(kb)
+
+    real_build = backend._build_chunk_snapshot
+    fired = {"done": False}
+
+    def build_then_mutate(kb_id: str) -> Any:
+        gen, snapshot = real_build(kb_id)  # reads OLD committed rows + old generation
+        if not fired["done"]:
+            fired["done"] = True
+            # Commit a NEW, query-aligned chunk in the fetch->publish window. This bumps
+            # _vec_gen and invalidates (no-op pop) BEFORE the caller publishes `snapshot`.
+            _ingest(
+                backend, kb, doc_id="late", source_uri="late", text="late",
+                embedding=[1.0, 0.0, 0.0],
+            )
+        return gen, snapshot
+
+    backend._build_chunk_snapshot = build_then_mutate  # type: ignore[method-assign]
+    # This search built the stale snapshot, then the late chunk committed mid-flight.
+    run_async(
+        backend.search(kb, [1.0, 0.0, 0.0], top_k=5, similarity_threshold=None, metadata_filters=None)
+    )
+    backend._build_chunk_snapshot = real_build  # type: ignore[method-assign]
+
+    # The stale snapshot must NOT have been cached over the newer committed state. The next
+    # search rebuilds and MUST reflect the late chunk.
+    after = run_async(
+        backend.search(kb, [1.0, 0.0, 0.0], top_k=5, similarity_threshold=None, metadata_filters=None)
+    )
+    assert sorted(r.text for r in after) == ["late", "seed"], (
+        "a commit in the fetch->publish window must not be masked by a stale publish"
+    )
+
+
+def test_concurrent_aligned_mutate_seen_at_barrier() -> None:
+    """Query-aligned transient chunks: every committed chunk is observable, no stale mask.
+
+    Unlike the orthogonal-vector stress, these transient chunks share the query axis, so a
+    stale matrix (missing a committed chunk, or retaining a deleted one) would be DETECTABLE
+    in the result. We commit a batch, assert a fresh search sees them all, delete them, assert
+    a fresh search sees none — hammered concurrently with background searchers.
+    """
+    backend = SqliteKnowledgeBackend(":memory:", enable_lexical=False)
+    kb = _make_kb(backend)
+    _ingest(
+        backend, kb, doc_id="base", source_uri="base", text="base",
+        embedding=[1.0, 0.0, 0.0],
+    )
+
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def searcher() -> None:
+        try:
+            while not stop.is_set():
+                run_async(
+                    backend.search(
+                        kb, [1.0, 0.0, 0.0], top_k=50,
+                        similarity_threshold=None, metadata_filters=None,
+                    )
+                )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    searchers = [threading.Thread(target=searcher) for _ in range(4)]
+    for t in searchers:
+        t.start()
+    try:
+        for rnd in range(15):
+            ids = [f"r{rnd}_{j}" for j in range(4)]
+            for cid in ids:
+                _ingest(
+                    backend, kb, doc_id=cid, source_uri=cid, text=cid,
+                    embedding=[1.0, 0.0, 0.0],
+                )
+            seen = run_async(
+                backend.search(
+                    kb, [1.0, 0.0, 0.0], top_k=50,
+                    similarity_threshold=None, metadata_filters=None,
+                )
+            )
+            texts = {r.text for r in seen}
+            assert set(ids) <= texts, f"round {rnd}: committed chunks missing (stale): {set(ids) - texts}"
+            for cid in ids:
+                run_async(backend.delete_document(kb, cid))
+            seen2 = run_async(
+                backend.search(
+                    kb, [1.0, 0.0, 0.0], top_k=50,
+                    similarity_threshold=None, metadata_filters=None,
+                )
+            )
+            texts2 = {r.text for r in seen2}
+            assert not (set(ids) & texts2), f"round {rnd}: deleted chunks lingered (stale): {set(ids) & texts2}"
+    finally:
+        stop.set()
+        for t in searchers:
+            t.join()
+
+    assert not errors, f"concurrent access raised: {errors}"
+    final = run_async(
+        backend.search(
+            kb, [1.0, 0.0, 0.0], top_k=50, similarity_threshold=None, metadata_filters=None
+        )
+    )
+    assert [r.text for r in final] == ["base"]
