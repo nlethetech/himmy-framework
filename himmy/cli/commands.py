@@ -2765,7 +2765,7 @@ def _deploy_channel_with_restart(
     while True:
         started = time.monotonic()
         try:
-            code = fn(args)
+            code: int = fn(args)
         except KeyboardInterrupt:  # pragma: no cover - interactive
             _eprint(f"\n({label} stopped)")
             return 130
