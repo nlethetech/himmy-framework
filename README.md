@@ -572,8 +572,26 @@ this repo the SPA is already built and committed under `himmy/api/_studio_static
 
 ## Deploying
 
-Past `pip install` + `himmy studio` on one machine, there are durable, multi-user shapes —
-all offline-capable, secrets file-delivered, single-writer-honest:
+There are **two different things** you might deploy — pick the one you actually want:
+
+### Deploy MY agent (a service)
+
+You have an `agent.yaml` and want it running as a real, reachable, signed HTTP service.
+The one-command front door is `himmy deploy -f agent.yaml` (serve + worker together,
+bound `127.0.0.1`, signature-verified webhook). For a durable multi-process topology:
+
+- **Docker Compose** — [`deploy/compose/agent-compose.yml`](deploy/compose/agent-compose.yml):
+  an `api` service (`himmy serve` your agent as a signed webhook) + a `worker` service
+  (`himmy worker` — scheduler + run-queue dispatcher) over ONE durable store, plus an
+  optional Postgres behind the `postgres` profile. Point `AGENT_DIR` at your agent folder:
+  `AGENT_DIR=/path/to/my-agent docker compose -f deploy/compose/agent-compose.yml up -d`.
+- **Kubernetes** — the [`deploy/helm/himmy-agent/`](deploy/helm/himmy-agent/) chart: api +
+  worker Deployments mounting your `agent.yaml` (inline or an existing ConfigMap), sharing
+  one RWO state PVC. Fail-closed by default (loopback bind; add auth before exposing).
+
+### Deploy Himmy Studio (the admin GUI)
+
+You want the local web app for building/inspecting agents — **not** an agent endpoint:
 
 - **Docker Compose** — [`deploy/compose/docker-compose.yml`](deploy/compose/docker-compose.yml):
   studio + Postgres (+ an optional bundled Ollama behind the `ollama` profile). `make
@@ -581,6 +599,9 @@ all offline-capable, secrets file-delivered, single-writer-honest:
 - **Kubernetes** — the minimal [`deploy/helm/himmy-studio/`](deploy/helm/himmy-studio/) chart
   (single-replica by design — the `.himmy` SQLite stores are single-writer; external Postgres
   only). `make helm-lint` to validate.
+
+Both paths are offline-capable, secrets file-delivered, and single-writer-honest.
+
 - **Air-gapped** — `scripts/airgap_bundle.py` builds a no-network install bundle (images +
   wheelhouse + Ollama models); see [`docs/enterprise/airgap.md`](docs/enterprise/airgap.md).
 

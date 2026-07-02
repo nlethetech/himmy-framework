@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "himmy-agent.fullname" . }}-api
+  labels:
+    {{- include "himmy-agent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  # Single replica only — the /app/.himmy SQLite stores are single-writer on an
+  # RWO PVC (see values.yaml header).
+  replicas: {{ .Values.api.replicaCount }}
+  # Recreate (not RollingUpdate): the RWO PVC can only attach to one pod at a time.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "himmy-agent.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "himmy-agent.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.serviceAccountName }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: api
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # `himmy serve -f agent.yaml` exposes the agent as a signature-verified
+          # webhook. Fail-closed default bindHost 127.0.0.1: reachable only in-pod
+          # until auth.mode is set and bindHost widened to 0.0.0.0 (create_app
+          # refuses an unauthenticated off-loopback bind).
+          args:
+            - "serve"
+            - "-f"
+            - "/app/agent.yaml"
+            - "--host"
+            - {{ .Values.api.bindHost | quote }}
+            - "--port"
+            - {{ .Values.api.port | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+              protocol: TCP
+          env:
+            {{- include "himmy-agent.commonEnv" . | nindent 12 }}
+          # Probes hit the UNGUARDED /health (liveness: process up) and /readyz
+          # (readiness: 503 while durable storage is unwired), both answered on
+          # loopback regardless of the bind host.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.api.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.api.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.api.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.api.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: {{ .Values.api.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.api.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.api.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.api.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "himmy-agent.volumeMounts" . | nindent 12 }}
+      volumes:
+        {{- include "himmy-agent.volumes" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

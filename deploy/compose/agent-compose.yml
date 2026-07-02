@@ -1,0 +1,176 @@
+# =============================================================================
+# Deploy MY agent — a real, reachable service from an agent.yaml
+# =============================================================================
+#
+# This stands up YOUR agent (the one in your agent.yaml) as a durable service —
+# NOT Himmy Studio (the admin GUI). If you followed a runbook that pointed you at
+# docker-compose.yml and ended up with a GUI but no agent, THIS is the file you
+# wanted.
+#
+# Topology (two processes over ONE durable store):
+#   * api    — `himmy serve -f /app/agent.yaml`: the FastAPI BFF that exposes your
+#              agent as a SIGNATURE-VERIFIED webhook at POST /v1/connectors/webhook
+#              (default-DENY; an unsigned or unknown-source call is refused).
+#   * worker — `himmy worker -f /app/agent.yaml`: the routine scheduler + durable
+#              run-queue dispatcher, on the SAME .himmy store the api writes, so
+#              routines fire and queued runs drain even when nobody is calling the
+#              HTTP endpoint.
+#   * postgres (optional, `postgres` profile) — a durable entity store. Omit it and
+#              everything falls back to the offline single-writer SQLite default on
+#              the shared named volume. Zero-config works with no Postgres at all.
+#
+# Usage (run from the repo root so ./secrets resolves, OR set AGENT_DIR):
+# -------------------------------------------------------------------------
+#   1. Put your agent.yaml somewhere and point AGENT_DIR at its FOLDER:
+#        export AGENT_DIR=/abs/path/to/my-agent
+#      (defaults to ./ — the current directory — when unset.)
+#   2. Optionally drop a plain KEY=value env file at $AGENT_DIR/agent.env with the
+#      provider keys your tool packs need (OPENROUTER_API_KEY, etc). It is read by
+#      both services. Absent → the file is skipped and the agent runs on whatever
+#      local backend `himmy deploy` stamps (claude-cli/ollama), fully offline.
+#   3. Bring it up:
+#        docker compose -f deploy/compose/agent-compose.yml up -d
+#      ...with a durable Postgres entity store:
+#        docker compose -f deploy/compose/agent-compose.yml --profile postgres up -d
+#
+# Security posture (READ THIS before exposing a port)
+# ---------------------------------------------------
+# The api binds 127.0.0.1 INSIDE the container by default (fail-closed): the agent
+# webhook stays signature-verified + default-deny, and the port is deliberately NOT
+# reachable through a published `-p` mapping until you add real auth. To actually
+# reach it from off-host you must, in order:
+#   1. add auth   — set HIMMY_AUTH_MODE=apikey + provide an API key (see agent.env),
+#                   or run `himmy deploy --share` locally to mint one;
+#   2. widen bind  — set AGENT_BIND=0.0.0.0 so uvicorn listens on the container net;
+#   3. publish     — uncomment the `ports:` line under the api service.
+# Binding 0.0.0.0 with NO auth is refused by create_app (himmy will not boot an open
+# admin surface). NEVER set HIMMY_ALLOW_UNAUTHENTICATED=1 unless auth is terminated
+# at a trusted proxy in front of this container. The signing secret is delivered via
+# the RO-mounted secrets dir / agent.env — it is never baked into an image layer.
+# =============================================================================
+
+# Explicit project name so volumes are namespaced predictably (not "compose_*")
+# and do NOT collide with the Studio stack (himmy-full) or the dev stack.
+name: himmy-agent
+
+services:
+  api:
+    image: ${HIMMY_IMAGE:-ghcr.io/nlethetech/himmy}:${HIMMY_VERSION:-0.2.0}
+    container_name: himmy_agent_api
+    restart: unless-stopped
+    # Fail-closed by default: bind 127.0.0.1 so the port is NOT reachable through a
+    # published mapping until auth is configured. Override with AGENT_BIND=0.0.0.0
+    # ONLY after setting HIMMY_AUTH_MODE + a key (see the header's security posture).
+    command:
+      - "serve"
+      - "-f"
+      - "/app/agent.yaml"
+      - "--host"
+      - "${AGENT_BIND:-127.0.0.1}"
+      - "--port"
+      - "8000"
+    # To expose the endpoint, FIRST add auth (agent.env), THEN set AGENT_BIND=0.0.0.0,
+    # THEN uncomment this. Leaving it commented keeps the agent private-by-default.
+    # ports:
+    #   - "8000:8000"
+    environment:
+      # Durable run store (survives restarts) on the shared named volume below.
+      HIMMY_DURABLE_STORAGE: "1"
+      HIMMY_STORE_PATH: "/app/.himmy/storage.db"
+      # Postgres entity store when the `postgres` profile is up; empty → SQLite.
+      HIMMY_DATABASE_URL: "${HIMMY_DATABASE_URL:-}"
+      # App-managed secrets (e.g. the webhook signing secret, HIMMY_ENCRYPTION_KEY)
+      # read one-file-per-key from the RO-mounted dir below.
+      HIMMY_SECRETS: "file"
+      HIMMY_SECRETS_DIR: "/run/himmy-secrets"
+      # Auth hardening passthroughs (leave empty for loopback-only use). Required
+      # BEFORE widening AGENT_BIND off-loopback — create_app fails closed otherwise.
+      HIMMY_AUTH_MODE: "${HIMMY_AUTH_MODE:-}"
+      HIMMY_API_KEYS_FILE: "${HIMMY_API_KEYS_FILE:-}"
+    env_file:
+      # Provider keys + any HIMMY_* overrides. `required: false` → boots fine when
+      # the file is absent (the fully-offline, zero-config path).
+      - path: ${AGENT_DIR:-./}/agent.env
+        required: false
+    volumes:
+      # The user's agent spec, mounted read-only at the stable CMD path.
+      - ${AGENT_DIR:-./}/agent.yaml:/app/agent.yaml:ro
+      # Durable .himmy store — SHARED with the worker (named volume, uid 10001).
+      - himmy_agent_state:/app/.himmy
+      # Operator-provided secret files (signing secret, encryption key). Never written.
+      - ./secrets:/run/himmy-secrets:ro
+    healthcheck:
+      # /health is unguarded and answers on loopback regardless of the bind host, so
+      # the in-container probe passes whether or not the port is published.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+
+  worker:
+    image: ${HIMMY_IMAGE:-ghcr.io/nlethetech/himmy}:${HIMMY_VERSION:-0.2.0}
+    container_name: himmy_agent_worker
+    restart: unless-stopped
+    # Routine scheduler + durable run-queue dispatcher on the SAME store as api. No
+    # HTTP surface (no --host/--port) — this process exposes nothing on the network.
+    command:
+      - "worker"
+      - "-f"
+      - "/app/agent.yaml"
+      - "--store"
+      - "/app/.himmy/storage.db"
+    environment:
+      HIMMY_DURABLE_STORAGE: "1"
+      HIMMY_STORE_PATH: "/app/.himmy/storage.db"
+      HIMMY_DATABASE_URL: "${HIMMY_DATABASE_URL:-}"
+      HIMMY_SECRETS: "file"
+      HIMMY_SECRETS_DIR: "/run/himmy-secrets"
+    env_file:
+      - path: ${AGENT_DIR:-./}/agent.env
+        required: false
+    volumes:
+      - ${AGENT_DIR:-./}/agent.yaml:/app/agent.yaml:ro
+      # SAME named volume as api → one durable store, so the worker drains the runs
+      # the api enqueues (single-writer SQLite; both processes on one node).
+      - himmy_agent_state:/app/.himmy
+      - ./secrets:/run/himmy-secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc  # pgvector/pgvector:pg16
+    container_name: himmy_agent_postgres
+    restart: unless-stopped
+    # Opt-in only: without `--profile postgres` this service is not created and both
+    # api + worker fall back to the offline SQLite store on himmy_agent_state.
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: himmy
+      POSTGRES_USER: himmy
+      # Delivered as a file secret so it stays out of `docker inspect`.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      # Distinct volume name from the Studio stack so both can coexist.
+      - himmy_agent_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U himmy -d himmy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  himmy_agent_state:
+  himmy_agent_pgdata:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password

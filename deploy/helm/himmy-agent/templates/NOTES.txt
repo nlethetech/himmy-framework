@@ -1,0 +1,60 @@
+Your himmy agent has been deployed (api + worker).
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+Chart: {{ include "himmy-agent.chart" . }}  (appVersion {{ .Chart.AppVersion }})
+
+This deploys YOUR agent as a service — NOT Himmy Studio (the admin GUI). Two
+components share one durable .himmy store:
+  * {{ include "himmy-agent.fullname" . }}-api    — the signature-verified webhook endpoint
+  * {{ include "himmy-agent.fullname" . }}-worker — the routine scheduler + run-queue dispatcher
+
+1. Reach the agent endpoint:
+
+{{- if .Values.ingress.enabled }}
+   Ingress is enabled. The agent webhook is at:
+{{- range .Values.ingress.hosts }}
+{{- $host := .host }}
+{{- range .paths }}
+     http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host }}{{ .path }}v1/connectors/webhook
+{{- end }}
+{{- end }}
+{{- else if eq .Values.api.bindHost "127.0.0.1" }}
+   api.bindHost is 127.0.0.1 (fail-closed default): the endpoint is reachable only
+   INSIDE the pod. This is deliberate — the agent runs privately until you add auth.
+   Exec in to smoke-test:
+
+     kubectl --namespace {{ .Release.Namespace }} exec deploy/{{ include "himmy-agent.fullname" . }}-api -- \
+       curl -s http://127.0.0.1:{{ .Values.api.port }}/health      # -> {"status":"ok"}
+
+   To expose it: set auth.mode (e.g. apikey), set api.bindHost=0.0.0.0, then enable
+   ingress or port-forward. himmy REFUSES to boot an unauthenticated off-loopback bind.
+{{- else }}
+   api.bindHost is {{ .Values.api.bindHost }}. Port-forward or enable ingress to reach it:
+
+     kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "himmy-agent.fullname" . }}-api {{ .Values.api.service.port }}:{{ .Values.api.service.port }}
+
+   then: curl -s http://localhost:{{ .Values.api.service.port }}/health   # -> {"status":"ok"}
+{{- end }}
+
+2. The agent endpoint (POST /v1/connectors/webhook) is SIGNATURE-VERIFIED and
+   DEFAULT-DENY: an unsigned call, a bad signature, or an unknown source is refused.
+   Deliver the signing secret (HIMMY_WEBHOOK_SIGNING_SECRET) and any api keys via a
+   Kubernetes Secret referenced by .Values.secrets.existingSecret.
+
+3. Verify storage from inside a pod:
+
+     kubectl --namespace {{ .Release.Namespace }} exec deploy/{{ include "himmy-agent.fullname" . }}-worker -- himmy doctor --storage
+
+{{- if .Values.persistence.enabled }}
+
+NOTE: Each component is single-replica by design. The shared /app/.himmy SQLite
+stores live on an RWO PVC and are single-writer — do NOT raise replicaCount.
+{{- if .Values.persistence.retain }}
+The state PVC ({{ include "himmy-agent.pvcName" . }}) is annotated
+helm.sh/resource-policy: keep, so `helm uninstall` will NOT delete it.
+{{- else }}
+WARNING: persistence.retain is false — `helm uninstall` will DELETE the state PVC
+and every run/trace with it. Take a backup first, or set persistence.retain=true.
+{{- end }}
+{{- end }}
