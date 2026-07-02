@@ -204,8 +204,15 @@ def _spec_from_args(args: argparse.Namespace) -> AgentSpec:
     ``model_key`` (from ``spec.to_llm_config()``) matches the manager the flags
     built — otherwise an override sends the spec's old model string to the new
     provider every request (found live: OpenRouter 400 on a leaked ollama tag).
+
+    Finally, a spec that would fall through to the offline stub because it named no
+    provider and left ``model: default`` is resolved against the machine
+    (:func:`_resolve_default_provider`) so a run picks up the local claude-cli/ollama
+    doctor reports as ``[ok]`` — turning the misleading ``[stub:…]`` headline into a
+    real answer without touching an explicit backend or the CLI overrides above.
     """
-    return _apply_cli_overrides(_apply_himmy_md(_spec_from_args_inner(args)), args)
+    spec = _apply_cli_overrides(_apply_himmy_md(_spec_from_args_inner(args)), args)
+    return _resolve_default_provider(spec, args)
 
 
 def _apply_cli_overrides(spec: AgentSpec, args: argparse.Namespace) -> AgentSpec:
@@ -217,6 +224,38 @@ def _apply_cli_overrides(spec: AgentSpec, args: argparse.Namespace) -> AgentSpec
     if model and model != "default":
         spec.model = model
     return spec
+
+
+def _resolve_default_provider(spec: AgentSpec, args: argparse.Namespace) -> AgentSpec:
+    """Resolve a provider-less ``model: default`` spec against THIS machine before a run.
+
+    The framework's auto-select (``provider=None``) only reaches for a cloud SDK when a key
+    is present — it never notices a local ``claude`` CLI or ``ollama`` server, so a spec that
+    named no provider and left ``model: default`` runs on the offline stub even on a box where
+    ``himmy doctor`` reports claude-cli/ollama ``[ok]``. That is the misleading ``[stub:…]``
+    headline. Here we run the SAME probe the init wizard uses
+    (:func:`~himmy.cli.wizard.detect_provider_choices`) and, when a real backend is detected,
+    fold it into the spec so the run answers for real.
+
+    Conservative by construction — only fires when the user has expressed no backend at all:
+    a ``--provider``/``--model`` flag (already folded in by :func:`_apply_cli_overrides`), a
+    ``provider:`` in the YAML, or a pinned ``model:`` all short-circuit it, so explicit config
+    (including a deliberate ``provider: stub``) always stands. When nothing real is detected the
+    spec is left untouched on the honest offline stub. Never writes to disk (that is the
+    scaffold/deploy stamp's job — see :func:`_stamp_spec_provider_in_place`).
+    """
+    if getattr(args, "provider", None) or getattr(args, "model", None):
+        return spec  # explicit CLI override — leave it alone
+    if spec.provider or spec.model not in (None, "default"):
+        return spec  # explicit spec config — never clobber
+    from himmy.cli.wizard import detect_provider_choices
+
+    best = detect_provider_choices()[0]
+    if best.key == "stub":
+        return spec  # nothing real detected — honest offline stub stands
+    return spec.model_copy(
+        update={"provider": best.key, "model": best.model or "default"}
+    )
 
 
 def _spec_from_args_inner(args: argparse.Namespace) -> AgentSpec:
@@ -1334,8 +1373,59 @@ def cmd_init(args: argparse.Namespace) -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content)
         print(f"wrote {dest}")
+    # The classic/non-TTY default scaffold ships `model: default` (provider commented), which
+    # resolves to the stub. Stamp the best detected backend into it so `himmy run` answers for
+    # real out of the box — same probe the interactive wizard runs, minus the questions.
+    if "agent.yaml" in files and not template and not args.team:
+        _stamp_scaffold_provider(target / "agent.yaml")
     print(next_msg)
     return 0
+
+
+def _stamp_scaffold_provider(agent_yaml: Path) -> None:
+    """Stamp the best detected backend into a freshly-written classic/non-TTY scaffold.
+
+    Runs the SAME machine probe the init wizard uses
+    (:func:`~himmy.cli.wizard.detect_provider_choices`) and, when a real backend is detected,
+    fills in the scaffold's provider/model so ``himmy run -f agent.yaml`` answers for real out
+    of the box. The edit is TEXTUAL (uncomment the ``# provider:`` line, set ``model:``) rather
+    than a YAML re-dump, so the scaffold's teaching comments (the ``# skills:``/``# tool_packs:``
+    guidance) survive. Only touches the two lines the template ships as unset defaults, so it is
+    idempotent and never clobbers anything a user later pins.
+
+    When NOTHING real is detected the file is left exactly as scaffolded (a commented
+    ``provider:`` line + ``model: default``) and a note explains it will answer on the offline
+    stub until a backend is installed — the honest fallback, never a fake provider.
+    """
+    from himmy.cli.wizard import detect_provider_choices
+
+    best = detect_provider_choices()[0]
+    if best.key == "stub":
+        _eprint(
+            "note: no real backend detected — the scaffold will answer on the offline stub "
+            "(canned output).\n"
+            "  install one for real answers:  ollama pull llama3.2   "
+            "(or set --provider on run), then it just works."
+        )
+        return
+    try:
+        text = agent_yaml.read_text(encoding="utf-8")
+    except OSError:
+        return
+    # Only stamp the scaffold's unset defaults: a commented `# provider:` line and
+    # `model: default`. If the file has already been edited to pin either, leave it be.
+    if "\nprovider:" in f"\n{text}" or "\nmodel: default" not in f"\n{text}":
+        return
+    model = best.model or "default"
+    stamped = text.replace("model: default", f"model: {model}", 1).replace(
+        "# provider: claude-cli", f"provider: {best.key}", 1
+    )
+    try:
+        agent_yaml.write_text(stamped, encoding="utf-8")
+    except OSError:
+        return
+    label = best.key + (f" · {best.model}" if best.model else "")
+    _eprint(f"note: wired {label} (detected on this machine) into {agent_yaml}")
 
 
 # ------------------------------------------------------------------ demo-video

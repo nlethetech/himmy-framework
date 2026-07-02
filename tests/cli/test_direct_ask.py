@@ -26,6 +26,16 @@ def test_bare_words_become_a_run(
 ) -> None:
     """`himmy yo whats up` (no subcommand) answers via the run path."""
     monkeypatch.chdir(tmp_path)  # no agent.yaml anywhere above tmp
+    # Force the offline stub so the echo is deterministic regardless of what backend
+    # (claude-cli/ollama) happens to be installed on the machine running the suite —
+    # otherwise `_resolve_default_provider` upgrades the bare house spec to a real model.
+    import himmy.cli.wizard as wizard
+
+    monkeypatch.setattr(
+        wizard,
+        "detect_provider_choices",
+        lambda: [ProviderChoice(key="stub", label="stub")],
+    )
     monkeypatch.setattr(
         commands,
         "_house_spec",
