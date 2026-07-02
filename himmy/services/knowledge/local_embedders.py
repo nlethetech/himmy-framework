@@ -46,6 +46,33 @@ from himmy.services.knowledge.embedder import (
 
 OllamaTransport = Callable[[str, dict[str, Any]], Any]
 
+#: Max in-flight ``/api/embeddings`` round-trips per :meth:`OllamaEmbedder.embed_documents`
+#: batch. Ollama embeds ONE prompt per HTTP call, so a batch is otherwise a serial chain of
+#: awaited round-trips; a bounded ``asyncio.gather`` overlaps up to this many at once so a
+#: many-chunk ingest completes in ~ceil(n/cap) round-trips of latency instead of n. Output is
+#: byte-identical: ``gather`` preserves input order and each prompt is embedded independently,
+#: so the concurrency only changes timing, never the vectors or their order. The default (8)
+#: is a modest fan-out that helps a slow/remote server without stampeding a tiny local one; a
+#: misconfigured value (non-int) falls back to the default and ``<= 0`` forces the fully serial
+#: path — a bad knob never breaks embed. Read per call so tests/operators can flip it live.
+_OLLAMA_EMBED_CONCURRENCY_ENV = "HIMMY_OLLAMA_EMBED_CONCURRENCY"
+_DEFAULT_OLLAMA_EMBED_CONCURRENCY = 8
+
+
+def _ollama_embed_concurrency() -> int:
+    """Max concurrent Ollama embed round-trips per batch (env → int, else default 8).
+
+    A misconfigured value (non-int) falls back to the default; ``0`` or negative forces the
+    fully serial path (one in-flight request), so a bad knob never breaks embed.
+    """
+    raw = os.environ.get(_OLLAMA_EMBED_CONCURRENCY_ENV)
+    if raw is None:
+        return _DEFAULT_OLLAMA_EMBED_CONCURRENCY
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_OLLAMA_EMBED_CONCURRENCY
+
 #: Kill-switch for the shared native-session cache (default ON). Set
 #: ``HIMMY_EMBED_CACHE=off`` (``0``/``false``/``no``) to force each embedder to build
 #: its own private ONNX session — the pre-cache behaviour — e.g. to isolate a suspected
@@ -217,8 +244,26 @@ class OllamaEmbedder:
         return [float(x) for x in vec]
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Embed each document (Ollama embeds one prompt per call)."""
-        return [await self._embed_one(t) for t in texts]
+        """Embed each document (Ollama embeds one prompt per call).
+
+        Ollama embeds one prompt per HTTP round-trip, so a batch fans out under a
+        bounded :func:`asyncio.gather` — up to :func:`_ollama_embed_concurrency` requests
+        in flight at once (``HIMMY_OLLAMA_EMBED_CONCURRENCY``, default 8) — instead of a
+        serial chain of awaited calls. ``gather`` preserves input order and each prompt is
+        embedded independently, so the returned vectors are byte-identical and in the SAME
+        order as ``texts``; only the wall-clock latency drops. A cap ``<= 0`` (or a single
+        text) runs the fully serial path — the prior behaviour.
+        """
+        cap = _ollama_embed_concurrency()
+        if cap <= 0 or len(texts) <= 1:
+            return [await self._embed_one(t) for t in texts]
+        semaphore = asyncio.Semaphore(cap)
+
+        async def _bounded(text: str) -> list[float]:
+            async with semaphore:
+                return await self._embed_one(text)
+
+        return list(await asyncio.gather(*(_bounded(t) for t in texts)))
 
     async def embed_query(self, text: str) -> list[float]:
         """Embed a single query string."""

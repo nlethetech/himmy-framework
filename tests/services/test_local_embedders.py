@@ -558,3 +558,93 @@ def test_impl_and_guard_private_session_uses_nullcontext(
     import contextlib
 
     assert isinstance(guard, contextlib.nullcontext)
+
+
+def _distinct_async_transport(delay: float = 0.0):
+    """An async /api/embeddings transport that returns a per-prompt-distinct vector.
+
+    Also records the max number of concurrently in-flight requests so tests can assert
+    both output-order preservation (vector encodes the prompt) and the concurrency cap.
+    """
+    import asyncio as _asyncio
+
+    state = {"in_flight": 0, "peak": 0}
+
+    async def transport(path: str, payload: dict) -> dict:
+        assert path == "/api/embeddings"
+        prompt = payload["prompt"]
+        state["in_flight"] += 1
+        state["peak"] = max(state["peak"], state["in_flight"])
+        try:
+            if delay:
+                await _asyncio.sleep(delay)
+            # Vector deterministically encodes the prompt so order can be verified.
+            return {"embedding": [float(len(prompt)), float(sum(map(ord, prompt)))]}
+        finally:
+            state["in_flight"] -= 1
+
+    return transport, state
+
+
+def test_ollama_embed_documents_preserves_order() -> None:
+    """Fan-out via asyncio.gather returns vectors in the SAME order as input texts."""
+    transport, _ = _distinct_async_transport(delay=0.01)
+    emb = OllamaEmbedder(dim=2, transport=transport)
+    texts = ["a", "bb", "ccc", "dddd", "eeeee"]
+    vecs = run_async(emb.embed_documents(texts))
+    expected = [[float(len(t)), float(sum(map(ord, t)))] for t in texts]
+    assert vecs == expected
+
+
+def test_ollama_embed_documents_identical_to_serial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fan-out path yields byte-identical vectors to the fully serial (cap<=0) path."""
+    texts = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+
+    transport_a, _ = _distinct_async_transport()
+    monkeypatch.setenv("HIMMY_OLLAMA_EMBED_CONCURRENCY", "0")  # serial
+    serial = run_async(OllamaEmbedder(dim=2, transport=transport_a).embed_documents(texts))
+
+    transport_b, _ = _distinct_async_transport()
+    monkeypatch.setenv("HIMMY_OLLAMA_EMBED_CONCURRENCY", "4")  # fan-out
+    parallel = run_async(OllamaEmbedder(dim=2, transport=transport_b).embed_documents(texts))
+
+    assert parallel == serial
+
+
+def test_ollama_embed_documents_bounded_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Peak in-flight requests never exceed the configured concurrency cap."""
+    transport, state = _distinct_async_transport(delay=0.02)
+    monkeypatch.setenv("HIMMY_OLLAMA_EMBED_CONCURRENCY", "3")
+    emb = OllamaEmbedder(dim=2, transport=transport)
+    texts = [f"chunk-{i}" for i in range(12)]
+    run_async(emb.embed_documents(texts))
+    assert state["peak"] <= 3
+    # With 12 texts and a delay, the fan-out should actually overlap requests.
+    assert state["peak"] >= 2
+
+
+def test_ollama_embed_documents_serial_cap_single_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cap of 0 forces the fully serial path (never more than one request in flight)."""
+    transport, state = _distinct_async_transport(delay=0.01)
+    monkeypatch.setenv("HIMMY_OLLAMA_EMBED_CONCURRENCY", "0")
+    emb = OllamaEmbedder(dim=2, transport=transport)
+    run_async(emb.embed_documents([f"c{i}" for i in range(6)]))
+    assert state["peak"] == 1
+
+
+def test_ollama_embed_concurrency_env_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap env parses to int, falling back to the default on a bad value."""
+    monkeypatch.delenv("HIMMY_OLLAMA_EMBED_CONCURRENCY", raising=False)
+    assert local_embedders._ollama_embed_concurrency() == 8
+    monkeypatch.setenv("HIMMY_OLLAMA_EMBED_CONCURRENCY", "16")
+    assert local_embedders._ollama_embed_concurrency() == 16
+    monkeypatch.setenv("HIMMY_OLLAMA_EMBED_CONCURRENCY", "not-an-int")
+    assert local_embedders._ollama_embed_concurrency() == 8
