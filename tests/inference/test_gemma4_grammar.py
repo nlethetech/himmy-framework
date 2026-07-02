@@ -100,3 +100,63 @@ def test_render_assistant_calls_grammar():
 
     out = g.render_assistant_calls([_TC("get_order", {"order_id": "W123", "full": True})])
     assert out == '<|tool_call>call:get_order{full:true,order_id:<|"|>W123<|"|>}<tool_call|>'
+
+
+# --------------------------------------------------------------------------- #
+# Tolerant recovery of a DEGRADED opener-less call (the real himalaya-gemma-4
+# symptom: name+args correct, but written as ``NAME{...}<tool_call|>`` with no
+# ``<|tool_call>call:`` opener, so the strict grammar never fires the tool).
+# --------------------------------------------------------------------------- #
+_DEGRADED = 'book_appointment{name:<|"|>Sam<|"|>,phone:<|"|>555<|"|>}<tool_call|>'
+_CORRECT = '<|tool_call>call:book_appointment{name:<|"|>Sam<|"|>,phone:<|"|>555<|"|>}<tool_call|>'
+
+
+def test_parse_recovers_openerless_degraded_call():
+    # The EXACT shape the user reported. Before the fix this returned [].
+    calls = g.parse(_DEGRADED, {"book_appointment"})
+    assert len(calls) == 1
+    assert calls[0].tool_name == "book_appointment"
+    assert calls[0].args == {"name": "Sam", "phone": "555"}
+
+
+def test_parse_recovers_call_prefix_without_opener():
+    # ``call:NAME{...}<tool_call|>`` — has the ``call:`` but no ``<|tool_call>`` opener.
+    text = 'call:book_appointment{name:<|"|>Sam<|"|>}<tool_call|>'
+    calls = g.parse(text, {"book_appointment"})
+    assert [c.tool_name for c in calls] == ["book_appointment"]
+
+
+def test_parse_degraded_is_name_guarded():
+    # An opener-less blob whose name is NOT a bound tool must NOT fire (prose safety).
+    assert g.parse(_DEGRADED, {"some_other_tool"}) == []
+    assert g.parse('note{body:<|"|>hi<|"|>}<tool_call|>', {"book_appointment"}) == []
+
+
+def test_parse_degraded_not_recovered_without_known_tools():
+    # With no bound-tool set we cannot name-guard, so tolerant recovery stays OFF
+    # (strict-only) — byte-for-byte the pre-fix behavior for the unknown-tools case.
+    assert g.parse(_DEGRADED, set()) == []
+
+
+def test_parse_correct_form_not_double_counted():
+    # The strict + tolerant passes must not both count the same well-formed call.
+    calls = g.parse(_CORRECT, {"book_appointment"})
+    assert len(calls) == 1
+    assert calls[0].args == {"name": "Sam", "phone": "555"}
+
+
+def test_parse_mixed_correct_and_degraded_in_order():
+    text = (
+        '<|tool_call>call:get_weather{location:<|"|>A<|"|>}<tool_call|>'
+        'book_appointment{name:<|"|>Sam<|"|>}<tool_call|>'
+    )
+    calls = g.parse(text, {"get_weather", "book_appointment"})
+    assert [c.tool_name for c in calls] == ["get_weather", "book_appointment"]
+
+
+def test_registry_gemma4_parse_recovers_degraded():
+    # Same recovery through the format the manager actually uses for gemma-4.
+    calls = GEMMA4.parse(_DEGRADED, {"book_appointment"})
+    assert [c.tool_name for c in calls] == ["book_appointment"]
+    # And gemma-4 auto-selects this format by model tag.
+    assert format_for("himalaya-gemma-4-e2b-it").name == "gemma4"

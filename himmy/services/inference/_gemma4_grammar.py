@@ -149,6 +149,17 @@ def render_system_manifest(tools: Sequence[BoundTool], provider: str) -> str:
 # --------------------------------------------------------------------------- #
 _CALL_RE = re.compile(r"<\|tool_call>call:(?P<name>[^{]+)\{(?P<args>.*?)\}<tool_call\|>", re.DOTALL)
 
+#: Tolerant fallback for a DEGRADED call that dropped the ``<|tool_call>call:`` opener.
+#: Observed on the real himalaya-gemma-4 model: it gets the name + args right but writes
+#: ``NAME{...}<tool_call|>`` (or ``call:NAME{...}<tool_call|>``) with no opener, so the
+#: strict grammar above never matches and the tool silently never fires. We recover it
+#: ONLY when NAME is a bound tool (name-guarded, so ordinary prose like ``note{...}`` is
+#: never mistaken for a call) and only when it is not already captured by the strict pass
+#: — keeping the tool firing whether or not the model remembers the opener.
+_LENIENT_CALL_RE = re.compile(
+    r"(?:call:)?(?P<name>[A-Za-z_][\w.-]*)\s*\{(?P<args>.*?)\}<tool_call\|>", re.DOTALL
+)
+
 
 def _skip_ws(s: str, i: int) -> int:
     while i < len(s) and s[i] in " \t\r\n":
@@ -234,17 +245,38 @@ def _parse_args(body: str) -> dict[str, Any]:
 
 
 def parse(text: str, known: set[str]) -> list[ToolCallRecord]:
-    """Fail-open parse: return only calls whose name is a known bound tool."""
+    """Fail-open parse: return only calls whose name is a known bound tool.
+
+    The strict native grammar ``<|tool_call>call:NAME{...}<tool_call|>`` is matched first.
+    Then, WHEN tool names are known, a tolerant pass recovers an opener-less
+    ``NAME{...}<tool_call|>`` (a real degradation the gemma-4 model exhibits) — name-guarded
+    so only a BOUND tool can fire, and de-duplicated against the strict pass by end
+    position. Calls are emitted in the order they appear in the text.
+    """
+    text = text or ""
+    seen_ends: set[int] = set()
+    hits: list[tuple[int, str, str]] = []  # (start_pos, name, args_body)
+    for m in _CALL_RE.finditer(text):
+        seen_ends.add(m.end())
+        hits.append((m.start(), m.group("name").strip(), m.group("args")))
+    # Tolerant recovery is name-guarded, so it only runs when the bound-tool set is known.
+    if known:
+        for m in _LENIENT_CALL_RE.finditer(text):
+            if m.end() in seen_ends:
+                continue  # shares a closer with a strict hit — already captured
+            name = m.group("name").strip()
+            if name in known:
+                hits.append((m.start(), name, m.group("args")))
+    hits.sort(key=lambda h: h[0])
     out: list[ToolCallRecord] = []
-    for m in _CALL_RE.finditer(text or ""):
-        name = m.group("name").strip()
+    for _start, name, args_body in hits:
         if known and name not in known:
             continue
         out.append(
             ToolCallRecord(
                 tool_call_id=f"gemma4-{uuid.uuid4().hex}",
                 tool_name=name,
-                args=_parse_args(m.group("args")),
+                args=_parse_args(args_body),
             )
         )
     return out
