@@ -1456,14 +1456,15 @@ def _stamp_scaffold_provider(agent_yaml: Path) -> None:
         text = agent_yaml.read_text(encoding="utf-8")
     except OSError:
         return
-    # Only stamp the scaffold's unset defaults: a commented `# provider:` line and
-    # `model: default`. If the file has already been edited to pin either, leave it be.
-    if "\nprovider:" in f"\n{text}" or "\nmodel: default" not in f"\n{text}":
-        return
+    # Reuse the line-ANCHORED textual stamper so an earlier comment that merely contains the
+    # literal ``model: default`` is never rewritten in place of the real top-level field (it
+    # also enforces "only stamp the scaffold's unset defaults" — a commented ``# provider:``
+    # line + ``model: default`` — and returns None when either is already pinned, leaving the
+    # file untouched).
     model = best.model or "default"
-    stamped = text.replace("model: default", f"model: {model}", 1).replace(
-        "# provider: claude-cli", f"provider: {best.key}", 1
-    )
+    stamped = _textual_stamp_provider(text, provider=best.key, model=model)
+    if stamped is None:
+        return
     try:
         agent_yaml.write_text(stamped, encoding="utf-8")
     except OSError:
@@ -1859,6 +1860,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # missing (cloud templates have no way to pre-write it) — so create_app boots authenticated
     # instead of fail-closing on a FileNotFoundError. No-op offline / when already provisioned.
     _materialize_api_keys_file()
+
+    # Keep GET /metrics off the single shared apikey on an off-loopback serve (the
+    # compose/helm path runs `himmy serve` with AGENT_BIND=0.0.0.0). Same default-a-token
+    # protection the deploy front door + --share apply; no-op on a loopback bind and never
+    # clobbers an operator-set HIMMY_METRICS_TOKEN. See _deploy_provision_metrics_token.
+    _deploy_provision_metrics_token(args.host)
 
     # Pass the bind host so create_app can fail closed when an unauthenticated
     # build would be exposed off-loopback (see _enforce_auth_posture).
@@ -2349,15 +2356,28 @@ def _textual_stamp_provider(text: str, *, provider: str, model: str) -> str | No
     and replace ``model: default``, touching nothing else. Returns the new text, or ``None``
     when the expected anchors are absent (so the caller can fall back to a structured re-dump).
     """
+    import re
+
     guard = f"\n{text}"
     if "\nprovider:" in guard or "\nmodel: default" not in guard:
         return None
-    stamped = text.replace("model: default", f"model: {model}", 1)
+    # Anchor the replace to a real top-level ``model: default`` KEY (line start), exactly like
+    # the guard above is line-anchored. An UNanchored substring replace would rewrite an earlier
+    # comment that merely CONTAINS the literal ``model: default`` (e.g. a teaching comment) and
+    # leave the real field untouched — a silent no-op stamp + a mangled doc line. ``count=1``
+    # stamps only the first real field.
+    model_line = re.compile(r"^model: default$", re.MULTILINE)
+    stamped, replaced = model_line.subn(f"model: {model}", text, count=1)
+    if replaced == 0:  # defensive: the anchored key was not a whole line — bail to re-dump
+        return None
     if "# provider: claude-cli" in stamped:
         return stamped.replace("# provider: claude-cli", f"provider: {provider}", 1)
-    # Model anchor present but no commented provider line: append the provider setting.
-    return stamped.replace(
-        f"model: {model}", f"model: {model}\nprovider: {provider}", 1
+    # Model anchor present but no commented provider line: append the provider setting after
+    # the real (now-stamped) model line — anchored, so a comment containing the same text is
+    # never the insertion point.
+    model_set = re.compile(rf"^model: {re.escape(model)}$", re.MULTILINE)
+    return model_set.sub(
+        f"model: {model}\nprovider: {provider}", stamped, count=1
     )
 
 
@@ -2444,7 +2464,26 @@ async def _serve_and_worker(
     # per-process installer (which would race the worker's handler for the same signal).
     server.install_signal_handlers = lambda: None  # type: ignore[method-assign,attr-defined]
 
-    server_task = asyncio.create_task(server.serve(), name="himmy-deploy-server")
+    async def _serve() -> None:
+        # uvicorn's bind failure calls ``sys.exit(1)`` inside ``Server.startup`` → SystemExit
+        # (a BaseException). If that reached the task boundary, asyncio propagates it straight
+        # out of ``asyncio.run`` at the LOOP level — bypassing the joint-shutdown finally below
+        # (orphaning the worker, which may hold the durable container / dispatcher / scheduler
+        # leader lease) and matching NEITHER of cmd_deploy's handlers. Convert it HERE, inside
+        # the task, to an OSError(EADDRINUSE): now the task completes with an ordinary Exception,
+        # ``asyncio.wait`` returns cleanly, the worker is cancelled+drained, and the OSError
+        # re-surfaces below so cmd_deploy's port-in-use branch fires (revoke share key, guidance).
+        try:
+            await server.serve()
+        except SystemExit as exc:
+            import errno as _errno
+
+            raise OSError(
+                _errno.EADDRINUSE,
+                "address already in use (uvicorn could not bind the port)",
+            ) from exc
+
+    server_task = asyncio.create_task(_serve(), name="himmy-deploy-server")
     worker_task = asyncio.create_task(
         _run_worker(run_scheduler=run_scheduler, run_dispatcher=run_dispatcher),
         name="himmy-deploy-worker",
@@ -2460,18 +2499,40 @@ async def _serve_and_worker(
             if not task.done():
                 task.cancel()
         for task in (server_task, worker_task):
-            with contextlib.suppress(asyncio.CancelledError, Exception):
+            # Suppress SystemExit too, not just Exception: a real uvicorn bind failure
+            # (port in use) calls ``sys.exit(1)`` inside ``Server.startup`` → raises
+            # SystemExit (a BaseException, NOT an Exception). If it escaped this suppress it
+            # would break the cleanup loop BEFORE the sibling task was awaited, orphaning the
+            # worker (which may hold the durable container / dispatcher / scheduler leader
+            # lease). We still want to REPORT it, so it is re-surfaced below as a typed error.
+            with contextlib.suppress(
+                asyncio.CancelledError, Exception, SystemExit
+            ):
                 await task
     # Surface a boot failure as an exception the caller reports — from EITHER half. A worker
     # task that finishes first with an exception (e.g. the scheduler failing to acquire its
     # leader lock, a durable-store startup error) lands in ``done`` while the server is still
-    # pending; without this it would be swallowed by the ``suppress(Exception)`` above and the
+    # pending; without this it would be swallowed by the ``suppress(...)`` above and the
     # deploy would falsely report "live" + exit 0 with NO scheduler/dispatcher running. Check
     # both completed tasks and re-raise the first real failure so cmd_deploy's handlers fire
     # (revoke the share key, print a real error, non-zero exit).
+    #
+    # A uvicorn bind failure raises SystemExit (not OSError): normalise it to an
+    # OSError(EADDRINUSE) so cmd_deploy's ``except OSError`` port-in-use branch fires (revoke
+    # the share key, print the friendly guidance) instead of SystemExit escaping every handler.
     for task in (server_task, worker_task):
         if task in done and not task.cancelled():
-            exc = task.exception()
+            try:
+                exc: BaseException | None = task.exception()
+            except asyncio.CancelledError:  # pragma: no cover - defensive
+                continue
+            if isinstance(exc, SystemExit):
+                import errno as _errno
+
+                raise OSError(
+                    _errno.EADDRINUSE,
+                    "address already in use (uvicorn could not bind the port)",
+                ) from exc
             if exc is not None:
                 raise exc
 
@@ -2579,6 +2640,15 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     # hosted case; no-op when already provisioned.
     _materialize_api_keys_file()
 
+    # Keep GET /metrics off the single shared apikey on an off-loopback deploy. /metrics
+    # authenticates ANY valid principal (no metrics-specific role), so without its OWN token
+    # the one all-tenants deploy key can scrape the deployment-wide authz-deny / latency /
+    # token-cost map. --share provisions its own metrics token; do the SAME for the non-share
+    # off-loopback path (env-driven cloud/compose/helm or `deploy --host 0.0.0.0`) so the fix
+    # is symmetric. No-op on a loopback bind (only the operator reaches /metrics) and set (not
+    # clobber) so an operator-configured HIMMY_METRICS_TOKEN always stands.
+    _deploy_provision_metrics_token(host)
+
     try:
         app = create_app(bind_host=host)
     except HimmyError as exc:
@@ -2616,6 +2686,18 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:  # pragma: no cover - interactive Ctrl-C
         _eprint("\n(stopped)")
         return 130
+    except SystemExit:
+        # Belt-and-suspenders: uvicorn's bind failure raises SystemExit (a BaseException that
+        # matches NEITHER ``except OSError`` NOR ``except Exception``). ``_serve_and_worker``
+        # normalises it to OSError, but if a SystemExit ever reaches here (a future code path)
+        # we still revoke the minted share key and print the friendly port-in-use guidance
+        # rather than letting a raw SystemExit escape with the operator credential left on disk.
+        _revoke_share_key(share_apikey)
+        _eprint(
+            f"error: port {port} is already in use — stop the other process or "
+            f"pass --port <n>."
+        )
+        return 1
     except OSError as exc:
         # The server never came up (most commonly the port is already in use) — revoke the
         # minted share key so a failed --share attempt doesn't leave an orphaned live key.
@@ -2726,6 +2808,26 @@ _SHARE_KEY_ROLE = "operator"
 #: Bounded lifetime for a ``--share`` key so a forgotten tunnel credential self-expires instead
 #: of lingering as a live key forever (``himmy apikey mint`` similarly supports ``--ttl-days``).
 _SHARE_KEY_TTL_DAYS = 7
+
+
+def _deploy_provision_metrics_token(host: str) -> None:
+    """Default a ``HIMMY_METRICS_TOKEN`` on an off-loopback deploy so /metrics is not scrapable
+    by the single shared apikey (parity with what ``--share`` already does for itself).
+
+    GET /metrics gates on any valid principal + an OPT-IN ``HIMMY_METRICS_TOKEN``; unset, the
+    one all-tenants deploy key (or an anonymous caller under ``HIMMY_ALLOW_UNAUTHENTICATED``)
+    can scrape the deployment-wide observability map. When the bind is off-loopback we mint a
+    separate token (not printed, not the shared key) so /metrics needs its own credential. This
+    is a no-op on a loopback bind (only the operator reaches the surface) and uses ``setdefault``
+    so an operator- or template-configured token is never clobbered.
+    """
+    from himmy.api.app import _is_loopback_host
+
+    if _is_loopback_host(host):
+        return
+    import secrets as _secrets
+
+    os.environ.setdefault("HIMMY_METRICS_TOKEN", _secrets.token_urlsafe(32))
 
 
 def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:

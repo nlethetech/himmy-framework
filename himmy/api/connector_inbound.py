@@ -53,8 +53,13 @@ def inbound_provider() -> str | None:
     value = (get_secret(INBOUND_PROVIDER_ENV) or "").strip()
     return value or None
 
-#: Default mount paths per inbound connector (under the guarded ``/v1`` prefix so the
-#: Studio rebinding/cross-site guard already protects them).
+#: Default mount paths per inbound connector. They live under ``/v1`` but are CARVED OUT of the
+#: Studio rebinding/cross-site guard's browser-origin checks (see ``_GUARD_EXEMPT_PREFIXES`` in
+#: ``himmy.api.app``): they are authenticated by an HMAC over the raw body + timestamp +
+#: default-deny allowlist, NOT by same-origin browser semantics, and are meant to be called by
+#: non-browser servers (GitHub/Stripe, a tunnel, a k8s ingress) that send a public Host and no
+#: Origin/Referer. The guard's browser checks would 403 every genuine signed delivery; the
+#: connector's own HMAC gate is what authorizes them.
 _INBOUND_PATHS: dict[str, str] = {
     "webhook": "/v1/connectors/webhook",
     "slack": "/v1/connectors/slack",
