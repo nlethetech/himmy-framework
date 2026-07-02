@@ -42,6 +42,8 @@ from himmy.services.knowledge.retrieval.hybrid import HybridRetriever
 from himmy.services.knowledge.retrieval.lexical import BM25Index
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Callable
+
     from himmy.services.knowledge.backend import KnowledgeBackendProtocol
     from himmy.services.knowledge.chunker import MarkdownAwareChunker
     from himmy.services.storage.service import StorageService
@@ -54,6 +56,27 @@ logger = logging.getLogger("himmy.knowledge")
 def _content_hash(text: str) -> str:
     """Stable sha256 hex of a document's source text (its content identity)."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _vec_norm(a: list[float]) -> float:
+    """Euclidean norm of ``a`` (matches the ``na``/``nb`` term inside :func:`_cosine`)."""
+    return math.sqrt(sum(x * x for x in a))
+
+
+def _cosine_with_norm(a: list[float], na: float, b: list[float]) -> float:
+    """Cosine similarity where ``a``'s norm ``na`` is precomputed by the caller.
+
+    Byte-identical to :func:`_cosine` — the arithmetic ``dot / (na * nb)`` and the
+    degenerate/length guards are preserved exactly — but the query norm ``na`` is
+    hoisted out of a per-chunk loop so it is computed once instead of per chunk.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -580,17 +603,9 @@ class KnowledgeBase:
             return backend_results
 
         chunks = list(self._chunks.get(kb_id, {}).values())
-        scored: list[tuple[float, KnowledgeChunk]] = []
-        for chunk in chunks:
-            if metadata_filters and any(
-                chunk.metadata.get(k) != v for k, v in metadata_filters.items()
-            ):
-                continue
-            sim = _cosine(query_vec, chunk.embedding)
-            if not _keep(sim):
-                continue
-            scored.append((sim, chunk))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
+        scored = await asyncio.to_thread(
+            self._dense_scan_sync, chunks, query_vec, _keep, metadata_filters
+        )
 
         results: list[RetrievedChunk] = []
         for sim, chunk in scored[:top_k]:
@@ -612,6 +627,35 @@ class KnowledgeBase:
                 )
             )
         return results
+
+    @staticmethod
+    def _dense_scan_sync(
+        chunks: list[KnowledgeChunk],
+        query_vec: list[float],
+        keep: Callable[[float], bool],
+        metadata_filters: dict[str, Any] | None,
+    ) -> list[tuple[float, KnowledgeChunk]]:
+        """Pure-Python cosine scan + sort, offloaded off the event loop.
+
+        Byte-identical to the inline loop it replaces: the query norm is hoisted
+        once (:func:`_cosine_with_norm`), metadata equality/keep filters and the
+        similarity-descending stable sort (no secondary tie-break) are unchanged.
+        ``chunks`` is a caller-materialized snapshot list so the offloaded thread
+        never iterates a mutating dict.
+        """
+        query_norm = _vec_norm(query_vec)
+        scored: list[tuple[float, KnowledgeChunk]] = []
+        for chunk in chunks:
+            if metadata_filters and any(
+                chunk.metadata.get(k) != v for k, v in metadata_filters.items()
+            ):
+                continue
+            sim = _cosine_with_norm(query_vec, query_norm, chunk.embedding)
+            if not keep(sim):
+                continue
+            scored.append((sim, chunk))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return scored
 
     # ------------------------------------------------------------- hybrid search
     async def _search_hybrid(
@@ -665,11 +709,12 @@ class KnowledgeBase:
 
         async def dense_leg(q: str, pool: int) -> list[tuple[str, float]]:
             query_vec = await self._embedder.embed_query(q)
+            query_norm = _vec_norm(query_vec)
             scored: list[tuple[str, float]] = []
             for chunk in kb_chunks.values():
                 if not _passes(chunk):
                     continue
-                sim = _cosine(query_vec, chunk.embedding)
+                sim = _cosine_with_norm(query_vec, query_norm, chunk.embedding)
                 if sim > 0.0:
                     scored.append((chunk.chunk_id, sim))
             scored.sort(key=lambda pair: (-pair[1], pair[0]))
