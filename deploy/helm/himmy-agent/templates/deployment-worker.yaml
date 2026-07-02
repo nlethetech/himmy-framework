@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "himmy-agent.fullname" . }}-worker
+  labels:
+    {{- include "himmy-agent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  # Single replica only — the run-queue dispatcher + the /app/.himmy SQLite stores
+  # are single-writer on the SHARED RWO PVC (a Postgres DATABASE_URL is what makes
+  # multi-node dispatch safe; out of scope here). See values.yaml header.
+  replicas: {{ .Values.worker.replicaCount }}
+  # Recreate: this pod shares the api's RWO PVC, which attaches to one node at a
+  # time — the old pod must release it before the new one mounts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "himmy-agent.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "himmy-agent.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.serviceAccountName }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # `himmy worker -f agent.yaml` runs the routine scheduler + durable
+          # run-queue dispatcher on the SAME /app/.himmy store the api writes to.
+          # No HTTP surface — this pod exposes nothing on the network.
+          # NO ENTRYPOINT in the image → pin `command: ["himmy"]` so `args` don't
+          # exec a nonexistent "worker" binary and CrashLoop the pod.
+          command:
+            - "himmy"
+          args:
+            - "worker"
+            - "-f"
+            - "/app/agent.yaml"
+            - "--store"
+            - "/app/.himmy/storage.db"
+          env:
+            {{- include "himmy-agent.commonEnv" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "himmy-agent.volumeMounts" . | nindent 12 }}
+      volumes:
+        {{- include "himmy-agent.volumes" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if .Values.persistence.enabled }}
+      # No user affinity + a shared RWO PVC: a RWO volume attaches to ONE node at a
+      # time, so the worker MUST land on the api pod's node or it hangs with a
+      # Multi-Attach error. Hard-require co-location with the api pod. Override by
+      # setting `.Values.affinity` (e.g. when using an RWX volume or Postgres-only).
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "himmy-agent.selectorLabels" . | nindent 18 }}
+                  app.kubernetes.io/component: api
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

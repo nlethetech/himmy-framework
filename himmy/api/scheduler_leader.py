@@ -50,6 +50,68 @@ logger = logging.getLogger("himmy.api.scheduler_leader")
 _SCHEDULER_HOST_LOCK = "himmy-scheduler"
 
 
+def _postgres_backend_configured() -> bool:
+    """True when a Postgres ``HIMMY_DATABASE_URL`` is configured (best-effort, never raises).
+
+    Mirrors the factory's backend selection so :func:`scheduler_running_on_host` can tell that
+    the SQLite host flock is NOT the coordination primitive here (a Postgres scheduler leads
+    via the advisory lease, not the flock). Any import/read error → ``False`` (fall back to the
+    flock probe), so a broken read only ever loses the Postgres short-circuit, never invents it.
+    """
+    try:
+        from himmy.config.secrets import get_secret
+        from himmy.services.storage.factory import _is_postgres_dsn
+
+        return _is_postgres_dsn(get_secret("HIMMY_DATABASE_URL"))
+    except Exception:  # noqa: BLE001 - a probe must never crash a hint/doctor caller
+        return False
+
+
+def scheduler_running_on_host() -> bool | None:
+    """Best-effort: is a scheduler (``himmy worker`` / ``himmy serve``) live on THIS host?
+
+    A running scheduler holds the :data:`_SCHEDULER_HOST_LOCK` ``flock`` for its whole
+    lifetime (see :func:`_acquire_sqlite`). We probe that lock the same non-blocking way:
+
+    * the lock is HELD (``ProcessLockBusy``) → a scheduler is running here → ``True``;
+    * we acquired it → nothing holds it → no scheduler here → ``False`` (released at once,
+      so this probe never becomes the thing that blocks a real worker from starting);
+    * ``fcntl`` is unavailable (non-POSIX) → the probe can't tell → ``None`` (unknown).
+
+    Same-host + advisory, exactly matching the guard's scope: it detects a co-located worker
+    on a SQLite deployment (the single-user-local case the routines CLI cares about). It does
+    NOT and can't see a scheduler on ANOTHER machine or coordinated via a Postgres lease —
+    callers treat ``None``/``False`` as "no LOCAL scheduler detected", never "definitely none
+    anywhere".
+
+    **Postgres exception.** The host flock is ONLY the SQLite/in-memory coordination
+    primitive: on Postgres the scheduler coordinates via a session-scoped advisory lease
+    (:func:`_acquire_postgres`) and never takes the flock, so a free flock does NOT mean "no
+    scheduler". Probing it there would return a false ``False`` and drive callers to emit the
+    load-bearing "routines will NEVER fire" warning on a *correctly-deployed* multi-worker
+    Postgres setup. So when a Postgres DSN is configured we short-circuit to ``None`` (unknown)
+    — the honest answer, since this probe cannot see a lease-coordinated scheduler — and both
+    the routines hint and the doctor RED line correctly stay quiet.
+    """
+    if _postgres_backend_configured():
+        # The flock is not the coordination primitive on Postgres — 'unknown', not 'False'.
+        return None
+
+    from himmy.core.process_lock import ProcessLockBusy, acquire_process_lock
+
+    try:
+        handle = acquire_process_lock(_SCHEDULER_HOST_LOCK)
+    except ProcessLockBusy:
+        return True
+    except OSError:  # pragma: no cover - lock dir unwritable; treat as unknown
+        return None
+    # We got it → nobody holds it → release immediately (never hold a scheduler out).
+    if handle._fd is None:  # inert handle → non-POSIX host → can't tell
+        return None
+    handle.release()
+    return False
+
+
 @dataclass
 class SchedulerLeadership:
     """The outcome of a leadership bid, plus the handles needed to refresh / release it.
@@ -288,4 +350,8 @@ def _acquire_sqlite(
     )
 
 
-__all__ = ["SchedulerLeadership", "acquire_scheduler_leadership"]
+__all__ = [
+    "SchedulerLeadership",
+    "acquire_scheduler_leadership",
+    "scheduler_running_on_host",
+]

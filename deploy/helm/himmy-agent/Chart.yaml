@@ -1,0 +1,19 @@
+apiVersion: v2
+name: himmy-agent
+description: |
+  Deploy YOUR agent (from an agent.yaml) as a service on Kubernetes — an `api`
+  Deployment that exposes the agent as a signature-verified webhook, plus a
+  `worker` Deployment (routine scheduler + durable run-queue dispatcher) over the
+  SAME single-writer .himmy store. This is DISTINCT from the himmy-studio chart,
+  which deploys the admin GUI, not an agent. Single-replica per component by
+  design (the .himmy SQLite stores are single-writer); external Postgres only.
+type: application
+# Chart version — bump on every chart change.
+version: 0.1.0
+# Application version — tracks the himmy release this chart targets.
+appVersion: "0.2.0"
+keywords:
+  - himmy
+  - agent
+  - agent-framework
+  - webhook

@@ -258,6 +258,69 @@ def test_multi_tenant_anonymous_refuses_to_start(
     assert "bind callers to tenants" in str(exc.value)
 
 
+# ------------------ sec-r1: binds_concrete_tenants closes the all-tenants-only-file gap
+
+
+def test_all_tenants_only_file_does_not_bind_concrete_tenants() -> None:
+    """A keys file of ONLY all-tenants records satisfies binds_tenants but NOT concrete.
+
+    Regression: the multi-tenant guard was satisfied by a single all-tenants-admin key,
+    giving false assurance of isolation. The stricter ``binds_concrete_tenants`` sees through
+    it — an all-tenants-only file binds no concrete tenant.
+    """
+    principal = Principal.build("admin", all_tenants=True)
+    auth = ApiKeyAuthenticator(key_principals={"k": principal})
+    assert auth.binds_tenants is True  # historical: any mapped key counts
+    assert auth.binds_concrete_tenants is False  # but it binds no concrete tenant
+
+
+def test_concrete_tenant_key_binds_concrete_tenants() -> None:
+    """A key scoped to a real tenant binds concrete tenants (the honest multi-tenant posture)."""
+    principal = Principal.build("u1", tenant_ids=["t1"])
+    auth = ApiKeyAuthenticator(key_principals={"k": principal})
+    assert auth.binds_concrete_tenants is True
+
+
+def test_multi_tenant_all_tenants_only_file_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """HIMMY_MULTI_TENANT + an all-tenants-only keys file is refused (no false assurance).
+
+    Regression for the sec-r1 finding: under an EXPLICIT multi-tenant posture a keys file whose
+    every record is all-tenants would run every caller as an all-tenants admin — exactly the
+    posture the guard promises to refuse. It must now fail closed.
+    """
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"admin": {"subject": "admin", "all_tenants": True}})
+    )
+    monkeypatch.setenv("HIMMY_MULTI_TENANT", "1")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    with pytest.raises(HimmyError) as exc:
+        create_app()
+    assert "concrete tenant" in str(exc.value)
+
+
+def test_single_agent_apikey_deploy_still_boots_on_all_tenants_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The documented one-secret single-agent deploy (auth mode, NO HIMMY_MULTI_TENANT) boots.
+
+    The stricter concrete-tenant check applies ONLY when HIMMY_MULTI_TENANT is explicitly
+    declared. The intentional one-key deploy (apikey mode alone) is unchanged — it still boots
+    on a single all-tenants key, so the offline/one-agent contract is preserved.
+    """
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(
+        json.dumps({"admin": {"subject": "admin", "all_tenants": True}})
+    )
+    monkeypatch.setenv("HIMMY_AUTH_MODE", "apikey")
+    monkeypatch.setenv("HIMMY_API_KEYS_FILE", str(keys_file))
+    # No HIMMY_MULTI_TENANT → the stricter concrete-tenant check does not engage.
+    app = create_app()  # boots, no refusal
+    assert app is not None
+
+
 def test_multi_tenant_with_mapped_keys_starts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

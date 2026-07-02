@@ -17,16 +17,18 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Optional extras probed by module import — label is what the user sees.
-_EXTRAS: tuple[tuple[str, str], ...] = (
-    ("providers (pydantic-ai)", "pydantic_ai"),
-    ("api (fastapi)", "fastapi"),
-    ("postgres (asyncpg)", "asyncpg"),
-    ("connectors (feedparser)", "feedparser"),
-    ("connectors (openpyxl)", "openpyxl"),
-    ("observability (logfire)", "logfire"),
-    ("nepal (nepali-datetime)", "nepali_datetime"),
-    ("validation (jsonschema)", "jsonschema"),
+# Optional extras probed by module import: (label shown, import module, pip extra name).
+# The extra name is the ``himmy[<extra>]`` a user installs to satisfy this row — surfaced
+# by ``himmy doctor`` as the exact install command for a missing capability.
+_EXTRAS: tuple[tuple[str, str, str], ...] = (
+    ("providers (pydantic-ai)", "pydantic_ai", "providers"),
+    ("api (fastapi)", "fastapi", "api"),
+    ("postgres (asyncpg)", "asyncpg", "postgres"),
+    ("connectors (feedparser)", "feedparser", "connectors"),
+    ("connectors (openpyxl)", "openpyxl", "connectors"),
+    ("observability (logfire)", "logfire", "observability"),
+    ("nepal (nepali-datetime)", "nepali_datetime", "nepal"),
+    ("validation (jsonschema)", "jsonschema", "validation"),
 )
 
 # Provider API keys we surface (presence only — never the value).
@@ -43,6 +45,10 @@ class ExtraStatus:
     label: str
     module: str
     ok: bool
+    #: The ``himmy[<extra>]`` pip extra that provides this capability (for the exact
+    #: install command ``himmy doctor`` prints when the row is missing). Defaulted so
+    #: older callers constructing an ``ExtraStatus`` by hand keep working.
+    extra: str = ""
 
 
 @dataclass
@@ -234,8 +240,10 @@ def collect_doctor_report() -> DoctorReport:
     from himmy.services.guardrails import BUILTIN_GUARDRAILS
 
     extras = [
-        ExtraStatus(label=label, module=module, ok=_can_import(module))
-        for label, module in _EXTRAS
+        ExtraStatus(
+            label=label, module=module, ok=_can_import(module), extra=extra
+        )
+        for label, module, extra in _EXTRAS
     ]
 
     providers: list[ProviderStatus] = []

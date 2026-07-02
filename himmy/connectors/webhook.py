@@ -264,6 +264,7 @@ class WebhookInboundConnector(InboundChannelConnector):
         signature_prefix: str = DEFAULT_SIGNATURE_PREFIX,
         timestamp_header: str = DEFAULT_TIMESTAMP_HEADER,
         max_timestamp_skew: int = DEFAULT_MAX_TIMESTAMP_SKEW,
+        require_timestamp: bool = False,
         text_field: str = DEFAULT_TEXT_FIELD,
         source_field: str = DEFAULT_SOURCE_FIELD,
         id_field: str = DEFAULT_ID_FIELD,
@@ -286,6 +287,15 @@ class WebhookInboundConnector(InboundChannelConnector):
         rather than returned inline. ``ack_only`` additionally suppresses the inline reply so
         the HTTP response is a bare ack (use with the router's ``202`` status). Passing a
         callback without a URL, or vice versa, is a configuration error.
+
+        ``require_timestamp`` fail-CLOSES the replay guard: with it on, a delivery with NO
+        timestamp header is REJECTED (rather than accepted as a body-only signature), so every
+        accepted request is bound to a fresh, skew-checked timestamp — a captured signed request
+        goes stale in ``max_timestamp_skew`` seconds instead of replaying forever. It also makes
+        the timestamp bind a dedup key even when the payload carries no ``id`` (see
+        :meth:`handle_webhook`), so an id-less replay inside the skew window is still deduped.
+        The auto-wired deploy/serve front door turns this ON (a public agent trigger must not be
+        replayable); off (the default) preserves GitHub-style body-only-signature interop.
         """
         from himmy.config.secrets import get_secret
 
@@ -308,6 +318,7 @@ class WebhookInboundConnector(InboundChannelConnector):
         self._secret = secret
         self._timestamp_header = timestamp_header
         self._max_skew = max_timestamp_skew
+        self._require_timestamp = require_timestamp
         self._text_field = text_field
         self._source_field = source_field
         self._id_field = id_field
@@ -345,6 +356,11 @@ class WebhookInboundConnector(InboundChannelConnector):
         timestamp header it is bound into the signed material (``{ts}.{body}``) and a
         timestamp older than ``max_timestamp_skew`` is rejected before the HMAC is even
         computed — closing a capture-replay window. A missing/forged signature returns False.
+
+        When ``require_timestamp`` is set (the deploy/serve front door), a delivery WITHOUT a
+        timestamp header is rejected outright — so a body-only signature is never accepted and
+        every request is skew-bound, making a captured request go stale rather than replay
+        forever.
         """
         if not self._secret:
             return False
@@ -352,6 +368,8 @@ class WebhookInboundConnector(InboundChannelConnector):
         if not provided:
             return False
         ts = _header_lookup(headers, self._timestamp_header)
+        if ts is None and self._require_timestamp:
+            return False  # replay guard is mandatory here — an unbound signature is refused
         material = body
         if ts is not None:
             try:
@@ -411,6 +429,17 @@ class WebhookInboundConnector(InboundChannelConnector):
             return {"ok": False, "reason": "source not allowed"}
 
         delivery_id = str(msg.raw.get(self._id_field) or "")
+        # When timestamps are mandatory (the deploy/serve front door) but the payload carries
+        # no explicit ``id``, synthesize a stable dedup key from the timestamp header + body so
+        # an id-less replay inside the skew window is still deduped — not merely staleness-
+        # bounded. verify_webhook already guaranteed a timestamp is present here.
+        if not delivery_id and self._require_timestamp:
+            ts = _header_lookup(headers, self._timestamp_header)
+            if ts is not None:
+                import hashlib
+
+                digest = hashlib.sha256(f"{ts}.".encode() + body).hexdigest()
+                delivery_id = f"ts:{digest}"
         # No delivery id ⇒ no dedup key; run unconditionally (the prior behaviour).
         if not delivery_id:
             self._throttle(msg.sender_id)
@@ -619,6 +648,7 @@ def make_webhook_connector(
     egress_allow_hosts: Collection[str] | None = None,
     allow_private_hosts: bool = False,
     ack_only: bool = False,
+    require_timestamp: bool = False,
     idempotency: IdempotencyStore | None = None,
     context: ConnectorContext | None = None,
 ) -> WebhookInboundConnector:
@@ -634,6 +664,10 @@ def make_webhook_connector(
     durable (SQLite/Postgres) deployment ``build_inbound('webhook', ..., idempotency=<store>)``
     forwards it here so a delivery id seen before a restart stays deduped after restart. The
     offline in-memory default passes ``None`` and falls back to a process-local store.
+
+    ``require_timestamp`` (set by the deploy/serve front door via
+    ``HIMMY_WEBHOOK_REQUIRE_TIMESTAMP``) makes the replay guard mandatory: a delivery without a
+    timestamp header is refused, and an id-less delivery is deduped on its timestamp+body hash.
     """
     from himmy.config.secrets import get_secret
 
@@ -652,6 +686,7 @@ def make_webhook_connector(
         result_callback=poster,
         callback_url=callback_url,
         ack_only=ack_only,
+        require_timestamp=require_timestamp,
         idempotency=idempotency,
         context=context,
     )

@@ -319,3 +319,31 @@ def test_dataclass_shape() -> None:
     assert lead.is_leader is False
     assert lead.backend == "postgres"
     assert lead.reason == ""
+
+
+def test_probe_returns_none_under_postgres_dsn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a Postgres deployment the host flock is NOT the coordination primitive.
+
+    A live ``himmy worker`` coordinates via the advisory lease and never takes the flock, so
+    the flock is free. The probe must return ``None`` (unknown), NOT ``False`` — a ``False``
+    would drive the routines hint + doctor into a load-bearing false "routines will NEVER fire"
+    warning on a correctly-deployed multi-worker Postgres setup.
+    """
+    from himmy.api import scheduler_leader as leader
+
+    monkeypatch.setenv("HIMMY_DATABASE_URL", "postgresql://u:p@localhost:5432/himmy")
+    assert leader.scheduler_running_on_host() is None
+
+
+def test_probe_reports_free_flock_as_false_without_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a Postgres DSN the SQLite flock probe stands: a free flock → ``False``."""
+    from himmy.api import scheduler_leader as leader
+
+    monkeypatch.delenv("HIMMY_DATABASE_URL", raising=False)
+    # No scheduler holding the lock in this test process → probe acquires it → False (or None
+    # on a non-POSIX host that can't tell). It must NOT be True.
+    assert leader.scheduler_running_on_host() is not True

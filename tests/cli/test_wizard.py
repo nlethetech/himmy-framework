@@ -55,8 +55,10 @@ def test_wizard_defaults_write_loadable_spec(
     assert spec.provider == "stub"
     assert spec.tool_packs == ["web", "utils"]
     assert spec.memory is False
-    # only the spec file is written — the wizard's output is minimal by design
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["agent.yaml"]
+    # the spec plus a ready-to-build container front door — the wizard's output stays minimal
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["Dockerfile", "agent.yaml"]
+    dockerfile = (tmp_path / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY agent.yaml /app/agent.yaml" in dockerfile
     assert f"wrote {dest}" in capsys.readouterr().out
 
 

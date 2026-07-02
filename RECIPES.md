@@ -139,6 +139,42 @@ MCP tool to the model, or name the (prefixed) ones you want bound. Works the sam
 > Verified offline against an in-repo mock MCP server: `himmy run` connected it,
 > registered `mock_echo`/`mock_add`, and the model called them through the full pipeline.
 
+## Reach your agent over HTTP — the signed webhook
+
+Turn an `agent.yaml` into a real, reachable, **signature-verified** HTTP endpoint. The
+one-command front door does all the wiring and prints a ready-to-paste signed `curl`:
+
+```bash
+himmy deploy -f agent.yaml     # serve + worker together, bound 127.0.0.1, signed webhook
+```
+
+To wire it by hand (in a container, a systemd unit, or any `create_app` process), set four
+config keys and serve — the agent mounts at `POST /v1/connectors/webhook`:
+
+```bash
+export HIMMY_INBOUND_AGENT_PATH="$PWD/agent.yaml"
+export HIMMY_CONNECTOR_WEBHOOK_INBOUND_ENABLED=1
+export HIMMY_WEBHOOK_ALLOWED_SOURCES=local
+# generate + persist a signing secret — store it, never echo the raw value
+export HIMMY_WEBHOOK_SIGNING_SECRET="whsec_$(python -c 'import secrets;print(secrets.token_hex(24))')"
+himmy serve -f agent.yaml
+```
+
+Every delivery is HMAC-verified over the raw body (`X-Himmy-Signature: sha256=<hex>`),
+default-deny — the connector refuses to mount without a secret. Call it with a valid
+signature (print the signature, never the secret):
+
+```bash
+BODY='{"source":"local","text":"hello"}'
+SIG="sha256=$(printf '%s' "$BODY" | \
+  openssl dgst -sha256 -hmac "$HIMMY_WEBHOOK_SIGNING_SECRET" | awk '{print $2}')"
+curl -s http://127.0.0.1:8000/v1/connectors/webhook \
+  -H "X-Himmy-Signature: $SIG" -d "$BODY"
+```
+
+> Full reference — off-loopback exposure, `--share` auth, Compose/Helm topology — is in
+> [`docs/enterprise/deployment.md`](docs/enterprise/deployment.md#agent-over-http).
+
 ## Notes from real-model testing
 
 - **Tool calling works** on Ollama (native `/api/chat` tools) and, best-effort, on the

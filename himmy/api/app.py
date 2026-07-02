@@ -181,6 +181,24 @@ def _enforce_multi_tenant_posture(authenticator: object | None) -> None:
             "would run every caller as an all-tenants admin. Configure tenant-binding "
             "auth (HIMMY_API_KEYS_FILE with per-tenant keys, or HIMMY_AUTH_MODE=oidc)."
         )
+    # When the operator EXPLICITLY declares mutually-untrusted tenants (HIMMY_MULTI_TENANT),
+    # ``binds_tenants`` is not enough: a keys file holding ONLY all-tenants-admin records
+    # satisfies it yet still runs every caller as an all-tenants admin — the exact posture the
+    # guard's own error text promises to refuse. Require at least one CONCRETE tenant-scoped
+    # key so the guarantee is real. A missing member (custom authenticator, or OIDC which binds
+    # per-request) is treated as concrete-binding (True) so only the apikey all-tenants-only
+    # file is caught. The single-agent apikey deploy (auth mode set, HIMMY_MULTI_TENANT unset)
+    # is the operator's intentional one-key posture and is NOT subject to this stricter check.
+    if env_truthy("HIMMY_MULTI_TENANT"):
+        concrete = getattr(authenticator, "binds_concrete_tenants", True)
+        if not concrete:
+            raise HimmyError(
+                "refusing to start: HIMMY_MULTI_TENANT is set but the configured keys bind "
+                "no concrete tenant — every key is an all-tenants admin, so every caller "
+                "would run as an all-tenants admin with no isolation. Configure per-tenant "
+                "API keys (HIMMY_API_KEYS_FILE entries with a non-empty tenant_ids), or use "
+                "HIMMY_AUTH_MODE=oidc."
+            )
     # Use the SAME truthy vocabulary as the consuming sanitizers / authenticator
     # (apikey._env_truthy, spec_sanitizer._truthy) — all now route through
     # himmy.config.flags.env_truthy — so a posture kill-switch can never be
@@ -1041,6 +1059,21 @@ def _origin_host(value: str) -> str:
 # BFF, not just one prefix.
 _GUARDED_PREFIXES = ("/api/studio", "/v1")
 
+# Signed inbound-connector paths are exempt from the browser-semantics half of the
+# guard (Host-allowlist + Origin/Referer/CSRF). They are authenticated by an HMAC over
+# the RAW request body plus a timestamp + default-deny allowlist inside the connector
+# itself (see himmy/api/connector_inbound.py), NOT by same-origin browser cookies — and
+# they are DELIBERATELY meant to be called by non-browser servers (GitHub/Stripe, a
+# cloudflared/ngrok tunnel, a k8s ingress) that deliver with a public Host and NO
+# Origin/Referer. Applying the DNS-rebinding/CSRF guard to them 403s every genuine signed
+# delivery before signature verification even runs, and the only workarounds
+# (HIMMY_STUDIO_GUARD=0 / a broad HIMMY_STUDIO_ALLOW_HOSTS) would reopen the whole /v1
+# surface. The carve-out is narrow: it drops ONLY the browser-origin checks; the
+# connector's own HMAC + timestamp + body-size + allowlist gate still authorizes every
+# call. A CSRF/rebind attacker cannot forge the HMAC (it needs the signing secret), so
+# exempting these paths opens no browser hole.
+_GUARD_EXEMPT_PREFIXES = ("/v1/connectors/",)
+
 
 def _install_studio_guard(app: FastAPI) -> None:
     """Block DNS-rebinding + cross-site access to the loopback BFF (WS3.5).
@@ -1078,7 +1111,9 @@ def _install_studio_guard(app: FastAPI) -> None:
     async def _guard(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        if request.url.path.startswith(_GUARDED_PREFIXES):
+        if request.url.path.startswith(
+            _GUARDED_PREFIXES
+        ) and not request.url.path.startswith(_GUARD_EXEMPT_PREFIXES):
             host = _studio_host(request.headers.get("host", ""))
             # Fail closed on a missing/empty Host too — an absent Host must NOT skip the
             # DNS-rebinding guard (mirrors the Origin/Referer fail-closed handling below).

@@ -1,10 +1,18 @@
 # syntax=docker/dockerfile:1
 #
-# Himmy Studio — a deployable image of the local web GUI.
+# Himmy runtime image — published to ghcr.io/nlethetech/himmy by
+# .github/workflows/deploy.yml on tag/release. It ships himmy[api,studio,...] already
+# installed, so it serves two audiences from ONE image:
+#
+#   1. as-is it runs `himmy studio` (the local web GUI, the default CMD below);
+#   2. as a BASE image for a user's agent: `himmy init` / `himmy deploy --docker` emit a
+#      3-line Dockerfile (`FROM ghcr.io/nlethetech/himmy:<version>` + COPY agent.yaml +
+#      CMD ["himmy","deploy",...]) so `docker build` works from the user's agent folder
+#      with no framework checkout. The CMD is overridden there to `himmy deploy`.
 #
 # Stage 1 builds the React SPA into the Python package (himmy/api/_studio_static);
-# stage 2 installs the package and serves it. Accessed via a mapped localhost port
-# (Host=localhost passes the Studio loopback guard). To reach it over a domain set
+# stage 2 installs the package and serves it. Studio is accessed via a mapped localhost
+# port (Host=localhost passes the Studio loopback guard). To reach it over a domain set
 # HIMMY_STUDIO_ALLOW_HOSTS=<your-host> (or run it behind an authenticated proxy).
 #
 #   docker build -t himmy-studio .

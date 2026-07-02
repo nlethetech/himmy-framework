@@ -1,0 +1,32 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "_comment": [
+    "Deploy MY agent to Railway — a real, reachable service from an agent.yaml.",
+    "This runs YOUR agent (the one in your agent.yaml), NOT Himmy Studio (the admin GUI).",
+    "It builds the thin agent Dockerfile (`himmy deploy --docker > Dockerfile`), which layers",
+    "your agent.yaml onto the published runtime image ghcr.io/nlethetech/himmy — no framework",
+    "checkout. Commit this as railway.json next to your agent.yaml + Dockerfile.",
+    "",
+    "SECURITY: the agent webhook stays signature-verified + default-DENY. The start command",
+    "binds 0.0.0.0 so Railway's edge can reach it, so auth is REQUIRED first — set these as",
+    "Railway variables BEFORE the first deploy (create_app refuses 0.0.0.0 with no auth):",
+    "  HIMMY_AUTH_MODE=apikey  HIMMY_API_KEYS_FILE=/app/.himmy/api_keys.json",
+    "  HIMMY_API_KEY=himmy_<generate one>   # himmy seeds the keys file from this on boot,",
+    "    e.g. python -c 'import secrets;print(\"himmy_\"+secrets.token_urlsafe(32))'",
+    "  (or HIMMY_API_KEYS_JSON='{\"himmy_yourkey\":{\"all_tenants\":true}}' for tenants/roles)",
+    "  OPENROUTER_API_KEY=...   # whatever your tool packs need",
+    "Run the worker (routine scheduler + run-queue dispatcher) as a SECOND service in the same",
+    "project with startCommand: himmy worker -f /app/agent.yaml --store /app/.himmy/storage.db"
+  ],
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "himmy serve -f /app/agent.yaml --host 0.0.0.0 --port 8000",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 40,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }
+}

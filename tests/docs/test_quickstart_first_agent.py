@@ -51,7 +51,8 @@ def test_expected_output_block_matches_classic_scaffold(tmp_path: Path) -> None:
     assert block, "section 4 lost its Expected-output block"
     documented = block.group(1)
 
-    # The four documented files, in the documented order.
+    # The documented files, in the documented order (agent spec + companions, then
+    # the deploy-DX container front door written last).
     documented_files = [
         line.removeprefix("wrote my-agent/").strip()
         for line in documented.splitlines()
@@ -62,6 +63,7 @@ def test_expected_output_block_matches_classic_scaffold(tmp_path: Path) -> None:
         "tools.py",
         "himmy.toml",
         "skills/my_skill.yaml",
+        "Dockerfile",
     ]
     assert 'Next: himmy run -f my-agent/agent.yaml -p "hello"' in documented
 
@@ -72,7 +74,7 @@ def test_expected_output_block_matches_classic_scaffold(tmp_path: Path) -> None:
         str(p.relative_to(target)) for p in target.rglob("*") if p.is_file()
     )
     assert written == sorted(
-        ["agent.yaml", "tools.py", "himmy.toml", "skills/my_skill.yaml"]
+        ["agent.yaml", "tools.py", "himmy.toml", "skills/my_skill.yaml", "Dockerfile"]
     )
 
 

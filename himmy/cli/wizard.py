@@ -255,13 +255,20 @@ def run_wizard(
     # that `himmy run` would then refuse to load.
     from himmy.config.agent_spec import AgentSpec
 
-    AgentSpec(**data)
+    spec = AgentSpec(**data)
 
     target.mkdir(parents=True, exist_ok=True)
     dest.write_text(_spec_to_yaml(data))
     print(f"wrote {dest}")
+    # Emit the ready-to-build container front door next to the spec (idempotent; never
+    # clobbers a Dockerfile the user already has), so `docker build` works from this folder.
+    from himmy.cli.commands import _emit_scaffold_dockerfile, spec_next_steps
 
-    _eprint(f'\nNext:\n  himmy run -f {dest} -p "hello"\n  himmy chat -f {dest}')
+    _emit_scaffold_dockerfile(target)
+
+    # Spec-aware Next: run/chat, plus any missing tool-pack creds, then `routines add` +
+    # `himmy deploy` — so the newcomer sees the path all the way to a scheduled/live service.
+    _eprint(spec_next_steps(dest, spec=spec))
     if chosen.key == "stub":
         _eprint(
             "\n(the stub answers deterministically — when you're ready for a real "

@@ -156,6 +156,29 @@ def _add_agent_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_service_agent_flags(parser: argparse.ArgumentParser) -> None:
+    """Agent-selection flags for the long-running SERVICE commands (serve, worker).
+
+    A thinner set than :func:`_add_agent_flags`: a service picks WHICH agent to expose, but
+    the per-run permission profile (``--yolo``/``--safe``/``--role``/``--budget``) does not
+    apply to a daemon — an inbound delivery runs under the connector's least-privilege service
+    principal, not an interactive session. ``-f``/``--agent`` name the ``agent.yaml`` (aliases,
+    so ``serve -f`` and ``eval --agent`` read alike); with neither, the nearest ``agent.yaml``
+    is discovered. ``--provider`` overrides the served agent's inference provider (like
+    run/chat); ``--name`` is accepted for parity but is informational only.
+    """
+    parser.add_argument("-f", "--file", help="path to the agent.yaml to expose as a service")
+    parser.add_argument(
+        "--agent", dest="agent", help="alias for -f/--file (the agent.yaml to serve)"
+    )
+    parser.add_argument("--name", help="agent name (parity with run/chat; informational)")
+    parser.add_argument(
+        "--provider",
+        choices=PROVIDERS,
+        help="inference provider override applied to the served agent (default: the spec's)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argument parser with all subcommands."""
     parser = argparse.ArgumentParser(prog="himmy", description="Himmy agent CLI.")
@@ -428,7 +451,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_demo.set_defaults(func=commands.cmd_demo_video)
 
-    p_serve = sub.add_parser("serve", help="serve the FastAPI BFF (needs api extra)")
+    p_serve = sub.add_parser(
+        "serve",
+        help="serve the FastAPI BFF, exposing -f agent.yaml as a signed HTTP endpoint "
+        "(needs api extra)",
+    )
+    _add_service_agent_flags(p_serve)
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.set_defaults(func=commands.cmd_serve)
@@ -437,6 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
         "worker",
         help="run the routine scheduler + durable run-queue dispatcher (no API server)",
     )
+    _add_service_agent_flags(p_worker)
     p_worker.add_argument(
         "--store",
         help="path for the durable SQLite run store (sets HIMMY_STORE_PATH; "
@@ -459,6 +488,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_worker.set_defaults(func=commands.cmd_worker)
 
+    p_deploy = sub.add_parser(
+        "deploy",
+        help="one command: stand up a live, signed service from an agent.yaml "
+        "(serve + worker together)",
+        epilog=(
+            "The agent mounts as a signature-verified webhook at "
+            "POST /v1/connectors/webhook (bound 127.0.0.1). deploy prints a ready-to-paste "
+            "signed curl. To wire it by hand, or expose it beyond loopback, see the "
+            "agent-over-HTTP recipe: docs/enterprise/deployment.md (#agent-over-http) "
+            "and RECIPES.md."
+        ),
+    )
+    _add_service_agent_flags(p_deploy)
+    p_deploy.add_argument("--host", default="127.0.0.1")
+    p_deploy.add_argument("--port", type=int, default=8000)
+    p_deploy.add_argument(
+        "--channel",
+        choices=("http", "telegram", "studio"),
+        default="http",
+        help="serve over HTTP (default), as a Telegram bot, or via Himmy Studio",
+    )
+    p_deploy.add_argument(
+        "--share",
+        action="store_true",
+        help="let a friend try it: mint an API key + enable auth, then print a "
+        "cloudflared/ngrok tunnel command (never exposes an unauthenticated endpoint)",
+    )
+    p_deploy.add_argument(
+        "--docker",
+        action="store_true",
+        help="print a minimal Dockerfile for this agent and exit (deploy nothing)",
+    )
+    p_deploy.set_defaults(func=commands.cmd_deploy)
+
     p_studio = sub.add_parser(
         "studio", help="serve Himmy Studio, the local web GUI (needs studio extra)"
     )
@@ -474,6 +537,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--storage",
         action="store_true",
         help="also report the storage backend, migrations, and SQLite stores",
+    )
+    p_doctor.add_argument(
+        "--runtime",
+        action="store_true",
+        help="report the unattended-run substrate (scheduler, durable store, routine "
+        "coverage) — shown by default; this is an explicit opt-in",
     )
     p_doctor.set_defaults(func=commands.cmd_doctor)
 

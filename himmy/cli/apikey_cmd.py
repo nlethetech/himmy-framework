@@ -21,6 +21,7 @@ needs to survive long enough to hand to the caller — the server stores a salte
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import secrets
@@ -65,12 +66,40 @@ def _load_keys(path: Path) -> dict[str, Any]:
 
 
 def _write_json_0600(path: Path, data: Any) -> None:
-    """Write JSON atomically with ``0600`` perms (owner read/write only)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    """Write JSON atomically, owner-only from creation (``0600`` file, ``0700`` parent).
+
+    The keys/revocation files hold the deployment's most sensitive material (the ``--share``
+    all-tenants key, the seeded ``HIMMY_API_KEY``). To keep it owner-only with NO world-readable
+    window we mirror :meth:`himmy.config.secrets.FileSecrets.set`:
+
+    * the parent dir (``.himmy/``) is chmod'd to ``0700`` so the file's very name is not
+      enumerable by other local users (a ``0755`` dir leaks it);
+    * the temp file is created via ``tempfile.mkstemp`` (mode ``0600`` from birth, UNPREDICTABLE
+      name) rather than ``Path.write_text`` (which opens at the process umask — typically
+      ``0644``/world-readable — and then chmods, leaving a race window) or a predictable
+      ``<path>.tmp`` name (which a pre-planted symlink could redirect);
+    * the atomic ``os.replace`` means a reader ever sees only the old or the new whole file.
+    """
+    import tempfile
+
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        # Owner-only dir so the keys-file name is not enumerable; best-effort (a mounted or
+        # operator-owned dir may refuse — the file itself is still created 0600 below).
+        os.chmod(directory, 0o700)
+    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=str(directory), prefix=".apikeys-", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        # mkstemp already created it 0600 with an unpredictable name; write through the fd.
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        tmp.replace(path)
+    finally:
+        with contextlib.suppress(OSError):
+            if tmp.exists():
+                tmp.unlink()
 
 
 def _err(msg: str) -> int:

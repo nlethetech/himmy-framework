@@ -8,6 +8,11 @@ name: Deploy
 on:
   push:
     branches: [main]
+    # Tags drive the ghcr publish job below (see `publish`). A `v*` tag or a GitHub
+    # Release both build + push the multi-arch runtime image to ghcr.io/nlethetech/himmy.
+    tags: ["v*"]
+  release:
+    types: [published]
   pull_request:
     paths:
       - Dockerfile
@@ -134,3 +139,55 @@ jobs:
 
       - name: Plan the air-gap bundle (no downloads, no docker save)
         run: python scripts/airgap_bundle.py build --dry-run
+
+  publish:
+    name: build + push multi-arch image to ghcr
+    # Only on a version tag or a published Release — never on PRs or plain main pushes
+    # (those keep to the local `load:`-only smoke test in the `image` job above). This is
+    # what makes `FROM ghcr.io/nlethetech/himmy:<version>` (the base image `himmy init` /
+    # `himmy deploy --docker` emit) resolvable for pip-install users with no checkout.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write  # push to GitHub Container Registry (ghcr.io)
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up QEMU (arm64 emulation for the multi-arch build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN scoped by `packages: write` above — no PAT needed.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/nlethetech/himmy
+          # A release tagged `v0.2.0` publishes `0.2.0`, `0.2`, and `latest` so both
+          # the exact pin the CLI writes (`:0.2.0`) and `:latest` resolve.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build + push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

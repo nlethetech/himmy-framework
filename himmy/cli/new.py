@@ -223,5 +223,9 @@ def cmd_new(args: argparse.Namespace) -> int:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(yaml_text)
     print(f"wrote {dest}")
-    _eprint(f'\nNext:\n  himmy run -f {dest} -p "hello"\n  himmy chat -f {dest}')
+    # Spec-aware Next: run/chat, any missing tool-pack creds, then `routines add` +
+    # `himmy deploy` — the full path from a drafted spec to a scheduled/live service.
+    from himmy.cli.commands import spec_next_steps
+
+    _eprint(spec_next_steps(dest))
     return 0

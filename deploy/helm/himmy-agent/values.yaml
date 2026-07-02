@@ -1,0 +1,186 @@
+# Default values for himmy-agent.
+#
+# This chart deploys YOUR agent (an agent.yaml) as a service — NOT Himmy Studio.
+# Two components share one durable state contract:
+#   - api    — `himmy serve -f /app/agent.yaml`: the FastAPI BFF exposing the agent
+#              as a signature-verified webhook (POST /v1/connectors/webhook,
+#              default-DENY).
+#   - worker — `himmy worker -f /app/agent.yaml`: routine scheduler + durable
+#              run-queue dispatcher over the SAME .himmy store.
+#
+# Single-writer reality (READ THIS before scaling):
+#   himmy keeps a cwd-relative /app/.himmy state dir of SQLite stores. The durable
+#   run store is opened WAL + busy_timeout (himmy.core.sqlite_util.connect_hardened),
+#   so TWO processes on ONE node (api enqueues, worker dispatches) coordinate instead
+#   of raising `database is locked` — this two-process-same-node topology IS the
+#   supported mode. It is single-WRITER, not single-process: api + worker mount the
+#   SAME RWO PVC and are each hard-pinned to one replica with a Recreate strategy, and
+#   the worker is auto co-located on the api's node (see `affinity` below). Even with
+#   an external Postgres entity store, those SQLite run stores stay on the shared PVC,
+#   so both pods must remain on the same node.
+#
+# Intentionally OUT OF SCOPE (wire in yourself): HPA, PDB, NetworkPolicy,
+# ServiceMonitor, a bundled Postgres subchart, and multi-replica scaling.
+
+image:
+  # NOTE: set to the published runtime image once available, e.g.
+  # repository: ghcr.io/nlethetech/himmy
+  repository: ghcr.io/nlethetech/himmy
+  pullPolicy: IfNotPresent
+  # Defaults to .Chart.AppVersion when empty.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# -- The agent spec. Provide EITHER inline YAML here (rendered into a ConfigMap and
+# mounted at /app/agent.yaml) OR reference an existing ConfigMap you manage.
+# The api + worker both mount the SAME spec, so they serve one agent.
+agent:
+  # Inline agent.yaml content (a YAML string). Example:
+  #   spec: |
+  #     name: my-agent
+  #     description: ...
+  #     tools: [...]
+  spec: ""
+  # Reference an existing ConfigMap instead of inline `spec`. The key holding the
+  # agent.yaml content defaults to "agent.yaml".
+  existingConfigMap: ""
+  existingConfigMapKey: agent.yaml
+
+# -- Container-level securityContext (applied to both components).
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+# -- Pod-level securityContext. himmy runs as uid 10001 in the image; fsGroup
+# ensures the mounted PVC is group-writable by that uid.
+podSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  runAsNonRoot: true
+
+# -- Use a specific ServiceAccount for the pods. This chart does NOT create one;
+# leave empty to use the namespace "default" SA.
+serviceAccountName: ""
+
+# -- Pod-level annotations (applied to both components).
+podAnnotations: {}
+
+# --- api component (the HTTP endpoint) --------------------------------------
+api:
+  # MUST stay 1: the /app/.himmy SQLite stores live on an RWO PVC and are
+  # single-writer. Scaling past 1 corrupts state.
+  replicaCount: 1
+  # -- Bind host INSIDE the container. Fail-closed default: 127.0.0.1 keeps the
+  # agent endpoint unreachable from off-pod (the webhook stays signature-verified
+  # + default-deny regardless). To expose it via the Service/ingress you MUST set
+  # bindHost: 0.0.0.0 AND configure auth (see `auth` below) — create_app refuses to
+  # boot an unauthenticated off-loopback surface.
+  bindHost: "127.0.0.1"
+  port: 8000
+  service:
+    type: ClusterIP
+    port: 8000
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  probes:
+    liveness:
+      initialDelaySeconds: 15
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+
+# --- worker component (scheduler + dispatcher, no HTTP) ---------------------
+worker:
+  # MUST stay 1 for the SQLite store (see api.replicaCount). A Postgres-backed
+  # DATABASE_URL is what makes multi-node dispatch safe — out of scope here.
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "500m"
+      memory: 512Mi
+
+# -- Auth hardening. REQUIRED before setting api.bindHost to 0.0.0.0 (himmy fails
+# closed on an unauthenticated off-loopback bind). apikey mode reads keys from the
+# mounted secrets dir; set mode + provide the key material via `secrets`.
+auth:
+  # "" (loopback-only), "apikey", or "oidc".
+  mode: ""
+  # Path (under secrets.mountPath) to the api_keys.json when mode=apikey.
+  apiKeysFile: ""
+
+# -- Ingress for the api endpoint. Only expose AFTER setting api.bindHost=0.0.0.0
+# and auth.mode. Off by default.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: agent.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# -- External Postgres entity store (optional). Provide EITHER an inline url OR an
+# existingSecret+key (existingSecret wins). Leave both empty to fall back to the
+# default single-writer SQLite store on the PVC. No Postgres is deployed here.
+database:
+  url: ""
+  existingSecret: ""
+  existingSecretKey: HIMMY_DATABASE_URL
+
+# -- File-based secrets, mounted one-file-per-key under mountPath. Put the webhook
+# signing secret (HIMMY_WEBHOOK_SIGNING_SECRET), any api_keys.json, and
+# HIMMY_ENCRYPTION_KEY here via a Kubernetes Secret. The app is told to read them
+# (HIMMY_SECRETS=file, HIMMY_SECRETS_DIR=mountPath).
+secrets:
+  existingSecret: ""
+  mountPath: /run/himmy-secrets
+
+# -- Persistence for the shared /app/.himmy state dir (SQLite stores). RWO because
+# the stores are single-writer; the SAME PVC is mounted by api + worker.
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 5Gi
+  annotations: {}
+  # Keep the PVC on `helm uninstall` so a routine uninstall does not delete the
+  # only copy of the .himmy state. Set false to let Helm GC it with the release.
+  retain: true
+
+# -- Free-form environment passthrough set verbatim on BOTH components. Use for
+# HIMMY_OLLAMA_URL, provider keys, rate-limit vars, etc.
+env: {}
+
+nodeSelector: {}
+tolerations: []
+# -- Pod affinity/anti-affinity. When LEFT EMPTY and persistence is enabled, the
+# worker pod auto-gets a HARD podAffinity co-locating it on the api pod's node —
+# required because the shared RWO state PVC can attach to only one node at a time
+# (cross-node placement → the worker hangs with a Multi-Attach error). Set this to
+# your own affinity ONLY if you use an RWX volume or a fully external run store, as
+# it REPLACES that auto co-location.
+affinity: {}

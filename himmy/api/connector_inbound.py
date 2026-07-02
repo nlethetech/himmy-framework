@@ -41,8 +41,25 @@ logger = logging.getLogger("himmy.api.connector_inbound")
 #: deliberately, never defaulted.
 INBOUND_AGENT_PATH_ENV = "HIMMY_INBOUND_AGENT_PATH"
 
-#: Default mount paths per inbound connector (under the guarded ``/v1`` prefix so the
-#: Studio rebinding/cross-site guard already protects them).
+#: Non-secret config key for an OPTIONAL provider override applied to the inbound agent's
+#: spec (mirrors the CLI ``--provider`` flag on ``run``/``chat``). Read through the secrets
+#: layer like :data:`INBOUND_AGENT_PATH_ENV`. When absent, the spec's own provider is used
+#: — the override never clobbers explicit spec config unless deliberately set.
+INBOUND_PROVIDER_ENV = "HIMMY_INBOUND_PROVIDER"
+
+
+def inbound_provider() -> str | None:
+    """The configured inbound provider override, or None when none is set."""
+    value = (get_secret(INBOUND_PROVIDER_ENV) or "").strip()
+    return value or None
+
+#: Default mount paths per inbound connector. They live under ``/v1`` but are CARVED OUT of the
+#: Studio rebinding/cross-site guard's browser-origin checks (see ``_GUARD_EXEMPT_PREFIXES`` in
+#: ``himmy.api.app``): they are authenticated by an HMAC over the raw body + timestamp +
+#: default-deny allowlist, NOT by same-origin browser semantics, and are meant to be called by
+#: non-browser servers (GitHub/Stripe, a tunnel, a k8s ingress) that send a public Host and no
+#: Origin/Referer. The guard's browser checks would 403 every genuine signed delivery; the
+#: connector's own HMAC gate is what authorizes them.
 _INBOUND_PATHS: dict[str, str] = {
     "webhook": "/v1/connectors/webhook",
     "slack": "/v1/connectors/slack",
@@ -100,7 +117,10 @@ def _build_inbound_handler(agent_path: str, *, app: FastAPI | None = None) -> An
     from himmy.agents.base_agent.thread import ChatThread
     from himmy.runtime.from_spec import build_runtime_for_spec, load_spec_file
 
-    spec = load_spec_file(agent_path)
+    # An optional operator-set provider override (``himmy serve --provider ollama``) is
+    # applied here, at spec load, so the served agent actually uses it — mirroring the CLI
+    # run/chat ``--provider`` path. Absent, the spec's own provider stands (never clobbered).
+    spec = load_spec_file(agent_path, provider=inbound_provider())
     tool_authorizer = _connector_tool_authorizer(app)
     # P1 tenancy: thread the connector service principal's FIXED bound workspace as the
     # tool-store ``subject`` so its memory/knowledge packs key off ``t:<workspace>`` instead
@@ -266,6 +286,8 @@ def mount_inbound_connectors(app: FastAPI) -> list[str]:
 
 __all__ = [
     "INBOUND_AGENT_PATH_ENV",
+    "INBOUND_PROVIDER_ENV",
     "inbound_agent_path",
+    "inbound_provider",
     "mount_inbound_connectors",
 ]

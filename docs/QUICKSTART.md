@@ -194,9 +194,14 @@ wrote my-agent/agent.yaml
 wrote my-agent/tools.py
 wrote my-agent/himmy.toml
 wrote my-agent/skills/my_skill.yaml
+wrote my-agent/Dockerfile
 
 Next: himmy run -f my-agent/agent.yaml -p "hello"
 ```
+
+The `Dockerfile` is a ready-to-build container front door: `docker build` from this
+folder layers your spec onto the published runtime image (no framework checkout). It is
+never written over one you already have.
 
 > **On a real terminal, plain `himmy init my-agent` (without `--classic`) is
 > interactive.** It asks a few short questions — name, what it should do, which model,
@@ -235,6 +240,33 @@ Hello! How can I assist you today?
 
 That's a working agent. Open `my-agent/agent.yaml` in any text editor to see how small it
 is — change the `role` and `instructions` lines, save, and re-run.
+
+---
+
+## 4b. Now deploy it — one command
+
+You have an agent that runs. To make it a real, reachable HTTP service (so another program,
+a webhook, or a friend can call it), one command stands up **serve + worker together**:
+
+```bash
+himmy deploy -f my-agent/agent.yaml
+```
+
+That boots the FastAPI server bound to `127.0.0.1:8000` **plus** the background worker
+(scheduler + run-queue), mounts your agent as a **signature-verified** webhook at
+`POST /v1/connectors/webhook`, and prints a boxed live summary with a **ready-to-paste,
+already-signed `curl`** — paste it and you'll get a real answer back from your agent. It is
+fail-closed by default: bound to loopback, default-deny, and it never prints the raw signing
+secret (only a valid signature for the sample payload).
+
+- **Let a friend try it** without a cloud account: `himmy deploy --share` mints an API key
+  and turns auth **on first**, then prints a `cloudflared`/`ngrok` tunnel command — it never
+  exposes an unauthenticated endpoint.
+- **Scheduled/unattended runs.** Add a routine (`himmy routines add …`) and the worker
+  `himmy deploy` started is what actually fires it on schedule.
+- **Containers, Compose, Helm, one-click cloud, and wiring the webhook by hand** are in the
+  [deployment runbook](./enterprise/deployment.md#deploy-my-agent-a-service) and
+  [`RECIPES.md`](../RECIPES.md).
 
 ---
 

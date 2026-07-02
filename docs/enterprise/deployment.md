@@ -1,9 +1,158 @@
 # Deployment runbook
 
+> **Two different things can be deployed — pick the right one first.**
+>
+> * **Deploy MY agent (a service).** You have an `agent.yaml` and want it running
+>   as a reachable, signed HTTP service. Use
+>   [`deploy/compose/agent-compose.yml`](../../deploy/compose/agent-compose.yml) or the
+>   [`deploy/helm/himmy-agent`](../../deploy/helm/himmy-agent) chart. See
+>   [Deploy MY agent](#deploy-my-agent-a-service).
+> * **Deploy Himmy Studio (the admin GUI).** You want the local web app for
+>   building/inspecting agents. Use
+>   [`deploy/compose/docker-compose.yml`](../../deploy/compose/docker-compose.yml) or the
+>   [`deploy/helm/himmy-studio`](../../deploy/helm/himmy-studio) chart. That is the rest
+>   of this runbook (below).
+>
+> These are NOT the same: the Studio artifacts stand up the GUI and expose **zero
+> agent endpoints**. If you followed the Studio compose/helm expecting your agent
+> to answer HTTP, you wanted the agent path above.
+
 How to install, configure, expose, monitor, back up, and recover a himmy Studio
 deployment. This is the operator's reference for the artifacts under `deploy/`
 and `scripts/ops_*.py`. It documents what those artifacts actually do today —
 including the sharp edges — rather than an idealized topology.
+
+## Deploy MY agent (a service)
+
+This path deploys the agent in your `agent.yaml` as a durable, signature-verified
+service — distinct from Himmy Studio. The single-command front door is:
+
+```bash
+himmy deploy -f agent.yaml     # serve + worker together, bound 127.0.0.1, signed webhook
+```
+
+For a durable multi-process topology (an HTTP `api` process and a background
+`worker` process over one store), use one of the two artifacts below.
+
+### Agent — Docker Compose
+
+[`deploy/compose/agent-compose.yml`](../../deploy/compose/agent-compose.yml) runs two
+services over ONE durable named volume:
+
+* **api** — `himmy serve -f /app/agent.yaml`: the FastAPI BFF exposing your agent as a
+  **signature-verified**, **default-deny** webhook at `POST /v1/connectors/webhook`.
+* **worker** — `himmy worker -f /app/agent.yaml`: the routine scheduler + durable
+  run-queue dispatcher on the SAME `.himmy` store, so routines fire and queued runs drain
+  even when no one is calling the endpoint.
+* **postgres** (optional, `postgres` profile) — a durable entity store. Omit it and both
+  services fall back to the offline single-writer SQLite default. Zero-config works with
+  no Postgres.
+
+```bash
+# point AGENT_DIR at the FOLDER holding your agent.yaml (defaults to ./)
+export AGENT_DIR=/abs/path/to/my-agent
+docker compose -f deploy/compose/agent-compose.yml up -d
+# ...with a durable Postgres entity store:
+docker compose -f deploy/compose/agent-compose.yml --profile postgres up -d
+```
+
+Optionally drop a plain `KEY=value` file at `$AGENT_DIR/agent.env` with the provider keys
+your tool packs need — it is read by both services and skipped when absent.
+
+**Security posture (fail-closed).** The api binds `127.0.0.1` inside the container by
+default: the webhook stays signature-verified + default-deny, and the port is deliberately
+NOT reachable through a published `-p` mapping until you add real auth. To expose it, in
+order: (1) set `HIMMY_AUTH_MODE=apikey` + provide a key (via `agent.env`), (2) set
+`AGENT_BIND=0.0.0.0`, (3) uncomment the api `ports:` line. Binding `0.0.0.0` with no auth is
+refused by `create_app` — himmy will not boot an open admin surface. The signing secret is
+file-delivered (RO-mounted `./secrets`), never baked into an image.
+
+### Agent — Helm
+
+[`deploy/helm/himmy-agent`](../../deploy/helm/himmy-agent) is a distinct chart (NOT
+`himmy-studio`) with an `api` Deployment and a `worker` Deployment that both mount your
+`agent.yaml` (inline `agent.spec` rendered into a ConfigMap, or an existing ConfigMap via
+`agent.existingConfigMap`) and share one RWO state PVC.
+
+```bash
+helm install my-agent deploy/helm/himmy-agent \
+  --set image.repository=ghcr.io/nlethetech/himmy \
+  --set-file agent.spec=./agent.yaml
+```
+
+Fail-closed by default: `api.bindHost` is `127.0.0.1`, so the endpoint is reachable only
+in-pod. To expose it via the Service/ingress you MUST set `auth.mode` (e.g. `apikey`) AND
+`api.bindHost=0.0.0.0` — the chart refuses to render an ingress otherwise, and himmy
+refuses to boot an unauthenticated off-loopback bind. Each component is single-replica by
+design (the shared `.himmy` SQLite run store is single-WRITER but opened WAL +
+busy_timeout, so the api + worker coordinate safely as two processes on ONE node); a
+Postgres `HIMMY_DATABASE_URL` moves the entity store off SQLite, but the run store
+stays on the shared PVC. Because that PVC is `ReadWriteOnce` (one node at a time), the
+worker pod is auto-scheduled onto the api pod's node via a hard `podAffinity` — leave
+`affinity` empty to keep it, or supply your own only with an RWX volume. The api's
+health/readiness use `exec` (in-pod `curl`) probes, not `httpGet`, so they stay correct
+at the loopback `bindHost` default. Both containers pin `command: ["himmy"]` (the image
+has no ENTRYPOINT).
+
+<a id="agent-over-http"></a>
+### Agent over HTTP — the signed webhook by hand
+
+`himmy deploy` / `himmy serve` wire the inbound webhook for you and print a ready-to-paste
+signed `curl`. This is the same wiring done by hand, so you can reproduce it in a container,
+a systemd unit, or any process that constructs the FastAPI app with
+[`create_app`](../../himmy/api/app.py) — the connector is mounted by
+[`mount_inbound_connectors`](../../himmy/api/connector_inbound.py) at app startup.
+
+Four config keys turn a bare BFF into an agent endpoint. All are read through the secrets
+layer, so the process env is the zero-config path (a file/keychain backend also works):
+
+| Key | Purpose |
+| --- | --- |
+| `HIMMY_INBOUND_AGENT_PATH` | the `agent.yaml` an inbound delivery runs (absent → nothing mounts) |
+| `HIMMY_CONNECTOR_WEBHOOK_INBOUND_ENABLED` | enable the `webhook` connector for the `inbound` surface |
+| `HIMMY_WEBHOOK_SIGNING_SECRET` | the shared HMAC secret every delivery must be signed with |
+| `HIMMY_WEBHOOK_ALLOWED_SOURCES` | allow-list for the payload `source` field (default-deny; empty allow-list rejects all) |
+
+Default-deny is preserved end to end: the connector refuses to mount without a signing
+secret (an unsigned public trigger is a forgeable agent trigger), and every delivery is
+HMAC-verified over the raw body before it reaches your agent.
+
+```bash
+# 1) point the inbound webhook at your agent + enable + allow the sample source
+export HIMMY_INBOUND_AGENT_PATH="$PWD/agent.yaml"
+export HIMMY_CONNECTOR_WEBHOOK_INBOUND_ENABLED=1
+export HIMMY_WEBHOOK_ALLOWED_SOURCES=local
+
+# 2) generate + persist a signing secret (NEVER print the raw secret; store it, don't echo)
+export HIMMY_WEBHOOK_SIGNING_SECRET="whsec_$(python -c 'import secrets;print(secrets.token_hex(24))')"
+
+# 3) serve it — the agent mounts at POST /v1/connectors/webhook (bound 127.0.0.1)
+himmy serve -f agent.yaml
+```
+
+The endpoint is `POST /v1/connectors/webhook` (under the guarded `/v1` prefix). Each request
+carries the HMAC of the *raw* body in the `X-Himmy-Signature` header, GitHub-style
+`sha256=<hex>`. Compute a valid signature and call it — printing the signature, **never** the
+secret:
+
+```bash
+BODY='{"source":"local","text":"hello"}'
+SIG="sha256=$(printf '%s' "$BODY" | \
+  openssl dgst -sha256 -hmac "$HIMMY_WEBHOOK_SIGNING_SECRET" | awk '{print $2}')"
+curl -s http://127.0.0.1:8000/v1/connectors/webhook \
+  -H "X-Himmy-Signature: $SIG" \
+  -d "$BODY"
+```
+
+`himmy serve`/`himmy deploy` print exactly this `curl` (a valid signature over the sample
+body, never the secret) in their live summary — so a newcomer can prove the endpoint end to
+end in one paste. To expose it beyond loopback, add real auth first (`--share`, or
+`HIMMY_AUTH_MODE=apikey` + a key) — an off-loopback bind with no auth is refused by
+`create_app`.
+
+---
+
+The remainder of this runbook covers the **Himmy Studio** deployment (the admin GUI).
 
 himmy is offline-first and single-process at its core: the durable state is a
 directory of **single-writer** SQLite stores (`.himmy/*.db`) plus an *optional*
@@ -11,10 +160,12 @@ external Postgres for the main entity store. That single-writer reality drives
 almost every constraint below (single replica, RWO volumes, WAL-safe backups).
 Read the [Gotchas](#gotchas) before you scale anything.
 
-## Overview — three deployment shapes
+## Overview — three Studio deployment shapes
 
-Pick the smallest shape that fits. They share the same image, the same `.himmy`
-state contract, and the same `HIMMY_*` configuration surface.
+These three shapes deploy **Himmy Studio (the GUI)**, not an agent endpoint — for
+an agent service see [Deploy MY agent](#deploy-my-agent-a-service) above. Pick the
+smallest shape that fits. They share the same image, the same `.himmy` state
+contract, and the same `HIMMY_*` configuration surface.
 
 | Shape | What it is | Use it when |
 |---|---|---|

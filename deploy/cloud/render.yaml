@@ -1,0 +1,68 @@
+# =============================================================================
+# Deploy MY agent to Render — a real, reachable service from an agent.yaml
+# =============================================================================
+#
+# This runs YOUR agent (the one in your agent.yaml), NOT Himmy Studio (the admin
+# GUI). Both services build the thin agent Dockerfile
+# (`himmy deploy --docker > Dockerfile`), which layers your agent.yaml onto the
+# published runtime image ghcr.io/nlethetech/himmy — no framework checkout.
+#
+# Usage: commit this as render.yaml next to your agent.yaml + Dockerfile, then
+# point Render at the repo (Blueprint) — it stands up the api + worker below.
+#
+# Security posture (READ before opening the port)
+# ------------------------------------------------
+# The agent webhook stays signature-verified + default-DENY. The web service binds
+# 0.0.0.0 so Render's edge can reach it, so auth is REQUIRED first: HIMMY_AUTH_MODE
+# is set to apikey below and a real API KEY is a `sync: false` secret you fill in the
+# Render dashboard. himmy materializes that key into HIMMY_API_KEYS_FILE on boot, so the
+# service comes up authenticated — binding 0.0.0.0 with NO auth is refused by create_app.
+# Fill HIMMY_API_KEY with a value you generate, e.g.:
+#   python -c 'import secrets;print("himmy_"+secrets.token_urlsafe(32))'
+# (or use HIMMY_API_KEYS_JSON with the literal JSON keys-file contents for tenants/roles).
+# =============================================================================
+
+services:
+  # The api: exposes the agent as a signature-verified webhook over HTTP.
+  - type: web
+    name: himmy-agent-api
+    runtime: docker
+    # Thin Dockerfile: FROM ghcr.io/nlethetech/himmy + COPY agent.yaml.
+    dockerfilePath: ./Dockerfile
+    dockerCommand: himmy serve -f /app/agent.yaml --host 0.0.0.0 --port 8000
+    healthCheckPath: /health
+    disk:
+      name: himmy-agent-state
+      mountPath: /app/.himmy
+      sizeGB: 1
+    envVars:
+      - key: HIMMY_DURABLE_STORAGE
+        value: "1"
+      - key: HIMMY_STORE_PATH
+        value: /app/.himmy/storage.db
+      # Auth required before the public endpoint accepts traffic.
+      - key: HIMMY_AUTH_MODE
+        value: apikey
+      - key: HIMMY_API_KEYS_FILE
+        value: /app/.himmy/api_keys.json
+      # The API key that makes the authenticated endpoint boot — set in the dashboard, never
+      # committed. himmy seeds HIMMY_API_KEYS_FILE from this on first boot.
+      - key: HIMMY_API_KEY
+        sync: false
+      # Provider key(s) your tool packs need — filled in the dashboard, never committed.
+      - key: OPENROUTER_API_KEY
+        sync: false
+
+  # The worker: routine scheduler + durable run-queue dispatcher. No HTTP surface.
+  - type: worker
+    name: himmy-agent-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: himmy worker -f /app/agent.yaml --store /app/.himmy/storage.db
+    envVars:
+      - key: HIMMY_DURABLE_STORAGE
+        value: "1"
+      - key: HIMMY_STORE_PATH
+        value: /app/.himmy/storage.db
+      - key: OPENROUTER_API_KEY
+        sync: false

@@ -1,0 +1,16 @@
+{{- if not .Values.agent.existingConfigMap }}
+{{- if not .Values.agent.spec }}
+{{- fail "himmy-agent: set agent.spec (inline agent.yaml) or agent.existingConfigMap — there is nothing to serve otherwise." }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "himmy-agent.configMapName" . }}
+  labels:
+    {{- include "himmy-agent.labels" . | nindent 4 }}
+data:
+  # The agent.yaml the api + worker both serve. Mounted read-only at
+  # /app/agent.yaml (see _helpers.tpl volumeMounts).
+  agent.yaml: |
+{{ .Values.agent.spec | indent 4 }}
+{{- end }}
