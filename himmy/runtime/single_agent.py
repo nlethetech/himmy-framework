@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import json
 import os
 import queue
@@ -421,6 +422,37 @@ def _prompt_cache_key_for_scope(scope_metadata: dict[str, Any]) -> str | None:
         if scope_metadata.get(key) not in (None, "")
     ]
     return "|".join(parts) if parts else None
+
+
+def _openai_conversation_cache_key_enabled() -> bool:
+    """Whether to stamp a per-conversation OpenAI ``prompt_cache_key`` (default ON).
+
+    ``HIMMY_OPENAI_CONVERSATION_CACHE_KEY=0``/``false``/``no``/``off`` opts out so the
+    request payload is byte-identical to the pre-P2.3 no-cache-key contract. Read per call
+    (not cached) so a test/host can flip it without reconstructing the runtime.
+    """
+    return os.environ.get(
+        "HIMMY_OPENAI_CONVERSATION_CACHE_KEY", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _prompt_cache_key_for_conversation(thread_id: str | None) -> str | None:
+    """A stable, per-conversation OpenAI ``prompt_cache_key`` routing hint (P2.3).
+
+    OpenAI's ``prompt_cache_key`` is a pure ROUTING hint: it steers a conversation's turns
+    to the same backend so its automatic prefix cache is more likely to hit, and has ZERO
+    effect on the generated output. This folds the run's ``thread_id`` (a fresh UUID per
+    :class:`ChatThread`, so stable across the turns of one run but distinct across runs)
+    into a short opaque digest so the hint is stable within a run and distinct across runs
+    without leaking the raw id. Returns ``None`` when no ``thread_id`` is available (keeping
+    the payload byte-identical). Applied by the runtime for OpenAI-family managers only; the
+    OpenAI adapter additionally gates on :func:`is_openai_family_model`, so no other provider
+    is ever affected.
+    """
+    if not thread_id:
+        return None
+    digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:32]
+    return f"himmy-conv-{digest}"
 
 
 def _context_workspace_id(ctx: dict[str, Any]) -> str | None:
@@ -3349,7 +3381,12 @@ class SingleAgentRuntime:
         return ctx.get("model_key") or self.default_model_key
 
     def _prompt_cache_policy(
-        self, model_key: str, *, cache_busted: bool, scope_metadata: dict[str, Any]
+        self,
+        model_key: str,
+        *,
+        cache_busted: bool,
+        scope_metadata: dict[str, Any],
+        thread_id: str | None = None,
     ) -> CachePolicy | None:
         """The per-turn :class:`CachePolicy` (or ``None`` to leave the request unmarked).
 
@@ -3381,15 +3418,34 @@ class SingleAgentRuntime:
           cross-tenant cache-read side-channel on a byte-identical prefix (which the new
           history-cache breakpoint would otherwise widen to tenant/tool-result content).
 
-        An unscoped run keeps ``cache_key=None`` so the payload is byte-identical to the
-        pre-change no-cache-key contract.
+        P2.3: an UNSCOPED run against an OpenAI-family manager
+        (:attr:`CacheCapability.OPENAI_AUTOMATIC`) instead carries a per-conversation
+        ``cache_key`` derived from ``thread_id`` (:func:`_prompt_cache_key_for_conversation`).
+        OpenAI's ``prompt_cache_key`` is a pure routing hint (steers a conversation's turns to
+        one backend for better automatic-cache affinity) with ZERO output effect, so this is a
+        speed-only win; it is opt-outable via ``HIMMY_OPENAI_CONVERSATION_CACHE_KEY=0``. A
+        scope key (when present) always WINS so tenant isolation is never diluted, and no
+        non-OpenAI family is touched: the conversation key is only minted for
+        ``OPENAI_AUTOMATIC`` (Anthropic's ``ANTHROPIC_EXPLICIT`` never enters this branch, so
+        its cacheable prefix bytes stay unchanged), and the OpenAI adapter itself additionally
+        gates ``prompt_cache_key`` on :func:`is_openai_family_model`.
+
+        An unscoped non-OpenAI run keeps ``cache_key=None`` so the payload is byte-identical to
+        the pre-change no-cache-key contract.
         """
         if cache_busted or not self._enable_prompt_cache:
             return None
         capability = self.inference_service.cache_capability_for(model_key)
         if capability is CacheCapability.NONE:
             return None
-        return CachePolicy(cache_key=_prompt_cache_key_for_scope(scope_metadata))
+        cache_key = _prompt_cache_key_for_scope(scope_metadata)
+        if (
+            cache_key is None
+            and capability is CacheCapability.OPENAI_AUTOMATIC
+            and _openai_conversation_cache_key_enabled()
+        ):
+            cache_key = _prompt_cache_key_for_conversation(thread_id)
+        return CachePolicy(cache_key=cache_key)
 
     def _build_request(
         self,
@@ -3514,7 +3570,10 @@ class SingleAgentRuntime:
             route_override=route_override,
             metadata=(scope_metadata := _cache_scope_metadata(ctx)),
             cache_policy=self._prompt_cache_policy(
-                model_key, cache_busted=cache_busted, scope_metadata=scope_metadata
+                model_key,
+                cache_busted=cache_busted,
+                scope_metadata=scope_metadata,
+                thread_id=getattr(thread, "thread_id", None),
             ),
             bound_tools=bound_tools,
             # The single execution seam for the bound tools (see ToolExecutor),
