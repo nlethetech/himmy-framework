@@ -253,6 +253,10 @@ class OllamaEmbedder:
         embedded independently, so the returned vectors are byte-identical and in the SAME
         order as ``texts``; only the wall-clock latency drops. A cap ``<= 0`` (or a single
         text) runs the fully serial path — the prior behaviour.
+
+        On a partial failure the whole batch fails (same as the serial path), and the
+        remaining in-flight/queued round-trips are CANCELLED so a single bad chunk does
+        not keep loading an already-struggling Ollama server with work that is discarded.
         """
         cap = _ollama_embed_concurrency()
         if cap <= 0 or len(texts) <= 1:
@@ -263,7 +267,16 @@ class OllamaEmbedder:
             async with semaphore:
                 return await self._embed_one(text)
 
-        return list(await asyncio.gather(*(_bounded(t) for t in texts)))
+        tasks = [asyncio.ensure_future(_bounded(t)) for t in texts]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Drain the cancellations so no round-trip is left detached.
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def embed_query(self, text: str) -> list[float]:
         """Embed a single query string."""

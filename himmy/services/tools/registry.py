@@ -93,6 +93,7 @@ def register_local_tool(
     retry_hints: dict[str, Any] | None = None,
     sensitive_arg_names: list[str] | None = None,
     read_only: bool | None = None,
+    read_only_authoritative: bool = True,
     metadata: dict[str, Any] | None = None,
 ) -> ToolDefinition:
     """Register a ``LOCAL`` tool backed by a Python callable.
@@ -104,8 +105,12 @@ def register_local_tool(
     look-up doesn't land on a write tool; omit it to infer from the name. Returns
     the created :class:`ToolDefinition`.
 
-    An explicit ``read_only=True`` is AUTHORITATIVE (the author asserts no side
-    effect), so a timed-out call may be re-fired; a name-inferred read-only is not.
+    A hand-written ``read_only=True`` is AUTHORITATIVE (the author asserts no side
+    effect), so a timed-out call may be re-fired, it waives the ``:write`` grant, and
+    it is parallel-safe; a name-inferred read-only is not. A caller that COMPUTES
+    ``read_only`` from an inference (e.g. a declarative connector deriving it from the
+    HTTP method) must pass ``read_only_authoritative=False`` so a side-effecting
+    ``GET /trigger`` still fails CLOSED — matching :func:`register_http_tool`.
     """
     definition = ToolDefinition(
         name=name,
@@ -115,7 +120,7 @@ def register_local_tool(
         output_json_schema=output_json_schema,
         requires_approval=requires_approval,
         read_only=read_only,
-        read_only_authoritative=read_only is True,
+        read_only_authoritative=read_only is True and read_only_authoritative,
         sequential=sequential,
         timeout_seconds=timeout_seconds,
         retry_hints=retry_hints or {},

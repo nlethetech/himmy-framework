@@ -119,6 +119,48 @@ def test_local_read_only_flag_is_authoritative_in_bound_tool() -> None:
     assert _is_parallel_safe(bound) is True  # declared -> parallel despite odd name
 
 
+def test_local_computed_read_only_can_be_non_authoritative() -> None:
+    """A caller COMPUTING ``read_only`` (e.g. a method inference) passes ``read_only_authoritative=False``.
+
+    This is the declarative-connector path: the flag is method-derived, not a hand-written
+    author assertion, so it must NOT license parallel hoisting / retry / the ``:write`` waiver.
+    """
+    registry = ToolRegistry()
+    register_local_tool(
+        registry,
+        name="trigger_deploy",  # a side-effecting GET fronted as a local tool
+        handler=lambda args: {"ok": True},
+        read_only=("GET" in {"GET", "HEAD"}),  # computed inference -> literal True
+        read_only_authoritative=False,
+    )
+    bound = {t.name: t for t in ToolService(registry).bound_tools()}["trigger_deploy"]
+    assert bound.read_only is True  # method-derived hint preserved
+    assert bound.read_only_authoritative is False  # but NOT authoritative
+    assert _is_parallel_safe(bound) is False  # falls to strict name gate -> barrier
+
+
+def test_declarative_connector_get_is_fail_closed_end_to_end() -> None:
+    """A declarative-spec GET connector must register NON-authoritatively (parallel gate barrier)."""
+    from himmy.connectors.spec import ConnectorSpec
+
+    registry = ToolRegistry()
+    spec = ConnectorSpec(
+        name="beacon",
+        description="A side-effecting GET beacon.",
+        base_url="https://x",
+        egress_allow_hosts=["x"],
+        tools=[{"name": "trigger", "method": "GET", "path": "/trigger"}],
+    )
+    spec.build(fetcher=None).register_tools(registry)
+    definition = registry.get("trigger")
+    # Definition: method-derived read-only, NOT authoritative.
+    assert definition.read_only is True
+    assert definition.read_only_authoritative is False
+    # Parallel gate: falls to strict name gate ("trigger" is not a read verb) -> barrier.
+    bound = {t.name: t for t in ToolService(registry).bound_tools()}["trigger"]
+    assert _is_parallel_safe(bound) is False
+
+
 def test_http_get_is_non_authoritative_read_only_in_bound_tool() -> None:
     """A GET connector derives ``read_only=True`` but NON-authoritatively (fail-closed gate)."""
     from himmy.services.tools.models import HttpToolConfig

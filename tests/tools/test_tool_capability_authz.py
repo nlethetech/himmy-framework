@@ -300,6 +300,44 @@ def test_method_derived_get_still_needs_write_grant() -> None:
     )
 
 
+def test_declarative_connector_get_still_needs_write_grant() -> None:
+    """A declarative-spec (YAML) GET connector must NOT waive the ``:write`` sub-grant.
+
+    ``register_connector_specs`` fronts every declared tool as a LOCAL tool with a
+    METHOD-DERIVED ``read_only`` (``GET``/``HEAD`` → ``True``). That inference must register
+    ``read_only_authoritative=False`` so a side-effecting ``GET /trigger`` fails CLOSED at the
+    capability gate exactly like ``register_http_tool`` — an invoke-only role cannot fire it.
+    """
+    from himmy.connectors.spec import ConnectorSpec
+
+    reg = ToolRegistry()
+    spec = ConnectorSpec(
+        name="beacon",
+        description="A side-effecting GET beacon.",
+        base_url="https://x",
+        egress_allow_hosts=["x"],
+        tools=[{"name": "trigger", "method": "GET", "path": "/trigger"}],
+    )
+    spec.build(fetcher=None).register_tools(reg)
+    derived = reg.get("trigger")
+    assert derived.read_only is True and derived.read_only_authoritative is False
+
+    invoke_only = AccessPolicy.from_mapping({"half": ["tool:trigger:invoke"]})
+    p = Principal(subject="u", roles=frozenset({"half"}), tenant_ids=frozenset({"ws1"}))
+    gate = ToolCapabilityAuthorizer.from_principal(p, invoke_only)
+    # Method-derived GET → not authoritative → fails CLOSED without :write.
+    assert gate.authorize_definition(derived) is False
+    # The :write sub-grant lets the side-effecting GET through.
+    full = AccessPolicy.from_mapping(
+        {"full": ["tool:trigger:invoke", "tool:trigger:write"]}
+    )
+    pf = Principal(subject="u", roles=frozenset({"full"}), tenant_ids=frozenset({"ws1"}))
+    assert (
+        ToolCapabilityAuthorizer.from_principal(pf, full).authorize_definition(derived)
+        is True
+    )
+
+
 def test_from_actor_rebuilds_enforcing_gate() -> None:
     """A persisted actor descriptor rebuilds the enforcing gate (dispatch-recovery path)."""
     actor = {"subject": "u", "roles": ["reader"], "tool_authz_enforce": True}

@@ -41,6 +41,56 @@ def test_ollama_embedder_rejects_empty() -> None:
         run_async(emb.embed_query("x"))
 
 
+def test_ollama_embed_documents_preserves_order_under_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fan-out returns vectors in the SAME order as the input texts (byte-identical)."""
+    monkeypatch.setattr(local_embedders, "_ollama_embed_concurrency", lambda: 4)
+
+    async def transport(path: str, payload: dict) -> dict:
+        # A per-text vector so an out-of-order result would be detectable.
+        n = float(len(payload["prompt"]))
+        return {"embedding": [n, n + 1.0]}
+
+    emb = OllamaEmbedder(dim=2, transport=transport)
+    texts = ["a", "bb", "ccc", "dddd", "eeeee"]
+    docs = run_async(emb.embed_documents(texts))
+    assert docs == [[float(len(t)), float(len(t)) + 1.0] for t in texts]
+
+
+def test_ollama_embed_documents_cancels_siblings_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-batch failure fails the whole batch AND cancels the in-flight siblings.
+
+    The serial path never dispatched the tail on failure; the concurrent fan-out must not
+    leave sibling ``/api/embeddings`` round-trips running detached against an already-
+    struggling server. We prove it: a sibling coroutine blocks forever unless cancelled, so
+    if cancellation did NOT happen the batch would hang (and the test would time out).
+    """
+    import asyncio
+
+    monkeypatch.setattr(local_embedders, "_ollama_embed_concurrency", lambda: 8)
+    cancelled: list[str] = []
+
+    async def transport(path: str, payload: dict) -> dict:
+        prompt = payload["prompt"]
+        if prompt == "boom":
+            raise HimmyError("Ollama returned an empty embedding")
+        try:
+            await asyncio.Event().wait()  # blocks forever unless cancelled
+        except asyncio.CancelledError:
+            cancelled.append(prompt)
+            raise
+        return {"embedding": [1.0]}
+
+    emb = OllamaEmbedder(dim=1, transport=transport)
+    with pytest.raises(HimmyError):
+        run_async(emb.embed_documents(["a", "boom", "b", "c"]))
+    # The blocking siblings were cancelled (drained), not left detached.
+    assert set(cancelled) == {"a", "b", "c"}
+
+
 def test_factory_selects_backends() -> None:
     """build_embedder maps names to embedder types with the right dim."""
     assert isinstance(build_embedder("deterministic", dim=16), DeterministicEmbedder)
