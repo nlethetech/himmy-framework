@@ -488,6 +488,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_worker.set_defaults(func=commands.cmd_worker)
 
+    p_deploy = sub.add_parser(
+        "deploy",
+        help="one command: stand up a live, signed service from an agent.yaml "
+        "(serve + worker together)",
+    )
+    _add_service_agent_flags(p_deploy)
+    p_deploy.add_argument("--host", default="127.0.0.1")
+    p_deploy.add_argument("--port", type=int, default=8000)
+    p_deploy.add_argument(
+        "--channel",
+        choices=("http", "telegram", "studio"),
+        default="http",
+        help="serve over HTTP (default), as a Telegram bot, or via Himmy Studio",
+    )
+    p_deploy.add_argument(
+        "--share",
+        action="store_true",
+        help="mint an API key + enable auth so the service can bind off-loopback safely",
+    )
+    p_deploy.add_argument(
+        "--docker",
+        action="store_true",
+        help="print a minimal Dockerfile for this agent and exit (deploy nothing)",
+    )
+    p_deploy.set_defaults(func=commands.cmd_deploy)
+
     p_studio = sub.add_parser(
         "studio", help="serve Himmy Studio, the local web GUI (needs studio extra)"
     )

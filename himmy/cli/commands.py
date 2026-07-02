@@ -1906,6 +1906,401 @@ def _scheduler_failover_interval_seconds() -> float:
     return value if value > 0 else 5.0
 
 
+# ---------------------------------------------------------------------- deploy
+
+#: Tool packs that only DO anything once a credential is configured, mapped to the
+#: env/secret key(s) they read. ``himmy deploy`` preflights these BEFORE booting so a
+#: newcomer sees exactly which keys are missing up front, instead of a live delivery
+#: silently no-op'ing (or erroring) mid-task. Keyless packs (web, utils, data-sources,
+#: memory, …) are absent by design — they work offline with nothing configured.
+_PACK_REQUIRED_CREDS: dict[str, tuple[str, ...]] = {
+    "comms": ("HIMMY_SMTP_HOST",),
+    "telegram": ("HIMMY_TELEGRAM_BOT_TOKEN",),
+    "google": ("HIMMY_GOOGLE_TOKEN",),
+}
+
+
+def _preflight_pack_credentials(spec: AgentSpec) -> list[str]:
+    """Return the env keys the spec's credential-requiring packs need but that are unset.
+
+    Reads through the secrets layer (:func:`himmy.config.secrets.get_secret`) so a
+    file/keychain backend counts, not only ``os.environ``. Only packs the spec actually
+    declares are checked; a key that resolves to a non-empty value is satisfied. The result
+    is a de-duplicated, order-stable list of MISSING keys — the caller prints them as a
+    warning and continues (deploy never fails mid-task on a preflight; the operator decides).
+    """
+    from himmy.config.secrets import get_secret
+
+    missing: list[str] = []
+    for pack in spec.tool_packs:
+        for key in _PACK_REQUIRED_CREDS.get(pack, ()):  # keyless packs → no entry
+            if not (get_secret(key) or "").strip() and key not in missing:
+                missing.append(key)
+    return missing
+
+
+def _stamp_spec_provider_in_place(
+    agent_path: str, choice: Any
+) -> tuple[str, str | None] | None:
+    """Persist the best detected provider into ``agent.yaml`` so the service answers for REAL.
+
+    Called ONLY when the resolved spec would run on the offline stub AND its ``provider`` is
+    unset and its ``model`` is ``default`` — i.e. the user has expressed no explicit backend.
+    Rewrites the YAML in place, setting ``provider:`` (and ``model:`` when the detected choice
+    carries one), and returns ``(provider, model)``. This is idempotent and NEVER clobbers
+    explicit config: with a provider already set, or a model other than ``default``, the caller
+    does not reach here, so a deliberate ``provider: stub`` or a pinned model always stands.
+
+    Returns ``None`` when nothing was written (unreadable/absent file) so the caller can fall
+    back to a clearly-labelled stub rather than claim a real backend it did not stamp.
+    """
+    import yaml
+
+    path = Path(agent_path)
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    # Idempotent + never-clobber: only stamp when the user set neither provider nor model.
+    if raw.get("provider") or (raw.get("model") not in (None, "default")):
+        return raw.get("provider") or None, raw.get("model") or None
+    raw["provider"] = choice.key
+    if choice.model:
+        raw["model"] = choice.model
+    try:
+        path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    except OSError:
+        return None
+    return choice.key, choice.model
+
+
+def _deploy_resolve_provider(agent_path: str) -> tuple[str | None, str | None, str | None]:
+    """Ensure the deployed agent answers for real: stamp a backend, or name the install line.
+
+    Loads the spec, and when it would resolve to the offline stub runs the SAME machine probe
+    the init wizard uses (:func:`detect_provider_choices`). If a real backend is detected it is
+    stamped into ``agent.yaml`` (idempotent, never clobbering — see
+    :func:`_stamp_spec_provider_in_place`) so the service returns real answers. If nothing is
+    detected the spec is left on the stub and the ONE exact install line is returned for the
+    caller to print (deploy continues on a clearly-labelled stub rather than refusing to boot).
+
+    Returns ``(provider, model, install_hint)``: ``install_hint`` is non-None only when the
+    service is booting on the stub because no real backend was found.
+    """
+    from himmy.cli.wizard import detect_provider_choices
+
+    spec = from_spec.load_spec_file(agent_path)
+    if spec.provider or spec.model not in (None, "default"):
+        return spec.provider, (None if spec.model == "default" else spec.model), None
+    from himmy.cli.provider import resolves_to_stub
+
+    if not resolves_to_stub(spec.provider, None if spec.model == "default" else spec.model):
+        return spec.provider, None, None
+    best = detect_provider_choices()[0]
+    if best.key == "stub":
+        hint = (
+            "no real backend detected — the service will answer on the offline stub "
+            "(canned output).\n"
+            "  install one for real answers:  ollama pull llama3.2   "
+            "(then re-run himmy deploy)"
+        )
+        return None, None, hint
+    stamped = _stamp_spec_provider_in_place(agent_path, best)
+    if stamped is None:
+        return None, None, None
+    return stamped[0], stamped[1], None
+
+
+async def _serve_and_worker(
+    app: Any, host: str, port: int, *, run_scheduler: bool, run_dispatcher: bool
+) -> None:
+    """Run the FastAPI server AND the worker substrate in ONE supervised process group.
+
+    Both live in a single event loop so a SIGINT/SIGTERM (or the server exiting because the
+    port is in use) tears BOTH down together — no orphaned worker draining a queue after the
+    HTTP surface is gone. The uvicorn ``Server`` is driven programmatically (not
+    ``uvicorn.run``) so we own its lifecycle; the worker substrate is the SAME
+    :func:`_run_worker` body ``himmy worker`` uses, cancelled on shutdown so it drains
+    cleanly. Whichever task finishes first (server stop, or the worker's own signal wait)
+    cancels the other, giving one clean joint shutdown.
+    """
+    import uvicorn
+
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(config)
+    # Let our own task-group own the signal handling / joint shutdown, not uvicorn's
+    # per-process installer (which would race the worker's handler for the same signal).
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+
+    server_task = asyncio.create_task(server.serve(), name="himmy-deploy-server")
+    worker_task = asyncio.create_task(
+        _run_worker(run_scheduler=run_scheduler, run_dispatcher=run_dispatcher),
+        name="himmy-deploy-worker",
+    )
+    try:
+        done, pending = await asyncio.wait(
+            {server_task, worker_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        # Ask the server to exit, then cancel any still-pending task so neither is orphaned.
+        server.should_exit = True
+        for task in (server_task, worker_task):
+            if not task.done():
+                task.cancel()
+        for task in (server_task, worker_task):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+    # Surface a boot failure (e.g. port already in use) as an exception the caller reports.
+    if server_task in done and not server_task.cancelled():
+        exc = server_task.exception()
+        if exc is not None:
+            raise exc
+
+
+def cmd_deploy(args: argparse.Namespace) -> int:
+    """One command from an ``agent.yaml`` to a live, reachable, signed service.
+
+    The delightful front door over the machinery ``himmy serve``/``himmy worker`` already
+    build — it does NOT invent a new runtime. In order it:
+
+    1. resolves + validates the spec (reusing ``himmy validate``'s findings) and preflights
+       the credential-requiring tool packs, printing exactly which env keys are missing
+       BEFORE booting (never failing mid-task);
+    2. ensures the service answers for REAL — when the spec would run on the offline stub it
+       stamps the best detected local backend into ``agent.yaml`` (idempotent, never
+       clobbering explicit config), or prints the one install line and continues on a
+       clearly-labelled stub;
+    3. points the inbound webhook at the file and auto-generates + persists a signing secret
+       via the secrets layer (the raw secret is never printed — only a valid sample
+       signature);
+    4. boots ONE supervised process group — ``create_app`` (serve) bound ``127.0.0.1:8000``
+       by default (fail-closed off-loopback) PLUS the worker (scheduler + durable run-queue
+       dispatcher) on ``.himmy/storage.db`` — with a clean joint shutdown on Ctrl-C/SIGTERM
+       and a clear message when the port is in use;
+    5. prints the boxed live summary with a working signed curl.
+
+    ``--channel telegram``/``studio`` wrap the existing entrypoints (restart-on-failure);
+    ``--host``/``--port`` override the bind; ``--share`` adds real apikey auth BEFORE binding
+    off-loopback; ``--docker`` emits a minimal Dockerfile and exits.
+    """
+    channel = getattr(args, "channel", None) or "http"
+    if getattr(args, "docker", False):
+        return _emit_deploy_dockerfile(args)
+    if channel == "telegram":
+        return _deploy_channel_with_restart(commands_telegram_wrapper, args, "telegram")
+    if channel == "studio":
+        return _deploy_channel_with_restart(cmd_studio, args, "studio")
+
+    agent_path = _service_agent_path(args)
+    if agent_path is None:
+        _eprint(
+            "error: no agent.yaml found here (or above) — run `himmy init` first, or "
+            "pass one: himmy deploy -f path/to/agent.yaml"
+        )
+        return 2
+
+    # 1) validate the spec up front (same findings as `himmy validate`) — a broken spec
+    #    should fail here, not after the port is bound.
+    from himmy.cli.agents import _findings_for
+
+    findings = _findings_for(Path(agent_path).expanduser())
+    if findings:
+        _eprint(f"error: {agent_path} has {len(findings)} problem(s):")
+        for f in findings:
+            _eprint(f"  - {f}")
+        _eprint("fix them (see `himmy validate`) and re-run.")
+        return 1
+
+    # 1b) preflight credential-requiring packs BEFORE booting (warn, never fail mid-task).
+    spec = from_spec.load_spec_file(agent_path)
+    missing = _preflight_pack_credentials(spec)
+    if missing:
+        _eprint("note: some tool packs need credentials that are not set yet:")
+        for key in missing:
+            _eprint(f"  - {key}")
+        _eprint("  those tools will no-op until you set the key(s); the rest deploy fine.\n")
+
+    # 2) make the service answer for REAL (stamp a backend, or name the install line).
+    _provider, _model, install_hint = _deploy_resolve_provider(agent_path)
+    if install_hint:
+        _eprint(f"note: {install_hint}\n")
+
+    # 3) --share: real auth BEFORE we widen the bind off-loopback (fail-closed otherwise).
+    host = getattr(args, "host", None) or "127.0.0.1"
+    port = getattr(args, "port", None) or 8000
+    if getattr(args, "share", False):
+        if not _deploy_configure_share_auth(host):
+            return 2
+
+    # 4) wire the signed webhook (auto-secret via the secrets layer; never printed raw).
+    _stamp_inbound_provider(args)
+    signing_secret = _enable_inbound_webhook(agent_path)
+
+    try:
+        import uvicorn  # noqa: F401
+
+        from himmy.api.app import create_app
+    except Exception as exc:  # pragma: no cover - optional extra missing
+        _eprint(
+            "error: `himmy deploy` needs the 'api' extra: "
+            f"pip install 'himmy[api]'  ({exc})"
+        )
+        return 1
+
+    # Durable run store for the worker half (survives restarts). Loopback-safe default.
+    os.environ.setdefault("HIMMY_DURABLE_STORAGE", "1")
+
+    try:
+        app = create_app(bind_host=host)
+    except RuntimeError as exc:
+        # Fail-closed posture: off-loopback with no auth is refused — point at --share.
+        _eprint(f"error: {exc}")
+        _eprint("  add auth before exposing off-loopback:  himmy deploy --share")
+        return 2
+
+    _eprint(
+        render_service_summary(
+            host=host,
+            port=port,
+            agent_path=agent_path,
+            signing_secret=signing_secret,
+            store_path=_durable_store_path(),
+        )
+    )
+    _eprint("  (serve + worker running together — Ctrl-C stops both)\n")
+
+    try:
+        asyncio.run(
+            _serve_and_worker(
+                app, host, port, run_scheduler=True, run_dispatcher=True
+            )
+        )
+    except KeyboardInterrupt:  # pragma: no cover - interactive Ctrl-C
+        _eprint("\n(stopped)")
+        return 130
+    except OSError as exc:
+        # The most common boot failure: the port is already in use.
+        if getattr(exc, "errno", None) in (48, 98) or "address already in use" in str(
+            exc
+        ).lower():
+            _eprint(
+                f"error: port {port} is already in use — stop the other process or "
+                f"pass --port <n>."
+            )
+            return 1
+        _eprint(f"error: failed to bind {host}:{port}: {exc}")
+        return 1
+    return 0
+
+
+def commands_telegram_wrapper(args: argparse.Namespace) -> int:
+    """Adapter so ``himmy deploy --channel telegram`` reuses ``cmd_telegram`` verbatim."""
+    return cmd_telegram(args)
+
+
+def _deploy_channel_with_restart(
+    fn: Any, args: argparse.Namespace, label: str
+) -> int:
+    """Run a channel entrypoint with restart-on-failure (a long-running daemon should heal).
+
+    ``himmy deploy --channel telegram``/``studio`` is meant to STAY up; a transient crash
+    (network blip, provider hiccup) should not end the deployment. This restarts ``fn`` on a
+    non-zero return or an exception, backing off up to a cap, and stops cleanly on Ctrl-C. A
+    clean exit (``0``) is honoured — the operator stopped it on purpose.
+    """
+    import time
+
+    backoff = 1.0
+    while True:
+        try:
+            code = fn(args)
+        except KeyboardInterrupt:  # pragma: no cover - interactive
+            _eprint(f"\n({label} stopped)")
+            return 130
+        except Exception as exc:  # noqa: BLE001 - a daemon heals rather than dies
+            _eprint(f"⚠ {label} crashed: {exc} — restarting in {backoff:.0f}s")
+        else:
+            if code == 0:
+                return 0
+            _eprint(f"⚠ {label} exited ({code}) — restarting in {backoff:.0f}s")
+        try:
+            time.sleep(backoff)
+        except KeyboardInterrupt:  # pragma: no cover - interactive
+            return 130
+        backoff = min(backoff * 2, 30.0)
+
+
+def _deploy_configure_share_auth(host: str) -> bool:
+    """Mint an apikey and turn auth ON so an off-loopback ``--share`` bind is fail-closed-safe.
+
+    Binding off-loopback with no authenticator is REFUSED by ``create_app`` (the fail-closed
+    posture). ``--share`` therefore mints a real API key into the default keys file and sets
+    ``HIMMY_AUTH_MODE=apikey`` + ``HIMMY_API_KEYS_FILE`` for THIS process, so the widened
+    surface is authenticated by construction — never an open admin endpoint. The minted key is
+    printed ONCE (it is the credential the operator hands to callers); returns ``True`` on
+    success. A loopback bind needs no auth, so this is a no-op there.
+    """
+    from himmy.api.app import _is_loopback_host
+
+    if _is_loopback_host(host):
+        return True  # loopback needs no auth — nothing to configure
+    import secrets as _secrets
+
+    from himmy.cli.apikey_cmd import _fingerprint, _load_keys, _write_json_0600
+
+    keys_file = os.environ.get("HIMMY_API_KEYS_FILE") or ".himmy/api_keys.json"
+    path = Path(keys_file)
+    try:
+        keys = _load_keys(path)
+    except (OSError, ValueError) as exc:
+        _eprint(f"error: could not read keys file {path}: {exc}")
+        return False
+    secret = f"himmy_{_secrets.token_urlsafe(32)}"
+    keys[secret] = {
+        "subject": f"apikey:{_fingerprint(secret)}",
+        "tenant_ids": [],
+        "roles": [],
+        "all_tenants": True,
+        "disabled": False,
+    }
+    _write_json_0600(path, keys)
+    os.environ["HIMMY_API_KEYS_FILE"] = str(path)
+    os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    _eprint(
+        "--share: minted an API key and enabled auth (required before exposing "
+        "off-loopback).\n"
+        "  send it as the Authorization: Bearer header. SECRET (shown once):\n"
+        f"    {secret}\n"
+    )
+    return True
+
+
+def _emit_deploy_dockerfile(args: argparse.Namespace) -> int:
+    """Print a minimal Dockerfile that runs ``himmy deploy`` for this agent, and exit.
+
+    The 3-line container: install himmy[api], copy the agent, run the service. Emitted to
+    stdout so ``himmy deploy --docker > Dockerfile`` just works; the agent path is taken from
+    the same resolution the live deploy uses so the image serves the SAME spec.
+    """
+    agent_path = _service_agent_path(args) or "agent.yaml"
+    name = Path(agent_path).name
+    dockerfile = (
+        "# Minimal container for this himmy agent — build + run:\n"
+        "#   docker build -t my-agent .\n"
+        "#   docker run --rm -p 8000:8000 my-agent\n"
+        "FROM python:3.12-slim\n"
+        "RUN pip install --no-cache-dir 'himmy[api]'\n"
+        f"COPY {name} /app/agent.yaml\n"
+        "WORKDIR /app\n"
+        "EXPOSE 8000\n"
+        'CMD ["himmy", "deploy", "-f", "agent.yaml", "--host", "0.0.0.0"]\n'
+    )
+    print(dockerfile, end="")
+    return 0
+
+
 # ---------------------------------------------------------------------- studio
 
 
