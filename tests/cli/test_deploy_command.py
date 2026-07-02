@@ -53,6 +53,8 @@ _TOUCHED = [
     "HIMMY_TELEGRAM_BOT_TOKEN",
     "HIMMY_AUTH_MODE",
     "HIMMY_API_KEYS_FILE",
+    commands.API_KEYS_JSON_ENV,
+    commands.API_KEY_ENV,
 ]
 
 
@@ -586,3 +588,131 @@ def test_cloud_templates_exist_and_reference_image_and_agent() -> None:
     comment = "\n".join(railway_data["_comment"])
     assert "ghcr.io/nlethetech/himmy" in comment
     assert "agent.yaml" in comment
+
+
+# ----------------------------------------------------- cloud boot-time key seeding (WP #9)
+
+
+def test_cloud_template_env_boots_authenticated_on_0000_after_seeding(env: Path) -> None:
+    """The cloud-template env (apikey mode, NO keys file) crash-loops until the seed secret.
+
+    This is the real happy path the templates promise, proven end to end:
+      1. under the template env alone (HIMMY_AUTH_MODE=apikey + a keys-file path that does not
+         exist yet), building the app on 0.0.0.0 FAILS — the file is genuinely required;
+      2. setting the documented one platform secret (HIMMY_API_KEY) + running the boot seeder
+         materializes the keys file, so create_app(bind_host='0.0.0.0') now BOOTS authenticated.
+    Asserting the YAML parses (the weaker sibling test) never catches the crash-loop; this does.
+    """
+    keys_file = env / ".himmy" / "api_keys.json"
+    os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    os.environ["HIMMY_API_KEYS_FILE"] = str(keys_file)
+
+    # 1) template env with no seed + no file: create_app on 0.0.0.0 fail-closes (file required).
+    assert not keys_file.exists()
+    with pytest.raises(Exception):  # noqa: B017 - FileNotFoundError/HimmyError, both are refusals
+        create_app(bind_host="0.0.0.0")  # noqa: S104
+
+    # 2) the documented one-secret step: set HIMMY_API_KEY, seed on boot, now it boots.
+    apikey = "himmy_seeded_boot_key"
+    os.environ[commands.API_KEY_ENV] = apikey
+    commands._materialize_api_keys_file()
+    assert keys_file.exists()
+    # File is 0600 and holds exactly the seeded record (the raw key is the map key).
+    seeded = json.loads(keys_file.read_text())
+    assert apikey in seeded and seeded[apikey]["all_tenants"] is True
+
+    body = json.dumps(
+        {"source": commands._SERVICE_SAMPLE_SOURCE, "text": "hi"}, separators=(",", ":")
+    ).encode()
+    # Wire the signed webhook so we can prove the seeded key gates a real request.
+    secret = commands._enable_inbound_webhook(str(env / "agent.yaml"))
+    sig = sign_webhook_body(secret=secret, body=body)
+    from himmy.api.auth.apikey import DEFAULT_HEADER as APIKEY_HEADER
+
+    # create_app now BOOTS on 0.0.0.0 (was a refusal before seeding) — proven authenticated.
+    with TestClient(create_app(bind_host="0.0.0.0")) as client:  # noqa: S104
+        # signature alone (no apikey) is refused; signature + seeded key succeeds.
+        denied = client.post(
+            "/v1/connectors/webhook",
+            content=body,
+            headers={DEFAULT_SIGNATURE_HEADER: sig},
+        )
+        assert denied.status_code in (401, 403)
+        ok = client.post(
+            "/v1/connectors/webhook",
+            content=body,
+            headers={DEFAULT_SIGNATURE_HEADER: sig, APIKEY_HEADER: apikey},
+        )
+        assert ok.status_code == 200
+
+
+def test_seed_from_full_json_secret_materializes_verbatim(env: Path) -> None:
+    """HIMMY_API_KEYS_JSON (literal keys-file contents) is written verbatim + boots on 0.0.0.0."""
+    keys_file = env / ".himmy" / "api_keys.json"
+    os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    os.environ["HIMMY_API_KEYS_FILE"] = str(keys_file)
+    record = {"himmy_json_key": {"subject": "ops", "all_tenants": True, "roles": ["admin"]}}
+    os.environ[commands.API_KEYS_JSON_ENV] = json.dumps(record)
+
+    commands._materialize_api_keys_file()
+    assert json.loads(keys_file.read_text()) == record
+    # The multi-tenant apikey posture boots on 0.0.0.0 with the seeded per-tenant record.
+    create_app(bind_host="0.0.0.0")  # noqa: S104 - must not raise
+
+
+def test_seed_is_idempotent_and_does_not_clobber_existing_keys_file(env: Path) -> None:
+    """An existing keys file is never overwritten by the boot seeder (respects `apikey mint`)."""
+    from himmy.cli.apikey_cmd import _write_json_0600
+
+    keys_file = env / ".himmy" / "api_keys.json"
+    existing = {"himmy_preexisting": {"all_tenants": True}}
+    _write_json_0600(keys_file, existing)
+    os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    os.environ["HIMMY_API_KEYS_FILE"] = str(keys_file)
+    os.environ[commands.API_KEY_ENV] = "himmy_would_be_seeded"
+
+    commands._materialize_api_keys_file()
+    # Untouched — the pre-existing file wins over the seed secret.
+    assert json.loads(keys_file.read_text()) == existing
+
+
+def test_seed_noop_when_not_apikey_mode(env: Path) -> None:
+    """The seeder does nothing outside apikey mode (offline default stays byte-unchanged)."""
+    keys_file = env / ".himmy" / "api_keys.json"
+    os.environ.pop("HIMMY_AUTH_MODE", None)  # offline default: no auth mode
+    os.environ["HIMMY_API_KEYS_FILE"] = str(keys_file)
+    os.environ[commands.API_KEY_ENV] = "himmy_should_not_seed"
+
+    commands._materialize_api_keys_file()
+    assert not keys_file.exists()
+
+
+def test_seed_invalid_json_secret_does_not_write_and_warns(
+    env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed HIMMY_API_KEYS_JSON is rejected (no half-written file, clear error)."""
+    keys_file = env / ".himmy" / "api_keys.json"
+    os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    os.environ["HIMMY_API_KEYS_FILE"] = str(keys_file)
+    os.environ[commands.API_KEYS_JSON_ENV] = "{not: valid json"
+
+    commands._materialize_api_keys_file()
+    assert not keys_file.exists()
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+def test_seed_never_prints_raw_key_material(
+    env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The seeder logs that it seeded + from which env — NEVER the raw secret value."""
+    keys_file = env / ".himmy" / "api_keys.json"
+    os.environ["HIMMY_AUTH_MODE"] = "apikey"
+    os.environ["HIMMY_API_KEYS_FILE"] = str(keys_file)
+    raw = "himmy_super_secret_value_do_not_log"
+    os.environ[commands.API_KEY_ENV] = raw
+
+    commands._materialize_api_keys_file()
+    out = capsys.readouterr()
+    combined = out.err + out.out
+    assert commands.API_KEY_ENV in combined  # names the env it seeded from
+    assert raw not in combined  # but never the secret itself

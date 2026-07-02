@@ -13,11 +13,16 @@
 # Security posture (READ before opening the port)
 # ------------------------------------------------
 # The agent webhook stays signature-verified + default-DENY. To reach it from the
-# internet you MUST provide auth first: set HIMMY_AUTH_MODE=apikey and an API key
-# (as a Fly secret, see below) — binding 0.0.0.0 with NO auth is refused by
-# create_app (himmy will not boot an open admin surface). The `[[services]]` block
-# publishes 0.0.0.0:8000, so configure auth BEFORE the first deploy:
-#   fly secrets set HIMMY_AUTH_MODE=apikey HIMMY_API_KEYS_FILE=/app/.himmy/api_keys.json
+# internet you MUST provide auth first: HIMMY_AUTH_MODE=apikey (set in [env] below)
+# plus a real API KEY — binding 0.0.0.0 with NO auth is refused by create_app (himmy
+# will not boot an open admin surface). The `[[services]]` block publishes 0.0.0.0:8000.
+#
+# Seed the key with ONE Fly secret — himmy materializes it into HIMMY_API_KEYS_FILE on
+# boot, so the container comes up authenticated (do this BEFORE the first deploy):
+#   # simplest: one key you generate + hand to callers (as the x-himmy-internal-key header)
+#   fly secrets set HIMMY_API_KEY="$(python -c 'import secrets;print("himmy_"+secrets.token_urlsafe(32))')"
+#   # or full control (tenants/roles/expiry) — the literal JSON keys-file contents:
+#   # fly secrets set HIMMY_API_KEYS_JSON='{"himmy_yourkey":{"all_tenants":true}}'
 #   fly secrets set OPENROUTER_API_KEY=...      # whatever your tool packs need
 # =============================================================================
 

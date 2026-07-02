@@ -593,8 +593,11 @@ bound `127.0.0.1`, signature-verified webhook). For a durable multi-process topo
   [`railway.json`](deploy/cloud/railway.json)) stand up the SAME api + worker topology on a
   hosted platform, running **your** agent (baked/mounted via the thin
   `himmy deploy --docker > Dockerfile`), not empty Studio. Each sets `HIMMY_AUTH_MODE=apikey`
-  so the public endpoint is authenticated before it accepts traffic. Buttons deploy the repo
-  next to your `agent.yaml`:
+  so the public endpoint is authenticated before it accepts traffic — set **one** platform
+  secret, `HIMMY_API_KEY` (a key you generate: `python -c 'import secrets;print("himmy_"+secrets.token_urlsafe(32))'`),
+  and himmy seeds the keys file into `HIMMY_API_KEYS_FILE` on boot so the container comes up
+  authenticated (use `HIMMY_API_KEYS_JSON` instead for per-tenant/role control). Buttons deploy
+  the repo next to your `agent.yaml`:
 
   [![Deploy to Fly.io](https://fly.io/static/images/brand/brandmark.svg)](https://fly.io/launch)
   [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)

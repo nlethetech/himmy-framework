@@ -14,8 +14,12 @@
 # ------------------------------------------------
 # The agent webhook stays signature-verified + default-DENY. The web service binds
 # 0.0.0.0 so Render's edge can reach it, so auth is REQUIRED first: HIMMY_AUTH_MODE
-# is set to apikey below and the API key is a `sync: false` secret you fill in the
-# Render dashboard. Binding 0.0.0.0 with NO auth is refused by create_app.
+# is set to apikey below and a real API KEY is a `sync: false` secret you fill in the
+# Render dashboard. himmy materializes that key into HIMMY_API_KEYS_FILE on boot, so the
+# service comes up authenticated — binding 0.0.0.0 with NO auth is refused by create_app.
+# Fill HIMMY_API_KEY with a value you generate, e.g.:
+#   python -c 'import secrets;print("himmy_"+secrets.token_urlsafe(32))'
+# (or use HIMMY_API_KEYS_JSON with the literal JSON keys-file contents for tenants/roles).
 # =============================================================================
 
 services:
@@ -41,6 +45,10 @@ services:
         value: apikey
       - key: HIMMY_API_KEYS_FILE
         value: /app/.himmy/api_keys.json
+      # The API key that makes the authenticated endpoint boot — set in the dashboard, never
+      # committed. himmy seeds HIMMY_API_KEYS_FILE from this on first boot.
+      - key: HIMMY_API_KEY
+        sync: false
       # Provider key(s) your tool packs need — filled in the dashboard, never committed.
       - key: OPENROUTER_API_KEY
         sync: false

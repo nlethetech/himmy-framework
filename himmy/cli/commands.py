@@ -1660,6 +1660,99 @@ def render_service_summary(
     return "\n".join(lines)
 
 
+# -------------------------------------------------------- boot-time key seeding
+
+#: Platform secret carrying the FULL contents of the keys file as JSON text. Set it in the
+#: hosting platform's secret store (fly secrets / render dashboard / railway variables) and
+#: :func:`_materialize_api_keys_file` writes it to ``HIMMY_API_KEYS_FILE`` on boot.
+API_KEYS_JSON_ENV = "HIMMY_API_KEYS_JSON"
+
+#: Platform secret carrying a SINGLE plaintext key. Simpler than the full JSON: the boot
+#: seeder wraps it in one all-tenants record so ``HIMMY_AUTH_MODE=apikey`` boots on 0.0.0.0.
+API_KEY_ENV = "HIMMY_API_KEY"
+
+
+def _materialize_api_keys_file() -> None:
+    """Seed the apikey keys file from a platform secret when it is missing (boot self-heal).
+
+    The cloud templates set ``HIMMY_AUTH_MODE=apikey`` + ``HIMMY_API_KEYS_FILE`` and bind
+    0.0.0.0, but a hosting platform has no way to ship a pre-written JSON file into the
+    container — so without this the file is absent and ``create_app`` fail-closes with a
+    ``FileNotFoundError`` (the multi-tenant posture demands a tenant-binding keys file, and a
+    shared ``HIMMY_INTERNAL_API_KEY`` alone is refused). This closes that gap: when apikey
+    mode is on and the keys file does not yet exist, it is materialized ONCE from a platform
+    secret, so the documented one-secret deploy actually boots authenticated.
+
+    Two seed sources (checked in order, both sourced through the secrets layer so a secrets
+    manager works too):
+
+    * :data:`API_KEYS_JSON_ENV` — the literal JSON keys-file contents (``{secret: {...}}``);
+      validated as a JSON object and written verbatim (full control over tenants/roles/expiry).
+    * :data:`API_KEY_ENV` — a single plaintext key, wrapped in one all-tenants record.
+
+    Idempotent + non-clobbering: does nothing when the file already exists (respecting a
+    key minted by ``himmy apikey`` or a real mounted secret) or when auth is not apikey mode.
+    NEVER logs the raw key material — only that a file was seeded and from which env name.
+    """
+    if os.environ.get("HIMMY_AUTH_MODE", "").lower() != "apikey":
+        return
+    keys_file = os.environ.get("HIMMY_API_KEYS_FILE")
+    if not keys_file:
+        return
+    path = Path(keys_file).expanduser()
+    if path.exists():
+        return  # already provisioned (mounted secret, prior boot, or `himmy apikey mint`).
+
+    from himmy.cli.apikey_cmd import _fingerprint, _write_json_0600
+    from himmy.config.secrets import get_secret
+
+    raw_json = get_secret(API_KEYS_JSON_ENV)
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            _eprint(
+                f"error: {API_KEYS_JSON_ENV} is not valid JSON ({exc}); cannot seed "
+                f"{path} — the authenticated endpoint will not boot."
+            )
+            return
+        if not isinstance(parsed, dict) or not parsed:
+            _eprint(
+                f"error: {API_KEYS_JSON_ENV} must be a non-empty JSON object "
+                "{secret: {...}}; cannot seed the keys file."
+            )
+            return
+        _write_json_0600(path, parsed)
+        _eprint(f"seeded {path} from {API_KEYS_JSON_ENV} ({len(parsed)} key record(s)).")
+        return
+
+    single = get_secret(API_KEY_ENV)
+    if single and single.strip():
+        secret = single.strip()
+        _write_json_0600(
+            path,
+            {
+                secret: {
+                    "subject": f"apikey:{_fingerprint(secret)}",
+                    "tenant_ids": [],
+                    "roles": [],
+                    "all_tenants": True,
+                    "disabled": False,
+                }
+            },
+        )
+        _eprint(f"seeded {path} from {API_KEY_ENV} (1 key record).")
+        return
+
+    # Nothing to seed from: leave the file absent so create_app fails closed with its clear
+    # error. Point the operator at the one secret that makes the deploy boot.
+    _eprint(
+        f"note: HIMMY_AUTH_MODE=apikey but {path} is missing and neither "
+        f"{API_KEYS_JSON_ENV} nor {API_KEY_ENV} is set — the authenticated endpoint will "
+        "not boot. Set one of those platform secrets, or mint a key with `himmy apikey mint`."
+    )
+
+
 # ----------------------------------------------------------------------- serve
 
 
@@ -1689,6 +1782,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if agent_path is not None:
         _stamp_inbound_provider(args)  # honour --provider on the served agent
         signing_secret = _enable_inbound_webhook(agent_path)
+
+    # Seed the apikey keys file from a platform secret if apikey mode is on but the file is
+    # missing (cloud templates have no way to pre-write it) — so create_app boots authenticated
+    # instead of fail-closing on a FileNotFoundError. No-op offline / when already provisioned.
+    _materialize_api_keys_file()
 
     # Pass the bind host so create_app can fail closed when an unauthenticated
     # build would be exposed off-loopback (see _enforce_auth_posture).
@@ -2283,6 +2381,12 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
     # Durable run store for the worker half (survives restarts). Loopback-safe default.
     os.environ.setdefault("HIMMY_DURABLE_STORAGE", "1")
+
+    # Seed the apikey keys file from a platform secret when apikey mode is on but the file is
+    # absent (the cloud-template path: HIMMY_AUTH_MODE=apikey set, no way to ship the JSON in).
+    # Runs AFTER --share (which mints its own key + file), so it only fires for the env-driven
+    # hosted case; no-op when already provisioned.
+    _materialize_api_keys_file()
 
     try:
         app = create_app(bind_host=host)
