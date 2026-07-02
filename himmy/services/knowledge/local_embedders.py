@@ -30,9 +30,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import threading
 from collections.abc import Awaitable, Callable
+from functools import cache
 from typing import Any
 
+from himmy.config.flags import env_falsy
 from himmy.core.errors import HimmyError
 from himmy.services.knowledge.embedder import (
     DeterministicEmbedder,
@@ -40,6 +43,62 @@ from himmy.services.knowledge.embedder import (
 )
 
 OllamaTransport = Callable[[str, dict[str, Any]], Any]
+
+#: Kill-switch for the shared native-session cache (default ON). Set
+#: ``HIMMY_EMBED_CACHE=off`` (``0``/``false``/``no``) to force each embedder to build
+#: its own private ONNX session — the pre-cache behaviour — e.g. to isolate a suspected
+#: cross-instance state bug. Read per call so tests/operators can flip it at runtime.
+_EMBED_CACHE_ENV = "HIMMY_EMBED_CACHE"
+
+
+def _embed_cache_enabled() -> bool:
+    """Whether the shared native-session cache is active (default ON, env-overridable)."""
+    return not env_falsy(_EMBED_CACHE_ENV)
+
+
+#: Serialises access to :func:`_load_text_embedding`'s cache *construction* and guards
+#: concurrent ``.embed()`` calls that share one native session. fastembed drives
+#: onnxruntime, whose ``InferenceSession.run`` is thread-safe, but fastembed's own
+#: ``embed()`` keeps mutable per-instance batching state, so once a session is *shared*
+#: across embedder wrappers we serialise inference to keep outputs byte-identical and
+#: avoid data races. The lock is process-wide and re-entrant-free (no nested embeds).
+_TEXT_EMBED_LOCK = threading.Lock()
+
+
+@cache
+def _load_text_embedding(model_name: str) -> Any:
+    """Load (and cache process-wide) the heavy fastembed ``TextEmbedding`` session.
+
+    Keyed by ``model_name`` only: the wrapper's ``dim`` is metadata that never changes
+    the native weights, so two :class:`FastEmbedEmbedder`\\ s for the same model share
+    one ONNX session (hundreds of ms + tens–hundreds MB saved per duplicate build)
+    while producing byte-identical vectors. Wrapped by :func:`functools.cache` so the
+    first caller pays the load and every later caller gets the same object. Raises a
+    clear :class:`HimmyError` when the ``[embeddings]`` extra is absent (never caches the
+    failure — ``functools.cache`` does not memoise exceptions).
+    """
+    try:
+        from fastembed import TextEmbedding  # type: ignore
+    except ImportError as exc:  # pragma: no cover - only without the extra
+        raise HimmyError(
+            "FastEmbedEmbedder requires the [embeddings] extra "
+            "(pip install 'himmy[embeddings]')."
+        ) from exc
+    return TextEmbedding(model_name=model_name)
+
+
+def reset_embedder_cache() -> None:
+    """Clear the shared native-session caches (test hook / operator escape hatch).
+
+    Drops every cached :func:`_load_text_embedding` (and, via the reranker module, every
+    cached cross-encoder) so the next build reloads the native model — used by tests to
+    assert cache identity/invalidation without leaking sessions between cases. Safe to
+    call at any time; a subsequent build simply pays the one-time load again.
+    """
+    _load_text_embedding.cache_clear()
+    from himmy.services.knowledge.retrieval import reranker as _reranker
+
+    _reranker.reset_reranker_cache()
 
 
 class OllamaEmbedder:
@@ -122,12 +181,24 @@ class FastEmbedEmbedder:
         self._impl: Any = None
 
     def _model_impl(self) -> Any:
-        """Lazily construct the fastembed model, raising a clear error if absent.
+        """Return the fastembed model, sharing one native session per model name.
 
         The native ``TextEmbedding`` constructor downloads (first time) and
         initialises an ONNX session — heavy, GIL-releasing work — so callers run
-        this inside ``asyncio.to_thread`` to avoid blocking the event loop.
+        this inside ``asyncio.to_thread`` to avoid blocking the event loop. When the
+        shared cache is enabled (the default; see :data:`_EMBED_CACHE_ENV`), the session
+        is fetched from the process-wide :func:`_load_text_embedding` cache so every
+        :class:`FastEmbedEmbedder` for the same model reuses one ONNX session instead of
+        reloading the native model per build. With the cache off, each instance builds
+        and holds its own private session (the pre-cache behaviour).
+
+        An explicitly pre-set ``self._impl`` (e.g. a test-injected fake session) always
+        wins over the shared cache, so per-instance overrides keep working unchanged.
         """
+        if self._impl is not None:
+            return self._impl
+        if _embed_cache_enabled():
+            return _load_text_embedding(self.model)
         if self._impl is None:
             try:
                 from fastembed import TextEmbedding  # type: ignore
@@ -143,11 +214,15 @@ class FastEmbedEmbedder:
         """Embed documents (fastembed is sync; vectors are numpy arrays).
 
         Model load + inference are GIL-releasing ONNX work, run off the event loop.
+        When the session is shared across instances, inference is serialised under
+        :data:`_TEXT_EMBED_LOCK` so concurrent embeds against one session cannot race on
+        fastembed's mutable batching state — outputs stay byte-identical.
         """
 
         def _embed() -> list[list[float]]:
             impl = self._model_impl()
-            return [list(map(float, vec)) for vec in impl.embed(texts)]
+            with _TEXT_EMBED_LOCK:
+                return [list(map(float, vec)) for vec in impl.embed(texts)]
 
         return await asyncio.to_thread(_embed)
 
@@ -156,7 +231,8 @@ class FastEmbedEmbedder:
 
         def _embed() -> list[float]:
             impl = self._model_impl()
-            return [float(x) for x in next(iter(impl.query_embed([text])))]
+            with _TEXT_EMBED_LOCK:
+                return [float(x) for x in next(iter(impl.query_embed([text])))]
 
         return await asyncio.to_thread(_embed)
 
@@ -366,4 +442,5 @@ __all__ = [
     "fastembed_available",
     "ollama_reachable",
     "resolve_auto_backend",
+    "reset_embedder_cache",
 ]

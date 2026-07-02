@@ -19,12 +19,64 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import threading
+from functools import cache
 from typing import Any, Protocol, runtime_checkable
 
+from himmy.config.flags import env_falsy
 from himmy.core.errors import HimmyError
 
 #: A small, fast ONNX cross-encoder that fastembed can fetch on first use.
 DEFAULT_RERANKER_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+
+#: Kill-switch for the shared cross-encoder cache (default ON). Shares the embedder's
+#: :data:`~himmy.services.knowledge.local_embedders._EMBED_CACHE_ENV` toggle so one
+#: ``HIMMY_EMBED_CACHE=off`` disables *all* shared native sessions coherently.
+_EMBED_CACHE_ENV = "HIMMY_EMBED_CACHE"
+
+
+def _rerank_cache_enabled() -> bool:
+    """Whether the shared cross-encoder cache is active (default ON, env-overridable)."""
+    return not env_falsy(_EMBED_CACHE_ENV)
+
+
+#: Guards concurrent ``rerank()`` calls that share one native cross-encoder session, for
+#: the same reason as the embedder's lock: onnxruntime inference is thread-safe but
+#: fastembed's wrapper carries mutable per-instance state, so we serialise inference over
+#: a shared session to keep scores byte-identical under concurrency.
+_CROSS_ENCODER_LOCK = threading.Lock()
+
+
+@cache
+def _load_cross_encoder(model_name: str) -> Any:
+    """Load (and cache process-wide) the heavy fastembed ``TextCrossEncoder`` session.
+
+    Keyed by ``model_name`` only (a reranker carries no ``dim``), so every
+    :class:`FastEmbedReranker` for the same model reuses one ONNX session instead of
+    reloading the native cross-encoder per build — hundreds of ms + tens–hundreds MB
+    saved per duplicate. Wrapped by :func:`functools.cache`; raises a clear
+    :class:`HimmyError` when the ``[embeddings]`` extra is absent (``functools.cache``
+    does not memoise the raised exception, so a later install can succeed).
+    """
+    try:
+        from fastembed.rerank.cross_encoder import (  # type: ignore
+            TextCrossEncoder,
+        )
+    except ImportError as exc:  # pragma: no cover - only without the extra
+        raise HimmyError(
+            "FastEmbedReranker requires the [embeddings] extra "
+            "(pip install 'himmy[embeddings]')."
+        ) from exc
+    return TextCrossEncoder(model_name=model_name)
+
+
+def reset_reranker_cache() -> None:
+    """Clear the shared cross-encoder cache (test hook / operator escape hatch).
+
+    Mirrors :func:`~himmy.services.knowledge.local_embedders.reset_embedder_cache` for
+    the rerank session so tests can assert cache identity/invalidation in isolation.
+    """
+    _load_cross_encoder.cache_clear()
 
 
 @runtime_checkable
@@ -67,7 +119,20 @@ class FastEmbedReranker:
         self._impl: Any = None
 
     def _model_impl(self) -> Any:
-        """Lazily construct the fastembed cross-encoder, raising if absent."""
+        """Return the cross-encoder, sharing one native session per model name.
+
+        When the shared cache is enabled (the default; see :data:`_EMBED_CACHE_ENV`),
+        the session comes from the process-wide :func:`_load_cross_encoder` cache so
+        every :class:`FastEmbedReranker` for the same model reuses one ONNX session; with
+        the cache off, each instance lazily builds and holds its own private session.
+
+        An explicitly pre-set ``self._impl`` (e.g. a test-injected fake) always wins over
+        the shared cache, so per-instance overrides keep working unchanged.
+        """
+        if self._impl is not None:
+            return self._impl
+        if _rerank_cache_enabled():
+            return _load_cross_encoder(self.model)
         if self._impl is None:
             try:
                 from fastembed.rerank.cross_encoder import (  # type: ignore
@@ -92,10 +157,13 @@ class FastEmbedReranker:
         def _score() -> list[float]:
             # Load the cross-encoder (first use) AND score inside the worker thread:
             # both the native model load and rerank() are GIL-releasing ONNX work, so
-            # keeping them off the event loop preserves host-loop responsiveness.
+            # keeping them off the event loop preserves host-loop responsiveness. When
+            # the session is shared, serialise inference so concurrent rerank() calls
+            # cannot race on fastembed's mutable state — scores stay byte-identical.
             impl = self._model_impl()
             # fastembed's rerank() yields one score per document, in input order.
-            return [float(s) for s in impl.rerank(query, texts)]
+            with _CROSS_ENCODER_LOCK:
+                return [float(s) for s in impl.rerank(query, texts)]
 
         scores = await asyncio.to_thread(_score)
         ranked = [
@@ -129,5 +197,6 @@ __all__ = [
     "FastEmbedReranker",
     "build_reranker",
     "fastembed_rerank_available",
+    "reset_reranker_cache",
     "DEFAULT_RERANKER_MODEL",
 ]
