@@ -124,6 +124,171 @@ def test_reproject_replaces_not_appends(tmp_path: Path) -> None:
     store.close()
 
 
+# ----------------------------------------------------------------- batch persist (P2.1)
+
+
+def _row_tuples(store: ConversationStore, cid: str) -> list[tuple[str, str, int, str]]:
+    """The identity-bearing columns of the flat projection (everything but the random id)."""
+    rows = store._conn.execute(
+        "SELECT role, text, seq, created_at FROM conversation_messages "
+        "WHERE conversation_id = ? ORDER BY seq",
+        (cid,),
+    ).fetchall()
+    return [(r["role"], r["text"], r["seq"], r["created_at"]) for r in rows]
+
+
+def test_batched_reproject_writes_identical_rows_to_rowwise(tmp_path: Path) -> None:
+    """The batched ``executemany`` projection is byte-identical to a row-by-row re-INSERT.
+
+    Persists the same thread through the (batched) store and through a hand-rolled row-by-row
+    INSERT under the SAME ``now`` timestamp, then asserts role/text/seq/created_at match column
+    for column, row for row (only the random per-row ``id`` differs — it always did).
+    """
+    store = ConversationStore(str(tmp_path / "c.db"))
+    thread = _rich_thread()
+    store.save_thread("batched", thread)
+    batched = _row_tuples(store, "batched")
+
+    # Reference: the exact row-by-row loop the batching replaced, same projection + timestamp.
+    now = store._conn.execute(
+        "SELECT created_at FROM conversation_messages WHERE conversation_id = ? LIMIT 1",
+        ("batched",),
+    ).fetchone()["created_at"]
+    for seq, (role, text) in enumerate(flat_from_thread(thread)):
+        store._conn.execute(
+            "INSERT INTO conversation_messages "
+            "(id, conversation_id, role, text, seq, created_at) VALUES (?,?,?,?,?,?)",
+            (f"ref-{seq}", "rowwise", role, text, seq, now),
+        )
+    store._conn.commit()
+    reference = _row_tuples(store, "rowwise")
+
+    assert batched == reference
+    assert len(batched) == 4  # the tool-only assistant turn is dropped, as before
+    store.close()
+
+
+def test_batched_reproject_handles_edited_and_regenerated_thread(tmp_path: Path) -> None:
+    """An edited/regenerated thread re-projects correctly (DELETE-all + batched re-INSERT).
+
+    Covers the shorten (fewer rows), grow (more rows) and empty-out (zero rows) cases — the
+    ``executemany`` path must never leave a stale row from the previous, longer projection.
+    """
+    store = ConversationStore(str(tmp_path / "c.db"))
+
+    t1 = ChatThread(thread_id="e")
+    t1.append_message(Message(role=MessageRole.USER, content="a"))
+    t1.append_message(Message(role=MessageRole.ASSISTANT, content="b"))
+    t1.append_message(Message(role=MessageRole.USER, content="c"))
+    store.save_thread("e", t1)
+    assert [m.text for m in store.flat_messages("e")] == ["a", "b", "c"]
+
+    # Regenerate SHORTER: the tail rows must be gone, not merely overwritten in place.
+    t2 = ChatThread(thread_id="e")
+    t2.append_message(Message(role=MessageRole.USER, content="only"))
+    store.save_thread("e", t2)
+    assert [m.text for m in store.flat_messages("e")] == ["only"]
+
+    # Regenerate LONGER.
+    t3 = ChatThread(thread_id="e")
+    for txt in ("x", "y", "z", "w"):
+        t3.append_message(Message(role=MessageRole.USER, content=txt))
+    store.save_thread("e", t3)
+    assert [m.text for m in store.flat_messages("e")] == ["x", "y", "z", "w"]
+
+    # Regenerate to EMPTY (only tool-only / blank turns): zero projected rows, no leftovers.
+    t4 = ChatThread(thread_id="e")
+    t4.append_message(Message(role=MessageRole.ASSISTANT, content=""))
+    store.save_thread("e", t4)
+    assert store.flat_messages("e") == []
+    assert store._count("e") == 0
+    store.close()
+
+
+def test_batched_persist_is_thread_safe_across_conversations(tmp_path: Path) -> None:
+    """Concurrent batched saves of distinct conversations preserve each projection exactly.
+
+    The store keeps ONE hardened sqlite connection and does not itself lock — exactly as
+    before the batching (the row-by-row path raised the same ``InterfaceError`` under raw
+    concurrent use of a single connection). Callers serialise writes; this drives many threads
+    saving DISTINCT conversation ids through a shared lock (the real contract) and asserts every
+    batched projection is intact and in order, with no cross-conversation row bleed.
+    """
+    import threading
+
+    store = ConversationStore(str(tmp_path / "c.db"))
+    lock = threading.Lock()
+
+    def _save(n: int) -> None:
+        t = ChatThread(thread_id=f"conv{n}")
+        for i in range(5):
+            t.append_message(
+                Message(role=MessageRole.USER, content=f"conv{n}-msg{i}")
+            )
+        with lock:
+            store.save_thread(f"conv{n}", t)
+
+    threads = [threading.Thread(target=_save, args=(n,)) for n in range(16)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    for n in range(16):
+        got = [m.text for m in store.flat_messages(f"conv{n}")]
+        assert got == [f"conv{n}-msg{i}" for i in range(5)]
+    store.close()
+
+
+def test_pg_reproject_batches_inserts_with_executemany() -> None:
+    """The Postgres mirror collapses the N per-row INSERTs into ONE ``executemany``.
+
+    Drives the async reproject against a recording fake conn and asserts (1) the flat-message
+    rows are written via a single ``executemany`` (not N ``execute`` calls) and (2) the batched
+    argument sequence carries the same tenant / conversation / role / text / ``seq`` / timestamp
+    the row-by-row path emitted (only the random per-row id differs).
+    """
+    import asyncio
+
+    from himmy.services.storage.postgres_aux import _AsyncConversationStore
+
+    class _RecordingConn:
+        def __init__(self) -> None:
+            self.execute_calls: list[tuple[str, tuple[object, ...]]] = []
+            self.executemany_calls: list[tuple[str, list[tuple[object, ...]]]] = []
+
+        async def execute(self, sql: str, *args: object) -> str:
+            self.execute_calls.append((sql, args))
+            return "DELETE 1"
+
+        async def executemany(self, sql: str, args_seq: object) -> str:
+            self.executemany_calls.append((sql, list(args_seq)))  # type: ignore[arg-type]
+            return "INSERT 0 3"
+
+    conn = _RecordingConn()
+    store = _AsyncConversationStore.__new__(_AsyncConversationStore)
+    store._tenant = "local"  # type: ignore[attr-defined]
+
+    thread = _rich_thread()
+    asyncio.run(store._reproject(conn, "cX", thread, "2026-01-01T00:00:00+00:00"))
+
+    # One DELETE-all, then exactly one batched INSERT (never one execute per row).
+    assert len(conn.executemany_calls) == 1
+    assert not any("INSERT INTO aux_conversation_messages" in s for s, _ in conn.execute_calls)
+    sql, batch = conn.executemany_calls[0]
+    assert "INSERT INTO aux_conversation_messages" in sql
+    # Identity of the batched rows: (tenant, id, conversation, role, text, seq, created_at).
+    projected = [
+        (row[0], row[2], row[3], row[4], row[5], row[6]) for row in batch
+    ]
+    assert projected == [
+        ("local", "cX", "agent", "be terse", 0, "2026-01-01T00:00:00+00:00"),
+        ("local", "cX", "user", "weather?", 1, "2026-01-01T00:00:00+00:00"),
+        ("local", "cX", "agent", "sunny", 2, "2026-01-01T00:00:00+00:00"),
+        ("local", "cX", "agent", "It is sunny.", 3, "2026-01-01T00:00:00+00:00"),
+    ]
+
+
 def test_save_thread_preserves_created_at_and_project(tmp_path: Path) -> None:
     store = ConversationStore(str(tmp_path / "c.db"))
     proj = store.create_project(name="P")

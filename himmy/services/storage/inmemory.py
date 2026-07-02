@@ -12,6 +12,7 @@ protocols in :mod:`himmy.services.storage.protocols`.
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Any, cast
 
 from himmy.core.events import RunEvent
@@ -62,14 +63,30 @@ class InMemoryThreadStore:
 
 
 class InMemoryEventLog:
-    """Process-local append-only run-event stream (EventSink surface)."""
+    """Process-local append-only run-event stream (EventSink surface).
+
+    The canonical stream is ``_events`` (append order = insertion order = the audit
+    spine, never capped). ``_by_thread`` / ``_by_trace`` are secondary indexes that map
+    each ``thread_id`` / ``trace_id`` to that key's events IN INSERTION ORDER, so a
+    filtered read by thread/trace is O(matches) instead of a linear scan of the whole
+    stream. The indexes hold the SAME event objects — they narrow the candidate set,
+    the remaining predicates and ordering are unchanged, so results are byte-identical.
+    """
 
     def __init__(self) -> None:
         self._events: list[RunEvent] = []
+        self._by_thread: dict[str, list[RunEvent]] = {}
+        self._by_trace: dict[str, list[RunEvent]] = {}
+        self._lock = threading.RLock()
 
     async def append_event(self, event: RunEvent) -> None:
         """Append a run event to the canonical audit stream (EventSink)."""
-        self._events.append(event)
+        with self._lock:
+            self._events.append(event)
+            if event.thread_id is not None:
+                self._by_thread.setdefault(event.thread_id, []).append(event)
+            if event.trace_id is not None:
+                self._by_trace.setdefault(event.trace_id, []).append(event)
 
     async def list_events(
         self,
@@ -89,20 +106,35 @@ class InMemoryEventLog:
         durable backends' indexed columns). ``workspace_id`` scopes the read to one
         tenant's events (``None`` = unscoped). ``limit`` bounds the result and
         ``newest_first`` flips the order — the learning miners take the most recent N.
+
+        When ``thread_id`` (or, failing that, ``trace_id``) is given the matching secondary
+        index supplies the candidate set — O(matches) instead of scanning every event —
+        and the remaining predicates run over it, so the result is byte-identical to a full
+        scan (each per-key list is already in insertion order).
         """
         want_type = normalize_event_type(event_type)
-        matches = [
-            e
-            for e in self._events
-            if (thread_id is None or e.thread_id == thread_id)
-            and (trace_id is None or e.trace_id == trace_id)
-            and (
-                want_type is None
-                or getattr(e.event_type, "value", str(e.event_type)) == want_type
-            )
-            and (tool_name is None or (e.payload or {}).get("tool_name") == tool_name)
-            and (workspace_id is None or e.workspace_id == workspace_id)
-        ]
+        with self._lock:
+            # Pick the narrowest already-insertion-ordered candidate list. A per-key
+            # index hit still re-applies the corresponding predicate below (a no-op that
+            # keeps the filter total identical for the empty-key / miss cases).
+            if thread_id is not None:
+                candidates: list[RunEvent] = self._by_thread.get(thread_id, [])
+            elif trace_id is not None:
+                candidates = self._by_trace.get(trace_id, [])
+            else:
+                candidates = self._events
+            matches = [
+                e
+                for e in candidates
+                if (thread_id is None or e.thread_id == thread_id)
+                and (trace_id is None or e.trace_id == trace_id)
+                and (
+                    want_type is None
+                    or getattr(e.event_type, "value", str(e.event_type)) == want_type
+                )
+                and (tool_name is None or (e.payload or {}).get("tool_name") == tool_name)
+                and (workspace_id is None or e.workspace_id == workspace_id)
+            ]
         if newest_first:
             matches = list(reversed(matches))
         if limit is not None:
@@ -110,14 +142,50 @@ class InMemoryEventLog:
         return matches
 
     def delete_events(self, thread_ids: set[str], trace_ids: set[str]) -> int:
-        """Drop events whose thread_id OR trace_id is named; return count (S4 erasure)."""
-        before = len(self._events)
-        self._events = [
-            e
-            for e in self._events
-            if e.thread_id not in thread_ids and e.trace_id not in trace_ids
-        ]
-        return before - len(self._events)
+        """Drop events whose thread_id OR trace_id is named; return count (S4 erasure).
+
+        A deleted event's ``thread_id`` and ``trace_id`` are both in the named sets (an
+        event is dropped iff EITHER matches), so evicting exactly the named index buckets
+        removes every reference to a dropped event — no surviving event can remain indexed
+        under a purged key.
+        """
+        with self._lock:
+            before = len(self._events)
+            self._events = [
+                e
+                for e in self._events
+                if e.thread_id not in thread_ids and e.trace_id not in trace_ids
+            ]
+            # Rebuild only the affected buckets from the pruned stream: an event dropped
+            # for a named thread may have carried an unnamed trace (and vice-versa), so
+            # that sibling bucket must shed the dropped event too.
+            dropped_threads = {
+                tid for tid in thread_ids if tid in self._by_thread
+            }
+            dropped_traces = {trid for trid in trace_ids if trid in self._by_trace}
+            sibling_threads: set[str] = set()
+            sibling_traces: set[str] = set()
+            for tid in dropped_threads:
+                for e in self._by_thread[tid]:
+                    if e.trace_id is not None and e.trace_id not in trace_ids:
+                        sibling_traces.add(e.trace_id)
+            for trid in dropped_traces:
+                for e in self._by_trace[trid]:
+                    if e.thread_id is not None and e.thread_id not in thread_ids:
+                        sibling_threads.add(e.thread_id)
+            for tid in dropped_threads:
+                self._by_thread.pop(tid, None)
+            for trid in dropped_traces:
+                self._by_trace.pop(trid, None)
+            for tid in sibling_threads:
+                self._by_thread[tid] = [
+                    e for e in self._events if e.thread_id == tid
+                ]
+            for trid in sibling_traces:
+                self._by_trace[trid] = [
+                    e for e in self._events if e.trace_id == trid
+                ]
+            return before - len(self._events)
 
 
 class InMemoryContextStore:

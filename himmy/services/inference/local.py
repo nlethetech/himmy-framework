@@ -202,23 +202,35 @@ def _default_tool_parallelism() -> int:
 def _is_parallel_safe(tool: BoundTool) -> bool:
     """Whether a resolved tool may join a CONCURRENT read-batch (fail-closed).
 
-    An explicit author ``sequential=True`` ALWAYS forces the tool out of any parallel run
-    (a non-reentrant client that must not overlap itself), regardless of read-only intent.
-    Otherwise the author's explicit ``read_only`` flag wins: only ``read_only=True`` is
-    eligible; ``False`` (a writer) is a barrier.
+    Read/write intent is a FIRST-CLASS, STRUCTURAL property of the tool; the gate prefers
+    the DECLARED intent and treats the name only as a strict last-resort fallback. Precedence
+    (mirrors the timeout-retry side-effect gate in :mod:`himmy.runtime.single_agent`):
 
-    When ``read_only`` is unset (``None``) we DO NOT trust the first-token-wins
-    :func:`classify_read_only` hint to gate concurrency — it infers a name like
-    ``fetch_and_delete``/``report_incident`` as read-only despite a write verb, which would
-    let a mutating call be hoisted into a concurrent read-batch ahead of a dependent read.
-    Instead we use the strict :func:`classify_parallel_safe`, which is read-only ONLY when
-    the name has a read verb and NO write verb anywhere. Ambiguous or mixed names stay
-    sequential — parallelism is opt-in for unambiguous readers, never assumed.
+    * ``sequential=True`` ALWAYS forces the tool out of any parallel run (a non-reentrant
+      client that must not overlap itself), regardless of read-only intent.
+    * An AUTHORITATIVE author declaration wins: ``read_only=True`` flagged
+      ``read_only_authoritative`` is eligible; an explicit ``read_only=False`` (a writer,
+      incl. a read-named mutator or a side-effecting GET the author marked write) is a barrier.
+    * A NON-authoritative ``read_only=True`` is a mere INFERENCE — an HTTP ``GET``/``HEAD``
+      derived from the method, which may still fire a server-side side effect
+      (``GET /trigger``, an analytics beacon). It is NOT trusted to waive the barrier; it
+      falls through to the strict name gate below, fail-closed.
+    * When intent is undeclared (``read_only`` is ``None``) or merely method-inferred, we
+      DO NOT trust the first-token-wins :func:`classify_read_only` hint — it infers a name
+      like ``fetch_and_delete``/``report_incident`` as read-only despite a write verb, which
+      would let a mutating call be hoisted into a concurrent read-batch ahead of a dependent
+      read. Instead the strict :func:`classify_parallel_safe` gates it: read-only ONLY when
+      the name has a read verb and NO write verb anywhere. Ambiguous/mixed/unknown names stay
+      sequential — an undeclared tool is a WRITE barrier, never parallelised (P1 fail-closed).
     """
     if tool.sequential:
         return False
-    if tool.read_only is not None:
-        return tool.read_only
+    if tool.read_only is False:
+        return False
+    if tool.read_only is True and tool.read_only_authoritative:
+        return True
+    # Undeclared (None) or a non-authoritative method-derived read-only (a GET that may
+    # have side effects): last-resort name gate, strictly fail-closed.
     return classify_parallel_safe(tool.name)
 
 

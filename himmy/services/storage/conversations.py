@@ -450,19 +450,30 @@ class ConversationStore:
         )
 
     def _reproject(self, conversation_id: str, thread: ChatThread, now: str) -> None:
-        """Rebuild the flat projection for one conversation from its authoritative thread."""
+        """Rebuild the flat projection for one conversation from its authoritative thread.
+
+        Keeps the DELETE-all + full re-INSERT contract (never an append-only delta, so an
+        edited/regenerated thread can never leave a stale row) but batches the re-INSERT into a
+        single :meth:`~sqlite3.Cursor.executemany` round-trip. The projected rows — role, text,
+        ``seq`` order and ``created_at`` — are byte-identical to the row-by-row path; only the
+        random per-row ``id`` is minted fresh (it always was, DELETE-all discards the old ones).
+        """
         self._conn.execute(
             "DELETE FROM conversation_messages WHERE conversation_id = ?",
             (conversation_id,),
         )
-        for seq, (role, text) in enumerate(flat_from_thread(thread)):
-            self._conn.execute(
+        rows = [
+            (new_uuid(), conversation_id, role, text, seq, now)
+            for seq, (role, text) in enumerate(flat_from_thread(thread))
+        ]
+        if rows:
+            self._conn.executemany(
                 """
                 INSERT INTO conversation_messages
                     (id, conversation_id, role, text, seq, created_at)
                 VALUES (?,?,?,?,?,?)
                 """,
-                (new_uuid(), conversation_id, role, text, seq, now),
+                rows,
             )
 
     # -- reads ---------------------------------------------------------------
@@ -530,8 +541,12 @@ class ConversationStore:
         """
         from himmy.api.studio_tenant_scope import scope_clause
 
+        # Select only the 8 metadata columns ``_summary`` reads — never the large
+        # ``thread`` blob a list view never touches (P2.5 storage-micro: summaries returned
+        # are byte-identical, we just stop pulling the payload over the row for every row).
         sql = (
-            "SELECT c.*, COUNT(m.id) AS n "
+            "SELECT c.conversation_id, c.origin, c.title, c.agent_path, c.provider, "
+            "c.project_id, c.created_at, c.updated_at, COUNT(m.id) AS n "
             "FROM conversations c "
             "LEFT JOIN conversation_messages m "
             "  ON m.conversation_id = c.conversation_id "

@@ -153,6 +153,16 @@ class BoundTool(BaseModel):
     #: read-only (True) / mutating (False) / infer-from-name (None); surfaced to the
     #: model so a look-up doesn't pick a write tool.
     read_only: bool | None = None
+    #: Whether ``read_only`` is an AUTHORITATIVE author declaration (a first-class,
+    #: structural assertion of no side effect) rather than a mere INFERENCE (an HTTP
+    #: method or a name guess). The parallel-safety gate trusts an authoritative
+    #: ``read_only=True`` directly, but routes a NON-authoritative ``read_only=True``
+    #: (a method-derived ``GET`` that may still fire a server-side beacon / ``GET
+    #: /trigger``) back through the strict fail-closed name gate — so a side-effecting
+    #: GET or a read-named mutator is never auto-parallelised. Defaults ``True`` so a
+    #: hand-built ``BoundTool(read_only=True)`` is treated as an explicit declaration;
+    #: the tool service passes the definition's authoritativeness through unchanged.
+    read_only_authoritative: bool = True
     #: Author opt-out of concurrency: when True the tool is NEVER batched into a parallel
     #: read-run (forced to run one-at-a-time as an ordering barrier), even if it is
     #: read-only — for a non-reentrant client that must not overlap itself.

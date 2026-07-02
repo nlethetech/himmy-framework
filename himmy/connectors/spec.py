@@ -320,6 +320,12 @@ class SpecToolConnector(OutboundToolConnector):
                 description=tool.description,
                 args_json_schema=tool.args_schema(),
                 read_only=tool.method.upper() in _SAFE_METHODS,
+                # Method-DERIVED intent, NOT a hand-authored assertion: a GET/HEAD
+                # endpoint may still have server-side side effects (``GET /trigger``,
+                # an analytics beacon). Mark it non-authoritative so it never waives the
+                # parallelism barrier, the timeout re-fire, or the ``:write`` grant —
+                # mirroring :func:`register_http_tool`'s method-derived read-only.
+                read_only_authoritative=False,
                 requires_approval=tool.requires_approval,
                 metadata={"connector": self.name},
             )

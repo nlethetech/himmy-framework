@@ -177,6 +177,30 @@ def test_spec_read_tool_is_read_only_and_write_tool_is_approval_gated() -> None:
         configure_secrets(None)
 
 
+def test_spec_get_tool_read_only_is_not_authoritative() -> None:
+    """A declarative GET is method-DERIVED read-only, never an authoritative assertion.
+
+    A ``GET`` connector tool may still fire a server-side side effect (``GET /trigger``,
+    an analytics beacon). Its ``read_only`` is inferred from the HTTP method, so it must
+    register with ``read_only_authoritative=False`` — otherwise it would be hoisted into
+    a concurrent read-batch, re-fired on timeout, and waive the ``:write`` grant (the P1
+    fail-closed regression). Mirrors :func:`register_http_tool`'s method-derived intent.
+    """
+    configure_secrets(_MemSecrets({"GITHUB_TOKEN": "ghp_x"}))
+    try:
+        registry = ToolRegistry()
+        _github_like_spec().build(fetcher=_RecordingFetcher()).register_tools(registry)
+        get_def = registry.get("github_get_issue")
+        assert get_def.read_only is True
+        assert get_def.read_only_authoritative is False
+        # A writer stays a writer (read_only False, non-authoritative either way).
+        post_def = registry.get("github_create_issue")
+        assert post_def.read_only is False
+        assert post_def.read_only_authoritative is False
+    finally:
+        configure_secrets(None)
+
+
 def test_spec_post_sends_auth_header_and_body_via_mock_transport() -> None:
     """Contract test: assert the real request a POST tool would make (mocked transport)."""
     import httpx
