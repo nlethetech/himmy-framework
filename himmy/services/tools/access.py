@@ -129,6 +129,26 @@ _WRITE_VERBS = frozenset(
         "unshare",
         "archive",
         "restore",
+        # Physical/actuation + control-flow + generation verbs that mutate the world or
+        # emit side effects. Without these a composite carrying an unambiguous read verb
+        # (``file_get_move``, ``get_and_actuate``, ``read_and_toggle``) was fail-OPEN:
+        # judged parallel-safe and hoisted into a concurrent read-batch ahead of a
+        # dependent read. They must barrier like any other write verb.
+        "actuate",
+        "toggle",
+        "move",
+        "copy",
+        "open",
+        "close",
+        "call",
+        "invoke",
+        "render",
+        "generate",
+        "build",
+        "forward",
+        "place",
+        "wire",
+        "process",
     }
 )
 
@@ -212,11 +232,28 @@ def classify_parallel_safe(name: str) -> bool:
     # ACTION (``report_incident``, ``check_out``, ``search_replace``) → not parallel-safe.
     if tokens[0] in _AMBIGUOUS_READ_VERBS and not all(t in _READ_VERBS for t in tokens):
         return False
+    # DEFENCE IN DEPTH against a mutating verb the deny-list has not learned yet. A NAME
+    # classifier is not an authorization boundary, so ``read_only=None`` tools must not be
+    # auto-parallelised on a fail-OPEN heuristic. When the name is not entirely read verbs
+    # (i.e. it carries at least one NON-read "tail" token — a noun like ``egg_totals`` or a
+    # verb we may not recognise), require an AUTHORITATIVE reader shape: the FIRST token
+    # must be an unambiguous read verb (``get_valve_state``, ``list_open_orders``) OR the
+    # LAST token — the one that carries the action in composite names — must itself be a
+    # read verb (``egg_totals``, ``ticket_status``). This bars ``valve_get_open``,
+    # ``file_get_move``, ``get_and_actuate`` (unknown mutating tail) while keeping genuine
+    # readers safe. A truly all-read name skips this and falls through to the check below.
+    all_read = all(t in _READ_VERBS for t in tokens)
+    if (
+        not all_read
+        and tokens[0] not in _UNAMBIGUOUS_READ_VERBS
+        and tokens[-1] not in _READ_VERBS
+    ):
+        return False
     # Otherwise: an unambiguous read verb ANYWHERE (noun-first ``egg_totals`` too), or a
     # name that is entirely read verbs, is safe.
     if any(t in _UNAMBIGUOUS_READ_VERBS for t in tokens):
         return True
-    return all(t in _READ_VERBS for t in tokens)
+    return all_read
 
 
 _READ_TAG = " — [read-only: returns data; safe to call for look-ups]"

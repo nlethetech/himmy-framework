@@ -20,8 +20,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib.util
+import os
 import threading
-from functools import cache
+from functools import lru_cache
 from typing import Any, Protocol, runtime_checkable
 
 from himmy.config.flags import env_falsy
@@ -60,16 +61,42 @@ _CROSS_ENCODER_LOCK = threading.Lock()
 _CROSS_ENCODER_BUILD_LOCK = threading.Lock()
 
 
-@cache
+def _reranker_cache_maxsize(default: int = 4) -> int:
+    """LRU bound for the cross-encoder session cache (env → positive int, else ``default``).
+
+    Mirrors the embedder's :func:`~himmy.services.knowledge.local_embedders._session_cache_maxsize`:
+    bounds how many distinct reranker model names stay resident so a process reconfigured
+    across many models evicts the least-recently-used session instead of pinning every one.
+    A misconfigured value falls back to the default. Override with
+    ``HIMMY_RERANK_SESSION_CACHE_MAX`` (read at import).
+    """
+    raw = os.environ.get("HIMMY_RERANK_SESSION_CACHE_MAX", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+#: LRU bound (distinct model names) for the shared cross-encoder session cache; read once
+#: at import so the ``lru_cache`` maxsize is fixed for the process.
+_CROSS_ENCODER_CACHE_MAX = _reranker_cache_maxsize()
+
+
+@lru_cache(maxsize=_CROSS_ENCODER_CACHE_MAX)
 def _load_cross_encoder(model_name: str) -> Any:
     """Load (and cache process-wide) the heavy fastembed ``TextCrossEncoder`` session.
 
     Keyed by ``model_name`` only (a reranker carries no ``dim``), so every
     :class:`FastEmbedReranker` for the same model reuses one ONNX session instead of
     reloading the native cross-encoder per build — hundreds of ms + tens–hundreds MB
-    saved per duplicate. Wrapped by :func:`functools.cache`; raises a clear
-    :class:`HimmyError` when the ``[embeddings]`` extra is absent (``functools.cache``
-    does not memoise the raised exception, so a later install can succeed).
+    saved per duplicate. Wrapped by a BOUNDED :func:`functools.lru_cache` (see
+    :data:`_CROSS_ENCODER_CACHE_MAX`) so a process reconfigured across MANY reranker models
+    evicts the least-recently-used session instead of pinning every model ever seen
+    (unbounded ``functools.cache`` grew RSS without bound). An in-flight rerank holds its own
+    reference to the session, so an LRU eviction of the cache entry cannot free a session
+    still in use. Raises a clear :class:`HimmyError` when the ``[embeddings]`` extra is
+    absent (an errored call is not memoised, so a later install can succeed).
     """
     try:
         from fastembed.rerank.cross_encoder import (  # type: ignore

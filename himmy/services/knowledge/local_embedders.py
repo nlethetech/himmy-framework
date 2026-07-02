@@ -34,7 +34,7 @@ import os
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from functools import cache
+from functools import lru_cache
 from typing import Any
 
 from himmy.config.flags import env_falsy
@@ -56,6 +56,35 @@ _EMBED_CACHE_ENV = "HIMMY_EMBED_CACHE"
 def _embed_cache_enabled() -> bool:
     """Whether the shared native-session cache is active (default ON, env-overridable)."""
     return not env_falsy(_EMBED_CACHE_ENV)
+
+
+#: Sub-batch size for a SHARED-session ``embed_documents``: the inference lock is released
+#: and re-acquired every this-many texts so a large ingest cannot monopolise the one shared
+#: ONNX session for its whole duration, letting a latency-critical concurrent ``embed_query``
+#: (or another tenant's small embed) interleave between sub-batches instead of head-of-line
+#: blocking behind thousands of docs. Output stays byte-identical: fastembed embeds each text
+#: independently, so ``embed([a,b,c])`` == ``embed([a,b]) + embed([c])`` per vector; only the
+#: lock-hold granularity changes. ``0``/negative/non-int ⇒ no sub-batching (hold the lock for
+#: the whole batch, the prior behaviour). A PRIVATE session (kill-switch off / injected impl)
+#: never takes the lock, so it is embedded in ONE pass regardless — the exact pre-cache path.
+_EMBED_SUBBATCH_ENV = "HIMMY_EMBED_SUBBATCH"
+_DEFAULT_EMBED_SUBBATCH = 64
+
+
+def _embed_subbatch_size() -> int:
+    """Texts per lock-hold for a shared-session batch embed (env → int, else default 64).
+
+    A misconfigured value (non-int) falls back to the default; ``0`` or negative disables
+    sub-batching (single lock-hold over the whole batch), so a bad knob never breaks embed.
+    """
+    raw = os.environ.get(_EMBED_SUBBATCH_ENV)
+    if raw is None:
+        return _DEFAULT_EMBED_SUBBATCH
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_EMBED_SUBBATCH
+    return value
 
 
 #: Serialises the one-time CONSTRUCTION of a shared :func:`_load_text_embedding` session
@@ -81,17 +110,48 @@ _TEXT_EMBED_BUILD_LOCK = threading.Lock()
 _TEXT_EMBED_LOCK = threading.Lock()
 
 
-@cache
+def _session_cache_maxsize(env_var: str, default: int = 4) -> int:
+    """LRU bound for a native-session cache (``env_var`` → positive int, else ``default``).
+
+    Bounds how many DISTINCT model names' heavy ONNX sessions stay resident at once, so a
+    long-lived process that is reconfigured across many embedder/reranker models (multi-
+    tenant specs, a rotating ``HIMMY_EMBEDDER_MODEL``) evicts the least-recently-used
+    native session instead of pinning every model ever seen for the process lifetime. The
+    default (4) comfortably covers the common 1–2 concurrent models while capping RSS; a
+    misconfigured value (non-int, ``<= 0``) falls back to the default rather than failing —
+    a bad knob must never take the embedder path down.
+    """
+    raw = os.environ.get(env_var, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+#: LRU bound (distinct model names) for the shared text-embedding session cache. Read ONCE
+#: at import so the ``lru_cache`` maxsize is fixed for the process; override with
+#: ``HIMMY_EMBED_SESSION_CACHE_MAX`` before import (env at process start).
+_TEXT_EMBED_CACHE_MAX = _session_cache_maxsize("HIMMY_EMBED_SESSION_CACHE_MAX")
+
+
+@lru_cache(maxsize=_TEXT_EMBED_CACHE_MAX)
 def _load_text_embedding(model_name: str) -> Any:
     """Load (and cache process-wide) the heavy fastembed ``TextEmbedding`` session.
 
     Keyed by ``model_name`` only: the wrapper's ``dim`` is metadata that never changes
     the native weights, so two :class:`FastEmbedEmbedder`\\ s for the same model share
     one ONNX session (hundreds of ms + tens–hundreds MB saved per duplicate build)
-    while producing byte-identical vectors. Wrapped by :func:`functools.cache` so the
-    first caller pays the load and every later caller gets the same object. Raises a
-    clear :class:`HimmyError` when the ``[embeddings]`` extra is absent (never caches the
-    failure — ``functools.cache`` does not memoise exceptions).
+    while producing byte-identical vectors. Wrapped by a BOUNDED :func:`functools.lru_cache`
+    (see :data:`_TEXT_EMBED_CACHE_MAX`) so the first caller for a model pays the load and
+    every later caller gets the same object, while a process reconfigured across MANY
+    distinct model names evicts the least-recently-used native session instead of pinning
+    every model ever seen (unbounded ``functools.cache`` did the latter — RSS grew without
+    bound). An in-flight embed holds its own reference to the session object, so an LRU
+    eviction of the cache ENTRY cannot free a session another thread is still using — the
+    object simply lives until its last referent drops (the pre-existing single-instance
+    lifetime semantics). Raises a clear :class:`HimmyError` when the ``[embeddings]`` extra
+    is absent (never caches the failure — an errored call is not memoised).
     """
     try:
         from fastembed import TextEmbedding  # type: ignore
@@ -282,8 +342,21 @@ class FastEmbedEmbedder:
 
         def _embed() -> list[list[float]]:
             impl, guard = self._impl_and_guard()
-            with guard:
-                return [list(map(float, vec)) for vec in impl.embed(texts)]
+            # A PRIVATE session (guard is a nullcontext) is unique to this instance and never
+            # contends, so embed the whole batch in ONE pass — the exact pre-cache path. A
+            # SHARED session (guard is _TEXT_EMBED_LOCK) is serialised process-wide, so hold
+            # the lock only per sub-batch and release between: a huge ingest can no longer
+            # head-of-line-block a concurrent latency-critical embed_query on the same session.
+            subbatch = _embed_subbatch_size() if guard is _TEXT_EMBED_LOCK else 0
+            if subbatch <= 0 or len(texts) <= subbatch:
+                with guard:
+                    return [list(map(float, vec)) for vec in impl.embed(texts)]
+            out: list[list[float]] = []
+            for start in range(0, len(texts), subbatch):
+                chunk = texts[start : start + subbatch]
+                with guard:
+                    out.extend(list(map(float, vec)) for vec in impl.embed(chunk))
+            return out
 
         return await asyncio.to_thread(_embed)
 

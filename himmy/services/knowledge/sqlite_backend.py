@@ -36,6 +36,7 @@ import math
 import os
 import sqlite3
 import threading
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -217,6 +218,25 @@ def _drop_vector_cache_state(conn: sqlite3.Connection) -> None:
         _VECTOR_CACHE_STATES.pop(id(conn), None)
 
 
+def _drop_vector_cache_state_by_id(conn_id: int) -> None:
+    """Evict a cache-state entry by ``id(conn)`` — the finalizer path for owned backends.
+
+    A backend that OWNS its connection registers a :func:`weakref.finalize` calling this,
+    so a backend garbage-collected WITHOUT an awaited :meth:`SqliteKnowledgeBackend.close`
+    still evicts its ``(conn, state)`` entry. That entry STRONG-references the connection
+    (to keep ``id(conn)`` stable), which would otherwise pin the fd + decoded matrices for
+    the whole process — the strong ref means the connection can never self-collect, so a
+    dropped-without-close backend used to leak forever. Dropping the entry here releases the
+    last reference to the owned connection, letting the interpreter reclaim it (sqlite3
+    closes on collection). The finalizer captures only the integer id (never ``self`` or the
+    connection), so it cannot itself keep the backend alive. Idempotent: an explicit
+    ``close()`` that already evicted the entry (and cancelled the finalizer) makes this a
+    no-op ``pop``.
+    """
+    with _VECTOR_CACHE_STATES_LOCK:
+        _VECTOR_CACHE_STATES.pop(conn_id, None)
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
     """Cosine similarity between two equal-length vectors (0.0 when degenerate).
 
@@ -315,6 +335,23 @@ class SqliteKnowledgeBackend:
         # no-op on the not-yet-published entry, then the stale snapshot would be published
         # and served indefinitely). For a SHARED connection ``self._lock`` is the shared
         # write lock, so sibling backends' bumps are seen coherently.
+        #
+        # For an OWNED connection register a garbage-collection finalizer that evicts this
+        # connection's ``(conn, state)`` entry from the process-global ``_VECTOR_CACHE_STATES``
+        # if the backend is dropped WITHOUT an awaited :meth:`close`. Because that global
+        # STRONG-references the connection (to keep ``id(conn)`` stable), a dropped-without-
+        # close owned backend would otherwise pin one fd + its decoded matrices for the whole
+        # process — the strong ref means the connection can never self-collect and no
+        # ``__del__`` could ever run. The finalizer captures ONLY ``id(self._conn)`` (never
+        # ``self`` or the connection), so it cannot keep the backend alive; :meth:`close`
+        # detaches it after an explicit eviction. A SHARED connection is left to its owning
+        # storage service's lifecycle (it legitimately outlives this backend), so no
+        # finalizer is registered there.
+        self._cache_finalizer: weakref.finalize | None = None
+        if self._owns_conn:
+            self._cache_finalizer = weakref.finalize(
+                self, _drop_vector_cache_state_by_id, id(self._conn)
+            )
         self._apply_schema()
 
     @property
@@ -335,6 +372,11 @@ class SqliteKnowledgeBackend:
     async def close(self) -> None:
         """Close the connection if this backend owns it (a shared conn is left alone)."""
         if self._owns_conn:
+            # Detach the GC finalizer: an explicit close is the normal path, so we evict the
+            # entry here deterministically and cancel the finalizer to avoid a redundant
+            # (and now dangling-id) pop later.
+            if self._cache_finalizer is not None:
+                self._cache_finalizer.detach()
             # Evict the per-connection cache state BEFORE closing so its ``id`` can't be
             # reused by a later connection while a stale entry lingers.
             _drop_vector_cache_state(self._conn)
@@ -885,6 +927,23 @@ class SqliteKnowledgeBackend:
                 cache.move_to_end(kb_id)
                 while len(cache) > self._vec_cache_max_kbs:
                     cache.popitem(last=False)
+                # Advance the OBSERVED external-write baseline to the version this snapshot
+                # was actually built at. ``_drop_cache_on_external_write`` is the only OTHER
+                # writer of ``data_version``; if an external commit landed BETWEEN that
+                # drop-check (which left the baseline at some older Vn) and this build (which
+                # captured a newer ``data_version``), the baseline would still read Vn while
+                # the cache now holds a snapshot at the newer version. The NEXT search's
+                # drop-check would then see ``current != Vn`` and CLEAR THE WHOLE cache on a
+                # FALSE positive — nothing changed since this snapshot was built. Syncing the
+                # baseline forward (never backward — ``max`` guards a concurrent higher
+                # observation) makes the observed version track the freshest state the cache
+                # actually reflects, so a steady external-write cadence can't repeatedly nuke
+                # every co-resident KB's decoded matrix. Held under ``cache_lock`` alongside
+                # the publish, so it is atomic with the entry it describes.
+                observed = self._vec_state.data_version
+                self._vec_state.data_version = (
+                    data_version if observed is None else max(observed, data_version)
+                )
         return snapshot
 
     def _drop_cache_on_external_write(self) -> None:
