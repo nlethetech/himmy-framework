@@ -2420,6 +2420,11 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
 # thin 3-line FROM/COPY/CMD over it — no framework checkout, no pip install at build time.
 GHCR_IMAGE = "ghcr.io/nlethetech/himmy"
 
+# Port the emitted agent Dockerfile binds. Pinned to the base image's EXPOSE/HEALTHCHECK port
+# (Dockerfile: 8765) so the inherited health probe curls the port the CMD actually serves — a
+# mismatch would leave the container permanently `(unhealthy)`.
+AGENT_IMAGE_PORT = 8765
+
 
 def _agent_image_ref() -> str:
     """The pinned base image an emitted agent Dockerfile builds ``FROM``.
@@ -2442,27 +2447,33 @@ def _agent_dockerfile_text(agent_name: str) -> str:
     the on-disk spec filename (copied to ``/app/agent.yaml`` inside the image so the CMD path is
     stable regardless of what the user named it).
 
-    Security posture is inherited verbatim from ``himmy deploy``: the container binds ``0.0.0.0``
-    so the mapped port is reachable, but himmy fails CLOSED off-loopback with no auth, so the
-    image opts in explicitly (``HIMMY_ALLOW_UNAUTHENTICATED``) under the documented assumption
-    that auth is terminated at a trusted proxy / ingress in front of it. The agent endpoint
-    itself stays signature-verified + default-deny regardless.
+    Port is pinned to :data:`AGENT_IMAGE_PORT` (8765) so the CMD reuses the base image's already
+    -correct ``EXPOSE`` + ``HEALTHCHECK`` verbatim — a mismatched port would probe a closed
+    socket and leave the container permanently ``(unhealthy)``.
+
+    Security posture is FAIL-CLOSED by default: this auto-emitted recipe binds loopback and
+    does NOT bake an unauthenticated-proxy opt-in. Bound to ``127.0.0.1`` the server stays
+    reachable to the in-container healthcheck but is not reachable through a mapped ``-p`` port,
+    so ``himmy deploy``'s off-loopback refusal guides the user to add real auth (a COMMENTED
+    opt-in block below shows exactly how) rather than shipping an open-by-default container. The
+    agent webhook endpoint stays signature-verified + default-deny regardless.
     """
     return (
         "# Container for this himmy agent — layered on the published runtime image so\n"
-        "# `docker build` works from this folder with no framework checkout. Build + run:\n"
+        "# `docker build` works from this folder with no framework checkout. Build:\n"
         "#   docker build -t my-agent .\n"
-        "#   docker run --rm -p 8000:8000 my-agent\n"
         f"FROM {_agent_image_ref()}\n"
         f"COPY {agent_name} /app/agent.yaml\n"
-        "# The container binds 0.0.0.0 so the mapped port is reachable. himmy fails\n"
-        "# CLOSED off-loopback with no auth, so we opt in explicitly: this image assumes\n"
-        "# auth is terminated at a trusted proxy / ingress in front of it. If you expose\n"
-        "# it directly, add real auth instead (set HIMMY_API_KEYS_FILE / HIMMY_AUTH_MODE,\n"
-        "# or run `himmy deploy --share`) and drop this line.\n"
-        "ENV HIMMY_ALLOW_UNAUTHENTICATED=1\n"
-        "# The agent endpoint stays signature-verified + default-deny regardless.\n"
-        'CMD ["himmy", "deploy", "-f", "agent.yaml", "--host", "0.0.0.0"]\n'
+        "# Fail-closed by default: binds 127.0.0.1, so the in-container healthcheck (the base\n"
+        "# image probes http://127.0.0.1:8765/readyz) passes while the port is NOT reachable\n"
+        "# through `-p`. To expose it, add REAL auth first, then bind 0.0.0.0 — either run\n"
+        "# `himmy deploy --share` (mints an api key), or set HIMMY_API_KEYS_FILE /\n"
+        "# HIMMY_AUTH_MODE and uncomment the two lines below (0.0.0.0 needs auth or himmy\n"
+        "# refuses to boot). Only if auth is terminated at a trusted proxy in front of the\n"
+        "# container is the unauthenticated opt-in appropriate:\n"
+        "#   ENV HIMMY_ALLOW_UNAUTHENTICATED=1\n"
+        f'#   CMD ["himmy", "deploy", "-f", "agent.yaml", "--host", "0.0.0.0", "--port", "{AGENT_IMAGE_PORT}"]\n'  # noqa: E501
+        f'CMD ["himmy", "deploy", "-f", "agent.yaml", "--host", "127.0.0.1", "--port", "{AGENT_IMAGE_PORT}"]\n'
     )
 
 

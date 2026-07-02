@@ -16,12 +16,18 @@ and the user's file is layered on. These tests prove, offline and with no docker
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import pytest
 
 from himmy import __version__
 from himmy.cli import commands
+
+
+def _repo_root() -> Path:
+    """Locate the repo root (holds the base ``Dockerfile``) from this test file's path."""
+    return Path(__file__).resolve().parents[2]
 
 
 def _parse_dockerfile(text: str) -> list[tuple[str, str]]:
@@ -67,6 +73,46 @@ def test_init_emits_agent_dockerfile(tmp_path: Path) -> None:
     assert "COPY agent.yaml /app/agent.yaml" in text
     # CMD runs `himmy deploy` on that spec.
     assert 'CMD ["himmy", "deploy", "-f", "agent.yaml"' in text
+
+
+def test_emitted_port_matches_base_healthcheck() -> None:
+    """The active CMD binds the same port the base image's inherited HEALTHCHECK probes.
+
+    The base Dockerfile EXPOSEs + HEALTHCHECKs 8765; a CMD on any other port would curl a
+    closed socket and leave the container permanently `(unhealthy)`. Assert the two agree by
+    reading the port straight out of the repo's base Dockerfile (source of truth), not a
+    hard-coded literal, so a future base-image port bump forces this to be revisited together.
+    """
+    base = (_repo_root() / "Dockerfile").read_text(encoding="utf-8")
+    healthcheck_port = re.search(r"127\.0\.0\.1:(\d+)/readyz", base)
+    expose_port = re.search(r"^EXPOSE\s+(\d+)", base, re.MULTILINE)
+    assert healthcheck_port is not None and expose_port is not None
+    # Base image is internally consistent (EXPOSE == HEALTHCHECK port).
+    assert healthcheck_port.group(1) == expose_port.group(1)
+    # And the emitted agent CMD binds exactly that port.
+    assert str(commands.AGENT_IMAGE_PORT) == healthcheck_port.group(1)
+    text = commands._agent_dockerfile_text("agent.yaml")
+    assert f'"--port", "{commands.AGENT_IMAGE_PORT}"' in text
+
+
+def test_emitted_dockerfile_is_fail_closed_by_default(tmp_path: Path) -> None:
+    """The auto-emitted recipe is fail-closed: no baked unauth opt-in in the ACTIVE CMD.
+
+    `himmy init` now drops this Dockerfile unprompted, so its default must not ship an
+    open-by-default container. The active CMD binds 127.0.0.1 and the unauthenticated-proxy
+    opt-in (`HIMMY_ALLOW_UNAUTHENTICATED` + `--host 0.0.0.0`) appears ONLY as commented lines
+    the user must consciously uncomment.
+    """
+    assert _init_classic(tmp_path) == 0
+    text = (tmp_path / "Dockerfile").read_text(encoding="utf-8")
+    active = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    joined = "\n".join(active)
+    # The live CMD binds loopback, never 0.0.0.0.
+    assert '"--host", "127.0.0.1"' in joined
+    assert "0.0.0.0" not in joined  # noqa: S104 - asserting absence, not binding
+    # No active ENV bakes the unauthenticated opt-in — it lives only in a comment.
+    assert "HIMMY_ALLOW_UNAUTHENTICATED" not in joined
+    assert "# " in text and "HIMMY_ALLOW_UNAUTHENTICATED" in text
 
 
 def test_init_dockerfile_parses(tmp_path: Path) -> None:

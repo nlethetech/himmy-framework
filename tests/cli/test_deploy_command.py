@@ -417,22 +417,26 @@ def test_share_summary_curl_carries_apikey_and_succeeds(env: Path) -> None:
         os.environ.pop("HIMMY_AUTH_MODE", None)
 
 
-def test_docker_cmd_does_not_bind_0000_unauthenticated(
+def test_docker_cmd_is_fail_closed_not_open_by_default(
     env: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The emitted Dockerfile binds 0.0.0.0 but opts into auth explicitly (boots on run 1).
+    """The emitted Dockerfile is fail-closed: the ACTIVE CMD binds loopback, never 0.0.0.0.
 
-    A bare `--host 0.0.0.0` CMD with no auth would make the image REFUSE to boot (fail-closed).
-    The Dockerfile must set HIMMY_ALLOW_UNAUTHENTICATED (documented proxy-terminated auth) so
-    the container starts — never a silent unauthenticated admin surface.
+    `himmy init` now drops this recipe unprompted, so it must not ship an open, unauthenticated
+    admin surface by default. The live CMD binds 127.0.0.1 (reachable to the in-container
+    healthcheck, NOT through `-p`), and the unauthenticated-proxy opt-in
+    (HIMMY_ALLOW_UNAUTHENTICATED + `--host 0.0.0.0`) appears only as COMMENTED guidance.
     """
     args = argparse.Namespace(
         file=str(env / "agent.yaml"), agent=None, docker=True, channel="http"
     )
     assert commands.cmd_deploy(args) == 0
     out = capsys.readouterr().out
-    assert "ENV HIMMY_ALLOW_UNAUTHENTICATED=1" in out
-    # The opt-in is documented as a trusted-proxy assumption, not silent.
+    active = "\n".join(ln for ln in out.splitlines() if ln and not ln.startswith("#"))
+    # Live CMD binds loopback; no active line binds all interfaces or bakes the unauth opt-in.
+    assert '"--host", "127.0.0.1"' in active
+    assert "0.0.0.0" not in active  # noqa: S104 - asserting absence, not binding
+    assert "HIMMY_ALLOW_UNAUTHENTICATED" not in active
+    # The opt-in still exists as documented (commented) trusted-proxy guidance.
     assert "trusted proxy" in out
-    # The agent endpoint stays signature-verified regardless.
-    assert "signature-verified" in out
+    assert "HIMMY_ALLOW_UNAUTHENTICATED" in out
