@@ -11,6 +11,7 @@ the real fastembed session identity when the extra is installed.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 
 import pytest
@@ -176,6 +177,96 @@ def test_concurrent_embeds_are_safe_and_identical(
     assert not errors
     assert len(results) == 16
     assert all(vec == expected for vec in results)
+
+
+# ---- lock is conditional on session sharing (kill-switch restores parallelism) ----
+
+
+def test_shared_session_serialises_but_private_parallelises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inference guard is the shared lock ONLY for the shared cached session.
+
+    A shared session (cache on, no injected impl) must serialise under
+    ``_TEXT_EMBED_LOCK``; a private session — either an injected ``self._impl`` or a
+    ``HIMMY_EMBED_CACHE=off`` build — must run under a no-op ``nullcontext`` so the
+    kill-switch restores pre-cache parallel throughput, not just pre-cache vectors.
+    """
+    _install_fake_loader(monkeypatch)
+
+    # Shared: cache on, lazily loaded -> the real process-wide lock.
+    shared = build_embedder("fastembed", model="m-a")
+    _impl, guard = shared._impl_and_guard()
+    assert guard is local_embedders._TEXT_EMBED_LOCK
+
+    # Injected private impl -> nullcontext (never touches the shared lock).
+    injected = build_embedder("fastembed", model="m-a")
+    injected._impl = object()
+    _impl, guard = injected._impl_and_guard()
+    assert isinstance(guard, contextlib.nullcontext)
+
+    # Cache off -> private per-instance session -> nullcontext.
+    import fastembed
+
+    monkeypatch.setattr(fastembed, "TextEmbedding", _FakeTextEmbedding)
+    monkeypatch.setenv("HIMMY_EMBED_CACHE", "off")
+    off = build_embedder("fastembed", model="m-a")
+    _impl, guard = off._impl_and_guard()
+    assert isinstance(guard, contextlib.nullcontext)
+
+
+def test_cache_off_does_not_touch_shared_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the kill-switch off, concurrent embeds run while the shared lock is held.
+
+    A background thread holds ``_TEXT_EMBED_LOCK`` for the whole embed; a ``cache=off``
+    embedder must still complete (it uses ``nullcontext``), proving it is not serialised
+    behind the global lock. If it were, the acquire would deadlock until timeout.
+    """
+    _install_fake_loader(monkeypatch)
+    import fastembed
+
+    monkeypatch.setattr(fastembed, "TextEmbedding", _FakeTextEmbedding)
+    monkeypatch.setenv("HIMMY_EMBED_CACHE", "off")
+    emb = build_embedder("fastembed", model="m-a")
+
+    done = threading.Event()
+
+    def _hold_lock() -> None:
+        with local_embedders._TEXT_EMBED_LOCK:
+            done.wait(timeout=5.0)
+
+    holder = threading.Thread(target=_hold_lock)
+    holder.start()
+    try:
+        # Would block indefinitely if the private session took the held lock.
+        vec = run_async(emb.embed_query("hello"))
+        assert vec == [float(len("hello")), 9.0]
+    finally:
+        done.set()
+        holder.join()
+
+
+def test_reranker_guard_conditional_on_sharing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror: the reranker guard is the shared lock only for a shared session."""
+    _FakeCrossEncoder.instances = 0
+    reranker_mod._load_cross_encoder.cache_clear()
+    monkeypatch.setattr(
+        reranker_mod,
+        "_load_cross_encoder",
+        _make_cached(lambda name: _FakeCrossEncoder(name)),
+    )
+    shared = build_reranker("fastembed", model="rr")
+    _impl, guard = shared._impl_and_guard()
+    assert guard is reranker_mod._CROSS_ENCODER_LOCK
+
+    injected = build_reranker("fastembed", model="rr")
+    injected._impl = object()
+    _impl, guard = injected._impl_and_guard()
+    assert isinstance(guard, contextlib.nullcontext)
 
 
 # ---- reranker cache mechanism ----

@@ -18,6 +18,7 @@ imports or downloads a model.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import threading
 from functools import cache
@@ -44,6 +45,11 @@ def _rerank_cache_enabled() -> bool:
 #: the same reason as the embedder's lock: onnxruntime inference is thread-safe but
 #: fastembed's wrapper carries mutable per-instance state, so we serialise inference over
 #: a shared session to keep scores byte-identical under concurrency.
+#:
+#: Acquired *only* when the impl is the shared cached session (see
+#: :meth:`FastEmbedReranker._impl_and_guard`): a private per-instance session — an injected
+#: ``self._impl`` or a ``HIMMY_EMBED_CACHE=off`` build — is not shared and runs under
+#: :class:`contextlib.nullcontext`, so the kill-switch restores pre-cache parallelism.
 _CROSS_ENCODER_LOCK = threading.Lock()
 
 
@@ -146,6 +152,22 @@ class FastEmbedReranker:
             self._impl = TextCrossEncoder(model_name=self.model)
         return self._impl
 
+    def _impl_and_guard(self) -> tuple[Any, Any]:
+        """Return the cross-encoder impl and the lock to serialise inference under.
+
+        The impl is *shared* only when this instance holds no private session
+        (``self._impl is None``) **and** the cache is enabled — exactly when
+        :meth:`_model_impl` returns the process-wide :func:`_load_cross_encoder` session,
+        which is then serialised under :data:`_CROSS_ENCODER_LOCK`. A private session (an
+        injected ``self._impl`` or a ``HIMMY_EMBED_CACHE=off`` build) is unique to this
+        instance and parallelises under :class:`contextlib.nullcontext`. The shared flag is
+        captured *before* :meth:`_model_impl` populates ``self._impl``.
+        """
+        shared = self._impl is None and _rerank_cache_enabled()
+        impl = self._model_impl()
+        guard = _CROSS_ENCODER_LOCK if shared else contextlib.nullcontext()
+        return impl, guard
+
     async def rerank(
         self, query: str, candidates: list[tuple[str, str]]
     ) -> list[tuple[str, float]]:
@@ -159,10 +181,11 @@ class FastEmbedReranker:
             # both the native model load and rerank() are GIL-releasing ONNX work, so
             # keeping them off the event loop preserves host-loop responsiveness. When
             # the session is shared, serialise inference so concurrent rerank() calls
-            # cannot race on fastembed's mutable state — scores stay byte-identical.
-            impl = self._model_impl()
+            # cannot race on fastembed's mutable state — scores stay byte-identical; a
+            # private session (kill-switch off, or injected) parallelises freely.
+            impl, guard = self._impl_and_guard()
             # fastembed's rerank() yields one score per document, in input order.
-            with _CROSS_ENCODER_LOCK:
+            with guard:
                 return [float(s) for s in impl.rerank(query, texts)]
 
         scores = await asyncio.to_thread(_score)

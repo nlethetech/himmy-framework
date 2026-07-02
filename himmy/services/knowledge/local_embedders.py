@@ -28,6 +28,7 @@ All embedders satisfy :class:`~himmy.services.knowledge.embedder.EmbedderProtoco
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import os
 import threading
@@ -62,6 +63,12 @@ def _embed_cache_enabled() -> bool:
 #: ``embed()`` keeps mutable per-instance batching state, so once a session is *shared*
 #: across embedder wrappers we serialise inference to keep outputs byte-identical and
 #: avoid data races. The lock is process-wide and re-entrant-free (no nested embeds).
+#:
+#: Acquired *only* when the impl is the shared cached session (see
+#: :meth:`FastEmbedEmbedder._impl_and_guard`): a private per-instance session — either a
+#: test-injected ``self._impl`` or the ``HIMMY_EMBED_CACHE=off`` build — is not shared and
+#: runs under :class:`contextlib.nullcontext`, so flipping the kill-switch restores the
+#: pre-cache parallel throughput, not just the pre-cache vectors.
 _TEXT_EMBED_LOCK = threading.Lock()
 
 
@@ -210,18 +217,37 @@ class FastEmbedEmbedder:
             self._impl = TextEmbedding(model_name=self.model)
         return self._impl
 
+    def _impl_and_guard(self) -> tuple[Any, Any]:
+        """Return the fastembed impl and the lock to serialise inference under.
+
+        The impl is *shared* only when this instance holds no private session
+        (``self._impl is None``) **and** the cache is enabled — that is exactly the
+        combination that makes :meth:`_model_impl` return the process-wide
+        :func:`_load_text_embedding` session. In that case inference is serialised under
+        :data:`_TEXT_EMBED_LOCK`; a private session (test-injected ``self._impl`` or a
+        ``HIMMY_EMBED_CACHE=off`` build) is unique to this instance, so it parallelises
+        under :class:`contextlib.nullcontext` — the pre-cache behaviour. The shared flag is
+        captured *before* :meth:`_model_impl` populates ``self._impl`` so the two never
+        disagree.
+        """
+        shared = self._impl is None and _embed_cache_enabled()
+        impl = self._model_impl()
+        guard = _TEXT_EMBED_LOCK if shared else contextlib.nullcontext()
+        return impl, guard
+
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed documents (fastembed is sync; vectors are numpy arrays).
 
         Model load + inference are GIL-releasing ONNX work, run off the event loop.
         When the session is shared across instances, inference is serialised under
         :data:`_TEXT_EMBED_LOCK` so concurrent embeds against one session cannot race on
-        fastembed's mutable batching state — outputs stay byte-identical.
+        fastembed's mutable batching state — outputs stay byte-identical. A private
+        session (kill-switch off, or an injected impl) parallelises freely.
         """
 
         def _embed() -> list[list[float]]:
-            impl = self._model_impl()
-            with _TEXT_EMBED_LOCK:
+            impl, guard = self._impl_and_guard()
+            with guard:
                 return [list(map(float, vec)) for vec in impl.embed(texts)]
 
         return await asyncio.to_thread(_embed)
@@ -230,8 +256,8 @@ class FastEmbedEmbedder:
         """Embed a single query string (off the event loop; see :meth:`embed_documents`)."""
 
         def _embed() -> list[float]:
-            impl = self._model_impl()
-            with _TEXT_EMBED_LOCK:
+            impl, guard = self._impl_and_guard()
+            with guard:
                 return [float(x) for x in next(iter(impl.query_embed([text])))]
 
         return await asyncio.to_thread(_embed)
