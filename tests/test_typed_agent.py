@@ -231,6 +231,72 @@ def test_tool_receives_typed_deps() -> None:
     assert result.output.summary == "Snowy"
 
 
+def test_typed_tool_read_only_not_asserted_by_default() -> None:
+    """A typed tool is NOT declared authoritative read-only just because it is typed.
+
+    Regression: a mutating ``@agent.tool`` (e.g. a writer) must stay fail-CLOSED at
+    the parallel/retry/authz gate. Left unset, ``read_only`` is name-inferred and
+    NON-authoritative, so it is not hoisted into a concurrent read-batch, not
+    re-fired on timeout, and does not waive its ``:write`` grant.
+    """
+    runtime, _inf, tools = build_runtime()
+    agent: TypedAgent[Deps, Weather] = TypedAgent(runtime, output_type=Weather)
+
+    @agent.tool
+    async def create_order(ctx: RunContext[Deps], sku: str) -> dict[str, Any]:
+        """Create an order (mutates state)."""
+        return {"sku": sku}
+
+    bound = agent._bind_tools(Deps(api_key="k"))
+    try:
+        definition = tools.registry.get("create_order")
+        assert definition is not None
+        assert definition.read_only is None  # name-inferred, not asserted True
+        assert definition.read_only_authoritative is False  # NOT the trust anchor
+    finally:
+        agent._unbind_tools(bound)
+
+
+def test_typed_tool_read_only_declared_true_is_authoritative() -> None:
+    """An explicit ``read_only=True`` typed tool IS authoritative (opt-in trust)."""
+    runtime, _inf, tools = build_runtime()
+    agent: TypedAgent[Deps, Weather] = TypedAgent(runtime, output_type=Weather)
+
+    @agent.tool(read_only=True)
+    async def lookup(ctx: RunContext[Deps], city: str) -> dict[str, Any]:
+        """Look up weather (no side effect)."""
+        return {"city": city}
+
+    bound = agent._bind_tools(Deps(api_key="k"))
+    try:
+        definition = tools.registry.get("lookup")
+        assert definition is not None
+        assert definition.read_only is True
+        assert definition.read_only_authoritative is True
+    finally:
+        agent._unbind_tools(bound)
+
+
+def test_typed_tool_read_only_declared_false_is_writer() -> None:
+    """An explicit ``read_only=False`` typed tool is a declared writer (non-authoritative)."""
+    runtime, _inf, tools = build_runtime()
+    agent: TypedAgent[Deps, Weather] = TypedAgent(runtime, output_type=Weather)
+
+    @agent.tool(read_only=False)
+    async def send_email(ctx: RunContext[Deps], to: str) -> dict[str, Any]:
+        """Send an email (mutates state)."""
+        return {"to": to}
+
+    bound = agent._bind_tools(Deps(api_key="k"))
+    try:
+        definition = tools.registry.get("send_email")
+        assert definition is not None
+        assert definition.read_only is False
+        assert definition.read_only_authoritative is False
+    finally:
+        agent._unbind_tools(bound)
+
+
 def test_tool_is_unbound_after_run() -> None:
     """Tools registered for a run are removed from the shared registry afterwards."""
     runtime, _inf, tools = build_runtime()

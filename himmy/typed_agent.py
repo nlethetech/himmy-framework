@@ -80,6 +80,7 @@ class _RegisteredTool:
     func: ToolFunc
     args_json_schema: dict[str, Any]
     takes_context: bool
+    read_only: bool | None = None
 
 
 @dataclass
@@ -268,6 +269,7 @@ class TypedAgent[DepsT, OutputT: BaseModel]:
         *,
         name: str | None = None,
         description: str | None = None,
+        read_only: bool | None = None,
     ) -> Any:
         """Register a typed tool from a Python function (decorator or call form).
 
@@ -278,6 +280,14 @@ class TypedAgent[DepsT, OutputT: BaseModel]:
         time; the model never sees that parameter. The remaining parameters become
         the tool's typed arguments. Usable as ``@agent.tool`` or
         ``@agent.tool(name=...)``.
+
+        ``read_only`` declares whether the tool only reads (vs mutates). It is left
+        UNSET (``None``) by default so the strict name-inference gate applies — a
+        typed tool is NOT assumed side-effect-free just because it is typed. Pass
+        ``read_only=True`` to authoritatively assert no side effect (which makes a
+        timed-out call re-fireable, parallel-safe, and waives its ``:write`` grant);
+        pass ``read_only=False`` for an explicit writer. A mutating ``@agent.tool``
+        left unset therefore stays fail-CLOSED at the parallel/retry/authz gate.
         """
 
         def _register(fn: ToolFunc) -> ToolFunc:
@@ -290,6 +300,7 @@ class TypedAgent[DepsT, OutputT: BaseModel]:
                 func=fn,
                 args_json_schema=schema,
                 takes_context=takes_context,
+                read_only=read_only,
             )
             return fn
 
@@ -447,7 +458,7 @@ class TypedAgent[DepsT, OutputT: BaseModel]:
                 handler=handler,
                 description=tool.description,
                 args_json_schema=tool.args_json_schema,
-                read_only=True,
+                read_only=tool.read_only,
             )
             bound_names.append(tool.name)
         return bound_names
