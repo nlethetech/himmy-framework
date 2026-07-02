@@ -252,6 +252,54 @@ def test_read_verb_prefixed_writer_requires_write_grant() -> None:
         assert gate.is_authorized(name, True) is True, name
 
 
+def test_method_derived_get_still_needs_write_grant() -> None:
+    """A method-derived read-only HTTP ``GET`` must NOT waive the ``:write`` sub-grant.
+
+    ``register_http_tool`` DERIVES ``read_only=True`` for a bare ``GET`` (no explicit
+    author flag) but leaves ``read_only_authoritative`` ``False`` — the endpoint may still
+    be side-effecting (``GET /trigger``). ``authorize_definition`` must therefore mirror the
+    retry (:meth:`ToolService._is_retry_side_effect_safe`) and parallelism
+    (:func:`himmy.services.inference.local._is_parallel_safe`) gates: only an AUTHORITATIVE
+    ``read_only=True`` waives ``:write``. So an invoke-only role is DENIED the GET connector
+    and needs ``tool:<name>:write`` — while an EXPLICIT (authoritative) ``read_only=True``
+    GET is invoke-only reachable.
+    """
+    from himmy.services.tools import HttpToolConfig, register_http_tool
+
+    reg = ToolRegistry()
+    derived = register_http_tool(
+        reg, name="trigger_get", http_config=HttpToolConfig(base_url="https://x", method="GET")
+    )
+    explicit = register_http_tool(
+        reg,
+        name="lookup_get",
+        http_config=HttpToolConfig(base_url="https://x", method="GET"),
+        read_only=True,
+    )
+    # Sanity: the derived GET IS inferred read-only but NOT authoritative.
+    assert derived.read_only is True and derived.read_only_authoritative is False
+    assert explicit.read_only is True and explicit.read_only_authoritative is True
+
+    invoke_only = AccessPolicy.from_mapping(
+        {"half": ["tool:trigger_get:invoke", "tool:lookup_get:invoke"]}
+    )
+    p = Principal(subject="u", roles=frozenset({"half"}), tenant_ids=frozenset({"ws1"}))
+    gate = ToolCapabilityAuthorizer.from_principal(p, invoke_only)
+    # Method-derived GET → not authoritative → fails CLOSED without the :write grant.
+    assert gate.authorize_definition(derived) is False
+    # Authoritative author read_only=True → waived → invoke-only reaches it.
+    assert gate.authorize_definition(explicit) is True
+    # The :write sub-grant lets the side-effecting GET through.
+    full = AccessPolicy.from_mapping(
+        {"full": ["tool:trigger_get:invoke", "tool:trigger_get:write"]}
+    )
+    pf = Principal(subject="u", roles=frozenset({"full"}), tenant_ids=frozenset({"ws1"}))
+    assert (
+        ToolCapabilityAuthorizer.from_principal(pf, full).authorize_definition(derived)
+        is True
+    )
+
+
 def test_from_actor_rebuilds_enforcing_gate() -> None:
     """A persisted actor descriptor rebuilds the enforcing gate (dispatch-recovery path)."""
     actor = {"subject": "u", "roles": ["reader"], "tool_authz_enforce": True}

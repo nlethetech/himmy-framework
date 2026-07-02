@@ -223,8 +223,23 @@ class ToolCapabilityAuthorizer:
         return True
 
     def authorize_definition(self, definition: ToolDefinition) -> bool:
-        """Authorize a :class:`ToolDefinition`, reading its read/write intent."""
-        return self.is_authorized(definition.name, definition.read_only)
+        """Authorize a :class:`ToolDefinition`, reading its read/write intent.
+
+        Only an AUTHORITATIVE author assertion (``read_only=True`` AND
+        ``read_only_authoritative``) waives the ``tool:<name>:write`` sub-grant —
+        exactly like the retry (:meth:`ToolService._is_retry_side_effect_safe`) and
+        parallelism (:func:`himmy.services.inference.local._is_parallel_safe`) gates.
+        A method-derived read-only (a bare HTTP ``GET`` whose ``read_only`` is inferred
+        ``True`` but whose ``read_only_authoritative`` is ``False``) may still be
+        side-effecting (``GET /trigger``), so it does NOT waive ``:write`` — it is
+        passed as ``None`` and the capability check fails CLOSED.
+        """
+        read_only = (
+            True
+            if (definition.read_only is True and definition.read_only_authoritative)
+            else None
+        )
+        return self.is_authorized(definition.name, read_only)
 
     def _grants(self, name: str, action: str) -> bool:
         """Whether any of the principal's roles grants ``tool:<name>:<action>``.
