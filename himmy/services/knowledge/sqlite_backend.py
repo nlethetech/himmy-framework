@@ -33,8 +33,11 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import sqlite3
 import threading
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -46,6 +49,31 @@ from himmy.services.knowledge.models import (
     KnowledgeDocument,
     RetrievedChunk,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedChunk:
+    """One chunk of a KB's cached dense-search snapshot with JSON already decoded.
+
+    Holds exactly the row fields the dense search paths consume — the decoded ``embedding``
+    float list and ``metadata`` dict (the load-bearing ``json.loads``), plus the scalar
+    columns :meth:`SqliteKnowledgeBackend._row_to_result` needs to hydrate a
+    :class:`RetrievedChunk` without a second SQL round-trip. Immutable so a cached snapshot
+    is safe to read concurrently across threads once published.
+    """
+
+    chunk_id: str
+    document_id: str
+    text: str | None
+    start_pos: int
+    end_pos: int
+    chunk_kind: str
+    image_uri: str | None
+    caption: str | None
+    doc_source_uri: str | None
+    doc_text: str | None
+    embedding: list[float]
+    metadata: dict[str, Any]
 
 #: Idempotent schema for the SQLite knowledge backend, a 1:1 shape-mirror of the
 #: Postgres knowledge tables (see :func:`himmy.services.knowledge.backend.build_knowledge_schema_ddl`)
@@ -107,6 +135,30 @@ _LEXICAL_SCHEMA = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5 ("
     "chunk_id UNINDEXED, kb_id UNINDEXED, text)"
 )
+
+
+#: Default upper bound on the number of DISTINCT ``kb_id`` matrices held in the decoded
+#: vector cache (an LRU by kb_id). Overridable via ``HIMMY_KB_VECTOR_CACHE_MAX_KBS``; set to
+#: ``0`` (or any non-positive value) to DISABLE the cache entirely and always decode from
+#: SQLite (the original, cache-free behaviour). Bounding by kb-count keeps a process that
+#: fans over many knowledge bases from pinning every decoded matrix in memory forever.
+_DEFAULT_VECTOR_CACHE_MAX_KBS = 32
+
+
+def _vector_cache_max_kbs() -> int:
+    """Resolve the vector-cache kb-bound from ``HIMMY_KB_VECTOR_CACHE_MAX_KBS``.
+
+    Returns the default when unset/garbage; a non-positive value disables caching (the
+    backend then decodes every embedding from SQLite on each search, byte-identically to the
+    pre-cache behaviour).
+    """
+    raw = os.environ.get("HIMMY_KB_VECTOR_CACHE_MAX_KBS")
+    if raw is None or raw == "":
+        return _DEFAULT_VECTOR_CACHE_MAX_KBS
+    try:
+        return int(raw)
+    except ValueError:  # pragma: no cover - defensive
+        return _DEFAULT_VECTOR_CACHE_MAX_KBS
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -177,6 +229,19 @@ class SqliteKnowledgeBackend:
         self._conn.row_factory = sqlite3.Row
         self._lexical_enabled = enable_lexical
         self._lexical_ready = False
+        # Decoded-vector cache: per-``kb_id`` snapshot of the KB's chunks with the embedding
+        # (and metadata) JSON already decoded, so a repeat dense search skips re-paying the
+        # high-dim ``json.loads`` that dwarfs the cosine math. An ``OrderedDict`` gives an LRU
+        # bounded by :func:`_vector_cache_max_kbs` distinct kb_ids (so many KBs can't grow
+        # memory without bound). Guarded by its OWN lock (never the write lock) so concurrent
+        # searches don't serialize on cache reads; every mutation point that changes a KB's
+        # chunks (:meth:`persist_documents`, :meth:`delete_document`, :meth:`delete_kb`, and
+        # the KB-wide chunk purge) invalidates that kb_id precisely so a stale matrix is never
+        # served. Keyed strictly by ``kb_id`` (a global PRIMARY KEY, unique across
+        # tenant/workspace even in a shared ``.db``), so KB A never serves KB B's matrix.
+        self._vec_cache: OrderedDict[str, list[_CachedChunk]] = OrderedDict()
+        self._vec_cache_lock = threading.Lock()
+        self._vec_cache_max_kbs = _vector_cache_max_kbs()
         self._apply_schema()
 
     @property
@@ -303,10 +368,13 @@ class SqliteKnowledgeBackend:
                     "DELETE FROM knowledge_bases WHERE kb_id = ?", (kb_id,)
                 )
                 self._conn.commit()
-                return cur.rowcount == 1
+                deleted = cur.rowcount == 1
             except BaseException:
                 self._rollback_quietly()
                 raise
+        # Committed: the KB (and all its chunks) are gone — evict its cached matrix.
+        self._invalidate_vector_cache(kb_id)
+        return deleted
 
     # -------------------------------------------------------------- documents
     async def persist_documents(
@@ -387,6 +455,9 @@ class SqliteKnowledgeBackend:
             except BaseException:
                 self._rollback_quietly()
                 raise
+        # Committed: the KB's chunk set changed — drop its cached matrix so the next search
+        # rebuilds from the new rows (never a stale snapshot).
+        self._invalidate_vector_cache(kb_id)
 
     async def delete_document(self, kb_id: str, document_id: str) -> bool:
         """Delete a document (chunks cascade) within a KB."""
@@ -399,10 +470,13 @@ class SqliteKnowledgeBackend:
             try:
                 deleted = self._delete_document_rows(kb_id, document_id)
                 self._conn.commit()
-                return deleted
             except BaseException:
                 self._rollback_quietly()
                 raise
+        # Committed: invalidate even when nothing matched is harmless (a miss is a no-op);
+        # when a chunk was removed this is what prevents a stale cached matrix.
+        self._invalidate_vector_cache(kb_id)
+        return deleted
 
     def _delete_document_rows(self, kb_id: str, document_id: str) -> bool:
         """Delete a document + its chunks (+ FTS rows). Caller holds the lock + commits."""
@@ -506,37 +580,28 @@ class SqliteKnowledgeBackend:
         similarity_threshold: float | None,
         metadata_filters: dict[str, Any] | None,
     ) -> list[RetrievedChunk]:
-        rows = self._fetchall(
-            "SELECT c.chunk_id, c.document_id, c.text, c.start_pos, c.end_pos, "
-            "c.embedding, c.chunk_kind, c.image_uri, c.caption, c.metadata, "
-            "d.source_uri AS doc_source_uri, d.text AS doc_text "
-            "FROM knowledge_chunks c "
-            "JOIN knowledge_documents d ON d.document_id = c.document_id "
-            "WHERE c.kb_id = ?",
-            (kb_id,),
-        )
+        chunks = self._cached_chunks(kb_id)
 
         def _keep(sim: float) -> bool:
             if similarity_threshold is None:
                 return sim > 0.0
             return sim >= similarity_threshold
 
-        scored: list[tuple[float, sqlite3.Row, dict[str, Any]]] = []
-        for row in rows:
-            meta = self._json(row["metadata"])
+        scored: list[tuple[float, _CachedChunk]] = []
+        for chunk in chunks:
             if metadata_filters and any(
-                meta.get(k) != v for k, v in metadata_filters.items()
+                chunk.metadata.get(k) != v for k, v in metadata_filters.items()
             ):
                 continue
-            sim = _cosine(query_vec, self._json_list(row["embedding"]))
+            sim = _cosine(query_vec, chunk.embedding)
             if not _keep(sim):
                 continue
-            scored.append((sim, row, meta))
-        scored.sort(key=lambda triple: triple[0], reverse=True)
+            scored.append((sim, chunk))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
 
         results: list[RetrievedChunk] = []
-        for sim, row, meta in scored[:top_k]:
-            results.append(self._row_to_result(row, sim, meta))
+        for sim, chunk in scored[:top_k]:
+            results.append(self._cached_to_result(chunk, sim))
         return results
 
     # --------------------------------------------------------------- lexical
@@ -662,22 +727,94 @@ class SqliteKnowledgeBackend:
         top_k: int,
         metadata_filters: dict[str, Any] | None,
     ) -> list[tuple[str, float]]:
-        rows = self._fetchall(
-            "SELECT chunk_id, embedding, metadata FROM knowledge_chunks "
-            "WHERE kb_id = ?",
-            (kb_id,),
-        )
+        chunks = self._cached_chunks(kb_id)
         scored: list[tuple[str, float]] = []
-        for row in rows:
-            if metadata_filters:
-                meta = self._json(row["metadata"])
-                if any(meta.get(k) != v for k, v in metadata_filters.items()):
-                    continue
-            sim = _cosine(query_vec, self._json_list(row["embedding"]))
+        for chunk in chunks:
+            if metadata_filters and any(
+                chunk.metadata.get(k) != v for k, v in metadata_filters.items()
+            ):
+                continue
+            sim = _cosine(query_vec, chunk.embedding)
             if sim > 0.0:
-                scored.append((str(row["chunk_id"]), sim))
+                scored.append((chunk.chunk_id, sim))
         scored.sort(key=lambda pair: (-pair[1], pair[0]))
         return scored[:top_k]
+
+    # ------------------------------------------------------------- vector cache
+    def _cached_chunks(self, kb_id: str) -> list[_CachedChunk]:
+        """Return the KB's decoded-chunk snapshot, building + caching it on a miss.
+
+        The returned list is the CACHED object; it is treated as immutable by all readers
+        (dense search never mutates it, only scores over it), so it is safe to hand the same
+        list to concurrent searches. When caching is disabled (bound <= 0) a fresh snapshot
+        is built and returned WITHOUT caching, preserving the exact pre-cache decode path.
+        """
+        if self._vec_cache_max_kbs <= 0:
+            return self._build_chunk_snapshot(kb_id)
+        with self._vec_cache_lock:
+            cached = self._vec_cache.get(kb_id)
+            if cached is not None:
+                self._vec_cache.move_to_end(kb_id)
+                return cached
+        # Build OUTSIDE the cache lock (the SELECT + JSON decode can be slow and must not
+        # serialize other KBs' cache reads); the write lock still guards the SQL fetch.
+        snapshot = self._build_chunk_snapshot(kb_id)
+        with self._vec_cache_lock:
+            # A concurrent builder may have populated it first — prefer the published entry so
+            # every reader shares one snapshot (both reflect the same committed rows).
+            existing = self._vec_cache.get(kb_id)
+            if existing is not None:
+                self._vec_cache.move_to_end(kb_id)
+                return existing
+            self._vec_cache[kb_id] = snapshot
+            self._vec_cache.move_to_end(kb_id)
+            while len(self._vec_cache) > self._vec_cache_max_kbs:
+                self._vec_cache.popitem(last=False)
+        return snapshot
+
+    def _build_chunk_snapshot(self, kb_id: str) -> list[_CachedChunk]:
+        """Fetch + decode every chunk of a KB into :class:`_CachedChunk` records (uncached).
+
+        This is the one place the ``embedding`` / ``metadata`` JSON is decoded; the cache then
+        amortises it across repeat searches. Ordering is left to the callers' sort, so the row
+        order here does not affect results.
+        """
+        rows = self._fetchall(
+            "SELECT c.chunk_id, c.document_id, c.text, c.start_pos, c.end_pos, "
+            "c.embedding, c.chunk_kind, c.image_uri, c.caption, c.metadata, "
+            "d.source_uri AS doc_source_uri, d.text AS doc_text "
+            "FROM knowledge_chunks c "
+            "JOIN knowledge_documents d ON d.document_id = c.document_id "
+            "WHERE c.kb_id = ?",
+            (kb_id,),
+        )
+        return [
+            _CachedChunk(
+                chunk_id=str(row["chunk_id"]),
+                document_id=row["document_id"],
+                text=row["text"],
+                start_pos=row["start_pos"],
+                end_pos=row["end_pos"],
+                chunk_kind=row["chunk_kind"],
+                image_uri=row["image_uri"],
+                caption=row["caption"],
+                doc_source_uri=row["doc_source_uri"],
+                doc_text=row["doc_text"],
+                embedding=self._json_list(row["embedding"]),
+                metadata=self._json(row["metadata"]),
+            )
+            for row in rows
+        ]
+
+    def _invalidate_vector_cache(self, kb_id: str) -> None:
+        """Drop the cached decoded snapshot for ``kb_id`` (precise, single-KB eviction).
+
+        Called from every mutation that changes a KB's chunk set so the next search rebuilds
+        from committed rows — the cache never serves a stale matrix. Cheap and idempotent
+        (a miss is a no-op); other KBs' snapshots are untouched.
+        """
+        with self._vec_cache_lock:
+            self._vec_cache.pop(kb_id, None)
 
     # ---------------------------------------------------------------- helpers
     def _row_to_result(
@@ -698,6 +835,31 @@ class SqliteKnowledgeBackend:
                 "chunk_id": row["chunk_id"],
                 "start_pos": row["start_pos"],
                 "end_pos": row["end_pos"],
+            },
+        )
+
+    def _cached_to_result(
+        self, chunk: _CachedChunk, similarity: float
+    ) -> RetrievedChunk:
+        """Map a cached decoded chunk to a RetrievedChunk (parity with :meth:`_row_to_result`).
+
+        Produces byte-identical output to the row-based mapping — the cache only pre-decodes
+        the JSON, it does not change what a hit looks like.
+        """
+        return RetrievedChunk(
+            text=chunk.text,
+            similarity=similarity,
+            context_window=self._window(
+                chunk.doc_text, chunk.start_pos, chunk.end_pos, chunk.text
+            ),
+            document_id=chunk.document_id,
+            source_uri=chunk.doc_source_uri,
+            chunk_kind=chunk.chunk_kind,
+            metadata={
+                **chunk.metadata,
+                "chunk_id": chunk.chunk_id,
+                "start_pos": chunk.start_pos,
+                "end_pos": chunk.end_pos,
             },
         )
 
