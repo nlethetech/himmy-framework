@@ -1388,6 +1388,23 @@ def _service_agent_path(args: argparse.Namespace) -> str | None:
     return str(discovered) if discovered is not None else None
 
 
+def _stamp_inbound_provider(args: argparse.Namespace) -> None:
+    """Honour ``--provider`` on a service by stamping the inbound provider override.
+
+    ``himmy serve --provider ollama`` (and the same on ``worker``) makes the SERVED agent
+    use that provider, mirroring the CLI run/chat ``--provider`` override. Written to the
+    process env (the ``EnvSecrets`` link) so :func:`inbound_provider` — read at spec load in
+    :func:`_build_inbound_handler` — applies it. Idempotent and never clobbering: with no
+    ``--provider`` the spec's own provider stands (the override is only set when asked for),
+    and an operator-set ``HIMMY_INBOUND_PROVIDER`` is left untouched.
+    """
+    from himmy.api.connector_inbound import INBOUND_PROVIDER_ENV
+
+    provider = getattr(args, "provider", None)
+    if provider and INBOUND_PROVIDER_ENV not in os.environ:
+        os.environ[INBOUND_PROVIDER_ENV] = provider
+
+
 def _enable_inbound_webhook(agent_path: str) -> str:
     """Point the inbound webhook at ``agent_path`` and ensure it can mount; return its secret.
 
@@ -1542,6 +1559,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     agent_path = _service_agent_path(args)
     signing_secret: str | None = None
     if agent_path is not None:
+        _stamp_inbound_provider(args)  # honour --provider on the served agent
         signing_secret = _enable_inbound_webhook(agent_path)
 
     # Pass the bind host so create_app can fail closed when an unauthenticated
@@ -1609,6 +1627,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         from himmy.api.connector_inbound import INBOUND_AGENT_PATH_ENV
 
         os.environ[INBOUND_AGENT_PATH_ENV] = agent_path
+        _stamp_inbound_provider(args)  # honour --provider on the worker's agent
 
     # Surface the worker's lifecycle log lines on stderr (the CLI default is quiet).
     logging.basicConfig(

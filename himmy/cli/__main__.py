@@ -164,7 +164,8 @@ def _add_service_agent_flags(parser: argparse.ArgumentParser) -> None:
     apply to a daemon — an inbound delivery runs under the connector's least-privilege service
     principal, not an interactive session. ``-f``/``--agent`` name the ``agent.yaml`` (aliases,
     so ``serve -f`` and ``eval --agent`` read alike); with neither, the nearest ``agent.yaml``
-    is discovered. ``--name``/``--provider`` are accepted for parity with the other commands.
+    is discovered. ``--provider`` overrides the served agent's inference provider (like
+    run/chat); ``--name`` is accepted for parity but is informational only.
     """
     parser.add_argument("-f", "--file", help="path to the agent.yaml to expose as a service")
     parser.add_argument(
@@ -174,7 +175,7 @@ def _add_service_agent_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
         choices=PROVIDERS,
-        help="inference provider override for the served agent (default: the spec's)",
+        help="inference provider override applied to the served agent (default: the spec's)",
     )
 
 

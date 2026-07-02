@@ -24,7 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from himmy.api import create_app
-from himmy.api.connector_inbound import INBOUND_AGENT_PATH_ENV
+from himmy.api.connector_inbound import INBOUND_AGENT_PATH_ENV, INBOUND_PROVIDER_ENV
 from himmy.api.route_introspection import collect_route_paths
 from himmy.cli import commands
 from himmy.cli.__main__ import build_parser
@@ -46,6 +46,7 @@ _TOUCHED = [
     "HIMMY_WEBHOOK_ALLOWED_SOURCES",
     _enabled_flag_name("webhook", "inbound"),
     INBOUND_AGENT_PATH_ENV,
+    INBOUND_PROVIDER_ENV,
     "HIMMY_STUDIO_GUARD",
 ]
 
@@ -100,6 +101,41 @@ def test_enable_never_clobbers_an_operator_secret_or_allowlist(env: Path) -> Non
     secret = commands._enable_inbound_webhook(str(env / "agent.yaml"))
     assert secret == "whsec_operator_chosen"  # honoured, not regenerated
     assert os.environ["HIMMY_WEBHOOK_ALLOWED_SOURCES"] == "ci,prod"  # untouched
+
+
+def test_stamp_provider_sets_override_only_when_asked(env: Path) -> None:
+    # No --provider → the spec's own provider stands (nothing stamped).
+    commands._stamp_inbound_provider(argparse.Namespace(provider=None))
+    assert INBOUND_PROVIDER_ENV not in os.environ
+    # --provider ollama → stamped so the served agent uses it.
+    commands._stamp_inbound_provider(argparse.Namespace(provider="ollama"))
+    assert os.environ[INBOUND_PROVIDER_ENV] == "ollama"
+
+
+def test_stamp_provider_never_clobbers_operator_override(env: Path) -> None:
+    os.environ[INBOUND_PROVIDER_ENV] = "claude-cli"
+    commands._stamp_inbound_provider(argparse.Namespace(provider="ollama"))
+    assert os.environ[INBOUND_PROVIDER_ENV] == "claude-cli"  # honoured, not overwritten
+
+
+def test_provider_override_reaches_the_served_spec(env: Path) -> None:
+    """A stamped --provider actually changes the loaded inbound spec's provider."""
+    from himmy.api.connector_inbound import inbound_provider
+    from himmy.runtime.from_spec import load_spec_file
+
+    yaml = str(env / "agent.yaml")  # spec declares provider: stub
+    commands._stamp_inbound_provider(argparse.Namespace(provider="ollama"))
+    # This is exactly what _build_inbound_handler does at spec load.
+    spec = load_spec_file(yaml, provider=inbound_provider())
+    assert spec.provider == "ollama"
+
+
+def test_serve_and_worker_parsers_accept_provider() -> None:
+    parser = build_parser()
+    serve = parser.parse_args(["serve", "-f", "agent.yaml", "--provider", "ollama"])
+    assert serve.provider == "ollama"
+    worker = parser.parse_args(["worker", "--provider", "claude-cli"])
+    assert worker.provider == "claude-cli"
 
 
 def test_serve_wiring_mounts_webhook_signed_ok_unsigned_401(env: Path) -> None:
