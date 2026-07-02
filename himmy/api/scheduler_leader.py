@@ -50,6 +50,38 @@ logger = logging.getLogger("himmy.api.scheduler_leader")
 _SCHEDULER_HOST_LOCK = "himmy-scheduler"
 
 
+def scheduler_running_on_host() -> bool | None:
+    """Best-effort: is a scheduler (``himmy worker`` / ``himmy serve``) live on THIS host?
+
+    A running scheduler holds the :data:`_SCHEDULER_HOST_LOCK` ``flock`` for its whole
+    lifetime (see :func:`_acquire_sqlite`). We probe that lock the same non-blocking way:
+
+    * the lock is HELD (``ProcessLockBusy``) → a scheduler is running here → ``True``;
+    * we acquired it → nothing holds it → no scheduler here → ``False`` (released at once,
+      so this probe never becomes the thing that blocks a real worker from starting);
+    * ``fcntl`` is unavailable (non-POSIX) → the probe can't tell → ``None`` (unknown).
+
+    Same-host + advisory, exactly matching the guard's scope: it detects a co-located worker
+    on a SQLite deployment (the single-user-local case the routines CLI cares about). It does
+    NOT and can't see a scheduler on ANOTHER machine or coordinated via a Postgres lease —
+    callers treat ``None``/``False`` as "no LOCAL scheduler detected", never "definitely none
+    anywhere".
+    """
+    from himmy.core.process_lock import ProcessLockBusy, acquire_process_lock
+
+    try:
+        handle = acquire_process_lock(_SCHEDULER_HOST_LOCK)
+    except ProcessLockBusy:
+        return True
+    except OSError:  # pragma: no cover - lock dir unwritable; treat as unknown
+        return None
+    # We got it → nobody holds it → release immediately (never hold a scheduler out).
+    if handle._fd is None:  # inert handle → non-POSIX host → can't tell
+        return None
+    handle.release()
+    return False
+
+
 @dataclass
 class SchedulerLeadership:
     """The outcome of a leadership bid, plus the handles needed to refresh / release it.
@@ -288,4 +320,8 @@ def _acquire_sqlite(
     )
 
 
-__all__ = ["SchedulerLeadership", "acquire_scheduler_leadership"]
+__all__ = [
+    "SchedulerLeadership",
+    "acquire_scheduler_leadership",
+    "scheduler_running_on_host",
+]

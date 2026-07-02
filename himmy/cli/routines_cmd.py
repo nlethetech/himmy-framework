@@ -39,6 +39,27 @@ def _eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
+def _warn_if_no_worker() -> None:
+    """Print a one-line hint when an enabled routine has nothing that will FIRE it.
+
+    A routine only runs when a scheduler is live for its store (``himmy worker`` or a
+    co-located ``himmy serve``). Without one, an ``add``/``enable`` silently succeeds but the
+    routine never fires — the single most common "why didn't my routine run?" trap. We probe
+    the same-host scheduler ``flock``; only warn when we're confident nothing is running here
+    (``False``). An unknown result (``None`` — Postgres lease / non-POSIX) stays quiet rather
+    than nagging a correctly-deployed setup. Goes to stderr (never pollutes ``--json`` stdout).
+    """
+    from himmy.api.scheduler_leader import scheduler_running_on_host
+
+    if scheduler_running_on_host() is False:
+        _eprint(
+            "hint: no scheduler is running for this store — routines won't fire until you "
+            "start one:\n"
+            "    himmy worker      # scheduler + run-queue, offline\n"
+            "    himmy deploy -f agent.yaml   # serve + worker together"
+        )
+
+
 def _routine_json(routine: svc.Routine) -> dict[str, Any]:
     """A stable machine-readable projection of a routine (drops internal-only churn)."""
     return {
@@ -175,6 +196,8 @@ def _cmd_add(args: argparse.Namespace) -> int:
     )
     stored = svc.get_routines_store().upsert(routine)
     _eprint(f"created routine {stored.id} ({schedule.describe()})")
+    if stored.enabled:
+        _warn_if_no_worker()
     if getattr(args, "json", False):
         print(json.dumps(_routine_json(stored)))
     else:
@@ -208,6 +231,8 @@ def _cmd_toggle(args: argparse.Namespace, *, enabled: bool) -> int:
     routine.enabled = enabled
     store.upsert(routine)
     _eprint(f"routine {routine.id} {'enabled' if enabled else 'disabled'}")
+    if enabled:
+        _warn_if_no_worker()
     return 0
 
 

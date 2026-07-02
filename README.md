@@ -32,9 +32,10 @@ spine. State is reconstructed from the latest versioned snapshot (not by folding
 
 Requires Python **3.12+**.
 
-> 🚀 **New here? [Quickstart — deploy in 5 minutes](docs/QUICKSTART.md).** Plain-English,
+> 🚀 **New here? [Quickstart — run locally in 5 minutes](docs/QUICKSTART.md).** Plain-English,
 > copy-paste steps from install to talking to an agent — including the free, offline,
-> no-API-key path.
+> no-API-key path. Then **[Now deploy it](#deploying)** — one command to a live, signed
+> service.
 
 ---
 

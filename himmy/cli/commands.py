@@ -58,12 +58,33 @@ def _maybe_hint_stub(spec: AgentSpec, args: argparse.Namespace) -> None:
 
     if not resolves_to_stub(provider, model):
         return
+
+    # Probe the machine the same way the init wizard does. When a REAL backend already
+    # exists here, print the single exact flag to append to THIS command — never tell a
+    # user to install a model they already have. Only fall back to install lines when
+    # nothing real is detected.
+    from himmy.cli.wizard import detect_provider_choices
+
+    real = [c for c in detect_provider_choices() if c.key != "stub"]
+    if real:
+        best = real[0]
+        rerun = f"--provider {best.key}"
+        if best.model:
+            rerun += f" --model {best.model}"
+        _eprint(
+            "note: running offline on the stub — canned deterministic output, not a real "
+            "model.\n"
+            f"  {best.label} is available here — re-run with a real backend:\n"
+            f"    add:  {rerun}\n"
+            "  or pin it in agent.yaml. details: himmy doctor\n"
+        )
+        return
     _eprint(
         "note: running offline on the stub — canned deterministic output, not a real "
         "model.\n"
-        "  for real answers, pick a backend:\n"
+        "  no real backend detected here — install one:\n"
         "    • local, free:  ollama pull llama3.2   then add  --provider ollama\n"
-        "    • Claude Max:   --provider claude-cli\n"
+        "    • Claude Max:   --provider claude-cli   (needs the claude CLI on PATH)\n"
         "    • cloud:        set OPENAI_API_KEY or ANTHROPIC_API_KEY\n"
         "  details: himmy doctor\n"
     )
@@ -1346,7 +1367,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         files = dict(tmpl["files"])
         next_msg = (
             f"\nNext ({tmpl['note']}):\n"
-            f'  himmy run -f {target / "agent.yaml"} -p "{tmpl["prompt"]}"'
+            f'  himmy run -f {target / "agent.yaml"} -p "{tmpl["prompt"]}"\n'
+            + _deploy_next_tail(target / "agent.yaml")
         )
     elif args.team:
         files = {"team.yaml": _TEAM_YAML}
@@ -1358,7 +1380,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "himmy.toml": _HIMMY_TOML,
             "skills/my_skill.yaml": _SKILL_YAML,
         }
-        next_msg = f'\nNext: himmy run -f {target / "agent.yaml"} -p "hello"'
+        next_msg = spec_next_steps(target / "agent.yaml")
 
     existing = [name for name in files if (target / name).exists()]
     if existing and not args.force:
@@ -2165,6 +2187,59 @@ def _preflight_pack_credentials(spec: AgentSpec) -> list[str]:
     return missing
 
 
+def spec_next_steps(agent_yaml: Path, *, spec: AgentSpec | None = None) -> str:
+    """A spec-aware ``Next:`` block shown after scaffolding an ``agent.yaml``.
+
+    The generic ``himmy run``/``himmy chat`` lines always come first. Then, when the spec is
+    known, three targeted follow-ups the newcomer would otherwise have to discover:
+
+    * a **creds** line when the spec's tool packs need env keys that aren't set yet (so the
+      agent doesn't silently no-op its web/email/etc. tools — reuses the SAME
+      :func:`_preflight_pack_credentials` deploy uses);
+    * ``himmy routines add`` — schedule it to run unattended;
+    * ``himmy deploy`` — stand it up as a live, signed HTTP service.
+
+    ``spec`` may be passed by a caller that already has it (the wizard/``himmy new`` hold the
+    validated dict); otherwise it is loaded from ``agent_yaml`` best-effort. A load failure
+    just drops the spec-specific lines — the generic Next always renders.
+    """
+    ref = str(agent_yaml)
+    lines = [
+        "\nNext:",
+        f'  himmy run -f {ref} -p "hello"      # one prompt',
+        f"  himmy chat -f {ref}                # interactive",
+        _deploy_next_tail(agent_yaml, spec=spec),
+    ]
+    return "\n".join(lines)
+
+
+def _deploy_next_tail(agent_yaml: Path, *, spec: AgentSpec | None = None) -> str:
+    """The creds + routines + deploy tail of a spec-aware ``Next:`` block (no run/chat lines).
+
+    Shared by :func:`spec_next_steps` and the ``himmy init --template`` path (which keeps its
+    own template-specific run line, then appends this). Loads ``agent_yaml`` best-effort when no
+    ``spec`` is supplied; a load failure just drops the creds line.
+    """
+    ref = str(agent_yaml)
+    if spec is None:
+        with contextlib.suppress(Exception):
+            spec = load_agent_spec(agent_yaml)
+    tail: list[str] = []
+    if spec is not None:
+        with contextlib.suppress(Exception):
+            missing = _preflight_pack_credentials(spec)
+            if missing:
+                tail.append(
+                    f"  set {', '.join(missing)}   # your tool packs need these keys"
+                )
+    tail += [
+        f'  himmy routines add --name daily -f {ref} -p "..." --daily 09:00'
+        "   # run it on a schedule",
+        f"  himmy deploy -f {ref}              # live, signed HTTP service",
+    ]
+    return "\n".join(tail)
+
+
 def _stamp_spec_provider_in_place(
     agent_path: str, choice: Any
 ) -> tuple[str, str | None] | None:
@@ -2720,7 +2795,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     print("\noptional extras:")
     for extra in report.extras:
-        print(f"  [{'ok ' if extra.ok else '-- '}] {extra.label}")
+        # A missing capability prints the EXACT install command for it — no guessing which
+        # extra name maps to the feature you just tried and lack.
+        hint = (
+            f"  → pip install 'himmy[{extra.extra}]'"
+            if not extra.ok and extra.extra
+            else ""
+        )
+        print(f"  [{'ok ' if extra.ok else '-- '}] {extra.label}{hint}")
 
     print("\nlocal providers (PATH):")
     for prov in report.providers:
@@ -2752,9 +2834,89 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("\nnext step:")
         print(f"  → {report.next_step.message}")
 
+    # The runtime section is shown by default (it's the "will my routines actually fire?"
+    # answer newcomers most need); ``--runtime`` is accepted as an explicit opt-in too.
+    _doctor_runtime_section()
+
     if getattr(args, "storage", False):
         _doctor_storage_section()
     return 0
+
+
+def _doctor_runtime_section() -> int:
+    """Report the unattended-run substrate: scheduler, durable store, and routine coverage.
+
+    Answers the single question a routine author most needs — "is anything going to FIRE my
+    routines?" — from the SAME machinery the runtime uses (no parallel probe):
+
+    * **scheduler** — a live ``himmy worker`` / co-located ``himmy serve`` holds the host
+      scheduler ``flock`` (:func:`~himmy.api.scheduler_leader.scheduler_running_on_host`);
+    * **durable store** — a Postgres DSN or the file-backed SQLite default is engaged (the
+      dispatcher/queue need durability; an in-memory store loses queued runs on exit);
+    * **routines** — how many local routines are defined + how many are enabled.
+
+    The load-bearing line is the RED one: when enabled routines EXIST but no scheduler is
+    running here, they silently never fire — the most common routines footgun. Returns the
+    count of enabled-but-unscheduled routines (0 = healthy) so a caller/test can assert on it.
+    """
+    from himmy.api.scheduler_leader import scheduler_running_on_host
+
+    print("\nruntime (unattended runs):")
+    running = scheduler_running_on_host()
+    if running is True:
+        print("  [ok ] scheduler: running on this host")
+    elif running is False:
+        print("  [-- ] scheduler: not running here (start `himmy worker`)")
+    else:
+        print("  [ ? ] scheduler: undetermined (Postgres lease / non-POSIX host)")
+
+    durable, store_label = _durable_store_engaged()
+    flag = "ok " if durable else "-- "
+    print(f"  [{flag}] durable store: {store_label}")
+
+    enabled, total = _local_routine_counts()
+    print(f"  [{'ok ' if total else '-- '}] routines: {total} defined, {enabled} enabled")
+
+    unscheduled = enabled if (enabled > 0 and running is False) else 0
+    if unscheduled:
+        print(
+            f"  RED: {unscheduled} enabled routine(s) but NO scheduler is running — they "
+            "will NEVER fire.\n"
+            "       start one:  himmy worker   (or `himmy deploy -f agent.yaml`)"
+        )
+    return unscheduled
+
+
+def _durable_store_engaged() -> tuple[bool, str]:
+    """Whether a DURABLE run store is engaged, plus a short label (Postgres vs SQLite path).
+
+    A Postgres ``HIMMY_DATABASE_URL`` or an opted-in durable SQLite store counts as durable;
+    a bare in-memory default does not (queued runs die with the process). Mirrors the factory's
+    selection so the report matches what a worker would actually use.
+    """
+    from himmy.config.flags import env_truthy
+    from himmy.config.secrets import get_secret
+    from himmy.services.storage.factory import HIMMY_STORE_PATH, _is_postgres_dsn
+
+    dsn = get_secret("HIMMY_DATABASE_URL")
+    if _is_postgres_dsn(dsn):
+        return True, "postgres (HIMMY_DATABASE_URL)"
+    store_path = get_secret("HIMMY_STORE_PATH") or HIMMY_STORE_PATH
+    # The file-backed SQLite store is durable; a worker opts it in via HIMMY_DURABLE_STORAGE,
+    # but the file itself persists regardless, so a configured path is the honest "durable" bit.
+    durable = bool(store_path) or env_truthy("HIMMY_DURABLE_STORAGE")
+    return durable, f"sqlite ({store_path})"
+
+
+def _local_routine_counts() -> tuple[int, int]:
+    """``(enabled, total)`` local-workspace routines, best-effort (``(0, 0)`` on any error)."""
+    try:
+        from himmy.api import routines as svc
+
+        routines = svc.get_routines_store().list(workspace_id=svc.LOCAL_WORKSPACE)
+    except Exception:  # noqa: BLE001 - doctor must never crash on a store read
+        return 0, 0
+    return sum(1 for r in routines if r.enabled), len(routines)
 
 
 def _redact_dsn(dsn: str) -> str:

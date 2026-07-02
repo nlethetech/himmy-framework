@@ -94,6 +94,62 @@ health/readiness use `exec` (in-pod `curl`) probes, not `httpGet`, so they stay 
 at the loopback `bindHost` default. Both containers pin `command: ["himmy"]` (the image
 has no ENTRYPOINT).
 
+<a id="agent-over-http"></a>
+### Agent over HTTP — the signed webhook by hand
+
+`himmy deploy` / `himmy serve` wire the inbound webhook for you and print a ready-to-paste
+signed `curl`. This is the same wiring done by hand, so you can reproduce it in a container,
+a systemd unit, or any process that constructs the FastAPI app with
+[`create_app`](../../himmy/api/app.py) — the connector is mounted by
+[`mount_inbound_connectors`](../../himmy/api/connector_inbound.py) at app startup.
+
+Four config keys turn a bare BFF into an agent endpoint. All are read through the secrets
+layer, so the process env is the zero-config path (a file/keychain backend also works):
+
+| Key | Purpose |
+| --- | --- |
+| `HIMMY_INBOUND_AGENT_PATH` | the `agent.yaml` an inbound delivery runs (absent → nothing mounts) |
+| `HIMMY_CONNECTOR_WEBHOOK_INBOUND_ENABLED` | enable the `webhook` connector for the `inbound` surface |
+| `HIMMY_WEBHOOK_SIGNING_SECRET` | the shared HMAC secret every delivery must be signed with |
+| `HIMMY_WEBHOOK_ALLOWED_SOURCES` | allow-list for the payload `source` field (default-deny; empty allow-list rejects all) |
+
+Default-deny is preserved end to end: the connector refuses to mount without a signing
+secret (an unsigned public trigger is a forgeable agent trigger), and every delivery is
+HMAC-verified over the raw body before it reaches your agent.
+
+```bash
+# 1) point the inbound webhook at your agent + enable + allow the sample source
+export HIMMY_INBOUND_AGENT_PATH="$PWD/agent.yaml"
+export HIMMY_CONNECTOR_WEBHOOK_INBOUND_ENABLED=1
+export HIMMY_WEBHOOK_ALLOWED_SOURCES=local
+
+# 2) generate + persist a signing secret (NEVER print the raw secret; store it, don't echo)
+export HIMMY_WEBHOOK_SIGNING_SECRET="whsec_$(python -c 'import secrets;print(secrets.token_hex(24))')"
+
+# 3) serve it — the agent mounts at POST /v1/connectors/webhook (bound 127.0.0.1)
+himmy serve -f agent.yaml
+```
+
+The endpoint is `POST /v1/connectors/webhook` (under the guarded `/v1` prefix). Each request
+carries the HMAC of the *raw* body in the `X-Himmy-Signature` header, GitHub-style
+`sha256=<hex>`. Compute a valid signature and call it — printing the signature, **never** the
+secret:
+
+```bash
+BODY='{"source":"local","text":"hello"}'
+SIG="sha256=$(printf '%s' "$BODY" | \
+  openssl dgst -sha256 -hmac "$HIMMY_WEBHOOK_SIGNING_SECRET" | awk '{print $2}')"
+curl -s http://127.0.0.1:8000/v1/connectors/webhook \
+  -H "X-Himmy-Signature: $SIG" \
+  -d "$BODY"
+```
+
+`himmy serve`/`himmy deploy` print exactly this `curl` (a valid signature over the sample
+body, never the secret) in their live summary — so a newcomer can prove the endpoint end to
+end in one paste. To expose it beyond loopback, add real auth first (`--share`, or
+`HIMMY_AUTH_MODE=apikey` + a key) — an off-loopback bind with no auth is refused by
+`create_app`.
+
 ---
 
 The remainder of this runbook covers the **Himmy Studio** deployment (the admin GUI).

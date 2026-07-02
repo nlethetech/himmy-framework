@@ -492,6 +492,13 @@ def build_parser() -> argparse.ArgumentParser:
         "deploy",
         help="one command: stand up a live, signed service from an agent.yaml "
         "(serve + worker together)",
+        epilog=(
+            "The agent mounts as a signature-verified webhook at "
+            "POST /v1/connectors/webhook (bound 127.0.0.1). deploy prints a ready-to-paste "
+            "signed curl. To wire it by hand, or expose it beyond loopback, see the "
+            "agent-over-HTTP recipe: docs/enterprise/deployment.md (#agent-over-http) "
+            "and RECIPES.md."
+        ),
     )
     _add_service_agent_flags(p_deploy)
     p_deploy.add_argument("--host", default="127.0.0.1")
@@ -530,6 +537,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--storage",
         action="store_true",
         help="also report the storage backend, migrations, and SQLite stores",
+    )
+    p_doctor.add_argument(
+        "--runtime",
+        action="store_true",
+        help="report the unattended-run substrate (scheduler, durable store, routine "
+        "coverage) — shown by default; this is an explicit opt-in",
     )
     p_doctor.set_defaults(func=commands.cmd_doctor)
 
