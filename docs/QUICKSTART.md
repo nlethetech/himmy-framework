@@ -194,9 +194,14 @@ wrote my-agent/agent.yaml
 wrote my-agent/tools.py
 wrote my-agent/himmy.toml
 wrote my-agent/skills/my_skill.yaml
+wrote my-agent/Dockerfile
 
 Next: himmy run -f my-agent/agent.yaml -p "hello"
 ```
+
+The `Dockerfile` is a ready-to-build container front door: `docker build` from this
+folder layers your spec onto the published runtime image (no framework checkout). It is
+never written over one you already have.
 
 > **On a real terminal, plain `himmy init my-agent` (without `--classic`) is
 > interactive.** It asks a few short questions — name, what it should do, which model,

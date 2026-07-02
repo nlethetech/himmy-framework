@@ -1725,7 +1725,8 @@ def _materialize_api_keys_file() -> None:
     if path.exists():
         return  # already provisioned (mounted secret, prior boot, or `himmy apikey mint`).
 
-    from himmy.cli.apikey_cmd import _fingerprint, _write_json_0600
+    from himmy.api.auth.apikey import _fingerprint
+    from himmy.cli.apikey_cmd import _write_json_0600
     from himmy.config.secrets import get_secret
 
     raw_json = get_secret(API_KEYS_JSON_ENV)
@@ -2242,7 +2243,7 @@ def _deploy_next_tail(agent_yaml: Path, *, spec: AgentSpec | None = None) -> str
 
 def _stamp_spec_provider_in_place(
     agent_path: str, choice: Any
-) -> tuple[str, str | None] | None:
+) -> tuple[str | None, str | None] | None:
     """Persist the best detected provider into ``agent.yaml`` so the service answers for REAL.
 
     Called ONLY when the resolved spec would run on the offline stub AND its ``provider`` is
@@ -2333,7 +2334,7 @@ async def _serve_and_worker(
     server = uvicorn.Server(config)
     # Let our own task-group own the signal handling / joint shutdown, not uvicorn's
     # per-process installer (which would race the worker's handler for the same signal).
-    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign,attr-defined]
 
     server_task = asyncio.create_task(server.serve(), name="himmy-deploy-server")
     worker_task = asyncio.create_task(
@@ -2567,7 +2568,8 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
     """
     import secrets as _secrets
 
-    from himmy.cli.apikey_cmd import _fingerprint, _load_keys, _write_json_0600
+    from himmy.api.auth.apikey import _fingerprint
+    from himmy.cli.apikey_cmd import _load_keys, _write_json_0600
 
     keys_file = os.environ.get("HIMMY_API_KEYS_FILE") or ".himmy/api_keys.json"
     path = Path(keys_file)
