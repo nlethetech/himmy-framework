@@ -260,6 +260,11 @@ def run_wizard(
     target.mkdir(parents=True, exist_ok=True)
     dest.write_text(_spec_to_yaml(data))
     print(f"wrote {dest}")
+    # Emit the ready-to-build container front door next to the spec (idempotent; never
+    # clobbers a Dockerfile the user already has), so `docker build` works from this folder.
+    from himmy.cli.commands import _emit_scaffold_dockerfile
+
+    _emit_scaffold_dockerfile(target)
 
     _eprint(f'\nNext:\n  himmy run -f {dest} -p "hello"\n  himmy chat -f {dest}')
     if chosen.key == "stub":

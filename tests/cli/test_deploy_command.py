@@ -265,10 +265,12 @@ def test_docker_emits_runnable_dockerfile(
     )
     assert commands.cmd_deploy(args) == 0
     out = capsys.readouterr().out
-    assert "FROM python:3.12-slim" in out
-    assert "pip install" in out and "himmy[api]" in out
+    # 3-line agent Dockerfile: FROM the published runtime image (no build-time pip install),
+    # COPY the spec, CMD `himmy deploy`.
+    assert f"FROM {commands.GHCR_IMAGE}:" in out
+    assert "pip install" not in out
     assert 'CMD ["himmy", "deploy"' in out
-    assert "agent.yaml" in out
+    assert "COPY agent.yaml /app/agent.yaml" in out
 
 
 def test_deploy_parser_accepts_new_flags() -> None:

@@ -1378,8 +1378,30 @@ def cmd_init(args: argparse.Namespace) -> int:
     # real out of the box — same probe the interactive wizard runs, minus the questions.
     if "agent.yaml" in files and not template and not args.team:
         _stamp_scaffold_provider(target / "agent.yaml")
+        # Emit a ready-to-build container front door next to the spec: `docker build` from
+        # this folder layers the agent onto the published runtime image (no framework
+        # checkout). Never clobbers a Dockerfile the user already has.
+        _emit_scaffold_dockerfile(target)
     print(next_msg)
     return 0
+
+
+def _emit_scaffold_dockerfile(target: Path) -> None:
+    """Write a 3-line agent ``Dockerfile`` next to a freshly-scaffolded ``agent.yaml``.
+
+    Layers the user's spec onto the published runtime image (see :func:`_agent_dockerfile_text`)
+    so ``docker build`` works straight from the scaffolded folder with no framework checkout. A
+    pre-existing ``Dockerfile`` is left untouched (idempotent; never clobbers user content) —
+    ``himmy init --force`` re-scaffolds the spec but the container recipe is the user's to own.
+    """
+    dockerfile = target / "Dockerfile"
+    if dockerfile.exists():
+        return
+    try:
+        dockerfile.write_text(_agent_dockerfile_text("agent.yaml"), encoding="utf-8")
+    except OSError:
+        return
+    print(f"wrote {dockerfile}")
 
 
 def _stamp_scaffold_provider(agent_yaml: Path) -> None:
@@ -2393,24 +2415,46 @@ def _deploy_configure_share_auth(host: str) -> tuple[bool, str | None]:
     return True, secret
 
 
-def _emit_deploy_dockerfile(args: argparse.Namespace) -> int:
-    """Print a minimal Dockerfile that runs ``himmy deploy`` for this agent, and exit.
+# The published runtime image (built + pushed by .github/workflows/deploy.yml on
+# tag/release). It ships himmy[api] already installed, so a user's agent Dockerfile is a
+# thin 3-line FROM/COPY/CMD over it — no framework checkout, no pip install at build time.
+GHCR_IMAGE = "ghcr.io/nlethetech/himmy"
 
-    The 3-line container: install himmy[api], copy the agent, run the service. Emitted to
-    stdout so ``himmy deploy --docker > Dockerfile`` just works; the agent path is taken from
-    the same resolution the live deploy uses so the image serves the SAME spec.
+
+def _agent_image_ref() -> str:
+    """The pinned base image an emitted agent Dockerfile builds ``FROM``.
+
+    ``ghcr.io/nlethetech/himmy:<version>`` where ``<version>`` is the installed
+    :data:`himmy.__version__` — so the generated Dockerfile pins the image that matches the
+    CLI that wrote it (reproducible; never a floating ``:latest``).
     """
-    agent_path = _service_agent_path(args) or "agent.yaml"
-    name = Path(agent_path).name
-    dockerfile = (
-        "# Minimal container for this himmy agent — build + run:\n"
+    from himmy import __version__
+
+    return f"{GHCR_IMAGE}:{__version__}"
+
+
+def _agent_dockerfile_text(agent_name: str) -> str:
+    """Render the 3-line agent Dockerfile that layers an ``agent.yaml`` onto the runtime image.
+
+    The delightful container front door: ``FROM`` the published runtime image (himmy already
+    installed), ``COPY`` the user's spec in, ``CMD`` ``himmy deploy`` it — so ``docker build``
+    works from a pip-install user's agent folder with NO framework checkout. ``agent_name`` is
+    the on-disk spec filename (copied to ``/app/agent.yaml`` inside the image so the CMD path is
+    stable regardless of what the user named it).
+
+    Security posture is inherited verbatim from ``himmy deploy``: the container binds ``0.0.0.0``
+    so the mapped port is reachable, but himmy fails CLOSED off-loopback with no auth, so the
+    image opts in explicitly (``HIMMY_ALLOW_UNAUTHENTICATED``) under the documented assumption
+    that auth is terminated at a trusted proxy / ingress in front of it. The agent endpoint
+    itself stays signature-verified + default-deny regardless.
+    """
+    return (
+        "# Container for this himmy agent — layered on the published runtime image so\n"
+        "# `docker build` works from this folder with no framework checkout. Build + run:\n"
         "#   docker build -t my-agent .\n"
         "#   docker run --rm -p 8000:8000 my-agent\n"
-        "FROM python:3.12-slim\n"
-        "RUN pip install --no-cache-dir 'himmy[api]'\n"
-        f"COPY {name} /app/agent.yaml\n"
-        "WORKDIR /app\n"
-        "EXPOSE 8000\n"
+        f"FROM {_agent_image_ref()}\n"
+        f"COPY {agent_name} /app/agent.yaml\n"
         "# The container binds 0.0.0.0 so the mapped port is reachable. himmy fails\n"
         "# CLOSED off-loopback with no auth, so we opt in explicitly: this image assumes\n"
         "# auth is terminated at a trusted proxy / ingress in front of it. If you expose\n"
@@ -2420,7 +2464,18 @@ def _emit_deploy_dockerfile(args: argparse.Namespace) -> int:
         "# The agent endpoint stays signature-verified + default-deny regardless.\n"
         'CMD ["himmy", "deploy", "-f", "agent.yaml", "--host", "0.0.0.0"]\n'
     )
-    print(dockerfile, end="")
+
+
+def _emit_deploy_dockerfile(args: argparse.Namespace) -> int:
+    """Print the agent Dockerfile that runs ``himmy deploy`` for this agent, and exit.
+
+    The 3-line container: ``FROM`` the published runtime image, ``COPY`` the agent, ``CMD``
+    ``himmy deploy``. Emitted to stdout so ``himmy deploy --docker > Dockerfile`` just works;
+    the agent path is taken from the same resolution the live deploy uses so the image serves
+    the SAME spec. Emits WITHOUT booting a server (pure text, no bind).
+    """
+    agent_path = _service_agent_path(args) or "agent.yaml"
+    print(_agent_dockerfile_text(Path(agent_path).name), end="")
     return 0
 
 
