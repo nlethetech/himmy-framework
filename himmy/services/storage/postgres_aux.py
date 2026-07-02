@@ -648,18 +648,20 @@ class _AsyncConversationStore:
             self._tenant,
             conversation_id,
         )
-        for seq, (role, text) in enumerate(flat_from_thread(thread)):
-            await conn.execute(
+        # Keep DELETE-all + full re-INSERT (no append-only delta) but collapse the N
+        # per-row round-trips into ONE ``executemany``. Projected rows (tenant, conversation,
+        # role, text, ``seq`` order, ``created_at``) are byte-identical to the row-by-row path;
+        # only the random per-row ``id`` is minted fresh, exactly as before.
+        rows = [
+            (self._tenant, new_uuid(), conversation_id, role, text, seq, now)
+            for seq, (role, text) in enumerate(flat_from_thread(thread))
+        ]
+        if rows:
+            await conn.executemany(
                 "INSERT INTO aux_conversation_messages "
                 "(tenant, id, conversation_id, role, text, seq, created_at) "
                 "VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                self._tenant,
-                new_uuid(),
-                conversation_id,
-                role,
-                text,
-                seq,
-                now,
+                rows,
             )
 
     async def load_thread(self, conversation_id: str) -> ChatThread | None:

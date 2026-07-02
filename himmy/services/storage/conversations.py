@@ -450,19 +450,30 @@ class ConversationStore:
         )
 
     def _reproject(self, conversation_id: str, thread: ChatThread, now: str) -> None:
-        """Rebuild the flat projection for one conversation from its authoritative thread."""
+        """Rebuild the flat projection for one conversation from its authoritative thread.
+
+        Keeps the DELETE-all + full re-INSERT contract (never an append-only delta, so an
+        edited/regenerated thread can never leave a stale row) but batches the re-INSERT into a
+        single :meth:`~sqlite3.Cursor.executemany` round-trip. The projected rows — role, text,
+        ``seq`` order and ``created_at`` — are byte-identical to the row-by-row path; only the
+        random per-row ``id`` is minted fresh (it always was, DELETE-all discards the old ones).
+        """
         self._conn.execute(
             "DELETE FROM conversation_messages WHERE conversation_id = ?",
             (conversation_id,),
         )
-        for seq, (role, text) in enumerate(flat_from_thread(thread)):
-            self._conn.execute(
+        rows = [
+            (new_uuid(), conversation_id, role, text, seq, now)
+            for seq, (role, text) in enumerate(flat_from_thread(thread))
+        ]
+        if rows:
+            self._conn.executemany(
                 """
                 INSERT INTO conversation_messages
                     (id, conversation_id, role, text, seq, created_at)
                 VALUES (?,?,?,?,?,?)
                 """,
-                (new_uuid(), conversation_id, role, text, seq, now),
+                rows,
             )
 
     # -- reads ---------------------------------------------------------------
