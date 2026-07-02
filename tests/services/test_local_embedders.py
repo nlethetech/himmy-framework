@@ -156,6 +156,9 @@ def test_auto_default_dim_tracks_resolved_backend(
     assert default_dim_for("auto") == 384
     monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
     monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: False)
+    # The decision is memoised per process; the environment genuinely changed mid-test, so
+    # re-probe (mirrors a runtime reconfig — never happens in a real single-env process).
+    local_embedders.reset_auto_backend_cache()
     assert default_dim_for("auto") == 64
 
 
@@ -175,6 +178,8 @@ def test_config_auto_resolves_embedder_and_matching_dim(
     assert dim == 4096  # the dim matches the resolved backend, not the "auto" alias
 
     monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: False)
+    # Environment flipped mid-test → clear the per-process decision memo to re-probe.
+    local_embedders.reset_auto_backend_cache()
     emb2, dim2 = ToolkitConfig(embedder="auto").build_embedder_and_dim()
     assert isinstance(emb2, DeterministicEmbedder)
     assert dim2 == 64
@@ -190,3 +195,150 @@ def test_ollama_reachable_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(httpx, "get", _boom)
     # An unreachable server must fail closed, not propagate the connection error.
     assert local_embedders.ollama_reachable("http://localhost:11434") is False
+
+
+class _ProbeCounter:
+    """Counts calls to the Ollama probes so a test can assert they fire at most once."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.reachable_calls = 0
+        self.model_calls = 0
+
+        def _reachable(*_a: object, **_k: object) -> bool:
+            self.reachable_calls += 1
+            return True
+
+        def _model(*_a: object, **_k: object) -> bool:
+            self.model_calls += 1
+            return True
+
+        monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+        monkeypatch.setattr(local_embedders, "ollama_reachable", _reachable)
+        monkeypatch.setattr(
+            local_embedders, "ollama_embed_model_available", _model
+        )
+
+
+def test_resolve_auto_backend_probes_ollama_at_most_once_per_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The blocking Ollama probes fire exactly once per base_url, not per call.
+
+    ``build_runtime_for_spec`` resolves ``"auto"`` 1-4x per turn; each uncached resolve
+    does two blocking HTTP probes (~0.25s + ~0.5s). Memoising per base_url makes the probe
+    fire once for the process while returning a byte-identical decision on every call.
+    """
+    counter = _ProbeCounter(monkeypatch)
+
+    results = [resolve_auto_backend() for _ in range(20)]
+
+    assert results == ["ollama"] * 20  # identical decision every call
+    assert counter.reachable_calls == 1
+    assert counter.model_calls == 1
+
+
+def test_resolve_auto_backend_reset_forces_a_reprobe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reset_auto_backend_cache() drops the memo so the next resolve re-probes Ollama."""
+    counter = _ProbeCounter(monkeypatch)
+
+    assert resolve_auto_backend() == "ollama"
+    assert counter.reachable_calls == 1
+
+    local_embedders.reset_auto_backend_cache()
+    assert resolve_auto_backend() == "ollama"
+    assert counter.reachable_calls == 2  # re-probed after the reset
+
+
+def test_reset_embedder_cache_also_clears_auto_backend_memo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The general reset hook also forces an auto-backend re-probe."""
+    counter = _ProbeCounter(monkeypatch)
+
+    assert resolve_auto_backend() == "ollama"
+    assert counter.reachable_calls == 1
+
+    local_embedders.reset_embedder_cache()
+    assert resolve_auto_backend() == "ollama"
+    assert counter.reachable_calls == 2
+
+
+def test_resolve_auto_backend_caches_per_base_url_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different base_urls memoise separately: each is probed once, neither shares state."""
+    seen: list[str] = []
+
+    def _reachable(base: str = local_embedders._DEFAULT_OLLAMA_URL, **_k: object) -> bool:
+        seen.append(base)
+        return True
+
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(local_embedders, "ollama_reachable", _reachable)
+    monkeypatch.setattr(
+        local_embedders, "ollama_embed_model_available", lambda *a, **k: True
+    )
+
+    url_a = "http://a.local:11434"
+    url_b = "http://b.local:11434"
+    for _ in range(5):
+        assert resolve_auto_backend(ollama_base_url=url_a) == "ollama"
+        assert resolve_auto_backend(ollama_base_url=url_b) == "ollama"
+
+    # Each distinct base_url is probed exactly once despite 5 rounds of both.
+    assert sorted(seen) == [url_a, url_b]
+
+
+def test_backend_probe_cache_off_reprobes_every_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIMMY_BACKEND_PROBE_CACHE=off restores the pre-cache re-probe-every-call behaviour."""
+    monkeypatch.setenv("HIMMY_BACKEND_PROBE_CACHE", "off")
+    counter = _ProbeCounter(monkeypatch)
+
+    for _ in range(3):
+        assert resolve_auto_backend() == "ollama"
+
+    assert counter.reachable_calls == 3  # no memoisation while the kill-switch is set
+
+
+def test_resolve_auto_backend_concurrent_probes_at_most_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under concurrent first-resolves the memo stays consistent and results identical.
+
+    A benign race may probe more than once (the probe runs outside the lock so a slow
+    Ollama can't block unrelated base_urls), but the cache must converge to one entry and
+    every caller must get the same decision — never a torn/None result.
+    """
+    import threading
+
+    barrier = threading.Barrier(16)
+    results: list[str] = []
+    results_lock = threading.Lock()
+
+    monkeypatch.setattr(local_embedders, "fastembed_available", lambda: False)
+    monkeypatch.setattr(local_embedders, "ollama_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(
+        local_embedders, "ollama_embed_model_available", lambda *a, **k: True
+    )
+
+    def _worker() -> None:
+        barrier.wait()
+        r = resolve_auto_backend()
+        with results_lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=_worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == ["ollama"] * 16  # every concurrent caller saw the same decision
+    # Exactly one converged cache entry for the default base_url.
+    assert local_embedders._AUTO_BACKEND_CACHE == {
+        local_embedders._DEFAULT_OLLAMA_URL: "ollama"
+    }

@@ -96,6 +96,26 @@ def _isolated_keyvault(
 
 
 @pytest.fixture(autouse=True)
+def _reset_auto_backend_cache() -> Any:
+    """Clear the per-process auto-backend decision memo around EVERY test.
+
+    :func:`~himmy.services.knowledge.local_embedders.resolve_auto_backend` memoises its
+    ``fastembed``/``ollama``/``deterministic`` decision per Ollama base_url for the process
+    lifetime (a latency win: ``build_runtime_for_spec`` calls it several times per turn but
+    the blocking HTTP probes then fire at most once). In a shared test process that memo is
+    otherwise sticky — a test that monkeypatches the probes to force ``ollama`` would pin
+    that decision for every later ``"auto"`` build. Resetting in setup AND teardown keeps
+    each test's backend resolution hermetic and order-independent. (Production is unaffected:
+    one process, one real environment, one stable decision.)
+    """
+    from himmy.services.knowledge.local_embedders import reset_auto_backend_cache
+
+    reset_auto_backend_cache()
+    yield
+    reset_auto_backend_cache()
+
+
+@pytest.fixture(autouse=True)
 def _reset_ambient_auth_flag() -> Any:
     """Reset the process-global tool-gate fail-closed flag around EVERY test.
 
