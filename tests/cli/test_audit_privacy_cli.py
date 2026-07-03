@@ -10,10 +10,15 @@ Asserts:
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import himmy.cli.audit as cli_audit
+import himmy.licensing.core as _lic
 from himmy.cli.__main__ import main
 from himmy.entities.integrity import AuditBundle, verify_audit_bundle
 from himmy.entities.registry import EntityRegistry
@@ -26,6 +31,37 @@ from tests.conftest import run_async
 
 # Fake-but-format-valid token — no real PII.
 _FAKE_EMAIL = "leaked.teacher@example.com"
+
+
+@pytest.fixture
+def ee_audit_export(monkeypatch: Any) -> None:
+    """Grant the ``audit_export`` Enterprise entitlement (the export path is EE-gated).
+
+    Mints an ephemeral EE license and swaps the baked-in public key for the run, so the
+    signed-bundle export behaviour can still be exercised end-to-end under an entitlement.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    priv = Ed25519PrivateKey.generate()
+    pub_hex = priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+    payload = {
+        "license_id": "lic-test",
+        "edition": "enterprise",
+        "features": ["audit_export"],
+        "customer": "Test",
+        "issued_at": int(time.time()),
+        "expires_at": 0,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    token = f"{_lic._b64url_encode(raw)}.{_lic._b64url_encode(priv.sign(raw))}"
+    monkeypatch.setattr(_lic, "LICENSE_PUBLIC_KEY_HEX", pub_hex)
+    monkeypatch.setenv(_lic.HIMMY_LICENSE_KEY_ENV, token)
+    _lic.reset_license_cache()
+    yield
+    _lic.reset_license_cache()
 
 
 def _service_over(storage: StorageService) -> PrivacyAuditService:
@@ -108,7 +144,7 @@ def test_failing_posture_json_has_no_raw_value(monkeypatch: Any, capsys: Any) ->
 
 # --------------------------------------------------------------- export bundle
 def test_export_bundle_writes_verifiable_bundle(
-    monkeypatch: Any, capsys: Any, tmp_path: Path
+    monkeypatch: Any, capsys: Any, tmp_path: Path, ee_audit_export: None
 ) -> None:
     """``--export-bundle`` writes a signed bundle that verifies and covers the report."""
     import himmy.config.secrets as secrets
@@ -140,7 +176,7 @@ def test_export_bundle_writes_verifiable_bundle(
 
 
 def test_export_bundle_without_key_exits_one(
-    monkeypatch: Any, capsys: Any, tmp_path: Path
+    monkeypatch: Any, capsys: Any, tmp_path: Path, ee_audit_export: None
 ) -> None:
     """Requesting a bundle with no signing key configured ⇒ a non-zero exit + stderr error."""
     import himmy.config.secrets as secrets
@@ -155,3 +191,23 @@ def test_export_bundle_without_key_exits_one(
     rc = main(["audit", "privacy", "--export-bundle", str(tmp_path / "b.json")])
     assert rc == 1
     assert "signing key not configured" in capsys.readouterr().err
+
+
+def test_export_bundle_gated_on_community(
+    monkeypatch: Any, capsys: Any, tmp_path: Path
+) -> None:
+    """Without an EE license the signed export is refused with the upgrade message (T)."""
+    monkeypatch.delenv(_lic.HIMMY_LICENSE_KEY_ENV, raising=False)
+    monkeypatch.setattr(_lic, "license_file_path", lambda: "/nonexistent/license")
+    monkeypatch.setattr("himmy.config.secrets.get_secret", lambda *a, **k: None)
+    _lic.reset_license_cache()
+
+    monkeypatch.setattr(
+        cli_audit, "_build_service", lambda: _service_over(StorageService())
+    )
+    out = tmp_path / "b.json"
+    rc = main(["audit", "privacy", "--export-bundle", str(out)])
+    assert rc == 1
+    assert "audit_export is an Enterprise Edition feature" in capsys.readouterr().err
+    assert not out.exists()
+    _lic.reset_license_cache()

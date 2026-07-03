@@ -211,10 +211,18 @@ class OidcAuthenticator:
 
     @classmethod
     def from_env(cls) -> OidcAuthenticator:
-        """Build from ``HIMMY_OIDC_*`` env vars (JWKS fetched + cached from the IdP)."""
+        """Build from ``HIMMY_OIDC_*`` env vars (JWKS fetched + cached from the IdP).
+
+        OIDC / SSO is an Enterprise Edition surface: :func:`require_entitlement` gates the
+        build path, so a community install gets a clear upgrade error here instead of a
+        half-configured authenticator (the free API-key auth stays fully available).
+        """
         import os
 
         from himmy.config.flags import env_truthy
+        from himmy.licensing import FEATURE_OIDC_SSO, require_entitlement
+
+        require_entitlement(FEATURE_OIDC_SSO)
 
         issuer = os.environ.get("HIMMY_OIDC_ISSUER")
         audience = os.environ.get("HIMMY_OIDC_AUDIENCE")

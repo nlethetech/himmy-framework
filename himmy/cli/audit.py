@@ -114,8 +114,24 @@ def cmd_audit_privacy(args: argparse.Namespace) -> int:
 
 
 def _export_bundle(service: Any, report: Any, path: str) -> int:
-    """Write a signed bundle over ``report`` to ``path`` (1 on a missing signing key)."""
+    """Write a signed bundle over ``report`` to ``path`` (1 on a missing signing key).
+
+    Signed audit-bundle EXPORT is an Enterprise Edition feature — the free privacy scan
+    and scorecard above are unaffected. On community, ``require_entitlement`` raises an
+    :class:`EnterpriseFeatureError`; we catch it below and print the upgrade message.
+    """
     from himmy.core.errors import HimmyError
+    from himmy.licensing import (
+        FEATURE_AUDIT_EXPORT,
+        EnterpriseFeatureError,
+        require_entitlement,
+    )
+
+    try:
+        require_entitlement(FEATURE_AUDIT_EXPORT)
+    except EnterpriseFeatureError as exc:
+        _eprint(f"error: {exc}")
+        return 1
 
     try:
         bundle = service.export_signed_bundle(report)
