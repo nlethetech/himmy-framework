@@ -20,9 +20,17 @@ Tenant scoping: the rollup is scoped to the caller's authorized workspace via
 tenant's agents, runs, cost or security events. An ``all_tenants`` (offline / admin)
 principal resolves to ``None`` and sees the unscoped, cross-tenant rollup.
 
+Subject scoping (BOLA, ee sec-r1): the tenant axis is not enough — a ``subject_scoped``
+principal must not see its siblings' runs/cost/tokens/audit either. The rollup narrows via
+:func:`~himmy.api.auth.narrow_subject`, so such a caller aggregates ONLY its own data
+subject (runs, cost buckets, and audit rows all pinned), mirroring ``/v1/runs``. Every
+other principal keeps the full workspace rollup, so the zero-config view is byte-unchanged.
+
 Efficiency: the rollup issues a bounded, fixed number of store reads (one ``list_runs``,
 one ``list_agent_defs``, one ``list_events``, one security-log ``recent``) and aggregates
-in memory — there is no per-run / per-agent follow-up query (no N+1).
+in memory — there is no per-run / per-agent follow-up query (no N+1). The ``list_events``
+read is WINDOWED to :data:`_MAX_COST_EVENTS` recent terminal events so a busy tenant's
+unbounded history cannot be loaded/scanned on a single request (a memory/CPU DoS).
 """
 
 from __future__ import annotations
@@ -32,7 +40,12 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from himmy.api.auth import require_permission, resolve_workspace, scoped_read
+from himmy.api.auth import (
+    narrow_subject,
+    require_permission,
+    resolve_workspace,
+    scoped_read,
+)
 from himmy.api.auth.rbac import DEFAULT_POLICY
 from himmy.core.events import EventType
 from himmy.licensing import (
@@ -53,6 +66,13 @@ _READ = [Depends(require_permission("dashboard", "read"))]
 _COST_EVENTS = frozenset(
     {EventType.INFERENCE_SUCCEEDED, EventType.INFERENCE_FAILED}
 )
+
+#: Hard cap on the number of inference events materialized + scanned per overview call
+#: (red-team ee sec-r1). Without a cap a busy tenant's ENTIRE event history is loaded and
+#: scanned on every request — a memory/CPU DoS a ``dashboard:read`` caller could hammer. The
+#: cost rollup is therefore a WINDOW over the most recent :data:`_MAX_COST_EVENTS` terminal
+#: events, not the unbounded lifetime total, so a single request cannot load an unbounded set.
+_MAX_COST_EVENTS = 50_000
 
 
 class CostBucket(BaseModel):
@@ -171,9 +191,18 @@ async def enterprise_overview(
     authorized workspace, so a tenant-bound principal never aggregates across tenants; an
     ``all_tenants`` principal sees the unscoped rollup.
 
+    Subject-scoped (BOLA, ee sec-r1): a governance rollup is inherently cross-subject, so a
+    ``subject_scoped`` principal WITHOUT ``tenant_admin`` is narrowed by :func:`narrow_subject`
+    to aggregate ONLY its OWN data subject — runs, cost, tokens and audit rows are all pinned
+    to that subject, mirroring ``/v1/runs``. Every other principal (``all_tenants`` / offline /
+    the historical multi-user-workspace default / a ``tenant_admin``) sees the full workspace
+    rollup, so the zero-config governance view is byte-unchanged.
+
     The rollup issues a fixed, bounded set of store reads and aggregates in memory (no
-    N+1). Cost is attributed from the terminal inference events' ``cost`` field — per agent
-    (the event ``agent_id``) and per model (the run's ``model_key``, joined by ``trace_id``).
+    N+1); the cost pass is WINDOWED to :data:`_MAX_COST_EVENTS` recent terminal events so a
+    single request cannot load an unbounded history. Cost is attributed from the terminal
+    inference events' ``cost`` field — per agent (the event ``agent_id``) and per model (the
+    run's ``model_key``, joined by ``trace_id``).
     """
     # 1) Edition gate (fail-closed to community with an actionable 402) — BEFORE any read.
     try:
@@ -182,13 +211,20 @@ async def enterprise_overview(
         raise HTTPException(status_code=402, detail=str(exc)) from exc
 
     workspace_id = resolve_workspace(request, workspace_id)
+    # Subject axis (BOLA): pin a subject-scoped, non-tenant_admin caller to its OWN subject;
+    # everyone else stays unrestricted (None). This is the same narrowing ``/v1/runs`` uses.
+    subject_id = narrow_subject(request, None)
     container = _container(request)
     storage = container.storage
 
-    # 2) Bounded store reads (no per-row follow-up query).
-    runs = await storage.list_runs(workspace_id=workspace_id)
+    # 2) Bounded store reads (no per-row follow-up query). Runs are subject-narrowed at the
+    #    store; events are capped to a finite window (newest first) so a busy tenant's whole
+    #    history is never materialized on a single request.
+    runs = await storage.list_runs(workspace_id=workspace_id, subject_id=subject_id)
     agent_defs = await storage.list_agent_defs(workspace_id=workspace_id)
-    events = await storage.list_events(workspace_id=workspace_id)
+    events = await storage.list_events(
+        workspace_id=workspace_id, limit=_MAX_COST_EVENTS, newest_first=True
+    )
 
     # 3) Runs rollup: count by status.
     by_status: dict[str, int] = {}
@@ -202,11 +238,21 @@ async def enterprise_overview(
         for run in runs
         if run.trace_id
     }
+    # When narrowed to a single subject (BOLA), attribute cost ONLY to events belonging to
+    # that subject's runs — the event store is workspace-scoped, not subject-scoped, so the
+    # narrowed run set (via trace_id) is the subject boundary. Unrestricted callers count all.
+    owned_traces: set[str] | None = (
+        {run.trace_id for run in runs if run.trace_id}
+        if subject_id is not None
+        else None
+    )
     by_agent: dict[str, CostBucket] = {}
     by_model: dict[str, CostBucket] = {}
     cost_total = 0.0
     for event in events:
         if event.event_type not in _COST_EVENTS:
+            continue
+        if owned_traces is not None and (event.trace_id or "") not in owned_traces:
             continue
         cost = float(event.cost or 0.0)
         cost_total += cost
@@ -236,7 +282,11 @@ async def enterprise_overview(
     audit = getattr(request.app.state, "security_audit", None)
     recent_events: list[dict[str, Any]] = []
     if audit is not None:
-        for e in audit.recent(limit=events_limit, workspace_id=workspace_id):
+        for e in audit.recent(
+            limit=events_limit,
+            workspace_id=workspace_id,
+            actor_subject=subject_id,
+        ):
             recent_events.append(
                 {
                     "event_id": e.event_id,

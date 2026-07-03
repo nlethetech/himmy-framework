@@ -53,6 +53,7 @@ class SecurityAuditLog:
         workspace_id: str | None = None,
         workspace_ids: frozenset[str] | set[str] | None = None,
         event_type: str | None = None,
+        actor_subject: str | None = None,
     ) -> list[SecurityEvent]:
         """Return recent events (newest first), optionally filtered.
 
@@ -60,9 +61,11 @@ class SecurityAuditLog:
         pins to an ALLOW-LIST of tenants — the shape a tenant-bound principal's
         :func:`~himmy.api.auth.context.studio_tenant_filter` returns — so the seclog
         viewer surfaces only events stamped to a workspace the caller is entitled to.
-        Both default to ``None`` (no tenant filter — the single-box / unrestricted path),
-        and both are applied BEFORE the ``limit`` slice so scoping never silently drops
-        in-window rows. Passing both intersects them.
+        ``actor_subject`` (red-team ee sec-r1) pins to a single data subject — the actor
+        axis a ``subject_scoped`` principal is confined to — so a per-user console never
+        surfaces another subject's audit rows. All default to ``None`` (no filter — the
+        single-box / unrestricted path), and every filter is applied BEFORE the ``limit``
+        slice so scoping never silently drops in-window rows. Passing several intersects.
         """
         events = [
             SecurityEvent.model_validate(r.payload)
@@ -74,6 +77,12 @@ class SecurityAuditLog:
             events = [e for e in events if e.workspace_id in workspace_ids]
         if event_type is not None:
             events = [e for e in events if e.event_type == event_type]
+        if actor_subject is not None:
+            events = [
+                e
+                for e in events
+                if (e.actor or {}).get("subject") == actor_subject
+            ]
         events.sort(key=lambda e: e.created_at, reverse=True)
         return events[:limit]
 

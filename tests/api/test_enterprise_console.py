@@ -305,3 +305,182 @@ def test_cross_tenant_workspace_denied(ee_console: None) -> None:
         headers={"x-himmy-internal-key": "op-a"},
     )
     assert resp.status_code == 403
+
+
+# ---------------------------------------------- subject scoping (BOLA, ee sec-r1)
+def _app_subject_scoped() -> TestClient:
+    """An app whose tenant-'a' viewer is ``subject_scoped`` to its OWN data subject 's1'.
+
+    Mirrors an OIDC + ``HIMMY_OIDC_SUBJECT_SCOPED=1`` deployment: a per-user principal that
+    still holds ``dashboard:read`` (via the viewer role) but must only see its own subject.
+    """
+    app = create_app(ApiContainer.build_default())
+    app.state.authenticator = ApiKeyAuthenticator(
+        key_principals={
+            # 'alice' is subject-scoped to subject 's1' (owns runs a1/a2 seeded below).
+            "alice": Principal.build(
+                "s1",
+                tenant_ids=["a"],
+                roles=["viewer"],
+                auth_method="apikey",
+                subject_scoped=True,
+            ),
+            # An unscoped tenant-'a' operator (full-workspace baseline).
+            "op-a": Principal.build(
+                "op-a", tenant_ids=["a"], roles=["operator"], auth_method="apikey"
+            ),
+        }
+    )
+    return TestClient(app)
+
+
+async def _seed_two_subjects(client: TestClient) -> None:
+    """Two data subjects (s1, s2) in the SAME tenant 'a', with distinct runs/cost/audit."""
+    storage = client.app.state.container.storage  # type: ignore[attr-defined]
+    audit = client.app.state.security_audit  # type: ignore[attr-defined]
+
+    # Subject s1 (alice's own): one run + one cost event.
+    await storage.save_run(
+        RunRecord(
+            run_id="a1",
+            workspace_id="a",
+            subject_id="s1",
+            status=RunStatus.SUCCEEDED,
+            trace_id="ta1",
+            model_key="gpt-4o",
+            metadata={},
+        )
+    )
+    await storage.append_event(
+        RunEvent(
+            event_type=EventType.INFERENCE_SUCCEEDED,
+            trace_id="ta1",
+            agent_id="agent-alice",
+            workspace_id="a",
+            cost=2.0,
+            payload={"input_tokens": 100, "output_tokens": 50},
+        )
+    )
+    # Subject s2 (a SIBLING in the same tenant): must NOT leak to alice.
+    await storage.save_run(
+        RunRecord(
+            run_id="a2",
+            workspace_id="a",
+            subject_id="s2",
+            status=RunStatus.SUCCEEDED,
+            trace_id="ta2",
+            model_key="claude",
+            metadata={},
+        )
+    )
+    await storage.append_event(
+        RunEvent(
+            event_type=EventType.INFERENCE_SUCCEEDED,
+            trace_id="ta2",
+            agent_id="agent-bob",
+            workspace_id="a",
+            cost=77.0,
+            payload={"input_tokens": 999, "output_tokens": 999},
+        )
+    )
+    # Audit rows attributed to each subject.
+    audit.record(
+        SecurityEvent(
+            event_type="access",
+            outcome="allow",
+            workspace_id="a",
+            actor={"subject": "s1"},
+            resource="run",
+            action="read",
+            detail="alice own action",
+        )
+    )
+    audit.record(
+        SecurityEvent(
+            event_type="access",
+            outcome="allow",
+            workspace_id="a",
+            actor={"subject": "s2"},
+            resource="run",
+            action="read",
+            detail="bob private action",
+        )
+    )
+
+
+def test_subject_scoped_console_sees_only_own_subject(ee_console: None) -> None:
+    """ee sec-r1: a ``subject_scoped`` viewer's overview is pinned to its OWN subject.
+
+    A sibling subject's runs / cost / tokens / audit detail in the SAME tenant must never
+    appear — the console must mirror the ``/v1/runs`` subject narrowing, not just the
+    tenant axis.
+    """
+    import anyio
+
+    client = _app_subject_scoped()
+    anyio.run(_seed_two_subjects, client)
+
+    body = client.get(
+        "/v1/enterprise/overview",
+        headers={"x-himmy-internal-key": "alice"},
+    ).json()
+
+    # Only s1's single run — s2's run is invisible.
+    assert body["runs"]["total"] == 1
+    # Only s1's cost (2.0); s2's 77.0 must be excluded.
+    assert body["cost_total"] == pytest.approx(2.0)
+    assert "agent-bob" not in {b["key"] for b in body["cost_by_agent"]}
+    assert "claude" not in {b["key"] for b in body["cost_by_model"]}
+    # Audit: only s1's own actor rows — bob's private detail never leaks.
+    details = {e["detail"] for e in body["recent_events"]}
+    assert "alice own action" in details
+    assert "bob private action" not in details
+
+
+def test_unscoped_operator_still_sees_full_workspace(ee_console: None) -> None:
+    """The non-subject-scoped operator keeps the full-workspace rollup (byte-unchanged)."""
+    import anyio
+
+    client = _app_subject_scoped()
+    anyio.run(_seed_two_subjects, client)
+
+    body = client.get(
+        "/v1/enterprise/overview",
+        headers={"x-himmy-internal-key": "op-a"},
+    ).json()
+    # Both subjects' runs + cost are visible to the unscoped operator.
+    assert body["runs"]["total"] == 2
+    assert body["cost_total"] == pytest.approx(79.0)
+
+
+def test_overview_windows_event_scan(ee_console: None, monkeypatch: Any) -> None:
+    """ee sec-r1: the cost pass is WINDOWED, not an unbounded full-history load.
+
+    Asserts ``list_events`` is called with a finite ``limit`` (the cap) rather than
+    ``None`` (load-everything), so a single request cannot materialize an unbounded set.
+    """
+    import anyio
+
+    import himmy.api.routers.enterprise as ent
+
+    client = _app()
+    anyio.run(_seed, client)
+
+    storage = client.app.state.container.storage  # type: ignore[attr-defined]
+    seen: dict[str, Any] = {}
+    orig = storage.list_events
+
+    async def _spy(*args: Any, **kwargs: Any) -> Any:
+        seen["limit"] = kwargs.get("limit")
+        return await orig(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "list_events", _spy)
+
+    resp = client.get(
+        "/v1/enterprise/overview?workspace_id=a",
+        headers={"x-himmy-internal-key": "op-a"},
+    )
+    assert resp.status_code == 200
+    # A finite, non-None cap was passed (the DoS window), matching the module constant.
+    assert seen["limit"] == ent._MAX_COST_EVENTS
+    assert seen["limit"] is not None

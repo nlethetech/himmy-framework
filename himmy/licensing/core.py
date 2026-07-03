@@ -236,7 +236,7 @@ def license_file_path() -> str:
 
 @dataclass(frozen=True)
 class _Resolution:
-    """The process-cached resolution of the active license posture."""
+    """The resolution of the active license posture at a point in time."""
 
     edition: Edition
     entitlements: frozenset[str]
@@ -244,46 +244,80 @@ class _Resolution:
     reason: str
 
 
-_CACHE: _Resolution | None = None
+@dataclass(frozen=True)
+class _Verified:
+    """The cached, token-keyed result of the (relatively costly) SIGNATURE verification.
+
+    We cache only what is invariant for a given raw token — the Ed25519-verified
+    :class:`License` (or ``None`` for a bad/absent token). We do NOT cache the final
+    edition/entitlement verdict, because that depends on wall-clock time (expiry) and must
+    be re-evaluated live on every read. Keying on the raw token also makes install / remove
+    / rotation live: a changed token source misses the cache and re-verifies, so a
+    running server honours a removed or swapped license without a restart.
+    """
+
+    token: str | None
+    license: License | None
+
+
+_CACHE: _Verified | None = None
+
+
+def _verified_license() -> tuple[str | None, License | None]:
+    """Return the current ``(token, verified License|None)``, caching only the verify step.
+
+    The raw token source is read on EVERY call (cheap: env/file/secret) so install, removal
+    and rotation are picked up live. The expensive Ed25519 verification is memoized, but
+    ONLY while the raw token is byte-identical to the cached one — a different (or absent)
+    token invalidates the cache and re-verifies. Crucially this returns the parsed License
+    regardless of expiry; expiry is evaluated by :func:`_resolve` at read time.
+    """
+    global _CACHE
+    token = _load_license_token()
+    cached = _CACHE
+    if cached is not None and cached.token == token:
+        return cached.token, cached.license
+    lic = verify_license(token) if token else None
+    _CACHE = _Verified(token=token, license=lic)
+    return token, lic
 
 
 def _resolve() -> _Resolution:
-    """Resolve (and process-cache) the active edition + entitlements, fail-closed.
+    """Resolve the active edition + entitlements, fail-closed, with LIVE expiry.
 
     Every failure mode — no token, bad signature, wrong edition, expired, or a decode
     fault — resolves to community with empty entitlements. Only a validly-signed,
     unexpired, enterprise-edition license grants entitlements (intersected with the
     registry so a forged feature name a signer never should mint still can't leak).
+
+    Expiry is re-checked on every call against the current wall clock, so a license that
+    expires mid-process stops granting Enterprise the instant it lapses — the cache holds
+    only the token-keyed signature verification, never the time-sensitive verdict. This is
+    still fully offline: no network, no phone-home (Ed25519 verify is microseconds and the
+    token source read is a local env/file/secret lookup).
     """
-    global _CACHE
-    if _CACHE is not None:
-        return _CACHE
-
-    token = _load_license_token()
+    token, lic = _verified_license()
     if not token:
-        _CACHE = _Resolution(Edition.COMMUNITY, frozenset(), None, "no-license")
-        return _CACHE
-
-    lic = verify_license(token)
+        return _Resolution(Edition.COMMUNITY, frozenset(), None, "no-license")
     if lic is None:
-        _CACHE = _Resolution(
-            Edition.COMMUNITY, frozenset(), None, "invalid-signature"
-        )
-        return _CACHE
+        return _Resolution(Edition.COMMUNITY, frozenset(), None, "invalid-signature")
     if lic.edition is not Edition.ENTERPRISE:
-        _CACHE = _Resolution(Edition.COMMUNITY, frozenset(), lic, "not-enterprise")
-        return _CACHE
+        return _Resolution(Edition.COMMUNITY, frozenset(), lic, "not-enterprise")
     if lic.is_expired():
-        _CACHE = _Resolution(Edition.COMMUNITY, frozenset(), lic, "expired")
-        return _CACHE
+        return _Resolution(Edition.COMMUNITY, frozenset(), lic, "expired")
 
     entitlements = frozenset(lic.features) & FEATURE_REGISTRY
-    _CACHE = _Resolution(Edition.ENTERPRISE, entitlements, lic, "ok")
-    return _CACHE
+    return _Resolution(Edition.ENTERPRISE, entitlements, lic, "ok")
 
 
 def reset_license_cache() -> None:
-    """Clear the process cache so the next lookup re-resolves (test hook / after install)."""
+    """Clear the verification cache so the next lookup re-reads + re-verifies the token.
+
+    A test hook / post-install nicety. Note that correctness no longer DEPENDS on this
+    being called: the token source is re-read on every resolution and expiry is evaluated
+    live, so install / removal / rotation / expiry are all honoured without an explicit
+    reset (this just drops the memoized signature check).
+    """
     global _CACHE
     _CACHE = None
 

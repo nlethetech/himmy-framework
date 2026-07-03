@@ -177,6 +177,77 @@ def test_require_entitlement_raises_clear_error():
     assert excinfo.value.feature == FEATURE_OIDC_SSO
 
 
+def test_expiry_enforced_live_with_warm_cache(monkeypatch):
+    """ee sec-r1: an EE license that lapses MID-PROCESS stops granting Enterprise live.
+
+    The old resolver memoized the full verdict on first touch, so an expired license kept
+    granting Enterprise for the whole process uptime (server restart the only revocation).
+    Now expiry is re-evaluated on every read against the wall clock, so a warm cache does
+    NOT let a lapsed license keep serving Enterprise.
+    """
+    priv, pub_hex = _keypair()
+    monkeypatch.setattr(lic, "LICENSE_PUBLIC_KEY_HEX", pub_hex)
+    # A license that expires 5s from "now".
+    expires_at = 1_000_000_000
+    token = _mint(priv, features=[FEATURE_OIDC_SSO], expires_at=expires_at)
+    monkeypatch.setenv(lic.HIMMY_LICENSE_KEY_ENV, token)
+    reset_license_cache()
+
+    # BEFORE expiry: warm the cache with a valid ENTERPRISE resolution.
+    monkeypatch.setattr(lic.time, "time", lambda: expires_at - 5)
+    assert current_edition() is Edition.ENTERPRISE
+    require_entitlement(FEATURE_OIDC_SSO)  # entitled
+
+    # Advance the clock PAST expires_at WITHOUT resetting the cache (the server never resets).
+    monkeypatch.setattr(lic.time, "time", lambda: expires_at + 5)
+    assert current_edition() is Edition.COMMUNITY
+    assert current_entitlements() == frozenset()
+    assert lic.resolution_reason() == "expired"
+    with pytest.raises(EnterpriseFeatureError):
+        require_entitlement(FEATURE_OIDC_SSO)
+
+
+def test_removed_license_revokes_live_with_warm_cache(monkeypatch):
+    """ee sec-r1: DELETING/unsetting the license revokes Enterprise on a running process.
+
+    The old resolver never re-read the token source once cached, so a removed license kept
+    granting Enterprise until restart. The token source is now re-read on every resolution,
+    so unsetting it drops to community immediately — no restart, no explicit reset.
+    """
+    priv, pub_hex = _keypair()
+    monkeypatch.setattr(lic, "LICENSE_PUBLIC_KEY_HEX", pub_hex)
+    token = _mint(priv, features=[FEATURE_OIDC_SSO])
+    monkeypatch.setenv(lic.HIMMY_LICENSE_KEY_ENV, token)
+    reset_license_cache()
+
+    # Warm the cache with an ENTERPRISE resolution.
+    assert current_edition() is Edition.ENTERPRISE
+
+    # Operator revokes: unset the env var (and no file/secret backs it). NO cache reset.
+    monkeypatch.delenv(lic.HIMMY_LICENSE_KEY_ENV, raising=False)
+    assert current_edition() is Edition.COMMUNITY
+    assert current_entitlements() == frozenset()
+    with pytest.raises(EnterpriseFeatureError):
+        require_entitlement(FEATURE_OIDC_SSO)
+
+
+def test_rotated_license_swaps_features_live_with_warm_cache(monkeypatch):
+    """ee sec-r1: rotating the token to a DIFFERENT license is picked up without a reset."""
+    priv, pub_hex = _keypair()
+    monkeypatch.setattr(lic, "LICENSE_PUBLIC_KEY_HEX", pub_hex)
+    monkeypatch.setenv(
+        lic.HIMMY_LICENSE_KEY_ENV, _mint(priv, features=[FEATURE_OIDC_SSO])
+    )
+    reset_license_cache()
+    assert current_entitlements() == frozenset({FEATURE_OIDC_SSO})
+
+    # Rotate to a license carrying a DIFFERENT feature — no explicit reset.
+    monkeypatch.setenv(
+        lic.HIMMY_LICENSE_KEY_ENV, _mint(priv, features=[FEATURE_AUDIT_EXPORT])
+    )
+    assert current_entitlements() == frozenset({FEATURE_AUDIT_EXPORT})
+
+
 def test_verification_is_offline(monkeypatch):
     # Assert no socket is ever opened during resolution/verification.
     def _boom(*a, **k):  # noqa: ANN002, ANN003
