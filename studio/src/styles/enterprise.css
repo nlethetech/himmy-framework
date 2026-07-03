@@ -1,0 +1,165 @@
+/* Enterprise Edition governance console — cost cards, runs, audit, agents. */
+
+.ent-dim {
+  color: var(--text-dim);
+}
+
+/* Header row: edition + backend badges. */
+.ent-badges {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.ent-badge {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+.ent-badge.ee {
+  border-color: var(--accent-line);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.ent-badge.ok {
+  color: #4ea076;
+  border-color: #2a5a44;
+}
+.ent-badge.warn {
+  color: #c88a3a;
+  border-color: #5a4426;
+}
+
+/* Cost cards. */
+.ent-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+.ent-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+  padding: 14px 16px;
+}
+.ent-card-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-dim);
+}
+.ent-card-value {
+  font-size: 24px;
+  font-weight: 600;
+  margin-top: 4px;
+}
+.ent-card-value.accent {
+  color: var(--accent);
+}
+
+/* Two-column layout for the breakdown tables. */
+.ent-grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+@media (max-width: 760px) {
+  .ent-grid2 {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* A simple breakdown row: label · bar · value. */
+.ent-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+}
+.ent-row:last-child {
+  border-bottom: none;
+}
+.ent-row-key {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ent-row-val {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+}
+.ent-row-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* Status chips for the runs rollup. */
+.ent-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.ent-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 12px;
+}
+.ent-status b {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Audit / security events. */
+.ent-evt {
+  display: grid;
+  grid-template-columns: 130px 90px 1fr;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.ent-evt:last-child {
+  border-bottom: none;
+}
+.ent-evt-deny {
+  color: #c86a6a;
+}
+.ent-evt-allow {
+  color: #4ea076;
+}
+
+/* Community upsell state. */
+.ent-upsell {
+  border: 1px solid var(--accent-line);
+  background: var(--accent-soft);
+  border-radius: 12px;
+  padding: 28px;
+  text-align: center;
+  max-width: 560px;
+  margin: 40px auto;
+}
+.ent-upsell h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+.ent-upsell p {
+  color: var(--text-dim);
+  margin: 0 0 14px;
+  line-height: 1.5;
+}
+.ent-upsell code {
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 2px 6px;
+}

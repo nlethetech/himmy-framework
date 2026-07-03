@@ -320,6 +320,26 @@
         "title": "AgentSpec",
         "type": "object"
       },
+      "AgentsSummary": {
+        "description": "The tenant's registered agents (count + a light listing).",
+        "properties": {
+          "agents": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Agents",
+            "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "title": "AgentsSummary",
+        "type": "object"
+      },
       "ApprovalDecisionRequest": {
         "description": "Optional body for approve/reject: an explicit workspace scope (else inferred).",
         "properties": {
@@ -934,6 +954,40 @@
         "title": "ContextSpecKey",
         "type": "object"
       },
+      "CostBucket": {
+        "description": "A cost + call-count rollup for one attribution key (an agent or a model).",
+        "properties": {
+          "calls": {
+            "default": 0,
+            "title": "Calls",
+            "type": "integer"
+          },
+          "cost": {
+            "default": 0.0,
+            "title": "Cost",
+            "type": "number"
+          },
+          "input_tokens": {
+            "default": 0,
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "output_tokens": {
+            "default": 0,
+            "title": "Output Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "CostBucket",
+        "type": "object"
+      },
       "CreateAgentRequest": {
         "description": "The POST /v1/agents body: the target workspace + the agent spec + idempotency.\n\n``spec`` is a full :class:`AgentSpec` (the same declarative shape as ``agent.yaml``).\nIts operator-only fields are sanitized server-side before persistence.",
         "properties": {
@@ -1496,6 +1550,69 @@
         "title": "DocumentView",
         "type": "object"
       },
+      "EnterpriseOverview": {
+        "description": "The one-call governance / observability / cost rollup (tenant-scoped).",
+        "properties": {
+          "agents": {
+            "$ref": "#/components/schemas/AgentsSummary"
+          },
+          "cost_by_agent": {
+            "items": {
+              "$ref": "#/components/schemas/CostBucket"
+            },
+            "title": "Cost By Agent",
+            "type": "array"
+          },
+          "cost_by_model": {
+            "items": {
+              "$ref": "#/components/schemas/CostBucket"
+            },
+            "title": "Cost By Model",
+            "type": "array"
+          },
+          "cost_total": {
+            "default": 0.0,
+            "title": "Cost Total",
+            "type": "number"
+          },
+          "health": {
+            "$ref": "#/components/schemas/HealthSummary"
+          },
+          "rbac": {
+            "$ref": "#/components/schemas/RbacSummary"
+          },
+          "recent_events": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Recent Events",
+            "type": "array"
+          },
+          "runs": {
+            "$ref": "#/components/schemas/RunsSummary"
+          },
+          "workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Id"
+          }
+        },
+        "required": [
+          "agents",
+          "runs",
+          "rbac",
+          "health"
+        ],
+        "title": "EnterpriseOverview",
+        "type": "object"
+      },
       "ErrorResponse": {
         "description": "The consistent error envelope returned for handled failures (AAEO-9).",
         "properties": {
@@ -1748,6 +1865,35 @@
       },
       "HTTPValidationError": {
         "x-framework-generated": "validation-error-envelope"
+      },
+      "HealthSummary": {
+        "description": "Health / readiness truth for the console header.",
+        "properties": {
+          "backend": {
+            "title": "Backend",
+            "type": "string"
+          },
+          "durable": {
+            "title": "Durable",
+            "type": "boolean"
+          },
+          "edition": {
+            "title": "Edition",
+            "type": "string"
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "edition",
+          "backend",
+          "durable",
+          "ready"
+        ],
+        "title": "HealthSummary",
+        "type": "object"
       },
       "HttpToolSpec": {
         "additionalProperties": false,
@@ -2457,6 +2603,27 @@
         "title": "Purpose",
         "type": "string"
       },
+      "RbacSummary": {
+        "description": "The active RBAC policy shape: roles and their permission counts.",
+        "properties": {
+          "permission_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Permission Counts",
+            "type": "object"
+          },
+          "roles": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Roles",
+            "type": "array"
+          }
+        },
+        "title": "RbacSummary",
+        "type": "object"
+      },
       "RecommendationItem": {
         "description": "A dashboard-facing advisory output, extracted from a run's structured output.",
         "properties": {
@@ -2967,6 +3134,25 @@
           "prompt"
         ],
         "title": "RunWorkflowRequest",
+        "type": "object"
+      },
+      "RunsSummary": {
+        "description": "A runs rollup: total + count by lifecycle status.",
+        "properties": {
+          "by_status": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "By Status",
+            "type": "object"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "title": "RunsSummary",
         "type": "object"
       },
       "Schedule": {
@@ -5450,6 +5636,84 @@
         "summary": "Diagnostics",
         "tags": [
           "diagnostics"
+        ]
+      }
+    },
+    "/v1/enterprise/overview": {
+      "get": {
+        "description": "Return the governance / cost rollup for the caller's tenant (Enterprise Edition).\n\nEdition-gated: a community install is refused **402** with the upgrade message (the\nOSS core is untouched). RBAC-gated: the caller must hold ``dashboard:read`` (**403**\notherwise). Tenant-scoped: :func:`resolve_workspace` pins the rollup to the caller's\nauthorized workspace, so a tenant-bound principal never aggregates across tenants; an\n``all_tenants`` principal sees the unscoped rollup.\n\nThe rollup issues a fixed, bounded set of store reads and aggregates in memory (no\nN+1). Cost is attributed from the terminal inference events' ``cost`` field \u2014 per agent\n(the event ``agent_id``) and per model (the run's ``model_key``, joined by ``trace_id``).",
+        "operationId": "enterprise_overview_v1_enterprise_overview_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "workspace_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace Id"
+            }
+          },
+          {
+            "description": "recent security-event rows to include",
+            "in": "query",
+            "name": "events_limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "description": "recent security-event rows to include",
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Events Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "agents listed in the summary (count is unbounded)",
+            "in": "query",
+            "name": "agents_limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "agents listed in the summary (count is unbounded)",
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Agents Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnterpriseOverview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enterprise Overview",
+        "tags": [
+          "enterprise"
         ]
       }
     },

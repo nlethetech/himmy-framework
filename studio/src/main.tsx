@@ -36,6 +36,7 @@ import Routines from "./screens/Routines";
 import Projects from "./screens/Projects";
 import Mcp from "./screens/Mcp";
 import Learning from "./screens/Learning";
+import Enterprise from "./screens/Enterprise";
 import "./index.css";
 
 // New task-first IA. Screens not yet built (Home/Connections/Approvals) render a
@@ -84,6 +85,7 @@ const router = createBrowserRouter([
       { path: "advanced/eval", element: <Evaluation /> },
       { path: "advanced/lineage", element: <Lineage /> },
       { path: "advanced/learning", element: <Learning /> },
+      { path: "advanced/enterprise", element: <Enterprise /> },
       // legacy redirects (one release)
       { path: "runs", element: <Navigate to="/activity" replace /> },
       { path: "runs/:runId", element: <Navigate to="/activity" replace /> },

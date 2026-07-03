@@ -36,6 +36,7 @@ from himmy.api.routers import (
     context,
     dashboard,
     diagnostics,
+    enterprise,
     evaluation,
     knowledge,
     models,
@@ -765,6 +766,7 @@ def create_app(
     app.include_router(workflows.router)
     app.include_router(recommendations.router)
     app.include_router(dashboard.router)
+    app.include_router(enterprise.router)
     app.include_router(evaluation.router)
     app.include_router(models.router)
     app.include_router(diagnostics.router)
