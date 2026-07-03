@@ -189,6 +189,36 @@ class EntityRegistry:
         with self._lock:
             return [self._shield(r) for r in self._records.values() if r.kind == kind]
 
+    def list_recent_by_kind(
+        self,
+        kind: str,
+        *,
+        limit: int,
+        metadata_filters: dict[str, Any] | None = None,
+    ) -> list[EntityRecord]:
+        """Return the newest ``limit`` records of ``kind``, filtered by metadata.
+
+        The in-memory twin of :meth:`SqliteEntityRegistry.list_recent_by_kind` (red-team
+        ee sec-r2): applies the exact-match ``metadata_filters`` and orders by
+        ``created_at`` (ISO-8601, lexicographically sortable) newest-first BEFORE slicing
+        to ``limit``, so scoping never drops an in-window row. A non-positive ``limit``
+        yields ``[]``. The volatile backend still walks its dict (there is no index to push
+        into), but it returns the same bounded, ordered window as the durable spine so a
+        single API surface can rely on the fast-path contract regardless of backend.
+        """
+        if limit <= 0:
+            return []
+        filters = metadata_filters or {}
+        with self._lock:
+            matches = [
+                r
+                for r in self._records.values()
+                if r.kind == kind
+                and all(r.metadata.get(k) == v for k, v in filters.items())
+            ]
+        matches.sort(key=lambda r: r.created_at, reverse=True)
+        return [self._shield(r) for r in matches[:limit]]
+
     def query(self, q: EntityQuery) -> list[EntityRecord]:
         """Return records matching the supplied query filter.
 

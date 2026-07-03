@@ -487,6 +487,41 @@ class SqliteEntityRegistry:
         ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
+    def list_recent_by_kind(
+        self,
+        kind: str,
+        *,
+        limit: int,
+        metadata_filters: dict[str, Any] | None = None,
+    ) -> list[EntityRecord]:
+        """Return the newest ``limit`` records of ``kind``, filtered DB-side.
+
+        Unlike :meth:`list_by_kind` (which materializes the ENTIRE history of a kind
+        and leaves ordering/limiting to the caller — an unbounded scan a hot read path
+        like the enterprise overview cannot afford, red-team ee sec-r2), this pushes the
+        ``metadata_filters`` (exact JSON-value matches on top-level ``metadata`` keys,
+        via ``json_extract``) plus ``ORDER BY created_at DESC LIMIT ?`` into SQL. Only
+        ``limit`` rows are ever read/decoded regardless of lifetime history, and the
+        filter runs BEFORE the limit so no in-window row is silently dropped. A
+        non-positive ``limit`` yields ``[]``. ``created_at`` is a lexicographically
+        sortable ISO-8601 timestamp, so DESC string ordering is newest-first.
+        """
+        if limit <= 0:
+            return []
+        clauses = ["kind = ?"]
+        params: list[Any] = [kind]
+        for key, value in (metadata_filters or {}).items():
+            clauses.append("json_extract(metadata, ?) = ?")
+            params.extend([f"$.{key}", value])
+        params.append(limit)
+        where = " AND ".join(clauses)
+        rows = self._conn.execute(
+            f"SELECT {_REC_COLS} FROM entity_records WHERE {where} "
+            "ORDER BY created_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
     def query(self, q: EntityQuery) -> list[EntityRecord]:
         """Return records matching the query (metadata filters applied in Python)."""
         clauses: list[str] = []

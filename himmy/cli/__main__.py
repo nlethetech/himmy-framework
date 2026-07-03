@@ -23,6 +23,7 @@ from himmy.cli.consent import add_consent_parser
 from himmy.cli.context_cmd import add_context_parser
 from himmy.cli.dashboard_cmd import add_dashboard_parser
 from himmy.cli.learned_cmd import add_learned_parser
+from himmy.cli.license_cmd import add_license_parser
 from himmy.cli.models_cmd import cmd_compare, cmd_models
 from himmy.cli.provider import PROVIDERS
 from himmy.cli.recommendations_cmd import add_recommendations_parser
@@ -837,6 +838,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_dashboard_parser(sub)
     add_consent_parser(sub)
     add_audit_parser(sub)
+    add_license_parser(sub)
     add_seclog_parser(sub)
     add_learned_parser(sub)
 

@@ -14,11 +14,40 @@ pytest.importorskip("cryptography")
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import himmy.licensing.core as _lic  # noqa: E402
 from himmy.api import ApiContainer, create_app  # noqa: E402
 from himmy.api.auth.base import AuthError  # noqa: E402
 from himmy.api.auth.context import build_authenticator  # noqa: E402
 from himmy.api.auth.oidc import OidcAuthenticator  # noqa: E402
 from tests.conftest import run_async  # noqa: E402
+
+
+@pytest.fixture
+def ee_oidc_sso(monkeypatch: Any) -> None:
+    """Grant the ``oidc_sso`` Enterprise entitlement (OIDC build is EE-gated)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    priv = Ed25519PrivateKey.generate()
+    pub_hex = priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+    payload = {
+        "license_id": "lic-test",
+        "edition": "enterprise",
+        "features": ["oidc_sso"],
+        "customer": "Test",
+        "issued_at": int(time.time()),
+        "expires_at": 0,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    token = f"{_lic._b64url_encode(raw)}.{_lic._b64url_encode(priv.sign(raw))}"
+    monkeypatch.setattr(_lic, "LICENSE_PUBLIC_KEY_HEX", pub_hex)
+    monkeypatch.setenv(_lic.HIMMY_LICENSE_KEY_ENV, token)
+    _lic.reset_license_cache()
+    yield
+    _lic.reset_license_cache()
+
 
 _ISS = "https://issuer.example"
 _AUD = "himmy-api"
@@ -215,7 +244,25 @@ def test_openapi_advertises_bearer_scheme() -> None:
 
 
 # ------------------------------------------------------------------- from_env
-def test_build_authenticator_selects_oidc(monkeypatch: Any) -> None:
+def test_oidc_from_env_gated_on_community(monkeypatch: Any) -> None:
+    """Without an EE license, building the OIDC authenticator raises the upgrade error."""
+    from himmy.licensing import EnterpriseFeatureError
+
+    monkeypatch.delenv(_lic.HIMMY_LICENSE_KEY_ENV, raising=False)
+    monkeypatch.setattr(_lic, "license_file_path", lambda: "/nonexistent/license")
+    monkeypatch.setattr("himmy.config.secrets.get_secret", lambda *a, **k: None)
+    _lic.reset_license_cache()
+    monkeypatch.setenv("HIMMY_OIDC_ISSUER", _ISS)
+    monkeypatch.setenv("HIMMY_OIDC_AUDIENCE", _AUD)
+    with pytest.raises(EnterpriseFeatureError) as excinfo:
+        OidcAuthenticator.from_env()
+    assert "oidc_sso is an Enterprise Edition feature" in str(excinfo.value)
+    _lic.reset_license_cache()
+
+
+def test_build_authenticator_selects_oidc(
+    monkeypatch: Any, ee_oidc_sso: None
+) -> None:
     monkeypatch.setenv("HIMMY_AUTH_MODE", "oidc")
     monkeypatch.setenv("HIMMY_OIDC_ISSUER", _ISS)
     monkeypatch.setenv("HIMMY_OIDC_AUDIENCE", _AUD)
@@ -224,7 +271,9 @@ def test_build_authenticator_selects_oidc(monkeypatch: Any) -> None:
     assert isinstance(auth, OidcAuthenticator)
 
 
-def test_oidc_from_env_requires_issuer_and_audience(monkeypatch: Any) -> None:
+def test_oidc_from_env_requires_issuer_and_audience(
+    monkeypatch: Any, ee_oidc_sso: None
+) -> None:
     monkeypatch.setenv("HIMMY_AUTH_MODE", "oidc")
     monkeypatch.delenv("HIMMY_OIDC_ISSUER", raising=False)
     monkeypatch.delenv("HIMMY_OIDC_AUDIENCE", raising=False)
@@ -266,7 +315,9 @@ def test_oidc_subject_scoped_admin_role_crosses_subjects() -> None:
     assert p.may_access_subject("bob") is True
 
 
-def test_oidc_from_env_reads_subject_scoped_flag(monkeypatch: Any) -> None:
+def test_oidc_from_env_reads_subject_scoped_flag(
+    monkeypatch: Any, ee_oidc_sso: None
+) -> None:
     """``HIMMY_OIDC_SUBJECT_SCOPED`` opts the env-built OIDC authenticator into BOLA."""
     monkeypatch.setenv("HIMMY_AUTH_MODE", "oidc")
     monkeypatch.setenv("HIMMY_OIDC_ISSUER", _ISS)

@@ -91,7 +91,18 @@ async def run_privacy_audit(
     signed: AuditBundle | None = None
     if bundle:
         from himmy.core.errors import HimmyError
+        from himmy.licensing import (
+            FEATURE_AUDIT_EXPORT,
+            EnterpriseFeatureError,
+            require_entitlement,
+        )
 
+        # Signed audit-bundle EXPORT is an Enterprise Edition feature (the free scan and
+        # its report above are unaffected). Community gets a 402 with the upgrade message.
+        try:
+            require_entitlement(FEATURE_AUDIT_EXPORT)
+        except EnterpriseFeatureError as exc:
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
         try:
             signed = service.export_signed_bundle(report)
         except HimmyError as exc:

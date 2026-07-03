@@ -45,6 +45,57 @@ def test_record_and_recent_filters() -> None:
     assert len(log.recent(limit=1)) == 1
 
 
+def test_recent_windows_metadata_filtered_reads(tmp_path: object) -> None:
+    """ee sec-r2: metadata-backed filters take the bounded DB-side reader, never a full scan.
+
+    ``workspace_id`` / ``actor_subject`` live in each record's ``metadata``, so a
+    metadata-only ``recent()`` must delegate to ``list_recent_by_kind`` (windowed +
+    ``LIMIT`` pushed down) and must NOT call the unbounded ``list_by_kind`` that
+    materializes+validates the whole audit history. Exercised on BOTH backends.
+    """
+    import os
+
+    from himmy.entities.sqlite_registry import SqliteEntityRegistry
+
+    mem = EntityRegistry()
+    sql = SqliteEntityRegistry(os.path.join(str(tmp_path), "spine.db"))
+    try:
+        for reg in (mem, sql):
+            log = SecurityAuditLog(reg)
+            for i in range(50):
+                log.record(
+                    SecurityEvent(
+                        event_type="authz_denied",
+                        outcome="deny",
+                        workspace_id="t" if i % 2 == 0 else "other",
+                        actor={"subject": "mallory" if i % 2 == 0 else "eve"},
+                    )
+                )
+
+            full_calls = {"n": 0}
+            orig_full = reg.list_by_kind
+
+            def _spy(kind: str, _orig: object = orig_full, _c: object = full_calls) -> object:
+                _c["n"] += 1  # type: ignore[index]
+                return _orig(kind)  # type: ignore[operator]
+
+            reg.list_by_kind = _spy  # type: ignore[method-assign,assignment]
+
+            # Metadata-backed filter → bounded reader only, no full scan, correct rows.
+            got = log.recent(limit=5, workspace_id="t", actor_subject="mallory")
+            assert full_calls["n"] == 0
+            assert len(got) == 5
+            assert all(e.workspace_id == "t" for e in got)
+            assert all(e.actor["subject"] == "mallory" for e in got)
+
+            # The non-metadata filters (event_type / workspace_ids) still fall back —
+            # they must remain correct even though they take the full-history path.
+            reg.list_by_kind = orig_full  # type: ignore[method-assign,assignment]
+            assert len(log.recent(event_type="authz_denied", limit=100)) == 50
+    finally:
+        sql.close()
+
+
 def test_events_are_stored_as_security_event_entities() -> None:
     log, reg = _log()
     log.record(SecurityEvent(event_type="access", actor={"subject": "a"}))
