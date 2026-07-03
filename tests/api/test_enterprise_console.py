@@ -484,3 +484,46 @@ def test_overview_windows_event_scan(ee_console: None, monkeypatch: Any) -> None
     # A finite, non-None cap was passed (the DoS window), matching the module constant.
     assert seen["limit"] == ent._MAX_COST_EVENTS
     assert seen["limit"] is not None
+
+
+def test_overview_audit_scan_is_bounded(ee_console: None) -> None:
+    """ee sec-r2: the overview's audit pass NEVER materializes the full history.
+
+    The recent-events step used to load+pydantic-validate every ``security_event`` row
+    (``list_by_kind``) before slicing to ``events_limit``, so per-request work grew with
+    lifetime audit history while output stayed ~20 rows — an asymmetric DoS. This asserts
+    the hot path now takes the DB-side windowed reader (``list_recent_by_kind`` with a
+    finite limit) and NEVER touches the unbounded ``list_by_kind``.
+    """
+    import anyio
+
+    client = _app()
+    anyio.run(_seed, client)
+
+    audit = client.app.state.security_audit  # type: ignore[attr-defined]
+    registry = audit._registry
+    calls: dict[str, Any] = {"list_by_kind": 0, "windowed_limit": None}
+
+    orig_full = registry.list_by_kind
+    orig_window = registry.list_recent_by_kind
+
+    def _spy_full(kind: str) -> Any:
+        calls["list_by_kind"] += 1
+        return orig_full(kind)
+
+    def _spy_window(kind: str, *, limit: int, metadata_filters: Any = None) -> Any:
+        calls["windowed_limit"] = limit
+        return orig_window(kind, limit=limit, metadata_filters=metadata_filters)
+
+    registry.list_by_kind = _spy_full  # type: ignore[method-assign]
+    registry.list_recent_by_kind = _spy_window  # type: ignore[method-assign]
+
+    resp = client.get(
+        "/v1/enterprise/overview?workspace_id=a&events_limit=20",
+        headers={"x-himmy-internal-key": "op-a"},
+    )
+    assert resp.status_code == 200, resp.text
+    # The unbounded full-history scan was NOT used on the overview audit path...
+    assert calls["list_by_kind"] == 0
+    # ...and the bounded reader ran with the finite output window, not load-everything.
+    assert calls["windowed_limit"] == 20
