@@ -7,7 +7,13 @@ import stays light and fully offline.
 
 from __future__ import annotations
 
+import os
 from typing import Any
+
+# Disable pydantic's logfire plugin autoload before the first BaseModel build: himmy
+# never calls instrument_pydantic(), so the plugin only adds ~0.35-0.44s import cost
+# (pulls in logfire+requests) per process. setdefault lets an explicit user override win.
+os.environ.setdefault("PYDANTIC_DISABLE_PLUGINS", "logfire-plugin")
 
 from himmy.agents.base_agent.agent import Agent
 from himmy.agents.base_agent.task import Task

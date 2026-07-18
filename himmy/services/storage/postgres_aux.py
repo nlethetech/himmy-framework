@@ -693,7 +693,8 @@ class _AsyncConversationStore:
         extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT *, ("
+                "SELECT c.conversation_id, c.origin, c.title, c.agent_path, c.provider, "
+                "c.project_id, c.created_at, c.updated_at, ("
                 "  SELECT COUNT(*) FROM aux_conversation_messages m "
                 "  WHERE m.tenant = c.tenant "
                 "  AND m.conversation_id = c.conversation_id) AS n "
@@ -1019,7 +1020,8 @@ class _AsyncConversationStore:
         extra = f" AND {pred}" if pred else ""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT c.*, ("
+                "SELECT c.conversation_id, c.origin, c.title, c.agent_path, c.provider, "
+                "c.project_id, c.created_at, c.updated_at, ("
                 "  SELECT COUNT(*) FROM aux_conversation_messages m "
                 "  WHERE m.tenant = c.tenant "
                 "  AND m.conversation_id = c.conversation_id) AS n "

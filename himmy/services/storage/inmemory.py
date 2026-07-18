@@ -549,6 +549,35 @@ class InMemoryRunStore:
             and (status is None or r.status == status)
         ]
 
+    async def count_runs(
+        self,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        status: RunStatus | None = None,
+        *,
+        exclude_local_workspace: bool = False,
+    ) -> int:
+        """Count runs matching the filter without materializing the rows.
+
+        ``exclude_local_workspace`` (only meaningful when ``workspace_id is None``)
+        drops the reserved ``__local__`` runs so the count matches the all-workspaces
+        list view (T2-runs-pagination).
+        """
+        from himmy.services.storage.models import LOCAL_WORKSPACE
+
+        return sum(
+            1
+            for r in self._runs.values()
+            if (workspace_id is None or r.workspace_id == workspace_id)
+            and (subject_id is None or r.subject_id == subject_id)
+            and (status is None or r.status == status)
+            and not (
+                exclude_local_workspace
+                and workspace_id is None
+                and r.workspace_id == LOCAL_WORKSPACE
+            )
+        )
+
     async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
         """Count a workspace's non-terminal (in-flight) runs (T3 quota).
 

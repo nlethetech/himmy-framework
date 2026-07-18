@@ -109,9 +109,15 @@ def test_kb_search_tool_hybrid_emits_events_and_breadcrumbs() -> None:
     ref = out["evidence_refs"][0]
     assert ref["source_type"] == "knowledge_base"
     assert ref["account_scope"]["workspace_id"] == "w1"
-    # Rank-fusion breadcrumbs ride in the chunk metadata under hybrid.
+    # retrieval_mode is retained, but the ranking-provenance breadcrumbs
+    # (rrf_score, dense_rank, rerank_score, …) are stripped from the MODEL-facing
+    # chunk: they never help the model answer and were being re-sent every turn.
+    # They are not persisted elsewhere (the TOOL_COMPLETED event does not embed the
+    # result body), so no audit data is lost by keeping them out of the prompt.
     assert out["chunks"][0]["metadata"]["retrieval_mode"] == "hybrid"
-    assert "rrf_score" in out["chunks"][0]["metadata"]
+    assert "rrf_score" not in out["chunks"][0]["metadata"]
+    # The padded context_window superset is dropped when the chunk carries its text.
+    assert "context_window" not in out["chunks"][0]
     # Both lifecycle events emitted.
     events = run_async(storage.list_events())
     types = {e.event_type.value for e in events}

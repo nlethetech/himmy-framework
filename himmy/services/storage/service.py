@@ -300,6 +300,22 @@ class StorageService:
         """List runs filtered by workspace, subject, and/or status."""
         return await self._run_store.list_runs(workspace_id, subject_id, status)
 
+    async def count_runs(
+        self,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        status: RunStatus | None = None,
+        *,
+        exclude_local_workspace: bool = False,
+    ) -> int:
+        """Count runs matching the filter without materializing the rows."""
+        return await self._run_store.count_runs(
+            workspace_id,
+            subject_id,
+            status,
+            exclude_local_workspace=exclude_local_workspace,
+        )
+
     async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
         """Count a workspace's non-terminal (in-flight) runs (T3 cross-node quota)."""
         return await self._run_store.count_active_runs_for_workspace(workspace_id)

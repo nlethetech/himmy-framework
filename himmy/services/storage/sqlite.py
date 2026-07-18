@@ -1772,6 +1772,46 @@ class SqliteStorageService:
         )
         return [self._row_to_run(r) for r in rows]
 
+    async def count_runs(
+        self,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        status: RunStatus | None = None,
+        *,
+        exclude_local_workspace: bool = False,
+    ) -> int:
+        """Count runs matching the filter in SQL (no payload load/deserialize).
+
+        Mirrors :meth:`list_runs`' predicates so a pagination envelope's total is
+        computed with a single ``SELECT COUNT(*)`` instead of materializing the whole
+        table just to ``len()`` it (T2-runs-pagination). ``exclude_local_workspace``
+        (only when ``workspace_id is None``) drops the reserved ``__local__`` runs so
+        the count matches the cross-tenant all-workspaces list view.
+        """
+        from himmy.services.storage.models import LOCAL_WORKSPACE
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            params.append(workspace_id)
+        elif exclude_local_workspace:
+            clauses.append("workspace_id != ?")
+            params.append(LOCAL_WORKSPACE)
+        if subject_id is not None:
+            clauses.append("subject_id = ?")
+            params.append(subject_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status.value)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        row = await asyncio.to_thread(
+            self._fetchone,
+            f"SELECT COUNT(*) AS n FROM runs{where}",  # noqa: S608
+            tuple(params),
+        )
+        return int(row["n"]) if row is not None else 0
+
     async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
         """Count a workspace's non-terminal (in-flight) runs (T3 cross-node quota).
 

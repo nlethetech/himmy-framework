@@ -51,6 +51,7 @@ from himmy.services.inference.prompt_cache import (
     anthropic_system_blocks,
     anthropic_ttl_supported,
     apply_history_cache_breakpoint,
+    cache_policy_active,
     cache_savings_usd,
     compute_cached_cost,
     read_anthropic_usage,
@@ -364,7 +365,14 @@ class AnthropicClientManager:
     def _payload_tools(
         self, request: InferenceRequest, wants_structured: bool
     ) -> list[dict[str, Any]]:
-        """Build the ``tools`` payload (real bound tools, or the structured shim)."""
+        """Build the ``tools`` payload (real bound tools, or the structured shim).
+
+        Anthropic renders the tool array inside the single ``cache_control`` breakpoint
+        on the system block, so an active cache policy name-sorts tools (a fresh,
+        non-mutating ``sorted``) to keep the cached system+tools prefix byte-stable —
+        mirroring the OpenAI adapter. Gated on ``cache_policy_active`` so the no-cache
+        path keeps registry order and stays byte-identical to the pinned contract.
+        """
         if wants_structured:
             return [
                 {
@@ -376,9 +384,10 @@ class AnthropicClientManager:
                 }
             ]
         if request.bound_tools:
-            return _anthropic_tools(
-                request.bound_tools, provider=self.provider_name
-            )
+            tools = request.bound_tools
+            if cache_policy_active(request):
+                tools = sorted(tools, key=lambda t: t.name)
+            return _anthropic_tools(tools, provider=self.provider_name)
         return []
 
     def _apply_system(
@@ -565,8 +574,14 @@ class AnthropicClientManager:
         if params.get("temperature") is not None:
             payload["temperature"] = params["temperature"]
         if request.bound_tools:
+            # Name-sort under an active policy so the cached system+tools prefix stays
+            # byte-stable (the stream path bypasses ``_payload_tools``); fresh list, no
+            # mutation, and byte-identical registry order when caching is inactive.
+            tools = request.bound_tools
+            if cache_policy_active(request):
+                tools = sorted(tools, key=lambda t: t.name)
             payload["tools"] = _anthropic_tools(
-                request.bound_tools, provider=self.provider_name
+                tools, provider=self.provider_name
             )
             tool_choice = self._tool_choice(request)
             if tool_choice is not None:

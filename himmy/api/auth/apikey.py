@@ -99,15 +99,44 @@ def _env_truthy(name: str) -> bool:
 DEMOTED_SHARED_KEY_ROLES: tuple[str, ...] = ("operator",)
 
 
+#: Process-lifetime memo of the resolved HMAC pepper. ``None`` = not yet resolved
+#: (distinct from a resolved-but-empty ``b""`` pepper — the valid unkeyed-fallback
+#: case), so the sentinel never collapses with "no pepper configured". Cleared by
+#: :func:`reset_pepper_cache` (fired by ``configure_secrets`` on a provider swap).
+_PEPPER_CACHE: bytes | None = None
+
+
 def _pepper() -> bytes:
     """The server HMAC pepper (``HIMMY_API_KEY_PEPPER``) as bytes, or empty if unset.
 
     Resolved lazily (not at import) through the secrets provider so keychain/vault
-    backends and test monkeypatching both work. Empty ⇒ unkeyed digest fallback.
+    backends and test monkeypatching both work, then MEMOIZED for the process lifetime:
+    the pepper is fixed once the provider is chosen, so resolving it per authenticate
+    (via :func:`hash_key`) would pay a fresh secrets-provider round-trip — a keychain /
+    AWS / GCP / Azure call — on every request. :func:`reset_pepper_cache` (fired by
+    ``configure_secrets``) drops the memo so a provider swap re-resolves. Empty ⇒
+    unkeyed digest fallback.
     """
+    global _PEPPER_CACHE
+    cached = _PEPPER_CACHE
+    if cached is not None:
+        return cached
     from himmy.config.secrets import get_secret
 
-    return (get_secret(PEPPER_SECRET) or "").encode("utf-8")
+    resolved = (get_secret(PEPPER_SECRET) or "").encode("utf-8")
+    _PEPPER_CACHE = resolved
+    return resolved
+
+
+def reset_pepper_cache() -> None:
+    """Clear the memoized HMAC pepper so the next hash re-resolves it through the provider.
+
+    Fired by :func:`himmy.config.secrets.configure_secrets` on a provider swap (so the
+    new backend's pepper takes effect) and available as a test hook. Mirrors
+    :func:`himmy.licensing.reset_license_cache`.
+    """
+    global _PEPPER_CACHE
+    _PEPPER_CACHE = None
 
 
 def hash_key(secret: str) -> str:
@@ -528,6 +557,7 @@ __all__ = [
     "load_key_principals",
     "load_key_records",
     "hash_key",
+    "reset_pepper_cache",
     "DEFAULT_HEADER",
     "DEMOTED_SHARED_KEY_ROLES",
     "PEPPER_SECRET",

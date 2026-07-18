@@ -461,6 +461,12 @@ def configure_secrets(provider: SecretProvider | None) -> None:
     """Install (or clear) the process-wide secret provider (mainly for embedding/tests)."""
     global _PROVIDER
     _PROVIDER = provider
+    # The API-key HMAC pepper is memoized for the process lifetime; swapping the
+    # provider must re-resolve it against the new backend (local import avoids an
+    # import cycle — apikey imports get_secret from this module).
+    from himmy.api.auth.apikey import reset_pepper_cache
+
+    reset_pepper_cache()
 
 
 def get_secret(name: str, default: str | None = None) -> str | None:

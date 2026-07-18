@@ -1970,6 +1970,44 @@ class PostgresRunStore(_PgStoreBase):
             )
         return [_row_to_run(r, cipher=self._cipher) for r in rows]
 
+    async def count_runs(
+        self,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        status: RunStatus | None = None,
+        *,
+        exclude_local_workspace: bool = False,
+    ) -> int:
+        """Count runs matching the filter in SQL (no row load/decrypt).
+
+        Mirrors :meth:`list_runs`' predicates so a pagination envelope's total is a
+        single ``SELECT COUNT(*)`` rather than a full-table materialization just to
+        ``len()`` it (T2-runs-pagination). ``exclude_local_workspace`` (only when
+        ``workspace_id is None``) drops the reserved ``__local__`` runs so the count
+        matches the cross-tenant all-workspaces list view.
+        """
+        from himmy.services.storage.models import LOCAL_WORKSPACE
+
+        pool = self._require_pool()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workspace_id is not None:
+            params.append(workspace_id)
+            clauses.append(f"workspace_id = ${len(params)}")
+        elif exclude_local_workspace:
+            params.append(LOCAL_WORKSPACE)
+            clauses.append(f"workspace_id != ${len(params)}")
+        if subject_id is not None:
+            params.append(subject_id)
+            clauses.append(f"subject_id = ${len(params)}")
+        if status is not None:
+            params.append(status.value)
+            clauses.append(f"status = ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with pool.acquire() as conn:
+            row = await conn.fetchval(f"SELECT COUNT(*) FROM runs{where}", *params)
+        return int(row or 0)
+
     async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
         """Count a workspace's non-terminal (in-flight) runs (T3 cross-node quota).
 
@@ -3139,6 +3177,22 @@ class PostgresStorageService:
     ) -> list[RunRecord]:
         """List runs filtered by workspace, subject, and/or status."""
         return await self._run_store.list_runs(workspace_id, subject_id, status)
+
+    async def count_runs(
+        self,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        status: RunStatus | None = None,
+        *,
+        exclude_local_workspace: bool = False,
+    ) -> int:
+        """Count runs matching the filter in SQL (T2-runs-pagination)."""
+        return await self._run_store.count_runs(
+            workspace_id,
+            subject_id,
+            status,
+            exclude_local_workspace=exclude_local_workspace,
+        )
 
     async def count_active_runs_for_workspace(self, workspace_id: str) -> int:
         """Count a workspace's non-terminal (in-flight) runs (T3 cross-node quota)."""

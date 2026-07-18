@@ -507,7 +507,9 @@ class ConversationStore:
         clause, params = scope_clause(workspace_id, column="workspace_id")
         extra = f" AND {clause}" if clause else ""
         row = self._conn.execute(
-            f"SELECT * FROM conversations WHERE conversation_id = ?{extra}",  # noqa: S608
+            "SELECT conversation_id, origin, title, agent_path, provider, "  # noqa: S608
+            "project_id, created_at, updated_at "
+            f"FROM conversations WHERE conversation_id = ?{extra}",
             (conversation_id, *params),
         ).fetchone()
         if row is None:
@@ -888,7 +890,8 @@ class ConversationStore:
         extra = f" AND {clause}" if clause else ""
         rows = self._conn.execute(
             f"""
-            SELECT c.*, COUNT(m.id) AS n
+            SELECT c.conversation_id, c.origin, c.title, c.agent_path, c.provider,
+                   c.project_id, c.created_at, c.updated_at, COUNT(m.id) AS n
             FROM conversations c
             LEFT JOIN conversation_messages m
                 ON m.conversation_id = c.conversation_id

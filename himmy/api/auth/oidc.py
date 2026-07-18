@@ -14,7 +14,9 @@ self-signed key — no IdP or network required.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from himmy.api.auth.base import AuthError, client_ip
@@ -182,6 +184,8 @@ class OidcAuthenticator:
         all_tenants_roles: Iterable[str] = (),
         subject_scoped: bool = False,
         leeway: float = 0.0,
+        verify_cache_ttl: float = 30.0,
+        verify_cache_max: int = 1024,
     ) -> None:
         """Configure issuer/audience/JWKS + how claims map to the principal.
 
@@ -208,6 +212,17 @@ class OidcAuthenticator:
         self._all_tenants_roles = set(all_tenants_roles)
         self._subject_scoped = subject_scoped
         self._leeway = leeway
+        # Verify-cache (perf): without it a full RSA/EC verify runs on EVERY request. We cache
+        # the VERIFIED CLAIMS (never the Principal — it embeds a per-request source_ip) keyed by
+        # a hash of the raw token, and memoize the parsed public-key object per kid. A cache MISS
+        # always does the full verify; a hit is bounded to a short TTL (capped at the token exp)
+        # so signature/iss/aud/exp validation is never weakened and revocation/rotation still
+        # takes effect promptly. See ``authenticate`` / ``_cached_claims`` / ``_signing_key``.
+        self._verify_cache_ttl = verify_cache_ttl
+        self._verify_cache_max = verify_cache_max
+        self._claims_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._pubkey_cache: dict[str | None, Any] = {}
+        self._pubkey_cache_src: Any = None
 
     @classmethod
     def from_env(cls) -> OidcAuthenticator:
@@ -276,6 +291,11 @@ class OidcAuthenticator:
         import jwt
 
         token = self._bearer_token(request)
+        cached = self._cached_claims(token)
+        if cached is not None:
+            # Cache HIT: reuse the already-VERIFIED claims but build a FRESH Principal so its
+            # source_ip reflects THIS request (the Principal itself is never cached).
+            return self._principal_from_claims(cached, request)
         try:
             header = jwt.get_unverified_header(token)
         except jwt.PyJWTError as exc:
@@ -293,7 +313,55 @@ class OidcAuthenticator:
             )
         except jwt.PyJWTError as exc:
             raise AuthError(f"token rejected: {exc}") from exc
+        self._store_claims(token, claims)
         return self._principal_from_claims(claims, request)
+
+    @staticmethod
+    def _token_hash(token: str) -> str:
+        """Stable cache key for a token (its raw bearer value is never stored)."""
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _cached_claims(self, token: str) -> dict[str, Any] | None:
+        """Return the cached VERIFIED claims for ``token`` while still fresh, else None.
+
+        A miss (absent or past the entry's TTL) returns None so ``authenticate`` falls through
+        to the FULL verify — the cache never weakens signature/iss/aud/exp validation.
+        """
+        key = self._token_hash(token)
+        entry = self._claims_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, claims = entry
+        if time.time() >= expires_at:
+            self._claims_cache.pop(key, None)
+            return None
+        self._claims_cache.move_to_end(key)  # LRU touch
+        return claims
+
+    def _store_claims(self, token: str, claims: dict[str, Any]) -> None:
+        """Cache freshly-VERIFIED claims, bounded by size (LRU) and a short TTL.
+
+        Entry expiry = min(token ``exp``, now + short TTL): the cache can never outlive the
+        token, and a long-lived token is still re-verified at least every TTL (so revocation /
+        key rotation takes effect promptly).
+        """
+        if self._verify_cache_max <= 0 or self._verify_cache_ttl <= 0:
+            return
+        expires_at = time.time() + self._verify_cache_ttl
+        exp = claims.get("exp")
+        if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+            expires_at = min(float(exp), expires_at)
+        key = self._token_hash(token)
+        self._claims_cache[key] = (expires_at, claims)
+        self._claims_cache.move_to_end(key)
+        while len(self._claims_cache) > self._verify_cache_max:
+            self._claims_cache.popitem(last=False)  # evict least-recently-used
+
+    def reset_caches(self) -> None:
+        """Clear the verified-claims + memoized signing-key caches (test / rotation hook)."""
+        self._claims_cache.clear()
+        self._pubkey_cache.clear()
+        self._pubkey_cache_src = None
 
     def _bearer_token(self, request: Request) -> str:
         """Extract the Bearer token from the Authorization header."""
@@ -304,7 +372,12 @@ class OidcAuthenticator:
         return token.strip()
 
     async def _signing_key(self, kid: str | None) -> Any:
-        """Find the signing key for ``kid``, refreshing the JWKS on a miss (rotation)."""
+        """Find the signing key for ``kid``, refreshing the JWKS on a miss (rotation).
+
+        The parsed public-key object is memoized per ``kid`` and invalidated whenever the JWKS
+        provider hands back a NEW key set (rotation / TTL refresh), so a steady stream of
+        requests reuses the parsed RSA/EC key instead of rebuilding it every time.
+        """
         import jwt
 
         jwks = await self._provider.get()
@@ -314,10 +387,19 @@ class OidcAuthenticator:
             key = self._match(jwks, kid)
         if key is None:
             raise AuthError("no matching signing key for token")
+        if jwks is not self._pubkey_cache_src:
+            # Provider returned a new JWKS object (rotation / refresh) → drop memoized keys.
+            self._pubkey_cache.clear()
+            self._pubkey_cache_src = jwks
+        cached = self._pubkey_cache.get(kid)
+        if cached is not None:
+            return cached
         try:
-            return jwt.PyJWK.from_dict(key).key
+            parsed = jwt.PyJWK.from_dict(key).key
         except jwt.PyJWTError as exc:  # pragma: no cover - defensive
             raise AuthError(f"invalid signing key: {exc}") from exc
+        self._pubkey_cache[kid] = parsed
+        return parsed
 
     @staticmethod
     def _match(jwks: dict[str, Any], kid: str | None) -> dict[str, Any] | None:

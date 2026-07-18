@@ -197,6 +197,15 @@ class RunStore(Protocol):
         status: RunStatus | None = None,
     ) -> list[RunRecord]: ...
 
+    async def count_runs(
+        self,
+        workspace_id: str | None = None,
+        subject_id: str | None = None,
+        status: RunStatus | None = None,
+        *,
+        exclude_local_workspace: bool = False,
+    ) -> int: ...
+
     async def count_active_runs_for_workspace(self, workspace_id: str) -> int: ...
 
     async def load_run_by_idempotency(

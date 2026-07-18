@@ -2984,7 +2984,25 @@ class RunAppService:
 
         Mirrors :meth:`list_runs`' cross-tenant rule so the count matches the page:
         the all-workspaces view excludes the reserved ``__local__`` runs (T2.2).
+
+        T2-runs-pagination: when the backing store exposes a native ``count_runs``
+        (the durable SQLite/Postgres services), the total is computed with a single
+        ``SELECT COUNT(*)`` — the ``__local__`` exclusion folded into the same WHERE
+        clause — instead of loading + JSON-deserializing the entire runs table just
+        to ``len()`` it. Stores without a native counter (the in-memory facade) fall
+        back to the load+filter path, which is cheap for an in-RAM dict and preserves
+        byte-for-byte the same count semantics.
         """
+        native_count = getattr(self._storage, "count_runs", None)
+        if native_count is not None:
+            return int(
+                await native_count(
+                    workspace_id=workspace_id,
+                    subject_id=subject_id,
+                    status=status,
+                    exclude_local_workspace=(workspace_id is None),
+                )
+            )
         runs = await self._storage.list_runs(
             workspace_id=workspace_id, subject_id=subject_id, status=status
         )

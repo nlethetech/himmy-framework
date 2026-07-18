@@ -83,6 +83,43 @@ KB_SEARCH_ARGS_SCHEMA: dict[str, Any] = {
 }
 
 
+#: Per-chunk ranking-provenance scalars the model never needs (they explain the
+#: ranking for the audit trail, not the answer). Stripped from the model-facing
+#: chunk in ``kb_search`` — the full dumps still reach the audit path elsewhere.
+_RANK_BREADCRUMB_KEYS: frozenset[str] = frozenset(
+    {
+        "dense_rank",
+        "dense_sim",
+        "lexical_rank",
+        "lexical_score",
+        "rrf_score",
+        "rerank_score",
+        "start_pos",
+        "end_pos",
+    }
+)
+
+
+def _lean_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
+    """Slim one model-facing chunk so its text is not re-sent ~3x every turn.
+
+    Drops the padded ``context_window`` superset whenever the chunk carries its
+    own ``text`` (kept only for text-less chunks, e.g. images, whose snippet lives
+    in ``context_window``) and strips the ranking-breadcrumb metadata scalars.
+    ``text``, ``chunk_id``, ``similarity``, and ``source_uri`` are preserved so GUI
+    citations and downstream grounding still resolve.
+    """
+    slim = dict(chunk)
+    if slim.get("text"):
+        slim.pop("context_window", None)
+    meta = slim.get("metadata")
+    if isinstance(meta, dict):
+        slim["metadata"] = {
+            k: v for k, v in meta.items() if k not in _RANK_BREADCRUMB_KEYS
+        }
+    return slim
+
+
 def register_kb_search_tool(
     registry: ToolRegistry,
     kb_service: KnowledgeBase,
@@ -159,7 +196,7 @@ def register_kb_search_tool(
             query=str(query),
         )
         return {
-            "chunks": field.value["chunks"],
+            "chunks": [_lean_chunk(c) for c in field.value["chunks"]],
             "rendered_text": field.value["rendered_text"],
             "confidence": field.confidence,
             "evidence_refs": [
