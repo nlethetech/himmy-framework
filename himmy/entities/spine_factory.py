@@ -39,7 +39,6 @@ from typing import TYPE_CHECKING
 
 from himmy.config.project import spine_db_path
 from himmy.config.secrets import get_secret
-from himmy.services.storage.factory import in_server_context
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from himmy.entities.protocol import EntityRegistryProtocol
@@ -119,7 +118,15 @@ class SpineFactory:
         that KNOWS it is the server passes ``True``). Both branches resolve to the SAME
         canonical ``.himmy/spine.db`` by default; the only effect of ``server`` is whether
         the opt-in Postgres spine (``HIMMY_SPINE_DATABASE_URL``) is considered.
+
+        The server-context probe is imported LAZILY here (not at module load) so the
+        entities layer carries no import-time dependency on ``himmy.services`` — services
+        already depends on entities (``services.storage.models`` -> ``entities.records``),
+        so a module-top import would be a layer-order inversion / cycle risk. Resolving it
+        only inside this one method keeps entities importable on its own.
         """
+        from himmy.services.storage.factory import in_server_context
+
         is_server = server if server is not None else in_server_context()
         return cls.for_server() if is_server else cls.for_cli()
 

@@ -33,6 +33,11 @@ from collections.abc import AsyncIterator, Callable, Collection
 from typing import TYPE_CHECKING, Any, cast
 
 from himmy.application.models import RecommendationEnvelope
+from himmy.application.workspace_quota import (
+    WorkspaceQuota,
+    WorkspaceRunQuotaExceeded,
+)
+from himmy.config.spec_sanitizer import sanitize_tenant_spec
 from himmy.entities.lineage import DEFAULT_TRACE_DEPTH
 from himmy.services.storage.models import (
     LOCAL_WORKSPACE,
@@ -119,23 +124,10 @@ _QUEUE_BACKOFF_MAX_SECONDS = 300.0
 DEFAULT_QUEUE_MAX_AGE_SECONDS = 3600.0
 
 
-class WorkspaceRunQuotaExceeded(Exception):
-    """A workspace exceeded its outstanding-run cap (T0.4 — surfaces as HTTP 429).
-
-    Raised by :meth:`RunAppService.create_run` when a workspace already has its
-    maximum number of in-flight (created-but-not-terminal) background runs. Carries
-    the workspace + the cap so the router can return an informative 429.
-    """
-
-    def __init__(self, workspace_id: str, *, cap: int, outstanding: int) -> None:
-        """Record the workspace and the cap it hit for the API error surface."""
-        self.workspace_id = workspace_id
-        self.cap = cap
-        self.outstanding = outstanding
-        super().__init__(
-            f"workspace {workspace_id!r} has {outstanding} outstanding run(s); "
-            f"the per-workspace cap is {cap}. Retry once in-flight runs complete."
-        )
+# ``WorkspaceRunQuotaExceeded`` is defined in and re-exported from
+# :mod:`himmy.application.workspace_quota` (imported at module top). It stays importable
+# from this module — ``from himmy.application.services import WorkspaceRunQuotaExceeded``
+# — so the API error handlers and tests that import it here are unchanged.
 
 
 class HitlNotSupportedError(Exception):
@@ -775,15 +767,16 @@ class RunAppService:
         # Keep strong refs to background tasks so they are not GC'd mid-flight and
         # so they can be drained/cancelled on shutdown (AAEO-1).
         self._tasks: set[asyncio.Task[Any]] = set()
-        # T0.4 per-workspace quotas. ``_ws_semaphores`` gates concurrent EXECUTION;
-        # ``_ws_outstanding`` counts created-but-not-terminal runs for the admission
-        # cap. Both are keyed on workspace_id and created lazily so an unused
-        # workspace costs nothing. A semaphore binds the loop it was created on, so it
-        # is created lazily inside the (async) create path, never at construction.
-        self._workspace_concurrency = max(1, int(workspace_concurrency))
-        self._workspace_max_outstanding = max(0, int(workspace_max_outstanding))
-        self._ws_semaphores: dict[str, asyncio.Semaphore] = {}
-        self._ws_outstanding: dict[str, int] = {}
+        # T0.4 per-workspace quotas, owned by a :class:`WorkspaceQuota` collaborator: it
+        # gates concurrent EXECUTION (a per-workspace semaphore, created lazily on the
+        # running loop) and counts created-but-not-terminal runs for the admission cap.
+        # The former inline attributes are preserved as delegating properties/methods
+        # (``_workspace_max_outstanding`` / ``_ws_outstanding`` / ``_admit_workspace_run`` …)
+        # so behaviour and the introspection surface are byte-identical.
+        self._ws_quota = WorkspaceQuota(
+            concurrency=workspace_concurrency,
+            max_outstanding=workspace_max_outstanding,
+        )
         # Q3 leased-dispatch mode. DEFAULT False = the inline fire-and-forget behaviour
         # (today's ``asyncio.create_task`` per run) — preserving the offline single-box +
         # bare-TestClient path byte-for-byte. A :class:`~himmy.application.dispatcher.
@@ -843,12 +836,27 @@ class RunAppService:
     @property
     def workspace_concurrency(self) -> int:
         """The per-workspace execution-concurrency cap (T0.4 in-process / T3 cross-node)."""
-        return self._workspace_concurrency
+        return self._ws_quota.concurrency
 
     @property
     def workspace_max_outstanding(self) -> int:
         """The per-workspace outstanding-run cap enforced at enqueue (T0.4 / T3)."""
-        return self._workspace_max_outstanding
+        return self._ws_quota.max_outstanding
+
+    # -- Backward-compatible views over the WorkspaceQuota collaborator's state. These
+    # preserve the exact private attributes the former inline implementation exposed, so
+    # existing callers/tests that read or poke them behave identically.
+    @property
+    def _workspace_max_outstanding(self) -> int:
+        return self._ws_quota.max_outstanding
+
+    @_workspace_max_outstanding.setter
+    def _workspace_max_outstanding(self, value: int) -> None:
+        self._ws_quota.max_outstanding = value
+
+    @property
+    def _ws_outstanding(self) -> dict[str, int]:
+        return self._ws_quota.outstanding_counts
 
     @property
     def run_timeout_seconds(self) -> float:
@@ -967,8 +975,6 @@ class RunAppService:
         # may keep their tools when the operator opted in; everyone else is stripped
         # or (default) rejected by ``sanitize_tenant_spec`` raising.
         if agent_spec is not None:
-            from himmy.config.spec_sanitizer import sanitize_tenant_spec
-
             agent_spec = sanitize_tenant_spec(
                 agent_spec, operator_provisioned=operator_provisioned
             ).spec
@@ -1139,8 +1145,6 @@ class RunAppService:
         # runs (defense-in-depth: the stored spec was sanitized at write, this honors the
         # caller's operator status so a tenant continuation can never reach privileged
         # tools the stored spec might carry).
-        from himmy.config.spec_sanitizer import sanitize_tenant_spec
-
         agent_spec = sanitize_tenant_spec(
             agent_spec, operator_provisioned=operator_provisioned
         ).spec
@@ -1373,20 +1377,10 @@ class RunAppService:
     def _admit_workspace_run(self, workspace_id: str) -> None:
         """Reserve one outstanding-run slot for ``workspace_id`` or reject (T0.4).
 
-        Raises :class:`WorkspaceRunQuotaExceeded` when the workspace already holds
-        :attr:`_workspace_max_outstanding` in-flight runs. ``0`` disables the cap.
-        Runs single-threaded in the event loop, so the read-modify-write is atomic.
+        Delegates to :class:`WorkspaceQuota`. Raises :class:`WorkspaceRunQuotaExceeded`
+        when the workspace already holds its outstanding-run cap. ``0`` disables the cap.
         """
-        if self._workspace_max_outstanding <= 0:
-            return
-        current = self._ws_outstanding.get(workspace_id, 0)
-        if current >= self._workspace_max_outstanding:
-            raise WorkspaceRunQuotaExceeded(
-                workspace_id,
-                cap=self._workspace_max_outstanding,
-                outstanding=current,
-            )
-        self._ws_outstanding[workspace_id] = current + 1
+        self._ws_quota.admit(workspace_id)
 
     async def _admit_workspace_run_durable(
         self, workspace_id: str, stored: RunRecord
@@ -1432,30 +1426,15 @@ class RunAppService:
 
     def _release_workspace_run(self, workspace_id: str) -> None:
         """Release one outstanding-run slot for ``workspace_id`` (floors at 0)."""
-        if self._workspace_max_outstanding <= 0:
-            return
-        current = self._ws_outstanding.get(workspace_id, 0)
-        if current <= 1:
-            self._ws_outstanding.pop(workspace_id, None)
-        else:
-            self._ws_outstanding[workspace_id] = current - 1
+        self._ws_quota.release(workspace_id)
 
     def _workspace_semaphore(self, workspace_id: str) -> asyncio.Semaphore:
-        """Lazily get/create the per-workspace execution semaphore (T0.4).
-
-        Created on first use inside the running loop so it binds the correct event
-        loop (a semaphore created at construction could bind the wrong loop under
-        ``asyncio.run`` test harnesses).
-        """
-        sem = self._ws_semaphores.get(workspace_id)
-        if sem is None:
-            sem = asyncio.Semaphore(self._workspace_concurrency)
-            self._ws_semaphores[workspace_id] = sem
-        return sem
+        """Lazily get/create the per-workspace execution semaphore (T0.4)."""
+        return self._ws_quota.semaphore(workspace_id)
 
     def workspace_outstanding(self, workspace_id: str) -> int:
         """Return the current count of in-flight runs for a workspace (introspection)."""
-        return self._ws_outstanding.get(workspace_id, 0)
+        return self._ws_quota.outstanding(workspace_id)
 
     @contextlib.asynccontextmanager
     async def workspace_run_slot(
@@ -2619,8 +2598,6 @@ class RunAppService:
             # resume runtime MUST re-register that synthetic tool, else the now-approved
             # plan call has no handler to execute against.
             plan_mode = bool((run.metadata or {}).get("plan_mode", False))
-            from himmy.config.spec_sanitizer import sanitize_tenant_spec
-
             try:
                 spec = sanitize_tenant_spec(
                     agent_def.agent_spec(),
@@ -3445,8 +3422,6 @@ class AgentDefAppService:
         makes a re-submit return the prior record (``created=False``) without creating a
         duplicate. The stored agent is projected as an ``agent`` entity into the spine.
         """
-        from himmy.config.spec_sanitizer import sanitize_tenant_spec
-
         clean = sanitize_tenant_spec(
             spec, operator_provisioned=operator_provisioned
         ).spec
@@ -3487,8 +3462,6 @@ class AgentDefAppService:
         )
         if existing is None:
             return None
-        from himmy.config.spec_sanitizer import sanitize_tenant_spec
-
         clean = sanitize_tenant_spec(
             spec, operator_provisioned=operator_provisioned
         ).spec

@@ -1343,6 +1343,37 @@ class PostgresConversationStore:
             )
         )
 
+    def prune(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete stale conversations, bounding growth — mirrors :meth:`ConversationStore.prune`.
+
+        Behaviour-consistent with the SQLite twin: at least one bound must be given; a
+        conversation is doomed if it fails EITHER bound (older than the cutoff, or beyond the
+        newest ``keep_last``). Composed entirely over the already-mirrored sync surface
+        (:meth:`list_summaries` + :meth:`delete`) so it introduces no new SQL — every doomed
+        conversation is removed with the same tenant-scoped ``delete`` the runtime uses, and
+        the flat-projection rows fall away with it. Returns the count deleted.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError("prune needs at least one of older_than_days / keep_last")
+        from datetime import UTC, datetime, timedelta
+
+        summaries = self.list_summaries()
+        doomed: set[str] = set()
+        if older_than_days is not None:
+            cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+            doomed.update(s.conversation_id for s in summaries if s.updated_at < cutoff)
+        if keep_last is not None:
+            keep = max(int(keep_last), 0)
+            ordered = sorted(summaries, key=lambda s: s.updated_at, reverse=True)
+            doomed.update(s.conversation_id for s in ordered[keep:])
+        removed = 0
+        for cid in sorted(doomed):
+            if self.delete(cid):
+                removed += 1
+        return removed
+
     def close(self) -> None:
         self._pool.close()
 

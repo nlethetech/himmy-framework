@@ -41,6 +41,7 @@ from himmy.runtime.checkpoint import (
     CheckpointStore,
     PendingToolCall,
 )
+from himmy.runtime.entity_registrar import _EntityRegistrar
 from himmy.runtime.termination import final_answer_text, is_no_progress
 from himmy.services.inference.models import (
     BoundTool,
@@ -824,6 +825,13 @@ class SingleAgentRuntime:
         self.tool_service = tool_service
         self.context_service = context_service
         self.entity_registry = entity_registry
+        # Audit-spine registration + lineage linking live in a cohesive collaborator
+        # (the ``_register_*`` / ``_link_lineage`` group). It shares this runtime's
+        # governed-run subject stamp so the ``{subject_id: ...}`` tag has one source of
+        # truth with ``_emit``. Behaviour is byte-identical; the runtime just delegates.
+        self._entity_registrar = _EntityRegistrar(
+            entity_registry, self._subject_metadata
+        )
         self.default_model_key = default_model_key
         self.save_threads = save_threads
         self.default_deadline_seconds = default_deadline_seconds
@@ -3945,41 +3953,17 @@ class SingleAgentRuntime:
     def _register_entity(self, obj: Any, *, stamp_subject: bool = False) -> Any:
         """Register a domain object's record when a registry is wired; else None.
 
-        ``stamp_subject`` is only set for the genuinely subject-bearing run artefacts
-        (messages, threads); infrastructure records (persona/prompt/agent) are never
-        stamped so a governed ``registry.query(metadata={'subject_id': ...})`` returns
-        only real subject data.
+        Delegates to :class:`~himmy.runtime.entity_registrar._EntityRegistrar`.
         """
-        if self.entity_registry is None:
-            return None
-        to_record = getattr(obj, "to_record", None)
-        if to_record is None:
-            return None
-        try:
-            metadata = self._subject_metadata() if stamp_subject else None
-            record = to_record(metadata=metadata)
-            return self.entity_registry.register(record)
-        except Exception:  # pragma: no cover - defensive
-            return None
+        return self._entity_registrar.register_entity(obj, stamp_subject=stamp_subject)
 
     def _register_message(self, message: Any) -> Any:
         """Register a Message entity (kind="message") when a registry is present."""
-        return self._register_entity(message, stamp_subject=True)
+        return self._entity_registrar.register_message(message)
 
     def _register_thread_version(self, thread: Any) -> Any:
-        """Project the current chat_thread version into a record (when a registry).
-
-        RO-8: the version bump now happens in the run body (regardless of
-        registry), so this helper only projects the record at the already-bumped
-        version. Returns ``None`` when no registry is wired.
-        """
-        if self.entity_registry is None:
-            return None
-        try:
-            record = thread.to_record(metadata=self._subject_metadata())
-            return self.entity_registry.register(record)
-        except Exception:  # pragma: no cover - defensive
-            return None
+        """Project the current chat_thread version into a record (when a registry)."""
+        return self._entity_registrar.register_thread_version(thread)
 
     def _link_lineage(
         self,
@@ -3992,43 +3976,14 @@ class SingleAgentRuntime:
         thread: Any,
     ) -> None:
         """Wire the documented lineage relations between run artefacts."""
-        if self.entity_registry is None or thread_record is None:
-            return
-        link = self.entity_registry.link
-        try:
-            if persona_record is not None:
-                link(
-                    from_record_id=thread_record.record_id,
-                    to_record_id=persona_record.record_id,
-                    relation="uses_persona",
-                )
-                link(
-                    from_record_id=thread_record.record_id,
-                    to_record_id=persona_record.record_id,
-                    relation="thread_for_agent",
-                )
-            if prompt_record is not None:
-                link(
-                    from_record_id=thread_record.record_id,
-                    to_record_id=prompt_record.record_id,
-                    relation="in_thread",
-                )
-            if snapshot is not None:
-                snapshot_record = getattr(snapshot, "to_record", None)
-                if snapshot_record is not None:
-                    sr = self.entity_registry.register(snapshot.to_record())
-                    link(
-                        from_record_id=thread_record.record_id,
-                        to_record_id=sr.record_id,
-                        relation="built_from",
-                    )
-                    link(
-                        from_record_id=sr.record_id,
-                        to_record_id=thread_record.record_id,
-                        relation="observed_in_run",
-                    )
-        except Exception:  # pragma: no cover - defensive
-            pass
+        self._entity_registrar.link_lineage(
+            persona_record=persona_record,
+            prompt_record=prompt_record,
+            thread_record=thread_record,
+            snapshot=snapshot,
+            persona=persona,
+            thread=thread,
+        )
 
     # --------------------------------------------------------------- helpers
     async def _emit(self, event: RunEvent) -> None:

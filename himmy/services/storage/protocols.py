@@ -37,6 +37,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context 
     from himmy.agents.base_agent.thread import ChatThread
     from himmy.services.context.models import ContextField, ContextSnapshot
     from himmy.services.evaluation.models import EvaluationRun
+    from himmy.services.storage.conversations import (
+        ConversationSummary,
+        FlatMessage,
+    )
 
 
 def normalize_event_type(event_type: Any) -> str | None:
@@ -360,9 +364,93 @@ class OrchestrationStore(Protocol):
     ) -> list[EnvironmentStateRecord]: ...
 
 
+@runtime_checkable
+class ConversationStoreProtocol(Protocol):
+    """Shared contract for the durable conversation store (SQLite ↔ Postgres twins).
+
+    The auxiliary conversation store is hand-mirrored across two backends —
+    :class:`himmy.services.storage.conversations.ConversationStore` (durable SQLite) and
+    :class:`himmy.services.storage.postgres_aux.PostgresConversationStore` (the K4 Postgres
+    mirror) — that :func:`~himmy.services.storage.conversations.get_conversation_store`
+    swaps behind one handle by ``HIMMY_DATABASE_URL``. Because callers hold that handle
+    polymorphically, the two twins must expose the SAME method surface or a Postgres
+    deployment silently loses a method the SQLite path has. This ``runtime_checkable``
+    Protocol pins that shared surface so the conformance test fails loudly on drift, exactly
+    like the focused core-store protocols above.
+
+    Method signatures use ``Any`` for the record/thread payloads (mirroring
+    ``ThreadEventStore``) so the contract stays decoupled from the concrete model modules;
+    ``runtime_checkable`` verifies method PRESENCE, which is the drift that actually bites.
+    ``prune`` is part of the surface for parity with the other pruneable stores
+    (``RunStore.prune_runs``, ``RecommendationStore.prune_recommendations``,
+    ``OrchestrationStore.prune_memory``); the SQLite-only ``import_legacy`` boot-path helper
+    (which folds local ``sessions.db``/``chats.db`` sidecars a Postgres deployment never has)
+    is deliberately NOT part of the abstract contract.
+    """
+
+    def save_thread(
+        self, conversation_id: str, thread: Any, **kwargs: Any
+    ) -> ConversationSummary: ...
+
+    def save_flat(self, **kwargs: Any) -> ConversationSummary: ...
+
+    def load_thread(self, conversation_id: str) -> ChatThread | None: ...
+
+    def get_summary(
+        self, conversation_id: str, **kwargs: Any
+    ) -> ConversationSummary | None: ...
+
+    def flat_messages(self, conversation_id: str) -> list[FlatMessage]: ...
+
+    def list_summaries(self, **kwargs: Any) -> list[ConversationSummary]: ...
+
+    def rename(self, conversation_id: str, title: str, **kwargs: Any) -> bool: ...
+
+    def delete(self, conversation_id: str, **kwargs: Any) -> bool: ...
+
+    def subject_of(self, conversation_id: str) -> str | None: ...
+
+    def conversation_ids_for_subject(self, subject_id: str) -> list[str]: ...
+
+    def delete_by_subject(self, subject_id: str) -> int: ...
+
+    def set_project(self, conversation_id: str, project_id: str | None) -> bool: ...
+
+    def prune(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int: ...
+
+    def create_project(self, *, name: str, **kwargs: Any) -> Any: ...
+
+    def get_project_row(self, project_id: str, **kwargs: Any) -> Any | None: ...
+
+    def project_chat_count(self, project_id: str, **kwargs: Any) -> int: ...
+
+    def list_project_rows(self, **kwargs: Any) -> list[Any]: ...
+
+    def update_project(
+        self, project_id: str, assignments: dict[str, str | None], **kwargs: Any
+    ) -> bool: ...
+
+    def delete_project(self, project_id: str, **kwargs: Any) -> bool: ...
+
+    def project_conversation_summaries(
+        self, project_id: str, **kwargs: Any
+    ) -> list[ConversationSummary]: ...
+
+    def assign_conversation(
+        self, project_id: str, conversation_id: str, **kwargs: Any
+    ) -> bool: ...
+
+    def unassign_conversation(self, conversation_id: str, **kwargs: Any) -> bool: ...
+
+    def close(self) -> None: ...
+
+
 __all__ = [
     "AgentDefStore",
     "ContextStore",
+    "ConversationStoreProtocol",
     "EvaluationStore",
     "EventLog",
     "OrchestrationStore",
