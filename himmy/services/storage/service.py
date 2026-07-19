@@ -337,6 +337,14 @@ class StorageService:
             workspace_id, idempotency_key
         )
 
+    async def prune_runs(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old TERMINAL run rows (operator-invoked retention). Returns rows removed."""
+        return await self._run_store.prune_runs(
+            older_than_days=older_than_days, keep_last=keep_last
+        )
+
     # ------------------------------------------------------------- agent defs (T2e)
     async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
         """Upsert a stored agent definition keyed by ``agent_id``."""
@@ -371,6 +379,14 @@ class StorageService:
         )
 
     # ---------------------------------------------------------- recommendations
+    async def prune_recommendations(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old recommendation rows (operator-invoked retention). Returns rows removed."""
+        return await self._recommendation_store.prune_recommendations(
+            older_than_days=older_than_days, keep_last=keep_last
+        )
+
     async def save_recommendation(self, item: RecommendationItem) -> RecommendationItem:
         """Upsert a recommendation item keyed by ``recommendation_id``."""
         return await self._recommendation_store.save_recommendation(item)
@@ -439,6 +455,14 @@ class StorageService:
     async def list_memory(self, subject_id: str | None = None) -> list[MemoryObject]:
         """List memory objects, optionally filtered by subject."""
         return await self._orchestration_store.list_memory(subject_id)
+
+    async def prune_memory(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old memory rows (operator-invoked retention). Returns rows removed."""
+        return await self._orchestration_store.prune_memory(
+            older_than_days=older_than_days, keep_last=keep_last
+        )
 
     async def save_episodic_memory(
         self, obj: EpisodicMemoryObject

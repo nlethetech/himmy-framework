@@ -1476,9 +1476,16 @@ class ChatRenameRequest(BaseModel):
     dependencies=[Depends(studio_permission(_RES_CHATS, "read")), Depends(scoped_read)],
 )
 async def chats_list(request: Request) -> Any:
+    import asyncio
+
     from himmy.api.studio_chats import get_chats_store
 
-    return get_chats_store().list(workspace_id=_singleton_read_filter(request))
+    store = get_chats_store()
+    workspace_id = _singleton_read_filter(request)
+    # The unified ConversationStore is synchronous sqlite (one shared connection); offload it so
+    # the aux CRUD never blocks the event loop (the store serializes concurrent workers via its
+    # own reentrant lock).
+    return await asyncio.to_thread(store.list, workspace_id=workspace_id)
 
 
 @router.get(
@@ -1486,10 +1493,13 @@ async def chats_list(request: Request) -> Any:
     dependencies=[Depends(studio_permission(_RES_CHATS, "read")), Depends(scoped_read)],
 )
 async def chats_get(session_id: str, request: Request) -> Any:
+    import asyncio
+
     from himmy.api.studio_chats import get_chats_store
 
-    detail = get_chats_store().get(
-        session_id, workspace_id=_singleton_read_filter(request)
+    store = get_chats_store()
+    detail = await asyncio.to_thread(
+        store.get, session_id, workspace_id=_singleton_read_filter(request)
     )
     if detail is None:
         raise HTTPException(status_code=404, detail="unknown chat session")
@@ -1501,6 +1511,8 @@ async def chats_get(session_id: str, request: Request) -> Any:
     dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
 )
 async def chats_save(body: ChatSaveRequest, request: Request) -> Any:
+    import asyncio
+
     from himmy.api.studio_chats import ChatMessage, get_chats_store
 
     store = get_chats_store()
@@ -1509,11 +1521,13 @@ async def chats_save(body: ChatSaveRequest, request: Request) -> Any:
     # not clobber/overwrite its thread+title+messages (the ON CONFLICT upsert in save_thread
     # only PRESERVES the owner column, not the content) — fold a cross-owner id collision to 404
     # BEFORE the save, mirroring the notes/cookbook upsert guards. NO-OP offline / ``all_tenants``
-    # (scope None).
-    if body.id and scope is not None and store.get(body.id) is not None:
-        if store.get(body.id, workspace_id=scope) is None:
-            raise HTTPException(status_code=404, detail="unknown chat session")
-    return store.save(
+    # (scope None). The synchronous sqlite reads/writes are offloaded off the event loop.
+    if body.id and scope is not None:
+        if await asyncio.to_thread(store.get, body.id) is not None:
+            if await asyncio.to_thread(store.get, body.id, workspace_id=scope) is None:
+                raise HTTPException(status_code=404, detail="unknown chat session")
+    return await asyncio.to_thread(
+        store.save,
         session_id=body.id,
         title=body.title,
         agent_path=body.agent_path,
@@ -1531,13 +1545,15 @@ async def chats_save(body: ChatSaveRequest, request: Request) -> Any:
 async def chats_rename(
     session_id: str, body: ChatRenameRequest, request: Request
 ) -> dict[str, bool]:
+    import asyncio
+
     from himmy.api.studio_chats import get_chats_store
 
-    return {
-        "ok": get_chats_store().rename(
-            session_id, body.title, workspace_id=_singleton_read_filter(request)
-        )
-    }
+    store = get_chats_store()
+    ok = await asyncio.to_thread(
+        store.rename, session_id, body.title, workspace_id=_singleton_read_filter(request)
+    )
+    return {"ok": ok}
 
 
 @router.delete(
@@ -1545,13 +1561,15 @@ async def chats_rename(
     dependencies=[Depends(studio_permission(_RES_CHATS, "write"))],
 )
 async def chats_delete(session_id: str, request: Request) -> dict[str, bool]:
+    import asyncio
+
     from himmy.api.studio_chats import get_chats_store
 
-    return {
-        "ok": get_chats_store().delete(
-            session_id, workspace_id=_singleton_read_filter(request)
-        )
-    }
+    store = get_chats_store()
+    ok = await asyncio.to_thread(
+        store.delete, session_id, workspace_id=_singleton_read_filter(request)
+    )
+    return {"ok": ok}
 
 
 # ---- Cookbook (saved agent + prompt recipes) ----------------------------

@@ -336,6 +336,10 @@ class MetricsRegistry:
             "Total tool invocations, by outcome (called/completed/failed).",
             ("outcome",),
         )
+        self.tool_call_duration_seconds = Histogram(
+            "himmy_tool_call_duration_seconds",
+            "Tool invocation latency in seconds (terminal events only).",
+        )
         self.guardrail_blocks_total = Counter(
             "himmy_guardrail_blocks_total",
             "Total guardrail applications, by stage and action (blocked/redacted).",
@@ -358,6 +362,15 @@ class MetricsRegistry:
             "RBAC authorization grants for PRIVILEGED resources only, by resource "
             "and action (a high-volume read is intentionally not counted here).",
             ("resource", "action"),
+        )
+        # Audit-spine sink drops. Incremented when a best-effort ``_emit`` sink in the
+        # runtime swallows an exception (durable append / entity projection), so a
+        # silent audit-write loss still leaves an operator-visible metric. ``sink`` is a
+        # closed vocabulary (memory_store / entity_registry), so cardinality stays bounded.
+        self.event_sink_drops_total = Counter(
+            "himmy_event_sink_drops_total",
+            "Total run-events dropped by a best-effort audit sink, by sink.",
+            ("sink",),
         )
         # Run outcomes (status is clamped to a closed lifecycle set).
         self.agent_runs_total = Counter(
@@ -404,9 +417,11 @@ class MetricsRegistry:
             self.inference_cost_usd_total,
             self.inference_tokens,
             self.tool_calls_total,
+            self.tool_call_duration_seconds,
             self.guardrail_blocks_total,
             self.authz_denied_total,
             self.authz_granted_total,
+            self.event_sink_drops_total,
             self.agent_runs_total,
             self.agent_run_outcomes_total,
             self.dispatcher_in_flight,
@@ -665,8 +680,10 @@ class MetricsEventSink:
             reg.tool_calls_total.inc(("called",))
         elif name == "TOOL_COMPLETED":
             reg.tool_calls_total.inc(("completed",))
+            self._observe_tool_latency(reg, event, payload)
         elif name == "TOOL_FAILED":
             reg.tool_calls_total.inc(("failed",))
+            self._observe_tool_latency(reg, event, payload)
         elif name == "GUARDRAIL_APPLIED":
             self._record_guardrail(reg, payload)
         elif name == "AGENT_RUN_STARTED":
@@ -689,6 +706,19 @@ class MetricsEventSink:
         if output_tokens:
             reg.inference_output_tokens_total.inc((), output_tokens)
         reg.inference_tokens.observe(input_tokens + output_tokens)
+
+    @staticmethod
+    def _observe_tool_latency(
+        reg: MetricsRegistry, event: RunEvent, payload: dict[str, object]
+    ) -> None:
+        # The main runtime carries tool latency in ``payload['latency_ms']``
+        # (single_agent), while tools/service sets the top-level
+        # ``event.latency_ms`` — read both so neither call path is silently missed.
+        latency_ms = event.latency_ms
+        if latency_ms is None:
+            latency_ms = _as_float(payload.get("latency_ms")) or None
+        if latency_ms is not None:
+            reg.tool_call_duration_seconds.observe(float(latency_ms) / 1000.0)
 
     @staticmethod
     def _record_guardrail(reg: MetricsRegistry, payload: dict[str, object]) -> None:

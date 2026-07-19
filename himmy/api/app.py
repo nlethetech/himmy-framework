@@ -75,6 +75,7 @@ from himmy.api.runtime_bootstrap import (
 )
 from himmy.application.services import WorkspaceRunQuotaExceeded
 from himmy.core.errors import HimmyError
+from himmy.licensing import EnterpriseFeatureError
 from himmy.services.audit import SecurityAuditLog, SecurityEvent
 from himmy.services.observability.logging import (
     bind_request_id,
@@ -610,7 +611,36 @@ def create_app(
 
     # Identity: authenticate every request → Principal (WS1); None ⇒ offline/no-auth
     # default where requests are ANONYMOUS (all tenants). Rate limiting runs either way.
-    authenticator = build_authenticator()
+    try:
+        authenticator = build_authenticator()
+    except EnterpriseFeatureError as exc:
+        # A configured OIDC SSO surface failed its Enterprise entitlement gate — the
+        # license is expired or absent — which otherwise surfaces as an opaque uncaught
+        # traceback on the next restart/worker/autoscale. Turn it into a DISTINCT,
+        # actionable boot error (fail-closed; never serve OIDC unlicensed) that names
+        # WHY and HOW to fix it. ``resolution_reason`` distinguishes expired vs absent.
+        from himmy.licensing import resolution_reason
+
+        reason = resolution_reason()
+        if reason == "expired":
+            detail = "the Enterprise license appears EXPIRED"
+        elif reason in ("no-license", "invalid-signature"):
+            detail = "no valid Enterprise license is present"
+        else:
+            detail = "the current Enterprise license does not grant OIDC SSO"
+        remediation = (
+            "Install/renew via `himmy license install <key>` (or set HIMMY_LICENSE_KEY), "
+            "or disable OIDC by unsetting HIMMY_OIDC_ISSUER / HIMMY_OIDC_AUDIENCE."
+        )
+        logger.error(
+            "OIDC SSO requires a valid Enterprise license — %s. %s (%s)",
+            detail,
+            remediation,
+            exc,
+        )
+        raise RuntimeError(
+            f"OIDC SSO requires a valid Enterprise license — {detail}. {remediation}"
+        ) from exc
     # Fail closed: never silently expose an unauthenticated admin surface off-loopback.
     effective_host = (
         bind_host

@@ -214,12 +214,16 @@ class MemoryService:
             for record, vec in zip(missing, vecs, strict=False):
                 self._vectors[record.memory_id] = vec
         query_vec = await self._embedder.embed_query(query)
-        scored = [
-            MemoryHit(
-                record=r, similarity=_cosine(query_vec, self._vectors[r.memory_id])
-            )
-            for r in records
-        ]
+        scored: list[MemoryHit] = []
+        for r in records:
+            # ``embed_query`` above yields the loop, so a concurrent ``forget()``
+            # may have popped this record's vector between population and read.
+            # Read via ``.get`` and skip the now-stale record rather than crash
+            # with a ``KeyError`` (mirrors ``KnowledgeService.search``).
+            cached_vec = self._vectors.get(r.memory_id)
+            if cached_vec is None:
+                continue
+            scored.append(MemoryHit(record=r, similarity=_cosine(query_vec, cached_vec)))
         scored.sort(key=lambda h: h.similarity, reverse=True)
         threshold = (
             similarity_threshold

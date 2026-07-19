@@ -126,6 +126,7 @@ class InferenceService:
         timeout_grace_seconds: float = 0.25,
         timeout_grace_factor: float = 1.05,
         cache: InferenceCache | None = None,
+        stream_idle_timeout_seconds: float = 120.0,
     ) -> None:
         """Configure the client manager, retry/timeout policy, cache, and sink.
 
@@ -135,6 +136,14 @@ class InferenceService:
         ``cache`` (INF-9) is a pluggable response cache honored only when a
         request opts in via ``generation_params['use_cache']``; the default is a
         no-op so behavior is unchanged unless wired.
+
+        ``stream_idle_timeout_seconds`` is the per-chunk idle ceiling for the
+        provider-streamed path (INF-7): a provider that opens the stream then
+        stalls between chunks is reaped after this many seconds of silence with a
+        FAILED(TIMEOUT) terminal, so the SSE consumer is never left hung open. The
+        default is deliberately GENEROUS so legitimately slow-but-alive streams
+        (e.g. long reasoning pauses) are not killed — it guards against a dead
+        stall, not slowness.
         """
         self._client_manager = client_manager
         self._max_retries = max_retries
@@ -145,6 +154,7 @@ class InferenceService:
         self._timeout_grace_seconds = timeout_grace_seconds
         self._timeout_grace_factor = timeout_grace_factor
         self._cache: InferenceCache = cache or NoopInferenceCache()
+        self._stream_idle_timeout_seconds = stream_idle_timeout_seconds
 
     def _ceiling(self, timeout: float) -> float:
         """Proportional hard ceiling for the outer ``asyncio.wait_for`` guard."""
@@ -544,8 +554,52 @@ class InferenceService:
             index = 0
             final: InferenceResponse | None = None
             terminal_emitted = False
+            agen = manager_stream(request)
             try:
-                async for piece in manager_stream(request):
+                # Per-chunk IDLE timeout (INF-7): the outer run() ceiling never
+                # covered this path, so a provider that opened the stream then
+                # stalled between chunks left the task suspended forever and the
+                # SSE connection open with no server reap. Drive ``__anext__`` under
+                # a generous idle window so a dead stall is reaped with the same
+                # FAILED(TIMEOUT) terminal as run(), while slow-but-alive streams
+                # (long reasoning pauses) survive.
+                while True:
+                    try:
+                        piece = await asyncio.wait_for(
+                            agen.__anext__(),
+                            timeout=self._stream_idle_timeout_seconds,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError:
+                        aclose = getattr(agen, "aclose", None)
+                        if aclose is not None:
+                            try:
+                                await aclose()
+                            except Exception:  # noqa: BLE001 - best-effort cleanup
+                                pass
+                        final = InferenceResponse(
+                            request_id=request.request_id,
+                            status=InferenceStatus.FAILED,
+                            error=InferenceError(
+                                code=InferenceErrorCode.TIMEOUT,
+                                message=(
+                                    "stream idle for "
+                                    f"{self._stream_idle_timeout_seconds:.2f}s"
+                                ),
+                                retryable=True,
+                            ),
+                        )
+                        await self._emit_stream_terminal(request, final, started)
+                        terminal_emitted = True
+                        yield StreamDelta(
+                            request_id=request.request_id,
+                            delta="",
+                            index=index,
+                            done=True,
+                            response=final,
+                        )
+                        return
                     if isinstance(piece, InferenceResponse):
                         final = piece
                         continue

@@ -82,10 +82,19 @@ CREATE TABLE IF NOT EXISTS events (
     cost       REAL,
     payload    TEXT NOT NULL DEFAULT '{}',
     error      TEXT,
-    timestamp  TEXT NOT NULL
+    timestamp  TEXT NOT NULL,
+    request_id   TEXT,
+    tool_call_id TEXT,
+    workspace_id TEXT
 );
 CREATE INDEX IF NOT EXISTS events_thread_idx ON events (thread_id);
+CREATE INDEX IF NOT EXISTS events_trace_idx ON events (trace_id);
 """
+
+# Columns added after the original schema shipped; ALTER them in on open so an
+# existing .himmy/trace.db (created before these columns existed) doesn't break
+# _row's SELECT *. CREATE TABLE IF NOT EXISTS never migrates an existing table.
+_MIGRATIONS = ("request_id", "tool_call_id", "workspace_id")
 
 
 class SqliteEventStore:
@@ -96,14 +105,19 @@ class SqliteEventStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        existing = {r["name"] for r in self._conn.execute("PRAGMA table_info(events)")}
+        for col in _MIGRATIONS:
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
         self._conn.commit()
 
     async def append_event(self, event: RunEvent) -> None:
         """Persist one event (async to satisfy the EventSink protocol)."""
         self._conn.execute(
             "INSERT OR REPLACE INTO events (event_id, event_type, trace_id, thread_id, "
-            "agent_id, latency_ms, cost, payload, error, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "agent_id, latency_ms, cost, payload, error, timestamp, "
+            "request_id, tool_call_id, workspace_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.event_id,
                 event.event_type.value,
@@ -115,6 +129,9 @@ class SqliteEventStore:
                 json.dumps(event.payload, default=str),
                 event.error,
                 event.timestamp,
+                event.request_id,
+                event.tool_call_id,
+                event.workspace_id,
             ),
         )
         self._conn.commit()
@@ -165,6 +182,9 @@ class SqliteEventStore:
             payload=json.loads(row["payload"]),
             error=row["error"],
             timestamp=row["timestamp"],
+            request_id=row["request_id"],
+            tool_call_id=row["tool_call_id"],
+            workspace_id=row["workspace_id"],
         )
 
 

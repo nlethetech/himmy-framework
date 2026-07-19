@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from himmy.core.sqlite_util import connect_hardened
 from himmy.services.guardrails.base import GuardrailVerdict
-from himmy.services.guardrails.builtins import _PII_RULES
+from himmy.services.guardrails.builtins import _MAX_PII_SCAN_LEN, _PII_RULES
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable
@@ -295,7 +295,17 @@ class DlpGuardrail:
 
     def inspect(self, text: str, *, context: dict[str, Any]) -> GuardrailVerdict:
         """Classify sensitive data and apply the per-class action."""
-        result = text
+        # Cap the regex scan the same way PIIGuardrail does (see
+        # builtins._MAX_PII_SCAN_LEN): Python's ``re`` holds the GIL, so a multi-MiB
+        # blob stalls the event loop ~900 ms. Only the head is scanned; the tail is
+        # re-appended verbatim (redact/tokenize) or triggers a fail-closed block when
+        # the policy can BLOCK — an unscanned tail could carry the very class to withhold.
+        tail = ""
+        if len(text) > _MAX_PII_SCAN_LEN:
+            text_head, tail = text[:_MAX_PII_SCAN_LEN], text[_MAX_PII_SCAN_LEN:]
+        else:
+            text_head = text
+        result = text_head
         counts: dict[str, int] = {}
         blocked: list[str] = []
 
@@ -318,6 +328,14 @@ class DlpGuardrail:
 
         if self._analyzer is not None:
             result, blocked = self._apply_presidio(result, counts, blocked)
+
+        if tail and self.suppresses_output_content():
+            # A :block policy cannot be verified past the scan cap; rather than pass
+            # the unscanned tail through (fail-open past the cap), withhold the whole
+            # input. Redact/tokenize policies instead re-append the tail below.
+            blocked.append("unscanned-tail")
+        elif tail:
+            result = result + tail
 
         flags = [f"dlp:{label}" for label in counts]
         if self._audit_sink is not None and counts:

@@ -236,7 +236,11 @@ def test_metrics_payload_surfaces_read_creation_savings() -> None:
 
 def test_metrics_payload_flags_busted_prefix_audit_signal() -> None:
     """Over-threshold + requested + zero activity → prefix_cache_miss (the audit signal)."""
-    resp = InferenceResponse(request_id="r", status=InferenceStatus.SUCCESS)
+    resp = InferenceResponse(
+        request_id="r",
+        status=InferenceStatus.SUCCESS,
+        model_path="claude-3-5-sonnet-latest",  # resolved model → the audit floor
+    )
     payload = cache_metrics_payload(_req(active=True, over_threshold=True), resp)
     assert payload["prefix_cache_requested"] is True
     assert payload["prefix_cache_miss"] is True
@@ -259,6 +263,47 @@ def test_metrics_payload_warm_response_cache_hit_is_not_a_busted_prefix() -> Non
     )
     payload = cache_metrics_payload(_req(active=True), resp)
     assert payload.get("prefix_cache_requested") is True
+    assert "prefix_cache_miss" not in payload
+
+
+def test_metrics_payload_floor_uses_resolved_model_path_not_aliased_key() -> None:
+    """An aliased/'default' model_key misses the family floor and falls to 4096; the
+    audit floor must come from response.model_path (the model the adapter served, and
+    gated should_cache_prefix on) so a genuine busted prefix over the RESOLVED floor is
+    still flagged. Prefix ~1600 tokens: below the 4096 alias default, above the resolved
+    'claude' floor of 1024."""
+    req = InferenceRequest(
+        model_key="default",  # alias: _family_min_tokens misses → 4096 default
+        cache_policy=CachePolicy(),
+        messages=[
+            InferenceMessage(role="system", content=_BIG_SYSTEM),
+            InferenceMessage(role="user", content="hi"),
+        ],
+    )
+    resp = InferenceResponse(
+        request_id="r",
+        status=InferenceStatus.SUCCESS,
+        model_path="claude-3-5-sonnet-latest",  # resolved model → floor 1024
+    )
+    payload = cache_metrics_payload(req, resp)
+    assert payload["prefix_cache_requested"] is True
+    assert payload["prefix_cache_miss"] is True  # flagged via resolved-model floor
+
+
+def test_metrics_payload_empty_model_path_falls_to_conservative_default() -> None:
+    """A local manager leaves model_path empty → floor falls to the 4096 default; a
+    ~1600-token prefix is below it, so no busted-prefix flag (conservative, no noise)."""
+    req = InferenceRequest(
+        model_key="default",
+        cache_policy=CachePolicy(),
+        messages=[
+            InferenceMessage(role="system", content=_BIG_SYSTEM),
+            InferenceMessage(role="user", content="hi"),
+        ],
+    )
+    resp = InferenceResponse(request_id="r", status=InferenceStatus.SUCCESS)
+    payload = cache_metrics_payload(req, resp)
+    assert payload["prefix_cache_requested"] is True
     assert "prefix_cache_miss" not in payload
 
 

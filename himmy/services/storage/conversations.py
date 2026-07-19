@@ -38,17 +38,22 @@ config (``.himmy/conversations.db``), and a one-time best-effort import folds an
 
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
 from himmy.core.ids import new_uuid, utc_now_iso
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 #: ``origin`` marks which front door created a conversation. Used only for provenance /
 #: filtering; both origins live in the same table and are visible to both UIs.
@@ -234,6 +239,28 @@ class FlatMessage:
 # --------------------------------------------------------------------------- store
 
 
+def _synchronized(method: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Serialize a :class:`ConversationStore` method under the instance ``_lock``.
+
+    The store owns ONE ``check_same_thread=False`` :mod:`sqlite3` connection shared by the
+    CLI adapter and Studio; once the async Studio routes offload these sync calls onto
+    :func:`asyncio.to_thread` workers, concurrent workers would otherwise use the single
+    connection's cursor at the same time. Guarding every connection-touching method with the
+    per-instance lock serializes them (mirrors :class:`himmy.services.storage.sqlite`'s
+    lock+to_thread contract). A ``threading.RLock`` is used — not a plain ``Lock`` — because
+    these methods legitimately nest (``save_thread`` calls ``get_summary``/``_reproject``,
+    ``save_flat`` calls ``save_thread``, importers call ``save_thread``/``_exists``), and a
+    non-reentrant lock would self-deadlock on the same worker thread.
+    """
+
+    @functools.wraps(method)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with args[0]._lock:  # type: ignore[attr-defined]  # args[0] is self
+            return method(*args, **kwargs)
+
+    return wrapper
+
+
 class ConversationStore:
     """The ONE durable store of conversations, backing both the CLI and Studio.
 
@@ -249,6 +276,11 @@ class ConversationStore:
         """Open (or create) the unified conversation database at ``path``."""
         from himmy.core.sqlite_util import connect_hardened
 
+        # A reentrant lock serializes every connection use so concurrent ``asyncio.to_thread``
+        # workers (Studio) and the CLI adapter can share the single ``check_same_thread=False``
+        # connection safely. Created first; construction itself runs single-threaded before the
+        # instance is shared through the process-wide singleton.
+        self._lock = threading.RLock()
         self._conn = connect_hardened(path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
@@ -300,6 +332,7 @@ class ConversationStore:
 
     # -- authoritative writes ------------------------------------------------
 
+    @_synchronized
     def save_thread(
         self,
         conversation_id: str,
@@ -449,6 +482,7 @@ class ConversationStore:
             workspace_id=workspace_id,
         )
 
+    @_synchronized
     def _reproject(self, conversation_id: str, thread: ChatThread, now: str) -> None:
         """Rebuild the flat projection for one conversation from its authoritative thread.
 
@@ -478,6 +512,7 @@ class ConversationStore:
 
     # -- reads ---------------------------------------------------------------
 
+    @_synchronized
     def load_thread(self, conversation_id: str) -> ChatThread | None:
         """Return the authoritative :class:`ChatThread` for ``conversation_id`` (or None)."""
         row = self._conn.execute(
@@ -491,6 +526,7 @@ class ConversationStore:
         except Exception:  # noqa: BLE001 - a corrupt row must not break the caller
             return None
 
+    @_synchronized
     def get_summary(
         self,
         conversation_id: str,
@@ -516,6 +552,7 @@ class ConversationStore:
             return None
         return self._summary(row, self._count(conversation_id))
 
+    @_synchronized
     def flat_messages(self, conversation_id: str) -> list[FlatMessage]:
         """The regenerated flat transcript both UIs read, ordered."""
         rows = self._conn.execute(
@@ -525,6 +562,7 @@ class ConversationStore:
         ).fetchall()
         return [FlatMessage(role=r["role"], text=r["text"]) for r in rows]
 
+    @_synchronized
     def list_summaries(
         self,
         *,
@@ -570,6 +608,7 @@ class ConversationStore:
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [self._summary(r, r["n"]) for r in rows]
 
+    @_synchronized
     def _count(self, conversation_id: str) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM conversation_messages WHERE conversation_id = ?",
@@ -579,6 +618,7 @@ class ConversationStore:
 
     # -- mutations -----------------------------------------------------------
 
+    @_synchronized
     def rename(
         self,
         conversation_id: str,
@@ -603,6 +643,7 @@ class ConversationStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_synchronized
     def delete(
         self,
         conversation_id: str,
@@ -641,6 +682,7 @@ class ConversationStore:
 
     # -- subject linkage (S3/S4 right-to-erasure) ----------------------------
 
+    @_synchronized
     def subject_of(self, conversation_id: str) -> str | None:
         """Return the data subject linked to a conversation (or ``None`` if un-attributed)."""
         row = self._conn.execute(
@@ -649,6 +691,7 @@ class ConversationStore:
         ).fetchone()
         return row["subject_id"] if row and row["subject_id"] else None
 
+    @_synchronized
     def conversation_ids_for_subject(self, subject_id: str) -> list[str]:
         """Every conversation id linked to ``subject_id`` (the S4 reach-map for this store)."""
         rows = self._conn.execute(
@@ -657,6 +700,7 @@ class ConversationStore:
         ).fetchall()
         return [r["conversation_id"] for r in rows]
 
+    @_synchronized
     def delete_by_subject(self, subject_id: str) -> int:
         """Hard-DELETE every conversation (and its flat projection) for ``subject_id``.
 
@@ -677,6 +721,7 @@ class ConversationStore:
         self._conn.commit()
         return len(ids)
 
+    @_synchronized
     def set_project(self, conversation_id: str, project_id: str | None) -> bool:
         """Assign/clear the project of a conversation (touch ``updated_at`` only on change)."""
         cur = self._conn.execute(
@@ -686,6 +731,7 @@ class ConversationStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_synchronized
     def prune(
         self, *, older_than_days: float | None = None, keep_last: int | None = None
     ) -> int:
@@ -737,6 +783,7 @@ class ConversationStore:
     # Projects move here unchanged from the old chats store so Studio's grouping keeps
     # working over the unified DB. They reference a conversation's project_id.
 
+    @_synchronized
     def create_project(
         self,
         *,
@@ -769,6 +816,7 @@ class ConversationStore:
             "chat_count": 0,
         }
 
+    @_synchronized
     def get_project_row(
         self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
     ) -> sqlite3.Row | None:
@@ -783,6 +831,7 @@ class ConversationStore:
         ).fetchone()
         return row
 
+    @_synchronized
     def project_chat_count(
         self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
     ) -> int:
@@ -805,6 +854,7 @@ class ConversationStore:
         ).fetchone()
         return int(row["n"]) if row else 0
 
+    @_synchronized
     def list_project_rows(
         self, *, workspace_id: str | frozenset[str] | None = None
     ) -> list[tuple[sqlite3.Row, int]]:
@@ -825,6 +875,7 @@ class ConversationStore:
         ).fetchall()
         return [(r, r["n"]) for r in rows]
 
+    @_synchronized
     def update_project(
         self,
         project_id: str,
@@ -851,6 +902,7 @@ class ConversationStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_synchronized
     def delete_project(
         self, project_id: str, *, workspace_id: str | frozenset[str] | None = None
     ) -> bool:
@@ -877,6 +929,7 @@ class ConversationStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_synchronized
     def project_conversation_summaries(
         self,
         project_id: str,
@@ -903,6 +956,7 @@ class ConversationStore:
         ).fetchall()
         return [self._summary(r, r["n"]) for r in rows]
 
+    @_synchronized
     def assign_conversation(
         self,
         project_id: str,
@@ -934,6 +988,7 @@ class ConversationStore:
         self._conn.commit()
         return cur.rowcount > 0
 
+    @_synchronized
     def unassign_conversation(
         self,
         conversation_id: str,
@@ -979,6 +1034,7 @@ class ConversationStore:
             counts["projects"] = projects
         return counts
 
+    @_synchronized
     def _import_sessions(self, path: str) -> int:
         imported = 0
         try:
@@ -1004,6 +1060,7 @@ class ConversationStore:
             src.close()
         return imported
 
+    @_synchronized
     def _import_chats(self, path: str) -> tuple[int, int]:
         chats = 0
         projects = 0
@@ -1077,6 +1134,7 @@ class ConversationStore:
             src.close()
         return (chats, projects)
 
+    @_synchronized
     def _exists(self, conversation_id: str) -> bool:
         return (
             self._conn.execute(
@@ -1102,6 +1160,7 @@ class ConversationStore:
             message_count=count,
         )
 
+    @_synchronized
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
         self._conn.close()

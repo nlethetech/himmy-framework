@@ -1085,6 +1085,41 @@ class _PgStoreBase:
                 )
             )
 
+    async def _prune_by_created_at(
+        self,
+        table: str,
+        pk: str,
+        older_than_days: float | None,
+        keep_last: int | None,
+    ) -> int:
+        """Delete old rows from a spine table keyed by ``pk`` + ``created_at``.
+
+        The operator-invoked retention primitive: a row is pruned if it fails EITHER bound.
+        ``older_than_days`` drops rows whose ``created_at`` is older than the cutoff;
+        ``keep_last`` caps the table to its N most recent by ``created_at``. ``table``/``pk``
+        are internal literals (never caller input); values are parameterized. Returns rows
+        removed (age + keep_last deletes are disjoint — the age pass runs first).
+        """
+        pool = self._require_pool()
+        total = 0
+        async with pool.acquire() as conn, conn.transaction():
+            if older_than_days is not None:
+                tag = await conn.execute(
+                    f"DELETE FROM {table} "  # noqa: S608
+                    f"WHERE created_at < now() - make_interval(days => $1)",
+                    float(older_than_days),
+                )
+                total += int(str(tag).rsplit(" ", 1)[-1])
+            if keep_last is not None:
+                keep = max(int(keep_last), 0)
+                tag = await conn.execute(
+                    f"DELETE FROM {table} WHERE {pk} IN ("  # noqa: S608
+                    f"SELECT {pk} FROM {table} ORDER BY created_at DESC OFFSET $1)",
+                    keep,
+                )
+                total += int(str(tag).rsplit(" ", 1)[-1])
+        return total
+
 
 class PostgresThreadStore(_PgStoreBase):
     """Postgres-backed chat-thread persistence keyed by ``thread_id``."""
@@ -2098,6 +2133,54 @@ class PostgresRunStore(_PgStoreBase):
             )
         return _row_to_run(row, cipher=self._cipher) if row else None
 
+    async def prune_runs(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old TERMINAL run rows, bounding the run store's unbounded growth.
+
+        The Postgres mirror of :meth:`SqliteStorageService.prune_runs`. Only TERMINAL runs
+        (NOT in ``ACTIVE_RUN_STATUSES``) are candidates — a live/leased/queued run the leased
+        queue + reaper depend on is ALWAYS kept regardless of age. ``older_than_days`` drops
+        terminal runs older than the cutoff; ``keep_last`` additionally caps terminal runs to
+        the N most recent by ``created_at``; at least one bound must be given. Each pruned
+        run's ``recommendations`` (which reference ``run_id``) are hard-deleted in the SAME
+        transaction so no advisory row dangles against a deleted run.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_runs needs at least one of older_than_days / keep_last"
+            )
+        from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+        active = [s.value for s in ACTIVE_RUN_STATUSES]
+        pool = self._require_pool()
+        run_ids: list[str] = []
+        async with pool.acquire() as conn, conn.transaction():
+            if older_than_days is not None:
+                rows = await conn.fetch(
+                    "DELETE FROM runs WHERE status <> ALL($1::text[]) "
+                    "AND created_at < now() - make_interval(days => $2) RETURNING run_id",
+                    active,
+                    float(older_than_days),
+                )
+                run_ids += [r["run_id"] for r in rows]
+            if keep_last is not None:
+                keep = max(int(keep_last), 0)
+                rows = await conn.fetch(
+                    "DELETE FROM runs WHERE status <> ALL($1::text[]) AND run_id IN ("
+                    "SELECT run_id FROM runs WHERE status <> ALL($1::text[]) "
+                    "ORDER BY created_at DESC OFFSET $2) RETURNING run_id",
+                    active,
+                    keep,
+                )
+                run_ids += [r["run_id"] for r in rows]
+            if run_ids:
+                await conn.execute(
+                    "DELETE FROM recommendations WHERE run_id = ANY($1::text[])",
+                    run_ids,
+                )
+        return len(run_ids)
+
 
 class PostgresAgentDefStore(_PgStoreBase):
     """Postgres-backed workspace-scoped stored agent definitions (T2e)."""
@@ -2352,6 +2435,23 @@ class PostgresRecommendationStore(_PgStoreBase):
             )
         return _row_to_recommendation(row) if row else None
 
+    async def prune_recommendations(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old recommendation rows by age and/or keep_last (returns rows removed).
+
+        The Postgres mirror of :meth:`SqliteStorageService.prune_recommendations`.
+        Recommendations are advisory (no live-work status), so every row is a candidate. At
+        least one bound must be given.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_recommendations needs at least one of older_than_days / keep_last"
+            )
+        return await self._prune_by_created_at(
+            "recommendations", "recommendation_id", older_than_days, keep_last
+        )
+
 
 class PostgresEvaluationStore(_PgStoreBase):
     """Postgres-backed evaluation runs keyed by ``run_id``."""
@@ -2485,6 +2585,27 @@ class PostgresOrchestrationStore(_PgStoreBase):
         """List episodic memory objects, optionally filtered by subject."""
         rows = await self._list_by_subject("episodic_memory_objects", subject_id)
         return [EpisodicMemoryObject.model_validate(r["payload"]) for r in rows]
+
+    async def prune_memory(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old cognitive + episodic memory rows (returns total rows removed).
+
+        The Postgres mirror of :meth:`SqliteStorageService.prune_memory`: prunes BOTH the
+        ``memory_objects`` and ``episodic_memory_objects`` tables independently with the same
+        bounds. At least one bound must be given.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_memory needs at least one of older_than_days / keep_last"
+            )
+        total = await self._prune_by_created_at(
+            "memory_objects", "memory_id", older_than_days, keep_last
+        )
+        total += await self._prune_by_created_at(
+            "episodic_memory_objects", "episode_id", older_than_days, keep_last
+        )
+        return total
 
     async def save_agent_state(self, record: AgentStateRecord) -> AgentStateRecord:
         """Upsert an agent state record."""
@@ -3277,6 +3398,14 @@ class PostgresStorageService:
             workspace_id, idempotency_key
         )
 
+    async def prune_runs(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old TERMINAL run rows (+ their recommendations); returns rows removed."""
+        return await self._run_store.prune_runs(
+            older_than_days=older_than_days, keep_last=keep_last
+        )
+
     # ------------------------------------------------------------- agent defs (T2e)
     async def save_agent_def(self, record: AgentDefRecord) -> AgentDefRecord:
         """Upsert a stored agent definition keyed by ``agent_id``."""
@@ -3346,6 +3475,14 @@ class PostgresStorageService:
             recommendation_id, status=status, notes=notes
         )
 
+    async def prune_recommendations(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old recommendation rows by age and/or keep_last; returns rows removed."""
+        return await self._recommendation_store.prune_recommendations(
+            older_than_days=older_than_days, keep_last=keep_last
+        )
+
     # --------------------------------------------------------------- evaluation
     async def save_evaluation_run(self, run: Any) -> Any:
         """Upsert an evaluation run keyed by ``run_id``."""
@@ -3395,6 +3532,14 @@ class PostgresStorageService:
     ) -> list[EpisodicMemoryObject]:
         """List episodic memory objects, optionally filtered by subject."""
         return await self._orchestration_store.list_episodic_memory(subject_id)
+
+    async def prune_memory(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old cognitive + episodic memory rows; returns total rows removed."""
+        return await self._orchestration_store.prune_memory(
+            older_than_days=older_than_days, keep_last=keep_last
+        )
 
     async def save_agent_state(self, record: AgentStateRecord) -> AgentStateRecord:
         """Upsert an agent state record."""

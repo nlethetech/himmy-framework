@@ -16,6 +16,7 @@ import contextlib
 import contextvars
 import hashlib
 import json
+import logging
 import os
 import queue
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
@@ -82,6 +83,26 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids import cycles
 # ``_emit`` alongside the storage/registry/observability sinks so a UI driving a
 # long run can receive incremental progress without polling storage.
 OnEvent = Callable[[RunEvent], Awaitable[None]]
+
+# Module logger. The audit-spine sinks in ``_emit`` swallow their exceptions so a
+# failing sink can never break a run, but a silent swallow hides a durable-write
+# loss; log a warning so operators get a signal without the run itself failing.
+log = logging.getLogger(__name__)
+
+
+def _count_sink_drop(sink: str) -> None:
+    """Increment the bounded ``event_sink_drops_total{sink}`` counter (best-effort).
+
+    Complements the ``log.warning`` in ``_emit`` with an operator-scrapable metric so a
+    silent audit-spine write loss is visible on ``/metrics``. Never raises — observability
+    must never break a run (the sink drop it records is already itself a swallowed error).
+    """
+    try:
+        from himmy.services.observability.metrics import get_registry
+
+        get_registry().event_sink_drops_total.inc((sink,))
+    except Exception:  # pragma: no cover - metrics must never break a run
+        pass
 
 
 # The framework-enforced ceiling on agent-loop turns. ``max_turns`` is caller-
@@ -4026,14 +4047,30 @@ class SingleAgentRuntime:
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # pragma: no cover - defensive
-                    pass
+                    # Durable audit-spine write lost; keep the run alive but signal.
+                    log.warning(
+                        "memory_store.append_event failed (event dropped from "
+                        "durable spine): event_type=%s trace_id=%s",
+                        getattr(event.event_type, "value", event.event_type),
+                        event.trace_id,
+                        exc_info=True,
+                    )
+                    _count_sink_drop("memory_store")
         if self.entity_registry is not None:
             try:
                 self.entity_registry.register(
                     event.to_record(metadata=self._subject_metadata())
                 )
             except Exception:  # pragma: no cover - defensive
-                pass
+                # Entity-registry projection lost; keep the run alive but signal.
+                log.warning(
+                    "entity_registry.register failed (event dropped from "
+                    "projection): event_type=%s trace_id=%s",
+                    getattr(event.event_type, "value", event.event_type),
+                    event.trace_id,
+                    exc_info=True,
+                )
+                _count_sink_drop("entity_registry")
         try:
             from himmy.services.observability import emit_event_span
 

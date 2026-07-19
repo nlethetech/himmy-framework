@@ -24,7 +24,15 @@ Lifecycle hardening (P1):
 * A **live-consulted revocation file** (``HIMMY_API_KEY_REVOCATION_FILE``) lets a
   leaked key die WITHOUT a restart: it is a JSON list of revoked ``key_id`` strings
   re-read (mtime-cached) on each authenticate, so dropping a key_id into it kills the
-  key on the next request. If a CONFIGURED file later becomes unreadable (deleted,
+  key on the next request. To keep steady-state key auth a cheap in-memory check (no
+  synchronous ``stat()`` on the async event loop per request), the freshness ``stat()``
+  can be THROTTLED to at most once per ``revocation_stat_interval`` seconds. This is
+  OPT-IN and OFF by default (``_REVOCATION_STAT_INTERVAL_S = 0.0``) so revoke-on-next-
+  authenticate stays immediate/synchronous — the safe default for an auth surface. A
+  high-QPS deployment that profiles the per-request ``stat()`` as a bottleneck (e.g. on a
+  slow/NFS revocation path) can pass ``revocation_stat_interval=1.0`` to re-stat at most
+  once/sec, accepting a bounded ~1s revocation-propagation staleness in exchange.
+  If a CONFIGURED file later becomes unreadable (deleted,
   truncated, corrupted, or ``0600`` and written by a different user than the server —
   e.g. ``himmy apikey revoke`` run as another account), the control does NOT silently
   disarm: the LAST-KNOWN revoked set is retained (a transient blip can never
@@ -78,6 +86,15 @@ REVOCATION_FILE_ENV = "HIMMY_API_KEY_REVOCATION_FILE"
 #: back to the last-known revoked set. Off by default so the historical behavior
 #: (transient blips do not lock everyone out) is preserved unless an operator opts in.
 REVOCATION_FAIL_CLOSED_ENV = "HIMMY_API_KEY_REVOCATION_FAIL_CLOSED"
+
+#: Minimum wall-time (seconds, monotonic) between successive ``stat()`` probes of the
+#: revocation file on the async auth hot path. When SET (> 0) a healthy, already-loaded
+#: list is trusted in-memory and the file is re-stat'd (and re-read only if its fingerprint
+#: changed) at most once per interval — bounding 'revoke-on-next-authenticate' staleness to
+#: ~this interval. DEFAULT 0.0 = OFF: revocation stays immediate/synchronous, the safe
+#: default for an auth surface. Opt in (e.g. ``revocation_stat_interval=1.0``) only where a
+#: per-request ``stat()`` is a profiled bottleneck (high QPS on a slow/NFS revocation path).
+_REVOCATION_STAT_INTERVAL_S = 0.0
 
 
 def _env_truthy(name: str) -> bool:
@@ -245,8 +262,14 @@ class _RevocationList:
       CLOSED (every key 401s) rather than relying on the last-known set.
     """
 
-    def __init__(self, path: str | Path | None) -> None:
+    def __init__(
+        self, path: str | Path | None, *, stat_interval: float = _REVOCATION_STAT_INTERVAL_S
+    ) -> None:
         self._path = Path(path).expanduser() if path else None
+        #: Min seconds between ``stat()`` probes (see ``_REVOCATION_STAT_INTERVAL_S``).
+        #: Pass ``0.0`` to re-stat on EVERY consult (synchronous-freshness semantics —
+        #: e.g. unit tests that revoke and immediately re-check within the same instant).
+        self._stat_interval = stat_interval
         #: The composite freshness fingerprint of the last successful read. Keyed on
         #: ``(st_mtime_ns, st_size, st_ino)`` rather than ``st_mtime`` alone so a content
         #: rewrite that PRESERVES the mtime — an atomic replace that copies the source
@@ -260,6 +283,9 @@ class _RevocationList:
         self._ever_loaded = False
         #: Last error string surfaced, so we log a given failure loudly only once.
         self._last_error: str | None = None
+        #: Monotonic timestamp of the last ``stat()`` probe; throttles the synchronous
+        #: FS syscall off the async auth hot path (see ``_REVOCATION_STAT_INTERVAL_S``).
+        self._last_stat_at: float = 0.0
 
     def is_revoked(self, key_id: str) -> bool:
         """Whether ``key_id`` is in the current (freshly re-read) revocation set.
@@ -289,6 +315,20 @@ class _RevocationList:
         a stale revoked set that would keep an already-revoked key authenticating.
         """
         assert self._path is not None
+        # Throttle the synchronous ``stat()`` off the async auth hot path: once the list
+        # has loaded cleanly, trust the in-memory revoked set and skip the FS syscall
+        # until the interval elapses, so steady-state key auth is a cheap memory check.
+        # (Skipped only while healthy — a pending error keeps re-probing, bounded by the
+        # same interval, so recovery is still prompt without spamming the event loop.)
+        now = time.monotonic()
+        if (
+            self._stat_interval > 0
+            and self._ever_loaded
+            and self._last_error is None
+            and (now - self._last_stat_at) < self._stat_interval
+        ):
+            return True
+        self._last_stat_at = now
         try:
             st = self._path.stat()
             fingerprint = (st.st_mtime_ns, st.st_size, st.st_ino)
@@ -352,6 +392,7 @@ class ApiKeyAuthenticator:
         shared_key_roles: tuple[str, ...] | None = None,
         records: list[KeyRecord] | None = None,
         revocation_path: str | Path | None = None,
+        revocation_stat_interval: float = _REVOCATION_STAT_INTERVAL_S,
     ) -> None:
         """Wire shared keys (→ all-tenants) and/or mapped keys (→ bound principals).
 
@@ -403,7 +444,12 @@ class ApiKeyAuthenticator:
 
         if revocation_path is None:
             revocation_path = os.environ.get(REVOCATION_FILE_ENV)
-        self._revocations = _RevocationList(revocation_path)
+        # ``revocation_stat_interval`` throttles the synchronous ``stat()`` off the async
+        # auth hot path (steady-state auth is then a cheap in-memory check); pass ``0.0``
+        # for synchronous-freshness semantics (revoke observed on the very next consult).
+        self._revocations = _RevocationList(
+            revocation_path, stat_interval=revocation_stat_interval
+        )
 
         if not self._records:
             raise AuthError("ApiKeyAuthenticator needs at least one configured key")

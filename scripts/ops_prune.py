@@ -105,6 +105,59 @@ def _prune_graph(path: Path, older_than_days: float) -> int:
     return removed
 
 
+def _prune_spine(
+    path: Path,
+    older_than_days: float | None,
+    keep_last_runs: int | None,
+    keep_last_recommendations: int | None,
+    keep_last_memory: int | None,
+) -> int:
+    """Prune the runs / recommendations / memory spine tables in ``path``.
+
+    Runs are scoped to TERMINAL statuses only (a live/leased/queued run the queue reaper
+    depends on is always kept), and each pruned run's recommendations are cascade-deleted.
+    Returns total rows removed (0 if the store is absent). Each table is pruned only when a
+    bound applies to it (the shared age cutoff and/or that table's keep-last)."""
+    import asyncio
+
+    from himmy.services.storage.sqlite import SqliteStorageService
+
+    if not path.is_file():
+        _eprint(f"  run store {path} not present — skipped")
+        return 0
+    store = SqliteStorageService(str(path))
+    removed = 0
+    try:
+        if older_than_days is not None or keep_last_runs is not None:
+            n = asyncio.run(
+                store.prune_runs(
+                    older_than_days=older_than_days, keep_last=keep_last_runs
+                )
+            )
+            _eprint(f"  runs: pruned {n} from {path}")
+            removed += n
+        if older_than_days is not None or keep_last_recommendations is not None:
+            n = asyncio.run(
+                store.prune_recommendations(
+                    older_than_days=older_than_days,
+                    keep_last=keep_last_recommendations,
+                )
+            )
+            _eprint(f"  recommendations: pruned {n} from {path}")
+            removed += n
+        if older_than_days is not None or keep_last_memory is not None:
+            n = asyncio.run(
+                store.prune_memory(
+                    older_than_days=older_than_days, keep_last=keep_last_memory
+                )
+            )
+            _eprint(f"  memory objects: pruned {n} from {path}")
+            removed += n
+    finally:
+        asyncio.run(store.close())
+    return removed
+
+
 def _prune_sessions(
     path: Path, older_than_days: float | None, keep_last: int | None
 ) -> int:
@@ -145,6 +198,24 @@ def main(argv: list[str] | None = None) -> int:
         help="additionally cap the session store to the N most recently updated",
     )
     parser.add_argument(
+        "--keep-last-runs",
+        type=int,
+        default=None,
+        help="additionally cap the terminal-run store to the N most recent by created_at",
+    )
+    parser.add_argument(
+        "--keep-last-recommendations",
+        type=int,
+        default=None,
+        help="additionally cap the recommendations store to the N most recent",
+    )
+    parser.add_argument(
+        "--keep-last-memory",
+        type=int,
+        default=None,
+        help="additionally cap each memory table to the N most recent by created_at",
+    )
+    parser.add_argument(
         "--store-path",
         default=os.environ.get("HIMMY_STORE_PATH", _DEFAULT_STORE_PATH),
         help="run store path (default $HIMMY_STORE_PATH or .himmy/storage.db)",
@@ -166,12 +237,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.older_than_days is None and args.keep_last_events is None and (
-        args.keep_last_sessions is None
+    if (
+        args.older_than_days is None
+        and args.keep_last_events is None
+        and args.keep_last_sessions is None
+        and args.keep_last_runs is None
+        and args.keep_last_recommendations is None
+        and args.keep_last_memory is None
     ):
         parser.error(
             "give at least one bound: --older-than-days and/or --keep-last-events "
-            "and/or --keep-last-sessions"
+            "and/or --keep-last-sessions and/or --keep-last-runs and/or "
+            "--keep-last-recommendations and/or --keep-last-memory"
         )
 
     total = 0
@@ -181,6 +258,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.older_than_days is not None or args.keep_last_events is not None:
         total += _prune_events(
             Path(args.store_path), args.older_than_days, args.keep_last_events
+        )
+
+    # Runs (terminal only) + recommendations + memory objects live in the same store db.
+    if (
+        args.older_than_days is not None
+        or args.keep_last_runs is not None
+        or args.keep_last_recommendations is not None
+        or args.keep_last_memory is not None
+    ):
+        total += _prune_spine(
+            Path(args.store_path),
+            args.older_than_days,
+            args.keep_last_runs,
+            args.keep_last_recommendations,
+            args.keep_last_memory,
         )
 
     # Resolved + terminal checkpoints are age-only retention.

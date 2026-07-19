@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -26,6 +27,33 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Iterable
 
     from fastapi import Request
+
+    from himmy.licensing import License
+
+logger = logging.getLogger(__name__)
+
+#: How long before an Enterprise license lapses we start warning loudly at build time,
+#: so an operator renews BEFORE the next boot fails closed and OIDC stops starting.
+_LICENSE_EXPIRY_WARN_WINDOW_S = 14 * 24 * 3600  # 14 days
+
+
+def _warn_if_license_expiring(lic: License | None) -> None:
+    """Log a loud pre-expiry WARNING when the EE license lapses within the warn window.
+
+    No-op for a perpetual (``expires_at == 0``) or already-expired license — the latter
+    is handled as a hard, legible build error elsewhere. This only nudges operators to
+    renew while OIDC still works, so the fail-closed boot never comes as a surprise.
+    """
+    if lic is None or not lic.expires_at:
+        return
+    remaining = lic.expires_at - time.time()
+    if 0 < remaining <= _LICENSE_EXPIRY_WARN_WINDOW_S:
+        logger.warning(
+            "Enterprise license (OIDC SSO) expires in %.1f day(s) — renew before it "
+            "lapses via `himmy license install <key>`, or the next server boot will "
+            "fail closed and OIDC will not start.",
+            remaining / 86400,
+        )
 
 
 @runtime_checkable
@@ -235,9 +263,20 @@ class OidcAuthenticator:
         import os
 
         from himmy.config.flags import env_truthy
-        from himmy.licensing import FEATURE_OIDC_SSO, require_entitlement
+        from himmy.licensing import (
+            FEATURE_OIDC_SSO,
+            current_license,
+            require_entitlement,
+        )
 
+        # Fail-closed entitlement gate: raises EnterpriseFeatureError on a
+        # community/expired license (no grace window). The BOOT layer turns this into a
+        # DISTINCT, actionable startup error (see ``create_app`` at build_authenticator).
         require_entitlement(FEATURE_OIDC_SSO)
+
+        # Entitled: nudge operators loudly if renewal is due, so the next boot's
+        # fail-closed lapse never comes as a surprise.
+        _warn_if_license_expiring(current_license())
 
         issuer = os.environ.get("HIMMY_OIDC_ISSUER")
         audience = os.environ.get("HIMMY_OIDC_AUDIENCE")

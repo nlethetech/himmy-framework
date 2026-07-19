@@ -216,6 +216,10 @@ class RunStore(Protocol):
         self, workspace_id: str, idempotency_key: str
     ) -> RunRecord | None: ...
 
+    async def prune_runs(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int: ...
+
 
 @runtime_checkable
 class AgentDefStore(Protocol):
@@ -275,6 +279,10 @@ class RecommendationStore(Protocol):
         notes: str | None = None,
     ) -> RecommendationItem | None: ...
 
+    async def prune_recommendations(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int: ...
+
 
 @runtime_checkable
 class EvaluationStore(Protocol):
@@ -318,6 +326,10 @@ class OrchestrationStore(Protocol):
     async def list_episodic_memory(
         self, subject_id: str | None = None
     ) -> list[EpisodicMemoryObject]: ...
+
+    async def prune_memory(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int: ...
 
     async def save_agent_state(self, record: AgentStateRecord) -> AgentStateRecord: ...
 

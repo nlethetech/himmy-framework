@@ -184,3 +184,32 @@ def test_named_dlp_guardrail_honors_block_policy(
     v = pipe.inspect("reach me at a@b.com")
     assert v.allowed is False
     assert any("email" in r for r in v.reasons)
+
+
+# ------------------------------------------------------------------ scan cap
+def test_dlp_caps_scan_length_redact() -> None:
+    # A multi-MiB blob must not be fully regex-scanned (GIL/event-loop stall);
+    # only the head is scanned+redacted, the tail is re-appended verbatim.
+    from himmy.services.guardrails.builtins import _MAX_PII_SCAN_LEN
+
+    guard = DlpGuardrail(policy=DlpPolicy(default=DlpAction.REDACT))
+    head = "email a@b.com " + "x" * _MAX_PII_SCAN_LEN
+    tail = " tail-secret c@d.com"
+    v = _inspect(guard, head + tail)
+    assert v.allowed is True
+    assert "a@b.com" not in v.text  # head PII redacted
+    assert "c@d.com" in v.text  # past-cap tail passed through verbatim
+    assert v.text.endswith(tail)
+
+
+def test_dlp_block_fails_closed_past_cap() -> None:
+    # For a :block policy the unscanned tail could hide the very class to withhold,
+    # so an oversized input must fail CLOSED (block) rather than pass the tail.
+    from himmy.services.guardrails.builtins import _MAX_PII_SCAN_LEN
+
+    guard = DlpGuardrail(policy=DlpPolicy(default=DlpAction.BLOCK))
+    big = "x" * (_MAX_PII_SCAN_LEN + 1024)  # no PII anywhere, but over the cap
+    v = _inspect(guard, big)
+    assert v.allowed is False
+    assert v.text == big  # original withheld, not the redacted head
+    assert any("unscanned-tail" in r for r in v.reasons)

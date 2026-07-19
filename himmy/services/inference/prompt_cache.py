@@ -636,8 +636,15 @@ def cache_metrics_payload(
         # per-model floor) so a sub-threshold prefix isn't noise. A warm response-cache
         # hit (cache_hit) never touched a provider prefix cache, so it's not a bust.
         policy = request.cache_policy
+        # Compute the floor from the RESOLVED model the adapter actually served
+        # (response.model_path), NOT request.model_key — an aliased/"default"
+        # model_key would miss _family_min_tokens and fall to the 4096 default,
+        # while the adapter gated marking (should_cache_prefix) on the resolved
+        # model's real (possibly lower) floor. An empty model_path (local
+        # managers) conservatively falls back to the 4096 default.
+        resolved_model = getattr(response, "model_path", "") or ""
         floor = min_cacheable_tokens(
-            request.model_key, policy.min_prefix_tokens if policy else None
+            resolved_model, policy.min_prefix_tokens if policy else None
         )
         over_threshold = stable_prefix_estimate_tokens(request) >= floor
         if (

@@ -13,6 +13,7 @@ protocols in :mod:`himmy.services.storage.protocols`.
 from __future__ import annotations
 
 import threading
+from datetime import UTC
 from typing import TYPE_CHECKING, Any, cast
 
 from himmy.core.events import RunEvent
@@ -36,6 +37,43 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids storage <-> context 
     from himmy.agents.base_agent.thread import ChatThread
     from himmy.services.context.models import ContextField, ContextSnapshot
     from himmy.services.evaluation.models import EvaluationRun
+
+
+def _prune_victims_by_created_at(
+    items: list[tuple[str, Any]],
+    older_than_days: float | None,
+    keep_last: int | None,
+) -> set[str]:
+    """Pick keys to prune from ``(key, created_at_iso)`` pairs by age and/or keep_last.
+
+    The in-memory retention primitive shared by ``prune_runs``/``prune_recommendations``/
+    ``prune_memory``: a key is doomed if it fails EITHER bound. ``older_than_days`` dates each
+    row by parsing its ISO ``created_at`` (a malformed/blank value is never dated, so never
+    age-pruned); ``keep_last`` keeps the N most recent by ``created_at`` and dooms the rest.
+    """
+    from datetime import datetime, timedelta
+
+    def _parse(raw: Any) -> datetime:
+        if isinstance(raw, str) and raw:
+            try:
+                parsed = datetime.fromisoformat(raw)
+            except ValueError:
+                return datetime.min.replace(tzinfo=UTC)
+            return parsed if parsed.tzinfo else parsed.astimezone()
+        return datetime.min.replace(tzinfo=UTC)
+
+    doomed: set[str] = set()
+    if older_than_days is not None:
+        cutoff = datetime.now().astimezone() - timedelta(days=older_than_days)
+        for key, raw in items:
+            if isinstance(raw, str) and raw and _parse(raw) < cutoff:
+                doomed.add(key)
+    if keep_last is not None:
+        keep = max(int(keep_last), 0)
+        ordered = sorted(items, key=lambda kv: _parse(kv[1]))  # oldest first
+        over = ordered[: len(ordered) - keep] if keep else ordered
+        doomed.update(key for key, _ in over)
+    return doomed
 
 
 class InMemoryThreadStore:
@@ -649,6 +687,36 @@ class InMemoryRunStore:
                 )
         return len(doomed)
 
+    async def prune_runs(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old TERMINAL run rows by age and/or keep_last (returns rows removed).
+
+        The operator-invoked retention twin of the durable backends' ``prune_runs``. Only
+        TERMINAL runs (NOT in ``ACTIVE_RUN_STATUSES``) are candidates: a live/leased/queued
+        run is always kept regardless of age. At least one bound must be given.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_runs needs at least one of older_than_days / keep_last"
+            )
+        from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+        active = set(ACTIVE_RUN_STATUSES)
+        candidates = [
+            (rid, run.created_at)
+            for rid, run in self._runs.items()
+            if run.status not in active
+        ]
+        doomed = _prune_victims_by_created_at(candidates, older_than_days, keep_last)
+        for rid in doomed:
+            run = self._runs.pop(rid, None)
+            if run is not None and run.idempotency_key is not None:
+                self._runs_by_idempotency.pop(
+                    (run.workspace_id, run.idempotency_key), None
+                )
+        return len(doomed)
+
 
 class InMemoryAgentDefStore:
     """Process-local workspace-scoped stored agent definitions (T2e).
@@ -758,6 +826,24 @@ class InMemoryRecommendationStore:
             for rid, item in self._recommendations.items()
             if item.subject_id == subject_id
         ]
+        for rid in doomed:
+            self._recommendations.pop(rid, None)
+        return len(doomed)
+
+    async def prune_recommendations(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old recommendation rows by age and/or keep_last (returns rows removed).
+
+        Recommendations are advisory (no live-work status), so every row is a candidate. At
+        least one bound must be given.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_recommendations needs at least one of older_than_days / keep_last"
+            )
+        items = [(rid, i.created_at) for rid, i in self._recommendations.items()]
+        doomed = _prune_victims_by_created_at(items, older_than_days, keep_last)
         for rid in doomed:
             self._recommendations.pop(rid, None)
         return len(doomed)
@@ -900,6 +986,27 @@ class InMemoryOrchestrationStore:
             for m in self._episodic.values()
             if subject_id is None or m.subject_id == subject_id
         ]
+
+    async def prune_memory(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old cognitive + episodic memory rows (returns total rows removed).
+
+        Prunes BOTH ``_memory`` and ``_episodic`` independently with the same bounds by age
+        and/or keep_last. At least one bound must be given.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_memory needs at least one of older_than_days / keep_last"
+            )
+        total = 0
+        for store, key_attr in ((self._memory, "memory_id"), (self._episodic, "episode_id")):
+            items = [(getattr(o, key_attr), o.created_at) for o in store.values()]
+            doomed = _prune_victims_by_created_at(items, older_than_days, keep_last)
+            for k in doomed:
+                store.pop(k, None)
+            total += len(doomed)
+        return total
 
     async def save_agent_state(self, record: AgentStateRecord) -> AgentStateRecord:
         """Upsert an agent state record."""

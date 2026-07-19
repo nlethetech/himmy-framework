@@ -414,11 +414,31 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
 _PRUNE_DELETE_CHUNK = 900
 
 
-def _chunked(items: list[int], size: int) -> Iterator[list[int]]:
+def _chunked(items: list[Any], size: int) -> Iterator[list[Any]]:
     """Yield ``items`` in contiguous slices of at most ``size`` (size >= 1)."""
     step = max(int(size), 1)
     for start in range(0, len(items), step):
         yield items[start : start + step]
+
+
+def _parse_created_at(raw: Any) -> Any:
+    """Parse an ISO ``created_at`` column to an aware datetime, or None if unusable.
+
+    The spine tables (``runs``/``recommendations``/``memory_objects``) store ``created_at``
+    as a plain (unencrypted) ISO-8601 UTC string, so pruning dates a row by parsing this
+    column directly — no payload decrypt. A naive legacy value is coerced to local-aware so
+    the ``< cutoff`` comparison never raises on a mixed store; a malformed value returns None
+    and the row is kept (never dated, so never age-pruned).
+    """
+    from datetime import datetime
+
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:  # pragma: no cover - malformed legacy timestamp
+        return None
+    return parsed if parsed.tzinfo else parsed.astimezone()
 
 
 class _Unset:
@@ -797,6 +817,179 @@ class SqliteStorageService:
                     placeholders = ",".join("?" for _ in batch)
                     self._conn.execute(
                         f"DELETE FROM run_events WHERE seq IN ({placeholders})",  # noqa: S608
+                        tuple(batch),
+                    )
+                self._conn.commit()
+                return len(doomed)
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    async def prune_runs(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old TERMINAL run rows, bounding the run store's unbounded growth.
+
+        The operator-invoked retention twin of :meth:`prune_events` for the ``runs`` table
+        (drive it from ``scripts/ops_prune.py`` / a cron job — nothing deletes automatically).
+        Returns the number of run rows removed. Only TERMINAL runs
+        (``SUCCEEDED``/``FAILED``/``PARKED`` — everything NOT in ``ACTIVE_RUN_STATUSES``) are
+        candidates: a ``QUEUED``/``RUNNING``/``AWAITING_APPROVAL``/``RESOLVING`` run is live
+        work the leased queue + reaper still depend on and is ALWAYS kept regardless of age.
+        Pass ``older_than_days`` to drop terminal runs whose ``created_at`` is older than the
+        cutoff, and/or ``keep_last`` to additionally cap the terminal runs to the N most
+        recent by ``created_at``; at least one bound must be given (a row is pruned if it
+        fails EITHER bound). Each pruned run's ``recommendations`` (which reference
+        ``run_id``) are hard-deleted in the SAME transaction so no advisory row is left
+        dangling against a deleted run.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_runs needs at least one of older_than_days / keep_last"
+            )
+        return await asyncio.to_thread(self._prune_runs_sync, older_than_days, keep_last)
+
+    def _prune_runs_sync(
+        self, older_than_days: float | None, keep_last: int | None
+    ) -> int:
+        """The locked delete for :meth:`prune_runs` (returns run rows removed)."""
+        from datetime import datetime, timedelta
+
+        from himmy.services.storage.models import ACTIVE_RUN_STATUSES
+
+        active = tuple(s.value for s in ACTIVE_RUN_STATUSES)
+        placeholders = ",".join("?" for _ in active)
+        doomed: set[str] = set()
+        with self._lock:
+            try:
+                # Candidates are TERMINAL runs only — a live/leased/queued run is never a
+                # prune candidate (the queue reaper depends on it), oldest first for keep_last.
+                rows = self._conn.execute(
+                    f"SELECT run_id, created_at FROM runs "  # noqa: S608
+                    f"WHERE status NOT IN ({placeholders}) ORDER BY created_at ASC",
+                    active,
+                ).fetchall()
+                if older_than_days is not None:
+                    cutoff = datetime.now().astimezone() - timedelta(days=older_than_days)
+                    for row in rows:
+                        ts = _parse_created_at(row["created_at"])
+                        if ts is not None and ts < cutoff:
+                            doomed.add(str(row["run_id"]))
+                if keep_last is not None:
+                    keep = max(int(keep_last), 0)
+                    over = rows[: len(rows) - keep] if keep else list(rows)
+                    doomed.update(str(r["run_id"]) for r in over)
+                if not doomed:
+                    return 0
+                ordered = sorted(doomed)
+                for batch in _chunked(ordered, _PRUNE_DELETE_CHUNK):
+                    ph = ",".join("?" for _ in batch)
+                    self._conn.execute(
+                        f"DELETE FROM runs WHERE run_id IN ({ph})",  # noqa: S608
+                        tuple(batch),
+                    )
+                    # Cascade: drop recommendations that reference the pruned runs so no
+                    # advisory row dangles against a deleted run_id.
+                    self._conn.execute(
+                        f"DELETE FROM recommendations WHERE run_id IN ({ph})",  # noqa: S608
+                        tuple(batch),
+                    )
+                self._conn.commit()
+                return len(doomed)
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
+    async def prune_recommendations(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old recommendation rows, bounding the recommendations table's growth.
+
+        The operator-invoked retention twin of :meth:`prune_events` for the
+        ``recommendations`` table. Returns rows removed. Pass ``older_than_days`` to drop
+        rows whose ``created_at`` is older than the cutoff, and/or ``keep_last`` to cap the
+        table to the N most recent by ``created_at``; at least one bound must be given (a row
+        is pruned if it fails EITHER bound). Recommendations are advisory (no live-work
+        status), so — unlike :meth:`prune_runs` — every row is a candidate.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_recommendations needs at least one of older_than_days / keep_last"
+            )
+        return await asyncio.to_thread(
+            self._prune_by_created_at_sync,
+            "recommendations",
+            "recommendation_id",
+            older_than_days,
+            keep_last,
+        )
+
+    async def prune_memory(
+        self, *, older_than_days: float | None = None, keep_last: int | None = None
+    ) -> int:
+        """Delete old cognitive + episodic memory rows, bounding their unbounded growth.
+
+        The operator-invoked retention twin of :meth:`prune_events` for BOTH the
+        ``memory_objects`` and ``episodic_memory_objects`` tables (multi-agent /
+        world-model scratch that otherwise accretes forever). Returns the total rows removed
+        across both. Each table is pruned independently with the same bounds: ``older_than_days``
+        drops rows whose ``created_at`` is older than the cutoff, ``keep_last`` caps each table
+        to its N most recent by ``created_at``; at least one bound must be given.
+        """
+        if older_than_days is None and keep_last is None:
+            raise ValueError(
+                "prune_memory needs at least one of older_than_days / keep_last"
+            )
+
+        def _run() -> int:
+            total = self._prune_by_created_at_sync(
+                "memory_objects", "memory_id", older_than_days, keep_last
+            )
+            total += self._prune_by_created_at_sync(
+                "episodic_memory_objects", "episode_id", older_than_days, keep_last
+            )
+            return total
+
+        return await asyncio.to_thread(_run)
+
+    def _prune_by_created_at_sync(
+        self,
+        table: str,
+        pk: str,
+        older_than_days: float | None,
+        keep_last: int | None,
+    ) -> int:
+        """Locked age/keep_last delete for a spine table keyed by ``pk`` + ``created_at``.
+
+        ``table``/``pk`` are internal literals (never caller input); the SQL is otherwise
+        parameterized. Returns rows removed.
+        """
+        from datetime import datetime, timedelta
+
+        doomed: set[str] = set()
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    f"SELECT {pk} AS pk, created_at FROM {table} "  # noqa: S608
+                    f"ORDER BY created_at ASC"
+                ).fetchall()
+                if older_than_days is not None:
+                    cutoff = datetime.now().astimezone() - timedelta(days=older_than_days)
+                    for row in rows:
+                        ts = _parse_created_at(row["created_at"])
+                        if ts is not None and ts < cutoff:
+                            doomed.add(str(row["pk"]))
+                if keep_last is not None:
+                    keep = max(int(keep_last), 0)
+                    over = rows[: len(rows) - keep] if keep else list(rows)
+                    doomed.update(str(r["pk"]) for r in over)
+                if not doomed:
+                    return 0
+                ordered = sorted(doomed)
+                for batch in _chunked(ordered, _PRUNE_DELETE_CHUNK):
+                    ph = ",".join("?" for _ in batch)
+                    self._conn.execute(
+                        f"DELETE FROM {table} WHERE {pk} IN ({ph})",  # noqa: S608
                         tuple(batch),
                     )
                 self._conn.commit()
