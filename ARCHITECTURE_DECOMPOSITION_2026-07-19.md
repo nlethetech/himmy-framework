@@ -5,25 +5,38 @@ audit. **Prime directive: behavior preservation** — every step keeps public cl
 method signatures, construction, event ordering, prompt bytes, and error taxonomy byte-identical;
 only internal structure changes. Each step must leave the full offline suite green.
 
-## Landed this pass (committed, 6232 tests green, mypy + ruff clean)
+## Status: BOTH god-object decompositions COMPLETE (6232 tests green, mypy + ruff clean)
 
-- **Removed the stale `build/lib/himmy` copy** (422 untracked files) — a grep-trap mirror of the source tree.
-- **SingleAgentRuntime → first collaborator extracted:** `_EntityRegistrar` (`himmy/runtime/entity_registrar.py`)
-  owns the audit-spine registration + lineage group (`_register_entity/_register_message/_register_thread_version/_link_lineage`).
-  Runtime constructs it in `__init__` and delegates; bodies moved verbatim; `_subject_metadata` stays the single source of truth.
-- **RunAppService → first collaborator extracted:** `WorkspaceQuota` (`himmy/application/workspace_quota.py`)
-  owns the per-workspace back-pressure state (outstanding counters + lazily-bound semaphores) and `WorkspaceRunQuotaExceeded`
-  (re-exported so exception identity is preserved). Test-poked privates kept as delegating shims. `sanitize_tenant_spec` import hoisted.
-- **Storage aux-store shared contract:** added `ConversationStoreProtocol` (+ conformance test `tests/storage/test_aux_store_protocols.py`)
-  and implemented the concrete drift fix — `PostgresConversationStore.prune` — that its SQLite twin already had.
-- **Fixed the entities→services layering leak** in `himmy/entities/spine_factory.py` (was importing down into `services.storage.factory`).
+The full staged plan (Blueprints A & B below) has been **executed to completion**, one collaborator at a
+time, suite-green after each. Result: **`single_agent.py` 4157 → 2281 LOC** and **`services.py` 4052 → 2411 LOC**
+(both now thin facades that hold the public API + delegating shims), with the logic relocated into 14 focused
+collaborator modules. Public class names, method signatures, construction, event order, prompt bytes, and
+error taxonomy are byte-identical throughout.
+
+**Extracted collaborators:**
+- Runtime (`himmy/runtime/`): `snapshot.py` (SnapshotResolver), `tool_exchange.py` (ToolExchange), `prompt_assembly.py`
+  (RequestBuilder), `compaction.py` (CompactionRunner, extended), `audit.py` (AuditEmitter — absorbed the earlier
+  `_EntityRegistrar`, which was deleted), `loop.py` (LoopDriver), `resume.py` (ResumeCoordinator), `streaming.py` (StreamDriver).
+- Application (`himmy/application/`): `run_context.py` (_RunContext, one shared `_tasks` set), `run_reads.py` (RunReadService),
+  `run_side_effects.py` (RunSideEffects), `run_retry.py` (RetryPolicyEngine), `run_recovery.py` (RunRecovery),
+  `run_enqueue.py` (RunEnqueuer), `run_drive.py` (RunDriveEngine + HITL + orchestration core), plus the earlier `workspace_quota.py`.
+
+**Also landed earlier in P3:** removed the stale `build/lib/himmy` copy (422 untracked files); storage aux-store
+`ConversationStoreProtocol` + conformance test + the `PostgresConversationStore.prune` drift-fix; fixed the
+entities→services layering leak (`spine_factory.py`).
+
+**Landmines respected (verified):** `_apply_guardrail` never moved; every test-poked private kept a byte-identical class-level
+shim (re-exported names carry `# noqa: F401`); one `_tasks` set on `_RunContext` (drain); `orchestration_runner` stayed a
+function-local import (cycle); stream delegation uses `async for … yield` (early-close); the tool-authorizer confused-deputy
+gate moved intact into `run_drive.py` (the gate-coverage AST guard was re-pointed there).
 
 ## Deferred by design (with reasons)
 
 - **web_search unification:** the two `web_search` providers have **divergent public contracts** (toolkit: `HIMMY_SEARCH_API_KEY`,
   arg `max_results`, keyless-DDG-always-available; connector: `HIMMY_TAVILY/BRAVE_API_KEY`, arg `count`). Unifying them would change a
   public tool contract, violating behavior-preservation. Needs a deliberate contract-reconciliation decision — not a silent refactor.
-- **The remaining god-object collaborators** — captured below as a staged plan. They are extracted one at a time, suite-green after each.
+- **Remaining aux-store protocols** (Checkpoint/GraphCheckpoint/Binding/Routines/Calendar/Cookbook/Notes/Tasks/Memory) — additive,
+  all twins already name-match; add per Blueprint C when convenient.
 
 ---
 

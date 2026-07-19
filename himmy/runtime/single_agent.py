@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
-import hashlib
 import json
 import logging
 import os
@@ -34,19 +32,32 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from himmy.core.errors import HimmyError
 from himmy.core.events import EventType, RunEvent
 from himmy.core.metadata import AssistantMessageMetadata
+from himmy.runtime.audit import _CURRENT_SUBJECT, AuditEmitter
 from himmy.runtime.checkpoint import (
-    APPROVED,
-    REJECTED,
     AgentCheckpoint,
     CheckpointStore,
     PendingToolCall,
 )
-from himmy.runtime.entity_registrar import _EntityRegistrar
-from himmy.runtime.termination import final_answer_text, is_no_progress
+from himmy.runtime.compaction import (
+    _AUTO_COMPACT_KEEP_DEFAULT,  # noqa: F401 - re-exported for back-compat test import paths
+    _AUTO_COMPACT_TOKENS_DEFAULT,  # noqa: F401 - re-exported for back-compat test import paths
+    CompactionRunner,
+    _auto_compact_default_spec,  # noqa: F401 - re-exported for back-compat test import paths
+    _scrub_compaction_summary,  # noqa: F401 - re-exported for back-compat test import paths
+)
+from himmy.runtime.loop import LoopDriver
+from himmy.runtime.prompt_assembly import (
+    RequestBuilder,
+    _prompt_cache_key_for_conversation,
+    _prompt_cache_key_for_scope,
+)
+from himmy.runtime.resume import ResumeCoordinator
+from himmy.runtime.snapshot import SnapshotResolver
+from himmy.runtime.streaming import StreamDriver
+from himmy.runtime.tool_exchange import ToolExchange
 from himmy.services.inference.models import (
     BoundTool,
     CachePolicy,
-    InferenceMessage,
     InferenceRequest,
     InferenceResponse,
     InferenceStatus,
@@ -57,7 +68,6 @@ from himmy.services.inference.models import (
     ToolReturnRecord,
 )
 from himmy.services.inference.prompt_cache import (
-    CacheCapability,
     cache_metrics_payload,
 )
 
@@ -91,19 +101,13 @@ OnEvent = Callable[[RunEvent], Awaitable[None]]
 log = logging.getLogger(__name__)
 
 
-def _count_sink_drop(sink: str) -> None:
-    """Increment the bounded ``event_sink_drops_total{sink}`` counter (best-effort).
-
-    Complements the ``log.warning`` in ``_emit`` with an operator-scrapable metric so a
-    silent audit-spine write loss is visible on ``/metrics``. Never raises — observability
-    must never break a run (the sink drop it records is already itself a swallowed error).
-    """
-    try:
-        from himmy.services.observability.metrics import get_registry
-
-        get_registry().event_sink_drops_total.inc((sink,))
-    except Exception:  # pragma: no cover - metrics must never break a run
-        pass
+# The audit-spine event fan-out + entity projection (``_emit`` / ``_register_*`` /
+# ``_link_lineage`` / ``_subject_metadata`` / ``_maybe_save_thread``) plus the
+# ``_count_sink_drop`` metric helper and the ``_CURRENT_SUBJECT`` subject contextvar
+# were extracted verbatim to :mod:`himmy.runtime.audit` (P3 decomposition step
+# ``audit``). ``_count_sink_drop`` and ``_CURRENT_SUBJECT`` are re-imported at module
+# scope (see the imports block) so their historical ``himmy.runtime.single_agent``
+# import paths — pinned by tests and ``_subject_scope`` — stay valid.
 
 
 # The framework-enforced ceiling on agent-loop turns. ``max_turns`` is caller-
@@ -146,117 +150,12 @@ except ValueError:
     _TOOL_RESULT_MODEL_MAX = _TOOL_RESULT_MODEL_MAX_DEFAULT
 
 
-# --- Default auto-compaction (eff-p0 #3) -------------------------------------------------
-# A multi-turn agent re-sends its ENTIRE history every turn, so an unbounded run pays
-# O(turns^2) cumulative tokens (the same growing prefix, re-billed each turn). The
-# compaction planner (:mod:`himmy.runtime.compaction`) has always been correct, but it
-# only ran when a caller opted in via ``ctx['compaction_spec']`` / ``AgentSpec.compact_context``
-# — which almost nobody set — so by default the full uncompressed history rode along
-# forever. This makes compaction DEFAULT-ON with a DELIBERATELY CONSERVATIVE high
-# threshold: short runs are byte-identical (they never cross the budget), while a run
-# that genuinely balloons gets its middle summarized before it overflows.
-#
-# The threshold is high on purpose: correctness (the model seeing recent history) matters
-# more than shaving tokens off a run that was never going to overflow anyway. An explicit
-# ``compaction_spec`` in the context ALWAYS wins over this default; the default only fills
-# in when no per-run spec was provided.
-#
-# Fully overridable:
-#   * ``HIMMY_AUTO_COMPACT=0``           → disable the default entirely (restores the
-#                                          pre-eff-p0 opt-in-only behaviour). Accepts
-#                                          0/false/no/off (case-insensitive).
-#   * ``HIMMY_AUTO_COMPACT_TOKENS=<int>``→ override the conservative token budget.
-#   * ``HIMMY_AUTO_COMPACT_KEEP=<int>``  → override how many recent messages ride verbatim.
-# An explicit ``ctx['compaction_spec']`` overrides all three for that run.
-_AUTO_COMPACT_TOKENS_DEFAULT = 24000
-_AUTO_COMPACT_KEEP_DEFAULT = 8
-
-
-def _auto_compact_default_spec() -> dict[str, Any] | None:
-    """The default compaction spec, or ``None`` when disabled via ``HIMMY_AUTO_COMPACT``.
-
-    Read fresh from the environment on every call (not cached) so tests — and a caller
-    that flips the flag between runs — see the current value. Returns a spec dict shaped
-    exactly like an explicit ``ctx['compaction_spec']`` so the apply path is identical.
-    """
-    if os.environ.get("HIMMY_AUTO_COMPACT", "1").strip().lower() in ("0", "false", "no", "off"):
-        return None
-    try:
-        max_tokens = max(1, int(os.environ.get("HIMMY_AUTO_COMPACT_TOKENS", str(_AUTO_COMPACT_TOKENS_DEFAULT))))
-    except ValueError:
-        max_tokens = _AUTO_COMPACT_TOKENS_DEFAULT
-    try:
-        keep_recent = max(1, int(os.environ.get("HIMMY_AUTO_COMPACT_KEEP", str(_AUTO_COMPACT_KEEP_DEFAULT))))
-    except ValueError:
-        keep_recent = _AUTO_COMPACT_KEEP_DEFAULT
-    return {"max_tokens": max_tokens, "keep_recent": keep_recent}
-
-
-def _cap_tool_result_for_model(text: str, cap: int) -> str:
-    """Bound a tool result's model-facing text at ``cap`` characters.
-
-    Mirrors :func:`_truncate` but appends an explicit, self-describing marker so the
-    model knows the content was shortened for context economy (and by how much),
-    rather than silently seeing a mid-sentence cut. Returns ``text`` unchanged when
-    ``cap`` is ``0`` (cap disabled) or the text already fits.
-    """
-    text = text or ""
-    if cap <= 0 or len(text) <= cap:
-        return text
-    dropped = len(text) - cap
-    return text[:cap] + f"\n…[truncated {dropped} chars]"
-
-
-# --- Mandatory compaction-summary scrub (eff-p0 sec-r3 #3) ------------------------------
-# The compaction summary is distilled from UN-guarded USER + TOOL content (a scraped page,
-# a poisoned tool result), so it is untrusted. sec-r1 ran it through the configured INPUT
-# guardrail — but that guardrail is opt-in and is ``None`` in the offline / CLI / default
-# runtime, where ``_guard_input`` short-circuits to a plain passthrough. With compaction
-# now DEFAULT-ON, that left the offline default with NO laundering barrier: a planted
-# secret or standing directive would ride into a persistent USER recap message AND land
-# unredacted at rest in durable episodic memory recalled into future runs.
-#
-# This MANDATORY scrub runs REGARDLESS of whether a full input guardrail is wired. It
-# reuses the same credential rule set as the always-on ``SecretsGuardrail`` (redacts API
-# keys / JWTs / URL-embedded creds — things no legitimate summary should contain) so
-# secrets never persist unredacted, and neutralizes the common injection imperatives so a
-# distilled "ignore previous instructions"/"you are now" directive cannot re-ride as a
-# standing instruction. It is deliberately NARROW (credentials + injection markers only) so
-# it never mangles legitimate recap text; the configured input guardrail (when present)
-# still runs on top for the broader DLP/blocklist policy.
-_SUMMARY_INJECTION_MARKER = "[neutralized-directive]"
-try:  # narrow, dependency-free reuse of the builtin credential + injection rule sets.
-    from himmy.services.guardrails.builtins import (  # noqa: E402
-        _INJECTION_PATTERNS as _SUMMARY_INJECTION_PATTERNS,
-    )
-    from himmy.services.guardrails.builtins import (  # noqa: E402
-        _SECRET_RULES as _SUMMARY_SECRET_RULES,
-    )
-    from himmy.services.guardrails.builtins import (  # noqa: E402
-        _redact as _summary_redact_secrets,
-    )
-except Exception:  # pragma: no cover - guardrails always ship; defensive only
-    _SUMMARY_SECRET_RULES = None  # type: ignore[assignment]
-    _SUMMARY_INJECTION_PATTERNS = None  # type: ignore[assignment]
-
-
-def _scrub_compaction_summary(text: str) -> str:
-    """Mandatory, guardrail-independent scrub of a compaction summary (sec-r3 #3).
-
-    Redacts credentials (via the always-on secret rule set) and neutralizes common
-    prompt-injection imperatives so an untrusted, model-distilled recap can neither leak
-    a secret at rest nor smuggle a standing directive into every later turn — even when
-    NO input guardrail is configured (the offline / default deployment). Returns ``text``
-    unchanged only if the rule sets could not be imported (defensive).
-    """
-    if not text:
-        return text
-    if _SUMMARY_SECRET_RULES is not None:
-        text, _flags = _summary_redact_secrets(text, _SUMMARY_SECRET_RULES)
-    if _SUMMARY_INJECTION_PATTERNS is not None:
-        for pattern in _SUMMARY_INJECTION_PATTERNS:
-            text = pattern.sub(_SUMMARY_INJECTION_MARKER, text)
-    return text
+# Default-on auto-compaction policy (``_auto_compact_default_spec`` /
+# ``_AUTO_COMPACT_*_DEFAULT``) and the mandatory compaction-summary scrub
+# (``_scrub_compaction_summary`` + ``_SUMMARY_*``) were extracted verbatim to
+# :mod:`himmy.runtime.compaction` (P3 decomposition step ``compaction``). They are
+# re-imported at module scope (see the imports block) so their existing
+# ``himmy.runtime.single_agent`` import paths — pinned by tests — stay valid.
 
 
 def _validate_max_turns(max_turns: int, entry_point: str) -> None:
@@ -302,19 +201,6 @@ _OUTPUT_BLOCK_PLACEHOLDER = (
     "I can't share that response: it was withheld by an output guardrail because it "
     "contained blocked content."
 )
-
-
-def _transient_tool_codes() -> frozenset[str]:
-    """The tool error codes the runtime treats as transient (turn-level retry).
-
-    Sourced from the tools kernel's own ``RETRYABLE_TOOL_CODES`` taxonomy
-    (timeout / rate-limited / provider-unavailable) so the two layers can never
-    drift; imported lazily because the tools kernel is not on this kernel's
-    import path.
-    """
-    from himmy.services.tools.service import RETRYABLE_TOOL_CODES
-
-    return frozenset(code.value for code in RETRYABLE_TOOL_CODES)
 
 
 def _tool_timeout_code() -> str:
@@ -403,95 +289,12 @@ def _validated_ctx(context: dict[str, Any] | None, entry_point: str) -> dict[str
     return raw
 
 
-def _cache_scope_metadata(ctx: dict[str, Any]) -> dict[str, Any]:
-    """Derive tenant-isolation metadata for the inference cache from ``ctx``.
-
-    Stamps the :data:`~himmy.services.inference.cache.CACHE_SCOPE_METADATA_KEYS`
-    that the runtime knows about (``subject_id`` from ``context_subject_id`` and
-    any ``tenant_id``/``workspace_id`` carried on ``context_metadata``) onto
-    ``InferenceRequest.metadata`` so the response cache partitions per principal.
-    Only non-empty values are emitted; an unscoped run yields ``{}`` so the cache
-    key — and any recorded replay cassette — is byte-for-byte unchanged.
-    """
-    meta: dict[str, Any] = {}
-    subject_id = ctx.get("context_subject_id")
-    if subject_id:
-        meta["subject_id"] = subject_id
-    context_metadata = ctx.get("context_metadata")
-    if isinstance(context_metadata, dict):
-        for key in ("tenant_id", "workspace_id"):
-            value = context_metadata.get(key)
-            if value:
-                meta[key] = value
-    return meta
-
-
-def _prompt_cache_key_for_scope(scope_metadata: dict[str, Any]) -> str | None:
-    """Derive a stable, per-principal PROVIDER prompt-cache partition key (sec-r2).
-
-    Folds the same tenant-isolation metadata :func:`_cache_scope_metadata` stamps for the
-    internal response cache into one deterministic ``key=value|…`` string, so the
-    OpenAI-family adapter can set ``prompt_cache_key`` and never serve one principal a
-    cache-read of another's prefix on a shared provider API key. Returns ``None`` for an
-    unscoped run (offline / single-tenant / CLI — no principal metadata) so the request
-    payload stays byte-identical to the pre-sec-r2 no-cache-key contract.
-    """
-    from himmy.services.inference.cache import CACHE_SCOPE_METADATA_KEYS
-
-    parts = [
-        f"{key}={scope_metadata[key]}"
-        for key in CACHE_SCOPE_METADATA_KEYS
-        if scope_metadata.get(key) not in (None, "")
-    ]
-    return "|".join(parts) if parts else None
-
-
-def _openai_conversation_cache_key_enabled() -> bool:
-    """Whether to stamp a per-conversation OpenAI ``prompt_cache_key`` (default ON).
-
-    ``HIMMY_OPENAI_CONVERSATION_CACHE_KEY=0``/``false``/``no``/``off`` opts out so the
-    request payload is byte-identical to the pre-P2.3 no-cache-key contract. Read per call
-    (not cached) so a test/host can flip it without reconstructing the runtime.
-    """
-    return os.environ.get(
-        "HIMMY_OPENAI_CONVERSATION_CACHE_KEY", "1"
-    ).strip().lower() not in ("0", "false", "no", "off")
-
-
-def _prompt_cache_key_for_conversation(thread_id: str | None) -> str | None:
-    """A stable, per-conversation OpenAI ``prompt_cache_key`` routing hint (P2.3).
-
-    OpenAI's ``prompt_cache_key`` is a pure ROUTING hint: it steers a conversation's turns
-    to the same backend so its automatic prefix cache is more likely to hit, and has ZERO
-    effect on the generated output. This folds the run's ``thread_id`` (a fresh UUID per
-    :class:`ChatThread`, so stable across the turns of one run but distinct across runs)
-    into a short opaque digest so the hint is stable within a run and distinct across runs
-    without leaking the raw id. Returns ``None`` when no ``thread_id`` is available (keeping
-    the payload byte-identical). Applied by the runtime for OpenAI-family managers only; the
-    OpenAI adapter additionally gates on :func:`is_openai_family_model`, so no other provider
-    is ever affected.
-    """
-    if not thread_id:
-        return None
-    digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:32]
-    return f"himmy-conv-{digest}"
-
-
-def _context_workspace_id(ctx: dict[str, Any]) -> str | None:
-    """The run's owning ``workspace_id`` (for tenant-scoping the context build), if any.
-
-    Read from ``context_metadata`` — the same place :func:`_cache_scope_metadata` reads it
-    for cache partitioning — so the per-run context-snapshot build can tenant-scope its
-    STORAGE reads exactly as the HTTP ``/v1/context/snapshot`` route does. Returns ``None``
-    for an unscoped run (offline / single-tenant / CLI — no ``workspace_id`` carried), which
-    keeps :meth:`ContextService.build_snapshot` resolution byte-for-byte unchanged.
-    """
-    context_metadata = ctx.get("context_metadata")
-    if isinstance(context_metadata, dict):
-        value = context_metadata.get("workspace_id")
-        if value:
-            return str(value)
-    return None
+# The prompt/tools/request-assembly cache-key helpers
+# (``_cache_scope_metadata`` / ``_prompt_cache_key_for_scope`` /
+# ``_openai_conversation_cache_key_enabled`` / ``_prompt_cache_key_for_conversation``)
+# live in ``himmy.runtime.prompt_assembly`` and are imported above. They are re-exported
+# here so their existing import paths (tests import them from ``single_agent``) and the
+# module-level ``_cache_scope_metadata`` call in this file resolve unchanged.
 
 
 # WS4.6 — the human data subject participating in the *current* run, set ONLY when a
@@ -510,9 +313,11 @@ def _context_workspace_id(ctx: dict[str, Any]) -> str | None:
 # otherwise subject-less spine records. A :class:`contextvars.ContextVar` keeps this
 # correct under concurrent runs and the default ``None`` keeps the ungoverned path
 # byte-identical — no metadata is ever stamped when no decider is configured.
-_CURRENT_SUBJECT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "himmy_run_subject", default=None
-)
+#
+# ``_CURRENT_SUBJECT`` is DEFINED in :mod:`himmy.runtime.audit` (the audit-spine's
+# subject source) and re-imported here (see the imports block) so ``_subject_scope``
+# and its historical ``from himmy.runtime.single_agent import _CURRENT_SUBJECT`` import
+# path resolve to the one canonical contextvar object.
 
 
 @runtime_checkable
@@ -702,43 +507,6 @@ def _truncate(text: str, cap: int) -> str:
     return text if len(text) <= cap else text[: cap - 1] + "…"
 
 
-def _snapshot_grounding(snapshot: Any) -> list[dict[str, Any]]:
-    """Knowledge citations a snapshot pulled into the prompt (one entry per KB field).
-
-    Reads each ``knowledge_base``-sourced :class:`ContextField`: the query it ran and
-    the chunks it retrieved, each with a snippet, similarity, and source URI. Returns
-    ``[]`` when no KB field was resolved, so non-RAG agents add nothing.
-    """
-    out: list[dict[str, Any]] = []
-    fields = getattr(snapshot, "fields", None) or {}
-    for key, fld in fields.items():
-        if getattr(fld, "source", None) != "knowledge_base":
-            continue
-        value = getattr(fld, "value", None) or {}
-        chunks = value.get("chunks") if isinstance(value, dict) else None
-        meta = getattr(fld, "metadata", None) or {}
-        citations = []
-        for c in chunks or []:
-            snippet = c.get("text") or c.get("context_window") or ""
-            citations.append(
-                {
-                    "text": _truncate(str(snippet), 400),
-                    "similarity": c.get("similarity"),
-                    "source_uri": c.get("source_uri"),
-                }
-            )
-        out.append(
-            {
-                "source": "knowledge",
-                "key": key,
-                "query": meta.get("query"),
-                "kb_name": meta.get("kb_name"),
-                "citations": citations,
-            }
-        )
-    return out
-
-
 def build_io_capture(request: Any, response: Any) -> dict[str, Any]:
     """A bounded snapshot of one inference's raw I/O (for the trace inspector).
 
@@ -825,17 +593,58 @@ class SingleAgentRuntime:
         self.tool_service = tool_service
         self.context_service = context_service
         self.entity_registry = entity_registry
-        # Audit-spine registration + lineage linking live in a cohesive collaborator
-        # (the ``_register_*`` / ``_link_lineage`` group). It shares this runtime's
-        # governed-run subject stamp so the ``{subject_id: ...}`` tag has one source of
-        # truth with ``_emit``. Behaviour is byte-identical; the runtime just delegates.
-        self._entity_registrar = _EntityRegistrar(
-            entity_registry, self._subject_metadata
-        )
+        # The whole audit-spine concern — event fan-out across all sinks (``_emit``),
+        # entity-registry projection + lineage (``_register_*`` / ``_link_lineage``),
+        # the governed-run subject stamp (``_subject_metadata``) and thread persistence
+        # (``_maybe_save_thread``) — lives in a cohesive collaborator; those methods
+        # delegate. Reads live sink wiring (memory_store, entity_registry, _on_event,
+        # save_threads) off ``self``. Behaviour is byte-identical; the runtime delegates.
+        self._audit_emitter = AuditEmitter(self)
         self.default_model_key = default_model_key
         self.save_threads = save_threads
         self.default_deadline_seconds = default_deadline_seconds
         self.strict_snapshot = strict_snapshot
+        # Snapshot resolution (load-or-build a context snapshot, emit
+        # CONTEXT_SNAPSHOT_BUILT, honor strict_snapshot) lives in a collaborator;
+        # ``_resolve_snapshot`` delegates. Reads live wiring off ``self``.
+        self._snapshot_resolver = SnapshotResolver(self)
+        # Tool-loop replay / retry / result-capping lives in a collaborator; the
+        # ``_append_tool_messages`` / ``_wrap_executor_with_retry`` / ``_tool_*`` shims
+        # delegate. Reads live wiring (tool_service, _emit, _register_message) off ``self``.
+        self._tool_exchange = ToolExchange(self)
+        # Prompt / tools / request assembly (render prompts, guard injected context,
+        # resolve the model key + per-turn cache policy, build the typed
+        # InferenceRequest) lives in a collaborator; the ``_render_*`` /
+        # ``_effective_model_key`` / ``_prompt_cache_policy`` / ``_build_request`` shims
+        # delegate. Reads live wiring (prompt_manager, context_prompt_mapper,
+        # inference_service, tool_service, _enable_prompt_cache) off ``self``.
+        self._request_builder = RequestBuilder(self)
+        # Runtime-side auto-compaction (pick spec, plan, summarize, scrub/guard, splice
+        # the thread, emit CONTEXT_COMPACTED, persist episodic) lives in a collaborator;
+        # ``_maybe_compact`` delegates. Reads live wiring (default_model_key,
+        # inference_service, _guard_input, _emit, memory_store) off ``self``.
+        self._compaction_runner = CompactionRunner(self)
+        # Multi-turn drive (stop-condition ladder, between-turns steering, forced
+        # synthesis, adaptive tool routing) lives in a collaborator; the
+        # ``_drive_loop`` / ``_drain_steer_queue`` / ``_maybe_synthesize`` /
+        # ``_should_route`` / ``_route_tools`` shims delegate. Reads live wiring
+        # (tool_service, inference_service, _emit, _continue_turn, _save_checkpoint,
+        # _pending_approvals, run_task_detailed, _emit_turn_completed) off ``self``.
+        self._loop_driver = LoopDriver(self)
+        # The streaming surfaces (single-turn ``stream_task``, the whole-loop
+        # ``stream_agent_loop``, the streamed continuation-drive ladder, and the
+        # ``RunResult``/text/tool delta reconstruction) live in a collaborator; the
+        # public ``stream_task`` / ``stream_agent_loop`` async generators delegate
+        # into it via ``async for d in inner: yield d`` (wrapped in a
+        # ``finally: await inner.aclose()`` so an early client close / cancellation
+        # closes the inner generators — and the provider stream beneath them —
+        # deterministically). Reads live wiring (inference_service, _output_guardrail,
+        # _checkpoint_store, _subject_scope, _resolve_snapshot, _render_guarded_prompts,
+        # _guard_input, _guard_output, _emit, _build_request, _effective_model_key,
+        # _register_message, _register_thread_version, _should_route, _route_tools,
+        # stream_task, _append_tool_messages, _emit_turn_completed, _maybe_synthesize,
+        # _pending_approvals, _save_checkpoint, _continue_turn) off ``self``.
+        self._stream_driver = StreamDriver(self)
         self._checkpoint_store = checkpoint_store
         # Per-checkpoint resume serialization (HITL exactly-once). The store-level
         # atomic claim is the cross-process gate; this in-process lock keeps two
@@ -844,6 +653,17 @@ class SingleAgentRuntime:
         # between the claim and the gated tool's execution — so the approved action
         # runs exactly once. Keyed by checkpoint_id, created on demand.
         self._resume_locks: dict[str, asyncio.Lock] = {}
+        # HITL resume/checkpoint machinery (per-checkpoint locked resume body, the
+        # orchestration final-output anchor, the per-checkpoint lock lookup, and the
+        # paused-run checkpoint save) lives in a collaborator; the
+        # ``_resume_agent_loop_locked`` / ``_record_resume_final_output`` /
+        # ``_resume_lock_for`` / ``_save_checkpoint`` shims delegate. The public
+        # ``resume_agent_loop`` and the ``_resume_locks`` state stay here; the
+        # coordinator back-references them (and the rest of the live wiring:
+        # _checkpoint_store, tool_service, _subject_scope, _append_tool_messages,
+        # _emit, _register_thread_version, _continue_turn, _emit_turn_completed,
+        # _drive_loop) off ``self`` at call time. Behaviour is byte-identical.
+        self._resume_coordinator = ResumeCoordinator(self)
         self._input_guardrail = input_guardrail
         self._output_guardrail = output_guardrail
         # Opt-in raw-I/O capture for the trace inspector (off unless asked, or the
@@ -1131,55 +951,12 @@ class SingleAgentRuntime:
     AUTO_ROUTE_OVER_TOOLS = 8
 
     def _should_route(self, route_tools: bool | None) -> bool:
-        """Resolve the tri-state routing flag (explicit wins; None = adaptive)."""
-        if route_tools is not None:
-            return route_tools
-        registry = getattr(self.tool_service, "registry", None)
-        if registry is None:
-            return False
-        try:
-            return len(registry.list()) > self.AUTO_ROUTE_OVER_TOOLS
-        except Exception:  # noqa: BLE001 - routing is an optimization, never a crash
-            return False
+        """Delegating shim → :meth:`LoopDriver.should_route`."""
+        return self._loop_driver.should_route(route_tools)
 
     async def _route_tools(self, task: Task, max_tools: int) -> Task:
-        """Narrow the bound tools to the relevant few for this task (Tier 1.3).
-
-        A no-op unless a tool service is wired, the task hasn't already pinned
-        ``tool_names``, and there are more candidate tools than ``max_tools``. Returns
-        a copy of the task with ``context['tool_names']`` set to the routed subset.
-        """
-        if self.tool_service is None or max_tools < 1:
-            return task
-        ctx = task.context or {}
-        if ctx.get("tool_names") is not None:
-            return task  # caller already chose the tools — respect that
-        registry = getattr(self.tool_service, "registry", None)
-        if registry is None:
-            return task
-        candidates = [(d.name, d.description) for d in registry.list()]
-        if len(candidates) <= max_tools:
-            return task
-
-        from himmy.runtime.tool_router import select_tools
-
-        # Skills contribute "use this when …" hints so the router knows which tools a
-        # capability implies for this request, beyond the bare prompt.
-        query = task.prompt
-        hints = ctx.get("skill_routing_hints") or []
-        if hints:
-            query = f"{query}\n\nRelevant capabilities:\n" + "\n".join(
-                f"- {h}" for h in hints
-            )
-
-        selected = await select_tools(
-            self.inference_service,
-            query,
-            candidates,
-            max_tools=max_tools,
-            model_key=str(ctx.get("model_key") or self.default_model_key),
-        )
-        return task.model_copy(update={"context": {**ctx, "tool_names": selected}})
+        """Delegating shim → :meth:`LoopDriver.route_tools`."""
+        return await self._loop_driver.route_tools(task, max_tools)
 
     async def _maybe_synthesize(
         self,
@@ -1189,47 +966,9 @@ class SingleAgentRuntime:
         llm_config: LLMConfig | None,
         ctx: dict[str, Any] | None = None,
     ) -> AgentLoopResult:
-        """One forced final turn when a tool-using loop ended with no answer (Tier 1.1).
-
-        Small models often call a tool, get the result, then fail to write the final
-        answer (an empty reply). When the loop stops with an empty answer but tools
-        WERE used, run one more turn with tools unbound and an explicit instruction to
-        answer from the results already gathered — converting an empty into an answer.
-        """
-        # Only rescue the genuine "model fell silent" stops. ``no_progress`` is an
-        # opt-in deliberate halt whose stop reason callers rely on, so leave it.
-        if result.stopped_reason not in ("final", "max_turns"):
-            return result
-        if (result.final.output_text or "").strip():
-            return result  # already answered — nothing to nudge
-        if not any(t.tool_calls for t in result.turns):
-            return result  # no tools were used — synthesis has nothing to work from
-
-        from himmy.agents.base_agent.task import Task
-
-        # Thread the ORIGINAL run context onto the rescue turn so it keeps the run's
-        # model_key (a custom model must still write the final answer) AND its
-        # ``context_subject_id`` (a governed run's synthesis message/thread/event
-        # records must resolve to the subject, else they fail-closed DROP from the
-        # spine). Only ``tool_names`` is overridden (unbind tools: force a text
-        # answer); ``output_schema`` is dropped so a schema-constrained original run
-        # doesn't force the free-text rescue answer through structured validation.
-        nudge_ctx = {**(ctx or {}), "tool_names": []}
-        nudge_ctx.pop("output_schema", None)
-        nudge = Task(
-            title="synthesis",
-            prompt=_SYNTHESIS_NUDGE,
-            context=nudge_ctx,
-        )
-        synth = await self.run_task_detailed(
-            persona, nudge, thread=result.thread, llm_config=llm_config
-        )
-        index = result.turn_count + 1
-        await self._emit_turn_completed(trace_id, synth.thread, persona, index, synth)
-        return AgentLoopResult(
-            thread=synth.thread,
-            turns=[*result.turns, synth],
-            stopped_reason="synthesized",
+        """Delegating shim → :meth:`LoopDriver.maybe_synthesize`."""
+        return await self._loop_driver.maybe_synthesize(
+            result, persona, trace_id, llm_config, ctx
         )
 
     async def continue_turn(
@@ -1336,181 +1075,19 @@ class SingleAgentRuntime:
         provider stream deterministically rather than leaving it to the event
         loop's lazy async-generator finalizer.
         """
-        from himmy.agents.base_agent.thread import ChatThread, Message, MessageRole
-        from himmy.services.inference.service import StreamDelta
-
-        if thread is None:
-            thread = ChatThread(agent_id=persona.agent_id)
-        ctx = _validated_ctx(task.context, "stream_task")
-        # WS4.6: publish the subject so the streamed turn's system/user/assistant
-        # messages and the bumped thread version resolve to it (governed only; a no-op
-        # when no consent_decider is wired).
-        with self._subject_scope(ctx):
-            snapshot, _snapshot_id, _err = await self._resolve_snapshot(
-                persona, task, ctx, None
-            )
-            # Injected context (recalled memory / retrieved KB docs) is guarded here
-            # so a poisoned memory/KB chunk is redacted/blocked before it reaches the
-            # model (indirect prompt-injection seam) — parity with run_task_detailed.
-            system_prompt, task_prompt, _missing = await self._render_guarded_prompts(
-                persona, task, ctx, snapshot, thread_id=thread.thread_id
-            )
-            if not any(m.role == MessageRole.SYSTEM for m in thread.messages):
-                sys_msg = Message(role=MessageRole.SYSTEM, content=system_prompt)
-                thread.append_message(sys_msg)
-                self._register_message(sys_msg)
-            user_msg = Message(
-                role=MessageRole.USER,
-                content=await self._guard_input(
-                    task_prompt,
-                    agent_id=persona.agent_id,
-                    thread_id=thread.thread_id,
-                ),
-            )
-            thread.append_message(user_msg)
-            self._register_message(user_msg)
-
-            trace_id = f"{thread.thread_id}:{task.task_id}"
-            # Audit parity with run_task_detailed: a streamed run is a run — it
-            # opens with AGENT_RUN_STARTED and ALWAYS closes with a terminal
-            # AGENT_RUN_FINISHED (success, failure, or 'cancelled' when the client
-            # drops the stream / the consuming task is cancelled mid-run).
-            await self._emit(
-                RunEvent(
-                    event_type=EventType.AGENT_RUN_STARTED,
-                    trace_id=trace_id,
-                    thread_id=thread.thread_id,
-                    agent_id=persona.agent_id,
-                    payload={
-                        "model_key": self._effective_model_key(ctx, llm_config),
-                        "persona_name": persona.name,
-                        "streamed": True,
-                    },
-                )
-            )
-
-            request, _tool_names = self._build_request(
-                thread, ctx, llm_config, trace_id=trace_id
-            )
-            # The output guardrail must be enforced on a streamed answer too (audit
-            # parity with the non-streaming paths). Two regimes:
-            #  * BUFFER: the output guard can WITHHOLD blocked content (DLP ``…:block``
-            #    / blocklist / blocking injection). An already-streamed secret can't be
-            #    recalled, so we must NOT stream — we drain the provider stream silently,
-            #    guard the full answer, then emit it as one ``done`` delta.
-            #  * GUARD-AFTER: a redact-only / grounding-only output guard. Stream the
-            #    tokens, then guard the final text; if it changed, the PERSISTED message
-            #    and the ``done`` payload carry the guarded text (the already-streamed
-            #    deltas can't be recalled, but the durable copy must be clean) and a
-            #    correction delta is emitted so a consumer that materializes from
-            #    ``delta`` rather than ``response`` also lands on the guarded text.
-            buffer_output = (
-                self._output_guardrail is not None
-                and self._output_guardrail.suppresses_output_content()
-            )
-            # ``run_stream`` is an async generator; own the reference so an early
-            # close/cancellation of THIS generator can close it in the finally.
-            stream = self.inference_service.run_stream(request)
-            run_finished = False
-            try:
-                async for delta in stream:
-                    if delta.done and delta.response is not None:
-                        raw_text = delta.response.output_text or ""
-                        guarded_text = (
-                            await self._guard_output(
-                                raw_text,
-                                agent_id=persona.agent_id,
-                                trace_id=trace_id,
-                                thread_id=thread.thread_id,
-                            )
-                            or ""
-                        )
-                        corrected = guarded_text != raw_text
-                        assistant = Message(
-                            role=MessageRole.ASSISTANT,
-                            content=guarded_text,
-                            metadata={
-                                "request_id": request.request_id,
-                                "streamed": True,
-                                **({"guarded": True} if corrected else {}),
-                            },
-                        )
-                        thread.append_message(assistant)
-                        self._register_message(assistant)
-                        self._register_thread_version(thread)
-                        await self._emit(
-                            RunEvent(
-                                event_type=EventType.AGENT_RUN_FINISHED,
-                                trace_id=trace_id,
-                                thread_id=thread.thread_id,
-                                agent_id=persona.agent_id,
-                                latency_ms=delta.response.latency_ms,
-                                cost=delta.response.cost,
-                                error=(
-                                    delta.response.error.message
-                                    if delta.response.error is not None
-                                    and delta.response.status != InferenceStatus.SUCCESS
-                                    else None
-                                ),
-                                payload={
-                                    "status": delta.response.status.value,
-                                    "streamed": True,
-                                },
-                            )
-                        )
-                        run_finished = True
-                        # The ``done`` delta must never carry the pre-guard text. Rewrite
-                        # its response (and the textual ``delta``) to the guarded answer.
-                        guarded_response = delta.response.model_copy(
-                            update={"output_text": guarded_text}
-                        )
-                        if buffer_output:
-                            # Nothing was streamed; deliver the whole guarded answer now.
-                            yield StreamDelta(
-                                request_id=request.request_id,
-                                delta=guarded_text,
-                                index=delta.index,
-                                done=True,
-                                response=guarded_response,
-                            )
-                        else:
-                            if corrected:
-                                # The already-streamed tokens were the raw answer; emit a
-                                # correction so a delta-materializing consumer ends clean.
-                                yield StreamDelta(
-                                    request_id=request.request_id,
-                                    delta="",
-                                    index=delta.index,
-                                    event_type="guarded_output",
-                                    event_payload={"output_text": guarded_text},
-                                )
-                            yield delta.model_copy(update={"response": guarded_response})
-                        continue
-                    if buffer_output and not delta.done:
-                        # Suppress intermediate text in BUFFER mode — the answer is only
-                        # safe to surface after the guard runs on the ``done`` delta.
-                        continue
-                    yield delta
-            except (GeneratorExit, asyncio.CancelledError):
-                # Early termination at a yield point: record the terminal event
-                # (mirrors run_task_detailed's cancellation leg) before unwinding.
-                if not run_finished:
-                    await self._emit(
-                        RunEvent(
-                            event_type=EventType.AGENT_RUN_FINISHED,
-                            trace_id=trace_id,
-                            thread_id=thread.thread_id,
-                            agent_id=persona.agent_id,
-                            error="cancelled",
-                            payload={"status": "CANCELLED", "streamed": True},
-                        )
-                    )
-                raise
-            finally:
-                # GeneratorExit (client closed the stream) / CancelledError land
-                # here at a yield point; close the provider stream NOW so its own
-                # cleanup runs before we unwind, then the exception re-raises.
-                await stream.aclose()
+        # Delegating shim → :meth:`StreamDriver.stream_task`. The ``async for … yield``
+        # + ``finally: await inner.aclose()`` guarantees an early client close
+        # (GeneratorExit) / cancellation propagates into the driver generator's own
+        # ``finally`` (which closes the provider stream) deterministically — parity
+        # with the pre-extraction inline finalizer.
+        inner = self._stream_driver.stream_task(
+            persona, task, thread, llm_config=llm_config
+        )
+        try:
+            async for delta in inner:
+                yield delta
+        finally:
+            await inner.aclose()
 
     async def stream_agent_loop(
         self,
@@ -1560,133 +1137,30 @@ class SingleAgentRuntime:
         re-raises, so no suspended generators or provider streams are left
         dangling for the event loop's lazy async-generator finalizer.
         """
-        from himmy.services.inference.service import StreamDelta
+        # Delegating shim → :meth:`StreamDriver.stream_agent_loop`. Same ``async for
+        # … yield`` + ``finally: await inner.aclose()`` wrapping as ``stream_task`` so
+        # a client close / cancellation closes the driver's owned inner turn
+        # generators (and the provider stream beneath them) deterministically.
+        inner = self._stream_driver.stream_agent_loop(
+            persona,
+            task,
+            thread,
+            max_turns=max_turns,
+            cost_budget=cost_budget,
+            llm_config=llm_config,
+            hitl=hitl,
+            stop_on_no_progress=stop_on_no_progress,
+            synthesize_empty=synthesize_empty,
+            route_tools=route_tools,
+            route_max_tools=route_max_tools,
+        )
+        try:
+            async for delta in inner:
+                yield delta
+        finally:
+            await inner.aclose()
 
-        _validate_max_turns(max_turns, "stream_agent_loop")
-        # Reject a malformed context BEFORE the tool router / first turn runs.
-        _validated_ctx(task.context, "stream_agent_loop")
-        if hitl and self._checkpoint_store is None:
-            raise HimmyError("hitl=True requires a checkpoint_store on the runtime.")
-
-        if self._should_route(route_tools):
-            task = await self._route_tools(task, route_max_tools)
-
-        from himmy.agents.base_agent.thread import ChatThread as _ChatThread
-
-        # Own the thread reference up front so we keep operating on the SAME thread
-        # stream_task mutates (it creates one internally when None — we pre-create it
-        # here instead so the continuation turns and tool replay land on it).
-        if thread is None:
-            thread = _ChatThread(agent_id=persona.agent_id)
-
-        ctx = dict(task.context or {})
-        # WS4.6: publish the subject for the WHOLE streamed loop (governed only; a
-        # no-op when no consent_decider is wired) so the per-turn continuation
-        # messages, turn-completed events, and any synthesis turn — all emitted
-        # OUTSIDE the first turn's own scope — resolve to the subject. The inner
-        # stream_task / run_task_detailed scopes nest cleanly inside this one.
-        with self._subject_scope(ctx):
-            # Own the inner turn generators so EARLY termination — the client
-            # closing this generator (GeneratorExit) or the consuming task being
-            # cancelled (CancelledError) at any yield point — closes the in-flight
-            # turn in the ``finally`` below instead of leaving the suspended inner
-            # generators (and the provider stream beneath them) dangling until the
-            # event loop's lazy async-generator finalizer runs.
-            first_stream = self.stream_task(
-                persona, task, thread, llm_config=llm_config
-            )
-            drive: AsyncGenerator[StreamDelta | AgentLoopResult, None] | None = None
-            try:
-                # --- first turn: stream tokens via stream_task, materialize it ---
-                first_response: InferenceResponse | None = None
-                async for delta in first_stream:
-                    if delta.done:
-                        # Swallow the single-turn ``done`` delta: this loop owns the
-                        # one terminal ``done`` (carrying the AgentLoopResult).
-                        # Capture the materialized response so we can reconstruct
-                        # the turn result.
-                        first_response = delta.response
-                        continue
-                    yield delta
-
-                # run_stream always yields a done delta
-                assert first_response is not None
-                trace_id = f"{thread.thread_id}:{task.task_id}"
-
-                first = self._result_from_response(first_response, trace_id=trace_id)
-                first.thread = thread  # the real thread stream_task ran on
-                # stream_task does NOT replay TOOL exchanges; replay them now (so a
-                # continuation turn sees the tool results), surface them as events.
-                await self._append_tool_messages(
-                    thread,
-                    first_response,
-                    request_id=first.request_id or first_response.request_id,
-                    trace_id=trace_id,
-                    agent_id=persona.agent_id,
-                )
-                # stream_task already registered a chat_thread version snapshot that
-                # only held the ASSISTANT message (taken BEFORE these tools existed).
-                # Bump + re-project so the registered version includes the replayed
-                # TOOL messages, matching the resume / non-streaming paths. (The
-                # in-memory order stays [ASSISTANT, TOOL...] here — a full reorder to
-                # the non-streaming [TOOL..., ASSISTANT] is DEFERRED: stream_task owns
-                # the ASSISTANT append and never replays tools, so moving it risks the
-                # single-turn contract / delta ordering for LOW benefit.)
-                if first.tool_calls:
-                    thread.version += 1
-                    self._register_thread_version(thread)
-                for tool_delta in self._tool_deltas(first):
-                    yield tool_delta
-                await self._emit_turn_completed(trace_id, thread, persona, 1, first)
-                yield StreamDelta(
-                    request_id=first.request_id or first_response.request_id,
-                    event_type="turn_end",
-                    event_payload={"turn": 1, "tool_calls": len(first.tool_calls)},
-                )
-
-                # --- continuation turns: mirror _drive_loop, streaming each turn ---
-                result: AgentLoopResult | None = None
-                drive = self._stream_drive_loop(
-                    persona,
-                    task,
-                    thread,
-                    ctx,
-                    trace_id,
-                    turns=[first],
-                    max_turns=max_turns,
-                    cost_budget=cost_budget,
-                    llm_config=llm_config,
-                    hitl=hitl,
-                    stop_on_no_progress=stop_on_no_progress,
-                )
-                async for item in drive:
-                    if isinstance(item, AgentLoopResult):
-                        result = item
-                        break
-                    yield item
-
-                assert result is not None
-                if synthesize_empty:
-                    # Reuse the exact non-streaming synthesis rescue so an empty
-                    # tool-using answer is converted to a text answer identically.
-                    result = await self._maybe_synthesize(
-                        result, persona, trace_id, llm_config, ctx
-                    )
-                yield StreamDelta(
-                    request_id=first.request_id or first_response.request_id,
-                    done=True,
-                    event_type="done",
-                    event_payload={"result": result},
-                )
-            finally:
-                # Runs on normal completion (both acloses are no-ops on exhausted
-                # generators) AND on GeneratorExit/CancelledError, which then
-                # re-raise naturally after the inner generators are closed.
-                await first_stream.aclose()
-                if drive is not None:
-                    await drive.aclose()
-
-    async def _stream_drive_loop(
+    def _stream_drive_loop(
         self,
         persona: Persona,
         task: Task,
@@ -1701,214 +1175,41 @@ class SingleAgentRuntime:
         hitl: bool,
         stop_on_no_progress: bool,
     ) -> AsyncGenerator[StreamDelta | AgentLoopResult, None]:
-        """Drive streamed continuation turns until a stop condition.
-
-        Mirrors :meth:`_drive_loop`'s EXACT stop-condition / no-progress /
-        cost-budget / HITL logic (run from a continuation perspective, so the
-        ``turns_offset`` / ``cost_offset`` are zero), but per continuation turn it
-        runs the turn and yields its text + ``tool_call`` / ``tool_result`` /
-        ``turn_end`` :class:`StreamDelta`s. The final yielded item is the terminal
-        :class:`AgentLoopResult` (so the caller stops iterating and owns the single
-        ``done`` delta). The checkpoint / pending-approval helpers are shared with
-        the non-streaming loop — nothing is duplicated.
-        """
-        from himmy.services.inference.service import StreamDelta
-
-        while True:
-            last = turns[-1]
-            if not last.succeeded:
-                yield AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="error"
-                )
-                return
-            if hitl:
-                pending = self._pending_approvals(last)
-                if pending:
-                    checkpoint = self._save_checkpoint(
-                        persona,
-                        task,
-                        thread,
-                        ctx,
-                        llm_config,
-                        max_turns,
-                        cost_budget,
-                        len(turns),
-                        sum(t.cost for t in turns),
-                        pending,
-                    )
-                    await self._emit(
-                        RunEvent(
-                            event_type=EventType.APPROVAL_REQUIRED,
-                            trace_id=trace_id,
-                            thread_id=thread.thread_id,
-                            agent_id=persona.agent_id,
-                            payload={
-                                "checkpoint_id": checkpoint.checkpoint_id,
-                                "tools": [p.tool_name for p in pending],
-                            },
-                        )
-                    )
-                    yield AgentLoopResult(
-                        thread=thread,
-                        turns=turns,
-                        stopped_reason="awaiting_approval",
-                        checkpoint_id=checkpoint.checkpoint_id,
-                    )
-                    return
-            if not last.tool_calls:
-                yield AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="final"
-                )
-                return
-            if last.round_trip_complete:
-                yield AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="final"
-                )
-                return
-            if final_answer_text(last) is not None:
-                yield AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="final_answer"
-                )
-                return
-            if stop_on_no_progress and is_no_progress(turns):
-                yield AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="no_progress"
-                )
-                return
-            if len(turns) >= max_turns:
-                yield AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="max_turns"
-                )
-                return
-            if cost_budget is not None and sum(t.cost for t in turns) >= cost_budget:
-                yield AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="budget"
-                )
-                return
-            index = len(turns) + 1
-            await self._emit(
-                RunEvent(
-                    event_type=EventType.AGENT_TURN_STARTED,
-                    trace_id=trace_id,
-                    thread_id=thread.thread_id,
-                    agent_id=persona.agent_id,
-                    payload={"turn": index},
-                )
-            )
-            # Continuation turns buffer then re-chunk for deterministic offline
-            # replay (the stub streams in 24-char chunks; matching that keeps the
-            # reassembled text identical across turns).
-            result = await self._continue_turn(
-                persona, thread, ctx, trace_id, llm_config=llm_config
-            )
-            turns.append(result)
-            for text_delta in self._text_deltas(result):
-                yield text_delta
-            for tool_delta in self._tool_deltas(result):
-                yield tool_delta
-            await self._emit_turn_completed(trace_id, thread, persona, index, result)
-            yield StreamDelta(
-                request_id=result.request_id or "",
-                event_type="turn_end",
-                event_payload={"turn": index, "tool_calls": len(result.tool_calls)},
-            )
+        """Delegating shim → :meth:`StreamDriver._stream_drive_loop`."""
+        return self._stream_driver._stream_drive_loop(
+            persona,
+            task,
+            thread,
+            ctx,
+            trace_id,
+            turns=turns,
+            max_turns=max_turns,
+            cost_budget=cost_budget,
+            llm_config=llm_config,
+            hitl=hitl,
+            stop_on_no_progress=stop_on_no_progress,
+        )
 
     @staticmethod
     def _result_from_response(
         response: InferenceResponse, *, trace_id: str
     ) -> RunResult:
-        """Reconstruct a :class:`RunResult` from a streamed first turn's response.
-
-        :meth:`stream_task` yields its terminal ``done`` delta carrying the
-        materialized :class:`InferenceResponse` but no typed result; this rebuilds
-        the same :class:`RunResult` shape :meth:`_continue_turn` produces so the
-        streamed first turn drives the loop identically to a non-streamed one.
-        """
-        assistant_text = response.output_text
-        if assistant_text is None and response.output_structured is not None:
-            assistant_text = json.dumps(response.output_structured, default=str)
-        error_message = response.error.message if response.error else None
-        error_code = response.error.code.value if response.error else None
-        return RunResult(
-            thread=cast("ChatThread", None),  # not used by the loop's stop logic
-            status=response.status.value,
-            output_text=assistant_text,
-            output_structured=response.output_structured,
-            tool_calls=list(response.tool_calls),
-            tool_returns=list(response.tool_returns),
-            error=error_message,
-            error_code=error_code,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-            cost=response.cost,
-            latency_ms=response.latency_ms,
-            model_path=response.model_path,
-            provider_name=response.provider_name,
-            request_id=response.request_id,
-            trace_id=trace_id,
-            workflow=response.workflow,
-            workflow_complete=(
-                response.workflow.is_complete if response.workflow is not None else None
-            ),
-            round_trip_complete=bool(response.metadata.get("round_trip_complete")),
-        )
+        """Delegating shim → :meth:`StreamDriver._result_from_response`."""
+        return StreamDriver._result_from_response(response, trace_id=trace_id)
 
     @staticmethod
     def _text_deltas(result: RunResult) -> Iterator[StreamDelta]:
-        """Re-chunk a continuation turn's text at 24 chars (stub-faithful)."""
-        from himmy.services.inference.service import StreamDelta
-
-        text = result.output_text or ""
-        request_id = result.request_id or ""
-        index = 0
-        for start in range(0, len(text), 24):
-            yield StreamDelta(
-                request_id=request_id, delta=text[start : start + 24], index=index
-            )
-            index += 1
+        """Delegating shim → :meth:`StreamDriver._text_deltas`."""
+        return StreamDriver._text_deltas(result)
 
     @staticmethod
     def _tool_deltas(result: RunResult) -> Iterator[StreamDelta]:
-        """Yield a ``tool_call`` + paired ``tool_result`` delta per tool exchange."""
-        from himmy.services.inference.service import StreamDelta
-
-        returns_by_id = {r.tool_call_id: r for r in result.tool_returns}
-        request_id = result.request_id or ""
-        for call in result.tool_calls:
-            yield StreamDelta(
-                request_id=request_id,
-                event_type="tool_call",
-                event_payload={
-                    "tool_call_id": call.tool_call_id,
-                    "tool_name": call.tool_name,
-                    "tool_args": dict(call.args),
-                },
-            )
-            ret = returns_by_id.get(call.tool_call_id)
-            yield StreamDelta(
-                request_id=request_id,
-                event_type="tool_result",
-                event_payload={
-                    "tool_call_id": call.tool_call_id,
-                    "tool_name": call.tool_name,
-                    "outcome": ret.outcome if ret is not None else "unknown",
-                    "content": ret.content if ret is not None else None,
-                },
-            )
+        """Delegating shim → :meth:`StreamDriver._tool_deltas`."""
+        return StreamDriver._tool_deltas(result)
 
     def _resume_lock_for(self, checkpoint_id: str) -> asyncio.Lock:
-        """The per-checkpoint resume lock (created on first use), serializing resumes.
-
-        Two concurrent resumes of the SAME checkpoint on one event loop must not
-        interleave between the atomic claim and the gated tool's execution, or both
-        could run the approved action. Different checkpoints get different locks, so
-        unrelated resumes still proceed in parallel.
-        """
-        lock = self._resume_locks.get(checkpoint_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._resume_locks[checkpoint_id] = lock
-        return lock
+        """Delegating shim → :meth:`ResumeCoordinator.resume_lock_for`."""
+        return self._resume_coordinator.resume_lock_for(checkpoint_id)
 
     async def resume_agent_loop(
         self,
@@ -1962,225 +1263,20 @@ class SingleAgentRuntime:
         hitl: bool,
         actor: str = "human",
     ) -> AgentLoopResult:
-        """The resume body, run under the per-checkpoint lock (see resume_agent_loop)."""
-        assert self._checkpoint_store is not None  # guaranteed by the caller
-        # Atomic claim: compare-and-set the status to ``resolving`` as a single store
-        # operation. Concurrent resumes of the same checkpoint (two tabs, an
-        # automation retry, two workers on the shared SQLite file) race here, and only
-        # the winner proceeds to execute the approval-gated tool — the loser's claim
-        # returns False and it is refused outright, so the gated action runs EXACTLY
-        # once. (The old plain status check was a TOCTOU: both callers read
-        # awaiting_approval, both executed, then both flipped the status.) An
-        # already-resolved (approved/rejected) checkpoint also loses here.
-        if not self._checkpoint_store.claim(checkpoint_id):
-            current = self._checkpoint_store.load(checkpoint_id)
-            status = current.status if current is not None else "unknown"
-            raise HimmyError(
-                f"checkpoint {checkpoint_id!r} already resolved ({status})."
-            )
-        # We hold the claim: re-load so the executed_tool_results ledger (and status)
-        # reflect the just-claimed row rather than the pre-claim snapshot.
-        checkpoint = self._checkpoint_store.load(checkpoint_id)
-        if checkpoint is None:  # pragma: no cover - the claim just observed it
-            raise HimmyError(f"unknown checkpoint {checkpoint_id!r}.")
-        # Checkpoints written by the validated entry points always pass; this guards
-        # the resumed drive loop against a hand-crafted/tampered checkpoint row.
-        _validate_max_turns(checkpoint.max_turns, "resume_agent_loop")
-        if approved and self.tool_service is None:
-            raise HimmyError(
-                "cannot resume approved: no tool_service to execute the action."
-            )
-
-        from himmy.agents.base_agent.task import Task as _Task
-        from himmy.agents.base_agent.thread import ChatThread as _ChatThread
-        from himmy.agents.personas.persona import Persona as _Persona
-        from himmy.services.tools.models import ToolInvocation
-
-        persona = _Persona.model_validate(checkpoint.persona)
-        task = _Task.model_validate(checkpoint.task)
-        thread = _ChatThread.model_validate(checkpoint.thread)
-        # Like the max_turns guard above: contexts checkpointed by the validated
-        # entry points always pass; this catches a hand-crafted/tampered ctx row.
-        ctx = _validated_ctx(checkpoint.ctx, "resume_agent_loop")
-        trace_id = f"{thread.thread_id}:{task.task_id}"
-        resume_llm = llm_config
-        if resume_llm is None and checkpoint.llm_config is not None:
-            resume_llm = LLMConfig.model_validate(checkpoint.llm_config)
-
-        # WS4.6: publish the subject (rebuilt from the checkpoint's ``ctx``, which carries
-        # ``context_subject_id``) for the WHOLE resume path so the resumed tool messages,
-        # the APPROVAL_* / turn events, the bumped thread version, the inner _continue_turn
-        # (which does NOT self-wrap — only the public continue_turn does), and _drive_loop
-        # all emit subject-tagged spine records — otherwise a HITL-resumed run for a fully
-        # consented subject would emit subject-less records the fail-closed
-        # ConsentAwareRegistry silently drops. Governed only; a no-op when no
-        # consent_decider is wired. Inner scopes nest cleanly.
-        # The per-checkpoint idempotency record: each approved execution is recorded
-        # (and persisted) the moment it completes, so a repeated resume — including a
-        # retry after a crash between executing a state-mutating tool and resolving
-        # the checkpoint — replays the recorded result instead of running it twice.
-        idempotency = _CheckpointToolIdempotencyStore(
-            checkpoint, self._checkpoint_store
+        """Delegating shim → :meth:`ResumeCoordinator.resume_agent_loop_locked`."""
+        return await self._resume_coordinator.resume_agent_loop_locked(
+            checkpoint_id,
+            approved=approved,
+            llm_config=llm_config,
+            hitl=hitl,
+            actor=actor,
         )
-
-        with self._subject_scope(ctx):
-            # Apply the human decision to each pending tool call, recording the outcome
-            # on the thread as a TOOL message (so the next model turn sees it).
-            for call in checkpoint.pending_tool_calls:
-                if approved:
-                    assert self.tool_service is not None
-                    execution = await self.tool_service.execute(
-                        ToolInvocation(
-                            tool_call_id=call.tool_call_id,
-                            tool_name=call.tool_name,
-                            args=dict(call.args),
-                            metadata={
-                                "approved": True,
-                                "idempotency_key": call.tool_call_id,
-                            },
-                        ),
-                        idempotency_store=idempotency,
-                    )
-                    tool_returns = [
-                        ToolReturnRecord(
-                            tool_call_id=call.tool_call_id,
-                            tool_name=call.tool_name,
-                            content=execution.result,
-                            outcome=execution.outcome,
-                            metadata={
-                                "approved_by": actor,
-                                "error_code": execution.error_code.value
-                                if execution.error_code
-                                else None,
-                            },
-                        )
-                    ]
-                    event_type = EventType.APPROVAL_GRANTED
-                else:
-                    tool_returns = [
-                        ToolReturnRecord(
-                            tool_call_id=call.tool_call_id,
-                            tool_name=call.tool_name,
-                            content={"rejected": True, "reason": "rejected by human"},
-                            outcome="rejected",
-                            metadata={"approved_by": actor},
-                        )
-                    ]
-                    event_type = EventType.APPROVAL_REJECTED
-                synthetic = InferenceResponse(
-                    request_id=f"resume:{checkpoint_id}",
-                    status=InferenceStatus.SUCCESS,
-                    tool_calls=[
-                        ToolCallRecord(
-                            tool_call_id=call.tool_call_id,
-                            tool_name=call.tool_name,
-                            args=dict(call.args),
-                        )
-                    ],
-                    tool_returns=tool_returns,
-                )
-                await self._append_tool_messages(
-                    thread,
-                    synthetic,
-                    request_id=synthetic.request_id,
-                    trace_id=trace_id,
-                    agent_id=persona.agent_id,
-                )
-                await self._emit(
-                    RunEvent(
-                        event_type=event_type,
-                        trace_id=trace_id,
-                        thread_id=thread.thread_id,
-                        agent_id=persona.agent_id,
-                        tool_call_id=call.tool_call_id,
-                        payload={
-                            "checkpoint_id": checkpoint_id,
-                            "tool_name": call.tool_name,
-                            # Enriched (P0-B) so approvals are mineable per agent /
-                            # tool / decision / latency without re-joining tables.
-                            "decision": "granted" if approved else "rejected",
-                            "agent_name": persona.name,
-                            "actor": actor,
-                            "time_to_decision_ms": _decision_latency_ms(
-                                checkpoint.created_at
-                            ),
-                        },
-                    )
-                )
-
-            # Resolve the checkpoint exactly once (idempotency guard above).
-            self._checkpoint_store.save(
-                checkpoint.model_copy(
-                    update={"status": APPROVED if approved else REJECTED}
-                )
-            )
-            thread.version += 1
-            self._register_thread_version(thread)
-
-            # One continuation turn so the model reacts to the decision, then drive on.
-            index = checkpoint.turns_completed + 1
-            await self._emit(
-                RunEvent(
-                    event_type=EventType.AGENT_TURN_STARTED,
-                    trace_id=trace_id,
-                    thread_id=thread.thread_id,
-                    agent_id=persona.agent_id,
-                    payload={"turn": index},
-                )
-            )
-            result = await self._continue_turn(
-                persona, thread, ctx, trace_id, llm_config=resume_llm
-            )
-            await self._emit_turn_completed(trace_id, thread, persona, index, result)
-            loop = await self._drive_loop(
-                persona,
-                task,
-                thread,
-                ctx,
-                trace_id,
-                turns=[result],
-                max_turns=checkpoint.max_turns,
-                cost_budget=checkpoint.cost_budget,
-                llm_config=resume_llm,
-                hitl=hitl,
-                stop_on_no_progress=False,
-                turns_offset=checkpoint.turns_completed,
-                cost_offset=checkpoint.cost_completed,
-            )
-            self._record_resume_final_output(checkpoint_id, loop)
-            return loop
 
     def _record_resume_final_output(
         self, checkpoint_id: str, loop: AgentLoopResult
     ) -> None:
-        """Persist the resolved member's FINAL output onto its terminal checkpoint (#2).
-
-        The crash-recovery anchor for orchestration HITL. By the time this runs the
-        gated tool has fired exactly once and the checkpoint is already resolved
-        (``approved``/``rejected``); the member's final answer is only produced by the
-        drive loop AFTER that terminal save, so it is written back here — DURABLY, onto
-        the SAME store row that holds the claim + idempotency ledger, BEFORE the caller
-        returns (and therefore before the orchestration graph advance persists). If a
-        crash then strikes between the member resolving and the graph persisting its
-        advance, the graph recovery reads this text back and threads the REAL member
-        output downstream instead of an empty string.
-
-        A member that paused AGAIN on a second gated tool has NOT produced a final
-        answer (the original checkpoint stays terminal but re-pauses into a fresh
-        checkpoint), so nothing is recorded — ``final_output`` stays ``None``. The
-        write merges onto a freshly LOADED row so the ledger written during execution
-        is preserved, and never resurrects a since-pruned checkpoint.
-        """
-        assert self._checkpoint_store is not None  # guaranteed by the caller
-        if loop.stopped_reason == "awaiting_approval":
-            return
-        latest = self._checkpoint_store.load(checkpoint_id)
-        if latest is None:  # pragma: no cover - pruned mid-resume; nothing to anchor
-            return
-        final_text = (loop.final.output_text or "") if loop.turns else ""
-        self._checkpoint_store.save(
-            latest.model_copy(update={"final_output": final_text})
-        )
+        """Delegating shim → :meth:`ResumeCoordinator.record_resume_final_output`."""
+        self._resume_coordinator.record_resume_final_output(checkpoint_id, loop)
 
     async def _drive_loop(
         self,
@@ -2200,127 +1296,29 @@ class SingleAgentRuntime:
         cost_offset: float,
         steer_queue: queue.Queue[str] | None = None,
     ) -> AgentLoopResult:
-        """Drive continuation turns until a stop condition (shared by run/resume)."""
-        while True:
-            last = turns[-1]
-            if not last.succeeded:
-                return AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="error"
-                )
-            if hitl:
-                pending = self._pending_approvals(last)
-                if pending:
-                    checkpoint = self._save_checkpoint(
-                        persona,
-                        task,
-                        thread,
-                        ctx,
-                        llm_config,
-                        max_turns,
-                        cost_budget,
-                        turns_offset + len(turns),
-                        cost_offset + sum(t.cost for t in turns),
-                        pending,
-                    )
-                    await self._emit(
-                        RunEvent(
-                            event_type=EventType.APPROVAL_REQUIRED,
-                            trace_id=trace_id,
-                            thread_id=thread.thread_id,
-                            agent_id=persona.agent_id,
-                            payload={
-                                "checkpoint_id": checkpoint.checkpoint_id,
-                                "tools": [p.tool_name for p in pending],
-                            },
-                        )
-                    )
-                    return AgentLoopResult(
-                        thread=thread,
-                        turns=turns,
-                        stopped_reason="awaiting_approval",
-                        checkpoint_id=checkpoint.checkpoint_id,
-                    )
-            if not last.tool_calls:
-                return AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="final"
-                )
-            if last.round_trip_complete:
-                # The provider already ran the tool round-trip and produced the final
-                # answer this turn (e.g. pydantic-ai/OpenAI); continuing would re-send a
-                # history the strict API rejects. Stop here.
-                return AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="final"
-                )
-            if final_answer_text(last) is not None:
-                return AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="final_answer"
-                )
-            if stop_on_no_progress and is_no_progress(turns):
-                return AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="no_progress"
-                )
-            if turns_offset + len(turns) >= max_turns:
-                return AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="max_turns"
-                )
-            if (
-                cost_budget is not None
-                and cost_offset + sum(t.cost for t in turns) >= cost_budget
-            ):
-                return AgentLoopResult(
-                    thread=thread, turns=turns, stopped_reason="budget"
-                )
-            index = turns_offset + len(turns) + 1
-            # Between-turns steering (opt-in): drain queued user guidance at the
-            # top of this continuation turn so the next request includes it.
-            if steer_queue is not None:
-                self._drain_steer_queue(steer_queue, thread)
-            await self._emit(
-                RunEvent(
-                    event_type=EventType.AGENT_TURN_STARTED,
-                    trace_id=trace_id,
-                    thread_id=thread.thread_id,
-                    agent_id=persona.agent_id,
-                    payload={"turn": index},
-                )
-            )
-            result = await self._continue_turn(
-                persona, thread, ctx, trace_id, llm_config=llm_config
-            )
-            turns.append(result)
-            await self._emit_turn_completed(trace_id, thread, persona, index, result)
+        """Delegating shim → :meth:`LoopDriver.drive_loop`."""
+        return await self._loop_driver.drive_loop(
+            persona,
+            task,
+            thread,
+            ctx,
+            trace_id,
+            turns=turns,
+            max_turns=max_turns,
+            cost_budget=cost_budget,
+            llm_config=llm_config,
+            hitl=hitl,
+            stop_on_no_progress=stop_on_no_progress,
+            turns_offset=turns_offset,
+            cost_offset=cost_offset,
+            steer_queue=steer_queue,
+        )
 
     def _drain_steer_queue(
         self, steer_queue: queue.Queue[str], thread: ChatThread
     ) -> None:
-        """Append every queued steering text as a USER message on the thread.
-
-        Each non-empty text becomes one USER message (``metadata={'steer': True}``)
-        in arrival order, so the very next ``_continue_turn`` request — built from
-        the thread as-is — carries the guidance. Thread-safe by construction:
-        ``queue.Queue`` may be fed from any thread (an HTTP handler steering a
-        background mission) while the loop drains it here on the event loop.
-        """
-        from himmy.agents.base_agent.thread import Message, MessageRole
-
-        injected = False
-        while True:
-            try:
-                text = steer_queue.get_nowait()
-            except queue.Empty:
-                break
-            content = str(text).strip()
-            if not content:
-                continue
-            message = Message(
-                role=MessageRole.USER, content=content, metadata={"steer": True}
-            )
-            thread.append_message(message)
-            self._register_message(message)
-            injected = True
-        if injected:
-            thread.version += 1
-            self._register_thread_version(thread)
+        """Delegating shim → :meth:`LoopDriver.drain_steer_queue`."""
+        self._loop_driver.drain_steer_queue(steer_queue, thread)
 
     @staticmethod
     def _pending_approvals(result: RunResult) -> list[PendingToolCall]:
@@ -2360,24 +1358,19 @@ class SingleAgentRuntime:
         cost_completed: float,
         pending: list[PendingToolCall],
     ) -> AgentCheckpoint:
-        """Persist a paused run as a durable checkpoint and return it."""
-        assert self._checkpoint_store is not None
-        checkpoint = AgentCheckpoint(
-            persona=persona.model_dump(mode="json"),
-            task=task.model_dump(mode="json"),
-            thread=thread.model_dump(mode="json"),
-            ctx=ctx,
-            llm_config=llm_config.model_dump(mode="json")
-            if llm_config is not None
-            else None,
-            max_turns=max_turns,
-            cost_budget=cost_budget,
-            turns_completed=turns_completed,
-            cost_completed=cost_completed,
-            pending_tool_calls=pending,
+        """Delegating shim → :meth:`ResumeCoordinator.save_checkpoint`."""
+        return self._resume_coordinator.save_checkpoint(
+            persona,
+            task,
+            thread,
+            ctx,
+            llm_config,
+            max_turns,
+            cost_budget,
+            turns_completed,
+            cost_completed,
+            pending,
         )
-        self._checkpoint_store.save(checkpoint)
-        return checkpoint
 
     async def _emit_turn_completed(
         self,
@@ -2440,147 +1433,9 @@ class SingleAgentRuntime:
         Operator steer/control messages are pinned out of the summarize span upstream
         (see :mod:`himmy.runtime.compaction`) so they always ride verbatim.
         """
-        # An explicit per-run spec always wins; otherwise fall back to the default-on
-        # policy (which may itself be disabled via HIMMY_AUTO_COMPACT=0 → None).
-        spec = ctx.get("compaction_spec")
-        if not spec:
-            spec = _auto_compact_default_spec()
-        if not spec:
-            return False
-        from himmy.agents.base_agent.thread import Message, MessageRole
-        from himmy.runtime.compaction import (
-            SUMMARY_INSTRUCTION,
-            ContextCompactor,
-            estimate_tokens,
+        return await self._compaction_runner.maybe_compact(
+            persona, thread, ctx, trace_id, llm_config
         )
-
-        compactor = ContextCompactor(
-            max_tokens=int(spec.get("max_tokens", 3000)),
-            keep_recent=int(spec.get("keep_recent", 6)),
-        )
-        plan = compactor.plan(thread.messages)
-        if not plan.should_compact:
-            return False
-
-        span_text = compactor.render_span(plan.summarize)
-        model_key = str(ctx.get("model_key") or self.default_model_key)
-        summary_req = InferenceRequest(
-            model_key=model_key,
-            response_format=ResponseFormat.TEXT,
-            messages=[
-                InferenceMessage(role="system", content=SUMMARY_INSTRUCTION),
-                InferenceMessage(role="user", content=span_text),
-            ],
-            metadata=_cache_scope_metadata(ctx),
-        )
-        summary_resp = await self.inference_service.run(summary_req)
-        summary_text = (summary_resp.output_text or "").strip()
-        if not summary_text:
-            return False  # summarization failed/empty — leave history intact (safe)
-
-        # SECURITY (sec-r1 + sec-r3): the summarized span is distilled from USER and
-        # (crucially) UN-guarded TOOL result messages, so ``summary_text`` is UNTRUSTED —
-        # an attacker who planted an "instruction"/"decision" in a scraped page or poisoned
-        # tool result would otherwise have it re-emitted verbatim-in-spirit. Hardenings:
-        #   1. run it through the configured input guardrail (injection / DLP / blocklist)
-        #      when one is wired — BUT that guardrail is opt-in and absent in the offline /
-        #      default runtime, so it is NOT a guarantee on its own;
-        #   1b. (sec-r3) ALWAYS run a mandatory, guardrail-independent credential + injection
-        #      scrub so secrets are redacted and directives neutralized even with no
-        #      guardrail configured — this is the real laundering barrier;
-        #   2. insert it at USER trust (not SYSTEM). SYSTEM is reserved for operator /
-        #      persona text; laundering summarized untrusted content into a SYSTEM
-        #      directive would elevate its trust and let a one-shot indirect injection
-        #      persist as a standing higher-trust instruction on every later turn.
-        summary_text = await self._guard_input(
-            summary_text,
-            agent_id=persona.agent_id,
-            trace_id=trace_id,
-            thread_id=thread.thread_id,
-        )
-        # sec-r3 #3: the configured input guardrail above is OPT-IN and is ``None`` in the
-        # offline / default runtime (``_guard_input`` then passes through untouched). Apply
-        # a MANDATORY, guardrail-independent scrub so credentials are always redacted and
-        # injection directives are neutralized BEFORE the summary re-enters context or is
-        # persisted to durable episodic memory — regardless of whether a full guardrail is
-        # wired. This is the load-bearing laundering barrier for default-on compaction.
-        summary_text = _scrub_compaction_summary(summary_text)
-        if not summary_text.strip():
-            return False  # guardrail/scrub emptied it — nothing safe to fold in
-
-        summary_msg = Message(
-            role=MessageRole.USER,
-            content=(
-                "[Summary of earlier conversation — untrusted recap of prior turns, "
-                "not an operator instruction]\n"
-                f"{summary_text}"
-            ),
-            metadata={"compacted": True},
-        )
-        # Only apply if the summary is actually smaller than what it replaces — a verbose
-        # summary of a tiny span would otherwise grow the context, not shrink it.
-        if estimate_tokens(summary_msg.content) >= compactor.estimate(plan.summarize):
-            return False
-        head = list(thread.messages[: plan.head_count])
-        tail = list(thread.messages[plan.tail_start :])
-        # sec-r3 #4: pinned control/safety messages inside the summarize span are lifted
-        # out (plan.carry) and re-inserted VERBATIM between the summary and the kept tail,
-        # so the refusal/steer boundary survives compaction while the non-pinned middle is
-        # still condensed. Their tool_call group rides with them (planner-guaranteed), so
-        # no tool_result is orphaned after the USER summary.
-        carry = list(plan.carry)
-        compacted_count = len(plan.summarize)
-        thread.messages[:] = [*head, summary_msg, *carry, *tail]
-        thread.version += 1
-
-        await self._emit(
-            RunEvent(
-                event_type=EventType.CONTEXT_COMPACTED,
-                trace_id=trace_id,
-                thread_id=thread.thread_id,
-                agent_id=persona.agent_id,
-                payload={
-                    "summarized_messages": compacted_count,
-                    "before_tokens": plan.before_tokens,
-                    "after_tokens": compactor.estimate(thread.messages),
-                    "kept_recent": len(tail),
-                },
-            )
-        )
-
-        # P0-C: the compaction summary is the run's distilled experience ("every
-        # fact, decision, tool result"). Instead of discarding it when the thread
-        # middle is replaced, persist it as an episodic trace so learning loops have
-        # a corpus of "what happened" from day one. Best-effort: a persistence
-        # failure must never break the run (the in-context summary already applied).
-        # SECURITY (sec-r1 + sec-r3): ``summary_text`` here is the SCRUBBED text — through
-        # the configured input guardrail (if any) AND the mandatory credential + injection
-        # scrub — so secrets a tool returned verbatim are redacted BEFORE they land
-        # unredacted-at-rest in durable, subject-scoped episodic memory (recalled into
-        # FUTURE runs and readable by store-level exports) even with no guardrail wired.
-        save_episodic = getattr(self.memory_store, "save_episodic_memory", None)
-        if save_episodic is not None:
-            from himmy.services.storage.models import EpisodicMemoryObject
-
-            subject_raw = ctx.get("subject_id")
-            with contextlib.suppress(Exception):
-                await save_episodic(
-                    EpisodicMemoryObject(
-                        subject_id=str(subject_raw) if subject_raw else None,
-                        agent_id=persona.agent_id,
-                        payload={
-                            "summary": summary_text,
-                            "source": "compaction",
-                            "tier": "archival",
-                        },
-                        metadata={
-                            "trace_id": trace_id,
-                            "thread_id": thread.thread_id,
-                            "summarized_messages": compacted_count,
-                        },
-                    )
-                )
-        return True
 
     async def _continue_turn(
         self,
@@ -3197,103 +2052,9 @@ class SingleAgentRuntime:
         re-raised as an :class:`HimmyError` so the caller knows the requested
         evidence was unavailable instead of silently running without it.
         """
-        snapshot: Any = None
-        snapshot_error: str | None = None
-        resolved_id = snapshot_id or ctx.get("snapshot_id")
-        requested = bool(
-            snapshot_id
-            or ctx.get("snapshot_id")
-            or ctx.get("context_build_spec") is not None
+        return await self._snapshot_resolver.resolve(
+            persona, task, ctx, snapshot_id
         )
-
-        if self.context_service is None:
-            if requested and self.strict_snapshot:
-                raise HimmyError("snapshot requested but no context_service is wired")
-            return (
-                None,
-                resolved_id,
-                ("no context_service wired" if requested else None),
-            )
-
-        # Load an existing snapshot when an id was supplied and storage is present.
-        if resolved_id and self.memory_store is not None:
-            loader = getattr(self.memory_store, "load_snapshot", None)
-            if loader is not None:
-                try:
-                    snapshot = await loader(resolved_id)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - diagnose, don't crash
-                    snapshot_error = f"snapshot load failed: {exc}"
-                if snapshot is None and snapshot_error is None:
-                    snapshot_error = f"snapshot {resolved_id!r} not found"
-
-        # Otherwise build one from a declared build spec.
-        if snapshot is None and ctx.get("context_build_spec") is not None:
-            subject_id = ctx.get("context_subject_id") or persona.agent_id
-            # Tenant isolation (red-team reattack-r6): thread the run's workspace_id into
-            # the per-run context build so STORAGE-sourced fields are tenant-scoped, exactly
-            # as the HTTP /v1/context/snapshot route does. Without it, ContextService
-            # resolved every stored field for a free-form ``subject_id`` (which defaults to
-            # the SHARED ``persona.agent_id`` across tenants running the same spec) with NO
-            # tenant filter, so tenant A's run could surface tenant B's cached context field
-            # (a cross-tenant IDOR). ``None`` (offline / single-tenant / CLI — no
-            # workspace_id on context_metadata) keeps resolution byte-for-byte unchanged.
-            workspace_id = _context_workspace_id(ctx)
-            try:
-                snapshot = await self.context_service.build_snapshot(
-                    subject_id=subject_id,
-                    task_id=task.task_id,
-                    build_spec=ctx["context_build_spec"],
-                    metadata=ctx.get("context_metadata"),
-                    workspace_id=workspace_id,
-                )
-                resolved_id = snapshot.snapshot_id
-                snapshot_error = None
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - diagnose, don't crash
-                snapshot = None
-                snapshot_error = f"snapshot build failed: {exc}"
-
-        if snapshot is not None:
-            await self._emit(
-                RunEvent(
-                    event_type=EventType.CONTEXT_SNAPSHOT_BUILT,
-                    thread_id=None,
-                    agent_id=persona.agent_id,
-                    payload={
-                        "snapshot_id": getattr(snapshot, "snapshot_id", None),
-                        "subject_id": getattr(snapshot, "subject_id", None),
-                        "missing_required_keys": list(
-                            getattr(snapshot, "missing_required_keys", []) or []
-                        ),
-                        # Knowledge/RAG grounding — which chunks were retrieved into
-                        # the prompt, with citations (so the GUI can show "why it
-                        # said that"). Empty when no KB-sourced field was resolved.
-                        "grounding": _snapshot_grounding(snapshot),
-                    },
-                )
-            )
-            resolved_id = getattr(snapshot, "snapshot_id", resolved_id)
-        elif snapshot_error is not None:
-            # RO-11: surface the failure on the audit trail so 'requested but
-            # unavailable' is distinguishable from 'no snapshot requested'.
-            await self._emit(
-                RunEvent(
-                    event_type=EventType.CONTEXT_SNAPSHOT_BUILT,
-                    thread_id=None,
-                    agent_id=persona.agent_id,
-                    error=snapshot_error,
-                    payload={
-                        "snapshot_id": resolved_id,
-                        "snapshot_error": snapshot_error,
-                    },
-                )
-            )
-            if requested and self.strict_snapshot:
-                raise HimmyError(snapshot_error)
-        return snapshot, resolved_id, snapshot_error
 
     # --------------------------------------------------------------- prompts
     async def _render_guarded_prompts(
@@ -3306,39 +2067,15 @@ class SingleAgentRuntime:
         trace_id: str | None = None,
         thread_id: str | None = None,
     ) -> tuple[str, str, list[str]]:
-        """Render prompts, routing INJECTED context through the guardrail first.
-
-        Recalled long-term memory (``MemoryContextAdapter``) and retrieved KB docs
-        reach the model as projected snapshot blocks — content the agent did NOT
-        author and that an attacker may have planted in a remembered fact or an
-        ingested document (indirect prompt injection / data exfiltration). The
-        base persona/task prompts are the operator's own text and are left alone;
-        only the injected blocks are passed through :meth:`_guard_input` (the
-        configured injection/DLP/blocklist guards), so a poisoned memory or KB chunk
-        is redacted/blocked/flagged BEFORE it enters the model. No guardrail
-        configured ⇒ ``_guard_input`` is a passthrough, so the merged prompts are
-        byte-identical to the unguarded render.
-        """
-        system_prompt, task_prompt, missing, sys_block, task_block = (
-            self._render_prompt_parts(persona, task, ctx, snapshot)
+        """Delegating shim → :meth:`RequestBuilder.render_guarded_prompts`."""
+        return await self._request_builder.render_guarded_prompts(
+            persona,
+            task,
+            ctx,
+            snapshot,
+            trace_id=trace_id,
+            thread_id=thread_id,
         )
-        if sys_block:
-            guarded_sys = await self._guard_input(
-                sys_block,
-                agent_id=persona.agent_id,
-                trace_id=trace_id,
-                thread_id=thread_id,
-            )
-            system_prompt = f"{system_prompt}\n\n{guarded_sys}".strip()
-        if task_block:
-            guarded_task = await self._guard_input(
-                task_block,
-                agent_id=persona.agent_id,
-                trace_id=trace_id,
-                thread_id=thread_id,
-            )
-            task_prompt = f"{task_prompt}\n\n{guarded_task}".strip()
-        return system_prompt, task_prompt, missing
 
     def _render_prompt_parts(
         self,
@@ -3347,88 +2084,15 @@ class SingleAgentRuntime:
         ctx: dict[str, Any],
         snapshot: Any,
     ) -> tuple[str, str, list[str], str, str]:
-        """Render the base prompts and the projected snapshot blocks SEPARATELY.
-
-        Returns ``(system_prompt, task_prompt, missing, sys_block, task_block)`` where
-        the two prompts are the operator-authored text (persona/task/system_prefix)
-        and ``sys_block``/``task_block`` are the projected snapshot content kept apart
-        so a caller can guard the injected context independently of the base prompt.
-        """
-        system_prompt = ""
-        task_prompt = task.prompt
-        missing: list[str] = []
-
-        if self.prompt_manager is not None:
-            from himmy.services.prompts.manager import (
-                SystemPromptVariables,
-                TaskPromptVariables,
-            )
-
-            # The persona's instructions are its directives — render them as
-            # objectives so they reach the model EVEN WHEN a description is set.
-            # (Previously the background used `description or instructions`, which
-            # silently dropped every instruction whenever a description existed.)
-            objectives = list(persona.instructions or [])
-            objectives += list(getattr(persona, "objectives", []) or [])
-            objectives += list(ctx.get("objectives", []) or [])
-            # Skills: ctx override wins, else persona.metadata.skills/required_skills.
-            skills = ctx.get("skills")
-            if skills is None:
-                skills = persona.metadata.get("skills") or list(
-                    getattr(persona, "required_skills", []) or []
-                )
-            skills = list(skills or [])
-
-            system_vars = SystemPromptVariables(
-                role=ctx.get("role") or persona.role,
-                persona=persona.description,
-                objectives=objectives,
-                skills=skills,
-                datetime=ctx.get("datetime", ""),
-            )
-            system_prompt = self.prompt_manager.get_system_prompt(system_vars)
-
-            task_vars = TaskPromptVariables(
-                task=task.prompt,
-                output_format=ctx.get("output_format", ""),
-                output_schema=ctx.get("output_schema"),
-            )
-            task_prompt = self.prompt_manager.get_task_prompt(task_vars) or task.prompt
-
-        # Prepend any system_prefix.
-        prefix = ctx.get("system_prefix")
-        if prefix:
-            system_prompt = f"{prefix}\n\n{system_prompt}".strip()
-
-        # Project snapshot keys into system/task blocks (kept SEPARATE from the base
-        # prompts so the injected context can be guarded independently — see
-        # _render_guarded_prompts).
-        sys_block = ""
-        task_block = ""
-        map_spec = ctx.get("context_prompt_map_spec")
-        if (
-            self.context_prompt_mapper is not None
-            and map_spec is not None
-            and snapshot is not None
-        ):
-            try:
-                sys_block, task_block, missing = self.context_prompt_mapper.project(
-                    snapshot, map_spec
-                )
-            except Exception:  # pragma: no cover - defensive
-                missing = []
-                sys_block = ""
-                task_block = ""
-        return system_prompt, task_prompt, missing, sys_block, task_block
+        """Delegating shim → :meth:`RequestBuilder.render_prompt_parts`."""
+        return self._request_builder.render_prompt_parts(persona, task, ctx, snapshot)
 
     # ----------------------------------------------------------- inference
     def _effective_model_key(
         self, ctx: dict[str, Any], llm_config: LLMConfig | None
     ) -> str:
-        """Resolve the effective model key (llm_config > task.context > default)."""
-        if llm_config is not None and llm_config.model_key:
-            return llm_config.model_key
-        return ctx.get("model_key") or self.default_model_key
+        """Delegating shim → :meth:`RequestBuilder.effective_model_key`."""
+        return self._request_builder.effective_model_key(ctx, llm_config)
 
     def _prompt_cache_policy(
         self,
@@ -3438,64 +2102,13 @@ class SingleAgentRuntime:
         scope_metadata: dict[str, Any],
         thread_id: str | None = None,
     ) -> CachePolicy | None:
-        """The per-turn :class:`CachePolicy` (or ``None`` to leave the request unmarked).
-
-        Returns a default ``CachePolicy()`` only when ALL hold:
-
-        * prompt caching is enabled on this runtime (``enable_prompt_cache`` /
-          ``HIMMY_PROMPT_CACHE``);
-        * compaction did NOT just rewrite the system prefix this turn
-          (``cache_busted`` — skip the breakpoint so we don't mark a stale prefix);
-        * the underlying manager for ``model_key`` declares a non-NONE cache capability
-          (resolved at the call site via the inference service, ``getattr`` default
-          NONE) — so every local/offline backend keeps ``None`` and a byte-identical
-          payload.
-
-        Returning ``None`` is the byte-identical no-cache path; the system prefix being
-        stable WITHIN a run is guaranteed by the runtime (the SYSTEM message — with its
-        baked datetime/recalled-memory/KB snapshot — is appended once on the first turn
-        and never re-rendered on continuation turns), so the only intra-run buster is
-        compaction, which ``cache_busted`` handles.
-
-        sec-r2 + sec-r3 #5: when the run is tenant/principal-scoped (``scope_metadata``
-        non-empty), the policy carries a ``cache_key`` derived from that scope so BOTH
-        provider families partition the prompt cache per principal:
-
-        * OpenAI-family sets the native ``prompt_cache_key`` routing hint;
-        * Anthropic (which has NO out-of-band partition key) folds the scope key into the
-          cached prefix as a leading salt block (``anthropic_scope_salt_block``), so two
-          principals never share cacheable prefix BYTES — closing the shared-key
-          cross-tenant cache-read side-channel on a byte-identical prefix (which the new
-          history-cache breakpoint would otherwise widen to tenant/tool-result content).
-
-        P2.3: an UNSCOPED run against an OpenAI-family manager
-        (:attr:`CacheCapability.OPENAI_AUTOMATIC`) instead carries a per-conversation
-        ``cache_key`` derived from ``thread_id`` (:func:`_prompt_cache_key_for_conversation`).
-        OpenAI's ``prompt_cache_key`` is a pure routing hint (steers a conversation's turns to
-        one backend for better automatic-cache affinity) with ZERO output effect, so this is a
-        speed-only win; it is opt-outable via ``HIMMY_OPENAI_CONVERSATION_CACHE_KEY=0``. A
-        scope key (when present) always WINS so tenant isolation is never diluted, and no
-        non-OpenAI family is touched: the conversation key is only minted for
-        ``OPENAI_AUTOMATIC`` (Anthropic's ``ANTHROPIC_EXPLICIT`` never enters this branch, so
-        its cacheable prefix bytes stay unchanged), and the OpenAI adapter itself additionally
-        gates ``prompt_cache_key`` on :func:`is_openai_family_model`.
-
-        An unscoped non-OpenAI run keeps ``cache_key=None`` so the payload is byte-identical to
-        the pre-change no-cache-key contract.
-        """
-        if cache_busted or not self._enable_prompt_cache:
-            return None
-        capability = self.inference_service.cache_capability_for(model_key)
-        if capability is CacheCapability.NONE:
-            return None
-        cache_key = _prompt_cache_key_for_scope(scope_metadata)
-        if (
-            cache_key is None
-            and capability is CacheCapability.OPENAI_AUTOMATIC
-            and _openai_conversation_cache_key_enabled()
-        ):
-            cache_key = _prompt_cache_key_for_conversation(thread_id)
-        return CachePolicy(cache_key=cache_key)
+        """Delegating shim → :meth:`RequestBuilder.prompt_cache_policy` (test-poked)."""
+        return self._request_builder.prompt_cache_policy(
+            model_key,
+            cache_busted=cache_busted,
+            scope_metadata=scope_metadata,
+            thread_id=thread_id,
+        )
 
     def _build_request(
         self,
@@ -3506,187 +2119,18 @@ class SingleAgentRuntime:
         trace_id: str | None = None,
         cache_busted: bool = False,
     ) -> tuple[InferenceRequest, list[str] | None]:
-        """Build the typed InferenceRequest with llm_config-over-context precedence.
-
-        ``trace_id`` (optional) threads onto the transient-retry events the
-        wrapped tool executor emits, so retries link to the run like every
-        other emission. ``cache_busted`` (C5) suppresses the prompt-cache opt-in for
-        this one turn — set when compaction just rewrote the system prefix, so the
-        adapter doesn't mark a now-stale prefix and pay a write premium on the miss.
-        """
-        from himmy.agents.base_agent.thread import MessageRole
-
-        messages = [
-            InferenceMessage(
-                role=m.role.value if isinstance(m.role, MessageRole) else str(m.role),
-                content=m.content,
-                metadata=dict(m.metadata),
-                tool_call_id=m.metadata.get("tool_call_id"),
-                name=m.metadata.get("tool_name"),
-            )
-            for m in thread.messages
-        ]
-
-        model_key = self._effective_model_key(ctx, llm_config)
-        generation_params: dict[str, Any] = {}
-        response_format: ResponseFormat | None = None
-        output_json_schema: dict[str, Any] | None = None
-        workflow = None
-        route_override = None
-        timeout_seconds: float | None = None
-        seed: int | None = None
-        tool_names = ctx.get("tool_names")
-        # Default ON; a caller running its own richer structured-output validation
-        # (e.g. TypedAgent's pydantic + repair loop) opts out via this context flag so
-        # the inference service does not pre-empt it at the boundary.
-        validate_structured_output = ctx.get("validate_structured_output", True)
-        if not isinstance(validate_structured_output, bool):
-            validate_structured_output = True
-
-        if llm_config is not None:
-            response_format = llm_config.response_format
-            output_json_schema = llm_config.output_json_schema
-            workflow = llm_config.workflow
-            route_override = llm_config.route_override
-            timeout_seconds = llm_config.timeout_seconds
-            seed = llm_config.seed
-            if llm_config.temperature is not None:
-                generation_params["temperature"] = llm_config.temperature
-            if llm_config.max_tokens is not None:
-                generation_params["max_tokens"] = llm_config.max_tokens
-            if llm_config.top_p is not None:
-                generation_params["top_p"] = llm_config.top_p
-            if llm_config.use_cache is not None:
-                # Forward the cache lever so InferenceService's response cache
-                # (honored via generation_params['use_cache']) actually engages.
-                generation_params["use_cache"] = llm_config.use_cache
-            generation_params.update(llm_config.extra_params or {})
-        else:
-            # Fall back to task.context for the schema / format hints.
-            output_json_schema = ctx.get("output_schema")
-            fmt = ctx.get("response_format")
-            if isinstance(fmt, ResponseFormat):
-                response_format = fmt
-            elif isinstance(fmt, str):
-                try:
-                    response_format = ResponseFormat(fmt)
-                except ValueError:
-                    response_format = None
-
-        # Bind tools when a tool service is present.
-        # RO-9: compute the WORKFLOW single-tool override OUTSIDE the tool_service
-        # guard so the event payload always reflects the intended single tool,
-        # and fail fast with a clear message when WORKFLOW can't actually bind it.
-        bound_tools: list[BoundTool] = []
-        tool_names_override: list[str] | None = None
-        is_forced_workflow = (
-            response_format == ResponseFormat.WORKFLOW
-            and workflow is not None
-            and workflow.current_tool_name is not None
+        """Delegating shim → :meth:`RequestBuilder.build_request` (test-poked)."""
+        return self._request_builder.build_request(
+            thread,
+            ctx,
+            llm_config,
+            trace_id=trace_id,
+            cache_busted=cache_busted,
         )
-        if is_forced_workflow:
-            tool_names_override = [workflow.current_tool_name]  # type: ignore[union-attr,list-item]
-
-        if self.tool_service is not None:
-            if is_forced_workflow:
-                bound_tools = self.tool_service.bound_tools(tool_names_override)
-                bound_names = {bt.name for bt in bound_tools}
-                step_tool = tool_names_override[0]  # type: ignore[index]
-                if step_tool not in bound_names:
-                    raise HimmyError(
-                        f"WORKFLOW response_format requires the step tool "
-                        f"{step_tool!r} to be bound, but it is not registered "
-                        f"with the tool_service"
-                    )
-            else:
-                bound_tools = self.tool_service.bound_tools(tool_names)
-        elif is_forced_workflow:
-            # A WORKFLOW run with no tool_service can never bind the step tool;
-            # surface the real cause instead of a generic INFERENCE_FAILED later.
-            raise HimmyError(
-                "WORKFLOW response_format requires a tool_service with the "
-                f"named step tool {tool_names_override[0]!r} bound; none is wired"  # type: ignore[index]
-            )
-
-        request = InferenceRequest(
-            model_key=model_key,
-            messages=messages,
-            response_format=response_format,
-            output_json_schema=output_json_schema,
-            workflow=workflow,
-            generation_params=generation_params,
-            seed=seed,
-            validate_structured_output=validate_structured_output,
-            route_override=route_override,
-            metadata=(scope_metadata := _cache_scope_metadata(ctx)),
-            cache_policy=self._prompt_cache_policy(
-                model_key,
-                cache_busted=cache_busted,
-                scope_metadata=scope_metadata,
-                thread_id=getattr(thread, "thread_id", None),
-            ),
-            bound_tools=bound_tools,
-            # The single execution seam for the bound tools (see ToolExecutor),
-            # wrapped with bounded turn-level retry for transient failures.
-            tool_executor=(
-                self._wrap_executor_with_retry(
-                    self.tool_service.tool_executor(),
-                    ctx,
-                    thread_id=getattr(thread, "thread_id", None),
-                    agent_id=getattr(thread, "agent_id", None),
-                    trace_id=trace_id,
-                )
-                if self.tool_service is not None
-                else None
-            ),
-            tool_names_override=tool_names_override,
-        )
-        if timeout_seconds is not None:
-            request.timeout_seconds = timeout_seconds
-        return request, tool_names_override or tool_names
 
     def _tool_is_read_only(self, tool_name: str) -> bool:
-        """True only when ``tool_name`` is provably safe to RE-FIRE after a TIMEOUT.
-
-        A TIMEOUT does not mean the tool didn't run — the effect may have committed
-        server-side after the client gave up — so re-firing is only safe for a tool
-        with NO side effect. This is deliberately strict:
-
-        * an AUTHORITATIVE ``read_only=True`` (the author explicitly asserted no side
-          effect via the ``read_only`` argument) is trusted; but
-        * a merely-INFERRED read-only — a GET/HEAD HTTP method, or a name the strict
-          classifier reads as safe — is NOT, because a GET endpoint can still have a
-          server-side side effect (an analytics beacon, ``GET /trigger``) and a name is
-          only a guess. For those, timeout-retry falls back to the strict NAME check
-          only when there is no method signal; a method-derived read-only never
-          re-fires on its own.
-
-        Anything else (a write tool, an ambiguous name, an unknown tool with no
-        definition) is conservatively treated as side-effecting and NOT retried on
-        timeout.
-        """
-        if self.tool_service is None:
-            return False
-        registry = getattr(self.tool_service, "registry", None)
-        if registry is None:
-            return False
-        definition = registry.get(tool_name)
-        if definition is None:
-            return False
-        # An author's explicit read_only=True is authoritative — safe to re-fire.
-        if definition.read_only_authoritative:
-            return bool(definition.read_only)
-        # A method-DERIVED read_only (HTTP GET/HEAD/OPTIONS) is a parallelism hint only;
-        # the remote server may violate the convention, so never re-fire on it.
-        if definition.http_config is not None:
-            return False
-        # An author's explicit read_only=False is honoured; an inferred/absent value on
-        # a local tool falls back to the strict name gate.
-        if definition.read_only is False:
-            return False
-        from himmy.services.tools.access import classify_parallel_safe
-
-        return classify_parallel_safe(tool_name)
+        """Delegating shim → :meth:`ToolExchange.tool_is_read_only`."""
+        return self._tool_exchange.tool_is_read_only(tool_name)
 
     def _wrap_executor_with_retry(
         self,
@@ -3697,112 +2141,19 @@ class SingleAgentRuntime:
         agent_id: str | None,
         trace_id: str | None,
     ) -> ToolExecutor:
-        """Bound turn-level retry for TRANSIENT tool failures (timeout / rate-limit).
-
-        Provider-level errors are retried inside the inference service, but a
-        transiently-failed TOOL call used to land in the turn as a failed
-        ``ToolReturnRecord`` the loop just carried on with. This wraps the tool
-        executor so a failure whose ``error_code`` is in the tools kernel's own
-        retryable taxonomy (:func:`_transient_tool_codes`) re-executes the
-        affected tool — never the whole inference — up to
-        ``ctx['tool_retry_attempts']`` extra times (default
-        :data:`DEFAULT_TOOL_RETRY_ATTEMPTS`; ``0`` disables and returns the
-        executor unwrapped) with a short exponential backoff
-        (``ctx['tool_retry_backoff_seconds']`` base, default
-        :data:`DEFAULT_TOOL_RETRY_BACKOFF_SECONDS`). Each retry emits a
-        ``TOOL_CALLED`` event tagged ``transient_retry`` so the trace shows it.
-        Non-transient failures (and exhausted retries) keep the current
-        behavior exactly: the last failed record flows into the turn.
-
-        SIDE-EFFECT SAFETY: a ``TIMEOUT`` does NOT mean the tool didn't run — an
-        HTTP POST / write may have committed server-side after the client gave up,
-        so re-firing it would duplicate the write/send/charge. The retry therefore
-        skips ``TIMEOUT`` for any tool that is not provably read-only (a write or an
-        ambiguously-named tool); read-only tools (no side effect) still retry on
-        timeout. The other transient codes (``RATE_LIMITED`` /
-        ``PROVIDER_UNAVAILABLE``) mean the call never reached the tool, so they stay
-        retryable for every tool.
-        """
-        raw_attempts = ctx.get("tool_retry_attempts")
-        retries = (
-            DEFAULT_TOOL_RETRY_ATTEMPTS
-            if raw_attempts is None
-            else max(0, int(raw_attempts))
+        """Delegating shim → :meth:`ToolExchange.wrap_executor_with_retry`."""
+        return self._tool_exchange.wrap_executor_with_retry(
+            executor,
+            ctx,
+            thread_id=thread_id,
+            agent_id=agent_id,
+            trace_id=trace_id,
         )
-        if retries == 0:
-            return executor
-        raw_backoff = ctx.get("tool_retry_backoff_seconds")
-        backoff = (
-            DEFAULT_TOOL_RETRY_BACKOFF_SECONDS
-            if raw_backoff is None
-            else max(0.0, float(raw_backoff))
-        )
-        transient = _transient_tool_codes()
-        timeout_code = _tool_timeout_code()
-
-        async def _execute(tool_name: str, args: dict[str, Any]) -> ToolReturnRecord:
-            record = await executor(tool_name, args)
-            for attempt in range(1, retries + 1):
-                code = (record.metadata or {}).get("error_code")
-                if record.outcome != "failed" or code not in transient:
-                    return record
-                # A timed-out non-read-only tool may already have committed its
-                # side effect — do not re-fire it (idempotency would be violated).
-                if code == timeout_code and not self._tool_is_read_only(tool_name):
-                    return record
-                await self._emit(
-                    RunEvent(
-                        event_type=EventType.TOOL_CALLED,
-                        trace_id=trace_id,
-                        thread_id=thread_id,
-                        agent_id=agent_id,
-                        tool_call_id=record.tool_call_id,
-                        payload={
-                            "tool_name": tool_name,
-                            "transient_retry": attempt,
-                            "max_retries": retries,
-                            "error_code": code,
-                        },
-                    )
-                )
-                if backoff > 0.0:
-                    await asyncio.sleep(backoff * (2 ** (attempt - 1)))
-                record = await executor(tool_name, args)
-            return record
-
-        return _execute
 
     # ------------------------------------------------------- tool messages
     def _tool_result_uncapped(self, tool_name: str) -> bool:
-        """Whether ``tool_name`` opts OUT of the model-facing result cap.
-
-        A tool whose full output is essential (the model must see every byte — e.g. a
-        tool that returns a signed artifact, a full document the next step must quote
-        verbatim) can preserve its complete result two ways:
-
-        * declaratively — its :class:`ToolDefinition` metadata carries
-          ``model_result_uncapped=True``; or
-        * by deployment — its name appears in the comma-separated env allowlist
-          ``HIMMY_TOOL_RESULT_UNCAPPED`` (whitespace-trimmed, case-sensitive).
-
-        Returns ``False`` (cap applies) for any unknown tool or when neither opt-out
-        is set. Resolution is best-effort: a missing/odd tool service or metadata
-        never raises here — the cap simply applies.
-        """
-        raw = os.environ.get("HIMMY_TOOL_RESULT_UNCAPPED", "")
-        allowlist = {n.strip() for n in raw.split(",") if n.strip()}
-        if tool_name in allowlist:
-            return True
-        registry = getattr(self.tool_service, "registry", None)
-        if registry is None:
-            return False
-        try:
-            definition = registry.get(tool_name)
-        except Exception:  # noqa: BLE001 - opt-out lookup is best-effort, never fatal
-            return False
-        if definition is None:
-            return False
-        return bool((getattr(definition, "metadata", None) or {}).get("model_result_uncapped"))
+        """Delegating shim → :meth:`ToolExchange.tool_result_uncapped`."""
+        return self._tool_exchange.tool_result_uncapped(tool_name)
 
     async def _append_tool_messages(
         self,
@@ -3813,157 +2164,37 @@ class SingleAgentRuntime:
         trace_id: str,
         agent_id: str | None,
     ) -> None:
-        """Replay each tool call/return pair as a TOOL Message (full metadata).
-
-        RO-2: per tool exchange this also emits a ``TOOL_CALLED`` event for the
-        call and a ``TOOL_COMPLETED`` / ``TOOL_FAILED`` event for the paired
-        return (keyed on ``ret.outcome``), threading tool_call_id / tool_name /
-        tool_args / request_id / trace_id so the events link to the run like the
-        other emissions and power the ai_call_log / lineage view.
-        """
-        from himmy.agents.base_agent.thread import Message, MessageRole
-
-        returns_by_id: dict[str, ToolReturnRecord] = {
-            r.tool_call_id: r for r in response.tool_returns
-        }
-        for call in response.tool_calls:
-            ret = returns_by_id.get(call.tool_call_id)
-
-            # TOOL_CALLED: emitted before the return is recorded.
-            await self._emit(
-                RunEvent(
-                    event_type=EventType.TOOL_CALLED,
-                    trace_id=trace_id,
-                    thread_id=thread.thread_id,
-                    agent_id=agent_id,
-                    request_id=request_id,
-                    tool_call_id=call.tool_call_id,
-                    payload={
-                        "tool_name": call.tool_name,
-                        "tool_args": dict(call.args),
-                    },
-                )
-            )
-
-            content = ret.content if ret is not None else None
-            try:
-                content_text = (
-                    content
-                    if isinstance(content, str)
-                    else json.dumps(content, default=str)
-                )
-            except TypeError:  # pragma: no cover - defensive
-                content_text = str(content)
-            # Surface tool failures as a clear ERROR line so the model can adapt
-            # instead of seeing a bare ``null`` content.
-            if ret is not None and ret.outcome in ("failed", "denied"):
-                meta = ret.metadata or {}
-                code = meta.get("error_code", ret.outcome.upper())
-                detail = meta.get("error_message") or content_text or ""
-                content_text = f"ERROR: {code}: {detail}".strip().rstrip(":")
-            # C5: cap the MODEL-FACING copy of the result. ``content_text`` (the FULL
-            # result) is preserved untouched for the tool-return record + the
-            # TOOL_COMPLETED event below; only ``model_content_text`` — what rides on
-            # the re-sent thread every subsequent turn — is bounded. A per-tool
-            # opt-out (metadata flag / env allowlist) or ``HIMMY_TOOL_RESULT_MODEL_MAX=0``
-            # keeps the full result on the thread.
-            if _TOOL_RESULT_MODEL_MAX and not self._tool_result_uncapped(call.tool_name):
-                model_content_text = _cap_tool_result_for_model(
-                    content_text, _TOOL_RESULT_MODEL_MAX
-                )
-            else:
-                model_content_text = content_text
-            # sec-r3 #1: the message ``content`` is the capped MODEL-facing copy (what
-            # rides the re-sent thread), but the entity spine projects Message.content
-            # into the canonical kind='message'/'chat_thread' audit records. If those
-            # only ever saw the truncated copy, an auditor reconstructing "what the tool
-            # actually returned" from the spine would get a lossy, marker-suffixed answer
-            # while the full bytes lived only on a transient event/DTO. When (and only
-            # when) the model copy was actually shortened, stash the FULL untruncated
-            # result on ``metadata['full_content']`` so the audit trail stays faithful.
-            tool_metadata: dict[str, Any] = {
-                "tool_call_id": call.tool_call_id,
-                "tool_name": call.tool_name,
-                "tool_outcome": ret.outcome if ret is not None else "unknown",
-                "tool_args": dict(call.args),
-                "request_id": request_id,
-                "trace_id": trace_id,
-                "timestamp": message_timestamp(),
-                "tool_return_metadata": dict(ret.metadata)
-                if ret is not None
-                else {},
-            }
-            if model_content_text != content_text:
-                tool_metadata["full_content"] = content_text
-            message = Message(
-                role=MessageRole.TOOL,
-                content=model_content_text,
-                metadata=tool_metadata,
-            )
-            thread.append_message(message)
-            self._register_message(message)
-
-            # TOOL_COMPLETED / TOOL_FAILED keyed on the return's outcome. The result
-            # text + latency ride on the payload so an observer (e.g. Studio's live
-            # cognition/ledger view) can show what each tool returned and how long it
-            # took without re-reading the thread.
-            outcome = ret.outcome if ret is not None else "unknown"
-            completed = outcome == "success"
-            ret_meta = (ret.metadata or {}) if ret is not None else {}
-            result_text = (
-                content_text
-                if len(content_text) <= _TOOL_RESULT_EVENT_MAX
-                else (content_text[: _TOOL_RESULT_EVENT_MAX - 1] + "…")
-            )
-            await self._emit(
-                RunEvent(
-                    event_type=(
-                        EventType.TOOL_COMPLETED if completed else EventType.TOOL_FAILED
-                    ),
-                    trace_id=trace_id,
-                    thread_id=thread.thread_id,
-                    agent_id=agent_id,
-                    request_id=request_id,
-                    tool_call_id=call.tool_call_id,
-                    error=None if completed else f"tool outcome: {outcome}",
-                    payload={
-                        "tool_name": call.tool_name,
-                        "tool_args": dict(call.args),
-                        "tool_outcome": outcome,
-                        "result": result_text,
-                        "latency_ms": ret_meta.get("latency_ms"),
-                    },
-                )
-            )
+        """Delegating shim → :meth:`ToolExchange.append_tool_messages` (1 test poke)."""
+        await self._tool_exchange.append_tool_messages(
+            thread,
+            response,
+            request_id=request_id,
+            trace_id=trace_id,
+            agent_id=agent_id,
+        )
 
     # --------------------------------------------------------------- entities
     @staticmethod
     def _subject_metadata() -> dict[str, Any] | None:
-        """The ``{subject_id: ...}`` stamp for the current run, or ``None`` (ungoverned).
+        """Delegating shim → :meth:`AuditEmitter.subject_metadata`.
 
-        Returns ``None`` whenever no governed run subject is published (the offline /
-        ungoverned path), so ``to_record(metadata=None)`` keeps the projected record
-        byte-identical to a pre-WS4.6 runtime. When a governed run names a subject, the
-        stamp lets a :class:`ConsentAwareRegistry` resolve + gate the otherwise
-        subject-less spine records.
+        Kept as a class-level method (its callers ``_emit`` / ``_register_*`` and
+        tests read ``runtime._subject_metadata``); the ``{subject_id: ...}`` logic
+        lives in :class:`~himmy.runtime.audit.AuditEmitter`.
         """
-        subject = _CURRENT_SUBJECT.get()
-        return {"subject_id": subject} if subject else None
+        return AuditEmitter.subject_metadata()
 
     def _register_entity(self, obj: Any, *, stamp_subject: bool = False) -> Any:
-        """Register a domain object's record when a registry is wired; else None.
-
-        Delegates to :class:`~himmy.runtime.entity_registrar._EntityRegistrar`.
-        """
-        return self._entity_registrar.register_entity(obj, stamp_subject=stamp_subject)
+        """Delegating shim → :meth:`AuditEmitter.register_entity`."""
+        return self._audit_emitter.register_entity(obj, stamp_subject=stamp_subject)
 
     def _register_message(self, message: Any) -> Any:
-        """Register a Message entity (kind="message") when a registry is present."""
-        return self._entity_registrar.register_message(message)
+        """Delegating shim → :meth:`AuditEmitter.register_message`."""
+        return self._audit_emitter.register_message(message)
 
     def _register_thread_version(self, thread: Any) -> Any:
-        """Project the current chat_thread version into a record (when a registry)."""
-        return self._entity_registrar.register_thread_version(thread)
+        """Delegating shim → :meth:`AuditEmitter.register_thread_version`."""
+        return self._audit_emitter.register_thread_version(thread)
 
     def _link_lineage(
         self,
@@ -3975,8 +2206,8 @@ class SingleAgentRuntime:
         persona: Persona,
         thread: Any,
     ) -> None:
-        """Wire the documented lineage relations between run artefacts."""
-        self._entity_registrar.link_lineage(
+        """Delegating shim → :meth:`AuditEmitter.link_lineage`."""
+        self._audit_emitter.link_lineage(
             persona_record=persona_record,
             prompt_record=prompt_record,
             thread_record=thread_record,
@@ -3987,78 +2218,12 @@ class SingleAgentRuntime:
 
     # --------------------------------------------------------------- helpers
     async def _emit(self, event: RunEvent) -> None:
-        """Best-effort fan-out of one event to all configured sinks.
-
-        Order: storage (the durable spine) -> entity registry -> observability
-        span (invariant #6) -> caller-facing ``on_event`` callbacks (RO-6). Every
-        sink is isolated so one failing sink can never break the run or starve
-        the others, and ``CancelledError`` is honored so a cancelled run unwinds.
-        """
-        if self.memory_store is not None:
-            appender = getattr(self.memory_store, "append_event", None)
-            if appender is not None:
-                try:
-                    await appender(event)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # pragma: no cover - defensive
-                    # Durable audit-spine write lost; keep the run alive but signal.
-                    log.warning(
-                        "memory_store.append_event failed (event dropped from "
-                        "durable spine): event_type=%s trace_id=%s",
-                        getattr(event.event_type, "value", event.event_type),
-                        event.trace_id,
-                        exc_info=True,
-                    )
-                    _count_sink_drop("memory_store")
-        if self.entity_registry is not None:
-            try:
-                self.entity_registry.register(
-                    event.to_record(metadata=self._subject_metadata())
-                )
-            except Exception:  # pragma: no cover - defensive
-                # Entity-registry projection lost; keep the run alive but signal.
-                log.warning(
-                    "entity_registry.register failed (event dropped from "
-                    "projection): event_type=%s trace_id=%s",
-                    getattr(event.event_type, "value", event.event_type),
-                    event.trace_id,
-                    exc_info=True,
-                )
-                _count_sink_drop("entity_registry")
-        try:
-            from himmy.services.observability import emit_event_span
-
-            emit_event_span(event)
-        except Exception:  # pragma: no cover - defensive
-            pass
-        # Prometheus metrics: translate the event into bounded-cardinality counters.
-        try:
-            from himmy.services.observability.metrics import get_metrics_sink
-
-            await get_metrics_sink().append_event(event)
-        except Exception:  # pragma: no cover - defensive
-            pass
-        # RO-6: stream incremental progress to caller-supplied callbacks.
-        for callback in self._on_event:
-            try:
-                await callback(event)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # pragma: no cover - never let a listener break the run
-                pass
+        """Delegating shim → :meth:`AuditEmitter.emit` (a stub test needs this method)."""
+        await self._audit_emitter.emit(event)
 
     async def _maybe_save_thread(self, thread: Any) -> None:
-        """Persist the thread when ``save_threads`` and a memory store are present."""
-        if not self.save_threads or self.memory_store is None:
-            return
-        saver = getattr(self.memory_store, "save_thread", None)
-        if saver is None:
-            return
-        try:
-            await saver(thread)
-        except Exception:  # pragma: no cover - defensive
-            pass
+        """Delegating shim → :meth:`AuditEmitter.maybe_save_thread`."""
+        await self._audit_emitter.maybe_save_thread(thread)
 
 
 def message_timestamp() -> str:
@@ -4109,4 +2274,8 @@ __all__ = [
     "AgentLoopResult",
     "ToolServiceProtocol",
     "OnEvent",
+    # Re-exported from ``prompt_assembly`` so their historical import path
+    # (``from himmy.runtime.single_agent import _prompt_cache_key_*``) is preserved.
+    "_prompt_cache_key_for_scope",
+    "_prompt_cache_key_for_conversation",
 ]

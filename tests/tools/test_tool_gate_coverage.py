@@ -303,7 +303,9 @@ def test_analyzer_flags_a_synthetic_ungated_build() -> None:
 @pytest.mark.parametrize(
     "module",
     [
-        "himmy/application/services.py",
+        # P3 decomposition: the run-drive/execution path (which threads the tool
+        # authorizer) moved out of the RunAppService god-object into RunDriveEngine.
+        "himmy/application/run_drive.py",
         "himmy/application/orchestration_runner.py",
         "himmy/api/connector_inbound.py",
         "himmy/skills/dispatch.py",
