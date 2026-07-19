@@ -168,7 +168,7 @@ def test_spine_eraser_is_walked_and_recorded_in_certificate() -> None:
 
     cert = service.erase_subject("subj")
     by_store = {r.store: r for r in cert.per_store}
-    assert by_store["spine_storage"].deleted == 1  # the one thread row
+    assert by_store["spine_storage"].deleted == 2  # one thread row + the subject's own run row
     assert by_store["spine_storage"].ok is True
     assert cert.complete is True
     # The transcript is physically gone from the spine storage.

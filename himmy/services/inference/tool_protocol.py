@@ -31,6 +31,10 @@ from himmy.services.inference.models import ToolCallRecord
 _MARKER_RE = re.compile(r"TOOL_CALL\s+([^\s{]+)")
 # Fenced code blocks: ```lang\n ... \n``` (lang optional).
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\n(.*?)```", re.DOTALL)
+# Hermes/Qwen <tool_call>{json}</tool_call> envelope. Defined LOCALLY (not imported
+# from tool_formats, which would be a circular import). Recovers calls when a Qwen3 /
+# QwQ / Llama-4 model that emits this grammar falls through to the GENERIC parser.
+_TOOL_CALL_ENVELOPE_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
 # Vendor-spelling-tolerant key names.
 _NAME_KEYS = ("tool", "name", "tool_name", "function", "action", "tool_call")
@@ -132,6 +136,19 @@ def parse_text_tool_calls(
                 norm = _normalize_call(c)
                 if norm and _name_is_plausible(norm[0], known):
                     _add(*norm)
+
+    # 2b) <tool_call>{json}</tool_call> envelopes (Hermes/Qwen grammar leaking into the
+    #     GENERIC path). Name-guarded like the fenced form and fail-open — a bad JSON
+    #     payload is skipped, so this only ever ADDS recoveries, never raises.
+    for payload in _TOOL_CALL_ENVELOPE_RE.findall(text):
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        for c in obj if isinstance(obj, list) else [obj]:
+            norm = _normalize_call(c)
+            if norm and _name_is_plausible(norm[0], known):
+                _add(*norm)
 
     # 3) Bare JSON-only reply (no markers/fences found yet) → tool-call object(s).
     if not calls:

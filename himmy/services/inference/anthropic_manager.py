@@ -557,7 +557,19 @@ class AnthropicClientManager:
         deltas; the final accumulated message powers a fully-materialized
         :class:`InferenceResponse`. Any failure falls back to a single buffered
         :meth:`generate` so the contract (deltas then a final response) always holds.
+
+        A JSON_OBJECT / STRUCTURED_OUTPUT request relies on the forced
+        ``__structured_output__`` tool that ONLY the buffered path applies; a
+        forced-schema reply has no meaningful incremental text, so it delegates to
+        :meth:`generate` to get the same constraint + populated ``output_structured``
+        (otherwise the stream is unconstrained and ``output_structured`` stays ``None``).
         """
+        if request.response_format in (
+            ResponseFormat.JSON_OBJECT,
+            ResponseFormat.STRUCTURED_OUTPUT,
+        ):
+            yield await self.generate(request)
+            return
         model = self.resolve(request.model_key)
         model_path = f"anthropic:{model}"
         started = time.perf_counter()

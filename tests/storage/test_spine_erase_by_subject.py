@@ -70,7 +70,7 @@ def test_inmemory_delete_by_subject_removes_threads_and_events() -> None:
     asyncio.run(_seed(s))
 
     deleted = s.delete_by_subject("alice")
-    assert deleted == 2  # one thread + one event
+    assert deleted == 3  # one thread + one event + the subject's own run row
 
     async def _check() -> None:
         assert await s.load_thread("t1") is None
@@ -99,7 +99,7 @@ def test_sqlite_delete_by_subject_removes_threads_and_events(tmp_path: Path) -> 
     # Reopen (cross-restart) and erase alice.
     store2 = SqliteStorageService(path, cipher=cipher)
     deleted = store2.delete_by_subject("alice")
-    assert deleted == 2
+    assert deleted == 3  # one thread + one event + the subject's own run row
 
     async def _check() -> None:
         assert await store2.load_thread("t1") is None
@@ -118,8 +118,13 @@ def test_sqlite_delete_by_subject_removes_threads_and_events(tmp_path: Path) -> 
     n_events = store3._fetchone(  # noqa: SLF001
         "SELECT COUNT(*) AS n FROM run_events WHERE thread_id = 't1' OR trace_id = 'tr1'"
     )["n"]
+    n_runs = store3._fetchone(  # noqa: SLF001
+        "SELECT COUNT(*) AS n FROM runs WHERE subject_id = 'alice'"
+    )["n"]
     assert n_threads == 0
     assert n_events == 0
+    # The subject's own run row (holding cleartext output_text/output_structured) is gone.
+    assert n_runs == 0
     # Idempotent re-run on the clean store.
     assert store3.delete_by_subject("alice") == 0
     asyncio.run(store3.close())

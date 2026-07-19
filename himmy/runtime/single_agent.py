@@ -1091,7 +1091,7 @@ class SingleAgentRuntime:
             )
             if synthesize_empty:
                 result = await self._maybe_synthesize(
-                    result, persona, trace_id, llm_config
+                    result, persona, trace_id, llm_config, ctx
                 )
             return result
 
@@ -1158,6 +1158,7 @@ class SingleAgentRuntime:
         persona: Persona,
         trace_id: str,
         llm_config: LLMConfig | None,
+        ctx: dict[str, Any] | None = None,
     ) -> AgentLoopResult:
         """One forced final turn when a tool-using loop ended with no answer (Tier 1.1).
 
@@ -1177,10 +1178,19 @@ class SingleAgentRuntime:
 
         from himmy.agents.base_agent.task import Task
 
+        # Thread the ORIGINAL run context onto the rescue turn so it keeps the run's
+        # model_key (a custom model must still write the final answer) AND its
+        # ``context_subject_id`` (a governed run's synthesis message/thread/event
+        # records must resolve to the subject, else they fail-closed DROP from the
+        # spine). Only ``tool_names`` is overridden (unbind tools: force a text
+        # answer); ``output_schema`` is dropped so a schema-constrained original run
+        # doesn't force the free-text rescue answer through structured validation.
+        nudge_ctx = {**(ctx or {}), "tool_names": []}
+        nudge_ctx.pop("output_schema", None)
         nudge = Task(
             title="synthesis",
             prompt=_SYNTHESIS_NUDGE,
-            context={"tool_names": []},  # unbind tools: force a text answer
+            context=nudge_ctx,
         )
         synth = await self.run_task_detailed(
             persona, nudge, thread=result.thread, llm_config=llm_config
@@ -1585,6 +1595,17 @@ class SingleAgentRuntime:
                     trace_id=trace_id,
                     agent_id=persona.agent_id,
                 )
+                # stream_task already registered a chat_thread version snapshot that
+                # only held the ASSISTANT message (taken BEFORE these tools existed).
+                # Bump + re-project so the registered version includes the replayed
+                # TOOL messages, matching the resume / non-streaming paths. (The
+                # in-memory order stays [ASSISTANT, TOOL...] here — a full reorder to
+                # the non-streaming [TOOL..., ASSISTANT] is DEFERRED: stream_task owns
+                # the ASSISTANT append and never replays tools, so moving it risks the
+                # single-turn contract / delta ordering for LOW benefit.)
+                if first.tool_calls:
+                    thread.version += 1
+                    self._register_thread_version(thread)
                 for tool_delta in self._tool_deltas(first):
                     yield tool_delta
                 await self._emit_turn_completed(trace_id, thread, persona, 1, first)
@@ -1620,7 +1641,7 @@ class SingleAgentRuntime:
                     # Reuse the exact non-streaming synthesis rescue so an empty
                     # tool-using answer is converted to a text answer identically.
                     result = await self._maybe_synthesize(
-                        result, persona, trace_id, llm_config
+                        result, persona, trace_id, llm_config, ctx
                     )
                 yield StreamDelta(
                     request_id=first.request_id or first_response.request_id,

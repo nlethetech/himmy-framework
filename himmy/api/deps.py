@@ -125,6 +125,28 @@ def _spine_eraser(storage: Any) -> Callable[[str], int]:
     return _erase
 
 
+def _unwired_knowledge_eraser(subject_id: str) -> int:
+    """Honest placeholder for subject-scoped KB erasure (S4 — deferred, NOT yet wired).
+
+    A subject's knowledge bases are scoped by ``client_id == subject`` (see
+    ``KnowledgeBaseAdapter``), but neither :class:`KnowledgeBase` nor the pgvector backend
+    exposes an enumerate-by-client + cascade-delete, and no durable KB singleton is reachable
+    from the governance overlay here — so a clean, correct KB hard-delete cannot be wired this
+    pass. Rather than leave ``knowledge_eraser=None`` (which SKIPS the store and lets the
+    certificate falsely report ``complete=True`` for a category never erased), this raises so
+    :meth:`SubjectReachMap.erase` records the ``knowledge`` store with ``ok=False`` — the
+    :class:`DeletionCertificate` then TRUTHFULLY reports ``complete=False`` until a real
+    enumerate-by-client eraser replaces this.
+    """
+    from himmy.core.errors import HimmyError
+
+    raise HimmyError(
+        "subject-scoped knowledge-base erasure is not wired yet; the subject's KB rows are "
+        "NOT erased and the deletion certificate honestly reports the knowledge store "
+        "incomplete (complete=False) rather than falsely claiming completeness."
+    )
+
+
 @dataclass(frozen=True)
 class _GovernedOverlay:
     """The storage/registry the services see + the WS4.6 governance singletons.
@@ -678,7 +700,11 @@ class ApiContainer:
             # keyed). A crypto-shred of the subject key therefore leaves them recoverable, so
             # erasure HARD-DELETES them here. ``storage`` is that inner backend.
             spine_eraser=_spine_eraser(storage),
-            knowledge_eraser=None,
+            # KB erasure is not yet wired (no enumerate-by-client cascade-delete + no durable
+            # KB singleton reachable here). Wire an eraser that HONESTLY reports the knowledge
+            # store as not-yet-erased (ok=False → certificate.complete=False) instead of a
+            # false complete=True; see _unwired_knowledge_eraser.
+            knowledge_eraser=_unwired_knowledge_eraser,
         )
         retention = RetentionService(
             registry, key_vault=key_vault, reach_map=reach

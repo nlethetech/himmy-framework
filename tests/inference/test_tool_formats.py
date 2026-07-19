@@ -304,10 +304,13 @@ def test_hermes_parse_single_tool_call() -> None:
     assert _names_args(text, _WEATHER_KNOWN) == [("get_weather", {"city": "KTM"})]
 
 
-def test_hermes_parse_is_fail_open_where_generic_misses() -> None:
-    """The native block the GENERIC parser returns [] for becomes a hit (add-only)."""
+def test_generic_recovers_tool_call_envelope() -> None:
+    """The GENERIC parser now recovers a ``<tool_call>`` envelope too (name-guarded,
+    fail-open), so a Qwen3 / QwQ / Llama-4 model whose ChatML-XML grammar leaks into the
+    generic path no longer loses its tool calls. The Hermes parser handles it natively too."""
     text = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "KTM"}}\n</tool_call>'
-    assert parse_text_tool_calls(text, _WEATHER_KNOWN) == []  # generic misses it
+    generic = parse_text_tool_calls(text, _WEATHER_KNOWN)
+    assert [(c.tool_name, c.args) for c in generic] == [("get_weather", {"city": "KTM"})]
     assert _names_args(text, _WEATHER_KNOWN) == [("get_weather", {"city": "KTM"})]
 
 

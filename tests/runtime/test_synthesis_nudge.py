@@ -104,3 +104,42 @@ def test_synthesis_can_be_disabled() -> None:
     assert result.stopped_reason == "final"
     assert (result.final.output_text or "") == ""
     assert mgr.calls == 2  # no synthesis turn
+
+
+def test_synthesis_threads_governed_subject_and_model_key() -> None:
+    # A governed run pins a subject + custom model_key + output_schema. The rescue
+    # turn must KEEP model_key and context_subject_id (else its spine records
+    # fail-closed drop / the wrong model answers) but DROP output_schema (the
+    # free-text rescue answer must not be forced through structured validation).
+    rt, mgr = _rt(
+        [
+            {"tools": True, "text": ""},
+            {"tools": False, "text": ""},
+            {"tools": False, "text": "42 chickens."},
+        ]
+    )
+    seen: list[dict[str, Any]] = []
+    original = rt.run_task_detailed
+
+    async def _spy(persona, task, thread=None, **kw):  # type: ignore[no-untyped-def]
+        seen.append({"title": task.title, "context": dict(task.context or {})})
+        return await original(persona, task, thread=thread, **kw)
+
+    rt.run_task_detailed = _spy  # type: ignore[method-assign]
+    persona = Persona(name="a")
+    task = Task(
+        title="t",
+        prompt="answer me",
+        context={
+            "context_subject_id": "subj-1",
+            "model_key": "custom-key",
+            "output_schema": {"type": "object"},
+        },
+    )
+    result = run_async(rt.run_agent_loop(persona, task, max_turns=6))
+    assert result.stopped_reason == "synthesized"
+    nudge = next(s for s in seen if s["title"] == "synthesis")
+    assert nudge["context"]["context_subject_id"] == "subj-1"
+    assert nudge["context"]["model_key"] == "custom-key"
+    assert nudge["context"]["tool_names"] == []
+    assert "output_schema" not in nudge["context"]

@@ -806,24 +806,25 @@ class SqliteStorageService:
                 raise
 
     def delete_by_subject(self, subject_id: str) -> int:
-        """Hard-DELETE a subject's spine ``chat_threads`` + ``run_events`` rows (S4).
+        """Hard-DELETE a subject's ``chat_threads`` + ``run_events`` + ``runs`` + ``recommendations`` (S4).
 
-        These two tables hold the subject's full conversation transcript and run-event
-        stream, encrypted at rest under the store-WIDE KEK (``self._cipher``) — NOT the
-        per-subject key — so a crypto-shred of the subject key leaves them recoverable.
-        Right-to-erasure therefore reaches them by HARD-DELETE here (mirroring the mutable
-        sidecars), the cheaper match to the reach-map design than re-keying every spine
-        write per subject.
+        All four tables hold the subject's data (transcript, event stream, run
+        output_text/output_structured, recommendation title/summary/rationale) encrypted at
+        rest under the store-WIDE KEK (``self._cipher``) — NOT the per-subject key — so a
+        crypto-shred of the subject key leaves them recoverable. Right-to-erasure therefore
+        reaches them by HARD-DELETE here (mirroring the mutable sidecars), the cheaper match
+        to the reach-map design than re-keying every spine write per subject.
 
         The subject->thread/trace linkage is the ``runs`` table (``runs.subject_id`` is an
         indexed column; each run's ``payload`` carries its ``thread_id`` / ``trace_id``):
         a subject's runs name every thread + event-stream the runtime persisted for it.
-        We resolve those ids, then delete the matching ``chat_threads`` (by ``thread_id``)
-        and ``run_events`` (by ``thread_id`` OR ``trace_id``). Returns the total rows
-        removed. Runs as ONE transaction under the write lock so a mid-delete failure
-        leaves the tables untouched; idempotent (a re-run deletes whatever survived and
-        returns 0 once clean). Synchronous so the sync ``SubjectReachMap.erase`` can drive
-        it directly without re-entering the request event loop.
+        We resolve those ids FIRST, delete the matching ``chat_threads`` (by ``thread_id``)
+        and ``run_events`` (by ``thread_id`` OR ``trace_id``), THEN delete the subject's own
+        ``runs`` and ``recommendations`` rows. Returns the total rows removed. Runs as ONE
+        transaction under the write lock so a mid-delete failure leaves every table untouched
+        (and the certificate's ``complete`` flag honestly covers all four); idempotent (a
+        re-run deletes whatever survived and returns 0 once clean). Synchronous so the sync
+        ``SubjectReachMap.erase`` can drive it directly without re-entering the request loop.
         """
         with self._lock:
             try:
@@ -850,6 +851,19 @@ class SqliteStorageService:
                         "DELETE FROM run_events WHERE trace_id = ?", (trace,)
                     )
                     deleted += cur.rowcount
+                # The runs rows themselves (payload carries output_text / output_structured)
+                # and recommendations (title / summary / rationale) hold the subject's
+                # cleartext under the store-wide KEK too, so a crypto-shred alone leaves them
+                # recoverable — hard-delete them in the SAME transaction so the deletion
+                # certificate genuinely covers them (not just the transcript/events).
+                cur = self._conn.execute(
+                    "DELETE FROM runs WHERE subject_id = ?", (subject_id,)
+                )
+                deleted += cur.rowcount
+                cur = self._conn.execute(
+                    "DELETE FROM recommendations WHERE subject_id = ?", (subject_id,)
+                )
+                deleted += cur.rowcount
                 self._conn.commit()
                 return deleted
             except BaseException:
@@ -1009,6 +1023,39 @@ class SqliteStorageService:
         run.updated_at = utc_now_iso()
         await asyncio.to_thread(self._write, *self._run_upsert(run))
         return run
+
+    async def save_run_if_owner(self, run: RunRecord, owner_id: str) -> bool:
+        """Owner-conditional upsert: persist ``run`` iff the stored row still holds ``owner_id``.
+
+        The lease-guarded twin of :meth:`save_run`, for a worker's TERMINAL write. Mirrors
+        :meth:`renew_lease`'s ``WHERE owner_id = ?`` CAS: if the run was reaped and re-claimed by
+        a new owner between the claim and this write, the predicate misses and the stale terminal
+        write is DROPPED (returns ``False``) rather than clobbering the new owner. Returns ``True``
+        when we still owned the run and the write landed. Only for owner-held transitions —
+        the ``owner_id=None`` requeue/park/inline paths keep the unconditional :meth:`save_run`.
+        """
+        run.updated_at = utc_now_iso()
+        return await asyncio.to_thread(self._save_run_if_owner_sync, run, owner_id)
+
+    def _save_run_if_owner_sync(self, run: RunRecord, owner_id: str) -> bool:
+        """The locked conditional run upsert: write only while ``owner_id`` still holds the row."""
+        sql, params = self._run_upsert(run)
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                held = self._conn.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ? AND owner_id = ?",
+                    (run.run_id, owner_id),
+                ).fetchone()
+                if held is None:
+                    self._conn.commit()
+                    return False
+                self._conn.execute(sql, params)
+                self._conn.commit()
+                return True
+            except BaseException:
+                self._rollback_quietly()
+                raise
 
     async def save_run_if_absent_by_idempotency(
         self, run: RunRecord

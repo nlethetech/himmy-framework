@@ -624,9 +624,10 @@ HERMES_CHATML_XML = ToolCallFormat(
     render_system_manifest=_make_hermes_render_system_manifest(_HERMES_FLAGS),
     parse=_make_hermes_parse(_HERMES_FLAGS),
     render_tool_results=_make_hermes_render_tool_results(_HERMES_FLAGS),
-    # Auto-select for Qwen2.5-Instruct + the Hermes families. ``qwen2.5-coder`` is
-    # EXCLUDED below in selection (it does not use this grammar reliably).
-    model_tags=frozenset({"qwen2.5", "qwen2_5", "hermes"}),
+    # Auto-select for the Qwen (Qwen2 / Qwen2.5 / Qwen3) + QwQ + Hermes families, which
+    # all emit the <tool_call> ChatML-XML grammar. ``*-coder`` variants are EXCLUDED
+    # below in selection (they do not use this grammar reliably).
+    model_tags=frozenset({"qwen", "qwen2.5", "qwen2_5", "qwq", "hermes"}),
     exclude_tags=frozenset({"coder"}),
     flags=_HERMES_FLAGS,
 )

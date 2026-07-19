@@ -245,27 +245,34 @@ class RunDispatcher:
         claimed_any = False
         # Claim while there is free capacity AND ready work in a claimable lane.
         while not self._stop.is_set() and not self._sem.locked():
-            # Acquire a concurrency slot up front; release it if nothing was claimable.
+            # Acquire a concurrency slot up front; release it if nothing was claimable
+            # (or if the claim raises) so a DB error can't permanently leak the permit.
             await self._sem.acquire()
-            run = await self._run_app.storage.claim_next_queued_run(
-                self._owner_id,
-                self._run_app.lease_seconds,
-                lanes=lanes,
-                fairness=self._run_app.dispatch_fairness,
-                workspace_concurrency=(
-                    self._run_app.workspace_concurrency
-                    if self._run_app.dispatch_fairness
-                    else 0
-                ),
-            )
-            if run is None:
-                self._sem.release()
-                break
-            claimed_any = True
-            _metrics_registry().dispatcher_claims_total.inc()
-            worker = asyncio.create_task(self._run_worker(run))
-            self._workers.add(worker)
-            worker.add_done_callback(self._on_worker_done)
+            spawned = False
+            try:
+                run = await self._run_app.storage.claim_next_queued_run(
+                    self._owner_id,
+                    self._run_app.lease_seconds,
+                    lanes=lanes,
+                    fairness=self._run_app.dispatch_fairness,
+                    workspace_concurrency=(
+                        self._run_app.workspace_concurrency
+                        if self._run_app.dispatch_fairness
+                        else 0
+                    ),
+                )
+                if run is None:
+                    break
+                claimed_any = True
+                _metrics_registry().dispatcher_claims_total.inc()
+                worker = asyncio.create_task(self._run_worker(run))
+                self._workers.add(worker)
+                worker.add_done_callback(self._on_worker_done)
+                # The permit is now owned by the worker; it releases via _on_worker_done.
+                spawned = True
+            finally:
+                if not spawned:
+                    self._sem.release()
         return claimed_any
 
     def _on_worker_done(self, task: asyncio.Task[Any]) -> None:

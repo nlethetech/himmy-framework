@@ -216,8 +216,22 @@ _TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
 )
 
 
-def _is_transient_run_error(error: str) -> bool:
-    """Whether a recorded run ``error`` looks TRANSIENT (re-queuable) vs PERMANENT (Q3)."""
+def _is_transient_run_error(error: str, error_code: str | None = None) -> bool:
+    """Whether a recorded run failure looks TRANSIENT (re-queuable) vs PERMANENT (Q3).
+
+    Prefers the structured inference ``error_code`` when one was recorded — it is the
+    authoritative taxonomy and avoids the free-text substring traps the marker list has
+    (``'provider'`` falsely matching the permanent ``'no provider configured'``, or
+    ``'Temporary failure in name resolution'`` going unmatched). A structured code is
+    decisive in BOTH directions: a retryable code re-queues, a non-retryable code is left
+    PERMANENT (no fall-through to the over-broad markers). The substring match is kept only
+    as the last-resort fallback for failures that carry no code (the runtime-build/timeout/
+    cancel paths record free text but no structured code).
+    """
+    if error_code:
+        from himmy.services.inference.models import RETRYABLE_ERROR_CODES
+
+        return error_code in {code.value for code in RETRYABLE_ERROR_CODES}
     if not error:
         return False
     low = error.lower()
@@ -1625,7 +1639,8 @@ class RunAppService:
         if run is None or run.status != RunStatus.FAILED:
             return
         error = run.error or ""
-        if not _is_transient_run_error(error):
+        error_code = (run.metadata or {}).get("error_code")
+        if not _is_transient_run_error(error, error_code):
             return  # permanent failure: leave it FAILED for the operator/caller.
         age = time.time() - _parse_iso_epoch(run.created_at)
         attempts_left = run.attempt < max(1, run.max_attempts)
@@ -1885,6 +1900,10 @@ class RunAppService:
             run.status = RunStatus.FAILED
             run.error = result.error or (result.error_code or "inference failed")
             run.output_text = result.output_text or None
+            # Q3: carry the structured error_code so the retry classifier can branch on the
+            # authoritative inference taxonomy instead of substring-matching the free text.
+            if result.error_code:
+                run.metadata = {**(run.metadata or {}), "error_code": result.error_code}
             run.updated_at = _now()
             await self._storage.save_run(run)
             await self._notify_conversation_sink(run)
@@ -2057,6 +2076,9 @@ class RunAppService:
             run.status = RunStatus.FAILED
             run.error = final.error or (final.error_code or "inference failed")
             run.output_text = final.output_text or None
+            # Q3: carry the structured error_code for the retry classifier (see above).
+            if final.error_code:
+                run.metadata = {**(run.metadata or {}), "error_code": final.error_code}
             run.updated_at = _now()
             await self._storage.save_run(run)
             await self._notify_conversation_sink(run)

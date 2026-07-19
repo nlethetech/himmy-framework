@@ -24,6 +24,7 @@ right :class:`InferenceErrorCode` and ``retryable`` flag.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -321,6 +322,36 @@ class OpenAIClientManager:
             return self._registry.get("default", self._model)
         return self._registry.get(model_key, model_key)
 
+    def _model_path(self, model: str) -> str:
+        """Provider-qualified model path (``openrouter:`` when routed via OpenRouter).
+
+        OpenRouter ids are dashed/slash-qualified and absent from the ``openai:``-keyed
+        static table, so an ``openai:{model}`` path prices at $0 for most of them; the
+        ``openrouter:`` prefix routes cost through the live OpenRouter table instead.
+        """
+        prefix = "openrouter" if self.provider_name == "openrouter" else "openai"
+        return f"{prefix}:{model}"
+
+    async def _resolve_price(
+        self, model: str, request: InferenceRequest
+    ) -> ModelPrice:
+        """Resolve the per-model price, using OpenRouter's live table when applicable.
+
+        For an OpenRouter-routed model the static ``openai:`` table misses the dashed
+        ids (billing $0), so cost comes from :func:`pricing.openrouter_price_for` (live,
+        1h-cached, fail-open to the static ``price_for``). That path does a SYNC
+        ``httpx.get`` that can block the event loop up to ~3s on the first uncached turn,
+        so it runs off the loop via ``asyncio.to_thread``. Direct OpenAI keeps the static
+        lookup. Either way, an unpriced result falls back to the raw ``model_key``.
+        """
+        if self.provider_name == "openrouter":
+            price = await asyncio.to_thread(pricing.openrouter_price_for, model)
+        else:
+            price = pricing.price_for(self._model_path(model))
+        if price.input_per_1k == 0.0 and price.output_per_1k == 0.0:
+            price = pricing.price_for(request.model_key)
+        return price
+
     def _build_client(self) -> Any:
         """Lazily construct the real ``openai.AsyncOpenAI`` client (extra-gated)."""
         if self._client is not None:
@@ -350,7 +381,7 @@ class OpenAIClientManager:
         Never raises: any SDK / transport failure is normalized to a FAILED response.
         """
         model = self.resolve(request.model_key)
-        model_path = f"openai:{model}"
+        model_path = self._model_path(model)
         started = time.perf_counter()
         params = request.generation_params or {}
 
@@ -603,9 +634,7 @@ class OpenAIClientManager:
                 structured = None
 
         breakdown = read_openai_usage(getattr(completion, "usage", None))
-        price = pricing.price_for(model_path)
-        if price.input_per_1k == 0.0 and price.output_per_1k == 0.0:
-            price = pricing.price_for(request.model_key)
+        price = await self._resolve_price(model, request)
         read_rate, write_mult = resolve_cache_rates(
             price,
             capability=self.cache_capability,
@@ -645,9 +674,21 @@ class OpenAIClientManager:
         across chunks, then EXECUTED on stream end exactly like :meth:`generate` — so a
         streamed tool turn is no longer silently dropped. Any failure degrades to a
         single buffered :meth:`generate` so the delta-then-final contract always holds.
+
+        A JSON_OBJECT / STRUCTURED_OUTPUT request is constrained by the
+        ``response_format`` that ONLY the buffered path applies; a forced-schema reply
+        has no meaningful incremental text, so it delegates to :meth:`generate` to get
+        the same constraint + populated ``output_structured`` (otherwise the stream is
+        unconstrained and ``output_structured`` stays ``None``).
         """
+        if request.response_format in (
+            ResponseFormat.JSON_OBJECT,
+            ResponseFormat.STRUCTURED_OUTPUT,
+        ):
+            yield await self.generate(request)
+            return
         model = self.resolve(request.model_key)
-        model_path = f"openai:{model}"
+        model_path = self._model_path(model)
         started = time.perf_counter()
         params = request.generation_params or {}
         cache_system = self._passthrough_caches_system(request, model)
@@ -707,9 +748,7 @@ class OpenAIClientManager:
         text: str | None = "".join(chunks)
         if raw_calls:
             text = None  # the reply was a tool call, not a final answer
-        price = pricing.price_for(model_path)
-        if price.input_per_1k == 0.0 and price.output_per_1k == 0.0:
-            price = pricing.price_for(request.model_key)
+        price = await self._resolve_price(model, request)
         read_rate, write_mult = resolve_cache_rates(
             price,
             capability=self.cache_capability,

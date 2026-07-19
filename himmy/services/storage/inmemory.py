@@ -617,6 +617,38 @@ class InMemoryRunStore:
                 trace_ids.add(run.trace_id)
         return thread_ids, trace_ids
 
+    async def save_run_if_owner(self, run: RunRecord, owner_id: str) -> bool:
+        """Owner-conditional upsert (the in-memory twin of the durable SQL CAS).
+
+        Persist ``run`` iff the stored row still holds ``owner_id`` — the lease-guarded
+        terminal-write primitive. There is NO ``await`` between the read and the write, so a
+        reaped-then-reclaimed run's stale terminal write is DROPPED (returns ``False``) rather
+        than clobbering the new owner. ``True`` when we still owned the run and it landed.
+        """
+        existing = self._runs.get(run.run_id)
+        if existing is None or existing.owner_id != owner_id:
+            return False
+        run.updated_at = utc_now_iso()
+        self._index_idempotency(run)
+        self._runs[run.run_id] = run
+        return True
+
+    def delete_by_subject(self, subject_id: str) -> int:
+        """Hard-DELETE a subject's own run rows (S4 right-to-erasure parity).
+
+        Mirrors the durable backends: a governed run's ``output_text`` / ``output_structured``
+        hold the subject's cleartext, so erasure must drop the run rows too (not only the
+        transcript/events). Returns the count removed; idempotent (a re-run returns 0).
+        """
+        doomed = [rid for rid, run in self._runs.items() if run.subject_id == subject_id]
+        for rid in doomed:
+            run = self._runs.pop(rid, None)
+            if run is not None and run.idempotency_key is not None:
+                self._runs_by_idempotency.pop(
+                    (run.workspace_id, run.idempotency_key), None
+                )
+        return len(doomed)
+
 
 class InMemoryAgentDefStore:
     """Process-local workspace-scoped stored agent definitions (T2e).
@@ -713,6 +745,22 @@ class InMemoryRecommendationStore:
         """Upsert a recommendation item keyed by ``recommendation_id``."""
         self._recommendations[item.recommendation_id] = item
         return item
+
+    def delete_by_subject(self, subject_id: str) -> int:
+        """Hard-DELETE a subject's recommendation rows (S4 right-to-erasure parity).
+
+        ``title`` / ``summary`` / ``rationale`` carry the subject's cleartext, so erasure
+        drops every recommendation scoped to ``subject_id``. Returns the count removed;
+        idempotent. Synchronous so the sync ``SubjectReachMap.erase`` walk can drive it.
+        """
+        doomed = [
+            rid
+            for rid, item in self._recommendations.items()
+            if item.subject_id == subject_id
+        ]
+        for rid in doomed:
+            self._recommendations.pop(rid, None)
+        return len(doomed)
 
     async def get_recommendation(
         self, recommendation_id: str

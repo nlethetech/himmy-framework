@@ -1412,6 +1412,26 @@ class PostgresRunStore(_PgStoreBase):
             await conn.execute(self._RUN_UPSERT_BY_ID, *self._run_params(run))
         return run
 
+    async def save_run_if_owner(self, run: RunRecord, owner_id: str) -> bool:
+        """Owner-conditional upsert: persist ``run`` iff the stored row still holds ``owner_id``.
+
+        The lease-guarded twin of :meth:`save_run`, for a worker's TERMINAL write. Mirrors
+        :meth:`renew_lease`'s ``WHERE owner_id = $`` CAS: a run reaped and re-claimed by a new
+        owner between the claim and this write is NOT clobbered — the ``WHERE run_id = $ AND
+        owner_id = $`` predicate misses, no row is written, and the stale terminal write is
+        DROPPED (returns ``False``). Returns ``True`` when we still owned the run and it landed.
+        Only for owner-held transitions; the ``owner_id=None`` paths keep :meth:`save_run`.
+        """
+        from himmy.core.ids import utc_now_iso
+
+        run.updated_at = utc_now_iso()
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                self._RUN_UPSERT_IF_OWNER, *self._run_params(run), owner_id
+            )
+        return row is not None
+
     async def save_run_if_absent_by_idempotency(
         self, run: RunRecord
     ) -> tuple[RunRecord, bool]:
@@ -1891,6 +1911,42 @@ class PostgresRunStore(_PgStoreBase):
             last_error = EXCLUDED.last_error,
             lane_key = EXCLUDED.lane_key,
             input_blob = EXCLUDED.input_blob
+    """
+
+    #: Owner-conditional variant of the run upsert (save_run_if_owner). The claimed row always
+    #: pre-exists for a terminal write, so this is a plain UPDATE gated by ``owner_id = $27``
+    #: (the CAS): it takes the SAME 26 positional params as ``_RUN_UPSERT_BY_ID`` in the SAME
+    #: positions ($1..$26, ``created_at`` $16 left untouched exactly as the DO UPDATE), plus the
+    #: held ``owner_id`` as $27 in the WHERE. Zero rows updated (RETURNING empty) => the lease was
+    #: lost to a reap+reclaim and the stale terminal write is dropped.
+    _RUN_UPSERT_IF_OWNER = """
+        UPDATE runs SET
+            workspace_id = $2,
+            subject_id = $3,
+            task_id = $4,
+            thread_id = $5,
+            snapshot_id = $6,
+            persona_name = $7,
+            model_key = $8,
+            idempotency_key = $9,
+            status = $10,
+            output_text = $11,
+            output_structured = $12,
+            error = $13,
+            trace_id = $14,
+            metadata = $15,
+            updated_at = $17,
+            owner_id = $18,
+            lease_expires_at = $19,
+            heartbeat_at = $20,
+            attempt = $21,
+            max_attempts = $22,
+            next_attempt_at = $23,
+            last_error = $24,
+            lane_key = $25,
+            input_blob = $26
+        WHERE run_id = $1 AND owner_id = $27
+        RETURNING run_id
     """
 
     def _run_params(self, run: RunRecord) -> list[Any]:
@@ -2983,14 +3039,17 @@ class PostgresStorageService:
         )
 
     async def delete_by_subject(self, subject_id: str) -> int:
-        """Hard-DELETE a subject's chat_threads + run_events (S4 right-to-erasure).
+        """Hard-DELETE a subject's chat_threads + run_events + runs + recommendations (S4).
 
-        The Postgres mirror of :meth:`SqliteStorageService.delete_by_subject`: these tables
+        The Postgres mirror of :meth:`SqliteStorageService.delete_by_subject`: all four tables
         are encrypted at rest under the store-WIDE cipher (not the per-subject key), so a
         crypto-shred alone leaves them recoverable — erasure hard-deletes them. A subject's
         runs (``runs.subject_id``) name every ``thread_id`` / ``trace_id`` the runtime
-        persisted, resolved here via the ``runs`` row's typed columns. Runs in ONE
-        transaction so a mid-delete failure rolls back; idempotent. Returns rows removed.
+        persisted, resolved FIRST via the ``runs`` row's typed columns; the transcript/events
+        are dropped, THEN the subject's own ``runs`` (output_text / output_structured) and
+        ``recommendations`` (title / summary / rationale) rows. Runs in ONE transaction so a
+        mid-delete failure rolls back and the certificate's ``complete`` honestly covers all
+        four; idempotent. Returns rows removed.
         """
         pool = self._require_pool()
         async with pool.acquire() as conn, conn.transaction():
@@ -3015,6 +3074,14 @@ class PostgresStorageService:
                     trace_ids,
                 )
                 deleted += int(str(tag).rsplit(" ", 1)[-1])
+            tag = await conn.execute(
+                "DELETE FROM runs WHERE subject_id = $1", subject_id
+            )
+            deleted += int(str(tag).rsplit(" ", 1)[-1])
+            tag = await conn.execute(
+                "DELETE FROM recommendations WHERE subject_id = $1", subject_id
+            )
+            deleted += int(str(tag).rsplit(" ", 1)[-1])
         return deleted
 
     # ------------------------------------------------------------------ context
@@ -3050,6 +3117,10 @@ class PostgresStorageService:
     async def save_run(self, run: RunRecord) -> RunRecord:
         """Upsert a run record keyed by ``run_id``; storage stamps ``updated_at``."""
         return await self._run_store.save_run(run)
+
+    async def save_run_if_owner(self, run: RunRecord, owner_id: str) -> bool:
+        """Owner-conditional terminal upsert: write iff the row still holds ``owner_id``."""
+        return await self._run_store.save_run_if_owner(run, owner_id)
 
     async def save_run_if_absent_by_idempotency(
         self, run: RunRecord

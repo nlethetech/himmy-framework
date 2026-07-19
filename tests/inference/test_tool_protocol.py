@@ -48,6 +48,20 @@ def test_bare_json_list_multiple() -> None:
     assert [c.tool_name for c in calls] == ["egg_totals", "pond_status"]
 
 
+def test_tool_call_envelope_under_generic() -> None:
+    # A Qwen3/QwQ-style <tool_call>{json}</tool_call> envelope that leaked into the
+    # GENERIC text parser is recovered (name-guarded, fail-open).
+    text = 'Sure.\n<tool_call>\n{"name": "pond_status", "arguments": {"pond": 2}}\n</tool_call>'
+    calls = parse_text_tool_calls(text, KNOWN)
+    assert [(c.tool_name, c.args) for c in calls] == [("pond_status", {"pond": 2})]
+
+
+def test_tool_call_envelope_unknown_name_rejected() -> None:
+    # Envelope with an unrelated name is guarded off (no false positive).
+    text = '<tool_call>{"name": "wildly_unrelated", "arguments": {}}</tool_call>'
+    assert parse_text_tool_calls(text, KNOWN) == []
+
+
 def test_function_nested_arguments_string() -> None:
     # OpenAI-ish: function.name + arguments as a JSON string.
     text = '{"function": {"name": "egg_totals", "arguments": "{\\"days\\": 5}"}}'

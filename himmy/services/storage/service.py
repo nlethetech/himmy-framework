@@ -127,6 +127,11 @@ class StorageService:
         )
         removed = self._thread_store.delete_threads(thread_ids)
         removed += self._event_log.delete_events(thread_ids, trace_ids)
+        # The subject's own runs (output_text / output_structured) and recommendations
+        # (title / summary / rationale) hold its cleartext too — drop them for parity with
+        # the durable backends so the deletion certificate genuinely covers all of them.
+        removed += self._run_store.delete_by_subject(subject_id)
+        removed += self._recommendation_store.delete_by_subject(subject_id)
         return removed
 
     # ------------------------------------------------------------------ context
@@ -172,6 +177,10 @@ class StorageService:
     async def save_run(self, run: RunRecord) -> RunRecord:
         """Upsert a run record keyed by ``run_id``; storage stamps ``updated_at``."""
         return await self._run_store.save_run(run)
+
+    async def save_run_if_owner(self, run: RunRecord, owner_id: str) -> bool:
+        """Owner-conditional terminal upsert: persist iff the stored row still holds owner_id."""
+        return await self._run_store.save_run_if_owner(run, owner_id)
 
     async def save_run_if_absent_by_idempotency(
         self, run: RunRecord

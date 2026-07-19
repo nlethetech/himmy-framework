@@ -270,6 +270,56 @@ def test_generate_stream_yields_deltas_then_response() -> None:
     assert final.output_text == "Hello!"
 
 
+def test_generate_stream_structured_delegates_to_buffered_generate() -> None:
+    """A streamed STRUCTURED_OUTPUT request delegates to the buffered generate().
+
+    The stream path omits the forced ``__structured_output__`` tool, so a streamed
+    structured request would be unconstrained and ``output_structured`` would stay None.
+    Delegating applies the same forced tool + populates ``output_structured``; a
+    forced-schema reply has no meaningful incremental text, so no deltas are emitted.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    }
+    client = _client(
+        [
+            _Block(
+                type="tool_use",
+                id="t1",
+                name="__structured_output__",
+                input={"city": "Pokhara"},
+            )
+        ]
+    )
+    mgr = AnthropicClientManager(model=PRICED_MODEL, client=client)
+
+    async def _collect() -> tuple[list[str], Any]:
+        deltas: list[str] = []
+        final: Any = None
+        async for piece in mgr.generate_stream(
+            _req(
+                response_format=ResponseFormat.STRUCTURED_OUTPUT,
+                output_json_schema=schema,
+            )
+        ):
+            if isinstance(piece, str):
+                deltas.append(piece)
+            else:
+                final = piece
+        return deltas, final
+
+    deltas, final = run_async(_collect())
+    assert deltas == []  # structured reply → no incremental text
+    assert final is not None and final.status == InferenceStatus.SUCCESS
+    assert final.output_structured == {"city": "Pokhara"}
+    # Delegation went through messages.create with the forced structured tool applied.
+    seen = client.messages.seen
+    assert seen["tool_choice"] == {"type": "tool", "name": "__structured_output__"}
+    assert seen["tools"][0]["input_schema"] == schema
+
+
 # ------------------------------------------------------- error normalization
 def test_sdk_error_is_normalized_to_failed_never_raises() -> None:
     """An exception from messages.create becomes a FAILED response (never raises)."""

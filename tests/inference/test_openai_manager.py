@@ -231,7 +231,9 @@ def test_model_passes_through_verbatim_to_create() -> None:
     assert resp.status == InferenceStatus.SUCCESS
     # No prefix rewriting: the upstream model id is passed through unchanged.
     assert client.chat.completions.seen["model"] == "anthropic/claude-3.5-sonnet"
-    assert resp.model_path == "openai:anthropic/claude-3.5-sonnet"
+    # An OpenRouter-routed model is stamped with the openrouter: prefix so cost
+    # resolves via OpenRouter's live table (the openai: table misses dashed ids).
+    assert resp.model_path == "openrouter:anthropic/claude-3.5-sonnet"
     assert resp.provider_name == "openrouter"
 
 
@@ -560,6 +562,171 @@ def test_generate_stream_carries_and_executes_tool_calls() -> None:
     assert ran == [("lookup", {"q": "rates"})]
     assert final.tool_returns[0].content == "done"
     assert final.output_text is None
+
+
+def test_generate_stream_structured_delegates_to_buffered_generate() -> None:
+    """A streamed STRUCTURED_OUTPUT request delegates to the buffered generate().
+
+    The stream path omits ``response_format``, so a streamed structured request would be
+    unconstrained and ``output_structured`` would stay None. Delegating applies the
+    json_schema constraint and populates ``output_structured``; a forced-schema reply has
+    no meaningful incremental text, so no deltas are emitted and no stream is opened.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    }
+    client = _FakeClient(_completion(content='{"city": "Bardaghat"}'))
+    mgr = OpenAIClientManager(model=PRICED_MODEL, client=client)
+
+    async def _collect() -> tuple[list[str], Any]:
+        deltas: list[str] = []
+        final: Any = None
+        async for piece in mgr.generate_stream(
+            _req(
+                response_format=ResponseFormat.STRUCTURED_OUTPUT,
+                output_json_schema=schema,
+            )
+        ):
+            if isinstance(piece, str):
+                deltas.append(piece)
+            else:
+                final = piece
+        return deltas, final
+
+    deltas, final = run_async(_collect())
+    assert deltas == []  # structured reply → no incremental text
+    assert final is not None and final.status == InferenceStatus.SUCCESS
+    assert final.output_structured == {"city": "Bardaghat"}
+    seen = client.chat.completions.seen
+    # delegated to the buffered path: response_format applied, NOT a stream request.
+    assert seen["response_format"]["type"] == "json_schema"
+    assert "stream" not in seen
+
+
+def test_generate_stream_json_object_delegates_and_populates_structured() -> None:
+    """A streamed JSON_OBJECT request delegates and comes back with output_structured."""
+    client = _FakeClient(_completion(content='{"answer": 7}'))
+    mgr = OpenAIClientManager(model=PRICED_MODEL, client=client)
+
+    async def _collect() -> Any:
+        final: Any = None
+        async for piece in mgr.generate_stream(
+            _req(response_format=ResponseFormat.JSON_OBJECT)
+        ):
+            if not isinstance(piece, str):
+                final = piece
+        return final
+
+    final = run_async(_collect())
+    assert final is not None and final.output_structured == {"answer": 7}
+    seen = client.chat.completions.seen
+    assert seen["response_format"] == {"type": "json_object"}
+    assert "stream" not in seen
+
+
+# ------------------------------------------------------------ openrouter cost
+def test_openrouter_cost_uses_live_table_and_stamps_model_path(monkeypatch) -> None:
+    """OpenRouter cost resolves via the LIVE OpenRouter table (dashed keys the static
+    ``openai:`` table misses would bill $0) and model_path is ``openrouter:{model}``."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    payload = {
+        "data": [
+            {
+                "id": "some-vendor/model-x",
+                "pricing": {"prompt": "0.000002", "completion": "0.000008"},
+            }
+        ]
+    }
+    pricing.reload_openrouter()
+    # Prime the 1h live cache with an injected fetch so _resolve_price's off-loop,
+    # no-fetch lookup reads the primed table and never touches the network.
+    pricing.openrouter_live_prices(fetch=lambda u, h, t: payload)
+    try:
+        client = _FakeClient(
+            _completion(content="ok", prompt_tokens=1000, completion_tokens=500)
+        )
+        mgr = OpenAIClientManager(
+            model="some-vendor/model-x",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="sk-or-x",
+            client=client,
+            provider_name="openrouter",
+        )
+        resp = run_async(mgr.generate(_req(model_key="some-vendor/model-x")))
+    finally:
+        pricing.reload_openrouter()
+
+    assert resp.status == InferenceStatus.SUCCESS
+    assert resp.model_path == "openrouter:some-vendor/model-x"
+    # 1000 in @ 0.002/1k + 500 out @ 0.008/1k — billed, not $0 from the static miss.
+    expected = (1000 / 1000) * 0.002 + (500 / 1000) * 0.008
+    assert resp.cost == pytest.approx(expected)
+    assert resp.cost > 0.0
+
+
+def test_openrouter_generate_stream_cost_uses_live_table(monkeypatch) -> None:
+    """The streaming path also prices an OpenRouter model via the live table."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    payload = {
+        "data": [
+            {
+                "id": "some-vendor/model-x",
+                "pricing": {"prompt": "0.000002", "completion": "0.000008"},
+            }
+        ]
+    }
+    chunks = [
+        _Obj(choices=[_Obj(delta=_Obj(content="hi"))], usage=None),
+        _Obj(choices=[], usage=_Obj(prompt_tokens=1000, completion_tokens=500)),
+    ]
+
+    class _StreamCompletions:
+        async def create(self, **kwargs: Any) -> Any:
+            async def _gen() -> Any:
+                for c in chunks:
+                    yield c
+
+            return _gen()
+
+    class _StreamChat:
+        def __init__(self) -> None:
+            self.completions = _StreamCompletions()
+
+    class _StreamClient:
+        def __init__(self) -> None:
+            self.chat = _StreamChat()
+
+    pricing.reload_openrouter()
+    pricing.openrouter_live_prices(fetch=lambda u, h, t: payload)
+    try:
+        mgr = OpenAIClientManager(
+            model="some-vendor/model-x",
+            base_url="https://openrouter.ai/api/v1",
+            api_key="sk-or-x",
+            client=_StreamClient(),
+            provider_name="openrouter",
+        )
+
+        async def _collect() -> Any:
+            final: Any = None
+            async for piece in mgr.generate_stream(
+                _req(model_key="some-vendor/model-x")
+            ):
+                if not isinstance(piece, str):
+                    final = piece
+            return final
+
+        final = run_async(_collect())
+    finally:
+        pricing.reload_openrouter()
+
+    assert final is not None and final.status == InferenceStatus.SUCCESS
+    assert final.model_path == "openrouter:some-vendor/model-x"
+    expected = (1000 / 1000) * 0.002 + (500 / 1000) * 0.008
+    assert final.cost == pytest.approx(expected)
+    assert final.cost > 0.0
 
 
 # ------------------------------------------------------- error normalization

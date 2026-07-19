@@ -49,6 +49,7 @@ GATED_SAVE_METHODS = frozenset(
         "save_run",
         "save_run_if_absent_by_idempotency",
         "save_run_if_under_quota",
+        "save_run_if_owner",
         "save_snapshot",
         "save_memory",
         "save_episodic_memory",
@@ -142,6 +143,13 @@ class ConsentGatedStorage:
                 await self._inner.save_run_if_under_quota(run, cap=cap),
             )
         return run, True
+
+    async def save_run_if_owner(self, run: RunRecord, owner_id: str) -> bool:
+        """Owner-conditional terminal write, consent-gated. An unconsented subject's run is
+        not persisted (returns ``False``, the same 'did not land' signal as a lost-owner CAS)."""
+        if self._may_persist(run):
+            return cast("bool", await self._inner.save_run_if_owner(run, owner_id))
+        return False
 
     async def save_snapshot(self, snapshot: Any) -> Any:
         """Persist a context snapshot unless RETAIN is not consented."""

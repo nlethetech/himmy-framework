@@ -491,6 +491,27 @@ class SubjectKeyVault:
             return None
         return str(row[1])
 
+    def erasure_state(self, subject_id: str) -> tuple[str | None, bool]:
+        """Return ``(key_version, already_shredded)`` for a subject's row.
+
+        ``key_version`` is the recorded meta-KEK version whenever the subject ever HELD a key —
+        LIVE *or* already shredded (the row is retained as a tombstone with its ``key_version``
+        preserved) — else ``None`` (no row / never onboarded). ``already_shredded`` is ``True``
+        when the row's ``shredded_at`` is set. Unlike :meth:`key_version_of` (which returns
+        ``None`` once the key is gone), this still surfaces the ORIGINAL version after a shred so
+        an idempotent :meth:`RetentionService.erase_subject` re-run can carry the first truthful
+        crypto-shred forward instead of contradicting it with ``crypto_shredded=False`` /
+        ``key_version=None``.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT key_version, shredded_at FROM subject_keys WHERE subject_id = ?",
+                (subject_id,),
+            ).fetchone()
+        if row is None:
+            return None, False
+        return str(row[0]), row[1] is not None
+
     def _checkpoint_locked(self) -> None:
         """Force the WAL into the main DB + fsync after a crypto-shred (caller holds ``_lock``).
 
@@ -524,7 +545,6 @@ class SubjectKeyVault:
         withdrawal can never crypto-shred a key it does not own. ``None`` keeps the legacy
         single-tenant/offline path: any row is shreddable, exactly as before.
         """
-        self._cache.pop(subject_id, None)
         with self._lock:
             row = self._conn.execute(
                 "SELECT wrapped_dek, shredded_at, workspace_id FROM subject_keys "
@@ -547,6 +567,11 @@ class SubjectKeyVault:
                 "WHERE subject_id = ?",
                 (utc_now_iso(), subject_id),
             )
+            # Evict the cache INSIDE the lock, after the row is nulled — so a concurrent
+            # key_for (which also takes self._lock) cannot re-cache the still-live key
+            # between a pre-lock pop and this UPDATE and keep serving an already-shredded
+            # key. Mirrors shred_workspace, which pops under the same held lock.
+            self._cache.pop(subject_id, None)
             self._conn.commit()
             self._checkpoint_locked()
         return True
@@ -826,14 +851,23 @@ class RetentionService:
         so the crypto-shred is REFUSED when the subject's key is bound to a different tenant;
         ``None`` keeps the legacy single-tenant/offline path.
         """
-        key_version = (
-            self._keys.key_version_of(subject_id) if self._keys is not None else None
-        )
-        shredded = (
-            self._keys.destroy(subject_id, workspace_id=workspace_id)
-            if self._keys is not None
-            else False
-        )
+        key_version: str | None = None
+        shredded = False
+        if self._keys is not None:
+            # Read the recorded version + prior shred state BEFORE destroying, so an
+            # already-shredded row still yields the ORIGINAL key_version (the row is a
+            # retained tombstone) rather than None.
+            recorded_version, already_shredded = self._keys.erasure_state(subject_id)
+            shredded_now = self._keys.destroy(subject_id, workspace_id=workspace_id)
+            if shredded_now or already_shredded:
+                # shredded_now = a fresh crypto-shred (recorded_version protected the live
+                # data). already_shredded = an IDEMPOTENT re-run: the key is already gone, so
+                # carry the original shred forward — every certificate then truthfully asserts
+                # crypto_shredded=True with the original key_version instead of contradicting
+                # the first truthful cert. A cross-tenant REFUSAL (destroy False, row still
+                # live, not shredded) correctly leaves shredded=False / key_version=None.
+                key_version = recorded_version
+                shredded = True
         per_store = self._reach.erase(subject_id) if self._reach is not None else []
         erased_at = self._clock()
 

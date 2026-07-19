@@ -144,6 +144,10 @@ class RunStore(Protocol):
 
     async def save_run(self, run: RunRecord) -> RunRecord: ...
 
+    async def save_run_if_owner(
+        self, run: RunRecord, owner_id: str
+    ) -> bool: ...
+
     async def save_run_if_absent_by_idempotency(
         self, run: RunRecord
     ) -> tuple[RunRecord, bool]: ...
