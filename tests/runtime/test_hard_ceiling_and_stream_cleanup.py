@@ -301,6 +301,34 @@ def test_closing_stream_during_continuation_turns_leaves_no_dangling_work() -> N
     run_async(scenario())
 
 
+def test_subject_scope_reset_survives_cross_context_close() -> None:
+    """``_subject_scope`` finalized in a DIFFERENT context than it was entered in
+    must not raise — the streamed-loop early-``aclose`` path.
+
+    ``stream_agent_loop`` yields to its consumer while suspended INSIDE
+    ``_subject_scope``. In CPython an async generator runs each step in the caller's
+    context, so when the consumer closes the stream (``aclosing(...)`` after an early
+    ``break``, e.g. wrapped in ``asyncio.timeout``) from a different context than the
+    first ``anext`` ran in, this scope's ``finally`` calls
+    ``_CURRENT_SUBJECT.reset(token)`` against a token created elsewhere — raising
+    "Token was created in a different Context" before the fix.
+
+    We reproduce that condition deterministically: enter the CM inside a throwaway
+    ``contextvars.Context`` (so ``set()`` binds the token there) and exit outside it.
+    """
+    import contextvars
+
+    from himmy.runtime.audit import _CURRENT_SUBJECT
+
+    rt, _manager, _service = _scripted_runtime([{"tools": False, "text": "x"}])
+    cm = rt._subject_scope({})
+    contextvars.Context().run(cm.__enter__)  # set() binds the token to that context
+    # Exiting here runs reset() in the current (different) context: must not raise.
+    cm.__exit__(None, None, None)
+    # And no stale subject was left stamped on this context.
+    assert _CURRENT_SUBJECT.get() is None
+
+
 def test_cancellation_mid_stream_propagates_and_cleans_up() -> None:
     """Cancelling a consumer mid-turn re-raises CancelledError and leaks nothing."""
 

@@ -1632,7 +1632,21 @@ class SingleAgentRuntime:
         try:
             yield
         finally:
-            _CURRENT_SUBJECT.reset(token)
+            try:
+                _CURRENT_SUBJECT.reset(token)
+            except ValueError:
+                # The streamed-loop path (``stream_agent_loop``) yields to its
+                # consumer while suspended INSIDE this scope. When the consumer
+                # closes that async generator after an early ``break`` (e.g.
+                # ``aclosing(...)`` on the terminal delta), this ``finally`` runs
+                # during ``aclose()`` in a different context than the one ``set()``
+                # ran in, so ``reset(token)`` raises "Token was created in a
+                # different Context". That other context never observed our
+                # ``set()`` (the var is context-local, ``default=None``), so there
+                # is nothing to undo — swallowing the reset is correct, and
+                # leaving that context untouched avoids clobbering any subject a
+                # nesting scope legitimately owns there.
+                pass
 
     async def _run_task_pipeline(
         self,
