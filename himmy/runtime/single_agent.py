@@ -1635,18 +1635,33 @@ class SingleAgentRuntime:
             try:
                 _CURRENT_SUBJECT.reset(token)
             except ValueError:
-                # The streamed-loop path (``stream_agent_loop``) yields to its
-                # consumer while suspended INSIDE this scope. When the consumer
-                # closes that async generator after an early ``break`` (e.g.
-                # ``aclosing(...)`` on the terminal delta), this ``finally`` runs
-                # during ``aclose()`` in a different context than the one ``set()``
-                # ran in, so ``reset(token)`` raises "Token was created in a
-                # different Context". That other context never observed our
-                # ``set()`` (the var is context-local, ``default=None``), so there
-                # is nothing to undo — swallowing the reset is correct, and
-                # leaving that context untouched avoids clobbering any subject a
-                # nesting scope legitimately owns there.
-                pass
+                # The streamed paths (``stream_task`` / ``stream_agent_loop``) yield to
+                # their consumer while suspended INSIDE this scope. In CPython an async
+                # generator runs each step in the CALLER's context, so a consumer that
+                # closes the stream from a different context than the first ``anext``
+                # ran in — an early ``break`` under ``aclosing(...)``, or the event
+                # loop's lazy async-generator finalizer, which closes from a fresh task
+                # whose context is a COPY — runs this ``finally`` during ``aclose()``
+                # holding a foreign token. ``reset(token)`` then raises "Token was
+                # created in a different Context" and aborts the turn, so a downstream
+                # SSE/NDJSON consumer sees an empty / failed chat turn.
+                #
+                # Swallowing is right for THIS context: it never observed our ``set()``
+                # (the var is context-local, ``default=None``), so there is nothing to
+                # undo, and stamping ``None`` here instead would clobber a subject a
+                # nesting scope legitimately owns. The ENTERING context does keep the
+                # stamp — ``contextvars`` offers no way to reset a context you are not
+                # currently in — but that residue predates this guard (the raising
+                # ``reset`` left it too, and additionally killed the run) and every
+                # emit path re-``set``s the subject through this same scope.
+                #
+                # Narrow by construction: a re-used token raises ``RuntimeError``, not
+                # ``ValueError``, so a genuine double-exit still surfaces here.
+                log.debug(
+                    "subject-scope reset skipped: token was created in a different "
+                    "context (streamed close); the entering context keeps its stamp",
+                    exc_info=True,
+                )
 
     async def _run_task_pipeline(
         self,

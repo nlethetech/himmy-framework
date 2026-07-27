@@ -319,14 +319,37 @@ def test_subject_scope_reset_survives_cross_context_close() -> None:
     import contextvars
 
     from himmy.runtime.audit import _CURRENT_SUBJECT
+    from himmy.services.governance.consent import Decision, Effect
 
     rt, _manager, _service = _scripted_runtime([{"tools": False, "text": "x"}])
-    cm = rt._subject_scope({})
-    contextvars.Context().run(cm.__enter__)  # set() binds the token to that context
+    # Governed mode. ``_run_subject`` returns ``None`` unless a decider is wired, so
+    # without this the scope would stamp ``None`` and every assertion below would hold
+    # vacuously — the test would still pass with the guard removed and the subject left
+    # dangling. ``_subject_scope`` reaches the decider only through ``_run_subject``'s
+    # ``is None`` check, so this one is never actually invoked.
+    rt._consent_decider = lambda subject, purpose: Decision(
+        subject_id=subject, purpose=purpose, effect=Effect.ALLOW
+    )
+    ctx = {"context_subject_id": "teacher_a"}
+
+    entering = contextvars.Context()
+    cm = rt._subject_scope(ctx)
+    entering.run(cm.__enter__)  # set() binds the token to `entering`
+    assert entering.run(_CURRENT_SUBJECT.get) == "teacher_a"
+
     # Exiting here runs reset() in the current (different) context: must not raise.
     cm.__exit__(None, None, None)
-    # And no stale subject was left stamped on this context.
+
+    # This context never observed the ``set()``, and the guard must not stamp it on the
+    # way out either — writing ``None`` here would clobber a subject that a nesting
+    # scope legitimately owns in this context.
     assert _CURRENT_SUBJECT.get() is None
+    # Documents a KNOWN limitation rather than an intended behaviour: the entering
+    # context keeps its stamp, because ``contextvars`` cannot reset a context you are
+    # not currently in. The residue predates the guard (the raising ``reset`` left it
+    # too, and additionally killed the run). If this ever starts failing, the scope has
+    # gained real cross-context cleanup — update the guard's comment to match.
+    assert entering.run(_CURRENT_SUBJECT.get) == "teacher_a"
 
 
 def test_cancellation_mid_stream_propagates_and_cleans_up() -> None:
